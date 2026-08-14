@@ -2355,7 +2355,7 @@ mod tests {
     /// (non-power-of-two block count: 500 blocks in 512 slots).
     #[test]
     fn round1_inner_nt_matches_regular() {
-        let mut rng = Rng::new(0x57A6_ED17);
+        let mut rng = Rng::new(0x57A6_ED18);
         let n_blocks = 500usize;
         let blocks: Vec<Compression> = (0..n_blocks)
             .map(|_| {
