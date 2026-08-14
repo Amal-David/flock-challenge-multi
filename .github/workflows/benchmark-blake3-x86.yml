@@ -1,0 +1,84 @@
+name: BLAKE3 x86 Benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flock-blake3-x86-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: [self-hosted, x86-16c-32gb]
+    timeout-minutes: 25
+    env:
+      BLAKE3_LOG2: "18"
+      BLAKE3_THREADS: auto
+      BLAKE3_WARMUP_RUNS: "20"
+      BLAKE3_RUNS: "100"
+      FLOCK_REQUIRE_SANDBOX: "1"
+      RUSTFLAGS: -C target-cpu=native
+      RUSTUP_TOOLCHAIN: 1.97.0
+
+    steps:
+      - name: Checkout dispatched commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          persist-credentials: false
+
+      - name: Runner preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == Linux ]]
+          [[ "$(uname -m)" == x86_64 ]]
+          command -v git
+          command -v sha256sum
+          command -v bwrap
+          mkdir -p benchmark-results
+          {
+            cat /etc/os-release
+            uname -a
+            lscpu
+            grep MemTotal /proc/meminfo
+            nproc
+            git rev-parse HEAD
+          } | tee benchmark-results/runner.txt
+
+      - name: Setup benchmark
+        run: ./setup.sh
+
+      - name: Benchmark submission
+        run: ./benchmark.sh
+
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f benchmark-results/summary.md ]]; then
+            cat benchmark-results/summary.md >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "## Benchmark failed — see the job log" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload score
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-score
+          path: score.json
+          if-no-files-found: error
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-diagnostics-${{ github.run_id }}
+          path: benchmark-results/
+          if-no-files-found: warn
