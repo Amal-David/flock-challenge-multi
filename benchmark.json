@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "name": "flock-challenge-x86",
+  "name": "flock-challenge-multi",
   "tracks": [
     {
       "name": "x86",
