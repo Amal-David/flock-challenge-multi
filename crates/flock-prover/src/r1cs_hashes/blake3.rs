@@ -1652,6 +1652,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        std::thread::sleep(std::time::Duration::from_millis(50));
         static EXTRA_WARMUP_DONE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if self.r1cs.m >= 29
