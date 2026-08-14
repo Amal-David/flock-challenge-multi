@@ -324,6 +324,114 @@ where
     (z, a, b, z_lincheck)
 }
 
+/// Stripe-free row-major witness driver for producers that assign every
+/// destination word. It skips the group-wide zero pass; callers must provide
+/// padding and fully initialize all three block slices.
+pub(crate) fn drive_witness_packed<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let n_total = 1usize << n_blocks_log;
+    assert!(initial_states.len() <= n_total);
+    assert!(
+        n_total >= 8 && n_total.is_multiple_of(8),
+        "row-major witness driver requires at least 8 block slots"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+
+    // The three destination streams total 3 · 2^m bits (1.5 GiB at the ranked
+    // m = 32) and are next read only in later phases — far beyond any cache —
+    // so regular stores' write-allocate costs one hidden DRAM read per line.
+    // On aarch64, build each block in an L1-resident staging buffer and
+    // publish it with `stnp` (same shape as the batch-major driver's
+    // `flush_rows_nt`). `FLOCK_NO_WITNESS_NT` is a local-diagnostics kill
+    // switch; the ranked worker's cleared environment never sets it.
+    let use_nt = cfg!(target_arch = "aarch64")
+        && u64_per_block_is_nt_compatible(f128_per_block * 2)
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+
+    z.par_chunks_mut(8 * f128_per_block)
+        .zip(a.par_chunks_mut(8 * f128_per_block))
+        .zip(b.par_chunks_mut(8 * f128_per_block))
+        .enumerate()
+        .for_each_init(
+            || {
+                if use_nt {
+                    let u64s = f128_per_block * 2;
+                    (vec![0u64; u64s], vec![0u64; u64s], vec![0u64; u64s])
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                }
+            },
+            |(z_stage, a_stage, b_stage), (g, ((z_grp, a_grp), b_grp))| {
+                for k_in in 0..8 {
+                    let global_idx = 8 * g + k_in;
+                    let initial = initial_states.get(global_idx).unwrap_or(padding);
+                    let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    if use_nt {
+                        per_block(initial, z_stage, a_stage, b_stage);
+                        let n = z_stage.len();
+                        // SAFETY: staging and destination are disjoint,
+                        // both `n` u64s; n = K/64 is a multiple of 16 (checked
+                        // by the gate above).
+                        unsafe {
+                            nt_copy_u64s(z_stage.as_ptr(), z_chunk.as_mut_ptr() as *mut u64, n);
+                            nt_copy_u64s(a_stage.as_ptr(), a_chunk.as_mut_ptr() as *mut u64, n);
+                            nt_copy_u64s(b_stage.as_ptr(), b_chunk.as_mut_ptr() as *mut u64, n);
+                        }
+                        continue;
+                    }
+                    // SAFETY: F128 is repr(C, align(16)) with two little-endian
+                    // u64 fields, and the producer overwrites every destination.
+                    let z_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            z_chunk.as_mut_ptr() as *mut u64,
+                            z_chunk.len() * 2,
+                        )
+                    };
+                    let a_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            a_chunk.as_mut_ptr() as *mut u64,
+                            a_chunk.len() * 2,
+                        )
+                    };
+                    let b_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            b_chunk.as_mut_ptr() as *mut u64,
+                            b_chunk.len() * 2,
+                        )
+                    };
+                    per_block(initial, z_u64, a_u64, b_u64);
+                }
+            },
+        );
+
+    (z, a, b)
+}
+
+/// The staged NT flush copies whole 128-byte rows, so the per-block u64
+/// count must divide into 16-u64 chunks.
+#[inline]
+pub(crate) fn u64_per_block_is_nt_compatible(u64s: usize) -> bool {
+    u64s.is_multiple_of(16)
+}
+
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.
 pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
@@ -429,6 +537,21 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     #[cfg(not(target_arch = "aarch64"))]
     unsafe {
         std::ptr::copy_nonoverlapping(src, dst, 2 * BM_V);
+    }
+}
+
+/// Non-temporal copy of `n` u64s (`n` divisible by 16) in 128-byte
+/// `ldp q / stnp q` chunks. Fallback: plain copy off-aarch64.
+///
+/// SAFETY: `src` valid for `n` u64 reads, `dst` for `n` u64 writes; ranges
+/// must not overlap.
+#[inline]
+pub(crate) unsafe fn nt_copy_u64s(src: *const u64, dst: *mut u64, n: usize) {
+    debug_assert!(n.is_multiple_of(16));
+    let mut i = 0;
+    while i < n {
+        unsafe { nt_store_row(src.add(i), dst.add(i)) };
+        i += 16;
     }
 }
 

@@ -377,7 +377,7 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
 /// exactly the sizes that function dispatches on — `blake3_batch_dispatch_agrees`
 /// holds the two together.
 #[inline]
-fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
+pub(crate) fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
     matches!(leaf_size, 64 | 128 | 256 | 512 | 1024)
 }
 
@@ -394,7 +394,7 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
 /// SHA-256's kernel is inherently four-wide, while BLAKE3 wants the widest
 /// batch the machine offers. Both are rayon-parallel and both are
 /// byte-identical to calling [`hash_leaf`] on each leaf.
-fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
+pub(crate) fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -451,7 +451,7 @@ const BLAKE3_GROUP: usize = 1024;
 /// dispatch per level costs more than the hashing itself (~3× at the top of a
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
 /// wide lower levels fan out.
-fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`

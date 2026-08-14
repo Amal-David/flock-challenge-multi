@@ -41,6 +41,8 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::field::F128;
 
 mod kernels;
@@ -93,6 +95,63 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
     acc
 }
 
+/// Largest domain whose complete breadth-first twiddle tree is cached.
+/// A size-2^20 domain uses `(2^20 - 1) * 16` bytes, just under 16 MiB.
+/// Larger, non-production domains retain the allocation-free fallback.
+const MAX_PRECOMPUTED_TWIDDLE_LOG: usize = 20;
+
+/// Materialize every layer's twiddles in natural block order. Layer `l`
+/// starts at offset `2^l - 1` and contains `2^l` entries. Each successive
+/// half is the previous half XOR the next span basis value, so construction is
+/// O(2^log_d) rather than evaluating every block's bits independently.
+fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
+    let log_d = evals.len();
+    if log_d > MAX_PRECOMPUTED_TWIDDLE_LOG {
+        return None;
+    }
+
+    let mut twiddles = Vec::with_capacity((1usize << log_d) - 1);
+    for layer in 0..log_d {
+        let layer_start = twiddles.len();
+        let eval_row = &evals[log_d - layer - 1];
+        debug_assert_eq!(eval_row.len(), layer + 1);
+
+        twiddles.push(F128::ZERO);
+        for (bit, &basis_value) in eval_row[1..].iter().enumerate() {
+            let half = 1usize << bit;
+            for block in 0..half {
+                let value = twiddles[layer_start + block] + basis_value;
+                twiddles.push(value);
+            }
+        }
+        debug_assert_eq!(twiddles.len() - layer_start, 1usize << layer);
+    }
+    Some(twiddles)
+}
+
+/// Cache standard-basis tables across NTT instances. The ranked worker runs
+/// an untimed proof before accepting the measured seed, so its warm-up fills
+/// these one-time cells and measured proofs only clone an `Arc`.
+fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
+    if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
+        return None;
+    }
+
+    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
+        OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    Some(
+        tables[dim]
+            .get_or_init(|| {
+                Arc::from(
+                    precompute_twiddles(evals)
+                        .expect("standard production domain should fit twiddle cache"),
+                )
+            })
+            .clone(),
+    )
+}
+
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
 /// The basis is `{1, x, x², …, x^(ℓ-1)}` in F_{2^128} = F_2[x]/(GHASH-poly).
@@ -102,13 +161,20 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
     evals: Vec<Vec<F128>>,
+    /// Breadth-first layer table used by production-size transforms. Keeping
+    /// this separate preserves the compact fallback for unusually large
+    /// domains while making every hot-path twiddle lookup O(1).
+    precomputed_twiddles: Option<Arc<[F128]>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
+        let evals = generate_evals_from_subspace(basis);
+        let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals: generate_evals_from_subspace(basis),
+            evals,
+            precomputed_twiddles,
         }
     }
 
@@ -117,7 +183,12 @@ impl AdditiveNttF128 {
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
         let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Self::new(&basis)
+        let evals = generate_evals_from_subspace(&basis);
+        let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
+        Self {
+            evals,
+            precomputed_twiddles,
+        }
     }
 
     pub fn log_domain_size(&self) -> usize {
@@ -132,6 +203,11 @@ impl AdditiveNttF128 {
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
+        debug_assert!(layer < self.log_domain_size());
+        debug_assert!(block < 1usize << layer);
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            return twiddles[(1usize << layer) - 1 + block];
+        }
         let v = &self.evals[self.log_domain_size() - layer - 1];
         span_get(&v[1..], block)
     }
@@ -214,6 +290,218 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Reed--Solomon encode an interleaved message into `codeword`.
+    ///
+    /// `msg` holds the non-zero coefficient prefix in position-major SoA
+    /// layout and `codeword` is larger by a power-of-two inverse-rate factor.
+    /// Every codeword slot is overwritten, so its incoming contents may be
+    /// stale. This is semantically identical to zero-padding `msg` and running
+    /// [`Self::forward_transform_interleaved`] from layer zero.
+    ///
+    /// On large AArch64 rate-1/2 transforms, replication and NTT layers 1--2
+    /// are fused into one out-of-place pass. Other geometries retain the
+    /// replica-fill plus from-layer scheduler.
+    pub(crate) fn rs_encode_interleaved(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(!msg.is_empty());
+        assert_eq!(msg.len() % num_ntts, 0);
+        assert_eq!(codeword.len() % msg.len(), 0);
+
+        let inv_rate = codeword.len() / msg.len();
+        assert!(inv_rate.is_power_of_two() && inv_rate > 1);
+        let log_inv_rate = log2_pow2(inv_rate);
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        assert!(log_inv_rate <= log_d);
+        assert_eq!(msg.len() / num_ntts, 1usize << (log_d - log_inv_rate));
+        assert!(log_d <= self.log_domain_size());
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        if log_inv_rate == 1 && log_d >= 12 {
+            self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
+            self.forward_transform_interleaved_from_layer(codeword, num_ntts, 3);
+            return;
+        }
+
+        replicate_message_fill(codeword, msg);
+        self.forward_transform_interleaved_from_layer(codeword, num_ntts, log_inv_rate);
+    }
+
+    /// [`Self::rs_encode_interleaved`] with **ordered chunk streaming**: the
+    /// deep (cache-resident) NTT pass runs as ONE fully-parallel rayon pass
+    /// (same schedule as the unstreamed path) whose sub-groups are claimed in
+    /// strict ascending order; per-chunk completion counters let the worker
+    /// that finishes a chunk's last sub-group fire `on_chunk(idx,
+    /// position_range)` as soon as that contiguous range of codeword
+    /// positions is FINAL (all remaining layers applied — nothing will write
+    /// it again). No inter-chunk barriers: workers roll straight into the
+    /// next chunk's sub-groups while the callback commits.
+    ///
+    /// Contract: callbacks arrive in order, ranges are contiguous and
+    /// ascending, and their union covers `0..codeword.len()/num_ntts`. The
+    /// callback count may be *lower* than `n_chunks` on small or non-SIMD
+    /// geometries (down to a single trailing callback). Callbacks are
+    /// serialized (a single committer holds a mutex) but may run on a rayon
+    /// worker thread — hence the `Send` bound; the callback must be cheap
+    /// and non-blocking. `FLOCK_NTT_STREAM_BARRIERS=1` restores the season-1
+    /// per-chunk rayon-barrier scheme (callbacks on the calling thread).
+    ///
+    /// Used only by the GPU-Merkle streaming commit; the pure-CPU commit keeps
+    /// [`Self::rs_encode_interleaved`]'s single-pass deep loop (per-chunk
+    /// rayon barriers buy nothing without a streaming consumer).
+    pub fn rs_encode_interleaved_streamed(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+        n_chunks: usize,
+        on_chunk: &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(!msg.is_empty());
+        assert_eq!(msg.len() % num_ntts, 0);
+        assert_eq!(codeword.len() % msg.len(), 0);
+
+        let inv_rate = codeword.len() / msg.len();
+        assert!(inv_rate.is_power_of_two() && inv_rate > 1);
+        let log_inv_rate = log2_pow2(inv_rate);
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        assert!(log_inv_rate <= log_d);
+        assert_eq!(msg.len() / num_ntts, 1usize << (log_d - log_inv_rate));
+        assert!(log_d <= self.log_domain_size());
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            if log_inv_rate == 1 && log_d >= 12 {
+                self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
+                self.forward_transform_interleaved_parallel_from_layer_impl(
+                    codeword,
+                    num_ntts,
+                    3,
+                    Some((n_chunks, on_chunk)),
+                );
+                return;
+            }
+            replicate_message_fill(codeword, msg);
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                log_inv_rate,
+                Some((n_chunks, on_chunk)),
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            let _ = n_chunks;
+            replicate_message_fill(codeword, msg);
+            self.forward_transform_interleaved_scalar_from_layer(codeword, num_ntts, log_inv_rate);
+            on_chunk(0, 0..n_positions);
+        }
+    }
+
+    /// Write the exact post-layer-2 state for a rate-1/2 encoding directly
+    /// from its message. Layer zero turns `[msg, 0]` into `[msg, msg]`; each
+    /// half then follows its own fused two-layer twiddle tree.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn seed_rate_half_layers_1_through_2(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(codeword.len(), 2 * msg.len());
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert!(msg_positions >= 4 && msg_positions.is_power_of_two());
+        let quarter = msg_positions >> 2;
+
+        let mut twiddles = [[F128::ZERO; 3]; 2];
+        for (block, tw) in twiddles.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+
+        // Carry addresses as integers because raw pointers are not Sync. Each
+        // r owns four disjoint rows in each output half. Keeping the two block
+        // calls adjacent reuses their shared 4 KiB production input row group
+        // from L1 while limiting live state to four F128 values.
+        //
+        // On the ranked shape the destination rows are cold and next read a
+        // full sweep later, so the staged kernel routes the eight output rows
+        // through an 8 KiB stack block and publishes them with q-form `stnp`
+        // 32 B pairs at full-line granularity, skipping the write-allocate
+        // read of the ~1 GiB destination. Requires whole-line coverage
+        // (num_ntts % 8, 128 B-aligned halves). `FLOCK_NO_SEED_NT` is a
+        // local-diagnostics kill switch; the ranked worker's cleared
+        // environment never sets it.
+        let src = msg.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        let msg_len = msg.len();
+        let use_nt = num_ntts % 8 == 0
+            && num_ntts <= kernels::SEED_NT_MAX_NTTS
+            && dst % 128 == 0
+            && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
+            && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
+        let seed_row = |r| unsafe {
+            if use_nt {
+                kernels::seed_fused_2layer_row_group_nt(
+                    src as *const F128,
+                    dst as *mut F128,
+                    quarter,
+                    num_ntts,
+                    msg_len,
+                    r,
+                    twiddles[0][2],
+                    &twiddles[1],
+                );
+            } else {
+                kernels::butterfly_fused_2layer_row_from_sparse(
+                    src as *const F128,
+                    dst as *mut F128,
+                    quarter,
+                    num_ntts,
+                    r,
+                    twiddles[0][2],
+                );
+                kernels::butterfly_fused_2layer_row_from(
+                    src as *const F128,
+                    (dst as *mut F128).add(msg_len),
+                    quarter,
+                    num_ntts,
+                    r,
+                    &twiddles[1],
+                );
+            }
+        };
+
+        const PARALLEL_ROW_THRESHOLD: usize = 256;
+        if quarter < PARALLEL_ROW_THRESHOLD {
+            for r in 0..quarter {
+                seed_row(r);
+            }
+        } else {
+            (0..quarter).into_par_iter().for_each(seed_row);
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -282,6 +570,23 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_impl(data, num_ntts, start_layer, None);
+    }
+
+    /// Body of [`Self::forward_transform_interleaved_parallel_from_layer`],
+    /// with an optional ordered-chunk streaming hook `(n_chunks, on_chunk)` —
+    /// see [`Self::rs_encode_interleaved_streamed`] for the callback contract.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_impl(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        stream: Option<(usize, &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send))>,
+    ) {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -321,6 +626,9 @@ impl AdditiveNttF128 {
         };
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            if let Some((_, on_chunk)) = stream {
+                on_chunk(0, 0..(n_total / num_ntts));
+            }
             return;
         }
 
@@ -376,20 +684,73 @@ impl AdditiveNttF128 {
                 }
                 layer += 4;
             } else if layer + 1 < n_top && block_size >= 4 {
-                // Fuse layers (layer, layer+1).
+                // Fuse layers (layer, layer+1). One rayon region spans every
+                // (block, r) task of the pass: the old per-block regions cost
+                // one fork-join barrier per block (168 sequential barriers per
+                // ranked NTT across the three fused passes) plus coarse
+                // imbalance at low block counts. Per-task twiddle fetches are
+                // O(1) reads of the precomputed table. Each task calls the
+                // identical row kernel on the identical four rows, so the
+                // memory pattern per thread (4 in-place RMW streams within one
+                // block) is unchanged.
                 let quarter = block_size >> 2;
-                for block in 0..num_blocks {
-                    let t_outer = self.twiddle(layer, block);
-                    let t_inner_a = self.twiddle(layer + 1, 2 * block);
-                    let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
-                    let start = block * block_bytes;
-                    butterfly_interleaved_fused_2layer_par_rows(
-                        &mut data[start..start + block_bytes],
-                        t_outer,
-                        t_inner_a,
-                        t_inner_b,
-                        quarter,
-                        num_ntts,
+                const PARALLEL_ROW_THRESHOLD: usize = 256;
+                if quarter < PARALLEL_ROW_THRESHOLD {
+                    // Small shapes: rayon dispatch would cost more than the
+                    // work; keep the serial per-block kernel loop.
+                    for block in 0..num_blocks {
+                        let t_outer = self.twiddle(layer, block);
+                        let t_inner_a = self.twiddle(layer + 1, 2 * block);
+                        let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
+                        let start = block * block_bytes;
+                        butterfly_interleaved_fused_2layer_par_rows(
+                            &mut data[start..start + block_bytes],
+                            t_outer,
+                            t_inner_a,
+                            t_inner_b,
+                            quarter,
+                            num_ntts,
+                        );
+                    }
+                } else {
+                    // Carry the base address as an integer because raw
+                    // pointers are not Sync; every task owns four rows no
+                    // other task touches.
+                    let base_addr = data.as_mut_ptr() as usize;
+                    let log_quarter = log2_pow2(quarter);
+                    let stride = quarter * num_ntts;
+                    (0..num_blocks << log_quarter).into_par_iter().for_each(
+                        |idx| {
+                            let block = idx >> log_quarter;
+                            let r = idx & (quarter - 1);
+                            let t_outer = self.twiddle(layer, block);
+                            let t_inner_a = self.twiddle(layer + 1, 2 * block);
+                            let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
+                            let row = block * block_bytes + r * num_ntts;
+                            // SAFETY: rows `row + {0,1,2,3}·stride` lie inside
+                            // block `block` of `data` and are selected by a
+                            // unique (block, r) per task, so the four mutable
+                            // slices are disjoint across all tasks.
+                            unsafe {
+                                let base = base_addr as *mut F128;
+                                let a = std::slice::from_raw_parts_mut(base.add(row), num_ntts);
+                                let b = std::slice::from_raw_parts_mut(
+                                    base.add(row + stride),
+                                    num_ntts,
+                                );
+                                let c = std::slice::from_raw_parts_mut(
+                                    base.add(row + 2 * stride),
+                                    num_ntts,
+                                );
+                                let d = std::slice::from_raw_parts_mut(
+                                    base.add(row + 3 * stride),
+                                    num_ntts,
+                                );
+                                kernels::butterfly_fused_2layer(
+                                    a, b, c, d, t_outer, t_inner_a, t_inner_b,
+                                );
+                            }
+                        },
                     );
                 }
                 layer += 2;
@@ -413,25 +774,155 @@ impl AdditiveNttF128 {
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
 
-        data.par_chunks_mut(sub_bytes)
-            .enumerate()
-            .for_each(|(sub_idx, sub_data)| {
-                for layer in n_top.max(start_layer)..log_d {
-                    let layer_in_sub = layer - n_top;
-                    let num_blocks_in_sub = 1usize << layer_in_sub;
-                    let block_size = 1usize << (log_d - layer);
-                    let block_size_half = block_size >> 1;
-                    let block_bytes = block_size * num_ntts;
+        let deep_sub = |sub_idx: usize, sub_data: &mut [F128]| {
+            for layer in n_top.max(start_layer)..log_d {
+                let layer_in_sub = layer - n_top;
+                let num_blocks_in_sub = 1usize << layer_in_sub;
+                let block_size = 1usize << (log_d - layer);
+                let block_size_half = block_size >> 1;
+                let block_bytes = block_size * num_ntts;
 
-                    for block_in_sub in 0..num_blocks_in_sub {
-                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                        let twiddle = self.twiddle(layer, global_block);
-                        let block_start = block_in_sub * block_bytes;
-                        let block = &mut sub_data[block_start..block_start + block_bytes];
-                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
-                    }
+                for block_in_sub in 0..num_blocks_in_sub {
+                    let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                    let twiddle = self.twiddle(layer, global_block);
+                    let block_start = block_in_sub * block_bytes;
+                    let block = &mut sub_data[block_start..block_start + block_bytes];
+                    butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                 }
-            });
+            }
+        };
+
+        match stream {
+            None => {
+                // Pure-CPU path: single fully-parallel pass (no barriers).
+                data.par_chunks_mut(sub_bytes)
+                    .enumerate()
+                    .for_each(|(sub_idx, sub_data)| deep_sub(sub_idx, sub_data));
+            }
+            Some((n_chunks, on_chunk)) => {
+                let n_subs = 1usize << n_top;
+                let chunks = n_chunks.clamp(1, n_subs);
+
+                if std::env::var_os("FLOCK_NTT_STREAM_BARRIERS").is_some() {
+                    // Kill switch: season-1 scheme — ordered super-chunks
+                    // with a rayon barrier per chunk, callbacks on the
+                    // calling thread. Costs ~10 ms of fork-join idle per
+                    // ranked NTT vs the tracked scheme below.
+                    let mut rest: &mut [F128] = data;
+                    let mut sub_cursor = 0usize;
+                    for c in 0..chunks {
+                        let end_sub = ((c + 1) * n_subs) / chunks;
+                        let take = end_sub - sub_cursor;
+                        let (cur, tail) =
+                            std::mem::take(&mut rest).split_at_mut(take * sub_bytes);
+                        rest = tail;
+                        cur.par_chunks_mut(sub_bytes)
+                            .enumerate()
+                            .for_each(|(i, sub_data)| deep_sub(sub_cursor + i, sub_data));
+                        on_chunk(c, sub_cursor * sub_size_positions..end_sub * sub_size_positions);
+                        sub_cursor = end_sub;
+                    }
+                    return;
+                }
+
+                // Streaming path, completion-tracked: ONE fully-parallel
+                // pass over all sub-groups (identical schedule to the
+                // unstreamed path — no inter-chunk barriers), with two
+                // twists:
+                //
+                //  1. Sub-group indices are claimed off an atomic counter in
+                //     strict ascending order (rayon's recursive-split
+                //     stealing order would otherwise finish low indices
+                //     LAST, starving the streaming consumer until the very
+                //     end). In-flight sub-groups are therefore always the
+                //     next ≤ n_threads indices, so chunk `c` completes at
+                //     ~(c+1)/chunks of the pass plus one sub-group tail.
+                //
+                //  2. Each chunk keeps a remaining-sub-group counter. The
+                //     worker that zeroes a counter becomes the committer: it
+                //     fires `on_chunk` for every completed chunk extending
+                //     the committed prefix, under a mutex (callbacks stay
+                //     serialized and in order). `try_lock` losers rely on
+                //     the holder's post-unlock recheck, so no completion is
+                //     ever dropped.
+                use std::sync::Mutex;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                // Chunk boundaries in sub-group units; every chunk is
+                // non-empty because `chunks <= n_subs`.
+                let mut bounds = Vec::with_capacity(chunks + 1);
+                for c in 0..=chunks {
+                    bounds.push(c * n_subs / chunks);
+                }
+                let remaining: Vec<AtomicUsize> = (0..chunks)
+                    .map(|c| AtomicUsize::new(bounds[c + 1] - bounds[c]))
+                    .collect();
+                // (next chunk to fire, callback): the single-committer state.
+                let committer = Mutex::new((0usize, on_chunk));
+
+                // Fire callbacks for every chunk extending the committed
+                // prefix. Non-blocking mode backs off if another committer
+                // holds the lock; blocking mode is the final flush.
+                let drain = |blocking: bool| loop {
+                    let mut guard = if blocking {
+                        // Poison would mean a callback panicked, and that
+                        // panic is already propagating out of the par pass —
+                        // flushing what remains is still sound.
+                        committer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    } else {
+                        match committer.try_lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        }
+                    };
+                    let (next, cb) = &mut *guard;
+                    // Acquire pairs with the completers' AcqRel fetch_sub
+                    // release sequence: every sub-group write in the chunk
+                    // happens-before the callback observing `remaining == 0`.
+                    while *next < chunks && remaining[*next].load(Ordering::Acquire) == 0 {
+                        let lo = bounds[*next] * sub_size_positions;
+                        let hi = bounds[*next + 1] * sub_size_positions;
+                        cb(*next, lo..hi);
+                        *next += 1;
+                    }
+                    let n = *next;
+                    drop(guard);
+                    if blocking || n >= chunks || remaining[n].load(Ordering::Acquire) != 0 {
+                        return;
+                    }
+                    // Chunk `n` completed between the check under the lock
+                    // and the unlock, and its completer lost the try_lock to
+                    // us — it will not retry, so we must.
+                };
+
+                let next_sub = AtomicUsize::new(0);
+                let base_addr = data.as_mut_ptr() as usize;
+                (0..n_subs).into_par_iter().with_max_len(1).for_each(|_| {
+                    let i = next_sub.fetch_add(1, Ordering::Relaxed);
+                    // SAFETY: `i < n_subs` (exactly n_subs tasks run, each
+                    // claims one counter value) and each `i` is claimed by
+                    // exactly one task, so the sub-group slices are disjoint
+                    // across tasks and in-bounds of `data`.
+                    let sub_data = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (base_addr as *mut F128).add(i * sub_bytes),
+                            sub_bytes,
+                        )
+                    };
+                    deep_sub(i, sub_data);
+                    let c = bounds.partition_point(|&b| b <= i) - 1;
+                    if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        drain(false);
+                    }
+                });
+                // All sub-groups are complete; flush any chunks whose
+                // completer lost its try_lock race (blocking: the pass is
+                // over, nobody else can hold the lock for long).
+                drain(true);
+            }
+        }
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -860,6 +1351,30 @@ fn log2_pow2(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
 
+/// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
+/// the zero-padded transform's initial copy-only layers.
+fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
+    use rayon::prelude::*;
+
+    let msg_len = msg.len();
+    debug_assert!(codeword.len().is_multiple_of(msg_len));
+    const COPY_CHUNK: usize = 1 << 16;
+    if msg_len >= COPY_CHUNK {
+        // Both lengths are powers of two, so chunks never cross a replica.
+        codeword
+            .par_chunks_mut(COPY_CHUNK)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let src_off = (i * COPY_CHUNK) & (msg_len - 1);
+                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
+            });
+    } else {
+        for replica in codeword.chunks_mut(msg_len) {
+            replica.copy_from_slice(msg);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +1477,46 @@ mod tests {
         assert_eq!(ntt.twiddle(0, 0), F128::ZERO);
     }
 
+    #[test]
+    fn precomputed_twiddles_match_span_reference_and_cap() {
+        for log_d in [1usize, 2, 5, 8, 12] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let table = ntt
+                .precomputed_twiddles
+                .as_ref()
+                .expect("production-size domain should cache twiddles");
+            assert_eq!(table.len(), (1usize << log_d) - 1);
+
+            for layer in 0..log_d {
+                let eval_row = &ntt.evals[log_d - layer - 1];
+                for block in 0..(1usize << layer) {
+                    assert_eq!(
+                        ntt.twiddle(layer, block),
+                        span_get(&eval_row[1..], block),
+                        "cached twiddle mismatch at log_d={log_d}, layer={layer}, block={block}"
+                    );
+                }
+            }
+        }
+
+        let cached_a = AdditiveNttF128::standard(8);
+        let cached_b = AdditiveNttF128::standard(8);
+        assert!(Arc::ptr_eq(
+            cached_a.precomputed_twiddles.as_ref().unwrap(),
+            cached_b.precomputed_twiddles.as_ref().unwrap()
+        ));
+
+        let fallback = AdditiveNttF128::standard(MAX_PRECOMPUTED_TWIDDLE_LOG + 1);
+        assert!(fallback.precomputed_twiddles.is_none());
+        let layer = MAX_PRECOMPUTED_TWIDDLE_LOG;
+        let block = (1usize << layer) - 1;
+        let eval_row = &fallback.evals[fallback.log_domain_size() - layer - 1];
+        assert_eq!(
+            fallback.twiddle(layer, block),
+            span_get(&eval_row[1..], block)
+        );
+    }
+
     /// At layer log_d - 1 (deepest, where FRI starts), pairs are adjacent.
     /// twiddle should match the "domain points" indexing.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -1017,6 +1572,185 @@ mod tests {
         }
     }
 
+    /// The semantic RS encoder must overwrite stale output and match the
+    /// definitional zero-padded full transform across rates and lane widths.
+    /// The final case crosses the ARM seeded-fusion dispatch threshold with
+    /// the production lane count.
+    #[test]
+    fn rs_encode_matches_zero_padded_full_ntt() {
+        let mut rng = Rng::new(0x5EED);
+        for (log_d, num_ntts, log_inv_rate) in [
+            (4usize, 1usize, 1usize),
+            (5, 2, 1),
+            (8, 8, 1),
+            (10, 8, 2),
+            (12, 64, 1),
+        ] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> log_inv_rate;
+            let msg = rand_vec(&mut rng, msg_len);
+
+            let mut encoded = rand_vec(&mut rng, codeword_len);
+            ntt.rs_encode_interleaved(&msg, &mut encoded, num_ntts);
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "RS encoding mismatch at log_d={log_d}, num_ntts={num_ntts}, r={log_inv_rate}"
+            );
+        }
+    }
+
+    /// The streamed encoder (completion-tracked deep pass for the GPU Merkle
+    /// stream) must produce a byte-identical codeword to the plain encoder,
+    /// and its callbacks must arrive in order, contiguous, and covering —
+    /// with every reported range FINAL at callback time (verified by
+    /// checksumming the range then re-checking after the encode).
+    ///
+    /// Pinned-pool shapes (threads > 0) force the parallel deep pass with a
+    /// known sub-group split, so `min_callbacks` proves the tracked scheme
+    /// actually streams multiple chunks (callbacks fire on worker threads
+    /// concurrently with later sub-groups) instead of collapsing to one
+    /// trailing callback. Each shape repeats to shake completion/commit
+    /// races.
+    #[test]
+    fn rs_encode_streamed_matches_plain_and_ranges_are_final() {
+        let mut rng = Rng::new(0x57AE);
+        for (log_d, num_ntts, log_inv_rate, n_chunks, threads, min_callbacks) in [
+            (4usize, 1usize, 1usize, 8usize, 0usize, 1usize), // scalar fallback: 1 callback
+            (8, 8, 1, 8, 0, 1),
+            (10, 8, 2, 4, 0, 1),
+            (12, 64, 1, 8, 0, 1), // ARM seeded-fusion dispatch, production lanes
+            (13, 8, 1, 8, 0, 1),
+            // Tracked multi-chunk path: 8-thread pool -> n_top >= 3 -> 8+
+            // sub-groups; chunk count clamps to n_chunks exactly.
+            (13, 8, 1, 8, 8, 8),
+            (13, 8, 1, 5, 8, 5), // uneven bounds (5 chunks over 8 sub-groups)
+            (14, 32, 1, 8, 8, 8), // production lane width, 1 sub-group/chunk
+            (14, 8, 2, 3, 4, 3), // non-power-of-two chunks, rate 1/4
+        ] {
+          for _rep in 0..if threads > 0 { 4 } else { 1 } {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> log_inv_rate;
+            let msg = rand_vec(&mut rng, msg_len);
+
+            let mut plain = rand_vec(&mut rng, codeword_len); // stale contents
+            ntt.rs_encode_interleaved(&msg, &mut plain, num_ntts);
+
+            let mut streamed = rand_vec(&mut rng, codeword_len);
+            let mut seen: Vec<(usize, core::ops::Range<usize>)> = Vec::new();
+            let mut snapshots: Vec<u64> = Vec::new();
+            let base = streamed.as_ptr() as usize;
+            let checksum = |lo: usize, hi: usize| -> u64 {
+                // Read through a raw pointer: the callback fires while the
+                // encoder holds &mut, exactly like the GPU consumer does.
+                let mut acc = 0u64;
+                for i in lo * num_ntts..hi * num_ntts {
+                    let v = unsafe { *(base as *const F128).add(i) };
+                    acc = acc
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(v.lo ^ v.hi);
+                }
+                acc
+            };
+            let mut on_chunk = |idx: usize, range: core::ops::Range<usize>| {
+                snapshots.push(checksum(range.start, range.end));
+                seen.push((idx, range));
+            };
+            if threads > 0 {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        ntt.rs_encode_interleaved_streamed(
+                            &msg,
+                            &mut streamed,
+                            num_ntts,
+                            n_chunks,
+                            &mut on_chunk,
+                        );
+                    });
+            } else {
+                ntt.rs_encode_interleaved_streamed(
+                    &msg,
+                    &mut streamed,
+                    num_ntts,
+                    n_chunks,
+                    &mut on_chunk,
+                );
+            }
+
+            assert_eq!(
+                plain, streamed,
+                "streamed codeword mismatch at log_d={log_d} num_ntts={num_ntts} rate={log_inv_rate}"
+            );
+            // Ordered, contiguous, covering.
+            assert!(
+                seen.len() >= min_callbacks,
+                "expected >= {min_callbacks} callbacks, got {} (log_d={log_d} \
+                 num_ntts={num_ntts} threads={threads})",
+                seen.len()
+            );
+            let n_positions = 1usize << log_d;
+            let mut expect_start = 0usize;
+            for (i, (idx, range)) in seen.iter().enumerate() {
+                assert_eq!(*idx, i, "chunk indices must be sequential");
+                assert_eq!(range.start, expect_start, "ranges must be contiguous");
+                assert!(range.end > range.start);
+                expect_start = range.end;
+            }
+            assert_eq!(expect_start, n_positions, "ranges must cover the codeword");
+            // Finality: the data seen at callback time is the final data.
+            for ((_, range), snap) in seen.iter().zip(&snapshots) {
+                assert_eq!(
+                    checksum(range.start, range.end),
+                    *snap,
+                    "chunk {range:?} changed after its callback (not final)"
+                );
+            }
+          }
+        }
+    }
+
+    /// Exercise the direct layer-2 seed independently of its production-size
+    /// dispatch gate, including serial and parallel row scheduling.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn rate_half_layer2_seed_matches_full_ntt() {
+        let mut rng = Rng::new(0xD1EC7);
+        for (log_d, num_ntts, threads) in
+            [(4usize, 1usize, 1usize), (5, 2, 1), (8, 8, 1), (12, 64, 4)]
+        {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> 1;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut encoded = rand_vec(&mut rng, codeword_len);
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    ntt.seed_rate_half_layers_1_through_2(&msg, &mut encoded, num_ntts);
+                    ntt.forward_transform_interleaved_from_layer(&mut encoded, num_ntts, 3);
+                });
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "direct seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
+            );
+        }
+    }
+
     // Runs on both SIMD backends so the x86 PCLMUL and aarch64 NEON parallel
     // paths are each validated against the scalar oracle. AVX-512 builds also
     // exercise the fused-4 top-layer kernel in the larger cases.
@@ -1028,9 +1762,15 @@ mod tests {
     fn interleaved_parallel_matches_scalar() {
         let mut rng = Rng::new(0xCC2);
         for log_d in [4usize, 10, 14, 17, 19] {
-            for &num_ntts in &[2usize, 8, 32] {
-                let ntt = AdditiveNttF128::standard(log_d);
+            // num_ntts = 1 exercises single-lane rows (any vectorized leaf's
+            // scalar tail); 64 is the production lane count (capped by total
+            // size to bound test memory).
+            for &num_ntts in &[1usize, 2, 8, 32, 64] {
                 let n_total = (1 << log_d) * num_ntts;
+                if n_total > 1 << 24 {
+                    continue;
+                }
+                let ntt = AdditiveNttF128::standard(log_d);
                 let original = rand_vec(&mut rng, n_total);
                 let mut v_scalar = original.clone();
                 ntt.forward_transform_interleaved_scalar(&mut v_scalar, num_ntts);

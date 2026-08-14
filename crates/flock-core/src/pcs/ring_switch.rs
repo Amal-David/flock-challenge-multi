@@ -1556,6 +1556,9 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 /// `fold_b128_elems(build_eq_parallel(r), eq_r_dprime)` (field multiply is
 /// exact, so `eq_lo[i_lo] * eq_hi[i_hi]` has the same bits as the
 /// materialized entry).
+/// Total entries in a fold byte-table set (16 byte positions × 256 values).
+pub(crate) const FOLD_TABLE_TOTAL: usize = 16 * 256;
+
 /// Number of bytes in an `F128` (= lookup tables for the fold).
 const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
@@ -1564,7 +1567,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
@@ -1580,6 +1583,48 @@ fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
         }
     }
     tables
+}
+
+/// Compose a fold byte-table set `base` (a [`build_fold_byte_table`] output
+/// representing the F2-linear map `M`) with multiplication by a fixed field
+/// element `e_hi`: fills `out` (length [`FOLD_TABLE_TOTAL`]) so that for
+/// every `x`,
+/// `fold_one_slot(x, out) == fold_one_slot(x * e_hi, base)` **bit-exactly**.
+///
+/// Why this is exact algebra, not an approximation: GF(2^128) multiplication
+/// is F2-bilinear, so with `e_b` the basis element having only bit `b` set,
+/// `x·e_hi = Σ_{b: bit b of x set} (e_b · e_hi)`; and `fold_one_slot(·, base)`
+/// IS the F2-linear map `M`, hence
+/// `M(x·e_hi) = Σ_b x_b · M(e_b·e_hi)`. The columns `col[b] = M(X^b·e_hi)`
+/// are produced by the exact `mul_by_x` doubling chain (bit `b` of the
+/// GHASH layout is the coefficient of `X^b`) + a fold through `base`; the
+/// 16×256 byte tables are their subset sums (`out[k·256+v] =
+/// Σ_{bit j of v} col[8k+j]`). Every step is an exact F2 operation, so the
+/// composed fold is bit-identical to multiply-then-fold.
+///
+/// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
+/// per block, amortized by the caller over ≥ 2048 fold evaluations.
+pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
+    debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
+    debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
+    // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
+    let mut cols = [F128::ZERO; 128];
+    let mut w = e_hi; // X^0 · e_hi
+    for c in cols.iter_mut() {
+        *c = fold_one_slot(w, base);
+        w = crate::field::mul_by_x(w);
+    }
+    // Expand each 8-column group into its 256-entry subset-sum table. Every
+    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
+    // may be uninitialized on entry.
+    for k in 0..FOLD_N_BYTES {
+        let col8 = &cols[k * 8..k * 8 + 8];
+        let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        block[0] = F128::ZERO;
+        for v in 1..FOLD_TABLE_SIZE {
+            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+        }
+    }
 }
 
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where

@@ -62,41 +62,71 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
-            let mut converted_ab = vdupq_n_u8(0);
-            let mut converted_c_0 = vdupq_n_u8(0);
-            let mut converted_c_1 = vdupq_n_u8(0);
+        for lane in (0..64).step_by(4) {
+            // Four independent lanes form one lookup wavefront. Keeping the
+            // twelve XOR accumulators live together exposes table-load MLP;
+            // the historical lane-at-a-time order had only three independent
+            // chains before draining into the field multiplier.
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut c00 = vdupq_n_u8(0);
+            let mut c01 = vdupq_n_u8(0);
+            let mut c02 = vdupq_n_u8(0);
+            let mut c03 = vdupq_n_u8(0);
+            let mut c10 = vdupq_n_u8(0);
+            let mut c11 = vdupq_n_u8(0);
+            let mut c12 = vdupq_n_u8(0);
+            let mut c13 = vdupq_n_u8(0);
             for b_med in 0..n_b_med {
-                let ab = chunk_ab_bytes[b_med][lane] as usize;
-                let c = chunk_c_bytes[b_med][lane] as usize;
-                converted_ab = veorq_u8(
-                    converted_ab,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
-                );
-                converted_c_0 = veorq_u8(
-                    converted_c_0,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
-                );
-                converted_c_1 = veorq_u8(
-                    converted_c_1,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
-                );
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let a0 = chunk_ab_bytes[b_med][lane] as usize;
+                let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
+                let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
+                let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
+                let c0 = chunk_c_bytes[b_med][lane] as usize;
+                let c1 = chunk_c_bytes[b_med][lane + 1] as usize;
+                let c2 = chunk_c_bytes[b_med][lane + 2] as usize;
+                let c3 = chunk_c_bytes[b_med][lane + 3] as usize;
+
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
+                c00 = veorq_u8(c00, vld1q_u8(table.add((c0 & 0x55) * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(table.add((c1 & 0x55) * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(table.add((c2 & 0x55) * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(table.add((c3 & 0x55) * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(table.add((c0 & 0xaa) * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(table.add((c1 & 0xaa) * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(table.add((c2 & 0xaa) * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(table.add((c3 & 0xaa) * 16)));
             }
-            let ab = vreinterpretq_u64_u8(converted_ab);
-            let c_0 = vreinterpretq_u64_u8(converted_c_0);
-            let c_1 = vreinterpretq_u64_u8(converted_c_1);
-            partial_ab[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(ab),
-                hi: vgetq_lane_u64::<1>(ab),
-            } * eq_lo_val;
-            partial_c_0[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_0),
-                hi: vgetq_lane_u64::<1>(c_0),
-            } * eq_lo_val;
-            partial_c_1[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_1),
-                hi: vgetq_lane_u64::<1>(c_1),
-            } * eq_lo_val;
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident, $c0:ident, $c1:ident) => {{
+                    let ab = vreinterpretq_u64_u8($ab);
+                    let c0 = vreinterpretq_u64_u8($c0);
+                    let c1 = vreinterpretq_u64_u8($c1);
+                    partial_ab[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(ab),
+                        hi: vgetq_lane_u64::<1>(ab),
+                    } * eq_lo_val;
+                    partial_c_0[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c0),
+                        hi: vgetq_lane_u64::<1>(c0),
+                    } * eq_lo_val;
+                    partial_c_1[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c1),
+                        hi: vgetq_lane_u64::<1>(c1),
+                    } * eq_lo_val;
+                }};
+            }
+            drain_lane!(0, ab0, c00, c10);
+            drain_lane!(1, ab1, c01, c11);
+            drain_lane!(2, ab2, c02, c12);
+            drain_lane!(3, ab3, c03, c13);
         }
     }
 }
@@ -273,6 +303,7 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     table_base: *const u8,
+    half_swapped_table_base: *const u8,
     a_byte: u8,
     b_byte: u8,
     da0: &mut core::arch::aarch64::uint8x16_t,
@@ -286,8 +317,13 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let ra = table_base.add(a_byte as usize * 64);
-        let rb = table_base.add(b_byte as usize * 64);
+        let selected_table = if ODD {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let ra = selected_table.add(a_byte as usize * 64);
+        let rb = selected_table.add(b_byte as usize * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -296,20 +332,6 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         let vb1 = vld1q_u8(rb.add((1 ^ BH) * 16));
         let vb2 = vld1q_u8(rb.add((2 ^ BH) * 16));
         let vb3 = vld1q_u8(rb.add((3 ^ BH) * 16));
-        let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD {
-            (
-                vextq_u8::<8>(va0, va0),
-                vextq_u8::<8>(va1, va1),
-                vextq_u8::<8>(va2, va2),
-                vextq_u8::<8>(va3, va3),
-                vextq_u8::<8>(vb0, vb0),
-                vextq_u8::<8>(vb1, vb1),
-                vextq_u8::<8>(vb2, vb2),
-                vextq_u8::<8>(vb3, vb3),
-            )
-        } else {
-            (va0, va1, va2, va3, vb0, vb1, vb2, vb3)
-        };
         *da0 = veorq_u8(*da0, va0);
         *da1 = veorq_u8(*da1, va1);
         *da2 = veorq_u8(*da2, va2);
@@ -327,6 +349,7 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 #[inline(always)]
 unsafe fn fused_apply_one_k<const K: i32>(
     table_base: *const u8,
+    half_swapped_table_base: *const u8,
     a_row: *const u8,
     b_row: *const u8,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -356,6 +379,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
         xor_apply_byte_into_8_regs::<0, true>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(1),
             *b_row.add(1),
             &mut da0,
@@ -369,6 +393,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<1, false>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(2),
             *b_row.add(2),
             &mut da0,
@@ -382,6 +407,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<1, true>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(3),
             *b_row.add(3),
             &mut da0,
@@ -395,6 +421,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<2, false>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(4),
             *b_row.add(4),
             &mut da0,
@@ -408,6 +435,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<2, true>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(5),
             *b_row.add(5),
             &mut da0,
@@ -421,6 +449,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<3, false>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(6),
             *b_row.add(6),
             &mut da0,
@@ -434,6 +463,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
+            half_swapped_table_base,
             *a_row.add(7),
             *b_row.add(7),
             &mut da0,
@@ -479,6 +509,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
 
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
@@ -497,6 +528,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
                 let off = byte_base_b + $k * N_CHUNKS;
                 fused_apply_one_k::<$k>(
                     table_base,
+                    half_swapped_table_base,
                     a_packed.as_ptr().add(off),
                     b_packed.as_ptr().add(off),
                     &mut acc0_lo,
@@ -530,5 +562,217 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         vst1q_u8(p.add(16), r1);
         vst1q_u8(p.add(32), r2);
         vst1q_u8(p.add(48), r3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-window software wavefront: process b_med windows `w` and `w + 1` in a
+// single call with two fully independent register sets, interleaved per
+// K-row (w0-K, w1-K, w0-K+1, w1-K+1, ...).
+//
+// Rationale: one window's K-row is a bundle of 8 serial depth-7 XOR chains
+// (da0..3 / db0..3), each link gated on a 16-byte table load — the stall
+// source on M4 P-cores. Alternating K-rows from two independent windows
+// keeps ~2x the independent work inside the scheduler window so the second
+// window's table loads issue under the first window's XOR-tree tail.
+//
+// Register budget: the 16 u16x8 accumulators (two full sets) stay live for
+// the whole body, but only ONE window's 8 da/db lookup registers are live at
+// any point (they die at that window's gf8_mul), so peak pressure is
+// 16 + 8 + short-lived load/mul temps ≤ ~28 of 32 q-registers — no spills.
+// Interleaving finer than K-row granularity would need both windows' da/db
+// sets live at once (16 + 16 = 32 + temps → guaranteed spills), and a
+// 4-window variant blows the budget the same way; both rejected by design.
+//
+// Values are bit-identical to two `shift_reduce_inner_ab_fused_neon` calls:
+// the two windows share no state, and each window performs the exact same
+// loads, XORs, muls, and shift-XOR accumulation as the single-window path.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b0 = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let byte_base_b1 = chunk_byte_base + (b_med + 1) * N_CHUNKS * 8;
+    let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+
+    unsafe {
+        // Window 0 accumulators.
+        let mut w0_acc0_lo = vdupq_n_u16(0);
+        let mut w0_acc0_hi = vdupq_n_u16(0);
+        let mut w0_acc1_lo = vdupq_n_u16(0);
+        let mut w0_acc1_hi = vdupq_n_u16(0);
+        let mut w0_acc2_lo = vdupq_n_u16(0);
+        let mut w0_acc2_hi = vdupq_n_u16(0);
+        let mut w0_acc3_lo = vdupq_n_u16(0);
+        let mut w0_acc3_hi = vdupq_n_u16(0);
+        // Window 1 accumulators.
+        let mut w1_acc0_lo = vdupq_n_u16(0);
+        let mut w1_acc0_hi = vdupq_n_u16(0);
+        let mut w1_acc1_lo = vdupq_n_u16(0);
+        let mut w1_acc1_hi = vdupq_n_u16(0);
+        let mut w1_acc2_lo = vdupq_n_u16(0);
+        let mut w1_acc2_hi = vdupq_n_u16(0);
+        let mut w1_acc3_lo = vdupq_n_u16(0);
+        let mut w1_acc3_hi = vdupq_n_u16(0);
+
+        // Per K: window 0's K-row then window 1's K-row — two independent
+        // instruction streams back to back for the runtime OoO engine to
+        // overlap. `pin_accs` is a compile-time-only fence (empty asm, zero
+        // instructions emitted) that (a) clobbers memory, so no table load
+        // may be hoisted or sunk across a segment boundary, and (b) takes
+        // the segment's 8 accumulators as `inout(vreg)` operands, so the
+        // whole segment — loads, XOR tree, gf8 mul, widen-shift-XOR — must
+        // be fully scheduled inside its boundaries. Without it LLVM merges
+        // all 16 lookup streams into one region (16 accs + 16 da/db sets
+        // live at once) and spills the entire kernel state to the stack.
+        // Register pressure per segment stays at 16 accs + 8 lookup regs +
+        // mul temps/constants ≤ ~30 of 32 q-registers.
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn pin_accs(
+            a0: &mut core::arch::aarch64::uint16x8_t,
+            a1: &mut core::arch::aarch64::uint16x8_t,
+            a2: &mut core::arch::aarch64::uint16x8_t,
+            a3: &mut core::arch::aarch64::uint16x8_t,
+            a4: &mut core::arch::aarch64::uint16x8_t,
+            a5: &mut core::arch::aarch64::uint16x8_t,
+            a6: &mut core::arch::aarch64::uint16x8_t,
+            a7: &mut core::arch::aarch64::uint16x8_t,
+        ) {
+            unsafe {
+                core::arch::asm!(
+                    "/* pin {0:v} {1:v} {2:v} {3:v} {4:v} {5:v} {6:v} {7:v} */",
+                    inout(vreg) *a0,
+                    inout(vreg) *a1,
+                    inout(vreg) *a2,
+                    inout(vreg) *a3,
+                    inout(vreg) *a4,
+                    inout(vreg) *a5,
+                    inout(vreg) *a6,
+                    inout(vreg) *a7,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+
+        macro_rules! do_k_x2 {
+            ($k:literal) => {{
+                let off0 = byte_base_b0 + $k * N_CHUNKS;
+                fused_apply_one_k::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off0),
+                    b_packed.as_ptr().add(off0),
+                    &mut w0_acc0_lo,
+                    &mut w0_acc0_hi,
+                    &mut w0_acc1_lo,
+                    &mut w0_acc1_hi,
+                    &mut w0_acc2_lo,
+                    &mut w0_acc2_hi,
+                    &mut w0_acc3_lo,
+                    &mut w0_acc3_hi,
+                );
+                pin_accs(
+                    &mut w0_acc0_lo,
+                    &mut w0_acc0_hi,
+                    &mut w0_acc1_lo,
+                    &mut w0_acc1_hi,
+                    &mut w0_acc2_lo,
+                    &mut w0_acc2_hi,
+                    &mut w0_acc3_lo,
+                    &mut w0_acc3_hi,
+                );
+                let off1 = byte_base_b1 + $k * N_CHUNKS;
+                fused_apply_one_k::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off1),
+                    b_packed.as_ptr().add(off1),
+                    &mut w1_acc0_lo,
+                    &mut w1_acc0_hi,
+                    &mut w1_acc1_lo,
+                    &mut w1_acc1_hi,
+                    &mut w1_acc2_lo,
+                    &mut w1_acc2_hi,
+                    &mut w1_acc3_lo,
+                    &mut w1_acc3_hi,
+                );
+                pin_accs(
+                    &mut w1_acc0_lo,
+                    &mut w1_acc0_hi,
+                    &mut w1_acc1_lo,
+                    &mut w1_acc1_hi,
+                    &mut w1_acc2_lo,
+                    &mut w1_acc2_hi,
+                    &mut w1_acc3_lo,
+                    &mut w1_acc3_hi,
+                );
+            }};
+        }
+        do_k_x2!(0);
+        do_k_x2!(1);
+        do_k_x2!(2);
+        do_k_x2!(3);
+        do_k_x2!(4);
+        do_k_x2!(5);
+        do_k_x2!(6);
+        do_k_x2!(7);
+
+        // Reduce 16-bit accs → 16-byte F_8 results (4 × 16 lanes per window).
+        let r0 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc0_lo),
+            vreinterpretq_u8_u16(w0_acc0_hi),
+        );
+        let r1 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc1_lo),
+            vreinterpretq_u8_u16(w0_acc1_hi),
+        );
+        let r2 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc2_lo),
+            vreinterpretq_u8_u16(w0_acc2_hi),
+        );
+        let r3 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc3_lo),
+            vreinterpretq_u8_u16(w0_acc3_hi),
+        );
+        let s0 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc0_lo),
+            vreinterpretq_u8_u16(w1_acc0_hi),
+        );
+        let s1 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc1_lo),
+            vreinterpretq_u8_u16(w1_acc1_hi),
+        );
+        let s2 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc2_lo),
+            vreinterpretq_u8_u16(w1_acc2_hi),
+        );
+        let s3 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc3_lo),
+            vreinterpretq_u8_u16(w1_acc3_hi),
+        );
+
+        let p0 = out0.as_mut_ptr();
+        vst1q_u8(p0, r0);
+        vst1q_u8(p0.add(16), r1);
+        vst1q_u8(p0.add(32), r2);
+        vst1q_u8(p0.add(48), r3);
+        let p1 = out1.as_mut_ptr();
+        vst1q_u8(p1, s0);
+        vst1q_u8(p1.add(16), s1);
+        vst1q_u8(p1.add(32), s2);
+        vst1q_u8(p1.add(48), s3);
     }
 }

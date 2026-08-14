@@ -45,6 +45,87 @@ pub(super) fn butterfly_fused_2layer(
     }
 }
 
+/// # Safety
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 3],
+) {
+    let [t_outer, t_inner_a, t_inner_b] = *twiddles;
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut a = *src.add(r * num_ntts + lane);
+            let mut b = *src.add((quarter + r) * num_ntts + lane);
+            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
+            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+
+            let new_a = a + c * t_outer;
+            c += new_a;
+            a = new_a;
+            let new_b = b + d * t_outer;
+            d += new_b;
+            b = new_b;
+
+            let new_a = a + b * t_inner_a;
+            b += new_a;
+            a = new_a;
+            let new_c = c + d * t_inner_b;
+            d += new_c;
+            c = new_c;
+
+            *dst.add(r * num_ntts + lane) = a;
+            *dst.add((quarter + r) * num_ntts + lane) = b;
+            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
+            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+        }
+    }
+}
+
+/// # Safety
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    right_twiddle: F128,
+) {
+    unsafe {
+        for lane in 0..num_ntts {
+            let a = *src.add(r * num_ntts + lane);
+            let mut b = *src.add((quarter + r) * num_ntts + lane);
+            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
+            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+
+            // Layer 1 and the left layer-2 butterfly have zero twiddle.
+            c += a;
+            d += b;
+            b += a;
+            let new_c = c + d * right_twiddle;
+            d += new_c;
+            c = new_c;
+
+            *dst.add(r * num_ntts + lane) = a;
+            *dst.add((quarter + r) * num_ntts + lane) = b;
+            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
+            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

@@ -45,8 +45,10 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(target_arch = "aarch64")]
+use kernels::aarch64::{round2_chunk_raw_neon, round2_chunk_raw_neon_q};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -483,6 +485,12 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    // q-form message gate: the scalar leaf extracts every folded value to
+    // GPRs for the message muls; the q leaf keeps them in NEON registers
+    // (bit-identical output). `FLOCK_NO_R2_QMSG` is a local-diagnostics kill
+    // switch for one-process A/B runs; the ranked worker never sets it.
+    #[cfg(target_arch = "aarch64")]
+    let r2_qmsg = std::env::var_os("FLOCK_NO_R2_QMSG").is_none();
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -491,49 +499,33 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
         .map(|(x_hi, (a_chunk, b_chunk))| {
+            #[cfg(not(target_arch = "aarch64"))]
             let mut p1_acc = F256Unreduced::ZERO;
+            #[cfg(not(target_arch = "aarch64"))]
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
 
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                let table_ptr = table.data.as_ptr() as *const u8;
-                let a_pkt_ptr = a_packed.as_ptr();
-                let b_pkt_ptr = b_packed.as_ptr();
+            let (p1, pinf) = unsafe {
                 let base = x_hi * chunk_size;
-
-                for x_lo in 0..lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        // Padding hole: write zero (a_folded/b_folded were alloc'd
-                        // uninit, so we have to write every slot we don't fold into).
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
-                        continue;
-                    }
-                    let x0g = base + 2 * x_lo;
-                    let x1g = x0g + 1;
-
-                    let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                    let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                    let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                    let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
-
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                }
-            }
+                let kernel = if r2_qmsg {
+                    round2_chunk_raw_neon_q
+                } else {
+                    round2_chunk_raw_neon
+                };
+                kernel(
+                    table.data.as_ptr() as *const u8,
+                    a_packed.as_ptr().add(base * 8),
+                    b_packed.as_ptr().add(base * 8),
+                    a_chunk.as_mut_ptr(),
+                    b_chunk.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                )
+            };
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -670,8 +662,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 }
             }
 
-            let p1 = p1_acc.reduce();
-            let pinf = pinf_acc.reduce();
+            #[cfg(not(target_arch = "aarch64"))]
+            let (p1, pinf) = (p1_acc.reduce(), pinf_acc.reduce());
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
         })
@@ -815,6 +807,30 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
+    // Non-temporal tail path gate: only when the folded output per array is
+    // ≥ 32 MB (64 MB for the a/b pair) — beyond L2+SLC reach, so the next
+    // round's reads are DRAM-cold regardless and the regular stores'
+    // write-allocate is one pure hidden DRAM read per output line. Below the
+    // threshold the outputs may still be cache-resident when the next round
+    // reads them, and regular stores win (NT on cache-reachable data inverts).
+    // `FLOCK_NO_NT_TAIL` is a local-diagnostics kill switch for A/B runs;
+    // the ranked worker's cleared environment never sets it.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_nt_stores =
+        half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
+    // q-form (all-NEON) kernel gate. The scalar-struct leaf keeps F128 halves
+    // in GPRs and pays a fmov per PMULL operand; the q-form leaf keeps every
+    // value in NEON registers (bit-identical output). Unlike the v1 leaf it
+    // also covers the sub-NT mid rounds (regular stores). `FLOCK_NO_TAIL_QNEON`
+    // is a local-diagnostics kill switch for one-process A/B runs (reverts to
+    // v1 leaf + generic reload path); `FLOCK_TAIL_LDNP` opts the DRAM rounds
+    // into `ldnp` no-allocate input streaming. The ranked worker's cleared
+    // environment never sets either.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_qneon = std::env::var_os("FLOCK_NO_TAIL_QNEON").is_none();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_ldnp = std::env::var_os("FLOCK_TAIL_LDNP").is_some();
+
     let (sum1, sum_inf) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -838,7 +854,64 @@ pub fn fold_and_compute_round_pair_into(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             )))]
-            let (p1, pinf) = {
+            let (p1, pinf) = 'msg: {
+                // Large rounds: fused fold + register-sourced message with
+                // `stnp` output stores — no write-allocate, no reload. Value-
+                // and byte-identical to the generic path below (same vec2
+                // fold, same reduced message products, same unreduced
+                // accumulation schedule).
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                {
+                    // SAFETY: aes is cfg-guaranteed; the chunk geometry
+                    // supplies 4·lo_size inputs and 2·lo_size outputs per
+                    // worker and lo_size eq weights, all in-bounds slices.
+                    if use_qneon {
+                        break 'msg unsafe {
+                            match (use_nt_stores, use_ldnp) {
+                                (true, true) => kernels::aarch64::tail_fold_chunk_q::<true, true>(
+                                    a_in.as_ptr(),
+                                    b_in.as_ptr(),
+                                    a_out.as_mut_ptr(),
+                                    b_out.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    lo_size,
+                                    r_fold,
+                                ),
+                                (true, false) => kernels::aarch64::tail_fold_chunk_q::<true, false>(
+                                    a_in.as_ptr(),
+                                    b_in.as_ptr(),
+                                    a_out.as_mut_ptr(),
+                                    b_out.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    lo_size,
+                                    r_fold,
+                                ),
+                                (false, _) => kernels::aarch64::tail_fold_chunk_q::<false, false>(
+                                    a_in.as_ptr(),
+                                    b_in.as_ptr(),
+                                    a_out.as_mut_ptr(),
+                                    b_out.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    lo_size,
+                                    r_fold,
+                                ),
+                            }
+                        };
+                    }
+                    if use_nt_stores {
+                        break 'msg unsafe {
+                            kernels::aarch64::tail_fold_chunk_nt_neon(
+                                a_in.as_ptr(),
+                                b_in.as_ptr(),
+                                a_out.as_mut_ptr(),
+                                b_out.as_mut_ptr(),
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                r_fold,
+                            )
+                        };
+                    }
+                }
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
                 // selects the architecture kernel; this loop only consumes
                 // the resulting values to build the message.
@@ -1266,17 +1339,249 @@ mod tests {
         let z = rng.f128();
         let table = UniSkipFoldTable::new(k_skip, z);
 
+        let mut cases = vec![[0u8; 8], [0xffu8; 8]];
         for _ in 0..256 {
             let mut bytes = [0u8; 8];
             for byte in bytes.iter_mut() {
                 *byte = (rng.next_u64() & 0xff) as u8;
             }
+            cases.push(bytes);
+        }
+        for bytes in cases {
             let scalar = table.fold_one_row(&bytes);
             // SAFETY: on aarch64; bytes has 8 entries; table has 8 chunks.
             let neon = unsafe {
                 fold_one_row_neon_unchecked_8(table.data.as_ptr() as *const u8, bytes.as_ptr())
             };
             assert_eq!(scalar, neon, "fold mismatch bytes={bytes:02x?}");
+        }
+    }
+
+    /// The NT tail leaf (fused fold + register-sourced message + `stnp`)
+    /// produces bit-identical folded outputs AND message partial sums to the
+    /// generic path (`fold_pairs` + reload loop) it replaces on large rounds.
+    /// The NT hint changes cache allocation only, so the equality must hold at
+    /// any size — tested here across several lo_size shapes including the
+    /// odd/2-wide tails the generic path special-cases.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn tail_fold_nt_leaf_matches_generic() {
+        let mut rng = Rng::new(72);
+        for lo_size in [2usize, 4, 6, 8, 64, 256] {
+            let n_in = 4 * lo_size;
+            let a_in = rng.f128_vec(n_in);
+            let b_in = rng.f128_vec(n_in);
+            let eq_lo = rng.f128_vec(lo_size);
+            let r_fold = rng.f128();
+
+            // Generic reference: fold_pairs then the reload message loop.
+            let mut a_ref = vec![F128::ZERO; 2 * lo_size];
+            let mut b_ref = vec![F128::ZERO; 2 * lo_size];
+            crate::field::f128_slice::fold_pairs(&a_in, 0, &mut a_ref, r_fold);
+            crate::field::f128_slice::fold_pairs(&b_in, 0, &mut b_ref, r_fold);
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let o = 2 * x_lo;
+                let (a0, a1, b0, b1) = (a_ref[o], a_ref[o + 1], b_ref[o], b_ref[o + 1]);
+                p1_acc ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            let (p1_ref, pinf_ref) = (p1_acc.reduce(), pinf_acc.reduce());
+
+            let mut a_nt = vec![F128::ZERO; 2 * lo_size];
+            let mut b_nt = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: aes is cfg-guaranteed; buffers sized 4·lo_size in /
+            // 2·lo_size out / lo_size eq exactly as the contract requires.
+            let (p1_nt, pinf_nt) = unsafe {
+                kernels::aarch64::tail_fold_chunk_nt_neon(
+                    a_in.as_ptr(),
+                    b_in.as_ptr(),
+                    a_nt.as_mut_ptr(),
+                    b_nt.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    r_fold,
+                )
+            };
+
+            assert_eq!(a_ref, a_nt, "folded a mismatch at lo_size={lo_size}");
+            assert_eq!(b_ref, b_nt, "folded b mismatch at lo_size={lo_size}");
+            assert_eq!(p1_ref, p1_nt, "p1 mismatch at lo_size={lo_size}");
+            assert_eq!(pinf_ref, pinf_nt, "pinf mismatch at lo_size={lo_size}");
+        }
+    }
+    /// The q-form tail leaf (all-NEON registers, no GPR round trips) is
+    /// bit-identical to the scalar-struct NT leaf AND the generic path across
+    /// shapes, including a ranked-adjacent lo_size (the ranked worker's first
+    /// tail round runs lo_size = 4096).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn tail_fold_qneon_leaf_matches_v1_and_generic() {
+        let mut rng = Rng::new(73);
+        for lo_size in [2usize, 4, 6, 8, 64, 256, 4096] {
+            let n_in = 4 * lo_size;
+            let a_in = rng.f128_vec(n_in);
+            let b_in = rng.f128_vec(n_in);
+            let eq_lo = rng.f128_vec(lo_size);
+            let r_fold = rng.f128();
+
+            // Generic reference: fold_pairs then the reload message loop.
+            let mut a_ref = vec![F128::ZERO; 2 * lo_size];
+            let mut b_ref = vec![F128::ZERO; 2 * lo_size];
+            crate::field::f128_slice::fold_pairs(&a_in, 0, &mut a_ref, r_fold);
+            crate::field::f128_slice::fold_pairs(&b_in, 0, &mut b_ref, r_fold);
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let o = 2 * x_lo;
+                let (a0, a1, b0, b1) = (a_ref[o], a_ref[o + 1], b_ref[o], b_ref[o + 1]);
+                p1_acc ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            let (p1_ref, pinf_ref) = (p1_acc.reduce(), pinf_acc.reduce());
+
+            let mut a_v1 = vec![F128::ZERO; 2 * lo_size];
+            let mut b_v1 = vec![F128::ZERO; 2 * lo_size];
+            let mut a_q = vec![F128::ZERO; 2 * lo_size];
+            let mut b_q = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: aes is cfg-guaranteed; buffers sized 4·lo_size in /
+            // 2·lo_size out / lo_size eq exactly as the contract requires.
+            let ((p1_v1, pinf_v1), (p1_q, pinf_q)) = unsafe {
+                (
+                    kernels::aarch64::tail_fold_chunk_nt_neon(
+                        a_in.as_ptr(),
+                        b_in.as_ptr(),
+                        a_v1.as_mut_ptr(),
+                        b_v1.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        r_fold,
+                    ),
+                    kernels::aarch64::tail_fold_chunk_q::<true, false>(
+                        a_in.as_ptr(),
+                        b_in.as_ptr(),
+                        a_q.as_mut_ptr(),
+                        b_q.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        r_fold,
+                    ),
+                )
+            };
+
+            assert_eq!(a_ref, a_q, "folded a mismatch at lo_size={lo_size}");
+            assert_eq!(b_ref, b_q, "folded b mismatch at lo_size={lo_size}");
+            assert_eq!(p1_ref, p1_q, "p1 mismatch at lo_size={lo_size}");
+            assert_eq!(pinf_ref, pinf_q, "pinf mismatch at lo_size={lo_size}");
+            assert_eq!((a_v1, b_v1), (a_q, b_q), "v1/q fold divergence at lo_size={lo_size}");
+            assert_eq!(
+                (p1_v1, pinf_v1),
+                (p1_q, pinf_q),
+                "v1/q message divergence at lo_size={lo_size}"
+            );
+
+            // Store/load-hint variants change cache behavior only, never bits.
+            let mut a_v = vec![F128::ZERO; 2 * lo_size];
+            let mut b_v = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: same contract as above.
+            let m_nt_ldnp = unsafe {
+                kernels::aarch64::tail_fold_chunk_q::<true, true>(
+                    a_in.as_ptr(),
+                    b_in.as_ptr(),
+                    a_v.as_mut_ptr(),
+                    b_v.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    r_fold,
+                )
+            };
+            assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "ldnp variant fold mismatch");
+            assert_eq!(m_nt_ldnp, (p1_ref, pinf_ref), "ldnp variant message mismatch");
+            // SAFETY: same contract as above.
+            let m_reg = unsafe {
+                kernels::aarch64::tail_fold_chunk_q::<false, false>(
+                    a_in.as_ptr(),
+                    b_in.as_ptr(),
+                    a_v.as_mut_ptr(),
+                    b_v.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    r_fold,
+                )
+            };
+            assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "regular-store variant fold mismatch");
+            assert_eq!(m_reg, (p1_ref, pinf_ref), "regular-store variant message mismatch");
+        }
+    }
+    /// The q-form round-2 message leaf is bit-identical to the scalar-struct
+    /// leaf across shapes, exercising the `b ≡ 1` constant-fiber shortcut
+    /// (forced all-ones b rows), all-zero rows, and padding-skip pairs.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn round2_qmsg_leaf_matches_v1() {
+        let mut rng = Rng::new(74);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        for lo_size in [2usize, 8, 64, 512] {
+            // 2·lo_size packed rows of 8 bytes each per array.
+            let mut a_packed: Vec<u8> = (0..2 * lo_size * 8)
+                .map(|_| (rng.next_u64() & 0xff) as u8)
+                .collect();
+            let mut b_packed = a_packed.clone();
+            for byte in &mut b_packed {
+                *byte ^= (rng.next_u64() & 0xff) as u8;
+            }
+            // Force constant fibers: some all-ones b rows (shortcut), some
+            // all-zero a rows (row-fold early exit).
+            for row in 0..2 * lo_size {
+                match row % 7 {
+                    0 | 1 => b_packed[row * 8..(row + 1) * 8].fill(0xff),
+                    2 => a_packed[row * 8..(row + 1) * 8].fill(0),
+                    _ => {}
+                }
+            }
+            let eq_lo = rng.f128_vec(lo_size);
+            // Padding skip: mark the top quarter of pairs as padding.
+            let pair_in_block_mask = lo_size - 1;
+            let useful_pairs_inclusive = lo_size - lo_size / 4;
+
+            let mut a_v1 = vec![F128::ZERO; 2 * lo_size];
+            let mut b_v1 = vec![F128::ZERO; 2 * lo_size];
+            let mut a_q = vec![F128::ZERO; 2 * lo_size];
+            let mut b_q = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: aes is cfg-guaranteed; 2·lo_size packed rows / output
+            // elements and lo_size eq weights as the contract requires.
+            let (m_v1, m_q) = unsafe {
+                (
+                    kernels::aarch64::round2_chunk_raw_neon(
+                        table.data.as_ptr() as *const u8,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        a_v1.as_mut_ptr(),
+                        b_v1.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        0,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                    kernels::aarch64::round2_chunk_raw_neon_q(
+                        table.data.as_ptr() as *const u8,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        a_q.as_mut_ptr(),
+                        b_q.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        0,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                )
+            };
+            assert_eq!(a_v1, a_q, "folded a mismatch at lo_size={lo_size}");
+            assert_eq!(b_v1, b_q, "folded b mismatch at lo_size={lo_size}");
+            assert_eq!(m_v1, m_q, "message mismatch at lo_size={lo_size}");
         }
     }
 

@@ -20,6 +20,8 @@
 pub mod bits;
 pub mod challenger;
 pub mod field;
+pub mod gaptime;
+pub mod gpu;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;

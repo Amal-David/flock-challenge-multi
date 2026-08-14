@@ -248,6 +248,10 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 #[derive(Clone)]
 pub struct CscCircuit {
     n_cols: usize,
+    /// Row-index bound: every entry of `a_rows` / `b_rows` is `< n_rows`
+    /// (guaranteed by [`csc_from_rows`]). Justifies the unchecked
+    /// `eq_inner[r]` gather in [`LincheckCircuit::fold_alpha_batched`].
+    n_rows: usize,
     a_col_ptr: Vec<u32>,
     a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
@@ -300,6 +304,7 @@ impl CscCircuit {
         let (b_col_ptr, b_rows) = csc_from_rows(b_0);
         Self {
             n_cols: a_0.num_cols,
+            n_rows: a_0.num_rows,
             a_col_ptr,
             a_rows,
             b_col_ptr,
@@ -325,14 +330,20 @@ impl LincheckCircuit for CscCircuit {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
+        // Row indices are `< n_rows` by construction ([`csc_from_rows`]);
+        // checking here (once) instead of per nonzero drops the two-branch
+        // bounds check from the ~7-instruction gather loop body.
+        assert!(self.n_rows <= eq_inner.len());
         let one_col = |c: usize| {
             let mut sa = F128::ZERO;
             for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
+                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+                sa += *unsafe { eq_inner.get_unchecked(r as usize) };
             }
             let mut sb = F128::ZERO;
             for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
+                // SAFETY: as above.
+                sb += *unsafe { eq_inner.get_unchecked(r as usize) };
             }
             alpha * sa + sb
         };
@@ -654,6 +665,248 @@ pub fn partial_fold_packed_z_fast_padded(
                 a
             },
         )
+}
+
+/// Outer stripes processed together by the direct block-major fold. Eight
+/// stripes cover 64 consecutive outer blocks: their 32 KiB of sum tables fit
+/// in L1, while one 128-entry output row-group stays hot across all 8 tables.
+const DIRECT_FOLD_TILE_STRIPES: usize = 8;
+
+/// Ranked BLAKE3 has `m=32`, `k_log=14`, hence 18 outer variables. Splitting
+/// those variables 9+9 replaces the 4 MiB full equality tensor with two 8 KiB
+/// factors. Reconstructing each of the 2^18 weights once in the fold plus the
+/// two factor builds saves exactly 260,098 F128 multiplications versus the
+/// full doubling construction.
+const BLOCK_MAJOR_FACTORED_EQ_N_LOG: usize = 18;
+const BLOCK_MAJOR_FACTORED_EQ_LO_LOG: usize = 9;
+
+/// Transpose one F128 row-group from 8 consecutive outer blocks into the byte
+/// shape consumed by a lincheck sum table. Output byte `b` has bit `r` equal
+/// to bit `b` of `lanes[r]`.
+#[inline(always)]
+fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 128);
+    let lo: [u64; 8] = std::array::from_fn(|r| lanes[r].lo);
+    let hi: [u64; 8] = std::array::from_fn(|r| lanes[r].hi);
+    let (out_lo, out_hi) = out.split_at_mut(64);
+    crate::bits::transpose_8_u64s_to_64_bytes(&lo, out_lo);
+    crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
+}
+
+/// Direct partial fold from the canonical block-major F128 witness packing.
+/// This avoids materializing the equally-sized byte-stripe copy used by
+/// [`partial_fold_packed_z_fast`].
+///
+/// Each outer block contains `chunks_per_block = k / 128` F128 values, so
+/// `z_packed[i_outer * chunks_per_block + q]` holds inner columns
+/// `128*q..128*q+128`. For each group of 8 outer blocks, the corresponding 8
+/// F128 values are transposed into 128 bytes; byte `b` then indexes the same
+/// 256-entry sum table as the stripe fold.
+pub fn partial_fold_packed_z_block_major(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    partial_fold_packed_z_block_major_padded(z_packed, m, k_log, 1usize << k_log, eq_outer)
+}
+
+/// Padding-aware variant of [`partial_fold_packed_z_block_major`]. Inner
+/// columns `[useful_bits, k)` remain zero and are not read from the witness.
+pub fn partial_fold_packed_z_block_major_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    assert!(m >= k_log);
+    let n_outer = 1usize << (m - k_log);
+    assert_eq!(eq_outer.len(), n_outer);
+    partial_fold_packed_z_block_major_padded_with_tables(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base, table| {
+            build_sum_table(&eq_outer[outer_base..outer_base + 8], table);
+        },
+    )
+}
+
+/// Block-major partial fold with an exactly factorized outer equality tensor.
+///
+/// `eq_outer[i] = eq_lo[i & (B - 1)] * eq_hi[i >> log2(B)]`, where
+/// `B = eq_lo.len()`. The complete tensor is never materialized: each outer
+/// weight is reconstructed exactly once while building its 8-bit sum table.
+/// This preserves the existing witness sweep and private-accumulator schedule.
+fn partial_fold_packed_z_block_major_factorized_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+) -> Vec<F128> {
+    assert!(m >= k_log);
+    assert!(eq_lo.len().is_power_of_two());
+    assert!(eq_hi.len().is_power_of_two());
+    let n_outer = 1usize << (m - k_log);
+    assert_eq!(eq_lo.len() * eq_hi.len(), n_outer);
+    let log_b = eq_lo.len().trailing_zeros() as usize;
+    let lo_mask = eq_lo.len() - 1;
+
+    partial_fold_packed_z_block_major_padded_with_tables(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base, table| {
+            let eq8: [F128; 8] = std::array::from_fn(|r| {
+                let outer = outer_base + r;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            });
+            build_sum_table(&eq8, table);
+        },
+    )
+}
+
+/// Shared block-major witness sweep. `build_table` fills the 256-entry subset
+/// table for the eight outer positions beginning at `outer_base`.
+fn partial_fold_packed_z_block_major_padded_with_tables(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    build_table: impl Fn(usize, &mut [F128]) + Sync,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    assert!(m >= k_log);
+    assert!(k_log >= 7, "block-major F128 fold requires k >= 128");
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    let chunks_per_block = k / 128;
+    assert_eq!(z_packed.len(), n_outer * chunks_per_block);
+    assert!(n_log >= 3, "need n_outer >= 8 for byte groups");
+    assert!(useful_bits <= k);
+
+    let n_stripes = n_outer / 8;
+    let n_tiles = n_stripes.div_ceil(DIRECT_FOLD_TILE_STRIPES);
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+    let useful_chunks = useful_bits.div_ceil(128);
+
+    // Outer-tile partitioning reads every useful z chunk exactly once and
+    // builds every sum table once. Each worker owns a private length-k partial;
+    // the final XOR reduction is small relative to the witness pass.
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(worker, partial)| {
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
+            let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                let tile_stripes = (n_stripes - stripe_base).min(DIRECT_FOLD_TILE_STRIPES);
+                for t in 0..tile_stripes {
+                    let outer_base = 8 * (stripe_base + t);
+                    build_table(outer_base, &mut tables[t * 256..(t + 1) * 256]);
+                }
+
+                // Keep one 128-column (2 KiB) output group hot while applying
+                // all tables in this outer tile.
+                for q in 0..useful_chunks {
+                    let inner_base = q * 128;
+                    let chunk_bits = (useful_bits - inner_base).min(128);
+                    // Full tiles take the all-NEON gather + bit-transpose
+                    // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
+                    // swap rounds, no bounds checks) — byte-identical output
+                    // to the scalar-formed gather below, which remains as the
+                    // partial-tile fallback and `FLOCK_NO_LINCHECK_QFORM`
+                    // kill-switch path.
+                    #[cfg(target_arch = "aarch64")]
+                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                        && kernels::lincheck_qform_enabled()
+                    {
+                        // SAFETY: lane (t, r) is read at index
+                        // `(8·(stripe_base + t) + r) · chunks_per_block + q`
+                        // — exactly the indices the scalar path reads; the
+                        // full-tile guard plus `q < useful_chunks ≤
+                        // chunks_per_block` keep all 64 in bounds. The output
+                        // is the whole 8×128 `transposed` buffer.
+                        unsafe {
+                            kernels::gather_transpose_tile_neon(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let transposed_done = false;
+                    if !transposed_done {
+                        for t in 0..tile_stripes {
+                            let outer_base = 8 * (stripe_base + t);
+                            let lanes: [F128; 8] = std::array::from_fn(|r| {
+                                z_packed[(outer_base + r) * chunks_per_block + q]
+                            });
+                            transpose_8_f128s_to_128_bytes(
+                                &lanes,
+                                &mut transposed[t * 128..(t + 1) * 128],
+                            );
+                        }
+                    }
+                    let group = &mut partial[inner_base..inner_base + chunk_bits];
+                    // Full tiles take the two-stream NEON wavefront leaf
+                    // (paired 8-column blocks, 16 register accumulators —
+                    // bit-identical XOR order, ~2× the independent lookup
+                    // chains in flight). Partial last tiles and the
+                    // `chunk_bits % 8` remainder use the scalar chain below.
+                    #[cfg(target_arch = "aarch64")]
+                    let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
+                        kernels::fold_block_major_chunk_neon_x2(
+                            &transposed,
+                            &tables,
+                            group,
+                            chunk_bits,
+                        )
+                    } else {
+                        0
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let b_done = 0;
+                    for b in b_done..chunk_bits {
+                        let mut acc = group[b];
+                        for t in 0..tile_stripes {
+                            let byte = transposed[t * 128 + b] as usize;
+                            acc += tables[t * 256 + byte];
+                        }
+                        group[b] = acc;
+                    }
+                }
+            }
+        });
+
+    let (first, rest) = partials.split_at(k);
+    let mut out = first.to_vec();
+    for partial in rest.chunks(k) {
+        out.par_iter_mut()
+            .zip(partial.par_iter())
+            .for_each(|(o, p)| *o += *p);
+    }
+    out
 }
 
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
@@ -1098,6 +1351,11 @@ fn sumcheck_bind_both_and_eval_next(
 // API
 // ---------------------------------------------------------------------------
 
+enum PackedZ<'a> {
+    LincheckStripe(&'a [u8]),
+    BlockMajor(&'a [F128]),
+}
+
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
 ///
@@ -1146,7 +1404,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1179,7 +1437,39 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Direct block-major counterpart of [`prove_padded_capture_z_vec`]. The
+/// canonical F128-packed witness is folded after `x_ab.x_outer` is known, so
+/// callers do not need to allocate or populate a lincheck byte stripe.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
         m,
         k_log,
         k_skip,
@@ -1198,7 +1488,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    z_packed: PackedZ<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1272,8 +1562,29 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    let mut z_vec = match z_packed {
+        PackedZ::LincheckStripe(z) => {
+            let eq_x_outer = build_eq_table(&x_ab.x_outer);
+            partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
+        }
+        PackedZ::BlockMajor(z) if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG => {
+            let (outer_lo, outer_hi) = x_ab.x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+            let eq_lo = build_eq_table(outer_lo);
+            let eq_hi = build_eq_table(outer_hi);
+            partial_fold_packed_z_block_major_factorized_padded(
+                z,
+                m,
+                k_log,
+                useful_bits,
+                &eq_lo,
+                &eq_hi,
+            )
+        }
+        PackedZ::BlockMajor(z) => {
+            let eq_x_outer = build_eq_table(&x_ab.x_outer);
+            partial_fold_packed_z_block_major_padded(z, m, k_log, useful_bits, &eq_x_outer)
+        }
+    };
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1787,6 +2098,120 @@ mod tests {
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
             let fast = partial_fold_packed_z_fast(&z_packed, m, k_log, &eq);
             assert_eq!(serial, fast, "at m={m}, k_log={k_log}");
+        }
+    }
+
+    /// The direct block-major F128 fold is exactly the existing stripe fold,
+    /// including padded, non-128-aligned useful regions and partial outer
+    /// tiles.
+    #[test]
+    fn partial_fold_block_major_matches_stripe() {
+        let cases: &[(usize, usize, usize)] = &[
+            (10, 7, 1 << 7),
+            (13, 8, 233),
+            (16, 10, 997),
+            (16, 8, 241),
+            (18, 12, 3_801),
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let mut rng = Rng::new(0xD1EC_7F01 + (m * 31 + k_log) as u64);
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+
+            let z_block_major: Vec<F128> = z
+                .chunks_exact(128)
+                .map(|bits| {
+                    let mut packed = F128::ZERO;
+                    for (b, &set) in bits.iter().enumerate() {
+                        if set {
+                            if b < 64 {
+                                packed.lo |= 1u64 << b;
+                            } else {
+                                packed.hi |= 1u64 << (b - 64);
+                            }
+                        }
+                    }
+                    packed
+                })
+                .collect();
+            let z_stripe = pack_z_lincheck(&z, m, k_log);
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+
+            let want = partial_fold_packed_z_best(&z_stripe, m, k_log, useful_bits, &eq_outer);
+            let got = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// Factoring the outer equality tensor preserves both its LSB-first
+    /// indexing and the padding-aware block-major fold. The final case uses
+    /// the ranked BLAKE3 outer geometry (18 variables split 9+9) without
+    /// allocating its full 512 MiB witness.
+    #[test]
+    fn partial_fold_block_major_factorized_matches_materialized() {
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // m, k_log, useful_bits, low-factor variables
+            (10, 7, 1, 1),
+            (13, 7, 127, 2),
+            (16, 8, 233, 4),
+            (18, 10, 997, 4),
+            (25, 7, 121, 9),
+        ];
+
+        for &(m, k_log, useful_bits, lo_log) in cases {
+            let mut rng =
+                Rng::new(0xFAC7_0E00 + (m * 31 + k_log * 7 + useful_bits + lo_log) as u64);
+            let n_log = m - k_log;
+            let n_outer = 1usize << n_log;
+            let chunks_per_block = (1usize << k_log) / 128;
+            let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+            let point = rng.f128_vec(n_log);
+
+            let eq_outer = build_eq_table(&point);
+            let (point_lo, point_hi) = point.split_at(lo_log);
+            let eq_lo = build_eq_table(point_lo);
+            let eq_hi = build_eq_table(point_hi);
+            let lo_mask = eq_lo.len() - 1;
+
+            // Direct tensor oracle: catches a swapped factor order even if a
+            // sparse random witness happens not to observe a particular row.
+            for (outer, &dense) in eq_outer.iter().enumerate() {
+                assert_eq!(
+                    dense,
+                    eq_lo[outer & lo_mask] * eq_hi[outer >> lo_log],
+                    "factor mismatch at m={m}, outer={outer}",
+                );
+            }
+
+            let want = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            let got = partial_fold_packed_z_block_major_factorized_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_lo,
+                &eq_hi,
+            );
+            assert_eq!(
+                want, got,
+                "m={m} k_log={k_log} useful={useful_bits} lo_log={lo_log}",
+            );
         }
     }
 
