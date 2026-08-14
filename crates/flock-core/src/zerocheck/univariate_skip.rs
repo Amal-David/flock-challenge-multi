@@ -29,18 +29,34 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
+    const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
-        // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
-        for x in (0..(1usize << i)).rev() {
-            t[x | (1 << i)] = t[x] * r_i;
-            t[x] *= one_minus_r;
+        let half = 1usize << i;
+        let (lo, rest) = t.split_at_mut(half);
+        let hi = &mut rest[..half];
+        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
+            let v = *lo_x;
+            let vr = v * r_i;
+            *hi_x = vr;
+            // v * (1 + r_i) = v + v * r_i in characteristic two.
+            *lo_x = v + vr;
+        };
+        if half < PAR_THRESHOLD {
+            lo.iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+        } else {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
         }
     }
     t
@@ -172,8 +188,16 @@ pub struct SplitEqGhash {
 }
 
 impl SplitEqGhash {
-    /// C++-default cap on the hi half size — keeps outer F128 muls cheap.
-    pub const MAX_N_HI: usize = 7;
+    /// Cap on the hi half size. The original C++ default was 7 (128 chunks),
+    /// which with a 10-thread ranked pool yields a 2-wave rayon schedule
+    /// (128 → 16 jobs of 8 after four binary splits). Raising to 9 gives
+    /// 512 chunks / ~51 per thread and is bit-identical: the lo/hi split is
+    /// an exact tensor factorisation, XOR is associative, and deferred
+    /// reduction is F2-linear so regrouping across different chunk boundaries
+    /// is exact. The hi table grows from 2 KB to 8 KB (still register-friendly
+    /// as an outer product over 512 F128s); the lo table shrinks 4× and stays
+    /// more L2-resident across the ~120 ms of zerocheck that use this split.
+    pub const MAX_N_HI: usize = 9;
 
     pub fn new(r: &[F128]) -> Self {
         let n = r.len();
@@ -486,6 +510,98 @@ pub fn round1_extract_c_packed_with_s_hat_v(
     }
 
     (res_ab, res_c_lifted, s_hat_v_c)
+}
+
+/// **Test oracle, not part of the protocol.** Eight-bank generalization of
+/// [`round1_extract_c_packed_with_s_hat_v`], producing the C claim's four-bank
+/// (quad) sufficient statistic.
+///
+/// Where the two-bank form routes on `x_rest & 1` (= witness bit `k_skip`) and
+/// divides by `eq(r[k_skip], b_7)`, this routes on `x_rest & 7` (witness bits
+/// `k_skip..k_skip+3`) and divides bank `K = b_7 + 2 e` by the full
+/// `eq(r[k_skip], b_7) · eq(r[k_skip+1], e₀) · eq(r[k_skip+2], e₁)`. Because the
+/// division is by the literal eq weights, this oracle is **generic in `r`** —
+/// it never mentions α — so it is an independent check of the α-free convention
+/// the optimized capture's banks are defined in.
+///
+/// Output layout: `quad[e · 128 + (lane | (b_7 << k_skip))]`, length `4 · 128`.
+#[cfg(test)]
+pub(crate) fn round1_extract_c_packed_quad_oracle(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    let _ = (a_packed, b_packed);
+    assert!(k_skip + 3 <= m);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+
+    let ell = 1usize << k_skip;
+    let n_chunks = ell / 8;
+
+    let eq = SplitEqGhash::new(&r[k_skip..]);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+
+    // Eight raw banks indexed by K = x_rest & 7.
+    let mut res = vec![vec![F128::ZERO; ell]; 8];
+    let mut partial = vec![vec![F128::ZERO; ell]; 8];
+
+    for x_hi in 0..hi_size {
+        partial
+            .iter_mut()
+            .for_each(|bank| bank.iter_mut().for_each(|p| *p = F128::ZERO));
+
+        for x_lo in 0..lo_size {
+            let x_rest = (x_hi << eq.n_lo) | x_lo;
+            let chunk_offset = x_rest * n_chunks;
+            let eq_lo = eq.lo[x_lo];
+            let target = &mut partial[x_rest & 7];
+            for s in 0..ell {
+                let c_bit = (c_packed[chunk_offset + s / 8] >> (s % 8)) & 1;
+                if c_bit != 0 {
+                    target[s] += eq_lo;
+                }
+            }
+        }
+
+        let eq_hi = eq.hi[x_hi];
+        for (bank, part) in res.iter_mut().zip(partial.iter()) {
+            for lane in 0..ell {
+                bank[lane] += eq_hi * part[lane];
+            }
+        }
+    }
+
+    // Strip the three small-eq factors that routed each bank.
+    let eq_small = |coord: usize, bit: usize| -> F128 {
+        if bit == 0 {
+            F128::ONE + r[coord]
+        } else {
+            r[coord]
+        }
+    };
+    let mut quad = vec![F128::ZERO; 4 * 2 * ell];
+    for e in 0..4 {
+        for b_7 in 0..2 {
+            let k = b_7 + 2 * e;
+            let weight = (eq_small(k_skip, b_7)
+                * eq_small(k_skip + 1, e & 1)
+                * eq_small(k_skip + 2, (e >> 1) & 1))
+            .inv();
+            let base = e * 2 * ell + b_7 * ell;
+            for lane in 0..ell {
+                quad[base + lane] = res[k][lane] * weight;
+            }
+        }
+    }
+    quad
 }
 
 // ---------------------------------------------------------------------------
