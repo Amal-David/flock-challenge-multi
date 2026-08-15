@@ -56,3 +56,9 @@ pub mod r1cs_hashes;
 // dispersion-resample marker hermes-x86-push8-1786803203-23494
 // dispersion-resample marker hermes-x86-push9-1786803203-4845
 // dispersion-resample marker hermes-x86-push10-1786803203-30901
+
+// dispersion-resample marker hermes-x86-streak-1786804045-6373
+// dispersion-resample marker hermes-x86-streak2-1786804045-15142
+// dispersion-resample marker hermes-x86-streak3-1786804045-3389
+// dispersion-resample marker hermes-x86-streak4-1786804045-22364
+// dispersion-resample marker hermes-x86-streak5-1786804045-7221
