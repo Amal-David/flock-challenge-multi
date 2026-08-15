@@ -460,7 +460,15 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     let direct_count = direct_fold2.as_ref().map_or(0, Vec::len);
 
-    let direct_c_stats = if use_direct_c {
+    // When C carries H-products, first two messages come from
+    // messages_from_direct_products alone — skip deferred_stats stream.
+    let c_has_products = use_direct_c
+        && rs_results[1]
+            .1
+            .direct_fold2
+            .as_ref()
+            .is_some_and(|d| d.products.is_some());
+    let direct_c_stats = if use_direct_c && !c_has_products {
         match &rs_results[1].1.rs_eq_ind {
             ring_switch::RsEqInd::DeferredDense {
                 eq_lo,
@@ -556,6 +564,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             table,
         );
         (prime, Some(lookahead))
+    } else if c_has_products {
+        // AB + C both have H-products: no stream; messages filled below.
+        ((F128::ZERO, F128::ZERO), None)
     } else if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
@@ -668,11 +679,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
         round0_u0 += direct_round0.0;
         round0_u2 += direct_round0.1;
-        let combined_lookahead = round1_lookahead
-            .as_mut()
-            .expect("direct AB gate requires ordinary C lookahead");
-        for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
-            *out += value;
+        if let Some(combined_lookahead) = round1_lookahead.as_mut() {
+            // AB products + C deferred stream.
+            for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
+                *out += value;
+            }
+        } else {
+            // C products present: direct lookahead is the full round-1 message.
+            round1_lookahead = Some(direct_lookahead);
         }
     }
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {

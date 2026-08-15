@@ -1382,6 +1382,69 @@ fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128>
     out
 }
 
+/// Four-bank `s_hat_v` from a packed bit-witness (PCS domain), retaining the
+/// two least-significant index coordinates as banks. LSB-first index layout:
+/// `i = (rest << 2) | q` with bank `q` weighted by `eq(suffix[2..])[rest]`.
+/// Collapsing banks with `eq(suffix[..2])` recovers ordinary `fold_1b` `s_hat_v`.
+///
+/// Used so claim C can carry the same H-products AB gets from lincheck `z_vec`,
+/// allowing open to skip `deferred_stats_lookahead` when both claims have products.
+pub fn s_hat_v_quad_from_packed_witness(
+    packed_witness: &[F128],
+    suffix: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    assert!(
+        suffix.len() >= 2,
+        "packed quad requires at least two suffix coordinates"
+    );
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(
+        packed_witness.len(),
+        1usize << suffix.len(),
+        "packed_witness length {} mismatches 2^suffix.len() = {}",
+        packed_witness.len(),
+        1usize << suffix.len()
+    );
+    // Empty suffix[2..] → eq_rest = [ONE] (build_eq_parallel length 2^0).
+    let eq_rest = build_eq_parallel(&suffix[2..]);
+    eq_rest
+        .par_iter()
+        .enumerate()
+        .fold(
+            || vec![F128::ZERO; 4 * n_packed],
+            |mut acc, (rest, &w)| {
+                let base = rest << 2;
+                for q in 0..4 {
+                    let elem = packed_witness[base + q];
+                    let bank = q * n_packed;
+                    let mut lo = elem.lo;
+                    while lo != 0 {
+                        let r = lo.trailing_zeros() as usize;
+                        acc[bank + r] += w;
+                        lo &= lo - 1;
+                    }
+                    let mut hi = elem.hi;
+                    while hi != 0 {
+                        let r = hi.trailing_zeros() as usize;
+                        acc[bank + 64 + r] += w;
+                        hi &= hi - 1;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; 4 * n_packed],
+            |mut left, right| {
+                for (out, value) in left.iter_mut().zip(right) {
+                    *out += value;
+                }
+                left
+            },
+        )
+}
+
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
 /// and a tensor-expanded suffix point.
 ///
@@ -2740,7 +2803,31 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     let low_eq: [F128; 4] = build_eq(&suffix[..2])
                         .try_into()
                         .expect("two-coordinate eq has four entries");
-                    let products = w.s_hat_v_quad.as_deref().map(|quad| {
+                    // AB: precomputed lincheck quad. C: optional packed-witness
+                    // quad so both claims can carry H-products.
+                    // Kill switch: FLOCK_NO_OPEN_DIRECT_C_PRODUCTS.
+                    let c_quad_owned: Option<Vec<F128>> = if w.s_hat_v_quad.is_none()
+                        && retain_direct_c
+                        && i == 1
+                        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C_PRODUCTS").is_none()
+                    {
+                        match kinds[i] {
+                            Kind::Dense(d) if dense_suffixes[d].len() >= 2 => Some(
+                                s_hat_v_quad_from_packed_witness(
+                                    packed_witness,
+                                    dense_suffixes[d],
+                                ),
+                            ),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let quad_ref: Option<&[F128]> = w
+                        .s_hat_v_quad
+                        .as_deref()
+                        .or(c_quad_owned.as_deref());
+                    let products = quad_ref.map(|quad| {
                         let mut products = [F128::ZERO; 16];
                         let mut scaled_bank = vec![F128::ZERO; n_packed];
                         for e in 0..4 {
@@ -3599,6 +3686,35 @@ mod tests {
     }
 
     #[test]
+    
+    #[test]
+    fn packed_quad_collapses_to_fold_1b_rows_naive() {
+        // Small suffix: L = 2^4 = 16 packed slots, suffix length 4.
+        let mut state = 0xC0FFEEu64;
+        let mut next = || {
+            state = state.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            state
+        };
+        let packed: Vec<F128> = (0..16)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let suffix: Vec<F128> = (0..4)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let quad = s_hat_v_quad_from_packed_witness(&packed, &suffix);
+        assert_eq!(quad.len(), 4 * (1 << LOG_PACKING));
+        let collapsed = collapse_s_hat_v_quad(&quad, &suffix[..2]);
+        let full_eq = build_eq_parallel(&suffix);
+        let expect = fold_1b_rows_naive(&packed, &full_eq);
+        assert_eq!(collapsed, expect, "packed quad must collapse to fold_1b s_hat_v");
+    }
+
     fn quad_precompute_products_match_dense_ring_basis() {
         use crate::challenger::FsChallenger;
         use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
