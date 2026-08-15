@@ -755,9 +755,10 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 &x_ab,
                 challenger,
             );
-            // The stripe copy is dead after lincheck. Stripe-based callers
-            // retain their existing allocation lifecycle.
-            drop(z_packed_lincheck);
+            // The stripe copy is dead after lincheck. Return it to the
+            // scratch byte pool before the PCS open so the next prove
+            // reuses its resident pages instead of re-faulting.
+            flock_core::scratch::give_u8(z_packed_lincheck);
             result
         }
         FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
@@ -991,7 +992,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 &x_ab,
                 challenger,
             );
-            drop(z_packed_lincheck);
+            flock_core::scratch::give_u8(z_packed_lincheck);
             result
         }
         FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
