@@ -854,7 +854,28 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         false
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                        && kernels::lincheck_x86_tile_enabled()
+                    {
+                        // SAFETY: same indices as the scalar gather below;
+                        // full-tile + `q < useful_chunks ≤ chunks_per_block`
+                        // keep all 64 lanes in bounds. Output is the whole
+                        // 8×128 `transposed` buffer.
+                        unsafe {
+                            kernels::gather_transpose_tile_x86(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let transposed_done = false;
                     if !transposed_done {
                         for t in 0..tile_stripes {
@@ -885,7 +906,20 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         0
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                        && kernels::lincheck_x86_tile_enabled()
+                    {
+                        kernels::fold_block_major_chunk_x86(
+                            &transposed,
+                            &tables,
+                            group,
+                            chunk_bits,
+                        )
+                    } else {
+                        0
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let b_done = 0;
                     for b in b_done..chunk_bits {
                         let mut acc = group[b];

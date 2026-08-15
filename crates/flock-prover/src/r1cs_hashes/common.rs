@@ -372,12 +372,17 @@ where
             || {
                 if use_nt {
                     let u64s = f128_per_block * 2;
-                    (vec![0u64; u64s], vec![0u64; u64s], vec![0u64; u64s])
+                    (
+                        vec![0u64; u64s],
+                        vec![0u64; u64s],
+                        vec![0u64; u64s],
+                        NtWorkerFence::armed(),
+                    )
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new(), NtWorkerFence::idle())
                 }
             },
-            |(z_stage, a_stage, b_stage), (g, ((z_grp, a_grp), b_grp))| {
+            |(z_stage, a_stage, b_stage, _fence), (g, ((z_grp, a_grp), b_grp))| {
                 for k_in in 0..8 {
                     let global_idx = 8 * g + k_in;
                     let initial = initial_states.get(global_idx).unwrap_or(padding);
@@ -515,7 +520,40 @@ pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     }
 }
 
+/// Worker-local WC drain for NT publishes. `for_each_init` has no end hook;
+/// drop this with the TLS staging after that worker's last `nt_copy`.
+/// x86: `_mm_sfence`. aarch64 `stnp` needs no extra fence here.
+pub(crate) struct NtWorkerFence {
+    armed: bool,
+}
+
+impl NtWorkerFence {
+    #[inline]
+    pub(crate) fn armed() -> Self {
+        Self { armed: true }
+    }
+
+    #[inline]
+    pub(crate) fn idle() -> Self {
+        Self { armed: false }
+    }
+}
+
+impl Drop for NtWorkerFence {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: sfence is always legal on x86_64; drains this core's WC buffers.
+            unsafe {
+                core::arch::x86_64::_mm_sfence();
+            }
+        }
+    }
+}
+
 /// Non-temporal store of one interleaved 128-byte chunk-row.
+/// x86: 8× `_mm_stream_si128` (dest is F128 16-align). Staging is `Vec<u64>`
+/// (8-align) so the load is `loadu`. No fence here — that is the worker Drop.
 #[inline(always)]
 pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     #[cfg(target_arch = "aarch64")]
@@ -534,14 +572,24 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
             options(nostack),
         );
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let src_b = src.cast::<u8>();
+        let dst_b = dst.cast::<u8>();
+        for i in 0..8 {
+            let v = _mm_loadu_si128(src_b.add(i * 16).cast::<__m128i>());
+            _mm_stream_si128(dst_b.add(i * 16).cast::<__m128i>(), v);
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     unsafe {
         std::ptr::copy_nonoverlapping(src, dst, 2 * BM_V);
     }
 }
 
 /// Non-temporal copy of `n` u64s (`n` divisible by 16) in 128-byte
-/// `ldp q / stnp q` chunks. Fallback: plain copy off-aarch64.
+/// `ldp q / stnp q` chunks. x86: 8× `_mm_stream_si128` per row.
 ///
 /// SAFETY: `src` valid for `n` u64 reads, `dst` for `n` u64 writes; ranges
 /// must not overlap.
@@ -679,9 +727,10 @@ where
                 vec![[0u64; BM_V]; u64_per_block],
                 vec![[0u64; BM_V]; u64_per_block],
                 vec![[0u64; BM_V]; u64_per_block],
+                NtWorkerFence::armed(),
             )
         },
-        move |(rz, ra, rb), g| {
+        move |(rz, ra, rb, _fence), g| {
             rz[..useful_words].fill([0u64; BM_V]);
             ra[..useful_words].fill([0u64; BM_V]);
             rb[..useful_words].fill([0u64; BM_V]);

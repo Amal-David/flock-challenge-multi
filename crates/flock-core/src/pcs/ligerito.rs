@@ -2716,6 +2716,97 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     *evals = folded;
 }
 
+/// Accumulate the Ligerito message pair `(u0, u2)` from already-folded
+/// `fc`/`bc`: `u0 = Σ f_{2i}·b_{2i}`, `u2 = Σ (f_{2i}+f_{2i+1})·(b_{2i}+b_{2i+1})`.
+/// AVX-512 `WideGhashX4` when compiled+detected; scalar otherwise. Never
+/// multiplies adjacent `[f0,f1,f2,f3]*[b0,b1,b2,b3]` into u0 (that would
+/// add `f1*b1` and change Fiat–Shamir).
+fn message_pairs_lsb(fc: &[F128], bc: &[F128]) -> (F128, F128) {
+    debug_assert_eq!(fc.len(), bc.len());
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("vpclmulqdq") {
+            // SAFETY: runtime detect + compile-time cfg both require the features.
+            return unsafe { message_pairs_lsb_avx512(fc, bc) };
+        }
+    }
+    message_pairs_lsb_scalar(fc, bc)
+}
+
+fn message_pairs_lsb_scalar(fc: &[F128], bc: &[F128]) -> (F128, F128) {
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    let mut k = 0;
+    let len = fc.len();
+    while k + 1 < len {
+        let f0 = fc[k];
+        let f1 = fc[k + 1];
+        let b0 = bc[k];
+        let b1 = bc[k + 1];
+        u0 += f0 * b0;
+        u2 += (f0 + f1) * (b0 + b1);
+        k += 2;
+    }
+    (u0, u2)
+}
+
+/// Even/odd deinterleave of 8 already-folded F128s, then two WideGhashX4
+/// accs. Tail `len % 8` is unreduced-XOR then one reduce per acc.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn message_pairs_lsb_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller carries avx512f+vpclmulqdq; loads stay in-bounds.
+    unsafe {
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let mut u0 = WideGhashX4::zero();
+        let mut u2 = WideGhashX4::zero();
+        let n = fc.len();
+        let mut k = 0;
+        while k + 8 <= n {
+            let f_lo = _mm512_loadu_si512(fc.as_ptr().add(k).cast::<__m512i>());
+            let f_hi = _mm512_loadu_si512(fc.as_ptr().add(k + 4).cast::<__m512i>());
+            let b_lo = _mm512_loadu_si512(bc.as_ptr().add(k).cast::<__m512i>());
+            let b_hi = _mm512_loadu_si512(bc.as_ptr().add(k + 4).cast::<__m512i>());
+            let f_even = _mm512_permutex2var_epi64(f_lo, idx_even, f_hi);
+            let f_odd = _mm512_permutex2var_epi64(f_lo, idx_odd, f_hi);
+            let b_even = _mm512_permutex2var_epi64(b_lo, idx_even, b_hi);
+            let b_odd = _mm512_permutex2var_epi64(b_lo, idx_odd, b_hi);
+            // u0 lanes are even pairs only: (f0,b0),(f2,b2),(f4,b4),(f6,b6).
+            u0.mul_acc(f_even, b_even);
+            u2.mul_acc(
+                _mm512_xor_si512(f_even, f_odd),
+                _mm512_xor_si512(b_even, b_odd),
+            );
+            k += 8;
+        }
+        let mut acc0 = u0.fold();
+        let mut acc2 = u2.fold();
+        while k + 1 < n {
+            let f0 = fc[k];
+            let f1 = fc[k + 1];
+            let b0 = bc[k];
+            let b1 = bc[k + 1];
+            acc0 ^= f0.mul_unreduced(b0);
+            acc2 ^= (f0 + f1).mul_unreduced(b0 + b1);
+            k += 2;
+        }
+        (acc0.reduce(), acc2.reduce())
+    }
+}
+
 /// Fused fold + next-round message in a SINGLE parallel pass.
 ///
 /// Replaces the three separate passes a sumcheck fold otherwise needs
@@ -2858,23 +2949,10 @@ fn fold_and_msg_lsb(
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
             }
-            let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            (u0, u2)
+            message_pairs_lsb(fc, bc)
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
@@ -6449,6 +6527,46 @@ mod tests {
             assert_eq!(bc_soa, bc_soa_r, "folded b NT vs stp n_pairs={n_pairs}");
             assert_eq!(u0_soa, u0_soa_r, "u0 NT vs stp n_pairs={n_pairs}");
             assert_eq!(u2_soa, u2_soa_r, "u2 NT vs stp n_pairs={n_pairs}");
+        }
+    }
+
+    /// x86 oracle: WideGhash message leaf == fold_pairs + scalar message.
+    /// Required shape: `base != 0`, `n_pairs = 2048` (production CHUNK).
+    /// Extra shapes cover the `len % 8` tail. Apple `fold_and_msg_*` tests
+    /// are aarch64-only and do not count.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fold_and_msg_x86_message_matches_scalar() {
+        let mut state = 0xA5A5_5A5A_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for (n_pairs, base) in [(8usize, 3usize), (10, 1), (15, 7), (2048, 16)] {
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            let mut fc = vec![F128::ZERO; n_pairs];
+            let mut bc = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc, r);
+
+            let (u0_ref, u2_ref) = message_pairs_lsb_scalar(&fc, &bc);
+            let (u0, u2) = message_pairs_lsb(&fc, &bc);
+            assert_eq!(u0, u0_ref, "u0 dispatch n_pairs={n_pairs} base={base}");
+            assert_eq!(u2, u2_ref, "u2 dispatch n_pairs={n_pairs} base={base}");
+
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("vpclmulqdq") {
+                let (u0_avx, u2_avx) = unsafe { message_pairs_lsb_avx512(&fc, &bc) };
+                assert_eq!(u0_avx, u0_ref, "u0 avx512 n_pairs={n_pairs} base={base}");
+                assert_eq!(u2_avx, u2_ref, "u2 avx512 n_pairs={n_pairs} base={base}");
+            }
         }
     }
 

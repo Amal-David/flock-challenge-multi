@@ -1310,13 +1310,13 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     // 2^m bits) are pure write-only streams here — ~2 GiB at the ranked
     // m = 32 — next read only in later phases, far beyond any cache, so
     // regular stores' write-allocate costs one hidden DRAM read per line.
-    // On aarch64, build each block in L1-resident per-worker staging and
-    // publish with `stnp` (same design as `drive_witness_packed`); the
+    // On aarch64 / x86_64, build each block in L1-resident per-worker
+    // staging and publish with `stnp` / 8× `_mm_stream_si128`; the
     // ab_inner projection reads a/b from the hot staging copies, never
     // from the NT-flushed destinations. `FLOCK_NO_WITNESS_NT` is a
     // local-diagnostics kill switch; the ranked worker's cleared
     // environment never sets it.
-    let use_nt = cfg!(target_arch = "aarch64")
+    let use_nt = cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
@@ -1376,12 +1376,19 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
                         vec![0u64; U64_PER_BLOCK],
                         vec![0u64; U64_PER_BLOCK],
                         vec![0u64; U64_PER_BLOCK],
+                        super::common::NtWorkerFence::armed(),
                     )
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        super::common::NtWorkerFence::idle(),
+                    )
                 }
             },
-            |(z_stage, a_stage, b_stage, ab_stage),
+            |(z_stage, a_stage, b_stage, ab_stage, _fence),
              (block_idx, (((z_out, a_out), b_out), ab_out))| {
                 let (cv, msg, counter, block_len, flags) =
                     blocks.get(block_idx).unwrap_or(&padding);

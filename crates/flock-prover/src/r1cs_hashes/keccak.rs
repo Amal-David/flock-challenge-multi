@@ -1065,7 +1065,7 @@ impl KeccakSetup {
 // zeroes the contiguous padding suffix of the recycled scratch buffers.
 // ---------------------------------------------------------------------------
 
-use super::common::{BM_V, SendPtr, nt_store_row};
+use super::common::{BM_V, NtWorkerFence, SendPtr, nt_store_row};
 
 type VLane = [u64; BM_V];
 type VLanes = [[u64; BM_V]; N_LANES];
@@ -1356,23 +1356,26 @@ pub fn generate_witness_batch_major(
     let states_ref = initial_states;
     let padding_ref = &padding;
 
-    (0..n_total / BM_V).into_par_iter().for_each(move |g| {
-        let o0 = g * BM_V;
-        let group: [&State; BM_V] =
-            std::array::from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
-        // SAFETY: disjoint per-group ranges; suffix pre-zeroed above.
-        unsafe {
-            build_group_batch_major(
-                group,
-                o0,
-                n_keccaks_log,
-                zp.get(),
-                ap.get(),
-                bp.get(),
-                sp.get() as *mut u8,
-            )
-        }
-    });
+    (0..n_total / BM_V).into_par_iter().for_each_init(
+        || NtWorkerFence::armed(),
+        move |_fence, g| {
+            let o0 = g * BM_V;
+            let group: [&State; BM_V] =
+                std::array::from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
+            // SAFETY: disjoint per-group ranges; suffix pre-zeroed above.
+            unsafe {
+                build_group_batch_major(
+                    group,
+                    o0,
+                    n_keccaks_log,
+                    zp.get(),
+                    ap.get(),
+                    bp.get(),
+                    sp.get() as *mut u8,
+                )
+            }
+        },
+    );
 
     (z, a, b, stripe)
 }
