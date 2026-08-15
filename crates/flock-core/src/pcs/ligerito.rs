@@ -6626,6 +6626,51 @@ mod tests {
         }
     }
 
+    /// Parallel `half≥4096` path: `fold_and_msg_lsb` (AVX-512 message reduce
+    /// after `fold_pairs` when those features are on; scalar reload otherwise)
+    /// matches the two-mul fold + scalar message loop.
+    #[test]
+    fn fold_and_msg_lsb_parallel_matches_scalar() {
+        let mut state = 0xA5A5_5A5A_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+        // n=8192 → half=4096 hits the parallel path (PAR_THRESHOLD=4096).
+        for n in [8192usize] {
+            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let r = f128();
+            let one_plus_r = F128::ONE + r;
+            let half = n / 2;
+            let mut nf_ref = Vec::with_capacity(half);
+            let mut nb_ref = Vec::with_capacity(half);
+            for j in 0..half {
+                nf_ref.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+                nb_ref.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            }
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < half {
+                u0 += nf_ref[k] * nb_ref[k];
+                u2 += (nf_ref[k] + nf_ref[k + 1]) * (nb_ref[k] + nb_ref[k + 1]);
+                k += 2;
+            }
+            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, r, None);
+            assert_eq!(&nf[..], nf_ref.as_slice(), "nf n={n}");
+            assert_eq!(&nb[..], nb_ref.as_slice(), "nb n={n}");
+            assert_eq!(msg.u_0, u0, "u0 n={n}");
+            assert_eq!(msg.u_2, u2, "u2 n={n}");
+        }
+    }
+
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
     /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
