@@ -2837,6 +2837,35 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Pointwise `acc[i] += alpha * src[i]` for basis glue. 4-wide VPCLMUL.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn scale_add_axpy_avx512(acc: &mut [F128], src: &[F128], alpha: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(acc.len(), src.len());
+    let n = acc.len();
+    let lanes = n & !3;
+    let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+    let mut i = 0;
+    while i < lanes {
+        let s = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+        let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
+        let p = ghash_mul_x4(ab, s);
+        _mm512_storeu_si512(acc.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, p));
+        i += 4;
+    }
+    while i < n {
+        acc[i] += alpha * src[i];
+        i += 1;
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
@@ -4027,18 +4056,34 @@ impl SumcheckProver {
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
-            for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
-                *acc += alpha * v;
+        let n = self.combined_basis.len();
+
+        // AVX-512: 4-wide α·v + XOR into acc (same ghash_mul_x4 as NTT/msg paths).
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        {
+            // SAFETY: features cfg-guaranteed.
+            unsafe {
+                scale_add_axpy_avx512(&mut self.combined_basis, &b_new, alpha);
             }
-        } else {
-            self.combined_basis
-                .par_iter_mut()
-                .zip(b_new.par_iter())
-                .with_min_len(PAR_THRESHOLD / 4)
-                .for_each(|(acc, &v)| *acc += alpha * v);
+            self.t_r += alpha * h_new;
+            return;
         }
-        self.t_r += alpha * h_new;
+
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        {
+            if n < PAR_THRESHOLD {
+                for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
+                    *acc += alpha * v;
+                }
+            } else {
+                self.combined_basis
+                    .par_iter_mut()
+                    .zip(b_new.par_iter())
+                    .with_min_len(PAR_THRESHOLD / 4)
+                    .for_each(|(acc, &v)| *acc += alpha * v);
+            }
+            self.t_r += alpha * h_new;
+        }
     }
 
     pub fn f(&self) -> &[F128] {
