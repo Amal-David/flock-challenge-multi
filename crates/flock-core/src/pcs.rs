@@ -192,17 +192,35 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
-        lig_config,
-        packed_witness,
-        combined.b_combined,
-        combined.target_combined,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
-        combined.round0_prime,
-        fold_arena,
-        challenger,
-    );
+    let ligerito_proof = if let Some(direct) = combined.direct_fold2 {
+        ligerito::recursive_prover_with_basis_direct_ab_fold2(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            direct,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            combined
+                .round1_lookahead
+                .expect("direct AB fold2 requires round-1 lookahead"),
+            fold_arena,
+            challenger,
+        )
+    } else {
+        ligerito::recursive_prover_with_basis_precomputed_round0(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            fold_arena,
+            challenger,
+        )
+    };
     crate::gaptime::mark("open: ligerito recursive prover done");
     if trace {
         eprintln!(
@@ -229,6 +247,101 @@ struct CombinedClaim {
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
+    /// Round-1 message as two quadratics in the first challenge.
+    round1_lookahead: Option<[F128; 6]>,
+    /// AB sufficient statistics for direct materialization after rounds 0/1.
+    /// `b_combined` contains the ordinary C contribution only.
+    direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
+}
+
+/// Compute the ordinary round-zero message and the following message as two
+/// quadratics in the first challenge.
+#[cfg(test)]
+fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(4));
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    let mut c = [F128::ZERO; 6];
+    for i in (0..witness.len()).step_by(4) {
+        let a0 = witness[i];
+        let a1 = witness[i + 1];
+        let a2 = witness[i + 2];
+        let a3 = witness[i + 3];
+        let b0 = basis[i];
+        let b1 = basis[i + 1];
+        let b2 = basis[i + 2];
+        let b3 = basis[i + 3];
+        let sa0 = a0 + a1;
+        let sb0 = b0 + b1;
+        let sa1 = a2 + a3;
+        let sb1 = b2 + b3;
+        let p_even0 = a0 * b0;
+        let p_sum0 = sa0 * sb0;
+        u0 += p_even0 + a2 * b2;
+        u2 += p_sum0 + sa1 * sb1;
+        c[0] += p_even0;
+        c[1] += a1 * b1 + p_even0 + p_sum0;
+        c[2] += p_sum0;
+        let e_a = a0 + a2;
+        let e_b = b0 + b2;
+        let se_a = sa0 + sa1;
+        let se_b = sb0 + sb1;
+        let p_even = e_a * e_b;
+        let p_sum = se_a * se_b;
+        let p_odd = (se_a + e_a) * (se_b + e_b);
+        c[3] += p_even;
+        c[4] += p_odd + p_even + p_sum;
+        c[5] += p_sum;
+    }
+    ((u0, u2), c)
+}
+
+fn messages_from_direct_products(
+    products: &[ring_switch::DirectFold2Factors],
+) -> ((F128, F128), [F128; 6]) {
+    let mut h = [F128::ZERO; 16];
+    for claim in products {
+        for (out, value) in h.iter_mut().zip(claim.products) {
+            *out += value;
+        }
+    }
+    let at = |e: usize, d: usize| h[4 * e + d];
+    let block_sum = |es: &[usize], ds: &[usize]| {
+        let mut sum = F128::ZERO;
+        for &e in es {
+            for &d in ds {
+                sum += at(e, d);
+            }
+        }
+        sum
+    };
+    let round0 = (
+        at(0, 0) + at(2, 2),
+        block_sum(&[0, 1], &[0, 1]) + block_sum(&[2, 3], &[2, 3]),
+    );
+    let lookahead = [
+        at(0, 0),
+        at(0, 1) + at(1, 0),
+        block_sum(&[0, 1], &[0, 1]),
+        block_sum(&[0, 2], &[0, 2]),
+        block_sum(&[0, 2], &[1, 3]) + block_sum(&[1, 3], &[0, 2]),
+        block_sum(&[0, 1, 2, 3], &[0, 1, 2, 3]),
+    ];
+    (round0, lookahead)
+}
+
+#[inline]
+fn direct_ab_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold2.is_some()
+                && c.direct_fold2.is_none()
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
 }
 
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
@@ -259,7 +372,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
-    let (rs_results, gammas_rs): (
+    let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
@@ -311,11 +424,39 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined += *g * pd.value;
     }
 
+    // Production-only x86 route: retain AB as four low-coordinate banks and
+    // materialize it only after the first two sumcheck challenges. C remains
+    // on the incumbent deferred-dense combine path.
+    let use_direct_ab = cfg!(target_arch = "x86_64")
+        && l == (1usize << 25)
+        && n_rs == 2
+        && n_pd == 0
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && direct_ab_claim_mix_supported(&rs_results);
+    let direct_fold2 = if use_direct_ab {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct AB gate checked claim zero"),
+        ])
+    } else {
+        None
+    };
+    let direct_count = usize::from(direct_fold2.is_some());
+
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
-        .filter_map(|(_, o)| match &o.rs_eq_ind {
-            ring_switch::RsEqInd::Dense(v) => Some(v.as_slice()),
-            _ => None,
+        .enumerate()
+        .filter_map(|(index, (_, output))| {
+            if use_direct_ab && index == 0 {
+                return None;
+            }
+            match &output.rs_eq_ind {
+                ring_switch::RsEqInd::Dense(values) => Some(values.as_slice()),
+                _ => None,
+            }
         })
         .collect();
     // Deferred-dense claims (fused fast path): the per-claim `γ_k·B_k` buffer
@@ -324,18 +465,24 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // claim. Carries (eq_lo, eq_hi, γ-baked table, log₂ B).
     let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = rs_results
         .iter()
-        .filter_map(|(_, o)| match &o.rs_eq_ind {
-            ring_switch::RsEqInd::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => Some((
-                eq_lo.as_slice(),
-                eq_hi.as_slice(),
-                table.as_slice(),
-                eq_lo.len().trailing_zeros() as usize,
-            )),
-            _ => None,
+        .enumerate()
+        .filter_map(|(index, (_, output))| {
+            if use_direct_ab && index == 0 {
+                return None;
+            }
+            match &output.rs_eq_ind {
+                ring_switch::RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => Some((
+                    eq_lo.as_slice(),
+                    eq_hi.as_slice(),
+                    table.as_slice(),
+                    eq_lo.len().trailing_zeros() as usize,
+                )),
+                _ => None,
+            }
         })
         .collect();
     let pd_dense: Vec<(&[F128], F128)> = packed_direct
@@ -365,10 +512,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // incremental round-0 prime adjustment), so they only require
     // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
     // big ab/c claims on the fused fold instead of materializing them.
-    let use_fast =
-        !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
+    let use_fast = !rs_deferred.is_empty()
+        && rs_deferred.len() + direct_count == rs_results.len()
+        && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = in_wide_combine_pool(l, || if use_fast {
+    let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
+        in_wide_combine_pool(l, || if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -410,8 +559,23 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b)
         };
         #[cfg(not(target_arch = "aarch64"))]
-        let prime = fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b);
-        prime
+        let (prime, lookahead) = if use_direct_ab {
+            let (prime, lookahead) = fused_fast_combine_lookahead(
+                &mut b_combined,
+                packed_witness,
+                &rs_deferred,
+                b,
+            );
+            (prime, Some(lookahead))
+        } else {
+            (
+                fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b),
+                None,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let lookahead = None;
+        (prime, lookahead)
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
@@ -457,9 +621,21 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         for v in materialized {
             crate::scratch::give_f128(v);
         }
-        prime
+        (prime, None)
     });
     crate::gaptime::mark("open: combine kernel done");
+
+    if let Some(direct) = direct_fold2.as_ref() {
+        let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
+        round0_u0 += direct_round0.0;
+        round0_u2 += direct_round0.1;
+        let combined_lookahead = round1_lookahead
+            .as_mut()
+            .expect("direct AB gate requires ordinary C lookahead");
+        for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
+            *out += value;
+        }
+    }
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];
@@ -513,6 +689,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         b_combined,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        round1_lookahead,
+        direct_fold2,
     }
 }
 
@@ -580,6 +758,102 @@ fn fused_fast_combine(
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+}
+
+/// Direct-AB variant of [`fused_fast_combine`]. In addition to writing the
+/// ordinary (C) basis and its round-zero message, accumulate the round-one
+/// message as two quadratics in the first challenge. Groups of four are used
+/// so no extra pass over the full witness/basis is needed.
+fn fused_fast_combine_lookahead(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> ((F128, F128), [F128; 6]) {
+    use rayon::prelude::*;
+    debug_assert!(b >= 4 && b.is_multiple_of(4));
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map(|(hi, out_block)| {
+            let last = rs_deferred.len() - 1;
+            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred[..last].iter().enumerate() {
+                let e_hi = eq_hi[hi];
+                if ci == 0 {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                } else {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                }
+            }
+
+            let (eq_lo, eq_hi, table, _) = rs_deferred[last];
+            let e_hi = eq_hi[hi];
+            let base = hi * b;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut c = [F128::ZERO; 6];
+            for t in 0..(b / 4) {
+                let i = 4 * t;
+                let v0 = ring_switch::fold_one_slot(eq_lo[i] * e_hi, table);
+                let v1 = ring_switch::fold_one_slot(eq_lo[i + 1] * e_hi, table);
+                let v2 = ring_switch::fold_one_slot(eq_lo[i + 2] * e_hi, table);
+                let v3 = ring_switch::fold_one_slot(eq_lo[i + 3] * e_hi, table);
+                let (b0, b1, b2, b3) = if last == 0 {
+                    (v0, v1, v2, v3)
+                } else {
+                    (
+                        out_block[i] + v0,
+                        out_block[i + 1] + v1,
+                        out_block[i + 2] + v2,
+                        out_block[i + 3] + v3,
+                    )
+                };
+                out_block[i] = b0;
+                out_block[i + 1] = b1;
+                out_block[i + 2] = b2;
+                out_block[i + 3] = b3;
+
+                let a0 = packed_witness[base + i];
+                let a1 = packed_witness[base + i + 1];
+                let a2 = packed_witness[base + i + 2];
+                let a3 = packed_witness[base + i + 3];
+                let sa0 = a0 + a1;
+                let sb0 = b0 + b1;
+                let sa1 = a2 + a3;
+                let sb1 = b2 + b3;
+                let p_even0 = a0 * b0;
+                let p_sum0 = sa0 * sb0;
+                u0 += p_even0 + a2 * b2;
+                u2 += p_sum0 + sa1 * sb1;
+                c[0] += p_even0;
+                c[1] += a1 * b1 + p_even0 + p_sum0;
+                c[2] += p_sum0;
+                let e_a = a0 + a2;
+                let e_b = b0 + b2;
+                let se_a = sa0 + sa1;
+                let se_b = sb0 + sb1;
+                let p_even = e_a * e_b;
+                let p_sum = se_a * se_b;
+                let p_odd = (se_a + e_a) * (se_b + e_b);
+                c[3] += p_even;
+                c[4] += p_odd + p_even + p_sum;
+                c[5] += p_sum;
+            }
+            ((u0, u2), c)
+        })
+        .reduce(
+            || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
+            |((x0, x2), mut xc), ((y0, y2), yc)| {
+                for (x, y) in xc.iter_mut().zip(yc) {
+                    *x += y;
+                }
+                ((x0 + y0, x2 + y2), xc)
+            },
         )
 }
 
@@ -1140,6 +1414,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn combine_lookahead_matches_materialized_oracle() {
+        let mut rng = Rng::new(0xD1CE_C001);
+        for &(b, n_hi, n_claims) in &[(16usize, 8usize, 1usize), (64, 4, 2)] {
+            let l = b * n_hi;
+            let packed_witness: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let claims: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..n_claims)
+                .map(|_| {
+                    let eq_lo: Vec<F128> = (0..b).map(|_| rng.f128()).collect();
+                    let eq_hi: Vec<F128> = (0..n_hi).map(|_| rng.f128()).collect();
+                    let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+                    (
+                        eq_lo,
+                        eq_hi,
+                        ring_switch::build_fold_byte_table(&eq_r_dprime),
+                    )
+                })
+                .collect();
+            let deferred: Vec<(&[F128], &[F128], &[F128], usize)> = claims
+                .iter()
+                .map(|(lo, hi, table)| {
+                    (
+                        lo.as_slice(),
+                        hi.as_slice(),
+                        table.as_slice(),
+                        b.trailing_zeros() as usize,
+                    )
+                })
+                .collect();
+            let mut got_basis = vec![F128::ZERO; l];
+            let (got_round0, got_lookahead) = fused_fast_combine_lookahead(
+                &mut got_basis,
+                &packed_witness,
+                &deferred,
+                b,
+            );
+            let mut want_basis = vec![F128::ZERO; l];
+            let want_round0 =
+                fused_fast_combine(&mut want_basis, &packed_witness, &deferred, b);
+            let (oracle_round0, oracle_lookahead) =
+                round0_and_round1_lookahead(&packed_witness, &want_basis);
+            assert_eq!(got_basis, want_basis);
+            assert_eq!(got_round0, want_round0);
+            assert_eq!(got_round0, oracle_round0);
+            assert_eq!(got_lookahead, oracle_lookahead);
+        }
+    }
+
+    #[test]
+    fn direct_products_reproduce_round0_and_lookahead() {
+        let mut rng = Rng::new(0xD1CE_0002);
+        let mut witness = [F128::ZERO; 4];
+        let mut basis = [F128::ZERO; 4];
+        for value in witness.iter_mut().chain(basis.iter_mut()) {
+            *value = rng.f128();
+        }
+        let mut products = [F128::ZERO; 16];
+        for e in 0..4 {
+            for d in 0..4 {
+                products[4 * e + d] = witness[e] * basis[d];
+            }
+        }
+        let factors = ring_switch::DirectFold2Factors {
+            eq_lo: Vec::new(),
+            eq_hi: Vec::new(),
+            low_eq: [F128::ZERO; 4],
+            table: Vec::new(),
+            products,
+        };
+        assert_eq!(
+            messages_from_direct_products(&[factors]),
+            round0_and_round1_lookahead(&witness, &basis),
+        );
     }
 
     /// Oracle: `fused_fast_combine_merged_nt` must produce byte-identical

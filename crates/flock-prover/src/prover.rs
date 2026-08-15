@@ -33,6 +33,14 @@ use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
+#[inline]
+fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    cfg!(target_arch = "x86_64")
+        && r1cs.m == 32
+        && r1cs.k_log >= pcs::LOG_PACKING + 2
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+}
+
 enum FastLincheckInput {
     Stripe(Vec<u8>),
     BlockMajor,
@@ -249,7 +257,12 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -758,7 +771,12 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
@@ -968,7 +986,12 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(
             &z_vec_pre,
             &lc_claim.r_inner_rest[1..],
