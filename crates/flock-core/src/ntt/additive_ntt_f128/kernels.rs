@@ -183,6 +183,42 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// Out-of-place fused-four-layer row group: source rows from `src`, output
+/// rows to `dst` (one rate-1/2 codeword half; layer-0 replication implicit).
+///
+/// # Safety
+/// The caller must ensure the 16 row slices selected by `r` are valid in both
+/// buffers and that no other thread touches the selected `dst` rows.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features guaranteed by cfg; caller owns the geometry.
+    unsafe {
+        x86_64::butterfly_fused_4layer_row_from(src, dst, sixteenth, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_4layer_row_from(src, dst, sixteenth, num_ntts, r, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

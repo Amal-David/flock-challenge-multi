@@ -323,6 +323,15 @@ impl AdditiveNttF128 {
         assert_eq!(msg.len() / num_ntts, 1usize << (log_d - log_inv_rate));
         assert!(log_d <= self.log_domain_size());
 
+        // x86: seed fused through layer 4 — one fewer full-codeword
+        // read+write pass than the 2-layer seed (the {3,4} top sweep).
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        if log_inv_rate == 1 && log_d >= 14 && !rate_half_seed_disabled() {
+            self.seed_rate_half_layers_1_through_4(msg, codeword, num_ntts);
+            self.forward_transform_interleaved_from_layer(codeword, num_ntts, 5);
+            return;
+        }
+
         #[cfg(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -366,6 +375,22 @@ impl AdditiveNttF128 {
         assert!(log_inv_rate <= log_d);
         assert_eq!(msg.len() / num_ntts, 1usize << (log_d - log_inv_rate));
         assert!(log_d <= self.log_domain_size());
+
+        // x86: fused-through-layer-4 seed (see `rs_encode_interleaved`); the
+        // streamed range-done contract is unaffected — leaf ranges finalize
+        // in the deep pass, which starts at layer 5 instead of 3.
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        if log_inv_rate == 1 && log_d >= 14 && !rate_half_seed_disabled() {
+            self.seed_rate_half_layers_1_through_4(msg, codeword, num_ntts);
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                5,
+                None,
+                Some(on_range_done),
+            );
+            return;
+        }
 
         #[cfg(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -584,6 +609,83 @@ impl AdditiveNttF128 {
             }
         } else {
             (0..quarter).into_par_iter().for_each(seed_row);
+        }
+    }
+
+    /// Rate-1/2 seed fused through NTT layer FOUR: reads each message row
+    /// group once and writes each codeword-half row group once, replacing
+    /// `seed_rate_half_layers_1_through_2` + one full fused-2 codeword pass
+    /// (the {3,4} top pass) — i.e. one fewer full-codeword read+write sweep
+    /// (~2 GiB at the ranked m=32 shape). Caller continues with
+    /// `from_layer(5)`. Byte-identical to the layer-1..4 prefix of the
+    /// in-place schedule: same butterfly network, same twiddle tree, XOR
+    /// algebra order-free within each 16-row group.
+    ///
+    /// Activated on x86 only (aarch64 keeps its tuned NT 2-layer seed);
+    /// compiled under the same dual cfg as the 2-layer seed so the
+    /// byte-identity oracle also runs on aarch64 via the portable kernel.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn seed_rate_half_layers_1_through_4(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(codeword.len(), 2 * msg.len());
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert!(msg_positions >= 16 && msg_positions.is_power_of_two());
+        let sixteenth = msg_positions >> 4;
+
+        // Per-half twiddle trees for layers 1..=4 in the fused-4 kernel's
+        // order: [L1] ++ [L2 s=0..2] ++ [L3 s=0..4] ++ [L4 s=0..8].
+        let mut twiddles = [[F128::ZERO; 15]; 2];
+        for (block, tw) in twiddles.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(3, 4 * block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = self.twiddle(4, 8 * block + s);
+            }
+        }
+
+        let src = msg.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        let msg_len = msg.len();
+        let seed_row = |r| unsafe {
+            kernels::butterfly_fused_4layer_row_from(
+                src as *const F128,
+                dst as *mut F128,
+                sixteenth,
+                num_ntts,
+                r,
+                &twiddles[0],
+            );
+            kernels::butterfly_fused_4layer_row_from(
+                src as *const F128,
+                (dst as *mut F128).add(msg_len),
+                sixteenth,
+                num_ntts,
+                r,
+                &twiddles[1],
+            );
+        };
+
+        const PARALLEL_ROW_THRESHOLD_4: usize = 64;
+        if sixteenth < PARALLEL_ROW_THRESHOLD_4 {
+            for r in 0..sixteenth {
+                seed_row(r);
+            }
+        } else {
+            (0..sixteenth).into_par_iter().for_each(seed_row);
         }
     }
 
@@ -2003,6 +2105,45 @@ mod tests {
             assert_eq!(
                 encoded, oracle,
                 "x86 direct seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
+            );
+        }
+    }
+
+    /// Fused-through-layer-4 seed (+ `from_layer(5)`) matches the scalar
+    /// zero-padded full NTT — covers the portable kernel everywhere and the
+    /// AVX-512 `butterfly_fused_4layer_row_from` on x86, over multiple
+    /// geometries including one past the `log_d >= 14` activation gate.
+    #[test]
+    fn rate_half_layer4_seed_matches_full_ntt() {
+        let mut rng = Rng::new(0xD1EC8);
+        for (log_d, num_ntts, threads) in [
+            (5usize, 1usize, 1usize),
+            (6, 2, 1),
+            (8, 8, 1),
+            (12, 64, 4),
+            (14, 4, 4),
+        ] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> 1;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut encoded = junk_vec(codeword_len);
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    ntt.seed_rate_half_layers_1_through_4(&msg, &mut encoded, num_ntts);
+                    ntt.forward_transform_interleaved_from_layer(&mut encoded, num_ntts, 5);
+                });
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "layer-4 seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
             );
         }
     }

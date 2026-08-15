@@ -95,8 +95,43 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         v.set_len(n);
     }
+    advise_huge_pages(v.as_ptr() as *const u8, n * core::mem::size_of::<T>());
     v
 }
+
+/// Ask the kernel for transparent huge pages on a large, still-untouched
+/// allocation. Ubuntu ships THP in `madvise` mode, so without this every
+/// multi-GiB prover buffer sits on 4 KiB pages (m=32 parks ≈10.5 GiB ≈ 2.7 M
+/// pages against a ~2K-entry STLB). Calling before first touch lets the
+/// fault handler install 2 MiB pages directly. Purely advisory: cache/TLB
+/// placement only, no effect on any computed byte; errors are ignored.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(ptr: *const u8, bytes: usize) {
+    const HUGE_THRESHOLD: usize = 8 << 20;
+    const MADV_HUGEPAGE: i32 = 14;
+    const PAGE: usize = 4096;
+    if bytes < HUGE_THRESHOLD {
+        return;
+    }
+    // Cargo.lock is frozen and `libc` is not a dependency of this crate, so
+    // declare the syscall wrapper directly.
+    unsafe extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+    }
+    let addr = ptr as usize;
+    let aligned = addr.next_multiple_of(PAGE);
+    let end = (addr + bytes) & !(PAGE - 1);
+    if end > aligned {
+        // SAFETY: [aligned, end) lies inside the freshly reserved allocation;
+        // madvise with MADV_HUGEPAGE never invalidates or alters contents.
+        unsafe {
+            let _ = madvise(aligned as *mut core::ffi::c_void, end - aligned, MADV_HUGEPAGE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_ptr: *const u8, _bytes: usize) {}
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
 pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {

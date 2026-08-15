@@ -168,26 +168,52 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
-        for lane in (0..ELL).step_by(4) {
-            let mut cf_ab = [F128::ZERO; 4];
-            let mut cf_c_0 = [F128::ZERO; 4];
-            let mut cf_c_1 = [F128::ZERO; 4];
-            for b_med in 0..n_b_med {
-                let table_base = b_med * 256;
-                for j in 0..4 {
-                    let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
-                    let v_c = chunk_c_bytes[b_med][lane + j] as usize;
-                    cf_ab[j] += convert[table_base + v_ab];
-                    cf_c_0[j] += convert[table_base + (v_c & 0x55)];
-                    cf_c_1[j] += convert[table_base + (v_c & 0xAA)];
-                }
+        // Bank-major sweep: hold ONE 4 KiB convert bank L1-hot across all 64
+        // lanes instead of walking the whole table (up to 16 banks = 64 KiB,
+        // larger than Sapphire Rapids' 48 KiB L1d) once per four-lane group.
+        // Live working set per bank iteration: 4 KiB bank + 3 KiB stack
+        // accumulators + 128 index bytes. The XOR sums are order-free and the
+        // per-lane eq multiply still happens exactly once after all banks —
+        // bit-identical output to the lane-major nest.
+        let mut cf_ab = [F128::ZERO; ELL];
+        let mut cf_c_0 = [F128::ZERO; ELL];
+        let mut cf_c_1 = [F128::ZERO; ELL];
+        for b_med in 0..n_b_med {
+            let table_base = b_med * 256;
+            let ab_bytes = &chunk_ab_bytes[b_med];
+            let c_bytes = &chunk_c_bytes[b_med];
+            for lane in 0..ELL {
+                let v_ab = ab_bytes[lane] as usize;
+                let v_c = c_bytes[lane] as usize;
+                cf_ab[lane] += convert[table_base + v_ab];
+                cf_c_0[lane] += convert[table_base + (v_c & 0x55)];
+                cf_c_1[lane] += convert[table_base + (v_c & 0xAA)];
             }
+        }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
-            let scaled_c_0 =
-                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
-            let scaled_c_1 =
-                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
+        for lane in (0..ELL).step_by(4) {
+            let scaled_ab = ghash_mul_x4(
+                f128x4_set(cf_ab[lane], cf_ab[lane + 1], cf_ab[lane + 2], cf_ab[lane + 3]),
+                eq,
+            );
+            let scaled_c_0 = ghash_mul_x4(
+                f128x4_set(
+                    cf_c_0[lane],
+                    cf_c_0[lane + 1],
+                    cf_c_0[lane + 2],
+                    cf_c_0[lane + 3],
+                ),
+                eq,
+            );
+            let scaled_c_1 = ghash_mul_x4(
+                f128x4_set(
+                    cf_c_1[lane],
+                    cf_c_1[lane + 1],
+                    cf_c_1[lane + 2],
+                    cf_c_1[lane + 3],
+                ),
+                eq,
+            );
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;

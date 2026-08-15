@@ -188,3 +188,35 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         }
     }
 }
+
+/// Out-of-place fused-four-layer row group: reads the 16 source rows from
+/// `src` and writes the butterflied rows to `dst` (one codeword half whose
+/// layer-0 value equals the message — rate-1/2 replication is implicit in
+/// reading `src` directly).
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+pub(super) unsafe fn butterfly_fused_4layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * sixteenth + r) * num_ntts + lane);
+            }
+            butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * sixteenth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}

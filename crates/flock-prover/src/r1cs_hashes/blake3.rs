@@ -1710,14 +1710,17 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
-                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
+                // x86 ranked path: witness emits z/a/b only. The round-1 AB
+                // projection (`Round1AbInner`, 512 MiB at m=32) existed to
+                // feed the Apple-GPU URM split; with `gpu::urm::planned_g`
+                // stubbed to 0 on x86, round 1 recomputes its windows from
+                // a/b in the AVX-512 shift-reduce kernels instead — one
+                // fewer 512 MiB store+RFO stream inside the timed window.
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner(
-                                blocks,
-                                self.n_blocks_log(),
-                            )
+                            generate_witness_with_ab_packed(blocks, self.n_blocks_log())
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
@@ -1725,13 +1728,12 @@ impl Blake3Setup {
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
-                crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                crate::prover::prove_fast_ligerito_from_block_major_witness(
                     &self.r1cs,
                     &self.pcs_params,
                     z_packed,
                     a_packed_f128,
                     b_packed_f128,
-                    ab_inner,
                     lc_circuit,
                     codeword,
                     challenger,
