@@ -1717,14 +1717,15 @@ pub(crate) fn build_direct_fold2_table(
 ) -> Vec<F128> {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
     let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+    // Four independent mul_by_x chains (one per low_eq bank), then XOR-sum.
+    // Φ = fold_one_slot is only F2-linear on bits — do NOT pull fold_weight
+    // through Φ.
     let mut generators = [F128::ZERO; 128];
-    // X^bit * low_eq[d] is iterated mul_by_x from low_eq[d] (same chain as
-    // compose_block_table). Φ = fold_one_slot is only F2-linear on bits —
-    // do NOT pull fold_weight[d] through Φ.
     for d in 0..4 {
         let mut w = low_eq[d];
+        let fw = fold_weight[d];
         for generator in generators.iter_mut() {
-            *generator += fold_weight[d] * fold_one_slot(w, base);
+            *generator += fw * fold_one_slot(w, base);
             w = crate::field::mul_by_x(w);
         }
     }
