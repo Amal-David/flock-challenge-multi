@@ -47,17 +47,34 @@ pub mod zerocheck;
 /// code runs (rayon's global pool is set on first use; if it's already
 /// created, this call is a no-op).
 ///
-/// Respects `RAYON_NUM_THREADS` — if that env var is set, this function
-/// does nothing (so explicit user configuration always wins).
+/// Respects `RAYON_NUM_THREADS` on macOS and other non-Linux-x86_64 targets —
+/// if that env var is set there, this function does nothing (so explicit user
+/// configuration always wins).
+///
+/// On Linux/x86_64 the physical-core count wins even when `RAYON_NUM_THREADS`
+/// is set: the doc on [`perf_core_count`] records that SMT siblings share the
+/// core's execution ports and add no DRAM bandwidth on the CLMUL-heavy hot
+/// phases (a 32C/64T Threadripper proves ~16% faster at 32 threads than 64),
+/// so a logical-CPU thread count from the environment over-subscribes the
+/// physical cores. When the env var requests *fewer* threads than the
+/// physical-core count, the smaller value is kept.
 ///
 /// Returns the number of threads the pool was configured with, or `None`
-/// if no change was made (either because the env var was set or because
+/// if no change was made (either because the env var was honored or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+    let env_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    if env_threads.is_some() {
         return None;
     }
-    let n = perf_core_count();
+    let mut n = perf_core_count();
+    if let Some(e) = env_threads {
+        n = n.min(e);
+    }
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .build_global()
