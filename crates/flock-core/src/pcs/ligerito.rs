@@ -3088,8 +3088,13 @@ fn materialize_direct_ab_fold2(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || vec![F128::ZERO; claims.len() * table_len],
-            |scratch, (block, (b_out, f_out))| {
+            || {
+                (
+                    vec![F128::ZERO; claims.len() * table_len],
+                    vec![F128::ZERO; 2 * block_len],
+                )
+            },
+            |(scratch, fold_mid), (block, (b_out, f_out))| {
                 // Production 2-claim table-hot path composes inside each phase.
                 if claims.len() != 2 {
                     for (claim_index, (claim, direct_table)) in
@@ -3106,6 +3111,15 @@ fn materialize_direct_ab_fold2(
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = (!ordinary_basis.is_empty())
                     .then(|| &ordinary_basis[start..start + 4 * block_len]);
+                // Nested pair-folds, same algebra as the old scalar fold4:
+                //   low  = a0 + r0*(a0+a1)
+                //   high = a2 + r0*(a2+a3)
+                //   out  = low + r1*(low+high)
+                // Two fold_pairs passes (AVX-512 / NEON / portable). Mid is
+                // 2*block_len (always 0 mod 4); dest is f_out only. Not the
+                // independent-muls fold_weight form.
+                crate::field::f128_slice::fold_pairs(f_in, 0, fold_mid, r0);
+                crate::field::f128_slice::fold_pairs(fold_mid, 0, f_out, r1);
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
@@ -3116,26 +3130,23 @@ fn materialize_direct_ab_fold2(
                     low + r1 * (low + high)
                 };
                 if let [only] = claims {
-                    // Single-claim specialization.
+                    // Single-claim specialization. f_out already written.
                     let table = &scratch[..table_len];
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
-                        let f0 = fold4(f_in, slot0);
-                        let f1 = fold4(f_in, slot1);
                         let b0 = super::ring_switch::fold_one_slot(only.eq_lo[slot0], table)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
                         let b1 = super::ring_switch::fold_one_slot(only.eq_lo[slot1], table)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
-                        f_out[slot0] = f0;
-                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
                 } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
                     // Table-hot two-phase: only one 64 KiB composed table live.
-                    // Phase 1: first table hot → store f + partial b.
+                    // f_out already written by the nested pair-folds above.
+                    // Phase 1: first table hot → partial b.
                     // Phase 2: second table hot → complete b.
                     // Algebra identical to interleaved original.
                     let table = &mut scratch[..table_len];
@@ -3145,12 +3156,8 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
-                        let f0 = fold4(f_in, slot0);
-                        let f1 = fold4(f_in, slot1);
                         let b0 = super::ring_switch::fold_one_slot(first.eq_lo[slot0], table);
                         let b1 = super::ring_switch::fold_one_slot(first.eq_lo[slot1], table);
-                        f_out[slot0] = f0;
-                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
@@ -3171,8 +3178,6 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
-                        let f0 = fold4(f_in, slot0);
-                        let f1 = fold4(f_in, slot1);
                         let direct_at = |slot: usize| {
                             claims
                                 .iter()
@@ -3190,8 +3195,6 @@ fn materialize_direct_ab_fold2(
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
                         let b1 = direct_at(slot1)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
-                        f_out[slot0] = f0;
-                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
@@ -6395,10 +6398,87 @@ mod tests {
         partial_eval_lsb_one(&mut want_b, r1);
         let want_msg = round_msg_lsb(&want_f, &want_b);
         let (got_f, got_b, got_msg) =
-            materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
+            materialize_direct_ab_fold2(f.clone(), ordinary_c, &direct, r0, r1);
         assert_eq!(got_f, want_f);
         assert_eq!(got_b, want_b);
         assert_eq!(got_msg, want_msg);
+
+        // fold4 dest is two nested pair-folds, not the independent-muls form.
+        let mut mid = vec![F128::ZERO; n / 2];
+        let mut via_pairs = vec![F128::ZERO; n / 4];
+        crate::field::f128_slice::fold_pairs(&f, 0, &mut mid, r0);
+        crate::field::f128_slice::fold_pairs(&mid, 0, &mut via_pairs, r1);
+        let mut via_scalar = vec![F128::ZERO; n / 4];
+        for (t, slot) in via_scalar.iter_mut().enumerate() {
+            let a0 = f[4 * t];
+            let a1 = f[4 * t + 1];
+            let a2 = f[4 * t + 2];
+            let a3 = f[4 * t + 3];
+            let low = a0 + r0 * (a0 + a1);
+            let high = a2 + r0 * (a2 + a3);
+            *slot = low + r1 * (low + high);
+        }
+        assert_eq!(via_pairs, via_scalar);
+        assert_eq!(got_f, via_scalar);
+    }
+
+    #[test]
+    fn direct_ab_fold4_two_claim_dest_matches_nested_pair_folds() {
+        let mut state = 0xA11C_E55_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(17))
+        };
+        let n = 1usize << 8;
+        let f: Vec<F128> = (0..n).map(|_| random()).collect();
+        let r0 = random();
+        let r1 = random();
+        let make_claim = |suffix: &[F128], scaled_rdp: &[F128]| {
+            let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[2..], 3);
+            super::super::ring_switch::DirectFold2Factors {
+                eq_lo,
+                eq_hi,
+                low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
+                table: super::super::ring_switch::build_fold_byte_table(scaled_rdp),
+                products: None,
+            }
+        };
+        let suffix_ab: Vec<F128> = (0..8).map(|_| random()).collect();
+        let suffix_c: Vec<F128> = (0..8).map(|_| random()).collect();
+        let scaled_ab: Vec<F128> = build_eq_table(
+            &(0..crate::pcs::LOG_PACKING)
+                .map(|_| random())
+                .collect::<Vec<_>>(),
+        );
+        let scaled_c: Vec<F128> = build_eq_table(
+            &(0..crate::pcs::LOG_PACKING)
+                .map(|_| random())
+                .collect::<Vec<_>>(),
+        );
+        let direct = vec![
+            make_claim(&suffix_ab, &scaled_ab),
+            make_claim(&suffix_c, &scaled_c),
+        ];
+        let (got_f, _got_b, _got_msg) =
+            materialize_direct_ab_fold2(f.clone(), Vec::new(), &direct, r0, r1);
+        let mut mid = vec![F128::ZERO; n / 2];
+        let mut via_pairs = vec![F128::ZERO; n / 4];
+        crate::field::f128_slice::fold_pairs(&f, 0, &mut mid, r0);
+        crate::field::f128_slice::fold_pairs(&mid, 0, &mut via_pairs, r1);
+        let mut via_scalar = vec![F128::ZERO; n / 4];
+        for (t, slot) in via_scalar.iter_mut().enumerate() {
+            let a0 = f[4 * t];
+            let a1 = f[4 * t + 1];
+            let a2 = f[4 * t + 2];
+            let a3 = f[4 * t + 3];
+            let low = a0 + r0 * (a0 + a1);
+            let high = a2 + r0 * (a2 + a3);
+            *slot = low + r1 * (low + high);
+        }
+        assert_eq!(via_pairs, via_scalar);
+        assert_eq!(got_f, via_scalar);
     }
 
     #[test]

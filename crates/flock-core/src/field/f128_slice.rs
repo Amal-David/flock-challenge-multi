@@ -98,6 +98,49 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Two nested pair-folds match the scalar fold4 `even + r*(even+odd)` twice,
+    /// including a second-pass dest whose length is only even (portable tail).
+    #[test]
+    fn nested_fold_pairs_matches_scalar_fold4() {
+        let mut state = 0xC0FF_EE11_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let src: Vec<F128> = (0..40)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r0 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let r1 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for n in [1usize, 2, 3, 6, 8, 10] {
+            let mut mid = vec![F128::ZERO; 2 * n];
+            let mut got = vec![F128::ZERO; n];
+            fold_pairs(&src, 0, &mut mid, r0);
+            fold_pairs(&mid, 0, &mut got, r1);
+            for t in 0..n {
+                let a0 = src[4 * t];
+                let a1 = src[4 * t + 1];
+                let a2 = src[4 * t + 2];
+                let a3 = src[4 * t + 3];
+                let low = a0 + r0 * (a0 + a1);
+                let high = a2 + r0 * (a2 + a3);
+                let expect = low + r1 * (low + high);
+                assert_eq!(got[t], expect, "n={n} t={t}");
+            }
+        }
+    }
+
     /// Portable one-mul leaf is bit-identical to the two-mul formula.
     #[test]
     fn portable_fold_pairs_matches_two_mul() {
