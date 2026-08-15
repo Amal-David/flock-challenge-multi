@@ -2740,37 +2740,63 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
 
-    const PAR_THRESHOLD: usize = 4096;
-    let half = n / 2;
-    let term = |j: usize| -> (F128, F128, F128) {
-        let f0 = f[2 * j];
-        let f1 = f[2 * j + 1];
-        let b0 = b[2 * j];
-        let b1 = b[2 * j + 1];
-        let e0 = f0 * b0;
-        // (u_0 term, u_2 term, y term = f0·b0 + f1·b1).
-        (e0, (f0 + f1) * (b0 + b1), e0 + f1 * b1)
-    };
-    if half < PAR_THRESHOLD {
-        let (mut u_0, mut u_2, mut y) = (F128::ZERO, F128::ZERO, F128::ZERO);
-        for j in 0..half {
-            let (a0, a2, ay) = term(j);
-            u_0 += a0;
-            u_2 += a2;
-            y += ay;
+    // AVX-512 fused path: one VPCLMUL pass for (u0, u2, y).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        const PAR_THRESHOLD: usize = 4096;
+        if n < PAR_THRESHOLD {
+            // SAFETY: features cfg-guaranteed; n even and >= 2.
+            let (u_0, u_2, y) = unsafe { msg_reduce_and_eval_avx512(f, b) };
+            return (SumcheckMessage { u_0, u_2 }, y);
         }
+        const CHUNK: usize = 2048;
+        let (u_0, u_2, y) = f
+            .par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .map(|(fc, bc)| {
+                // SAFETY: equal chunk lengths; features cfg-guaranteed.
+                unsafe { msg_reduce_and_eval_avx512(fc, bc) }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
+            );
         return (SumcheckMessage { u_0, u_2 }, y);
     }
 
-    let (u_0, u_2, y) = (0..half)
-        .into_par_iter()
-        .with_min_len(PAR_THRESHOLD / 4)
-        .map(term)
-        .reduce(
-            || (F128::ZERO, F128::ZERO, F128::ZERO),
-            |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
-        );
-    (SumcheckMessage { u_0, u_2 }, y)
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        const PAR_THRESHOLD: usize = 4096;
+        let half = n / 2;
+        let term = |j: usize| -> (F128, F128, F128) {
+            let f0 = f[2 * j];
+            let f1 = f[2 * j + 1];
+            let b0 = b[2 * j];
+            let b1 = b[2 * j + 1];
+            let e0 = f0 * b0;
+            (e0, (f0 + f1) * (b0 + b1), e0 + f1 * b1)
+        };
+        if half < PAR_THRESHOLD {
+            let (mut u_0, mut u_2, mut y) = (F128::ZERO, F128::ZERO, F128::ZERO);
+            for j in 0..half {
+                let (a0, a2, ay) = term(j);
+                u_0 += a0;
+                u_2 += a2;
+                y += ay;
+            }
+            return (SumcheckMessage { u_0, u_2 }, y);
+        }
+
+        let (u_0, u_2, y) = (0..half)
+            .into_par_iter()
+            .with_min_len(PAR_THRESHOLD / 4)
+            .map(term)
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
+            );
+        (SumcheckMessage { u_0, u_2 }, y)
+    }
 }
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
@@ -2897,6 +2923,75 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     }
 
     (u0, u2)
+}
+
+/// Like [`msg_reduce_avx512`] but also returns `y = Σ_i fc[i]·bc[i]` (full
+/// inner product) for OOD / MLE eval fusion. Algebra:
+///   u0 = Σ_j fc[2j]·bc[2j]
+///   u2 = Σ_j (fc[2j]+fc[2j+1])·(bc[2j]+bc[2j+1])
+///   y  = Σ_i fc[i]·bc[i]
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn msg_reduce_and_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    let lanes = len & !7;
+    let mut u0_acc = WideGhashX4::zero();
+    let mut u2_acc = WideGhashX4::zero();
+    let mut y_acc = WideGhashX4::zero();
+
+    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+    let mut k = 0;
+    while k < lanes {
+        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+        y_acc.mul_acc(f0, b0);
+        y_acc.mul_acc(f1, b1);
+
+        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        u0_acc.mul_acc(f_even, b_even);
+
+        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        u2_acc.mul_acc(f_sum, b_sum);
+
+        k += 8;
+    }
+
+    let mut u0 = u0_acc.fold().reduce();
+    let mut u2 = u2_acc.fold().reduce();
+    let mut y = y_acc.fold().reduce();
+
+    while k + 1 < len {
+        let f0 = fc[k];
+        let f1 = fc[k + 1];
+        let b0 = bc[k];
+        let b1 = bc[k + 1];
+        let p0 = f0 * b0;
+        let p1 = f1 * b1;
+        u0 += p0;
+        u2 += (f0 + f1) * (b0 + b1);
+        y += p0 + p1;
+        k += 2;
+    }
+
+    (u0, u2, y)
 }
 
 fn fold_and_msg_lsb(
