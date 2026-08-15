@@ -559,6 +559,46 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
     }
 }
 
+/// Serial twin of [`hash_pairs_level`]. Same parent CVs; no rayon dispatch.
+///
+/// Used by the tested [`StreamMerkle`] helper (not the production CPU L0
+/// path — that hashes leaves in `on_range_done` and folds parents after
+/// the encode join via `build_upper_levels`).
+#[allow(dead_code)]
+pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    match kind {
+        HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 => {
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        let mut h = Sha256::new();
+                        h.update(l);
+                        h.update(r);
+                        *out = h.finalize().into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
 ///
 /// Multi-threaded via rayon. `num_leaves` must be a power of two and divide
@@ -617,6 +657,7 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
 /// prefix. Do not absorb a range whose last NTT write has not retired.
 /// Parents fold as soon as both children exist, and only on a contiguous
 /// pair-prefix of an already-written child level. Root stays at `tree[2n−2]`.
+#[allow(dead_code)]
 pub(crate) struct StreamMerkle {
     tree: Vec<Hash>,
     n_leaves: usize,
@@ -628,6 +669,7 @@ pub(crate) struct StreamMerkle {
     level_done: Vec<usize>,
 }
 
+#[allow(dead_code)]
 impl StreamMerkle {
     pub(crate) fn new(n_leaves: usize, leaf_size: usize, kind: HashKind) -> Self {
         assert!(
@@ -644,8 +686,23 @@ impl StreamMerkle {
         }
     }
 
+    pub(crate) fn tree_as_mut_ptr(&mut self) -> *mut Hash {
+        self.tree.as_mut_ptr()
+    }
+
+    pub(crate) fn hashed_prefix(&self) -> usize {
+        self.level_done[0]
+    }
+
+    pub(crate) fn n_leaves(&self) -> usize {
+        self.n_leaves
+    }
+
     /// Hash leaves `[lo, hi)` from `data` (exactly `(hi-lo)*leaf_size` bytes)
     /// and fold every parent whose both children now exist.
+    ///
+    /// Requires `lo == hashed prefix`. Do **not** call this from an NTT
+    /// worker: [`hash_leaves`] is parallel and would oversub the deep pass.
     pub(crate) fn absorb_leaf_range(&mut self, data: &[u8], lo: usize, hi: usize) {
         assert!(hi > lo && hi <= self.n_leaves);
         assert_eq!(
@@ -656,10 +713,30 @@ impl StreamMerkle {
         assert_eq!(data.len(), (hi - lo) * self.leaf_size);
         hash_leaves(data, self.leaf_size, &mut self.tree[lo..hi], self.kind);
         self.level_done[0] = hi;
-        self.fold_ready_parents();
+        self.fold_ready_parents(false);
     }
 
-    fn fold_ready_parents(&mut self) {
+    /// Leaves `[lo, hi)` are already written into `tree[lo..hi]`.
+    /// Extends the hashed prefix and folds ready parents serially.
+    ///
+    /// Requires `lo == hashed prefix`. Tested helper only — production CPU
+    /// L0 does not spawn a parent coordinator or call this from encode.
+    pub(crate) fn note_hashed_range(&mut self, lo: usize, hi: usize) {
+        assert!(hi > lo && hi <= self.n_leaves);
+        assert_eq!(
+            lo, self.level_done[0],
+            "leaf ranges must extend the hashed prefix (got {lo}, prefix {})",
+            self.level_done[0]
+        );
+        self.level_done[0] = hi;
+        self.fold_ready_parents(true);
+    }
+
+    /// Fold parents only on a contiguous written pair-prefix of each child
+    /// level. Slices cover **only** the ready children and the new parent
+    /// slots — never unwritten `tree[]` (concurrent leaf writers may still
+    /// be filling later leaf slots).
+    fn fold_ready_parents(&mut self, serial: bool) {
         let mut s = self.n_leaves;
         let mut level = 0usize;
         while s > 1 {
@@ -668,13 +745,40 @@ impl StreamMerkle {
             let already = self.level_done[level + 1];
             if parent_ready > already {
                 let child_start = 2 * self.n_leaves - 2 * s;
-                let (read, rest) = self.tree[child_start..].split_at_mut(s);
-                let write = &mut rest[..s / 2];
-                hash_pairs_level(
-                    &read[2 * already..2 * parent_ready],
-                    &mut write[already..parent_ready],
-                    self.kind,
-                );
+                let parent_start = child_start + s;
+                let read_lo = child_start + 2 * already;
+                let read_hi = child_start + 2 * parent_ready;
+                let write_lo = parent_start + already;
+                let write_hi = parent_start + parent_ready;
+                debug_assert!(read_hi <= parent_start);
+                debug_assert!(write_hi <= self.tree.len());
+                // `split_at_mut(parent_start)` exclusively borrows every child
+                // slot (`parent_start == n` at the leaf level), including later
+                // unwritten leaves that NTT workers still write through
+                // `tree_addr`. Safe adjacent slices cannot skip that gap
+                // (`get_disjoint_mut` still takes `&mut [T]` of the whole
+                // buffer). Narrow raw parts: hashed/contiguous completed
+                // prefix + new parent slots only. Later leaf slots stay
+                // unborrowed.
+                //
+                // SAFETY: `read_lo..read_hi` is the already-written child
+                // prefix (mpsc happens-before `note_hashed_range`; workers
+                // never rewrite it). `write_lo..write_hi` are parent slots
+                // workers never touch. The two ranges are disjoint
+                // (`read_hi <= parent_start <= write_lo`) and in-bounds.
+                // `[read_hi, parent_start)` is not referenced — concurrent
+                // NTT leaf writers may still fill those slots.
+                let base = self.tree.as_mut_ptr();
+                let read =
+                    unsafe { core::slice::from_raw_parts(base.add(read_lo), read_hi - read_lo) };
+                let write = unsafe {
+                    core::slice::from_raw_parts_mut(base.add(write_lo), write_hi - write_lo)
+                };
+                if serial {
+                    hash_pairs_level_serial(read, write, self.kind);
+                } else {
+                    hash_pairs_level(read, write, self.kind);
+                }
                 self.level_done[level + 1] = parent_ready;
             }
             s >>= 1;
@@ -692,8 +796,80 @@ impl StreamMerkle {
     }
 }
 
+/// Out-of-order inbox in front of [`StreamMerkle`].
+///
+/// Tested helper only. Production CPU L0 does not enqueue ranges here
+/// during encode — leaves are hashed same-worker, parents fold after the
+/// encode join via `build_upper_levels`. Calling
+/// [`StreamMerkle::absorb_leaf_range`] from `on_range_done` is a reject
+/// (`lo == prefix` plus parallel `hash_leaves`).
+#[allow(dead_code)]
+pub(crate) struct StreamMerkleInbox {
+    inner: StreamMerkle,
+    pending: std::collections::BTreeMap<usize, usize>,
+}
+
+#[allow(dead_code)]
+impl StreamMerkleInbox {
+    pub(crate) fn new(n_leaves: usize, leaf_size: usize, kind: HashKind) -> Self {
+        Self {
+            inner: StreamMerkle::new(n_leaves, leaf_size, kind),
+            pending: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn tree_as_mut_ptr(&mut self) -> *mut Hash {
+        self.inner.tree_as_mut_ptr()
+    }
+
+    pub(crate) fn leaf_slots_mut(&mut self, lo: usize, hi: usize) -> &mut [Hash] {
+        &mut self.inner.tree[lo..hi]
+    }
+
+    /// Leaves `[lo, hi)` are already written. Enqueue; fold only a
+    /// contiguous completed prefix. Overlap / duplicate = reject.
+    pub(crate) fn note_hashed_range(&mut self, lo: usize, hi: usize) {
+        assert!(hi > lo && hi <= self.inner.n_leaves());
+        let prefix = self.inner.hashed_prefix();
+        assert!(
+            lo >= prefix,
+            "range {lo}..{hi} overlaps hashed prefix {prefix}"
+        );
+        if let Some((&prev_lo, &prev_hi)) = self.pending.range(..lo).next_back() {
+            assert!(
+                prev_hi <= lo,
+                "overlap {prev_lo}..{prev_hi} with {lo}..{hi}"
+            );
+        }
+        if let Some((&next_lo, &next_hi)) = self.pending.range(lo..).next() {
+            assert!(
+                hi <= next_lo,
+                "overlap {lo}..{hi} with {next_lo}..{next_hi}"
+            );
+        }
+        let prev = self.pending.insert(lo, hi);
+        assert!(prev.is_none(), "duplicate hashed range {lo}..{hi}");
+        while let Some((&start, &end)) = self.pending.first_key_value() {
+            if start != self.inner.hashed_prefix() {
+                break;
+            }
+            self.pending.remove(&start);
+            self.inner.note_hashed_range(start, end);
+        }
+    }
+
+    pub(crate) fn into_tree(self) -> Vec<Hash> {
+        assert!(
+            self.pending.is_empty(),
+            "hashed ranges left a hole; cannot fold past a contiguous prefix"
+        );
+        self.inner.into_tree()
+    }
+}
+
 /// Same tree as [`merkle_tree`], built by streaming `ranges` in leaf-index
 /// order and folding parents as soon as both children exist.
+#[allow(dead_code)]
 pub(crate) fn merkle_tree_streaming(
     data: &[u8],
     num_leaves: usize,
@@ -716,6 +892,35 @@ pub(crate) fn merkle_tree_streaming(
         builder.absorb_leaf_range(bytes, r.start, r.end);
     }
     builder.into_tree()
+}
+
+/// Same tree as [`merkle_tree`], but `ranges` may complete out of order.
+/// Leaves are hashed when the range arrives; parents fold only on a
+/// contiguous written prefix. Tested helper — not the production CPU L0 path.
+#[allow(dead_code)]
+pub(crate) fn merkle_tree_streaming_ooo(
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    ranges: impl IntoIterator<Item = core::ops::Range<usize>>,
+) -> Vec<Hash> {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+    let leaf_size = data.len() / num_leaves;
+    let mut inbox = StreamMerkleInbox::new(num_leaves, leaf_size, kind);
+    for r in ranges {
+        let bytes = &data[r.start * leaf_size..r.end * leaf_size];
+        hash_leaves_serial(bytes, leaf_size, inbox.leaf_slots_mut(r.start, r.end), kind);
+        inbox.note_hashed_range(r.start, r.end);
+    }
+    inbox.into_tree()
 }
 
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
@@ -928,7 +1133,11 @@ pub fn verify_merkle_multi_proof(
                     None => return false,
                 };
                 i += 1;
-                if p & 1 == 0 { (h, sib) } else { (sib, h) }
+                if p & 1 == 0 {
+                    (h, sib)
+                } else {
+                    (sib, h)
+                }
             };
             next.push((p >> 1, hash_pair(&left, &right, kind)));
         }
@@ -1144,13 +1353,41 @@ mod tests {
             (16, 64, &[0..4, 4..8, 8..12, 12..16]),
             (16, 64, &[0..1, 1..3, 3..8, 8..16]),
             (256, 64, &[0..32, 32..64, 64..128, 128..192, 192..256]),
-            (256, 1024, &[0..32, 32..64, 64..96, 96..128, 128..160, 160..192, 192..224, 224..256]),
-            (1024, 1024, &[
-                0..128, 128..256, 256..384, 384..512, 512..640, 640..768, 768..896, 896..1024,
-            ]),
+            (
+                256,
+                1024,
+                &[
+                    0..32,
+                    32..64,
+                    64..96,
+                    96..128,
+                    128..160,
+                    160..192,
+                    192..224,
+                    224..256,
+                ],
+            ),
+            (
+                1024,
+                1024,
+                &[
+                    0..128,
+                    128..256,
+                    256..384,
+                    384..512,
+                    512..640,
+                    640..768,
+                    768..896,
+                    896..1024,
+                ],
+            ),
         ];
         for &(n_leaves, leaf_size, ranges) in cases {
-            let data = random_data(n_leaves, leaf_size, 0x51EA_u64.wrapping_mul(n_leaves as u64));
+            let data = random_data(
+                n_leaves,
+                leaf_size,
+                0x51EA_u64.wrapping_mul(n_leaves as u64),
+            );
             for kind in KINDS {
                 let oneshot = merkle_tree(&data, n_leaves, kind);
                 let streamed = merkle_tree_streaming(&data, n_leaves, kind, ranges.iter().cloned());
@@ -1162,6 +1399,66 @@ mod tests {
                 assert_eq!(
                     streamed, oneshot,
                     "{kind} n={n_leaves} leaf={leaf_size}: node-for-node vs merkle_tree"
+                );
+                assert_eq!(
+                    streamed[2 * n_leaves - 2],
+                    *oneshot.last().unwrap(),
+                    "{kind} n={n_leaves}: root at 2n-2"
+                );
+            }
+        }
+    }
+
+    /// StreamMerkleInbox helper: out-of-order completed ranges still
+    /// produce the same `2n−1` tree. Parents fold only on a contiguous
+    /// written prefix (a hole is enqueued, not absorbed). Not production CPU L0.
+    #[test]
+    fn streaming_inbox_out_of_order_matches_merkle_tree_node_for_node() {
+        let cases: &[(usize, usize, &[core::ops::Range<usize>])] = &[
+            (16, 64, &[4..8, 0..4, 12..16, 8..12]),
+            (16, 64, &[8..16, 0..1, 1..3, 3..8]),
+            (
+                256,
+                1024,
+                &[
+                    64..96,
+                    224..256,
+                    0..32,
+                    32..64,
+                    96..128,
+                    192..224,
+                    128..160,
+                    160..192,
+                ],
+            ),
+            (
+                1024,
+                1024,
+                &[
+                    256..384,
+                    0..128,
+                    768..896,
+                    128..256,
+                    512..640,
+                    896..1024,
+                    384..512,
+                    640..768,
+                ],
+            ),
+        ];
+        for &(n_leaves, leaf_size, ranges) in cases {
+            let data = random_data(
+                n_leaves,
+                leaf_size,
+                0x51EA_u64.wrapping_mul(n_leaves as u64),
+            );
+            for kind in KINDS {
+                let oneshot = merkle_tree(&data, n_leaves, kind);
+                let streamed =
+                    merkle_tree_streaming_ooo(&data, n_leaves, kind, ranges.iter().cloned());
+                assert_eq!(
+                    streamed, oneshot,
+                    "{kind} n={n_leaves} leaf={leaf_size}: ooo inbox vs merkle_tree"
                 );
                 assert_eq!(
                     streamed[2 * n_leaves - 2],

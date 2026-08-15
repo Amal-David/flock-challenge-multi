@@ -2394,15 +2394,44 @@ pub(crate) fn ligero_commit(
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
+    let codeword_len = block_len * num_interleaved;
+    let mat = crate::scratch::take_f128(codeword_len);
+    ligero_commit_into(
+        poly,
+        mat,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+    )
+}
+
+/// Like [`ligero_commit`] but takes a pre-allocated codeword. Last-fold may
+/// have stored the message prefix in `mat[0..poly.len()]`. Encode is
+/// non-systematic and overwrites that prefix. `poly` must stay a separate
+/// live buffer (OOD reads it after the L1 root).
+fn ligero_commit_into(
+    poly: &[F128],
+    mut mat: Vec<F128>,
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+) -> LigeroWitness {
+    let msg_cols = 1usize << log_msg_cols;
+    let num_interleaved = 1usize << log_num_interleaved;
+    let block_len = msg_cols << log_inv_rate;
     let log_block_len = log_msg_cols + log_inv_rate;
     assert_eq!(poly.len(), num_interleaved * msg_cols);
+    assert_eq!(mat.len(), block_len * num_interleaved);
     assert!(log_block_len <= ntt.log_domain_size());
 
     // LSB-lane input already matches the position-major SoA codeword layout.
     // The semantic encoder owns zero-padding shortcuts and target-specific
     // fusion while overwriting every slot of the recycled matrix.
-    let codeword_len = block_len * num_interleaved;
-    let mut mat = crate::scratch::take_f128(codeword_len);
+    let codeword_len = mat.len();
     let ot = open_timing();
     let t_encode = std::time::Instant::now();
     ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
@@ -2733,13 +2762,107 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// output buffers from (prefaulted pages, no per-round zero-fill faults).
 /// `None`, an exhausted arena, or the serial path fall back to the previous
 /// per-arch allocation behavior.
+fn fold_and_msg_lsb_into(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    nf: &mut [F128],
+    nb: &mut [F128],
+) -> SumcheckMessage {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    debug_assert_eq!(nf.len(), half);
+    debug_assert_eq!(nb.len(), half);
+    const PAR_THRESHOLD: usize = 4096;
+    if half < PAR_THRESHOLD {
+        // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
+        for j in 0..half {
+            let f0 = f[2 * j];
+            let f1 = f[2 * j + 1];
+            let b0 = b[2 * j];
+            let b1 = b[2 * j + 1];
+            nf[j] = f0 + r * (f0 + f1);
+            nb[j] = b0 + r * (b0 + b1);
+        }
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        let mut k = 0;
+        while k + 1 < half {
+            let f0 = nf[k];
+            let f1 = nf[k + 1];
+            let b0 = nb[k];
+            let b1 = nb[k + 1];
+            u_0 += f0 * b0;
+            u_2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+        return SumcheckMessage { u_0, u_2 };
+    }
+
+    const CHUNK: usize = 2048;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_soa = cfg!(target_feature = "sha3") && {
+        static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
+        });
+        *SOA
+    };
+    let (u_0, u_2) = nf
+        .par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_soa {
+                    return unsafe {
+                        if use_nt {
+                            fold_and_msg_chunk_nt_neon_soa::<true>(f, b, base, fc, bc, r)
+                        } else {
+                            fold_and_msg_chunk_nt_neon_soa::<false>(f, b, base, fc, bc, r)
+                        }
+                    };
+                }
+                if use_nt {
+                    return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
+                }
+            }
+            let len = fc.len();
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            crate::field::f128_slice::fold_pairs(f, base, fc, r);
+            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            let mut k = 0;
+            while k + 1 < len {
+                let f0 = fc[k];
+                let f1 = fc[k + 1];
+                let b0 = bc[k];
+                let b1 = bc[k + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+            (u0, u2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+        );
+    SumcheckMessage { u_0, u_2 }
+}
+
 fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -2776,43 +2899,6 @@ fn fold_and_msg_lsb(
         );
     }
 
-    // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
-    // power of two, so every chunk has even length and starts at an even
-    // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
-    const CHUNK: usize = 2048;
-    // Non-temporal fold path gate: the folded `nf`/`nb` are next read only
-    // after a Fiat–Shamir round trip; when each output is ≥ 32 MB (64 MB for
-    // the pair) they are DRAM-cold by then on the ranked M4 Pro's SLC and
-    // regular stores' write-allocate is one pure hidden DRAM read per output
-    // line. The NT leaf computes the message terms from registers instead of
-    // reloading the just-written pairs. `FLOCK_NO_OPEN_NT` is a
-    // local-diagnostics kill switch; the ranked worker's cleared environment
-    // never sets it.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
-    // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
-    // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
-    // leaf (local diagnostics / A-B; the ranked worker's cleared environment
-    // never sets it). Read once per process. The SoA leaf's EOR3 needs sha3
-    // (statically true under `-C target-cpu=native` on every Apple Silicon
-    // target this ships to; other builds keep the previous leaf).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa = cfg!(target_feature = "sha3") && {
-        static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
-        });
-        *SOA
-    };
-    // Fold-output storage, in preference order:
-    //   1. Per-open `FoldArena` slices: one exact-size prefaulted allocation
-    //      carved round by round — removes the ~1 GiB of kernel zero-fill +
-    //      page faults the fresh-per-round allocations paid inside the
-    //      serial Fiat–Shamir chain.
-    //   2. x86_64: prewarmed scratch pool (the prover gives the previous
-    //      round's buffers back in `SumcheckProver::fold`), so the initial
-    //      sumcheck reuses resident pages.
-    //   3. aarch64 without an arena: fresh uninit allocation each round
-    //      (cross-prove pooling measured slower here).
     let (mut nf, mut nb) = match arena.and_then(|a| a.carve_pair(half)) {
         Some(pair) => pair,
         None => {
@@ -2832,58 +2918,8 @@ fn fold_and_msg_lsb(
             }
         }
     };
-    let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
-    let (u_0, u_2) = nf_s
-        .par_chunks_mut(CHUNK)
-        .zip(nb_s.par_chunks_mut(CHUNK))
-        .enumerate()
-        .map(|(ci, (fc, bc))| {
-            let base = ci * CHUNK;
-            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-            {
-                // SAFETY: aes is cfg-guaranteed (sha3 checked by `use_soa`);
-                // chunk geometry supplies two source elements per output
-                // (bounds asserted by the caller's chunking) and every chunk
-                // has even length.
-                if use_soa {
-                    return unsafe {
-                        if use_nt {
-                            fold_and_msg_chunk_nt_neon_soa::<true>(f, b, base, fc, bc, r)
-                        } else {
-                            // Small rounds: same fused SoA kernel, plain
-                            // `stp` publish (output is re-read next round
-                            // while cache-resident).
-                            fold_and_msg_chunk_nt_neon_soa::<false>(f, b, base, fc, bc, r)
-                        }
-                    };
-                }
-                if use_nt {
-                    return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
-                }
-            }
-            let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            (u0, u2)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-        );
-    (nf, nb, SumcheckMessage { u_0, u_2 })
+    let msg = fold_and_msg_lsb_into(f, b, r, &mut nf, &mut nb);
+    (nf, nb, msg)
 }
 
 #[inline]
@@ -2900,12 +2936,12 @@ fn eval_lookahead(coeffs: &[F128; 6], challenge: F128) -> SumcheckMessage {
 /// ordinary basis is the direct-AB-only fallback. All contributions already
 /// have their ring-switch batching challenge baked in.
 fn materialize_direct_ab_fold2(
-    packed_witness: Vec<F128>,
+    packed_witness: &[F128],
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold2Factors],
     r0: F128,
     r1: F128,
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+) -> (Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
@@ -2934,8 +2970,10 @@ fn materialize_direct_ab_fold2(
         claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
     }));
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
+    // Recycle-slot dest: [folded_f | folded_b], each `out_len`. Does not
+    // overwrite `packed_witness` (z stays bit-identical).
+    let mut dest = crate::scratch::take_f128(2 * out_len);
+    let (folded_f, folded_b) = dest.split_at_mut(out_len);
     let (u_0, u_2) = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -3066,11 +3104,10 @@ fn materialize_direct_ab_fold2(
             || (F128::ZERO, F128::ZERO),
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
-    crate::scratch::give_f128(packed_witness);
     if !ordinary_basis.is_empty() {
         crate::scratch::give_f128(ordinary_basis);
     }
-    (folded_f, folded_b, SumcheckMessage { u_0, u_2 })
+    (dest, SumcheckMessage { u_0, u_2 })
 }
 
 /// NT leaf for one [`fold_and_msg_lsb`] chunk: fold `f`/`b` at `r` AND build
@@ -3692,6 +3729,73 @@ impl std::ops::DerefMut for FoldBuf {
     }
 }
 
+/// Recycled `[folded_f | folded_b]` workspace for in-place fold2 and the
+/// remaining LSB ping-pong. `z` / `packed_witness` is never stored here.
+struct RecycleSlot {
+    buf: Vec<F128>,
+    /// Length of each half (`f` and `b`).
+    n: usize,
+    /// Partner buffer for ping-pong dest `[nf | nb]`.
+    ping: Option<Vec<F128>>,
+}
+
+impl RecycleSlot {
+    fn new(buf: Vec<F128>, n: usize) -> Self {
+        assert_eq!(buf.len(), 2 * n);
+        Self {
+            buf,
+            n,
+            ping: None,
+        }
+    }
+
+    #[inline]
+    fn f(&self) -> &[F128] {
+        &self.buf[..self.n]
+    }
+
+    #[inline]
+    fn b(&self) -> &[F128] {
+        &self.buf[self.n..2 * self.n]
+    }
+
+    #[inline]
+    fn b_mut(&mut self) -> &mut [F128] {
+        let n = self.n;
+        &mut self.buf[n..2 * n]
+    }
+
+    fn take_dest(&mut self, dest_len: usize) -> Vec<F128> {
+        if let Some(mut v) = self.ping.take() {
+            if v.capacity() >= dest_len {
+                v.clear();
+                // SAFETY: F128 is Copy; caller write-before-read (same as take_f128).
+                unsafe {
+                    v.set_len(dest_len);
+                }
+                return v;
+            }
+            crate::scratch::give_f128(v);
+        }
+        crate::scratch::take_f128(dest_len)
+    }
+
+    fn give_ping(&mut self, v: Vec<F128>) {
+        if let Some(old) = self.ping.replace(v) {
+            crate::scratch::give_f128(old);
+        }
+    }
+}
+
+impl Drop for RecycleSlot {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(std::mem::take(&mut self.buf));
+        if let Some(v) = self.ping.take() {
+            crate::scratch::give_f128(v);
+        }
+    }
+}
+
 pub struct SumcheckProver {
     f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -3704,6 +3808,9 @@ pub struct SumcheckProver {
     /// `combined_basis` purely for clarity; `FoldBuf::Arena` drops are no-ops
     /// so field drop order is irrelevant for safety.
     fold_arena: Option<FoldArena>,
+    /// In-place `[f|b]` workspace after direct fold2. When set, `f` /
+    /// `combined_basis` are unused placeholders and accessors read the slot.
+    recycle: Option<RecycleSlot>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
@@ -3716,6 +3823,7 @@ impl SumcheckProver {
             f: FoldBuf::Owned(f),
             combined_basis: FoldBuf::Owned(b1),
             fold_arena: None,
+            recycle: None,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -3752,6 +3860,7 @@ impl SumcheckProver {
             f: FoldBuf::Owned(f),
             combined_basis: FoldBuf::Owned(b1),
             fold_arena: None,
+            recycle: None,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -3761,24 +3870,77 @@ impl SumcheckProver {
     }
 
     fn new_after_direct_fold2(
-        f: Vec<F128>,
-        basis: Vec<F128>,
+        slot: RecycleSlot,
         target: F128,
         transcript: [SumcheckMessage; 3],
         fold_arena: Option<FoldArena>,
     ) -> Self {
-        assert_eq!(f.len(), basis.len());
         Self {
-            f: FoldBuf::Owned(f),
-            combined_basis: FoldBuf::Owned(basis),
+            f: FoldBuf::Owned(Vec::new()),
+            combined_basis: FoldBuf::Owned(Vec::new()),
             fold_arena,
+            recycle: Some(slot),
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
         }
     }
 
+    fn f_slice(&self) -> &[F128] {
+        match &self.recycle {
+            Some(slot) => slot.f(),
+            None => &self.f,
+        }
+    }
+
+    fn b_slice(&self) -> &[F128] {
+        match &self.recycle {
+            Some(slot) => slot.b(),
+            None => &self.combined_basis,
+        }
+    }
+
+    fn b_slice_mut(&mut self) -> &mut [F128] {
+        match &mut self.recycle {
+            Some(slot) => slot.b_mut(),
+            None => &mut self.combined_basis,
+        }
+    }
+
+    /// Ping-pong one LSB fold inside the recycle slot. `f_dest`, when set,
+    /// receives the folded `f` (L1 encode prefix). A keep-copy of that `f`
+    /// stays in the slot for OOD — encode must not alias-and-free `f`.
+    fn fold_recycle(&mut self, r: F128, mut f_dest: Option<&mut [F128]>) -> SumcheckMessage {
+        let slot = self.recycle.as_mut().expect("fold_recycle without slot");
+        let n = slot.n;
+        debug_assert!(n >= 2 && n.is_power_of_two());
+        let half = n / 2;
+        let mut dest = slot.take_dest(n);
+        let msg = {
+            let (keep_f, rest) = dest.split_at_mut(half);
+            let nb = &mut rest[..half];
+            match f_dest.as_mut() {
+                Some(prefix) => {
+                    assert_eq!(prefix.len(), half);
+                    let msg = fold_and_msg_lsb_into(&slot.buf[..n], &slot.buf[n..2 * n], r, prefix, nb);
+                    keep_f.copy_from_slice(prefix);
+                    msg
+                }
+                None => fold_and_msg_lsb_into(&slot.buf[..n], &slot.buf[n..2 * n], r, keep_f, nb),
+            }
+        };
+        let old = std::mem::replace(&mut slot.buf, dest);
+        slot.n = half;
+        slot.give_ping(old);
+        msg
+    }
+
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
+        if self.recycle.is_some() {
+            let msg = self.fold_recycle(r, None);
+            self.transcript.push(msg);
+            return msg;
+        }
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
@@ -3810,8 +3972,8 @@ impl SumcheckProver {
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
-        assert_eq!(b_new.len(), self.f.len());
-        let msg = round_msg_lsb(&self.f, &b_new);
+        assert_eq!(b_new.len(), self.f_slice().len());
+        let msg = round_msg_lsb(self.f_slice(), &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
         msg
@@ -3824,8 +3986,8 @@ impl SumcheckProver {
     /// fold over `f`. Transcript-identical: the caller observes the returned
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
-        assert_eq!(b_new.len(), self.f.len());
-        let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
+        assert_eq!(b_new.len(), self.f_slice().len());
+        let (msg, h_new) = round_msg_and_eval_lsb(self.f_slice(), &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
         (msg, h_new)
@@ -3839,14 +4001,15 @@ impl SumcheckProver {
             .pending_glue
             .take()
             .expect("glue without introduce_new");
-        assert_eq!(b_new.len(), self.combined_basis.len());
+        let basis = self.b_slice_mut();
+        assert_eq!(b_new.len(), basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
-            for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
+        if basis.len() < PAR_THRESHOLD {
+            for (acc, &v) in basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
         } else {
-            self.combined_basis
+            basis
                 .par_iter_mut()
                 .zip(b_new.par_iter())
                 .with_min_len(PAR_THRESHOLD / 4)
@@ -3856,7 +4019,7 @@ impl SumcheckProver {
     }
 
     pub fn f(&self) -> &[F128] {
-        &self.f
+        self.f_slice()
     }
 
     pub fn transcript(&self) -> &[SumcheckMessage] {
@@ -4245,6 +4408,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut b_initial = Some(b_initial);
     let mut direct_fold2 = direct_fold2;
     let mut fold_arena = fold_arena;
+    let mut kept_z: Option<Vec<F128>> = None;
+    let mut l1_mat: Option<Vec<F128>> = None;
     let (mut sc_prover, start_msg) = if direct_mode {
         (
             None,
@@ -4307,20 +4472,38 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             msg
         } else if direct_mode && j == 1 {
             let direct = direct_fold2.take().expect("direct AB factors consumed once");
-            let (f2, b2, msg) = materialize_direct_ab_fold2(
-                packed_witness.take().unwrap(),
+            let z = packed_witness.take().unwrap();
+            let (workspace, msg) = materialize_direct_ab_fold2(
+                &z,
                 b_initial.take().unwrap(),
                 &direct,
                 direct_r0.take().unwrap(),
                 r,
             );
+            let out_len = workspace.len() / 2;
+            if j == initial_k - 1 {
+                let poly_len = out_len;
+                let codeword_len = poly_len << config.log_inv_rates[1];
+                let mut mat = crate::scratch::take_f128(codeword_len);
+                mat[..poly_len].copy_from_slice(&workspace[..out_len]);
+                l1_mat = Some(mat);
+            }
+            kept_z = Some(z);
             sc_prover = Some(SumcheckProver::new_after_direct_fold2(
-                f2,
-                b2,
+                RecycleSlot::new(workspace, out_len),
                 target,
                 [start_msg, direct_msg1.take().unwrap(), msg],
                 fold_arena.take(),
             ));
+            msg
+        } else if direct_mode && j == initial_k - 1 {
+            let poly_len = 1usize << (log_n - initial_k);
+            let codeword_len = poly_len << config.log_inv_rates[1];
+            let mut mat = crate::scratch::take_f128(codeword_len);
+            let prover = sc_prover.as_mut().unwrap();
+            let msg = prover.fold_recycle(r, Some(&mut mat[..poly_len]));
+            prover.transcript.push(msg);
+            l1_mat = Some(mat);
             msg
         } else {
             sc_prover.as_mut().unwrap().fold(r)
@@ -4351,14 +4534,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let wtns_1 = ligero_commit(
-        sc_prover.f(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
+    let wtns_1 = if let Some(mat) = l1_mat.take() {
+        ligero_commit_into(
+            sc_prover.f(),
+            mat,
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    } else {
+        ligero_commit(
+            sc_prover.f(),
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    };
     if trace {
         t_commits += _t.elapsed();
     }
@@ -4404,6 +4599,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    if let Some(z) = kept_z.take() {
+        crate::scratch::give_f128(z);
+    }
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -6235,11 +6433,199 @@ mod tests {
         partial_eval_lsb_one(&mut want_f, r1);
         partial_eval_lsb_one(&mut want_b, r1);
         let want_msg = round_msg_lsb(&want_f, &want_b);
-        let (got_f, got_b, got_msg) =
-            materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
-        assert_eq!(got_f, want_f);
-        assert_eq!(got_b, want_b);
+        let z_before = f.clone();
+        let (dest, got_msg) = materialize_direct_ab_fold2(&f, ordinary_c, &direct, r0, r1);
+        let out_len = dest.len() / 2;
+        assert_eq!(&dest[..out_len], want_f.as_slice());
+        assert_eq!(&dest[out_len..], want_b.as_slice());
         assert_eq!(got_msg, want_msg);
+        assert_eq!(f, z_before, "fold2 must not clobber z / packed_witness");
+    }
+
+    fn test_rng(seed: u64) -> impl FnMut() -> F128 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(29))
+        }
+    }
+
+    fn fold2_claim(
+        suffix: &[F128],
+        scaled_rdp: &[F128],
+        lo_bits: usize,
+    ) -> super::super::ring_switch::DirectFold2Factors {
+        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[2..], lo_bits);
+        super::super::ring_switch::DirectFold2Factors {
+            eq_lo,
+            eq_hi,
+            low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
+            table: super::super::ring_switch::build_fold_byte_table(scaled_rdp),
+            products: None,
+        }
+    }
+
+    #[test]
+    fn in_place_fold2_two_claim_matches_out_of_place_and_keeps_z() {
+        let mut random = test_rng(0xAB_C0_FF_EE);
+        let n = 1usize << 8;
+        let z: Vec<F128> = (0..n).map(|_| random()).collect();
+        let r0 = random();
+        let r1 = random();
+        let suffix_ab: Vec<F128> = (0..8).map(|_| random()).collect();
+        let suffix_c: Vec<F128> = (0..8).map(|_| random()).collect();
+        let rdp_ab: Vec<F128> = build_eq_table(&(0..crate::pcs::LOG_PACKING).map(|_| random()).collect::<Vec<_>>());
+        let rdp_c: Vec<F128> = build_eq_table(&(0..crate::pcs::LOG_PACKING).map(|_| random()).collect::<Vec<_>>());
+        let basis_ab = super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_ab), &rdp_ab);
+        let basis_c = super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_c), &rdp_c);
+        let combined: Vec<F128> = basis_ab.iter().zip(basis_c).map(|(&a, c)| a + c).collect();
+        let mut want_f = z.clone();
+        let mut want_b = combined;
+        partial_eval_lsb_one(&mut want_f, r0);
+        partial_eval_lsb_one(&mut want_b, r0);
+        partial_eval_lsb_one(&mut want_f, r1);
+        partial_eval_lsb_one(&mut want_b, r1);
+        let want_msg = round_msg_lsb(&want_f, &want_b);
+
+        let lo_bits = (8 - 2) / 2;
+        let ab = fold2_claim(&suffix_ab, &rdp_ab, lo_bits);
+        let c = fold2_claim(&suffix_c, &rdp_c, lo_bits);
+        let z_before = z.clone();
+        let (dest, msg) = materialize_direct_ab_fold2(&z, Vec::new(), &[ab.clone(), c.clone()], r0, r1);
+        let out = dest.len() / 2;
+        assert_eq!(&dest[..out], want_f.as_slice(), "folded_f");
+        assert_eq!(&dest[out..], want_b.as_slice(), "folded_b [ab,c]");
+        assert_eq!(msg, want_msg);
+        assert_eq!(z, z_before, "z must be bit-identical after fold2");
+
+        // XOR swap of claims still matches b; f is claim-order-independent.
+        let (dest_swapped, msg_swapped) =
+            materialize_direct_ab_fold2(&z, Vec::new(), &[c, ab], r0, r1);
+        assert_eq!(&dest_swapped[..out], want_f.as_slice());
+        assert_eq!(&dest_swapped[out..], want_b.as_slice());
+        assert_eq!(msg_swapped, want_msg);
+        assert_eq!(z, z_before);
+    }
+
+    #[test]
+    fn recycle_ping_pong_matches_fold_and_msg_lsb() {
+        let mut random = test_rng(0x51E0_F01D);
+        let n = 1usize << 12;
+        let f0: Vec<F128> = (0..n).map(|_| random()).collect();
+        let b0: Vec<F128> = (0..n).map(|_| random()).collect();
+        let challenges: Vec<F128> = (0..4).map(|_| random()).collect();
+
+        let mut f_ref = f0.clone();
+        let mut b_ref = b0.clone();
+        let mut msgs_ref = Vec::new();
+        for &r in &challenges {
+            let (nf, nb, msg) = fold_and_msg_lsb(&f_ref, &b_ref, r, None);
+            f_ref = nf.to_vec();
+            b_ref = nb.to_vec();
+            msgs_ref.push(msg);
+        }
+
+        let mut workspace = crate::scratch::take_f128(2 * n);
+        workspace[..n].copy_from_slice(&f0);
+        workspace[n..].copy_from_slice(&b0);
+        let slot = RecycleSlot::new(workspace, n);
+        let mut prover = SumcheckProver::new_after_direct_fold2(
+            slot,
+            F128::ZERO,
+            [SumcheckMessage { u_0: F128::ZERO, u_2: F128::ZERO }; 3],
+            None,
+        );
+        let mut msgs = Vec::new();
+        for (i, &r) in challenges.iter().enumerate() {
+            if i + 1 == challenges.len() {
+                let half = prover.f().len() / 2;
+                let mut prefix = vec![F128::new(0xA5A5_A5A5_A5A5_A5A5, 0xA5A5_A5A5_A5A5_A5A5); half];
+                let msg = prover.fold_recycle(r, Some(&mut prefix));
+                prover.transcript.push(msg);
+                assert_eq!(prefix.as_slice(), prover.f(), "last-fold prefix == kept f");
+                msgs.push(msg);
+            } else {
+                msgs.push(prover.fold(r));
+            }
+        }
+        assert_eq!(prover.f(), f_ref.as_slice());
+        assert_eq!(prover.b_slice(), b_ref.as_slice());
+        assert_eq!(msgs, msgs_ref);
+    }
+
+    #[test]
+    fn last_fold_soa_prefix_store_and_ood_keep() {
+        // (log_n=12 after 4 folds from 16, L1 ilv=3, rate 2) — ranked L1 is
+        // log_inv_rates[1]=2, poly[col*8+lane], not lane-major.
+        let mut random = test_rng(0x11F0_1D00);
+        let n = 1usize << 12;
+        let poly: Vec<F128> = (0..n).map(|_| random()).collect();
+        let log_ilv = 3usize;
+        let log_cols = 9usize;
+        let log_rate = 2usize;
+        assert_eq!(n, (1 << log_ilv) * (1 << log_cols));
+        let ntt = AdditiveNttF128::standard(log_cols + log_rate);
+
+        // Prefix store: junk dest, then write poly into prefix.
+        let codeword_len = n << log_rate;
+        let mut mat = crate::scratch::take_f128(codeword_len);
+        let junk = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        for slot in mat.iter_mut() {
+            *slot = junk;
+        }
+        mat[..n].copy_from_slice(&poly);
+        assert_eq!(&mat[..n], poly.as_slice(), "prefix == poly (LSB-lane SoA)");
+
+        let kept = poly.clone();
+        let wtns = ligero_commit_into(
+            &kept,
+            mat,
+            log_cols,
+            log_ilv,
+            log_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
+        let today = ligero_commit(&poly, log_cols, log_ilv, log_rate, &ntt, HashKind::Sha256);
+        assert_eq!(wtns.mat, today.mat, "L1 codeword after prefix store");
+        assert_eq!(wtns.root(), today.root(), "L1 root unchanged");
+        assert_eq!(kept, poly, "kept f must survive non-systematic encode");
+
+        // OOD: introduce on kept f after encode matches today's y.
+        let z_pt: Vec<F128> = (0..12).map(|_| random()).collect();
+        let eq_z = build_eq_table(&z_pt);
+        let dummy_b: Vec<F128> = (0..n).map(|_| random()).collect();
+        let (mut sc_keep, _) = SumcheckProver::new(kept, dummy_b.clone(), F128::ZERO);
+        let (_, y_keep) = sc_keep.introduce_new_with_eval(eq_z.clone());
+        let (mut sc_today, _) = SumcheckProver::new(poly.clone(), dummy_b, F128::ZERO);
+        let (_, y_today) = sc_today.introduce_new_with_eval(eq_z);
+        assert_eq!(y_keep, y_today, "OOD y on kept f");
+
+        // Negative: lane-major disagrees with LSB-lane SoA.
+        let mut lane_major = vec![F128::ZERO; n];
+        let ilv = 1usize << log_ilv;
+        let cols = 1usize << log_cols;
+        for lane in 0..ilv {
+            for col in 0..cols {
+                lane_major[lane * cols + col] = poly[col * ilv + lane];
+            }
+        }
+        assert_ne!(lane_major, poly, "lane-major is a reject footgun");
+        let w_lane = ligero_commit(&lane_major, log_cols, log_ilv, log_rate, &ntt, HashKind::Sha256);
+        assert_ne!(w_lane.mat, today.mat);
+        assert_ne!(w_lane.root(), today.root());
+
+        // Negative: prefix-only + skip replica + from_layer(2) disagrees
+        // (need 4 copies, not 1).
+        let mut prefix_only = crate::scratch::take_f128(codeword_len);
+        for slot in prefix_only.iter_mut() {
+            *slot = junk;
+        }
+        prefix_only[..n].copy_from_slice(&poly);
+        ntt.forward_transform_interleaved_from_layer(&mut prefix_only, ilv, log_rate);
+        assert_ne!(prefix_only, today.mat, "prefix-only skip replica must disagree");
     }
 
     #[test]

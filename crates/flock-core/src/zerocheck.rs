@@ -496,6 +496,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+        // After the 8th ML sample, RowMajor `x_inner_rest = mlv[0..8]` is
+        // complete. Build eq_inner on main (256 KiB, no observe, no par_*).
+        // Do not start the leftover z-fold here (`x_outer` incomplete).
+        // Lincheck takes the table only if the quirky point matches.
+        if mlv_rhos.len() == 8 {
+            crate::lincheck::store_eq_inner_after_rho7(z, &mlv_rhos[..8], k_skip);
+        }
     }
     // Last ML ρ is in. RowMajor `x_outer = mlv[k_log − k_skip ..]` is
     // complete here (not URM `r`). Kick today's one-shot leftover z-fold
