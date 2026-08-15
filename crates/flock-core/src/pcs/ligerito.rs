@@ -3093,11 +3093,13 @@ fn materialize_direct_ab_fold2(
 
     assert!(!claims.is_empty());
     assert!(ordinary_basis.is_empty() || ordinary_basis.len() == packed_witness.len());
+    // Char-2: share r0·r1 across the four fold weights.
+    let r0r1 = r0 * r1;
     let fold_weight = [
-        (F128::ONE + r0) * (F128::ONE + r1),
-        r0 * (F128::ONE + r1),
-        (F128::ONE + r0) * r1,
-        r0 * r1,
+        F128::ONE + r0 + r1 + r0r1,
+        r0 + r0r1,
+        r1 + r0r1,
+        r0r1,
     ];
     // Two claims on ranked path: build both fold2 tables in parallel.
     let direct_tables: Vec<Vec<F128>> = claims
@@ -3183,56 +3185,70 @@ fn materialize_direct_ab_fold2(
                     // Table-hot two-phase: only one 64 KiB composed table live.
                     // Phase 1: first table hot → partial b (f_out already written).
                     // Phase 2: second table hot → complete b.
-                    // 2× pair unroll keeps two slot pairs in flight per iteration.
+                    // 4× pair unroll (8 slots) for more independent fold_one_slot ILP.
                     let table = &mut scratch[..table_len];
                     super::ring_switch::compose_block_table(
                         &direct_tables[0], first.eq_hi[block], table,
                     );
                     let n_pairs = block_len / 2;
                     let mut pair = 0usize;
-                    while pair + 1 < n_pairs {
+                    while pair + 3 < n_pairs {
                         let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        let s2 = s0 + 2;
-                        let s3 = s0 + 3;
                         b_out[s0] = super::ring_switch::fold_one_slot(first.eq_lo[s0], table);
-                        b_out[s1] = super::ring_switch::fold_one_slot(first.eq_lo[s1], table);
-                        b_out[s2] = super::ring_switch::fold_one_slot(first.eq_lo[s2], table);
-                        b_out[s3] = super::ring_switch::fold_one_slot(first.eq_lo[s3], table);
-                        pair += 2;
+                        b_out[s0 + 1] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 1], table);
+                        b_out[s0 + 2] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 2], table);
+                        b_out[s0 + 3] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 3], table);
+                        b_out[s0 + 4] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 4], table);
+                        b_out[s0 + 5] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 5], table);
+                        b_out[s0 + 6] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 6], table);
+                        b_out[s0 + 7] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 7], table);
+                        pair += 4;
                     }
-                    if pair < n_pairs {
+                    while pair < n_pairs {
                         let s0 = 2 * pair;
-                        let s1 = s0 + 1;
                         b_out[s0] = super::ring_switch::fold_one_slot(first.eq_lo[s0], table);
-                        b_out[s1] = super::ring_switch::fold_one_slot(first.eq_lo[s1], table);
+                        b_out[s0 + 1] =
+                            super::ring_switch::fold_one_slot(first.eq_lo[s0 + 1], table);
+                        pair += 1;
                     }
                     super::ring_switch::compose_block_table(
                         &direct_tables[1], second.eq_hi[block], table,
                     );
                     pair = 0;
-                    while pair + 1 < n_pairs {
+                    while pair + 3 < n_pairs {
                         let s0 = 2 * pair;
-                        let s1 = s0 + 1;
-                        let s2 = s0 + 2;
-                        let s3 = s0 + 3;
                         b_out[s0] = b_out[s0]
                             + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] = b_out[s1]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
-                        b_out[s2] = b_out[s2]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s2], table);
-                        b_out[s3] = b_out[s3]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s3], table);
-                        pair += 2;
+                        b_out[s0 + 1] = b_out[s0 + 1]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 1], table);
+                        b_out[s0 + 2] = b_out[s0 + 2]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 2], table);
+                        b_out[s0 + 3] = b_out[s0 + 3]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 3], table);
+                        b_out[s0 + 4] = b_out[s0 + 4]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 4], table);
+                        b_out[s0 + 5] = b_out[s0 + 5]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 5], table);
+                        b_out[s0 + 6] = b_out[s0 + 6]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 6], table);
+                        b_out[s0 + 7] = b_out[s0 + 7]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 7], table);
+                        pair += 4;
                     }
-                    if pair < n_pairs {
+                    while pair < n_pairs {
                         let s0 = 2 * pair;
-                        let s1 = s0 + 1;
                         b_out[s0] = b_out[s0]
                             + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] = b_out[s1]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
+                        b_out[s0 + 1] = b_out[s0 + 1]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[s0 + 1], table);
+                        pair += 1;
                     }
                 } else {
                     for pair in 0..(block_len / 2) {

@@ -1720,13 +1720,21 @@ pub(crate) fn build_direct_fold2_table(
     // Four independent mul_by_x chains (one per low_eq bank), then XOR-sum.
     // Φ = fold_one_slot is only F2-linear on bits — do NOT pull fold_weight
     // through Φ.
+    // Four independent chains into private buffers, then XOR-sum — better
+    // register pressure than accumulating into one shared generators array.
     let mut generators = [F128::ZERO; 128];
-    for d in 0..4 {
-        let mut w = low_eq[d];
-        let fw = fold_weight[d];
-        for generator in generators.iter_mut() {
-            *generator += fw * fold_one_slot(w, base);
-            w = crate::field::mul_by_x(w);
+    {
+        let mut chain = [F128::ZERO; 128];
+        for d in 0..4 {
+            let mut w = low_eq[d];
+            let fw = fold_weight[d];
+            for c in chain.iter_mut() {
+                *c = fw * fold_one_slot(w, base);
+                w = crate::field::mul_by_x(w);
+            }
+            for (g, c) in generators.iter_mut().zip(chain.iter()) {
+                *g += *c;
+            }
         }
     }
     for byte in 0..FOLD_N_BYTES {
