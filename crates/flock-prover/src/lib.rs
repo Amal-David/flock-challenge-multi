@@ -19,28 +19,3 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
-
-// dispersion-resample marker hermes-x86-r1-1786797518-12057
-// dispersion-resample marker hermes-x86-r2-1786797518-32723
-// dispersion-resample marker hermes-x86-r3-1786797518-26018
-// dispersion-resample marker hermes-x86-r4-1786797518-29141
-// dispersion-resample marker hermes-x86-r5-1786797518-24902
-
-// dispersion-resample marker hermes-x86-s2-1786798338-26580
-// dispersion-resample marker hermes-x86-s3-1786798338-9623
-// dispersion-resample marker hermes-x86-s4-1786798338-22226
-
-// dispersion-resample marker hermes-x86-defend-1786799202-23090
-// dispersion-resample marker hermes-x86-s5-1786799202-26239
-// dispersion-resample marker hermes-x86-s6-1786799202-12330
-// dispersion-resample marker hermes-x86-s7-1786799202-13151
-
-// dispersion-resample marker hermes-x86-push-1786800040-20769
-// dispersion-resample marker hermes-x86-push2-1786800040-8481
-// dispersion-resample marker hermes-x86-push3-1786800040-20716
-// dispersion-resample marker hermes-x86-push4-1786800040-6819
-// dispersion-resample marker hermes-x86-push5-1786800040-23863
-
-// dispersion-resample marker hermes-x86-defend2-1786801413-5614
-// dispersion-resample marker hermes-x86-defend3-1786801413-13170
-// dispersion-resample marker hermes-x86-defend4-1786801413-1779

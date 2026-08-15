@@ -2627,21 +2627,43 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
         return SumcheckMessage { u_0, u_2 };
     }
 
-    let (u_0, u_2) = (0..half)
-        .into_par_iter()
-        .with_min_len(PAR_THRESHOLD / 4)
-        .map(|j| {
-            let f0 = f[2 * j];
-            let f1 = f[2 * j + 1];
-            let b0 = b[2 * j];
-            let b1 = b[2 * j + 1];
-            (f0 * b0, (f0 + f1) * (b0 + b1))
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-        );
-    SumcheckMessage { u_0, u_2 }
+    // Parallel path. On avx512f+vpclmulqdq this is the same even-product +
+    // pair-sum kernel as the post-fold message (`msg_reduce_avx512`).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        const CHUNK: usize = 2048;
+        let (u_0, u_2) = f
+            .par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .map(|(fc, bc)| {
+                // SAFETY: target features cfg-guaranteed; fc/bc have equal
+                // length (caller asserts n ≥ 2, power of two).
+                unsafe { msg_reduce_avx512(fc, bc) }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+            );
+        SumcheckMessage { u_0, u_2 }
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        let (u_0, u_2) = (0..half)
+            .into_par_iter()
+            .with_min_len(PAR_THRESHOLD / 4)
+            .map(|j| {
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                (f0 * b0, (f0 + f1) * (b0 + b1))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            );
+        SumcheckMessage { u_0, u_2 }
+    }
 }
 
 /// Fused round message + full inner product: returns `round_msg_lsb(f, b)`
@@ -2683,15 +2705,38 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
         return (SumcheckMessage { u_0, u_2 }, y);
     }
 
-    let (u_0, u_2, y) = (0..half)
-        .into_par_iter()
-        .with_min_len(PAR_THRESHOLD / 4)
-        .map(term)
-        .reduce(
-            || (F128::ZERO, F128::ZERO, F128::ZERO),
-            |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
-        );
-    (SumcheckMessage { u_0, u_2 }, y)
+    // Parallel path. Message (u0, u2) is `msg_reduce_avx512`; y adds the
+    // odd-product acc so y = u0 + Σ f[2j+1]·b[2j+1] (TV-identical to
+    // e0 + f1*b1 per pair).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        const CHUNK: usize = 2048;
+        let (u_0, u_2, y) = f
+            .par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .map(|(fc, bc)| {
+                // SAFETY: target features cfg-guaranteed; fc/bc have equal
+                // length (caller asserts n ≥ 2, power of two).
+                unsafe { msg_reduce_and_eval_avx512(fc, bc) }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (c0, c2, cy)| (a0 + c0, a2 + c2, ay + cy),
+            );
+        (SumcheckMessage { u_0, u_2 }, y)
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        let (u_0, u_2, y) = (0..half)
+            .into_par_iter()
+            .with_min_len(PAR_THRESHOLD / 4)
+            .map(term)
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
+            );
+        (SumcheckMessage { u_0, u_2 }, y)
+    }
 }
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
@@ -2818,6 +2863,77 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     }
 
     (u0, u2)
+}
+
+/// Sibling of [`msg_reduce_avx512`] with a third WideGhash acc on the odd
+/// pair-positions. Returns `(u0, u2, y)` where `(u0, u2)` match
+/// [`msg_reduce_avx512`] and `y = u0 + Σ fc[k]·bc[k]` over odd `k`
+/// (TV-identical to the scalar `e0 + f1*b1` per pair). Used by
+/// [`round_msg_and_eval_lsb`]; does not change the message.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn msg_reduce_and_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    let lanes = len & !7;
+    let mut u0_acc = WideGhashX4::zero();
+    let mut u2_acc = WideGhashX4::zero();
+    let mut odd_acc = WideGhashX4::zero();
+
+    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+    // idx_odd: pick 128-bit lanes {1, 3} from reg0 and {1, 3} from reg1
+    // → [reg0[1], reg0[3], reg1[1], reg1[3]] (odd-indexed F128 elements).
+    let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+    let mut k = 0;
+    while k < lanes {
+        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        u0_acc.mul_acc(f_even, b_even);
+
+        let f_odd = _mm512_permutex2var_epi64(f0, idx_odd, f1);
+        let b_odd = _mm512_permutex2var_epi64(b0, idx_odd, b1);
+        odd_acc.mul_acc(f_odd, b_odd);
+
+        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        u2_acc.mul_acc(f_sum, b_sum);
+
+        k += 8;
+    }
+
+    let mut u0 = u0_acc.fold().reduce();
+    let mut u2 = u2_acc.fold().reduce();
+    let mut y_odd = odd_acc.fold().reduce();
+
+    while k + 1 < len {
+        let f0 = fc[k];
+        let f1 = fc[k + 1];
+        let b0 = bc[k];
+        let b1 = bc[k + 1];
+        u0 += f0 * b0;
+        u2 += (f0 + f1) * (b0 + b1);
+        y_odd += f1 * b1;
+        k += 2;
+    }
+
+    (u0, u2, u0 + y_odd)
 }
 
 fn fold_and_msg_lsb(
@@ -3065,6 +3181,8 @@ fn materialize_direct_ab_fold2(
                     let high = a2 + r0 * (a2 + a3);
                     low + r1 * (low + high)
                 };
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
                 if let [only] = claims {
                     // Single-claim specialization.
                     let table = &scratch[..table_len];
@@ -3081,12 +3199,14 @@ fn materialize_direct_ab_fold2(
                         f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
                     }
                 } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
                     // Table-hot two-phase: only one 64 KiB composed table live.
                     // Phase 1: first table hot → store f + partial b.
-                    // Phase 2: second table hot → complete b.
+                    // Phase 2: second table hot → complete b + accumulate.
                     // Algebra identical to interleaved original.
                     let table = &mut scratch[..table_len];
                     super::ring_switch::compose_block_table(
@@ -3110,12 +3230,16 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
+                        let f0 = f_out[slot0];
+                        let f1 = f_out[slot1];
                         let b0 = b_out[slot0]
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot0], table);
                         let b1 = b_out[slot1]
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot1], table);
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
                     }
                 } else {
                     for pair in 0..(block_len / 2) {
@@ -3144,31 +3268,11 @@ fn materialize_direct_ab_fold2(
                         f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
-                    }
-                }
-                // Vectorized message-term reduction over the folded chunk.
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    // SAFETY: target features cfg-guaranteed; f_out/b_out
-                    // have equal length (block_len, a multiple of 2).
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    let mut k = 0;
-                    while k + 1 < f_out.len() {
-                        let f0 = f_out[k];
-                        let f1 = f_out[k + 1];
-                        let b0 = b_out[k];
-                        let b1 = b_out[k + 1];
                         u0 += f0 * b0;
                         u2 += (f0 + f1) * (b0 + b1);
-                        k += 2;
                     }
-                    (u0, u2)
                 }
+                (u0, u2)
             },
         )
         .reduce(
@@ -6635,6 +6739,118 @@ mod tests {
             assert_eq!(&nb[..], nb_ref.as_slice(), "nb n={n}");
             assert_eq!(msg.u_0, u0, "u0 n={n}");
             assert_eq!(msg.u_2, u2, "u2 n={n}");
+        }
+    }
+
+    /// Parallel `half≥4096` path: `fold_and_msg_lsb` (AVX-512 message reduce
+    /// after `fold_pairs` when those features are on; scalar reload otherwise)
+    /// matches the two-mul fold + scalar message loop.
+    #[test]
+    fn fold_and_msg_lsb_parallel_matches_scalar() {
+        let mut state = 0xA5A5_5A5A_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+        // n=8192 → half=4096 hits the parallel path (PAR_THRESHOLD=4096).
+        for n in [8192usize] {
+            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let r = f128();
+            let one_plus_r = F128::ONE + r;
+            let half = n / 2;
+            let mut nf_ref = Vec::with_capacity(half);
+            let mut nb_ref = Vec::with_capacity(half);
+            for j in 0..half {
+                nf_ref.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+                nb_ref.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            }
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < half {
+                u0 += nf_ref[k] * nb_ref[k];
+                u2 += (nf_ref[k] + nf_ref[k + 1]) * (nb_ref[k] + nb_ref[k + 1]);
+                k += 2;
+            }
+            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, r, None);
+            assert_eq!(&nf[..], nf_ref.as_slice(), "nf n={n}");
+            assert_eq!(&nb[..], nb_ref.as_slice(), "nb n={n}");
+            assert_eq!(msg.u_0, u0, "u0 n={n}");
+            assert_eq!(msg.u_2, u2, "u2 n={n}");
+        }
+    }
+
+    /// Parallel `half≥4096` path: `round_msg_lsb` (AVX-512 WideGhash when
+    /// those features are on; scalar rayon otherwise) matches the serial
+    /// scalar pair loop.
+    #[test]
+    fn round_msg_lsb_parallel_matches_scalar() {
+        let mut state = 0xA5A5_5A5A_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+        // n=8192 → half=4096 hits the parallel path (PAR_THRESHOLD=4096).
+        for n in [8192usize] {
+            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let half = n / 2;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for j in 0..half {
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+            }
+            let msg = round_msg_lsb(&f, &b);
+            assert_eq!(msg.u_0, u0, "u0 n={n}");
+            assert_eq!(msg.u_2, u2, "u2 n={n}");
+        }
+    }
+
+    /// `round_msg_and_eval_lsb` message matches `round_msg_lsb`; y matches
+    /// the unfused Σ f[i]·b[i]. Covers serial (`n=256`) and parallel (`n=8192`).
+    #[test]
+    fn round_msg_and_eval_lsb_y_matches_unfused() {
+        let mut state = 0x0fed_cba9_8765_4321_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for n in [256usize, 8192] {
+            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let want_msg = round_msg_lsb(&f, &b);
+            let (got_msg, y) = round_msg_and_eval_lsb(&f, &b);
+            assert_eq!(got_msg, want_msg, "msg n={n}");
+            let y_ref = f
+                .iter()
+                .zip(b.iter())
+                .map(|(&fi, &bi)| fi * bi)
+                .fold(F128::ZERO, |acc, v| acc + v);
+            assert_eq!(y, y_ref, "y n={n}");
         }
     }
 
