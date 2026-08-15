@@ -296,7 +296,6 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
@@ -304,7 +303,7 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
             for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                 let old = *lo_x;
                 *hi_x = old * r_i;
-                *lo_x = old * one_minus_r;
+                *lo_x = old + *hi_x;
             }
         } else {
             lo.par_iter_mut()
@@ -312,7 +311,7 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
                 .for_each(|(lo_x, hi_x)| {
                     let old = *lo_x;
                     *hi_x = old * r_i;
-                    *lo_x = old * one_minus_r;
+                    *lo_x = old + *hi_x;
                 });
         }
     }
@@ -2406,6 +2405,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         }
     }
 
+    // 2. Precompute only for claims that still need fold work.
+    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
+        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .collect();
+    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
+        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
+        .collect();
+
     // 2. Build suffix representations. Dense claims use the tensor-split
     //    factorization (two ~2^(n/2) factors instead of the full 2^n tensor)
     //    whenever `len` is a whole number of 16-wide MFR chunks — i.e. all
@@ -2415,22 +2422,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
     let t = std::time::Instant::now();
-    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
-        dense_suffixes
-            .iter()
-            .map(|s| build_eq_split(s, split_n_lo(s.len())))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let dense_tensors: Vec<Vec<F128>> = if use_split {
-        Vec::new()
-    } else {
-        dense_suffixes
-            .iter()
-            .map(|s| build_eq_parallel(s))
-            .collect()
-    };
+    let mut dense_splits: Vec<Option<(Vec<F128>, Vec<F128>)>> = vec![None; dense_suffixes.len()];
+    let mut dense_tensors: Vec<Option<Vec<F128>>> = vec![None; dense_suffixes.len()];
+
     let sparse_supports: Vec<SparseEqTensor> =
         sparse_suffixes.iter().map(|s| build_eq_sparse(s)).collect();
     if trace {
@@ -2451,12 +2445,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
-        .collect();
-    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
-        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
-        .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
@@ -2484,24 +2472,66 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 // one packed_witness streaming pass, shared transposes.
                 let d0 = dense_needs_fold[0];
                 let d1 = dense_needs_fold[1];
-                let (lo0, hi0) = (dense_splits[d0].0.as_slice(), dense_splits[d0].1.as_slice());
-                let (lo1, hi1) = (dense_splits[d1].0.as_slice(), dense_splits[d1].1.as_slice());
+                if dense_splits[d0].is_none() {
+                    dense_splits[d0] = Some(build_eq_split(
+                        dense_suffixes[d0],
+                        split_n_lo(dense_suffixes[d0].len()),
+                    ));
+                }
+                if dense_splits[d1].is_none() {
+                    dense_splits[d1] = Some(build_eq_split(
+                        dense_suffixes[d1],
+                        split_n_lo(dense_suffixes[d1].len()),
+                    ));
+                }
+                let (eq_lo0, eq_hi0) = dense_splits[d0]
+                    .as_ref()
+                    .map(|(eq_lo, eq_hi)| (eq_lo.as_slice(), eq_hi.as_slice()))
+                    .expect("dense split missing");
+                let (eq_lo1, eq_hi1) = dense_splits[d1]
+                    .as_ref()
+                    .map(|(eq_lo, eq_hi)| (eq_lo.as_slice(), eq_hi.as_slice()))
+                    .expect("dense split missing");
+                let lo0 = eq_lo0;
+                let hi0 = eq_hi0;
+                let lo1 = eq_lo1;
+                let hi1 = eq_hi1;
                 let (a, b) = fold_1b_rows_split_2way(packed_witness, lo0, hi0, lo1, hi1, padding);
                 dense_s_hat_v[d0] = a;
                 dense_s_hat_v[d1] = b;
             }
             _ => {
                 for &d in &dense_needs_fold {
-                    let (eq_lo, eq_hi) = (&dense_splits[d].0, &dense_splits[d].1);
+                    if dense_splits[d].is_none() {
+                        dense_splits[d] = Some(build_eq_split(
+                            dense_suffixes[d],
+                            split_n_lo(dense_suffixes[d].len()),
+                        ));
+                    }
+                    let (eq_lo, eq_hi) = dense_splits[d]
+                        .as_ref()
+                        .map(|(eq_lo, eq_hi)| (eq_lo.as_slice(), eq_hi.as_slice()))
+                        .expect("dense split missing");
                     dense_s_hat_v[d] = fold_1b_rows_split(packed_witness, eq_lo, eq_hi, padding);
                 }
             }
         }
     } else if !dense_needs_fold.is_empty() {
-        let dense_refs: Vec<&[F128]> = dense_needs_fold
-            .iter()
-            .map(|&d| dense_tensors[d].as_slice())
-            .collect();
+        for &d in &dense_needs_fold {
+            if dense_tensors[d].is_none() {
+                dense_tensors[d] = Some(build_eq_parallel(dense_suffixes[d]));
+            }
+        }
+
+        let mut dense_refs: Vec<&[F128]> = Vec::with_capacity(dense_needs_fold.len());
+        for &d in &dense_needs_fold {
+            dense_refs.push(
+                dense_tensors[d]
+                    .as_ref()
+                    .expect("dense tensor missing")
+                    .as_slice(),
+            );
+        }
         let out = fold_1b_rows_multi_padded(packed_witness, &dense_refs, padding);
         for (i, &d) in dense_needs_fold.iter().enumerate() {
             dense_s_hat_v[d] = out[i].clone();
@@ -2567,18 +2597,31 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
+                        if dense_splits[d].is_none() {
+                            dense_splits[d] = Some(build_eq_split(
+                                dense_suffixes[d],
+                                split_n_lo(dense_suffixes[d].len()),
+                            ));
+                        }
+                        let (eq_lo, eq_hi) = dense_splits[d]
+                            .as_ref()
+                            .map(|(eq_lo, eq_hi)| (eq_lo.as_slice(), eq_hi.as_slice()))
+                            .expect("dense split missing");
                         // Defer the fold: carry the split factors + γ-baked byte
                         // table so pcs's combine folds each slot directly into
                         // `b_combined` (no 2^(m-7) materialize + readback). The
                         // table build is the only work done here (16·256 adds).
-                        let (eq_lo, eq_hi) = &dense_splits[d];
                         RsEqInd::DeferredDense {
-                            eq_lo: eq_lo.clone(),
-                            eq_hi: eq_hi.clone(),
+                            eq_lo: eq_lo.to_vec(),
+                            eq_hi: eq_hi.to_vec(),
                             table: build_fold_byte_table(&scaled_eq_r_dprime),
                         }
                     } else {
-                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                        if dense_tensors[d].is_none() {
+                            dense_tensors[d] = Some(build_eq_parallel(dense_suffixes[d]));
+                        }
+                        let dense = dense_tensors[d].as_ref().expect("dense tensor missing");
+                        RsEqInd::Dense(fold_b128_elems(dense.as_slice(), &scaled_eq_r_dprime))
                     }
                 }
                 Kind::Sparse(s) => RsEqInd::Sparse {

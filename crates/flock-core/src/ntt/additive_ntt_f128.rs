@@ -570,7 +570,12 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        self.forward_transform_interleaved_parallel_from_layer_impl(data, num_ntts, start_layer, None);
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            data,
+            num_ntts,
+            start_layer,
+            None,
+        );
     }
 
     /// Body of [`Self::forward_transform_interleaved_parallel_from_layer`],
@@ -585,7 +590,10 @@ impl AdditiveNttF128 {
         data: &mut [F128],
         num_ntts: usize,
         start_layer: usize,
-        stream: Option<(usize, &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send))>,
+        stream: Option<(
+            usize,
+            &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
+        )>,
     ) {
         use rayon::prelude::*;
         let n_total = data.len();
@@ -652,10 +660,7 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
-        // Unit tests exercise the deep fused-four schedule through the
-        // portable kernel without changing the production dispatch on CPUs
-        // that do not provide AVX-512 VPCLMULQDQ.
-        let deep_fused4_ok = fused4_ok || cfg!(test);
+        let deep_fused4_ok = false;
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -723,8 +728,9 @@ impl AdditiveNttF128 {
                     let base_addr = data.as_mut_ptr() as usize;
                     let log_quarter = log2_pow2(quarter);
                     let stride = quarter * num_ntts;
-                    (0..num_blocks << log_quarter).into_par_iter().for_each(
-                        |idx| {
+                    (0..num_blocks << log_quarter)
+                        .into_par_iter()
+                        .for_each(|idx| {
                             let block = idx >> log_quarter;
                             let r = idx & (quarter - 1);
                             let t_outer = self.twiddle(layer, block);
@@ -754,8 +760,7 @@ impl AdditiveNttF128 {
                                     a, b, c, d, t_outer, t_inner_a, t_inner_b,
                                 );
                             }
-                        },
-                    );
+                        });
                 }
                 layer += 2;
             } else {
@@ -779,103 +784,58 @@ impl AdditiveNttF128 {
         let sub_bytes = sub_size_positions * num_ntts;
 
         let deep_sub = |sub_idx: usize, sub_data: &mut [F128]| {
-            // The cache-blocked tail normally sweeps each subgroup once per
-            // remaining layer. On AVX-512, reuse the fused-four kernel from
-            // the top layers so a row group remains in registers across four
-            // butterflies. At the ranked geometry this turns deep layers
-            // 9..19 from eleven subgroup sweeps into two fused-four sweeps,
-            // one fused-two sweep, and one scalar tail.
-            //
-            // Keep the existing schedule verbatim on other targets: the
-            // portable fused-four kernel is scalar and loses to the ordinary
-            // row-pair path outside correctness tests.
-            if deep_fused4_ok {
-                let mut layer = n_top.max(start_layer);
-                while layer < log_d {
-                    let layer_in_sub = layer - n_top;
-                    let num_blocks_in_sub = 1usize << layer_in_sub;
-                    let block_size = 1usize << (log_d - layer);
-                    let block_bytes = block_size * num_ntts;
-
-                    if layer + 3 < log_d {
-                        let sixteenth = block_size >> 4;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
-                            for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                            }
-                            let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_fused_4layer_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                &tw,
-                                sixteenth,
-                                num_ntts,
-                            );
-                        }
-                        layer += 4;
-                    } else if layer + 1 < log_d {
-                        // Greedy fused-four scheduling leaves at most three
-                        // layers. The existing fused-two row helper therefore
-                        // remains sequential inside this outer Rayon task.
-                        let quarter = block_size >> 2;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let t_outer = self.twiddle(layer, global_block);
-                            let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
-                            let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
-                            let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_fused_2layer_par_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                t_outer,
-                                t_inner_a,
-                                t_inner_b,
-                                quarter,
-                                num_ntts,
-                            );
-                        }
-                        layer += 2;
-                    } else {
-                        let block_size_half = block_size >> 1;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let twiddle = self.twiddle(layer, global_block);
-                            let block_start = block_in_sub * block_bytes;
-                            let block = &mut sub_data[block_start..block_start + block_bytes];
-                            butterfly_interleaved_block(
-                                block,
-                                twiddle,
-                                block_size_half,
-                                num_ntts,
-                            );
-                        }
-                        layer += 1;
-                    }
-                }
-                return;
-            }
-
-            for layer in n_top.max(start_layer)..log_d {
+            let mut layer = n_top.max(start_layer);
+            while layer < log_d {
                 let layer_in_sub = layer - n_top;
                 let num_blocks_in_sub = 1usize << layer_in_sub;
                 let block_size = 1usize << (log_d - layer);
                 let block_size_half = block_size >> 1;
                 let block_bytes = block_size * num_ntts;
 
+                if deep_fused4_ok && layer + 3 < log_d {
+                    // Keep four rows of a deep group in registers with a
+                    // fused-4 AVX-512 kernel.
+                    let sixteenth = block_size >> 4;
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                        tw[0] = self.twiddle(layer, global_block);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                        }
+                        for s in 0..8 {
+                            tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                        }
+
+                        let block_start = block_in_sub * block_bytes;
+                        let block_end = block_start + block_bytes;
+                        butterfly_interleaved_fused_4layer_par_rows(
+                            &mut sub_data[block_start..block_end],
+                            &tw,
+                            sixteenth,
+                            num_ntts,
+                        );
+                    }
+                    layer += 4;
+                    continue;
+                }
+
                 for block_in_sub in 0..num_blocks_in_sub {
                     let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                    let twiddle = self.twiddle(layer, global_block);
                     let block_start = block_in_sub * block_bytes;
-                    let block = &mut sub_data[block_start..block_start + block_bytes];
-                    butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                    let block_end = block_start + block_bytes;
+                    let block = &mut sub_data[block_start..block_end];
+                    butterfly_interleaved_block(
+                        block,
+                        self.twiddle(layer, global_block),
+                        block_size_half,
+                        num_ntts,
+                    );
                 }
+                layer += 1;
             }
         };
 
@@ -900,13 +860,15 @@ impl AdditiveNttF128 {
                     for c in 0..chunks {
                         let end_sub = ((c + 1) * n_subs) / chunks;
                         let take = end_sub - sub_cursor;
-                        let (cur, tail) =
-                            std::mem::take(&mut rest).split_at_mut(take * sub_bytes);
+                        let (cur, tail) = std::mem::take(&mut rest).split_at_mut(take * sub_bytes);
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
                             .for_each(|(i, sub_data)| deep_sub(sub_cursor + i, sub_data));
-                        on_chunk(c, sub_cursor * sub_size_positions..end_sub * sub_size_positions);
+                        on_chunk(
+                            c,
+                            sub_cursor * sub_size_positions..end_sub * sub_size_positions,
+                        );
                         sub_cursor = end_sub;
                     }
                     return;
@@ -1429,25 +1391,6 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     }
 }
 
-/// Sequential row driver for a fused-four block. The caller already runs one
-/// disjoint cache-sized subgroup per Rayon task, so spawning nested Rayon work
-/// here would add dispatch overhead and disrupt subgroup cache locality.
-#[inline]
-fn butterfly_interleaved_fused_4layer_rows(
-    block: &mut [F128],
-    t: &[F128; 15],
-    sixteenth: usize,
-    num_ntts: usize,
-) {
-    debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
-    let base = block.as_mut_ptr();
-    for r in 0..sixteenth {
-        // SAFETY: each call writes the valid, disjoint row group
-        // `{i*sixteenth + r : i in 0..16}` and calls are sequential here.
-        unsafe { kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, r, t) };
-    }
-}
-
 #[inline]
 fn log2_pow2(n: usize) -> usize {
     assert!(
@@ -1734,92 +1677,92 @@ mod tests {
             // Tracked multi-chunk path: 8-thread pool -> n_top >= 3 -> 8+
             // sub-groups; chunk count clamps to n_chunks exactly.
             (13, 8, 1, 8, 8, 8),
-            (13, 8, 1, 5, 8, 5), // uneven bounds (5 chunks over 8 sub-groups)
+            (13, 8, 1, 5, 8, 5),  // uneven bounds (5 chunks over 8 sub-groups)
             (14, 32, 1, 8, 8, 8), // production lane width, 1 sub-group/chunk
-            (14, 8, 2, 3, 4, 3), // non-power-of-two chunks, rate 1/4
+            (14, 8, 2, 3, 4, 3),  // non-power-of-two chunks, rate 1/4
         ] {
-          for _rep in 0..if threads > 0 { 4 } else { 1 } {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let codeword_len = (1usize << log_d) * num_ntts;
-            let msg_len = codeword_len >> log_inv_rate;
-            let msg = rand_vec(&mut rng, msg_len);
+            for _rep in 0..if threads > 0 { 4 } else { 1 } {
+                let ntt = AdditiveNttF128::standard(log_d);
+                let codeword_len = (1usize << log_d) * num_ntts;
+                let msg_len = codeword_len >> log_inv_rate;
+                let msg = rand_vec(&mut rng, msg_len);
 
-            let mut plain = rand_vec(&mut rng, codeword_len); // stale contents
-            ntt.rs_encode_interleaved(&msg, &mut plain, num_ntts);
+                let mut plain = rand_vec(&mut rng, codeword_len); // stale contents
+                ntt.rs_encode_interleaved(&msg, &mut plain, num_ntts);
 
-            let mut streamed = rand_vec(&mut rng, codeword_len);
-            let mut seen: Vec<(usize, core::ops::Range<usize>)> = Vec::new();
-            let mut snapshots: Vec<u64> = Vec::new();
-            let base = streamed.as_ptr() as usize;
-            let checksum = |lo: usize, hi: usize| -> u64 {
-                // Read through a raw pointer: the callback fires while the
-                // encoder holds &mut, exactly like the GPU consumer does.
-                let mut acc = 0u64;
-                for i in lo * num_ntts..hi * num_ntts {
-                    let v = unsafe { *(base as *const F128).add(i) };
-                    acc = acc
-                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        .wrapping_add(v.lo ^ v.hi);
+                let mut streamed = rand_vec(&mut rng, codeword_len);
+                let mut seen: Vec<(usize, core::ops::Range<usize>)> = Vec::new();
+                let mut snapshots: Vec<u64> = Vec::new();
+                let base = streamed.as_ptr() as usize;
+                let checksum = |lo: usize, hi: usize| -> u64 {
+                    // Read through a raw pointer: the callback fires while the
+                    // encoder holds &mut, exactly like the GPU consumer does.
+                    let mut acc = 0u64;
+                    for i in lo * num_ntts..hi * num_ntts {
+                        let v = unsafe { *(base as *const F128).add(i) };
+                        acc = acc
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add(v.lo ^ v.hi);
+                    }
+                    acc
+                };
+                let mut on_chunk = |idx: usize, range: core::ops::Range<usize>| {
+                    snapshots.push(checksum(range.start, range.end));
+                    seen.push((idx, range));
+                };
+                if threads > 0 {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                        .install(|| {
+                            ntt.rs_encode_interleaved_streamed(
+                                &msg,
+                                &mut streamed,
+                                num_ntts,
+                                n_chunks,
+                                &mut on_chunk,
+                            );
+                        });
+                } else {
+                    ntt.rs_encode_interleaved_streamed(
+                        &msg,
+                        &mut streamed,
+                        num_ntts,
+                        n_chunks,
+                        &mut on_chunk,
+                    );
                 }
-                acc
-            };
-            let mut on_chunk = |idx: usize, range: core::ops::Range<usize>| {
-                snapshots.push(checksum(range.start, range.end));
-                seen.push((idx, range));
-            };
-            if threads > 0 {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap()
-                    .install(|| {
-                        ntt.rs_encode_interleaved_streamed(
-                            &msg,
-                            &mut streamed,
-                            num_ntts,
-                            n_chunks,
-                            &mut on_chunk,
-                        );
-                    });
-            } else {
-                ntt.rs_encode_interleaved_streamed(
-                    &msg,
-                    &mut streamed,
-                    num_ntts,
-                    n_chunks,
-                    &mut on_chunk,
-                );
-            }
 
-            assert_eq!(
-                plain, streamed,
-                "streamed codeword mismatch at log_d={log_d} num_ntts={num_ntts} rate={log_inv_rate}"
-            );
-            // Ordered, contiguous, covering.
-            assert!(
-                seen.len() >= min_callbacks,
-                "expected >= {min_callbacks} callbacks, got {} (log_d={log_d} \
-                 num_ntts={num_ntts} threads={threads})",
-                seen.len()
-            );
-            let n_positions = 1usize << log_d;
-            let mut expect_start = 0usize;
-            for (i, (idx, range)) in seen.iter().enumerate() {
-                assert_eq!(*idx, i, "chunk indices must be sequential");
-                assert_eq!(range.start, expect_start, "ranges must be contiguous");
-                assert!(range.end > range.start);
-                expect_start = range.end;
-            }
-            assert_eq!(expect_start, n_positions, "ranges must cover the codeword");
-            // Finality: the data seen at callback time is the final data.
-            for ((_, range), snap) in seen.iter().zip(&snapshots) {
                 assert_eq!(
-                    checksum(range.start, range.end),
-                    *snap,
-                    "chunk {range:?} changed after its callback (not final)"
+                    plain, streamed,
+                    "streamed codeword mismatch at log_d={log_d} num_ntts={num_ntts} rate={log_inv_rate}"
                 );
+                // Ordered, contiguous, covering.
+                assert!(
+                    seen.len() >= min_callbacks,
+                    "expected >= {min_callbacks} callbacks, got {} (log_d={log_d} \
+                 num_ntts={num_ntts} threads={threads})",
+                    seen.len()
+                );
+                let n_positions = 1usize << log_d;
+                let mut expect_start = 0usize;
+                for (i, (idx, range)) in seen.iter().enumerate() {
+                    assert_eq!(*idx, i, "chunk indices must be sequential");
+                    assert_eq!(range.start, expect_start, "ranges must be contiguous");
+                    assert!(range.end > range.start);
+                    expect_start = range.end;
+                }
+                assert_eq!(expect_start, n_positions, "ranges must cover the codeword");
+                // Finality: the data seen at callback time is the final data.
+                for ((_, range), snap) in seen.iter().zip(&snapshots) {
+                    assert_eq!(
+                        checksum(range.start, range.end),
+                        *snap,
+                        "chunk {range:?} changed after its callback (not final)"
+                    );
+                }
             }
-          }
         }
     }
 
@@ -1888,49 +1831,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Exercise the cache-blocked fused-four schedule from an absolute layer
-    /// inside the deep subgroup tail. The fixed four-thread pool makes
-    /// `n_top <= 4` for this geometry, so starts 5..=9 cover multiple
-    /// subgroups and fused-four runs followed by 3/2/1/0 fused-two/scalar tail
-    /// layers.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq")
-    ))]
-    #[test]
-    fn interleaved_parallel_from_deep_layer_matches_scalar() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            let log_d = 12;
-            let num_ntts = 64;
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut rng = Rng::new(0xCC3);
-            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
-
-            for start_layer in 5..=9 {
-                let mut expected = original.clone();
-                ntt.forward_transform_interleaved_scalar_from_layer(
-                    &mut expected,
-                    num_ntts,
-                    start_layer,
-                );
-                let mut actual = original.clone();
-                ntt.forward_transform_interleaved_parallel_from_layer(
-                    &mut actual,
-                    num_ntts,
-                    start_layer,
-                );
-                assert_eq!(
-                    actual, expected,
-                    "deep from-layer mismatch at start_layer={start_layer}"
-                );
-            }
-        });
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
