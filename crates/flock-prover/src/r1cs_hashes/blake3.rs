@@ -92,6 +92,11 @@ use super::common::{add_carry_parts, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+use flock_core::ntt::AdditiveNttF128;
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
@@ -1319,7 +1324,16 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     let use_nt = cfg!(target_arch = "aarch64")
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
-    generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
+    let (z, a, b, ab_inner, seed_done) =
+        generate_witness_with_ab_packed_and_round1_inner_impl(
+            blocks,
+            n_blocks_log,
+            use_nt,
+            None,
+            None,
+        );
+    debug_assert!(!seed_done, "no L0 → encode must still seed");
+    (z, a, b, ab_inner)
 }
 
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
@@ -1328,11 +1342,14 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
     use_nt: bool,
+    mut codeword: Option<&mut [F128]>,
+    pcs: Option<&PcsParams>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
     Vec<F128>,
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    bool,
 ) {
     use rayon::prelude::*;
 
@@ -1362,6 +1379,56 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
     let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+
+    // Four-row seed handshake. Release after finish()+OUT_LO of dest-z block
+    // `s + k·q` (q = n_blocks/4), Acquire all four, then seed_row(2s) and
+    // seed_row(2s+1). Not a block-count / last-quarter wait. L0 must already
+    // be visible (warm prefault). No stnp. Dest z stays.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    let handshake = !use_nt
+        && pcs
+            .zip(codeword.as_ref())
+            .is_some_and(|(p, cw)| {
+                AdditiveNttF128::rate_half_four_row_handshake_ok(
+                    n_total,
+                    p.num_ntts(),
+                    n_total * F128_PER_BLOCK,
+                    cw.len(),
+                    p.k_code(),
+                    p.log_inv_rate,
+                )
+            });
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
+    let handshake = false;
+    let _ = (&codeword, &pcs);
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    let handshake_state = handshake.then(|| {
+        use std::sync::atomic::AtomicBool;
+        let q = n_total / 4;
+        let done: Vec<AtomicBool> = (0..n_total).map(|_| AtomicBool::new(false)).collect();
+        let fired: Vec<AtomicBool> = (0..q).map(|_| AtomicBool::new(false)).collect();
+        let ntt = AdditiveNttF128::standard(pcs.unwrap().k_code());
+        let z_addr = z.as_ptr() as usize;
+        let cw_addr = codeword.as_mut().unwrap().as_mut_ptr() as usize;
+        let z_len = n_total * F128_PER_BLOCK;
+        let num_ntts = pcs.unwrap().num_ntts();
+        (done, fired, ntt, z_addr, cw_addr, z_len, num_ntts, q)
+    });
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
+    let handshake_state = None::<()>;
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -1471,10 +1538,62 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
                         a_bytes, b_bytes, ab_out, &inv_table,
                     );
                 }
+                #[cfg(any(
+                    all(target_arch = "aarch64", target_feature = "aes"),
+                    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+                ))]
+                if let Some((done, fired, ntt, z_addr, cw_addr, z_len, num_ntts, q)) =
+                    handshake_state.as_ref()
+                {
+                    use std::sync::atomic::Ordering;
+                    // dest-z block is complete: PackedRowStream::finish() AND OUT_LO.
+                    done[block_idx].store(true, Ordering::Release);
+                    let s = block_idx % *q;
+                    if (0..4).all(|k| done[s + k * *q].load(Ordering::Acquire))
+                        && fired[s]
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        unsafe {
+                            ntt.seed_rate_half_row(
+                                *z_addr as *const F128,
+                                *cw_addr as *mut F128,
+                                *z_len,
+                                *num_ntts,
+                                2 * s,
+                            );
+                            ntt.seed_rate_half_row(
+                                *z_addr as *const F128,
+                                *cw_addr as *mut F128,
+                                *z_len,
+                                *num_ntts,
+                                2 * s + 1,
+                            );
+                        }
+                    }
+                }
             },
         );
 
-    (z, a, b, ab_inner)
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    let seed_done = handshake_state
+        .as_ref()
+        .is_some_and(|(_, fired, ..)| {
+            use std::sync::atomic::Ordering;
+            fired.iter().all(|b| b.load(Ordering::Relaxed))
+        });
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
+    let seed_done = {
+        let _ = handshake_state;
+        false
+    };
+    (z, a, b, ab_inner, seed_done)
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -1710,15 +1829,24 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
-                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner, seed_done)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
-                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner(
-                                blocks,
-                                self.n_blocks_log(),
-                            )
-                        });
+                        let r = flock_core::pcs::prefault_codeword_during_visible(
+                            &self.pcs_params,
+                            |l0| {
+                                let use_nt = cfg!(target_arch = "aarch64")
+                                    && super::common::u64_per_block_is_nt_compatible(K / 64)
+                                    && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+                                generate_witness_with_ab_packed_and_round1_inner_impl(
+                                    blocks,
+                                    self.n_blocks_log(),
+                                    use_nt,
+                                    l0,
+                                    Some(&self.pcs_params),
+                                )
+                            },
+                        );
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
                     });
@@ -1734,6 +1862,7 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    seed_done,
                     challenger,
                 )
             }
@@ -2408,10 +2537,11 @@ mod tests {
             .collect();
         let n_log = min_n_blocks_log(n_blocks);
 
-        let (z_nt, a_nt, b_nt, mut ab_nt) =
-            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, true);
-        let (z_rg, a_rg, b_rg, mut ab_rg) =
-            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, false);
+        let (z_nt, a_nt, b_nt, mut ab_nt, seed_nt) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, true, None, None);
+        let (z_rg, a_rg, b_rg, mut ab_rg, seed_rg) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, false, None, None);
+        assert!(!seed_nt && !seed_rg, "no L0 → encode must still seed");
 
         assert_eq!(z_nt, z_rg, "z mismatch between NT and regular paths");
         assert_eq!(a_nt, a_rg, "a mismatch between NT and regular paths");
@@ -2421,6 +2551,82 @@ mod tests {
             ab_rg.as_bytes_mut(),
             "ab_inner mismatch between NT and regular paths"
         );
+    }
+
+    /// Generate-path handshake: after finish()+OUT_LO, Release/Acquire the
+    /// four partners of slot s and fire seed_row(2s)+seed_row(2s+1). Must
+    /// match portable seed_rate_half on dest z. Dest z unchanged vs no-L0.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn handshake_generate_seed_matches_seed_rate_half() {
+        let mut rng = Rng::new(0x5EED_6E11);
+        let n_log = 10usize;
+        let n_blocks = 1usize << n_log;
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let pcs = PcsParams {
+            m: K_LOG + n_log,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: Default::default(),
+            merkle_hash: Default::default(),
+        };
+        let z_len = n_blocks * (K / 128);
+        let codeword_len = pcs.codeword_len_f128();
+        assert_eq!(codeword_len, 2 * z_len);
+        let mut l0 = vec![
+            F128 {
+                lo: 0xA5A5A5A5A5A5A5A5,
+                hi: 0xA5A5A5A5A5A5A5A5,
+            };
+            codeword_len
+        ];
+        let (z, _a, _b, _ab, seed_done) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(
+                &blocks,
+                n_log,
+                false,
+                Some(&mut l0),
+                Some(&pcs),
+            );
+        assert!(seed_done, "warm L0 + ranked-like geometry must seed all slots");
+
+        let (z2, _a2, _b2, _ab2, seed2) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(
+                &blocks, n_log, false, None, None,
+            );
+        assert!(!seed2);
+        assert_eq!(z, z2, "dest z must stay");
+
+        let ntt = AdditiveNttF128::standard(pcs.k_code());
+        let mut today = vec![
+            F128 {
+                lo: 0xA5A5A5A5A5A5A5A5,
+                hi: 0xA5A5A5A5A5A5A5A5,
+            };
+            codeword_len
+        ];
+        let quarter = (z_len / pcs.num_ntts()) >> 2;
+        for r in 0..quarter {
+            unsafe {
+                ntt.seed_rate_half_row(
+                    z.as_ptr(),
+                    today.as_mut_ptr(),
+                    z_len,
+                    pcs.num_ntts(),
+                    r,
+                );
+            }
+        }
+        assert_eq!(l0, today, "generate handshake != portable seed_rate_half");
     }
 
     /// Full-buffer oracle at m = 20 (64 blocks): the fused round1_inner

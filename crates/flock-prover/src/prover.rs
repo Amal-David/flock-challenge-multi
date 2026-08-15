@@ -318,6 +318,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -346,6 +347,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -363,6 +365,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
     ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    skip_rate_half_seed: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_inner(
@@ -375,6 +378,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        skip_rate_half_seed,
         challenger,
     )
 }
@@ -390,6 +394,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    skip_rate_half_seed: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -417,6 +422,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        skip_rate_half_seed,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -616,6 +622,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -631,6 +638,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    skip_rate_half_seed: bool,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -653,7 +661,12 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = match prefaulted_codeword {
-                Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+                Some(buf) => pcs::commit_into_skip_seed(
+                    &z_packed,
+                    pcs_params,
+                    buf,
+                    skip_rate_half_seed,
+                ),
                 None => pcs::commit(&z_packed, pcs_params),
             };
             flock_core::gaptime::mark("commit: work done");
