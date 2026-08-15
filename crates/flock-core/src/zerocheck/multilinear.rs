@@ -55,6 +55,8 @@ use kernels::aarch64::{round2_chunk_raw_neon, round2_chunk_raw_neon_q};
     target_feature = "vpclmulqdq"
 ))]
 use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+#[cfg(target_arch = "x86_64")]
+use kernels::x86_64::tail_fold_chunk_x86_nt;
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
@@ -818,6 +820,15 @@ pub fn fold_and_compute_round_pair_into(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_nt_stores =
         half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
+    // x86: same gate + kill switch. The AVX-512 tail path is handled below;
+    // the SSE2 NT leaf is used on all other x86_64 builds (and when the
+    // AVX-512 flavor is not compiled in).
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))
+    ))]
+    let use_nt_stores =
+        half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
     // q-form (all-NEON) kernel gate. The scalar-struct leaf keeps F128 halves
     // in GPRs and pays a fmov per PMULL operand; the q-form leaf keeps every
     // value in NEON registers (bit-identical output). Unlike the v1 leaf it
@@ -911,6 +922,23 @@ pub fn fold_and_compute_round_pair_into(
                             )
                         };
                     }
+                }
+                // x86 SSE2 NT tail leaf: fused fold + register-sourced
+                // message with `_mm_stream_si128` output stores and one
+                // `_mm_sfence()` per closure — no write-allocate, no reload.
+                #[cfg(target_arch = "x86_64")]
+                if use_nt_stores {
+                    break 'msg unsafe {
+                        tail_fold_chunk_x86_nt(
+                            a_in.as_ptr(),
+                            b_in.as_ptr(),
+                            a_out.as_mut_ptr(),
+                            b_out.as_mut_ptr(),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            r_fold,
+                        )
+                    };
                 }
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
                 // selects the architecture kernel; this loop only consumes
@@ -1395,6 +1423,57 @@ mod tests {
             // 2·lo_size out / lo_size eq exactly as the contract requires.
             let (p1_nt, pinf_nt) = unsafe {
                 kernels::aarch64::tail_fold_chunk_nt_neon(
+                    a_in.as_ptr(),
+                    b_in.as_ptr(),
+                    a_nt.as_mut_ptr(),
+                    b_nt.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    r_fold,
+                )
+            };
+
+            assert_eq!(a_ref, a_nt, "folded a mismatch at lo_size={lo_size}");
+            assert_eq!(b_ref, b_nt, "folded b mismatch at lo_size={lo_size}");
+            assert_eq!(p1_ref, p1_nt, "p1 mismatch at lo_size={lo_size}");
+            assert_eq!(pinf_ref, pinf_nt, "pinf mismatch at lo_size={lo_size}");
+        }
+    }
+    /// x86 SSE2 tail leaf: bit-identical folded outputs and (p1, pinf) to the
+    /// generic fold-then-reload path. Streaming stores change cache behavior
+    /// only.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn tail_fold_x86_nt_leaf_matches_generic() {
+        let mut rng = Rng::new(76);
+        for lo_size in [2usize, 4, 6, 8, 64, 256, 4096] {
+            let n_in = 4 * lo_size;
+            let a_in = rng.f128_vec(n_in);
+            let b_in = rng.f128_vec(n_in);
+            let eq_lo = rng.f128_vec(lo_size);
+            let r_fold = rng.f128();
+
+            // Generic reference: fold_pairs then the reload message loop.
+            let mut a_ref = vec![F128::ZERO; 2 * lo_size];
+            let mut b_ref = vec![F128::ZERO; 2 * lo_size];
+            crate::field::f128_slice::fold_pairs(&a_in, 0, &mut a_ref, r_fold);
+            crate::field::f128_slice::fold_pairs(&b_in, 0, &mut b_ref, r_fold);
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let o = 2 * x_lo;
+                let (a0, a1, b0, b1) = (a_ref[o], a_ref[o + 1], b_ref[o], b_ref[o + 1]);
+                p1_acc ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            let (p1_ref, pinf_ref) = (p1_acc.reduce(), pinf_acc.reduce());
+
+            let mut a_nt = vec![F128::ZERO; 2 * lo_size];
+            let mut b_nt = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: SSE2 is baseline on x86_64; buffers sized 4·lo_size in /
+            // 2·lo_size out / lo_size eq exactly as the contract requires.
+            let (p1_nt, pinf_nt) = unsafe {
+                tail_fold_chunk_x86_nt(
                     a_in.as_ptr(),
                     b_in.as_ptr(),
                     a_nt.as_mut_ptr(),

@@ -1,5 +1,14 @@
+use crate::field::F128;
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
-use crate::field::{F128, F256Unreduced};
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+use crate::field::F256Unreduced;
 
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.
@@ -41,6 +50,79 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
         }
         // F128 is exactly two u64 words and accepts every bit pattern.
         acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+    }
+}
+
+/// x86 SSE2 tail leaf: fold `a`/`b` at `r_fold`, publish each folded F128
+/// with `_mm_stream_si128` (no write-allocate), and compute the round message
+/// from the folded register values — never re-reading the streamed output.
+/// Bit-identical to the generic `fold_pairs` + reload path below the gate.
+///
+/// # Safety
+/// Requires SSE2 (baseline on x86_64). `a_in`/`b_in` must be valid for
+/// `4 * lo_size` F128 reads, `a_out`/`b_out` for `2 * lo_size` F128 writes
+/// (16-byte aligned), and `eq_lo` for `lo_size` F128 reads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub(crate) unsafe fn tail_fold_chunk_x86_nt(
+    a_in: *const F128,
+    b_in: *const F128,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    r_fold: F128,
+) -> (F128, F128) {
+    use crate::field::F256Unreduced;
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller guarantees the slice ranges; F128 is 16-byte aligned so
+    // every streaming store is aligned.
+    unsafe {
+        let mut p1_acc = F256Unreduced::ZERO;
+        let mut pinf_acc = F256Unreduced::ZERO;
+
+        let mut src_a = a_in;
+        let mut src_b = b_in;
+        let mut dst_a = a_out;
+        let mut dst_b = b_out;
+        let mut eq_ptr = eq_lo;
+        let mut remaining = lo_size;
+
+        while remaining != 0 {
+            let ae0 = src_a.read();
+            let ao0 = src_a.add(1).read();
+            let ae1 = src_a.add(2).read();
+            let ao1 = src_a.add(3).read();
+            let be0 = src_b.read();
+            let bo0 = src_b.add(1).read();
+            let be1 = src_b.add(2).read();
+            let bo1 = src_b.add(3).read();
+
+            let a0 = ae0 + r_fold * (ae0 + ao0);
+            let a1 = ae1 + r_fold * (ae1 + ao1);
+            let b0 = be0 + r_fold * (be0 + bo0);
+            let b1 = be1 + r_fold * (be1 + bo1);
+
+            _mm_stream_si128(dst_a.cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(a0));
+            _mm_stream_si128(dst_a.add(1).cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(a1));
+            _mm_stream_si128(dst_b.cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(b0));
+            _mm_stream_si128(dst_b.add(1).cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(b1));
+
+            let eq_l = eq_ptr.read();
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+
+            src_a = src_a.add(4);
+            src_b = src_b.add(4);
+            dst_a = dst_a.add(2);
+            dst_b = dst_b.add(2);
+            eq_ptr = eq_ptr.add(1);
+            remaining -= 1;
+        }
+
+        _mm_sfence();
+        (p1_acc.reduce(), pinf_acc.reduce())
     }
 }
 
