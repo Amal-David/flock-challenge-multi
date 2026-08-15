@@ -167,4 +167,39 @@ mod tests {
         assert!(POOL.lock().unwrap().len() <= MAX_POOLED);
         clear();
     }
+
+    /// Smallest-fit: a 16 MiB-class take must reuse the matching parked
+    /// buffer, not steal dest-z (512 MiB) / L0 codeword (1 GiB).
+    #[test]
+    fn take_f128_smallest_fit_does_not_steal_large() {
+        clear();
+        let small_n = 1 << 10;
+        let large_n = 1 << 14;
+        let small = take_f128(small_n);
+        let ptr_small = small.as_ptr();
+        give_f128(small);
+        let large = take_f128(large_n);
+        let ptr_large = large.as_ptr();
+        give_f128(large);
+        let again_small = take_f128(small_n);
+        assert_eq!(
+            again_small.as_ptr(),
+            ptr_small,
+            "small take must reuse the small parked buffer"
+        );
+        assert_ne!(
+            again_small.as_ptr(),
+            ptr_large,
+            "small take must not steal the large parked buffer"
+        );
+        give_f128(again_small);
+        let again_large = take_f128(large_n);
+        assert_eq!(
+            again_large.as_ptr(),
+            ptr_large,
+            "large take must reuse the large parked buffer"
+        );
+        give_f128(again_large);
+        clear();
+    }
 }

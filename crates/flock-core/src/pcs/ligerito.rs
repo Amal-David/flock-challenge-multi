@@ -2208,6 +2208,19 @@ pub(crate) fn induce_sumcheck_poly_auto(
     }
 }
 
+/// Ranked Fast L0 induce is NTT-path `2^20` F128 = 16 MiB. `take_f128` is
+/// uninit/stale; the scatter is sparse, so every slot must be zero — same
+/// bytes as `vec![F128::ZERO; n]`. Smallest-fit: a parked 16 MiB slot is
+/// preferred over dest-z / L0-codeword (512 MiB / 1 GiB). Those large
+/// buffers are live or just-given at induce; L0 is checked out, dest z
+/// was `give_f128`'d at fold2 and is parked — take will only grab it if
+/// no smaller slot exists (first warmup). Glue/`Drop` park the 16 MiB.
+fn take_zeroed_f128(n: usize) -> Vec<F128> {
+    let mut v = crate::scratch::take_f128(n);
+    v.fill(F128::ZERO);
+    v
+}
+
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
@@ -2228,7 +2241,7 @@ fn transpose_forward_ntt_sparse(
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
-        let mut data = vec![F128::ZERO; n];
+        let mut data = take_zeroed_f128(n);
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
         }
@@ -2277,7 +2290,7 @@ fn transpose_forward_ntt_sparse(
 
     // Densify (active windows only; the rest stay zero, which is the correct
     // post-step-(k-1) state for an all-zero window).
-    let mut data = vec![F128::ZERO; n];
+    let mut data = take_zeroed_f128(n);
     for (w, buf) in processed {
         data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
@@ -2350,8 +2363,9 @@ impl Drop for LigeroWitness {
 }
 
 // SumcheckProver owns the two witness-sized polynomials of the open (the
-// packed witness `f` and the γ-combined basis) — recycle owned heap buffers
-// on drop. Arena-carved buffers are views into `fold_arena`, which drops
+// packed witness `f` and the γ-combined basis) plus any introduced basis
+// still sitting in `pending_glue` — recycle owned heap buffers on drop.
+// Arena-carved buffers are views into `fold_arena`, which drops
 // (joins its prefault thread + frees the one allocation) right after.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
@@ -2359,6 +2373,9 @@ impl Drop for SumcheckProver {
             crate::scratch::give_f128(v);
         }
         if let FoldBuf::Owned(v) = std::mem::take(&mut self.combined_basis) {
+            crate::scratch::give_f128(v);
+        }
+        if let Some((v, _)) = self.pending_glue.take() {
             crate::scratch::give_f128(v);
         }
     }
@@ -3864,6 +3881,10 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+        // Ranked L0 induced basis is 16 MiB (cap stays 16 MiB after truncate).
+        // Without this, glue's local `b_new` munmaps and the next trial
+        // `take_f128(2^20)` misses.
+        crate::scratch::give_f128(b_new);
     }
 
     pub fn f(&self) -> &[F128] {
@@ -7206,6 +7227,62 @@ mod tests {
             t_r,
             "residual inner product != t_r"
         );
+    }
+
+    /// glue `take()` must `give_f128` the introduced basis so the next
+    /// `take_f128` reuses the same allocation (ranked L0 induce is 16 MiB).
+    #[test]
+    fn glue_gives_back_introduced_basis() {
+        crate::scratch::clear();
+        let n = 1usize << 10;
+        let f = vec![F128::ONE; n];
+        let b1 = vec![F128::ONE; n];
+        let (mut prover, _) = SumcheckProver::new(f, b1, F128::ZERO);
+        let mut b_new = crate::scratch::take_f128(n);
+        b_new.fill(F128::ONE);
+        let ptr = b_new.as_ptr();
+        prover.introduce_new(b_new, F128::ZERO);
+        prover.glue(F128::ONE);
+        let reused = crate::scratch::take_f128(n);
+        assert_eq!(
+            reused.as_ptr(),
+            ptr,
+            "glue must park the introduced basis for take_f128 reuse"
+        );
+        crate::scratch::give_f128(reused);
+        drop(prover);
+        crate::scratch::clear();
+    }
+
+    /// Drop without glue must still `give_f128` `pending_glue` (and f / basis).
+    #[test]
+    fn sumcheck_drop_gives_pending_glue() {
+        crate::scratch::clear();
+        let n = 1usize << 10;
+        let mut f = crate::scratch::take_f128(n);
+        f.fill(F128::ONE);
+        let pf = f.as_ptr();
+        let mut b1 = crate::scratch::take_f128(n);
+        b1.fill(F128::ONE);
+        let pb = b1.as_ptr();
+        let mut b_new = crate::scratch::take_f128(n);
+        b_new.fill(F128::ONE);
+        let pn = b_new.as_ptr();
+        let (mut prover, _) = SumcheckProver::new(f, b1, F128::ZERO);
+        prover.introduce_new(b_new, F128::ZERO);
+        drop(prover);
+        let a = crate::scratch::take_f128(n);
+        let b = crate::scratch::take_f128(n);
+        let c = crate::scratch::take_f128(n);
+        let got = [a.as_ptr(), b.as_ptr(), c.as_ptr()];
+        assert!(
+            got.contains(&pf) && got.contains(&pb) && got.contains(&pn),
+            "Drop must give f, combined_basis, and pending_glue"
+        );
+        crate::scratch::give_f128(a);
+        crate::scratch::give_f128(b);
+        crate::scratch::give_f128(c);
+        crate::scratch::clear();
     }
 
     /// `induce_sumcheck_poly` is consistent with the codeword:
