@@ -1682,13 +1682,13 @@ impl LigeritoProof {
 pub(crate) fn partial_eval_lsb(evals: &[F128], rs: &[F128]) -> Vec<F128> {
     let mut cur = evals.to_vec();
     for &r in rs {
-        let one_plus_r = F128::ONE + r;
         let half = cur.len() / 2;
-        // Pair (cur[2i], cur[2i+1]) collapses to cur[2i]·(1+r) + cur[2i+1]·r.
-        // LSB-first ⇒ adjacent pairs are bit_0 = 0 vs 1.
+        // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
         let mut next = Vec::with_capacity(half);
         for i in 0..half {
-            next.push(cur[2 * i] * one_plus_r + cur[2 * i + 1] * r);
+            let e0 = cur[2 * i];
+            let e1 = cur[2 * i + 1];
+            next.push(e0 + r * (e0 + e1));
         }
         cur = next;
     }
@@ -2661,37 +2661,66 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
 
-    const PAR_THRESHOLD: usize = 4096;
-    let half = n / 2;
-    if half < PAR_THRESHOLD {
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
-        for j in 0..half {
-            let f0 = f[2 * j];
-            let f1 = f[2 * j + 1];
-            let b0 = b[2 * j];
-            let b1 = b[2 * j + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
+    // Layout matches msg_reduce: pairs are consecutive (f[2j], f[2j+1]).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        const PAR_THRESHOLD: usize = 4096;
+        if n < PAR_THRESHOLD {
+            // SAFETY: features cfg-guaranteed; n even and >= 2.
+            let (u_0, u_2) = unsafe { msg_reduce_avx512(f, b) };
+            return SumcheckMessage { u_0, u_2 };
         }
+        // Chunked parallel reduce; each chunk length is a multiple of 8 when
+        // possible so the AVX-512 body stays saturated.
+        const CHUNK: usize = 2048;
+        let (u_0, u_2) = f
+            .par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .map(|(fc, bc)| {
+                // SAFETY: equal chunk lengths; features cfg-guaranteed.
+                unsafe { msg_reduce_avx512(fc, bc) }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            );
         return SumcheckMessage { u_0, u_2 };
     }
 
-    let (u_0, u_2) = (0..half)
-        .into_par_iter()
-        .with_min_len(PAR_THRESHOLD / 4)
-        .map(|j| {
-            let f0 = f[2 * j];
-            let f1 = f[2 * j + 1];
-            let b0 = b[2 * j];
-            let b1 = b[2 * j + 1];
-            (f0 * b0, (f0 + f1) * (b0 + b1))
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-        );
-    SumcheckMessage { u_0, u_2 }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        const PAR_THRESHOLD: usize = 4096;
+        let half = n / 2;
+        if half < PAR_THRESHOLD {
+            let mut u_0 = F128::ZERO;
+            let mut u_2 = F128::ZERO;
+            for j in 0..half {
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                u_0 += f0 * b0;
+                u_2 += (f0 + f1) * (b0 + b1);
+            }
+            return SumcheckMessage { u_0, u_2 };
+        }
+
+        let (u_0, u_2) = (0..half)
+            .into_par_iter()
+            .with_min_len(PAR_THRESHOLD / 4)
+            .map(|j| {
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                (f0 * b0, (f0 + f1) * (b0 + b1))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            );
+        SumcheckMessage { u_0, u_2 }
+    }
 }
 
 /// Fused round message + full inner product: returns `round_msg_lsb(f, b)`
@@ -2894,18 +2923,25 @@ fn fold_and_msg_lsb(
             nf.push(f0 + r * (f0 + f1));
             nb.push(b0 + r * (b0 + b1));
         }
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
-        let mut k = 0;
-        while k + 1 < half {
-            let f0 = nf[k];
-            let f1 = nf[k + 1];
-            let b0 = nb[k];
-            let b1 = nb[k + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
-            k += 2;
-        }
+        // Same AVX-512 message reduce used on the parallel path.
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let (u_0, u_2) = unsafe { msg_reduce_avx512(&nf, &nb) };
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        let (u_0, u_2) = {
+            let mut u_0 = F128::ZERO;
+            let mut u_2 = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < half {
+                let f0 = nf[k];
+                let f1 = nf[k + 1];
+                let b0 = nb[k];
+                let b1 = nb[k + 1];
+                u_0 += f0 * b0;
+                u_2 += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+            (u_0, u_2)
+        };
         return (
             FoldBuf::Owned(nf),
             FoldBuf::Owned(nb),
