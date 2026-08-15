@@ -2744,6 +2744,82 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// output buffers from (prefaulted pages, no per-round zero-fill faults).
 /// `None`, an exhausted arena, or the serial path fall back to the previous
 /// per-arch allocation behavior.
+/// AVX-512 + VPCLMULQDQ vectorized message-term reduction for
+/// [`fold_and_msg_lsb`]. Replaces the scalar `u0 += f0*b0; u2 += (f0+f1)*(b0+b1)`
+/// loop with a 4-lane unreduced multiply-accumulate, folding the 4 lanes
+/// and reducing once at the end.  Processes 8 F128 (4 pairs) per iteration.
+///
+/// `fc` and `bc` are the folded slices (length `half = n/2`, a power of two
+/// ≥ `PAR_THRESHOLD/2`). The message pairs are (k, k+1) for k = 0, 2, 4, …:
+///   u0 = Σ fc[k]·bc[k]           (products at even pair-positions)
+///   u2 = Σ (fc[k]+fc[k+1])·(bc[k]+bc[k+1])  (products of pair sums)
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    // Process 8 F128 (4 message pairs) per iteration.
+    let lanes = len & !7;
+    let mut u0_acc = WideGhashX4::zero();
+    let mut u2_acc = WideGhashX4::zero();
+
+    // idx_even: pick 128-bit lanes {0, 2} from reg0 and {0, 2} from reg1
+    // → [reg0[0], reg0[2], reg1[0], reg1[2]] (even-indexed F128 elements).
+    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+    // perm_swap: swap adjacent 128-bit lanes (0↔1, 2↔3) within a register.
+    // After XOR with original, every lane holds a pair sum.
+    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+    let mut k = 0;
+    while k < lanes {
+        // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
+        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+        // u0: products at even pair-positions k, k+2, k+4, k+6.
+        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        u0_acc.mul_acc(f_even, b_even);
+
+        // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
+        //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
+        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        u2_acc.mul_acc(f_sum, b_sum);
+
+        k += 8;
+    }
+
+    // Fold the 4-lane unreduced accumulators to scalar F128.
+    let mut u0 = u0_acc.fold().reduce();
+    let mut u2 = u2_acc.fold().reduce();
+
+    // Scalar tail for remaining pairs.
+    while k + 1 < len {
+        let f0 = fc[k];
+        let f1 = fc[k + 1];
+        let b0 = bc[k];
+        let b1 = bc[k + 1];
+        u0 += f0 * b0;
+        u2 += (f0 + f1) * (b0 + b1);
+        k += 2;
+    }
+
+    (u0, u2)
+}
+
 fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
@@ -2873,22 +2949,32 @@ fn fold_and_msg_lsb(
                 }
             }
             let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                // SAFETY: target features cfg-guaranteed; fc/bc have equal
+                // even length (caller asserts n ≥ 2, power of two).
+                let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
+                (u0, u2)
             }
-            (u0, u2)
+            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+            {
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut k = 0;
+                while k + 1 < len {
+                    let f0 = fc[k];
+                    let f1 = fc[k + 1];
+                    let b0 = bc[k];
+                    let b1 = bc[k + 1];
+                    u0 += f0 * b0;
+                    u2 += (f0 + f1) * (b0 + b1);
+                    k += 2;
+                }
+                (u0, u2)
+            }
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
