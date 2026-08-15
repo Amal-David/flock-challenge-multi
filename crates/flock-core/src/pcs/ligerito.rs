@@ -2940,14 +2940,17 @@ fn materialize_direct_ab_fold2(
         .map_init(
             || vec![F128::ZERO; claims.len() * table_len],
             |scratch, (block, (b_out, f_out))| {
-                for (claim_index, (claim, direct_table)) in
-                    claims.iter().zip(direct_tables.iter()).enumerate()
-                {
-                    super::ring_switch::compose_block_table(
-                        direct_table,
-                        claim.eq_hi[block],
-                        &mut scratch[claim_index * table_len..(claim_index + 1) * table_len],
-                    );
+                // Production 2-claim table-hot path composes inside each phase.
+                if claims.len() != 2 {
+                    for (claim_index, (claim, direct_table)) in
+                        claims.iter().zip(direct_tables.iter()).enumerate()
+                    {
+                        super::ring_switch::compose_block_table(
+                            direct_table,
+                            claim.eq_hi[block],
+                            &mut scratch[claim_index * table_len..(claim_index + 1) * table_len],
+                        );
+                    }
                 }
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
@@ -2985,29 +2988,38 @@ fn materialize_direct_ab_fold2(
                     }
                 } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
-                    let first_table = &scratch[..table_len];
-                    let second_table = &scratch[table_len..2 * table_len];
+                    // Table-hot two-phase: only one 64 KiB composed table live.
+                    // Phase 1: first table hot → store f + partial b.
+                    // Phase 2: second table hot → complete b + accumulate.
+                    // Algebra identical to interleaved original.
+                    let table = &mut scratch[..table_len];
+                    super::ring_switch::compose_block_table(
+                        &direct_tables[0], first.eq_hi[block], table,
+                    );
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
                         let f0 = fold4(f_in, slot0);
                         let f1 = fold4(f_in, slot1);
-                        let b0 = super::ring_switch::fold_one_slot(
-                            first.eq_lo[slot0],
-                            first_table,
-                        ) + super::ring_switch::fold_one_slot(
-                            second.eq_lo[slot0],
-                            second_table,
-                        );
-                        let b1 = super::ring_switch::fold_one_slot(
-                            first.eq_lo[slot1],
-                            first_table,
-                        ) + super::ring_switch::fold_one_slot(
-                            second.eq_lo[slot1],
-                            second_table,
-                        );
+                        let b0 = super::ring_switch::fold_one_slot(first.eq_lo[slot0], table);
+                        let b1 = super::ring_switch::fold_one_slot(first.eq_lo[slot1], table);
                         f_out[slot0] = f0;
                         f_out[slot1] = f1;
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                    }
+                    super::ring_switch::compose_block_table(
+                        &direct_tables[1], second.eq_hi[block], table,
+                    );
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = f_out[slot0];
+                        let f1 = f_out[slot1];
+                        let b0 = b_out[slot0]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[slot0], table);
+                        let b1 = b_out[slot1]
+                            + super::ring_switch::fold_one_slot(second.eq_lo[slot1], table);
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                         u0 += f0 * b0;

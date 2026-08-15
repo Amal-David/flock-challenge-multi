@@ -909,48 +909,55 @@ fn deferred_stats_lookahead(
     let b = eq_lo.len();
     debug_assert!(b >= 4 && b.is_multiple_of(4));
     debug_assert_eq!(packed_witness.len(), b * eq_hi.len());
+    // Hoist e_hi multiply into one composed 64 KiB table per hi-block.
+    // Removes one GF mult per element from the full-length C statistics pass.
+    // map_init reuses the composed buffer across hi-blocks (no per-block alloc).
     eq_hi
         .par_iter()
         .enumerate()
-        .map(|(hi, &e_hi)| {
-            let base = hi * b;
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            let mut c = [F128::ZERO; 6];
-            for t in 0..(b / 4) {
-                let i = 4 * t;
-                let b0 = ring_switch::fold_one_slot(eq_lo[i] * e_hi, table);
-                let b1 = ring_switch::fold_one_slot(eq_lo[i + 1] * e_hi, table);
-                let b2 = ring_switch::fold_one_slot(eq_lo[i + 2] * e_hi, table);
-                let b3 = ring_switch::fold_one_slot(eq_lo[i + 3] * e_hi, table);
-                let a0 = packed_witness[base + i];
-                let a1 = packed_witness[base + i + 1];
-                let a2 = packed_witness[base + i + 2];
-                let a3 = packed_witness[base + i + 3];
-                let sa0 = a0 + a1;
-                let sb0 = b0 + b1;
-                let sa1 = a2 + a3;
-                let sb1 = b2 + b3;
-                let p_even0 = a0 * b0;
-                let p_sum0 = sa0 * sb0;
-                u0 += p_even0 + a2 * b2;
-                u2 += p_sum0 + sa1 * sb1;
-                c[0] += p_even0;
-                c[1] += a1 * b1 + p_even0 + p_sum0;
-                c[2] += p_sum0;
-                let e_a = a0 + a2;
-                let e_b = b0 + b2;
-                let se_a = sa0 + sa1;
-                let se_b = sb0 + sb1;
-                let p_even = e_a * e_b;
-                let p_sum = se_a * se_b;
-                let p_odd = (se_a + e_a) * (se_b + e_b);
-                c[3] += p_even;
-                c[4] += p_odd + p_even + p_sum;
-                c[5] += p_sum;
-            }
-            ((u0, u2), c)
-        })
+        .map_init(
+            || vec![F128::ZERO; ring_switch::FOLD_TABLE_TOTAL],
+            |composed, (hi, &e_hi)| {
+                let base = hi * b;
+                ring_switch::compose_block_table(table, e_hi, composed);
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut c = [F128::ZERO; 6];
+                for t in 0..(b / 4) {
+                    let i = 4 * t;
+                    let b0 = ring_switch::fold_one_slot(eq_lo[i], composed);
+                    let b1 = ring_switch::fold_one_slot(eq_lo[i + 1], composed);
+                    let b2 = ring_switch::fold_one_slot(eq_lo[i + 2], composed);
+                    let b3 = ring_switch::fold_one_slot(eq_lo[i + 3], composed);
+                    let a0 = packed_witness[base + i];
+                    let a1 = packed_witness[base + i + 1];
+                    let a2 = packed_witness[base + i + 2];
+                    let a3 = packed_witness[base + i + 3];
+                    let sa0 = a0 + a1;
+                    let sb0 = b0 + b1;
+                    let sa1 = a2 + a3;
+                    let sb1 = b2 + b3;
+                    let p_even0 = a0 * b0;
+                    let p_sum0 = sa0 * sb0;
+                    u0 += p_even0 + a2 * b2;
+                    u2 += p_sum0 + sa1 * sb1;
+                    c[0] += p_even0;
+                    c[1] += a1 * b1 + p_even0 + p_sum0;
+                    c[2] += p_sum0;
+                    let e_a = a0 + a2;
+                    let e_b = b0 + b2;
+                    let se_a = sa0 + sa1;
+                    let se_b = sb0 + sb1;
+                    let p_even = e_a * e_b;
+                    let p_sum = se_a * se_b;
+                    let p_odd = (se_a + e_a) * (se_b + e_b);
+                    c[3] += p_even;
+                    c[4] += p_odd + p_even + p_sum;
+                    c[5] += p_sum;
+                }
+                ((u0, u2), c)
+            },
+        )
         .reduce(
             || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
             |((x0, x2), mut xc), ((y0, y2), yc)| {
