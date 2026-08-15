@@ -30,17 +30,58 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     // SAFETY: the caller guarantees all table and row bounds. Every table
     // entry is 16-byte aligned because F128 has align(16).
     unsafe {
-        let rows = [a0_bytes, a1_bytes, b0_bytes, b1_bytes];
-        let mut acc = [_mm_setzero_si128(); 4];
-        for chunk in 0..8 {
-            let table_chunk = table_data.add(chunk * 256);
-            for lane in 0..4 {
-                let entry = table_chunk.add(*rows[lane].add(chunk) as usize);
-                acc[lane] = _mm_xor_si128(acc[lane], _mm_load_si128(entry.cast::<__m128i>()));
+        // Group pre-check: read the four packed words once up front. These are
+        // the same 8 bytes per row the fast path consumes anyway, so this is
+        // 4 unaligned u64 loads + 8 compares + 1 branch ahead of the original
+        // interleaved body. Constant rows (word == 0 → F128::ZERO, word ==
+        // u64::MAX → F128::ONE) sit at fixed periodic indices, so the common
+        // all-mixed case keeps this branch perfectly predicted.
+        let words = [
+            (a0_bytes as *const u64).read_unaligned(),
+            (a1_bytes as *const u64).read_unaligned(),
+            (b0_bytes as *const u64).read_unaligned(),
+            (b1_bytes as *const u64).read_unaligned(),
+        ];
+        let any_const = words.iter().any(|&w| w == 0 || w == u64::MAX);
+
+        if !any_const {
+            let rows = [a0_bytes, a1_bytes, b0_bytes, b1_bytes];
+            let mut acc = [_mm_setzero_si128(); 4];
+            for chunk in 0..8 {
+                let table_chunk = table_data.add(chunk * 256);
+                for lane in 0..4 {
+                    let entry = table_chunk.add(*rows[lane].add(chunk) as usize);
+                    acc[lane] = _mm_xor_si128(acc[lane], _mm_load_si128(entry.cast::<__m128i>()));
+                }
             }
+            // F128 is exactly two u64 words and accepts every bit pattern.
+            acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+        } else {
+            // Slow path (rare): resolve each word individually. Constant words
+            // are resolved by compare; mixed words use a simple scalar per-word
+            // fold. Its speed does not matter — it only runs when a constant
+            // row is present in the group.
+            let fold_one = |bytes: *const u8, word: u64| -> F128 {
+                if word == 0 {
+                    F128::ZERO
+                } else if word == u64::MAX {
+                    F128::ONE
+                } else {
+                    let mut acc = _mm_setzero_si128();
+                    for chunk in 0..8 {
+                        let entry = table_data.add(chunk * 256 + *bytes.add(chunk) as usize);
+                        acc = _mm_xor_si128(acc, _mm_load_si128(entry.cast::<__m128i>()));
+                    }
+                    core::mem::transmute::<__m128i, F128>(acc)
+                }
+            };
+            [
+                fold_one(a0_bytes, words[0]),
+                fold_one(a1_bytes, words[1]),
+                fold_one(b0_bytes, words[2]),
+                fold_one(b1_bytes, words[3]),
+            ]
         }
-        // F128 is exactly two u64 words and accepts every bit pattern.
-        acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
     }
 }
 
