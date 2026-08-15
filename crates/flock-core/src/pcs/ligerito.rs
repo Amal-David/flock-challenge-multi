@@ -1682,13 +1682,13 @@ impl LigeritoProof {
 pub(crate) fn partial_eval_lsb(evals: &[F128], rs: &[F128]) -> Vec<F128> {
     let mut cur = evals.to_vec();
     for &r in rs {
-        let one_plus_r = F128::ONE + r;
         let half = cur.len() / 2;
-        // Pair (cur[2i], cur[2i+1]) collapses to cur[2i]·(1+r) + cur[2i+1]·r.
-        // LSB-first ⇒ adjacent pairs are bit_0 = 0 vs 1.
+        // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
         let mut next = Vec::with_capacity(half);
         for i in 0..half {
-            next.push(cur[2 * i] * one_plus_r + cur[2 * i + 1] * r);
+            let e0 = cur[2 * i];
+            let e1 = cur[2 * i + 1];
+            next.push(e0 + r * (e0 + e1));
         }
         cur = next;
     }
@@ -2692,14 +2692,13 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     let n = evals.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     let half = n / 2;
-    let one_plus_r = F128::ONE + r;
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
         for j in 0..half {
             let v0 = evals[2 * j];
             let v1 = evals[2 * j + 1];
-            evals[j] = v0 * one_plus_r + v1 * r;
+            evals[j] = v0 + r * (v0 + v1);
         }
         evals.truncate(half);
         return;
@@ -2711,7 +2710,11 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     let folded: Vec<F128> = (0..half)
         .into_par_iter()
         .with_min_len(PAR_THRESHOLD / 4)
-        .map(|j| evals[2 * j] * one_plus_r + evals[2 * j + 1] * r)
+        .map(|j| {
+            let v0 = evals[2 * j];
+            let v1 = evals[2 * j + 1];
+            v0 + r * (v0 + v1)
+        })
         .collect();
     *evals = folded;
 }
@@ -2941,7 +2944,17 @@ fn materialize_direct_ab_fold2(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || vec![F128::ZERO; claims.len() * table_len],
+            // Production 2-claim table-hot keeps only one 64 KiB table live.
+            || {
+                vec![
+                    F128::ZERO;
+                    if claims.len() == 2 {
+                        table_len
+                    } else {
+                        claims.len() * table_len
+                    }
+                ]
+            },
             |scratch, (block, (b_out, f_out))| {
                 // Production 2-claim table-hot path composes inside each phase.
                 if claims.len() != 2 {
@@ -3023,6 +3036,56 @@ fn materialize_direct_ab_fold2(
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot0], table);
                         let b1 = b_out[slot1]
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot1], table);
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                    }
+                } else if let [c0, c1, c2] = claims {
+                    // Three-claim specialization: fixed table pointers, no map/fold.
+                    let t0 = &scratch[..table_len];
+                    let t1 = &scratch[table_len..2 * table_len];
+                    let t2 = &scratch[2 * table_len..3 * table_len];
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
+                        let b0 = super::ring_switch::fold_one_slot(c0.eq_lo[slot0], t0)
+                            + super::ring_switch::fold_one_slot(c1.eq_lo[slot0], t1)
+                            + super::ring_switch::fold_one_slot(c2.eq_lo[slot0], t2)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
+                        let b1 = super::ring_switch::fold_one_slot(c0.eq_lo[slot1], t0)
+                            + super::ring_switch::fold_one_slot(c1.eq_lo[slot1], t1)
+                            + super::ring_switch::fold_one_slot(c2.eq_lo[slot1], t2)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                    }
+                } else if let [c0, c1, c2] = claims {
+                    // N=3 specialization: fixed table pointers, no per-slot map/fold.
+                    let t0 = &scratch[0..table_len];
+                    let t1 = &scratch[table_len..2 * table_len];
+                    let t2 = &scratch[2 * table_len..3 * table_len];
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
+                        let b0 = super::ring_switch::fold_one_slot(c0.eq_lo[slot0], t0)
+                            + super::ring_switch::fold_one_slot(c1.eq_lo[slot0], t1)
+                            + super::ring_switch::fold_one_slot(c2.eq_lo[slot0], t2)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
+                        let b1 = super::ring_switch::fold_one_slot(c0.eq_lo[slot1], t0)
+                            + super::ring_switch::fold_one_slot(c1.eq_lo[slot1], t1)
+                            + super::ring_switch::fold_one_slot(c2.eq_lo[slot1], t2)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                         u0 += f0 * b0;
