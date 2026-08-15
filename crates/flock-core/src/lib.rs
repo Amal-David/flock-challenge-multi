@@ -1,6 +1,8 @@
 //! `flock-core`: the protocol library and verifier for Flock's R1CS-over-GF(2)
 //! sumcheck/zerocheck PIOP with a multilinear PCS.
 //!
+//! dispersion-resample marker nsc-2 (no functional change vs promoted frontier)
+//!
 //! This crate carries everything the verifier needs. It is portable — the NEON
 //! kernels in `field`, `ntt`, `lincheck`, `zerocheck`, and `merkle` have scalar
 //! fallbacks — though it is tuned for Apple silicon. The end-to-end prover, the
