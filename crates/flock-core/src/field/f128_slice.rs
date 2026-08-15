@@ -66,6 +66,49 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
+///
+/// `dst[t] = low + r1·(low+high)` where
+/// `low = a0 + r0·(a0+a1)`, `high = a2 + r0·(a2+a3)` and
+/// `(a0,a1,a2,a3) = src[4t .. 4t+4]`. Writes `dst` only — the r0 mid stays
+/// in registers on AVX-512. Portable / non-x86 is the scalar nested form.
+#[inline]
+pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    assert_eq!(
+        src.len(),
+        4 * dst.len(),
+        "fold4 source must contain four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all four source elements per output.
+    unsafe {
+        x86_64::fold4_nested(src, dst, r0, r1);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let a0 = src[4 * t];
+            let a1 = src[4 * t + 1];
+            let a2 = src[4 * t + 2];
+            let a3 = src[4 * t + 3];
+            let low = a0 + r0 * (a0 + a1);
+            let high = a2 + r0 * (a2 + a3);
+            *value = low + r1 * (low + high);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +170,56 @@ mod tests {
                 let expect = src[s] * one_plus_r + src[s + 1] * r;
                 assert_eq!(got[t], expect, "base={base} t={t}");
             }
+        }
+    }
+
+    /// Selected fold4_nested matches the scalar nested pair-fold, including a
+    /// non-multiple-of-4 tail, and matches two `fold_pairs` (r0 then r1).
+    #[test]
+    fn selected_fold4_nested_matches_scalar_and_two_pass_pairs() {
+        let mut state = 0xA5A5_C0DE_F00D_1234_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let src: Vec<F128> = (0..44)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r0 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let r1 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for n in [1usize, 3, 4, 5, 7, 8, 11] {
+            let mut got = vec![F128::ZERO; n];
+            let mut portable_got = vec![F128::ZERO; n];
+            fold4_nested(&src[..4 * n], &mut got, r0, r1);
+            portable::fold4_nested(&src[..4 * n], &mut portable_got, r0, r1);
+            assert_eq!(got, portable_got, "portable n={n}");
+            for t in 0..n {
+                let a0 = src[4 * t];
+                let a1 = src[4 * t + 1];
+                let a2 = src[4 * t + 2];
+                let a3 = src[4 * t + 3];
+                let low = a0 + r0 * (a0 + a1);
+                let high = a2 + r0 * (a2 + a3);
+                let expect = low + r1 * (low + high);
+                assert_eq!(got[t], expect, "scalar n={n} t={t}");
+            }
+            // Two-pass fold_pairs on a tiny stack mid (test only) must agree.
+            let mut mid = vec![F128::ZERO; 2 * n];
+            let mut via_pairs = vec![F128::ZERO; n];
+            fold_pairs(&src[..4 * n], 0, &mut mid, r0);
+            fold_pairs(&mid, 0, &mut via_pairs, r1);
+            assert_eq!(got, via_pairs, "two-pass pairs n={n}");
         }
     }
 }
