@@ -660,23 +660,26 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             r
         });
         flock_core::gaptime::mark("commit: pool exited");
-        (committed, ab_inner)
+        (committed, Some(ab_inner))
     } else {
-        let r = in_commit_phase_pool(r1cs.m, || {
+        // No precomputed AB: commit plain and let zerocheck round 1 recompute
+        // its shift-reduce windows directly from a/b (the baseline-proven
+        // x86 configuration). Materializing `Round1AbInner` here existed to
+        // feed the Apple-GPU URM split (`gpu::urm::planned_g`, a 0-stub on
+        // x86); on a CPU-only runner it costs a 512 MiB store+RFO stream and
+        // replaces a read of a+b with a read of ab_inner — net-negative
+        // DRAM traffic and +512 MiB peak footprint.
+        let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
-            let r = commit_with_round1_ab_precompute(
-                &z_packed,
-                &a_packed_f128,
-                &b_packed_f128,
-                pcs_params,
-                &padding,
-                prefaulted_codeword,
-            );
+            let r = match prefaulted_codeword {
+                Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+                None => pcs::commit(&z_packed, pcs_params),
+            };
             flock_core::gaptime::mark("commit: work done");
             r
         });
         flock_core::gaptime::mark("commit: pool exited");
-        r
+        (committed, None)
     };
     bind_statement(challenger, r1cs, &commitment);
     flock_core::gaptime::mark("bind_statement done");
@@ -718,9 +721,14 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             )
         };
         flock_core::gaptime::mark("zerocheck: views built");
-        let r = zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        );
+        let r = match ab_inner {
+            Some(ab_inner) => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            ),
+            None => zerocheck::prove_packed_padded_capture_s_hat_v_c(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+            ),
+        };
         flock_core::gaptime::mark("zerocheck: work done");
         r
     });
