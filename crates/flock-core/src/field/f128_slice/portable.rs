@@ -9,17 +9,3 @@ pub(super) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
         *value = even + r * (even + src[s + 1]);
     }
 }
-
-#[inline]
-pub(super) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
-    // Nested pair-fold: r0 on (a0,a1) and (a2,a3), then r1 on (low, high).
-    for (t, value) in dst.iter_mut().enumerate() {
-        let a0 = src[4 * t];
-        let a1 = src[4 * t + 1];
-        let a2 = src[4 * t + 2];
-        let a3 = src[4 * t + 3];
-        let low = a0 + r0 * (a0 + a1);
-        let high = a2 + r0 * (a2 + a3);
-        *value = low + r1 * (low + high);
-    }
-}

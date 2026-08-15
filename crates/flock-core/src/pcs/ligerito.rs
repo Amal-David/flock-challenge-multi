@@ -3106,9 +3106,6 @@ fn materialize_direct_ab_fold2(
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = (!ordinary_basis.is_empty())
                     .then(|| &ordinary_basis[start..start + 4 * block_len]);
-                // In-register nested pair-fold (r0 then r1). Writes f_out only;
-                // no mid 2·block_len buffer. fold_one_slot / phase-2 / MAC stay.
-                crate::field::f128_slice::fold4_nested(f_in, f_out, r0, r1);
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
@@ -3124,17 +3121,21 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
                         let b0 = super::ring_switch::fold_one_slot(only.eq_lo[slot0], table)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
                         let b1 = super::ring_switch::fold_one_slot(only.eq_lo[slot1], table)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
                 } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
                     // Table-hot two-phase: only one 64 KiB composed table live.
-                    // Phase 1: first table hot → partial b (f_out already written).
+                    // Phase 1: first table hot → store f + partial b.
                     // Phase 2: second table hot → complete b.
                     // Algebra identical to interleaved original.
                     let table = &mut scratch[..table_len];
@@ -3144,8 +3145,12 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
                         let b0 = super::ring_switch::fold_one_slot(first.eq_lo[slot0], table);
                         let b1 = super::ring_switch::fold_one_slot(first.eq_lo[slot1], table);
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
@@ -3166,6 +3171,8 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
                         let direct_at = |slot: usize| {
                             claims
                                 .iter()
@@ -3183,6 +3190,8 @@ fn materialize_direct_ab_fold2(
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
                         let b1 = direct_at(slot1)
                             + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
