@@ -1681,6 +1681,7 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 ///
 /// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
 /// per block, amortized by the caller over ≥ 2048 fold evaluations.
+#[inline(always)]
 pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
     debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
@@ -1706,6 +1707,7 @@ pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
 
 /// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
 /// where `base` encodes the γ-baked linear map `Φ`.
+#[inline(always)]
 pub(crate) fn build_direct_fold2_table(
     low_eq: &[F128; 4],
     fold_weight: &[F128; 4],

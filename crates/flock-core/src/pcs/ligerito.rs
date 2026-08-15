@@ -2964,7 +2964,26 @@ fn materialize_direct_ab_fold2(
                 };
                 let mut u0 = F128::ZERO;
                 let mut u2 = F128::ZERO;
-                if let [first, second] = claims {
+                if let [only] = claims {
+                    // Single-claim specialization.
+                    let table = &scratch[..table_len];
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
+                        let b0 = super::ring_switch::fold_one_slot(only.eq_lo[slot0], table)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
+                        let b1 = super::ring_switch::fold_one_slot(only.eq_lo[slot1], table)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                    }
+                } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
                     let first_table = &scratch[..table_len];
                     let second_table = &scratch[table_len..2 * table_len];
