@@ -1070,6 +1070,135 @@ pub fn fold_1b_rows_split(
         )
 }
 
+/// Four-bank sibling of [`fold_1b_rows_split`] that retains the two lowest
+/// suffix coordinates instead of immediately evaluating them.  For
+/// `e in 0..4` and packed-row bit `r`, the output is
+///
+/// ```text
+/// out[128 * e + r] = sum_h bit_r(W[4h + e]) * eq_tail[h].
+/// ```
+///
+/// Collapsing the four banks against `build_eq(low_point)` is therefore
+/// byte-identical to the ordinary full-suffix fold.  The production direct
+/// opening path keeps the banks long enough to derive the first two BaseFold
+/// messages, avoiding a later full-length statistics pass over `W`.
+///
+/// The kernel uses the same split/MFR organization as [`fold_1b_rows_split`].
+/// One set of four subset-sum tables is shared across all four interleaved
+/// banks. Padding is tested at the original 16-packed-element chunk
+/// granularity, matching the ordinary padded kernel exactly.
+pub fn fold_1b_rows_quad_split(
+    packed_witness: &[F128],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    padding: &PaddingSpec,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    const N_PACKED: usize = 1 << LOG_PACKING;
+    const BANKS: usize = 4;
+
+    let b = eq_lo.len();
+    assert!(
+        b.is_multiple_of(16),
+        "fold_1b_rows_quad_split: eq_lo block size must be a multiple of 16 (got {b})"
+    );
+    assert_eq!(packed_witness.len(), BANKS * b * eq_hi.len());
+    let chunks_per_block = b / 16;
+    let skip = ChunkPadding::new(padding, 16);
+
+    // The tail weights are common to all four low-coordinate banks.
+    let tables: Vec<[[F128; 16]; 4]> = (0..chunks_per_block)
+        .map(|c| {
+            let o = c * 16;
+            [
+                subset_sums_4([eq_lo[o], eq_lo[o + 1], eq_lo[o + 2], eq_lo[o + 3]]),
+                subset_sums_4([eq_lo[o + 4], eq_lo[o + 5], eq_lo[o + 6], eq_lo[o + 7]]),
+                subset_sums_4([eq_lo[o + 8], eq_lo[o + 9], eq_lo[o + 10], eq_lo[o + 11]]),
+                subset_sums_4([eq_lo[o + 12], eq_lo[o + 13], eq_lo[o + 14], eq_lo[o + 15]]),
+            ]
+        })
+        .collect();
+
+    packed_witness
+        .par_chunks(BANKS * b)
+        .enumerate()
+        .fold(
+            || vec![F128::ZERO; BANKS * N_PACKED],
+            |mut acc, (i_hi, w_block)| {
+                let mut inner = [[F128::ZERO; N_PACKED]; BANKS];
+                // One tail chunk is 16 h-values = 64 packed witness values =
+                // four original 16-value padding chunks.
+                let base_padding_chunk = i_hi * (BANKS * b / 16);
+                for c in 0..chunks_per_block {
+                    let [tbl0, tbl1, tbl2, tbl3] = &tables[c];
+                    let mut m_bytes = [[[0u8; 16]; 16]; BANKS];
+                    for quartet in 0..4 {
+                        if skip.skip(base_padding_chunk + 4 * c + quartet) {
+                            continue;
+                        }
+                        for j_in_quartet in 0..4 {
+                            let j = 4 * quartet + j_in_quartet;
+                            for e in 0..BANKS {
+                                let value = w_block[BANKS * (16 * c + j) + e];
+                                m_bytes[e][j][..8].copy_from_slice(&value.lo.to_le_bytes());
+                                m_bytes[e][j][8..].copy_from_slice(&value.hi.to_le_bytes());
+                            }
+                        }
+                    }
+
+                    for e in 0..BANKS {
+                        for r_byte in 0..16 {
+                            let lo8: u64 = (m_bytes[e][0][r_byte] as u64)
+                                | ((m_bytes[e][1][r_byte] as u64) << 8)
+                                | ((m_bytes[e][2][r_byte] as u64) << 16)
+                                | ((m_bytes[e][3][r_byte] as u64) << 24)
+                                | ((m_bytes[e][4][r_byte] as u64) << 32)
+                                | ((m_bytes[e][5][r_byte] as u64) << 40)
+                                | ((m_bytes[e][6][r_byte] as u64) << 48)
+                                | ((m_bytes[e][7][r_byte] as u64) << 56);
+                            let hi8: u64 = (m_bytes[e][8][r_byte] as u64)
+                                | ((m_bytes[e][9][r_byte] as u64) << 8)
+                                | ((m_bytes[e][10][r_byte] as u64) << 16)
+                                | ((m_bytes[e][11][r_byte] as u64) << 24)
+                                | ((m_bytes[e][12][r_byte] as u64) << 32)
+                                | ((m_bytes[e][13][r_byte] as u64) << 40)
+                                | ((m_bytes[e][14][r_byte] as u64) << 48)
+                                | ((m_bytes[e][15][r_byte] as u64) << 56);
+                            let tlo = transpose_8x8_bits(lo8).to_le_bytes();
+                            let thi = transpose_8x8_bits(hi8).to_le_bytes();
+                            let base = r_byte * 8;
+                            for p in 0..8 {
+                                let m_lo = tlo[p];
+                                let m_hi = thi[p];
+                                inner[e][base + p] += tbl0[(m_lo & 0x0F) as usize]
+                                    + tbl1[(m_lo >> 4) as usize]
+                                    + tbl2[(m_hi & 0x0F) as usize]
+                                    + tbl3[(m_hi >> 4) as usize];
+                            }
+                        }
+                    }
+                }
+
+                let outer = eq_hi[i_hi];
+                for e in 0..BANKS {
+                    for r in 0..N_PACKED {
+                        acc[e * N_PACKED + r] += outer * inner[e][r];
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; BANKS * N_PACKED],
+            |mut a, b| {
+                for i in 0..BANKS * N_PACKED {
+                    a[i] += b[i];
+                }
+                a
+            },
+        )
+}
+
 /// Two-claim variant of [`fold_1b_rows_split`] with stack-allocated per-claim
 /// inner accumulators. The common batched case (exactly 2 dense claims, e.g.
 /// `[ab, c]` or `[ab, c]` alongside a sparse chain claim) hits this fast path.
@@ -1366,7 +1495,10 @@ pub fn s_hat_v_quad_from_z_vec(
         )
 }
 
-fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
+pub(crate) fn collapse_s_hat_v_quad(
+    s_hat_v_quad: &[F128],
+    low_point: &[F128],
+) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_quad.len(), 4 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
@@ -2209,9 +2341,8 @@ pub(crate) struct DirectFold2Factors {
     pub(crate) eq_hi: Vec<F128>,
     pub(crate) low_eq: [F128; 4],
     pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[4h+e] B_k[4h+d]`. Available for AB because its
-    /// four-bank witness statistic makes these products cheap; C obtains its
-    /// initial messages from a stats-only streaming pass instead.
+    /// `H[e,d] = Σ_h f[4h+e] B_k[4h+d]`. Available whenever the claim retains
+    /// the low two suffix coordinates as a four-bank witness statistic.
     pub(crate) products: Option<[F128; 16]>,
 }
 
@@ -2534,6 +2665,32 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         }
     }
 
+    // Exact production route for the second (C) claim: compute its
+    // ring-switch statistic as four banks too. This does the same witness
+    // streaming/bit-transpose work as the ordinary 128-row fold, but retains
+    // two suffix coordinates. The retained statistic later supplies C's
+    // first two BaseFold messages and removes the separate length-L C scan.
+    let retain_direct_c_quad = cfg!(target_arch = "x86_64")
+        && l == (1usize << 25)
+        && n == 2
+        && precomputed_s_hat_v
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|claim| claim.len() == 4 * n_packed)
+        && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C_QUAD").is_none();
+    let direct_c_dense = if retain_direct_c_quad {
+        match kinds[1] {
+            Kind::Dense(d) => Some(d),
+            Kind::Sparse(_) => unreachable!("direct C quad gate requires a dense C claim"),
+        }
+    } else {
+        None
+    };
+
     // 2. Build suffix representations. Dense claims use the tensor-split
     //    factorization (two ~2^(n/2) factors instead of the full 2^n tensor)
     //    whenever `len` is a whole number of 16-wide MFR chunks — i.e. all
@@ -2580,13 +2737,15 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
     let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .filter(|&d| !has_precomputed(dense_to_orig[d]) && Some(d) != direct_c_dense)
         .collect();
     let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
         .filter(|&s| !has_precomputed(sparse_to_orig[s]))
         .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
+    let mut dense_s_hat_v_quad: Vec<Option<Vec<F128>>> =
+        vec![None; dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
     for d in 0..dense_suffixes.len() {
@@ -2596,6 +2755,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     dense_suffixes[d].len() >= 2,
                     "four-bank s_hat_v requires at least two suffix coordinates"
                 );
+                dense_s_hat_v_quad[d] = Some(p.to_vec());
                 collapse_s_hat_v_quad(p, &dense_suffixes[d][..2])
             } else {
                 p.to_vec()
@@ -2618,6 +2778,15 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 p.to_vec()
             };
         }
+    }
+    if let Some(d) = direct_c_dense {
+        let suffix = dense_suffixes[d];
+        debug_assert!(suffix.len() >= 2);
+        let tail = &suffix[2..];
+        let (eq_lo, eq_hi) = build_eq_split(tail, split_n_lo(tail.len()));
+        let quad = fold_1b_rows_quad_split(packed_witness, &eq_lo, &eq_hi, padding);
+        dense_s_hat_v[d] = collapse_s_hat_v_quad(&quad, &suffix[..2]);
+        dense_s_hat_v_quad[d] = Some(quad);
     }
     // Run the kernel only on claims that genuinely need fold_1b_rows.
     if use_split {
@@ -2684,12 +2853,15 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             Kind::Dense(d) => dense_s_hat_v[d].clone(),
             Kind::Sparse(s) => sparse_s_hat_v[s].clone(),
         };
-        let s_hat_v_quad = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
+        let s_hat_v_quad = match kinds[i] {
+            Kind::Dense(d) => dense_s_hat_v_quad[d].clone(),
+            Kind::Sparse(_) => precomputed_s_hat_v
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|precomputed| precomputed.len() == 4 * n_packed)
+                .map(<[F128]>::to_vec),
+        };
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
@@ -2710,13 +2882,12 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // fold output is γ_k · B_k directly. pcs combine just adds.
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
 
-    // The production all-direct experiment also retains C's materialization
-    // factors. C has no four-bank witness statistic, so only AB carries the
-    // optional H-products used for the first two messages.
+    // The production all-direct route retains materialization factors and
+    // four-bank products for both AB and C.
     let retain_direct_c = cfg!(target_arch = "x86_64")
         && l == (1usize << 25)
         && n == 2
-        && work.first().is_some_and(|claim| claim.s_hat_v_quad.is_some())
+        && work.iter().all(|claim| claim.s_hat_v_quad.is_some())
         && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none();
@@ -3482,6 +3653,34 @@ mod tests {
                 reference,
                 "fold_1b_rows_split mismatch at split_n_lo: m={m}"
             );
+        }
+    }
+
+    /// Retaining the low two suffix coordinates as four interleaved banks and
+    /// collapsing them later must reproduce the ordinary full-suffix fold,
+    /// including the existing 16-value padding skip semantics.
+    #[test]
+    fn fold_1b_rows_quad_split_matches_full_fold() {
+        let cases: &[(usize, usize, usize)] =
+            &[(17, 14, 15_409), (18, 15, 31_401), (19, 16, 42_560)];
+        for &(m, k_log, useful_bits) in cases {
+            let l = m - LOG_PACKING;
+            let len = 1usize << l;
+            let mut rng = Rng::new(0x4A_D5_u64.wrapping_add((m * 131 + k_log) as u64));
+            let w: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+            let suffix: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let padding = PaddingSpec {
+                k_log,
+                useful_bits_per_block: useful_bits,
+            };
+
+            let (full_lo, full_hi) = build_eq_split(&suffix, split_n_lo(l));
+            let want = fold_1b_rows_split(&w, &full_lo, &full_hi, &padding);
+            let tail = &suffix[2..];
+            let (tail_lo, tail_hi) = build_eq_split(tail, split_n_lo(tail.len()));
+            let quad = fold_1b_rows_quad_split(&w, &tail_lo, &tail_hi, &padding);
+            let got = collapse_s_hat_v_quad(&quad, &suffix[..2]);
+            assert_eq!(got, want, "quad split mismatch: m={m} k_log={k_log}");
         }
     }
 

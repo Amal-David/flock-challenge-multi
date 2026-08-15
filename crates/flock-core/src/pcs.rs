@@ -460,7 +460,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     let direct_count = direct_fold2.as_ref().map_or(0, Vec::len);
 
-    let direct_c_stats = if use_direct_c {
+    let all_direct_products = use_direct_c
+        && direct_fold2
+            .as_ref()
+            .is_some_and(|direct| direct.iter().all(|claim| claim.products.is_some()));
+    let direct_c_stats = if use_direct_c && !all_direct_products {
         match &rs_results[1].1.rs_eq_ind {
             ring_switch::RsEqInd::DeferredDense {
                 eq_lo,
@@ -548,7 +552,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && pd_dense.is_empty();
 
     let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
-        in_wide_combine_pool(l, || if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
+        in_wide_combine_pool(l, || if all_direct_products {
+        // Both claims supply exact four-bank H-products. No full-length basis
+        // or statistics pass is needed before the two direct materializers.
+        ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
+    } else if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
         let (prime, lookahead) = deferred_stats_lookahead(
             packed_witness,
             eq_lo,
@@ -670,7 +678,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round0_u2 += direct_round0.1;
         let combined_lookahead = round1_lookahead
             .as_mut()
-            .expect("direct AB gate requires ordinary C lookahead");
+            .expect("direct fold2 gate requires a round-one accumulator");
         for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
             *out += value;
         }
@@ -1603,6 +1611,59 @@ mod tests {
         assert_eq!(
             messages_from_direct_products(&[factors]),
             round0_and_round1_lookahead(&witness, &basis),
+        );
+    }
+
+    /// Bounded phase-level comparison for the direct-C four-bank route. The
+    /// old path performs an ordinary ring-switch fold and later scans all L
+    /// witness/basis slots for the first two messages; the new path retains
+    /// four banks during the fold and needs no later scan.
+    #[test]
+    #[ignore]
+    fn zzz_bench_direct_c_quad_phase() {
+        let mut rng = Rng::new(0xC4_4D_B3_7C);
+        let log_l = 20usize; // 16 MiB packed witness: bounded local probe.
+        let l = 1usize << log_l;
+        let packed_witness: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+        let suffix: Vec<F128> = (0..log_l).map(|_| rng.f128()).collect();
+        let scaled_rdp: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+        let table = ring_switch::build_fold_byte_table(&scaled_rdp);
+        let padding = PaddingSpec::dense(LOG_PACKING + log_l);
+
+        let (full_lo, full_hi) =
+            ring_switch::build_eq_split(&suffix, ring_switch::split_n_lo(suffix.len()));
+        let tail = &suffix[2..];
+        let (tail_lo, tail_hi) =
+            ring_switch::build_eq_split(tail, ring_switch::split_n_lo(tail.len()));
+
+        let start = std::time::Instant::now();
+        let ordinary = ring_switch::fold_1b_rows_split(
+            &packed_witness,
+            &full_lo,
+            &full_hi,
+            &padding,
+        );
+        let _stats = deferred_stats_lookahead(&packed_witness, &full_lo, &full_hi, &table);
+        let old = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let quad = ring_switch::fold_1b_rows_quad_split(
+            &packed_witness,
+            &tail_lo,
+            &tail_hi,
+            &padding,
+        );
+        let new = start.elapsed();
+        assert_eq!(
+            super::ring_switch::collapse_s_hat_v_quad(&quad, &suffix[..2]),
+            ordinary,
+        );
+        std::hint::black_box(quad);
+        eprintln!(
+            "direct-C phase L=2^{log_l}: old fold+stats={:.3} ms new quad={:.3} ms speedup={:.2}x",
+            old.as_secs_f64() * 1e3,
+            new.as_secs_f64() * 1e3,
+            old.as_secs_f64() / new.as_secs_f64(),
         );
     }
 
