@@ -681,6 +681,21 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     bind_statement(challenger, r1cs, &commitment);
     flock_core::gaptime::mark("bind_statement done");
 
+    // Last-ρ leftover z-fold: arm before zerocheck so the last ML ρ can
+    // start today's one-shot fold. Guard keeps `z_packed` live until
+    // lincheck waits (before fold_alpha). Stripe path does not prepare.
+    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        Some(lincheck::prepare_last_rho_z_fold(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            r1cs.k_log - r1cs.k_skip,
+        ))
+    } else {
+        None
+    };
+
     let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
         flock_core::gaptime::mark("zerocheck: pool entered");
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -918,6 +933,18 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     });
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
+
+    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        Some(lincheck::prepare_last_rho_z_fold(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.useful_bits,
+            r1cs.k_log - r1cs.k_skip,
+        ))
+    } else {
+        None
+    };
 
     // --- zerocheck ---
     let t0 = Instant::now();

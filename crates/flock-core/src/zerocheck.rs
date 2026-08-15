@@ -497,6 +497,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
     }
+    // Last ML ρ is in. RowMajor `x_outer = mlv[k_log − k_skip ..]` is
+    // complete here (not URM `r`). Kick today's one-shot leftover z-fold
+    // so it can run on the full rayon pool while this thread finishes
+    // serial FS (final bind + observe â/b̂). Compute only. No-op if the
+    // ranked BlockMajor path did not prepare, or if `mlv` is short
+    // (kicking during rounds 2–27 is REJECT). Kick after this function
+    // returns is a no-op — the final bind has already run.
+    crate::lincheck::kick_last_rho_z_fold(&mlv_rhos);
     crate::gaptime::mark("zc: tail rounds done");
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----

@@ -121,7 +121,9 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
+use std::thread::JoinHandle;
 
 mod kernels;
 
@@ -771,6 +773,37 @@ fn partial_fold_packed_z_block_major_factorized_padded(
     )
 }
 
+/// Today's one-shot block-major fold at `x_outer`. Same dispatch as
+/// [`prove_padded_inner`]: factorized eq when `n_log == 18`, else a
+/// materialized outer table. Used by the last-ρ kick and the sequential
+/// fallback so both produce the same `ẑ`.
+fn fold_block_major_one_shot(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    debug_assert_eq!(x_outer.len(), n_log);
+    if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+        let eq_lo = build_eq_table(outer_lo);
+        let eq_hi = build_eq_table(outer_hi);
+        partial_fold_packed_z_block_major_factorized_padded(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq_lo,
+            &eq_hi,
+        )
+    } else {
+        let eq_x_outer = build_eq_table(x_outer);
+        partial_fold_packed_z_block_major_padded(z, m, k_log, useful_bits, &eq_x_outer)
+    }
+}
+
 /// Shared block-major witness sweep. `build_table` fills the 256-entry subset
 /// table for the eight outer positions beginning at `outer_base`.
 fn partial_fold_packed_z_block_major_padded_with_tables(
@@ -1356,6 +1389,156 @@ enum PackedZ<'a> {
     BlockMajor(&'a [F128]),
 }
 
+// ---------------------------------------------------------------------------
+// Last-ρ leftover z-fold (wait-not-join)
+// ---------------------------------------------------------------------------
+//
+// Ranked BlockMajor path: start today's one-shot `ẑ(·, x_outer)` at the last
+// zerocheck ML ρ (`x_outer = mlv[inner_rest_len..]` is complete there). The
+// fold runs on a dedicated OS thread so it can own the full global rayon
+// pool while main finishes serial FS (final bind, observe â/b̂, lincheck
+// label, sample α, build eq_inner).
+//
+// When lincheck needs the pool for `fold_alpha_batched`, WAIT the handle
+// first, then run CSC at full width. Do not `rayon::join` / `rayon::scope`
+// the leftover fold with fold_alpha (that split is HOLD and can lose).
+// Residual join stays unimplemented. Incremental 18-pass packed fold stays
+// unimplemented. Compute only — no observe/sample in the kick.
+//
+// Kick after zc returns is a no-op (final bind already done; the prepare
+// slot is consumed or never armed). Kick with a short `mlv` (rounds 2–27)
+// is a no-op: `x_outer` is incomplete. Do not reuse URM `r` as `x_outer`.
+// `z` is read-only (`C` aliases it).
+
+struct LastRhoPrepared {
+    z_ptr: *const F128,
+    z_len: usize,
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    inner_rest_len: usize,
+}
+
+// SAFETY: the pointer is only read, and only while the registering thread
+// keeps `z` alive and unmutated (see [`LastRhoZFoldGuard`]).
+unsafe impl Send for LastRhoPrepared {}
+
+enum LastRhoSlot {
+    Empty,
+    Prepared(LastRhoPrepared),
+    Running(JoinHandle<Vec<F128>>),
+}
+
+thread_local! {
+    static LAST_RHO: RefCell<LastRhoSlot> = const { RefCell::new(LastRhoSlot::Empty) };
+}
+
+/// Keeps packed `z` alive until a kicked leftover fold is waited. Drop
+/// joins any in-flight handle so the raw pointer cannot dangle.
+pub struct LastRhoZFoldGuard;
+
+impl Drop for LastRhoZFoldGuard {
+    fn drop(&mut self) {
+        let _ = wait_last_rho_z_fold();
+    }
+}
+
+/// Register packed `z` for a last-ρ leftover fold. Call from the ranked
+/// BlockMajor prover **before** zerocheck. `z` must stay live and unmutated
+/// until [`wait_last_rho_z_fold`] (or drop of the returned guard).
+///
+/// `inner_rest_len = k_log − k_skip` so the kick can slice
+/// `x_outer = mlv[inner_rest_len..]` without using URM `r`.
+pub fn prepare_last_rho_z_fold(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    inner_rest_len: usize,
+) -> LastRhoZFoldGuard {
+    // A previous prepare on this thread that was never waited would leave a
+    // live handle holding a pointer into a now-dead buffer. Join it first.
+    let _ = wait_last_rho_z_fold();
+    LAST_RHO.with(|slot| {
+        *slot.borrow_mut() = LastRhoSlot::Prepared(LastRhoPrepared {
+            z_ptr: z.as_ptr(),
+            z_len: z.len(),
+            m,
+            k_log,
+            useful_bits,
+            inner_rest_len,
+        });
+    });
+    LastRhoZFoldGuard
+}
+
+/// Start today's one-shot z-fold. Compute only — no observe/sample.
+///
+/// No-op unless this thread prepared a BlockMajor fold **and** `mlv` is
+/// complete (`len == inner_rest_len + n_log`). A short `mlv` means the
+/// caller is still in zerocheck rounds 2–27 (`x_outer` incomplete) — that
+/// kick is REJECT, so we refuse to start. A second kick, or a kick after
+/// wait / after zc with no prepare, is a no-op.
+pub fn kick_last_rho_z_fold(mlv: &[F128]) {
+    let prepared = LAST_RHO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
+            LastRhoSlot::Prepared(p)
+                if mlv.len() == p.inner_rest_len + (p.m - p.k_log) =>
+            {
+                Some(p)
+            }
+            LastRhoSlot::Prepared(p) => {
+                *slot = LastRhoSlot::Prepared(p);
+                None
+            }
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    });
+    let Some(p) = prepared else {
+        return;
+    };
+    let x_outer = mlv[p.inner_rest_len..].to_vec();
+    // Carry the address as usize so the spawn closure is Send without
+    // relying on `*const F128: Send`.
+    let z_addr = p.z_ptr as usize;
+    let z_len = p.z_len;
+    let m = p.m;
+    let k_log = p.k_log;
+    let useful_bits = p.useful_bits;
+    let handle = std::thread::Builder::new()
+        .name("flock-last-rho-z-fold".into())
+        .spawn(move || {
+            // SAFETY: [`prepare_last_rho_z_fold`] contract — `z` is live,
+            // unmutated, and not aliased for writes (`C` aliases `z` but
+            // the leftover fold starts after the last ρ, when C is no
+            // longer written).
+            let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
+            fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer)
+        })
+        .expect("spawn last-ρ z-fold");
+    LAST_RHO.with(|slot| {
+        *slot.borrow_mut() = LastRhoSlot::Running(handle);
+    });
+}
+
+/// Join a kicked leftover fold. Call **after** serial FS and **before**
+/// `fold_alpha_batched` so CSC keeps the full pool. Returns `Some(ẑ)` if
+/// a kick was running; `None` if nothing was kicked (caller runs today's
+/// sequential one-shot).
+pub fn wait_last_rho_z_fold() -> Option<Vec<F128>> {
+    let handle = LAST_RHO.with(|slot| {
+        match std::mem::replace(&mut *slot.borrow_mut(), LastRhoSlot::Empty) {
+            LastRhoSlot::Running(h) => Some(h),
+            LastRhoSlot::Prepared(_) | LastRhoSlot::Empty => None,
+        }
+    });
+    handle.map(|h| h.join().expect("last-ρ z-fold thread"))
+}
+
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
 ///
@@ -1532,6 +1715,11 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    // Wait-not-join: if the last-ρ kick is still running, join the OS
+    // handle here — after serial FS (label, α, eq_inner) and BEFORE
+    // fold_alpha. Do not rayon::join / rayon::scope with CSC (that pulls
+    // this thread into the fold and splits the pool). Residual join HOLD.
+    let kicked_z_vec = wait_last_rho_z_fold();
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1557,32 +1745,28 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 3. Partial fold of z at the shared outer half (length-k F128 vector).
+    //    A last-ρ kick already produced the same one-shot ẑ; reuse it.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    let mut z_vec = match z_packed {
-        PackedZ::LincheckStripe(z) => {
-            let eq_x_outer = build_eq_table(&x_ab.x_outer);
-            partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
-        }
-        PackedZ::BlockMajor(z) if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG => {
-            let (outer_lo, outer_hi) = x_ab.x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
-            let eq_lo = build_eq_table(outer_lo);
-            let eq_hi = build_eq_table(outer_hi);
-            partial_fold_packed_z_block_major_factorized_padded(
-                z,
-                m,
-                k_log,
-                useful_bits,
-                &eq_lo,
-                &eq_hi,
-            )
-        }
-        PackedZ::BlockMajor(z) => {
-            let eq_x_outer = build_eq_table(&x_ab.x_outer);
-            partial_fold_packed_z_block_major_padded(z, m, k_log, useful_bits, &eq_x_outer)
+    let mut z_vec = match (kicked_z_vec, z_packed) {
+        (Some(z), PackedZ::BlockMajor(_)) => z,
+        (kicked, z_packed) => {
+            debug_assert!(
+                kicked.is_none(),
+                "last-ρ kick is BlockMajor-only; stripe path must not be prepared"
+            );
+            match z_packed {
+                PackedZ::LincheckStripe(z) => {
+                    let eq_x_outer = build_eq_table(&x_ab.x_outer);
+                    partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
+                }
+                PackedZ::BlockMajor(z) => {
+                    fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                }
+            }
         }
     };
     if let Some(t) = t {
@@ -2213,6 +2397,107 @@ mod tests {
                 "m={m} k_log={k_log} useful={useful_bits} lo_log={lo_log}",
             );
         }
+    }
+
+    /// Last-ρ kick then wait produces the same packed fold as today's
+    /// sequential one-shot (no Fiat–Shamir). Covers the materialized eq
+    /// path and the ranked `n_log=18` factorized path without a LOG2=18 prove.
+    #[test]
+    fn last_rho_kick_then_wait_matches_oneshot_fold() {
+        let cases: &[(usize, usize, usize)] = &[
+            (16, 8, 241),
+            (18, 10, 997),
+            (25, 7, 121), // n_log=18 factorized dispatch
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let mut rng =
+                Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
+            let n_log = m - k_log;
+            let n_outer = 1usize << n_log;
+            let chunks_per_block = (1usize << k_log) / 128;
+            let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+            let z_before = z_block_major.clone();
+            let inner_rest_len = k_log - 6; // ranked k_skip
+            let x_inner_rest = rng.f128_vec(inner_rest_len);
+            let x_outer = rng.f128_vec(n_log);
+            let mut mlv = x_inner_rest;
+            mlv.extend_from_slice(&x_outer);
+
+            let want = if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+                let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+                partial_fold_packed_z_block_major_factorized_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &build_eq_table(outer_lo),
+                    &build_eq_table(outer_hi),
+                )
+            } else {
+                partial_fold_packed_z_block_major_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &build_eq_table(&x_outer),
+                )
+            };
+
+            let _guard = prepare_last_rho_z_fold(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                inner_rest_len,
+            );
+            kick_last_rho_z_fold(&mlv);
+            let got = wait_last_rho_z_fold().expect("kick at complete mlv must run");
+            assert_eq!(
+                want, got,
+                "m={m} k_log={k_log} useful={useful_bits} last-ρ ≠ one-shot"
+            );
+            assert_eq!(
+                z_block_major, z_before,
+                "m={m} last-ρ kick must not mutate z"
+            );
+            // Kick after the fold has been waited (stand-in for "after zc
+            // returns") is a no-op.
+            kick_last_rho_z_fold(&mlv);
+            assert!(
+                wait_last_rho_z_fold().is_none(),
+                "kick after wait must be a no-op"
+            );
+        }
+    }
+
+    /// Kicking with a short `mlv` (zerocheck rounds 2–27, `x_outer`
+    /// incomplete) must not start a fold. Sequential one-shot after zc
+    /// remains the path.
+    #[test]
+    fn last_rho_kick_incomplete_mlv_is_noop() {
+        let (m, k_log, useful_bits) = (16usize, 8usize, 241usize);
+        let mut rng = Rng::new(0xBAD2_2700);
+        let n_log = m - k_log;
+        let n_outer = 1usize << n_log;
+        let chunks_per_block = (1usize << k_log) / 128;
+        let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+        let z_before = z_block_major.clone();
+        let inner_rest_len = k_log - 6;
+        let short_mlv = rng.f128_vec(inner_rest_len + n_log - 1);
+
+        let _guard = prepare_last_rho_z_fold(
+            &z_block_major,
+            m,
+            k_log,
+            useful_bits,
+            inner_rest_len,
+        );
+        kick_last_rho_z_fold(&short_mlv);
+        assert!(
+            wait_last_rho_z_fold().is_none(),
+            "incomplete mlv must not start the leftover fold"
+        );
+        assert_eq!(z_block_major, z_before, "no-op kick must not mutate z");
     }
 
     #[test]
