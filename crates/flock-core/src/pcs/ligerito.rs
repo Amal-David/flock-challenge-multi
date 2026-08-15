@@ -2913,16 +2913,24 @@ fn materialize_direct_ab_fold2(
         (F128::ONE + r0) * r1,
         r0 * r1,
     ];
-    let direct_tables: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|claim| {
-            super::ring_switch::build_direct_fold2_table(
-                &claim.low_eq,
-                &fold_weight,
-                &claim.table,
+    // Parallel table construction (order-preserving via enumerate + sort for safety;
+    // claims usually small but build_direct_fold2_table is non-trivial).
+    let mut direct_tables: Vec<(usize, Vec<F128>)> = claims
+        .par_iter()
+        .enumerate()
+        .map(|(i, claim)| {
+            (
+                i,
+                super::ring_switch::build_direct_fold2_table(
+                    &claim.low_eq,
+                    &fold_weight,
+                    &claim.table,
+                ),
             )
         })
         .collect();
+    direct_tables.sort_unstable_by_key(|(i, _)| *i);
+    let direct_tables: Vec<Vec<F128>> = direct_tables.into_iter().map(|(_, t)| t).collect();
 
     let out_len = packed_witness.len() / 4;
     let block_len = claims[0].eq_lo.len();
