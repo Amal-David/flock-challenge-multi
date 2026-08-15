@@ -406,9 +406,11 @@ pub fn set_gpu_merkle_split(chunks: usize) {
 }
 
 /// Pool of page-stable Merkle tree buffers. The GPU wrap-cache keys MTLBuffer
-/// wraps by base pointer, so the tree allocation (64 MiB at the ranked shape,
-/// ≥ the 64 MiB wrap-cache floor) must survive across proves — dropping and
+/// wraps by base pointer, so the L0 tree (64 MiB at the ranked shape, ≥ the
+/// 64 MiB wrap-cache floor) must survive across proves — dropping and
 /// re-allocating it would churn a fresh wire+wrap every prove (season-1 rule).
+/// Cap 3 holds L0 + L1 + L2 after warmup; L2 (~4 MiB) is the same mmap-recycle
+/// class even though it sits below the wrap-cache floor.
 static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
 
 pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
@@ -437,18 +439,13 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
 }
 
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
-    // Only park allocations big enough to matter for wrap-cache stability.
-    // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
-    // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
+    // Park L0 (64 MiB), L1 (16 MiB), and L2 (~4 MiB, 2^17-1 nodes). L3
+    // (2^15-1 nodes, ~1 MiB) stays below the 2^16-node floor.
     if tree.capacity() < (1 << 16) {
         return;
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {
-        // Cap 3: ranked L0 (64 MiB) + L1 (16 MiB) + L2 (4 MiB) all park
-        // after untimed warmup; the timed prove takes all three without
-        // a fresh mmap/fault. Trees are sequential (L_i dropped before
-        // L_{i+1} is committed), so at most three are ever parked at once.
         if pool.len() < 3 {
             pool.push(tree);
         }
@@ -1305,11 +1302,11 @@ mod tests {
         );
     }
 
-    /// TREE_POOL smallest-fit: a small take must reuse the small parked
-    /// buffer, not steal the large one (L1 must not evict L0).
+    /// TREE_POOL: smallest-fit (L1 must not steal L0), L2 parks and reuses
+    /// by pointer identity without stealing L0/L1, L3 stays below the floor.
     #[test]
     fn tree_pool_smallest_fit_reuses_matching_buffer() {
-        // Both sizes clear give_tree's 1<<18-node (8 MiB) floor.
+        // Both sizes still clear give_tree's 1<<16-node floor.
         let n_small = 1 << 18;
         let n_large = 1 << 19;
         {
@@ -1345,54 +1342,79 @@ mod tests {
             let mut pool = TREE_POOL.lock().unwrap();
             pool.clear();
         }
-    }
 
-    /// TREE_POOL cap 3 + lowered floor: the ranked L2 Ligerito tree
-    /// (2^16 leaves → 2·2^16−1 = 131071 nodes, ~4 MiB) must now be parked
-    /// by give_tree (previously refused by the 2^18 floor), and three
-    /// trees (L0/L1/L2 sizes) must coexist in the pool.
-    #[test]
-    fn tree_pool_parks_l2_and_caps_at_three() {
-        let n_l2 = 2 * (1 << 16) - 1; // 131071 — ranked L2
-        let n_l1 = 2 * (1 << 18) - 1; // ranked L1
-        let n_l0 = 2 * (1 << 20) - 1; // ranked L0
+        // L2 (2^17-1, ~4 MiB) clears the 2^16 floor; pointer identity.
+        let n_l2 = (1 << 17) - 1;
+        let only_l2 = take_tree(n_l2);
+        let ptr_only_l2 = only_l2.as_ptr();
+        give_tree(only_l2);
+        let again_only_l2 = take_tree(n_l2);
+        assert_eq!(
+            again_only_l2.as_ptr(),
+            ptr_only_l2,
+            "L2 take must reuse a lone parked L2 tree"
+        );
+        give_tree(again_only_l2);
         {
             let mut pool = TREE_POOL.lock().unwrap();
             pool.clear();
         }
-        // L2-sized tree must now be parked (was refused by old 2^18 floor).
-        let l2 = take_tree(n_l2);
-        let ptr_l2 = l2.as_ptr();
-        give_tree(l2);
-        let l1 = take_tree(n_l1);
-        let ptr_l1 = l1.as_ptr();
-        give_tree(l1);
+
+        // L0+L1+L2 parked together: L2 take must hit the L2 pointer.
+        // Allocate all three checked-out so L1/L2 cannot steal a larger tree.
+        let n_l0 = (1 << 21) - 1;
+        let n_l1 = (1 << 19) - 1;
         let l0 = take_tree(n_l0);
+        let l1 = take_tree(n_l1);
+        let l2 = take_tree(n_l2);
         let ptr_l0 = l0.as_ptr();
+        let ptr_l1 = l1.as_ptr();
+        let ptr_l2 = l2.as_ptr();
         give_tree(l0);
-        // All three should be parked (cap 3).
-        {
-            let pool = TREE_POOL.lock().unwrap();
-            assert_eq!(pool.len(), 3, "cap 3: L0+L1+L2 must all park");
-        }
-        // Smallest-fit: taking L2 must reuse the L2 buffer, not L0/L1.
+        give_tree(l1);
+        give_tree(l2);
         let again_l2 = take_tree(n_l2);
         assert_eq!(
             again_l2.as_ptr(),
             ptr_l2,
-            "L2 take must reuse the small L2 buffer"
+            "L2 take must reuse the parked L2 tree"
         );
-        // A fourth give_tree must be refused (cap 3, pool full after re-give).
+        assert_ne!(
+            again_l2.as_ptr(),
+            ptr_l0,
+            "L2 take must not steal the parked L0 tree"
+        );
+        assert_ne!(
+            again_l2.as_ptr(),
+            ptr_l1,
+            "L2 take must not steal the parked L1 tree"
+        );
         give_tree(again_l2);
         {
+            let mut pool = TREE_POOL.lock().unwrap();
+            pool.clear();
+        }
+
+        // L3 (2^15-1) stays below the floor. A dropped buffer can be remapped
+        // at the same VA, so the refuse oracle is an empty pool, not pointer
+        // inequality.
+        let n_l3 = (1 << 15) - 1;
+        let l3: Vec<Hash> = Vec::with_capacity(n_l3);
+        assert!(
+            l3.capacity() < (1 << 16),
+            "L3 fixture must sit below the give_tree floor"
+        );
+        give_tree(l3);
+        {
             let pool = TREE_POOL.lock().unwrap();
-            assert_eq!(pool.len(), 3, "cap 3: fourth tree must be refused");
+            assert!(
+                pool.is_empty(),
+                "give_tree must refuse L3 (2^15-1) below the 2^16 floor"
+            );
         }
         {
             let mut pool = TREE_POOL.lock().unwrap();
             pool.clear();
         }
-        // Suppress unused warnings for ptr_l0/l1 used in capacity reasoning.
-        let _ = (ptr_l0, ptr_l1);
     }
 }
