@@ -105,7 +105,13 @@ pub struct PackedDirectClaim {
 /// diagnostics; the ranked worker's cleared env never sets it). Pool width
 /// cannot change wire bytes: every parallel reduction here is an XOR sum.
 fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    // Unlock for x86_64 as well. On Sapphire Rapids the combine section is
+    // DRAM + L1-table bound and benefits from extra HT capacity when the
+    // harness has set a narrower Rayon pool. Runtime predicate unchanged.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     if l >= (1 << 22)
         && std::thread::available_parallelism()
             .is_ok_and(|n| n.get() > rayon::current_num_threads())
@@ -113,6 +119,7 @@ fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
     {
         return commit::wide_hash_pool().install(op);
     }
+    let _ = l;
     op()
 }
 

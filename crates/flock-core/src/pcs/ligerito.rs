@@ -2953,14 +2953,15 @@ fn materialize_direct_ab_fold2(
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = (!ordinary_basis.is_empty())
                     .then(|| &ordinary_basis[start..start + 4 * block_len]);
+                // Precomputed multilinear coeffs (same as fold_weight):
+                // fold4 = a0*c0 + a1*c1 + a2*c2 + a3*c3
+                let [c0, c1, c2, c3] = fold_weight;
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
                     let a2 = input[4 * slot + 2];
                     let a3 = input[4 * slot + 3];
-                    let low = a0 + r0 * (a0 + a1);
-                    let high = a2 + r0 * (a2 + a3);
-                    low + r1 * (low + high)
+                    a0 * c0 + a1 * c1 + a2 * c2 + a3 * c3
                 };
                 let mut u0 = F128::ZERO;
                 let mut u2 = F128::ZERO;
