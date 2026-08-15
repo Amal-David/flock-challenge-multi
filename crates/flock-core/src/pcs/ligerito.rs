@@ -2064,16 +2064,55 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
-/// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
-/// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
-/// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
-/// one parallel sweep per layer.)
-fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+/// 4-lane AVX-512 transpose butterfly: `s = a ⊕ b; a' = s; b' = t·s ⊕ b`.
+///
+/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one `ghash_mul_x4`
+/// per 4-lane group, XOR for the sum. Field-identical to the scalar loop
+/// (`ghash_mul_x4` is the canonical mod-p product, cross-checked against
+/// `ghash_mul_karatsuba_barrett` in the field tests).
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site). `top` and
+/// `bot` must have equal length.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller carries the target features; slice bounds hold.
+    unsafe {
+        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let lanes = top.len() & !3;
+        let mut i = 0;
+        while i < lanes {
+            let va = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+            let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+            let vs = _mm512_xor_si512(va, vb);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
+            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
+            i += 4;
+        }
+        while i < top.len() {
+            // F128 addition IS XOR (GF(2^128)).
+            let s = top[i] + bot[i];
+            top[i] = s;
+            bot[i] = t * s + bot[i];
+            i += 1;
+        }
+    }
+}
+
+/// Dense transpose sweep over forward layers `0..top` (applied in reverse
+/// layer order). Shared by [`transpose_forward_ntt`] and the sparse-prefix
+/// tail; `data.len()` must be `2^log_d` with `top <= log_d`.
+fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
     use rayon::prelude::*;
-    debug_assert_eq!(data.len(), 1usize << log_d);
-    debug_assert!(log_d <= ntt.log_domain_size());
+    let log_d = data.len().trailing_zeros() as usize;
+    debug_assert!(top <= log_d);
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..log_d).rev() {
+    for layer in (0..top).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2082,32 +2121,68 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
                 .enumerate()
                 .for_each(|(block, chunk)| {
                     let t = ntt.twiddle(layer, block);
-                    let (top, bot) = chunk.split_at_mut(bsh);
-                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let s = a + b;
-                        *a_ref = s;
-                        *b_ref = t * s + b;
+                    let (top_h, bot) = chunk.split_at_mut(bsh);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    // SAFETY: target features cfg-guaranteed; split halves
+                    // are equal-length.
+                    unsafe {
+                        transpose_butterfly_avx512(top_h, bot, t)
+                    }
+                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                    {
+                        for (a_ref, b_ref) in top_h.iter_mut().zip(bot.iter_mut()) {
+                            let a = *a_ref;
+                            let b = *b_ref;
+                            let s = a + b;
+                            *a_ref = s;
+                            *b_ref = t * s + b;
+                        }
                     }
                 });
         } else {
             for block in 0..num_blocks {
                 let t = ntt.twiddle(layer, block);
                 let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bot) = chunk.split_at_mut(bsh);
-                top.par_iter_mut()
-                    .zip(bot.par_iter_mut())
-                    .for_each(|(a_ref, b_ref)| {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let s = a + b;
-                        *a_ref = s;
-                        *b_ref = t * s + b;
-                    });
+                let (top_h, bot) = chunk.split_at_mut(bsh);
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // Few huge blocks: split each block's span into 4 KiB
+                    // segments so the vector kernel still fills the cores.
+                    const SEG: usize = 4096;
+                    top_h
+                        .par_chunks_mut(SEG)
+                        .zip(bot.par_chunks_mut(SEG))
+                        .for_each(|(a, b)| {
+                            // SAFETY: target features cfg-guaranteed.
+                            unsafe { transpose_butterfly_avx512(a, b, t) }
+                        });
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    top_h
+                        .par_iter_mut()
+                        .zip(bot.par_iter_mut())
+                        .for_each(|(a_ref, b_ref)| {
+                            let a = *a_ref;
+                            let b = *b_ref;
+                            let s = a + b;
+                            *a_ref = s;
+                            *b_ref = t * s + b;
+                        });
+                }
             }
         }
     }
+}
+
+/// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
+/// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
+/// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
+/// one parallel sweep per layer.)
+fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    debug_assert!(log_d <= ntt.log_domain_size());
+    transpose_forward_ntt_dense_layers(ntt, data, log_d);
 }
 
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
@@ -2262,12 +2337,22 @@ fn transpose_forward_ntt_sparse(
                     // global block index = ((w<<k) + jb*block_size) >> (s+1).
                     let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
                     let base = jb * block_size;
-                    for r in 0..bsh {
-                        let a = buf[base + r];
-                        let b = buf[base + r + bsh];
-                        let sab = a + b;
-                        buf[base + r] = sab;
-                        buf[base + r + bsh] = t * sab + b;
+                    let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    // SAFETY: target features cfg-guaranteed; split halves
+                    // are equal-length.
+                    unsafe {
+                        transpose_butterfly_avx512(top_h, bot, t)
+                    }
+                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                    {
+                        for r in 0..bsh {
+                            let a = top_h[r];
+                            let b = bot[r];
+                            let sab = a + b;
+                            top_h[r] = sab;
+                            bot[r] = t * sab + b;
+                        }
                     }
                 }
             }
@@ -2283,42 +2368,7 @@ fn transpose_forward_ntt_sparse(
     }
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
-        let num_blocks = 1usize << layer;
-        let block_size = 1usize << (log_d - layer);
-        let bsh = block_size >> 1;
-        if num_blocks >= n_threads {
-            data.par_chunks_mut(block_size)
-                .enumerate()
-                .for_each(|(block, chunk)| {
-                    let t = ntt.twiddle(layer, block);
-                    let (top, bot) = chunk.split_at_mut(bsh);
-                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let sab = a + b;
-                        *a_ref = sab;
-                        *b_ref = t * sab + b;
-                    }
-                });
-        } else {
-            for block in 0..num_blocks {
-                let t = ntt.twiddle(layer, block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bot) = chunk.split_at_mut(bsh);
-                top.par_iter_mut()
-                    .zip(bot.par_iter_mut())
-                    .for_each(|(a_ref, b_ref)| {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let sab = a + b;
-                        *a_ref = sab;
-                        *b_ref = t * sab + b;
-                    });
-            }
-        }
-    }
+    transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
     data
 }
 
