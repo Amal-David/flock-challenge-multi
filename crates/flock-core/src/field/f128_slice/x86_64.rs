@@ -34,10 +34,11 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
 
 #[inline]
 fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: usize) {
-    let one_plus_r = F128::ONE + r;
+    // Char-2 one-mul tail (SIMD body already uses even + r*(even+odd)).
     while t < dst.len() {
         let s = 2 * (base + t);
-        dst[t] = src[s] * one_plus_r + src[s + 1] * r;
+        let even = src[s];
+        dst[t] = even + r * (even + src[s + 1]);
         t += 1;
     }
 }

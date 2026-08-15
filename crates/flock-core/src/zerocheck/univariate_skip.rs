@@ -36,11 +36,12 @@ pub fn build_eq(r: &[F128]) -> Vec<F128> {
     t[0] = F128::ONE;
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
+        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
         // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
         for x in (0..(1usize << i)).rev() {
-            t[x | (1 << i)] = t[x] * r_i;
-            t[x] *= one_minus_r;
+            let hi = t[x] * r_i;
+            t[x | (1 << i)] = hi;
+            t[x] += hi;
         }
     }
     t
@@ -594,6 +595,30 @@ mod tests {
         let t = build_eq(&r);
         let sum: F128 = t.iter().copied().fold(F128::ZERO, |a, b| a + b);
         assert_eq!(sum, F128::ONE, "Σ_x eq(r, x) should be 1");
+    }
+
+    /// Char-2 one-mul doubling is bit-identical to the two-GHASH formula.
+    #[test]
+    fn build_eq_matches_two_mul() {
+        fn two_mul(r: &[F128]) -> Vec<F128> {
+            let n = r.len();
+            let mut t = vec![F128::ZERO; 1usize << n];
+            t[0] = F128::ONE;
+            for i in 0..n {
+                let r_i = r[i];
+                let one_plus_r = F128::ONE + r_i;
+                for x in (0..(1usize << i)).rev() {
+                    t[x | (1 << i)] = t[x] * r_i;
+                    t[x] *= one_plus_r;
+                }
+            }
+            t
+        }
+        let mut rng = Rng::new(0xE0_D0_B1E);
+        for n in 0..=8 {
+            let r = rng.f128_vec(n);
+            assert_eq!(build_eq(&r), two_mul(&r), "n={n}");
+        }
     }
 
     #[test]

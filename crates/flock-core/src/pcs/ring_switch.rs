@@ -296,23 +296,25 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
+        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
         if half < PAR_THRESHOLD {
             for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                 let old = *lo_x;
-                *hi_x = old * r_i;
-                *lo_x = old * one_minus_r;
+                let prod = old * r_i;
+                *hi_x = prod;
+                *lo_x = old + prod;
             }
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
                 .for_each(|(lo_x, hi_x)| {
                     let old = *lo_x;
-                    *hi_x = old * r_i;
-                    *lo_x = old * one_minus_r;
+                    let prod = old * r_i;
+                    *hi_x = prod;
+                    *lo_x = old + prod;
                 });
         }
     }
@@ -1716,14 +1718,14 @@ pub(crate) fn build_direct_fold2_table(
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
     let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
     let mut generators = [F128::ZERO; 128];
-    for (bit, generator) in generators.iter_mut().enumerate() {
-        let basis = if bit < 64 {
-            F128::new(1u64 << bit, 0)
-        } else {
-            F128::new(0, 1u64 << (bit - 64))
-        };
-        for d in 0..4 {
-            *generator += fold_weight[d] * fold_one_slot(basis * low_eq[d], base);
+    // X^bit * low_eq[d] is iterated mul_by_x from low_eq[d] (same chain as
+    // compose_block_table). Φ = fold_one_slot is only F2-linear on bits —
+    // do NOT pull fold_weight[d] through Φ.
+    for d in 0..4 {
+        let mut w = low_eq[d];
+        for generator in generators.iter_mut() {
+            *generator += fold_weight[d] * fold_one_slot(w, base);
+            w = crate::field::mul_by_x(w);
         }
     }
     for byte in 0..FOLD_N_BYTES {
@@ -4063,6 +4065,90 @@ mod tests {
                     "eval_rs_eq mismatch at l_prime={l_prime}"
                 );
             }
+        }
+    }
+
+    /// Current 512-GHASH bit-loop (pre-mul_by_x rewrite). Oracle only.
+    fn build_direct_fold2_table_ghash_oracle(
+        low_eq: &[F128; 4],
+        fold_weight: &[F128; 4],
+        base: &[F128],
+    ) -> Vec<F128> {
+        let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+        let mut generators = [F128::ZERO; 128];
+        for (bit, generator) in generators.iter_mut().enumerate() {
+            let basis = if bit < 64 {
+                F128::new(1u64 << bit, 0)
+            } else {
+                F128::new(0, 1u64 << (bit - 64))
+            };
+            for d in 0..4 {
+                *generator += fold_weight[d] * fold_one_slot(basis * low_eq[d], base);
+            }
+        }
+        for byte in 0..FOLD_N_BYTES {
+            let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
+            table[0] = F128::ZERO;
+            for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
+                let half = 1usize << bit;
+                for value in 0..half {
+                    table[value + half] = table[value] + generator;
+                }
+            }
+        }
+        out
+    }
+
+    /// `build_direct_fold2_table` mul_by_x chains == the 512-GHASH bit-loop.
+    #[test]
+    fn build_direct_fold2_table_matches_ghash_bit_loop() {
+        let mut rng = Rng::new(0xF01D2_C47);
+        for trial in 0..4 {
+            let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_fold_byte_table(&eq_r_dprime);
+            let low_eq = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+            let fold_weight = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+            let got = build_direct_fold2_table(&low_eq, &fold_weight, &base);
+            let expect = build_direct_fold2_table_ghash_oracle(&low_eq, &fold_weight, &base);
+            assert_eq!(got, expect, "trial {trial}");
+            // Same Φ columns: folding a random x through the table equals
+            // Σ_d fold_weight[d] * Φ(low_eq[d] * x).
+            for _ in 0..32 {
+                let x = rng.f128();
+                let mut acc = F128::ZERO;
+                for d in 0..4 {
+                    acc += fold_weight[d] * fold_one_slot(low_eq[d] * x, &base);
+                }
+                assert_eq!(fold_one_slot(x, &got), acc, "trial {trial} slot");
+            }
+        }
+    }
+
+    /// Parallel one-mul doubling is bit-identical to the two-GHASH formula.
+    #[test]
+    fn build_eq_parallel_matches_two_mul() {
+        fn two_mul(r: &[F128]) -> Vec<F128> {
+            let n = r.len();
+            let mut t = vec![F128::ZERO; 1usize << n];
+            t[0] = F128::ONE;
+            for i in 0..n {
+                let r_i = r[i];
+                let one_plus_r = F128::ONE + r_i;
+                let half = 1usize << i;
+                for x in 0..half {
+                    let v = t[x];
+                    t[x + half] = v * r_i;
+                    t[x] = v * one_plus_r;
+                }
+            }
+            t
+        }
+        let mut rng = Rng::new(0xB01D_E0);
+        // Include a width past PAR_THRESHOLD (2^12) so the rayon arm runs.
+        for &n in &[0usize, 1, 4, 8, 12, 13] {
+            let r: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            assert_eq!(build_eq_parallel(&r), two_mul(&r), "n={n}");
+            assert_eq!(build_eq_parallel(&r), build_eq(&r), "vs sequential n={n}");
         }
     }
 }

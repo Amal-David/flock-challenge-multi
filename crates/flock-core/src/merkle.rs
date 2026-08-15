@@ -440,6 +440,56 @@ pub(crate) fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind:
     }
 }
 
+/// Serial twin of [`hash_leaves`]. Same CVs; no rayon dispatch.
+///
+/// Used when a worker already owns a retired leaf-index range (Merkle
+/// rewrite 1): nested `par_chunks` inside the NTT deep pass would oversub.
+pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            for (outs, leaves) in out
+                .chunks_mut(BLAKE3_GROUP)
+                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
+            {
+                blake3_hash_many_leaves(leaves, leaf_size, outs);
+            }
+        }
+        HashKind::Blake3 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (outs, leaves) in out.chunks_mut(4).zip(data.chunks(4 * leaf_size)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -559,6 +609,113 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     }
 
     tree
+}
+
+/// Incremental builder for the same `2n−1` flat tree as [`merkle_tree`].
+///
+/// Leaf-index ranges must be absorbed in order and must extend a contiguous
+/// prefix. Do not absorb a range whose last NTT write has not retired.
+/// Parents fold as soon as both children exist, and only on a contiguous
+/// pair-prefix of an already-written child level. Root stays at `tree[2n−2]`.
+pub(crate) struct StreamMerkle {
+    tree: Vec<Hash>,
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    /// `level_done[0]` = contiguous hashed leaf prefix.
+    /// `level_done[k]` = contiguous written prefix at the level with
+    /// `n_leaves >> k` nodes (1 at the root).
+    level_done: Vec<usize>,
+}
+
+impl StreamMerkle {
+    pub(crate) fn new(n_leaves: usize, leaf_size: usize, kind: HashKind) -> Self {
+        assert!(
+            n_leaves.is_power_of_two() && n_leaves > 0,
+            "num_leaves must be power of 2"
+        );
+        let levels = n_leaves.trailing_zeros() as usize + 1;
+        Self {
+            tree: crate::alloc_uninit_vec(2 * n_leaves - 1),
+            n_leaves,
+            leaf_size,
+            kind,
+            level_done: vec![0; levels],
+        }
+    }
+
+    /// Hash leaves `[lo, hi)` from `data` (exactly `(hi-lo)*leaf_size` bytes)
+    /// and fold every parent whose both children now exist.
+    pub(crate) fn absorb_leaf_range(&mut self, data: &[u8], lo: usize, hi: usize) {
+        assert!(hi > lo && hi <= self.n_leaves);
+        assert_eq!(
+            lo, self.level_done[0],
+            "leaf ranges must extend the hashed prefix (got {lo}, prefix {})",
+            self.level_done[0]
+        );
+        assert_eq!(data.len(), (hi - lo) * self.leaf_size);
+        hash_leaves(data, self.leaf_size, &mut self.tree[lo..hi], self.kind);
+        self.level_done[0] = hi;
+        self.fold_ready_parents();
+    }
+
+    fn fold_ready_parents(&mut self) {
+        let mut s = self.n_leaves;
+        let mut level = 0usize;
+        while s > 1 {
+            let child_done = self.level_done[level];
+            let parent_ready = child_done / 2;
+            let already = self.level_done[level + 1];
+            if parent_ready > already {
+                let child_start = 2 * self.n_leaves - 2 * s;
+                let (read, rest) = self.tree[child_start..].split_at_mut(s);
+                let write = &mut rest[..s / 2];
+                hash_pairs_level(
+                    &read[2 * already..2 * parent_ready],
+                    &mut write[already..parent_ready],
+                    self.kind,
+                );
+                self.level_done[level + 1] = parent_ready;
+            }
+            s >>= 1;
+            level += 1;
+        }
+    }
+
+    pub(crate) fn into_tree(self) -> Vec<Hash> {
+        assert_eq!(
+            self.level_done[0], self.n_leaves,
+            "not every leaf was absorbed"
+        );
+        debug_assert_eq!(*self.level_done.last().unwrap(), 1);
+        self.tree
+    }
+}
+
+/// Same tree as [`merkle_tree`], built by streaming `ranges` in leaf-index
+/// order and folding parents as soon as both children exist.
+pub(crate) fn merkle_tree_streaming(
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    ranges: impl IntoIterator<Item = core::ops::Range<usize>>,
+) -> Vec<Hash> {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+    let leaf_size = data.len() / num_leaves;
+    let mut builder = StreamMerkle::new(num_leaves, leaf_size, kind);
+    for r in ranges {
+        let bytes = &data[r.start * leaf_size..r.end * leaf_size];
+        builder.absorb_leaf_range(bytes, r.start, r.end);
+    }
+    builder.into_tree()
 }
 
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
@@ -974,6 +1131,58 @@ mod tests {
             let par = merkle_tree(&data, n_leaves, kind);
             let seq = merkle_tree_sequential(&data, n_leaves, kind);
             assert_eq!(par, seq, "{kind}");
+        }
+    }
+
+    /// Merkle rewrite 1 oracle: streaming layers into the same `2n−1` tree
+    /// is node-for-node identical to the one-shot [`merkle_tree`] build.
+    /// Reduced geometries, including the ranked 1024 B leaf.
+    #[test]
+    fn streaming_tree_matches_merkle_tree_node_for_node() {
+        let cases: &[(usize, usize, &[core::ops::Range<usize>])] = &[
+            (16, 64, &[0..16]),
+            (16, 64, &[0..4, 4..8, 8..12, 12..16]),
+            (16, 64, &[0..1, 1..3, 3..8, 8..16]),
+            (256, 64, &[0..32, 32..64, 64..128, 128..192, 192..256]),
+            (256, 1024, &[0..32, 32..64, 64..96, 96..128, 128..160, 160..192, 192..224, 224..256]),
+            (1024, 1024, &[
+                0..128, 128..256, 256..384, 384..512, 512..640, 640..768, 768..896, 896..1024,
+            ]),
+        ];
+        for &(n_leaves, leaf_size, ranges) in cases {
+            let data = random_data(n_leaves, leaf_size, 0x51EA_u64.wrapping_mul(n_leaves as u64));
+            for kind in KINDS {
+                let oneshot = merkle_tree(&data, n_leaves, kind);
+                let streamed = merkle_tree_streaming(&data, n_leaves, kind, ranges.iter().cloned());
+                assert_eq!(
+                    streamed.len(),
+                    2 * n_leaves - 1,
+                    "{kind} n={n_leaves} leaf={leaf_size}: length"
+                );
+                assert_eq!(
+                    streamed, oneshot,
+                    "{kind} n={n_leaves} leaf={leaf_size}: node-for-node vs merkle_tree"
+                );
+                assert_eq!(
+                    streamed[2 * n_leaves - 2],
+                    *oneshot.last().unwrap(),
+                    "{kind} n={n_leaves}: root at 2n-2"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_leaves_serial_matches_hash_leaves() {
+        for &(n, leaf_size) in &[(1usize, 64), (7, 64), (16, 1024), (1024, 64)] {
+            let data = random_data(n, leaf_size, 0x51);
+            for kind in KINDS {
+                let mut par = vec![[0u8; 32]; n];
+                let mut ser = vec![[0u8; 32]; n];
+                hash_leaves(&data, leaf_size, &mut par, kind);
+                hash_leaves_serial(&data, leaf_size, &mut ser, kind);
+                assert_eq!(par, ser, "{kind} n={n} leaf={leaf_size}");
+            }
         }
     }
 

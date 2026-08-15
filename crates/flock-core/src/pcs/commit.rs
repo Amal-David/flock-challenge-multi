@@ -19,8 +19,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -282,12 +282,45 @@ fn finalize_commit(
         }
     }
 
+    // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
+    // each NTT deep-pass sub-group retires (regular stores, same worker).
+    // Parents fold after the encode join via [`build_upper_levels`] — the
+    // same `hash_pairs_level` sequence `merkle_tree()` uses. No
+    // `wide_hash_pool` (same-width hop / nested-install footgun). No Metal.
+    let n_leaves = params.n_leaves();
+    let kind = params.merkle_hash;
+    let leaf_size = params.leaf_size_bytes();
+    let num_ntts = params.num_ntts();
+    let mut merkle_tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
+    let tree_addr = merkle_tree.as_mut_ptr() as usize;
+
     let t_ntt = std::time::Instant::now();
-    // ---- Interleaved RS encoding: 2^log_batch_size independent sub-NTTs with
-    // shared twiddles. The encoder owns the zero-padding/replication shortcut
-    // and any target-specific fusion, so this timer covers the complete
-    // logical encoding stage.
-    ntt.rs_encode_interleaved(z_packed, &mut codeword, params.num_ntts());
+    ntt.rs_encode_interleaved_on_range_done(
+        z_packed,
+        &mut codeword,
+        num_ntts,
+        &|range, sub_data| {
+            debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
+            // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
+            // the one-shot `merkle_tree` cast in the previous barrier path.
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    sub_data.as_ptr() as *const u8,
+                    sub_data.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            // SAFETY: each deep-pass sub-group maps to a disjoint leaf-index
+            // range; only this worker writes `tree[range]`, and NTT writes to
+            // those leaves have retired on this thread.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (tree_addr as *mut Hash).add(range.start),
+                    range.len(),
+                )
+            };
+            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+        },
+    );
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",
@@ -295,37 +328,8 @@ fn finalize_commit(
         );
     }
     let t_merkle = std::time::Instant::now();
-
-    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
-    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
-    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
-    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
-    let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
-        )
-    };
-    // Initial tree: one leaf per codeword position, each containing the
-    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
-    // Ligerito's L0 commitment.
-    //
-    // Under SHA-256 the leaf level was SHA-unit bound (one unit per core), so
-    // E-cores added ~10-15% at the ranked 2^20-leaf tree. Under BLAKE3 the
-    // tree hash is NEON-bound (hash_many batching, no hw hash unit) — E-cores
-    // still add NEON throughput (~35-40% of a P-core each), so the widest
-    // pool should still pay for LARGE trees. TUNING POINT for the BLAKE3
-    // runner: re-A/B the >=2^18-leaves gate (and whether the E-core spin-up
-    // is worth it at all) once end-to-end numbers exist. The recursive
-    // Ligerito commits (≤ 2^17 leaves) run at open time, where wider pools
-    // measurably regressed under SHA-256.
-    let merkle_tree = if params.n_leaves() >= (1 << 18) {
-        wide_hash_pool()
-            .install(|| merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash))
-    } else {
-        merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash)
-    };
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves, kind);
+    let root = merkle_tree[2 * n_leaves - 2];
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms",
@@ -625,9 +629,7 @@ fn gpu_streamed_commit(
     // once, per chunk: committed to the GPU (chunks 0..gpu_share, while
     // healthy) or pushed to the CPU-join list. This is what keeps the two
     // sides' tree writes disjoint.
-    let gpu_share = MERKLE_GPU_CHUNK_SHARE
-        .load(Ordering::Relaxed)
-        .min(n_chunks);
+    let gpu_share = MERKLE_GPU_CHUNK_SHARE.load(Ordering::Relaxed).min(n_chunks);
     let mut gpu_ranges: Vec<core::ops::Range<usize>> = Vec::with_capacity(n_chunks);
     let mut cpu_ranges: Vec<core::ops::Range<usize>> = Vec::with_capacity(n_chunks);
     let mut gpu_failed = false;
@@ -696,7 +698,11 @@ fn gpu_streamed_commit(
         Some(gpu_busy) if !gpu_failed => {
             // ---- CPU top: from stop_nodes (or from the leaves when the tree
             // was too small for GPU parent levels) up to the root.
-            let from_nodes = if committed_parents { stop_nodes } else { n_leaves };
+            let from_nodes = if committed_parents {
+                stop_nodes
+            } else {
+                n_leaves
+            };
             build_upper_levels(&mut tree, n_leaves, from_nodes, kind);
 
             // Calibrate only on production-scale commits: on tiny (test)
@@ -776,9 +782,8 @@ pub fn gpu_merkle_warmup_calibrate() {
     // CPU rate: same batched kernels the join uses, on the wide pool.
     let t_cpu = std::time::Instant::now();
     {
-        let bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16)
-        };
+        let bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16) };
         wide_hash_pool().install(|| {
             merkle::hash_leaves(bytes, leaf_size, &mut tree[..n_leaves], HashKind::Blake3);
         });
@@ -789,9 +794,8 @@ pub fn gpu_merkle_warmup_calibrate() {
     // second — but calibrate on FULL turnaround of that pass.
     let mut gpu_seconds_best = f64::INFINITY;
     for _pass in 0..2 {
-        let bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16)
-        };
+        let bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16) };
         // SAFETY: `data` and `tree` outlive the session; no CPU writes race
         // the GPU (the CPU pass above is complete).
         let Some(mut session) = (unsafe {
@@ -1082,6 +1086,74 @@ mod tests {
         let z_packed = super::super::pack::pack_witness(&z, m);
         let (_, pd) = commit(&z_packed, &params);
         assert_eq!(pd.codeword.len(), 2 * z_packed.len());
+    }
+
+    /// Merkle rewrite 1: CPU streamed commit (hash-as-NTT-finishes + parent
+    /// fold) must be node-for-node identical to one-shot `merkle_tree()` on
+    /// the same codeword. Reduced geometry, ranked 1024 B leaf. Does not
+    /// go through Metal (`gpu_hybrid_commit_matches_pure_cpu` skips here).
+    ///
+    /// Soundness: `pd.codeword` must also match the definitional zero-padded
+    /// full interleaved NTT of the same packed message (same oracle as
+    /// [`commit_matches_full_ntt_oracle`]). Hashing `pd.codeword` alone
+    /// cannot hide a wrong encode. Both shapes stay: m=20 scalar deep pass
+    /// and m=24 parallel deep pass (`on_range_done` per sub-group).
+    #[test]
+    fn cpu_streamed_commit_matches_merkle_tree_node_for_node() {
+        let mut rng = Rng::new(0x51EA);
+        // m=20 / log_batch=6 → k_code=8, 256 leaves (scalar deep pass).
+        // m=24 / log_batch=6 → k_code=12, 4096 leaves (parallel deep pass).
+        for m in [20usize, 24] {
+            let params = PcsParams {
+                m,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: Default::default(),
+                merkle_hash: HashKind::Blake3,
+            };
+            let z = rng.bits(1 << m);
+            let z_packed = super::super::pack::pack_witness(&z, m);
+            let (commitment, pd) = commit(&z_packed, &params);
+
+            // Independent encode oracle (same construction as
+            // `commit_matches_full_ntt_oracle`): zero-pad + full interleaved
+            // NTT. The streamed path uses `rs_encode_interleaved_on_range_done`;
+            // a wrong encode must not pass just because the tree hashes
+            // `pd.codeword`.
+            let mut encode_oracle = vec![F128::ZERO; params.codeword_len_f128()];
+            encode_oracle[..z_packed.len()].copy_from_slice(&z_packed);
+            let ntt = AdditiveNttF128::standard(params.k_code());
+            ntt.forward_transform_interleaved(&mut encode_oracle, params.num_ntts());
+            assert_eq!(
+                pd.codeword,
+                encode_oracle,
+                "streamed codeword != full-NTT encode at m={m} r={} ntts={}",
+                params.log_inv_rate,
+                params.num_ntts()
+            );
+
+            let codeword_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    pd.codeword.as_ptr() as *const u8,
+                    pd.codeword.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let oracle = merkle::merkle_tree(codeword_bytes, params.n_leaves(), HashKind::Blake3);
+            assert_eq!(
+                pd.merkle_tree.len(),
+                2 * params.n_leaves() - 1,
+                "flat 2n-1 layout at m={m}"
+            );
+            assert_eq!(
+                pd.merkle_tree, oracle,
+                "streamed CPU tree != merkle_tree() node-for-node at m={m}"
+            );
+            assert_eq!(
+                commitment.root,
+                oracle[2 * params.n_leaves() - 2],
+                "root at 2n-2 at m={m}"
+            );
+        }
     }
 
     /// **GPU-hybrid acceptance**: the streamed GPU commit (leaf chunks + GPU

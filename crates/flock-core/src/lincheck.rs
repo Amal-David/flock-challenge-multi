@@ -464,17 +464,17 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     out.push(F128::ONE);
     for j in 0..d {
         let r_j = point[j];
-        let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
         out.resize(2 * len, F128::ZERO);
-        // For each existing entry i ∈ [0, len), produce two children:
-        //   out[i]       *= (1 + r_j)     ← new bit_j = 0
-        //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
+        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+        //   out[i]       = v + v*r_j      ← new bit_j = 0
+        //   out[i + len] = v * r_j        ← new bit_j = 1
         // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
         for i in 0..len {
             let v = out[i];
-            out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
+            let hi = v * r_j;
+            out[i + len] = hi;
+            out[i] = v + hi;
         }
     }
     out

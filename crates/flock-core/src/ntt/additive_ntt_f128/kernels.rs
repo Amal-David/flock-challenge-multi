@@ -97,7 +97,10 @@ pub(super) fn butterfly_fused_2layer(
 /// The caller must ensure the four selected source rows are valid, the four
 /// selected destination rows are valid, and concurrent calls write disjoint
 /// destination row groups. Source and destination must not overlap.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from(
     src: *const F128,
@@ -119,7 +122,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
 /// # Safety
 /// Same source/destination validity, non-aliasing, and disjoint-write contract
 /// as [`butterfly_fused_2layer_row_from`].
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     src: *const F128,

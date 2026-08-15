@@ -2744,15 +2744,18 @@ fn fold_and_msg_lsb(
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    let one_plus_r = F128::ONE + r;
-
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
+        // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
         for j in 0..half {
-            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
-            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            let f0 = f[2 * j];
+            let f1 = f[2 * j + 1];
+            let b0 = b[2 * j];
+            let b1 = b[2 * j + 1];
+            nf.push(f0 + r * (f0 + f1));
+            nb.push(b0 + r * (b0 + b1));
         }
         let mut u_0 = F128::ZERO;
         let mut u_2 = F128::ZERO;
@@ -6480,6 +6483,49 @@ mod tests {
             assert_eq!(bc_soa, bc_soa_r, "folded b NT vs stp n_pairs={n_pairs}");
             assert_eq!(u0_soa, u0_soa_r, "u0 NT vs stp n_pairs={n_pairs}");
             assert_eq!(u2_soa, u2_soa_r, "u2 NT vs stp n_pairs={n_pairs}");
+        }
+    }
+
+    /// Serial `half<4096` leaf: one-mul fold is bit-identical to two-mul +
+    /// the scalar message loop.
+    #[test]
+    fn fold_and_msg_serial_leaf_matches_two_mul() {
+        let mut state = 0xA5A5_5A5A_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for n in [2usize, 4, 8, 16, 64, 256] {
+            let f: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| f128()).collect();
+            let r = f128();
+            let one_plus_r = F128::ONE + r;
+            let half = n / 2;
+            let mut nf_ref = Vec::with_capacity(half);
+            let mut nb_ref = Vec::with_capacity(half);
+            for j in 0..half {
+                nf_ref.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+                nb_ref.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            }
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < half {
+                u0 += nf_ref[k] * nb_ref[k];
+                u2 += (nf_ref[k] + nf_ref[k + 1]) * (nb_ref[k] + nb_ref[k + 1]);
+                k += 2;
+            }
+            let (nf, nb, msg) = fold_and_msg_lsb(&f, &b, r, None);
+            assert_eq!(&nf[..], nf_ref.as_slice(), "nf n={n}");
+            assert_eq!(&nb[..], nb_ref.as_slice(), "nb n={n}");
+            assert_eq!(msg.u_0, u0, "u0 n={n}");
+            assert_eq!(msg.u_2, u2, "u2 n={n}");
         }
     }
 
