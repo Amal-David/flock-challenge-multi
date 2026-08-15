@@ -923,7 +923,60 @@ fn deferred_stats_lookahead(
                 let mut u0 = F128::ZERO;
                 let mut u2 = F128::ZERO;
                 let mut c = [F128::ZERO; 6];
-                for t in 0..(b / 4) {
+                // Dual 4-slot groups + x86 prefetch of the next witness line.
+                // Algebra identical to the single-group loop.
+                let n4 = b / 4;
+                let mut t = 0usize;
+                while t + 1 < n4 {
+                    let i = 4 * t;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let next = base + i + 8;
+                        if next < packed_witness.len() {
+                            // SAFETY: within the same allocation; prefetch is a hint.
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    packed_witness.as_ptr().add(next) as *const i8,
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
+                    }
+                    for group in 0..2usize {
+                        let ig = i + 4 * group;
+                        let b0 = ring_switch::fold_one_slot(eq_lo[ig], composed);
+                        let b1 = ring_switch::fold_one_slot(eq_lo[ig + 1], composed);
+                        let b2 = ring_switch::fold_one_slot(eq_lo[ig + 2], composed);
+                        let b3 = ring_switch::fold_one_slot(eq_lo[ig + 3], composed);
+                        let a0 = packed_witness[base + ig];
+                        let a1 = packed_witness[base + ig + 1];
+                        let a2 = packed_witness[base + ig + 2];
+                        let a3 = packed_witness[base + ig + 3];
+                        let sa0 = a0 + a1;
+                        let sb0 = b0 + b1;
+                        let sa1 = a2 + a3;
+                        let sb1 = b2 + b3;
+                        let p_even0 = a0 * b0;
+                        let p_sum0 = sa0 * sb0;
+                        u0 += p_even0 + a2 * b2;
+                        u2 += p_sum0 + sa1 * sb1;
+                        c[0] += p_even0;
+                        c[1] += a1 * b1 + p_even0 + p_sum0;
+                        c[2] += p_sum0;
+                        let e_a = a0 + a2;
+                        let e_b = b0 + b2;
+                        let se_a = sa0 + sa1;
+                        let se_b = sb0 + sb1;
+                        let p_even = e_a * e_b;
+                        let p_sum = se_a * se_b;
+                        let p_odd = (se_a + e_a) * (se_b + e_b);
+                        c[3] += p_even;
+                        c[4] += p_odd + p_even + p_sum;
+                        c[5] += p_sum;
+                    }
+                    t += 2;
+                }
+                if t < n4 {
                     let i = 4 * t;
                     let b0 = ring_switch::fold_one_slot(eq_lo[i], composed);
                     let b1 = ring_switch::fold_one_slot(eq_lo[i + 1], composed);
