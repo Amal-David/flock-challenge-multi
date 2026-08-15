@@ -2892,10 +2892,10 @@ fn eval_lookahead(coeffs: &[F128; 6], challenge: F128) -> SumcheckMessage {
     }
 }
 
-/// Materialize the combined state only after the first two folds. The
-/// ordinary basis contains C; the single direct claim contains AB in
-/// sufficient-stat form. Both contributions already have their ring-switch
-/// batching challenge baked in.
+/// Materialize the combined state only after the first two folds. Direct
+/// claims contain AB and optionally C in sufficient-stat form; a non-empty
+/// ordinary basis is the direct-AB-only fallback. All contributions already
+/// have their ring-switch batching challenge baked in.
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -2905,25 +2905,32 @@ fn materialize_direct_ab_fold2(
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
-    assert_eq!(claims.len(), 1, "direct AB path carries exactly one claim");
-    assert_eq!(ordinary_basis.len(), packed_witness.len());
-    let claim = &claims[0];
+    assert!(!claims.is_empty());
+    assert!(ordinary_basis.is_empty() || ordinary_basis.len() == packed_witness.len());
     let fold_weight = [
         (F128::ONE + r0) * (F128::ONE + r1),
         r0 * (F128::ONE + r1),
         (F128::ONE + r0) * r1,
         r0 * r1,
     ];
-    let direct_table = super::ring_switch::build_direct_fold2_table(
-        &claim.low_eq,
-        &fold_weight,
-        &claim.table,
-    );
+    let direct_tables: Vec<Vec<F128>> = claims
+        .iter()
+        .map(|claim| {
+            super::ring_switch::build_direct_fold2_table(
+                &claim.low_eq,
+                &fold_weight,
+                &claim.table,
+            )
+        })
+        .collect();
 
     let out_len = packed_witness.len() / 4;
-    let block_len = claim.eq_lo.len();
+    let block_len = claims[0].eq_lo.len();
     assert!(block_len.is_multiple_of(2));
-    assert_eq!(out_len, block_len * claim.eq_hi.len());
+    assert!(claims.iter().all(|claim| {
+        claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
+    }));
+    let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let (u_0, u_2) = folded_b
@@ -2931,16 +2938,21 @@ fn materialize_direct_ab_fold2(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_TOTAL],
+            || vec![F128::ZERO; claims.len() * table_len],
             |scratch, (block, (b_out, f_out))| {
-                super::ring_switch::compose_block_table(
-                    &direct_table,
-                    claim.eq_hi[block],
-                    scratch,
-                );
+                for (claim_index, (claim, direct_table)) in
+                    claims.iter().zip(direct_tables.iter()).enumerate()
+                {
+                    super::ring_switch::compose_block_table(
+                        direct_table,
+                        claim.eq_hi[block],
+                        &mut scratch[claim_index * table_len..(claim_index + 1) * table_len],
+                    );
+                }
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in = &ordinary_basis[start..start + 4 * block_len];
+                let b_in = (!ordinary_basis.is_empty())
+                    .then(|| &ordinary_basis[start..start + 4 * block_len]);
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
@@ -2950,24 +2962,68 @@ fn materialize_direct_ab_fold2(
                     let high = a2 + r0 * (a2 + a3);
                     low + r1 * (low + high)
                 };
-
                 let mut u0 = F128::ZERO;
                 let mut u2 = F128::ZERO;
-                for pair in 0..(block_len / 2) {
-                    let slot0 = 2 * pair;
-                    let slot1 = slot0 + 1;
-                    let f0 = fold4(f_in, slot0);
-                    let f1 = fold4(f_in, slot1);
-                    let b0 = super::ring_switch::fold_one_slot(claim.eq_lo[slot0], scratch)
-                        + fold4(b_in, slot0);
-                    let b1 = super::ring_switch::fold_one_slot(claim.eq_lo[slot1], scratch)
-                        + fold4(b_in, slot1);
-                    f_out[slot0] = f0;
-                    f_out[slot1] = f1;
-                    b_out[slot0] = b0;
-                    b_out[slot1] = b1;
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
+                if let [first, second] = claims {
+                    debug_assert!(b_in.is_none());
+                    let first_table = &scratch[..table_len];
+                    let second_table = &scratch[table_len..2 * table_len];
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
+                        let b0 = super::ring_switch::fold_one_slot(
+                            first.eq_lo[slot0],
+                            first_table,
+                        ) + super::ring_switch::fold_one_slot(
+                            second.eq_lo[slot0],
+                            second_table,
+                        );
+                        let b1 = super::ring_switch::fold_one_slot(
+                            first.eq_lo[slot1],
+                            first_table,
+                        ) + super::ring_switch::fold_one_slot(
+                            second.eq_lo[slot1],
+                            second_table,
+                        );
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                    }
+                } else {
+                    for pair in 0..(block_len / 2) {
+                        let slot0 = 2 * pair;
+                        let slot1 = slot0 + 1;
+                        let f0 = fold4(f_in, slot0);
+                        let f1 = fold4(f_in, slot1);
+                        let direct_at = |slot: usize| {
+                            claims
+                                .iter()
+                                .enumerate()
+                                .map(|(claim_index, claim)| {
+                                    super::ring_switch::fold_one_slot(
+                                        claim.eq_lo[slot],
+                                        &scratch[claim_index * table_len
+                                            ..(claim_index + 1) * table_len],
+                                    )
+                                })
+                                .fold(F128::ZERO, |sum, value| sum + value)
+                        };
+                        let b0 = direct_at(slot0)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
+                        let b1 = direct_at(slot1)
+                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        f_out[slot0] = f0;
+                        f_out[slot1] = f1;
+                        b_out[slot0] = b0;
+                        b_out[slot1] = b1;
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                    }
                 }
                 (u0, u2)
             },
@@ -2977,7 +3033,9 @@ fn materialize_direct_ab_fold2(
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
     crate::scratch::give_f128(packed_witness);
-    crate::scratch::give_f128(ordinary_basis);
+    if !ordinary_basis.is_empty() {
+        crate::scratch::give_f128(ordinary_basis);
+    }
     (folded_f, folded_b, SumcheckMessage { u_0, u_2 })
 }
 
@@ -4088,7 +4146,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    assert_eq!(b_initial.len(), 1usize << log_n);
+    if direct_fold2.is_some() {
+        assert!(b_initial.is_empty() || b_initial.len() == 1usize << log_n);
+    } else {
+        assert_eq!(b_initial.len(), 1usize << log_n);
+    }
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -6129,7 +6191,7 @@ mod tests {
             eq_hi,
             low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
             table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
-            products: [F128::ZERO; 16],
+            products: None,
         }];
 
         let mut want_f = f.clone();
@@ -6147,7 +6209,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_ab_full_proof_matches_ordinary_transcript() {
+    fn direct_all_full_proof_matches_ordinary_transcript() {
         use crate::challenger::Challenger;
 
         let log_n = 12;
@@ -6158,21 +6220,30 @@ mod tests {
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
             .collect();
-        let ordinary_c: Vec<F128> = (0..poly.len()).map(|_| rng.sample_f128()).collect();
-        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let scaled_rdp: Vec<F128> = build_eq_table(
+        let suffix_ab: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let suffix_c: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let scaled_rdp_ab: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let direct_full = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix),
-            &scaled_rdp,
+        let scaled_rdp_c: Vec<F128> = build_eq_table(
+            &(0..crate::pcs::LOG_PACKING)
+                .map(|_| rng.sample_f128())
+                .collect::<Vec<_>>(),
         );
-        let combined_basis: Vec<F128> = ordinary_c
+        let basis_ab = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix_ab),
+            &scaled_rdp_ab,
+        );
+        let basis_c = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix_c),
+            &scaled_rdp_c,
+        );
+        let combined_basis: Vec<F128> = basis_ab
             .iter()
-            .zip(direct_full)
-            .map(|(&ordinary, direct)| ordinary + direct)
+            .zip(basis_c)
+            .map(|(&ab, c)| ab + c)
             .collect();
         let target = poly
             .iter()
@@ -6181,15 +6252,22 @@ mod tests {
             .fold(F128::ZERO, |acc, value| acc + value);
         let (round0, lookahead) =
             super::super::round0_and_round1_lookahead(&poly, &combined_basis);
-        let (eq_lo, eq_hi) =
-            super::super::ring_switch::build_eq_split(&suffix[2..], (log_n - 2) / 2);
-        let direct = vec![super::super::ring_switch::DirectFold2Factors {
-            eq_lo,
-            eq_hi,
-            low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
-            table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
-            products: [F128::ZERO; 16],
-        }];
+        let direct = [(&suffix_ab, &scaled_rdp_ab), (&suffix_c, &scaled_rdp_c)]
+            .into_iter()
+            .map(|(suffix, scaled_rdp)| {
+                let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
+                    &suffix[2..],
+                    (log_n - 2) / 2,
+                );
+                super::super::ring_switch::DirectFold2Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq: build_eq_table(&suffix[..2]).try_into().unwrap(),
+                    table: super::super::ring_switch::build_fold_byte_table(scaled_rdp),
+                    products: None,
+                }
+            })
+            .collect();
 
         let log_inv_rates = vec![log_inv_rate, log_inv_rate];
         let cfg = ProverConfig {
@@ -6217,7 +6295,7 @@ mod tests {
         );
 
         let mut ordinary_challenger =
-            crate::challenger::FsChallenger::new(b"direct-ab-proof-byte-oracle");
+            crate::challenger::FsChallenger::new(b"direct-all-proof-byte-oracle");
         let ordinary = recursive_prover_with_basis_precomputed_round0(
             &cfg,
             poly.clone(),
@@ -6230,11 +6308,11 @@ mod tests {
             &mut ordinary_challenger,
         );
         let mut direct_challenger =
-            crate::challenger::FsChallenger::new(b"direct-ab-proof-byte-oracle");
+            crate::challenger::FsChallenger::new(b"direct-all-proof-byte-oracle");
         let got = recursive_prover_with_basis_direct_ab_fold2(
             &cfg,
             poly,
-            ordinary_c,
+            Vec::new(),
             direct,
             target,
             &wtns_0.mat,

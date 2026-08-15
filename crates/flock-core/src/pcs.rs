@@ -302,8 +302,10 @@ fn messages_from_direct_products(
 ) -> ((F128, F128), [F128; 6]) {
     let mut h = [F128::ZERO; 16];
     for claim in products {
-        for (out, value) in h.iter_mut().zip(claim.products) {
-            *out += value;
+        if let Some(products) = claim.products {
+            for (out, value) in h.iter_mut().zip(products) {
+                *out += value;
+            }
         }
     }
     let at = |e: usize, d: usize| h[4 * e + d];
@@ -338,8 +340,7 @@ fn direct_ab_claim_mix_supported(
     matches!(
         rs_results,
         [(_, ab), (_, c)]
-            if ab.direct_fold2.is_some()
-                && c.direct_fold2.is_none()
+            if ab.direct_fold2.as_ref().is_some_and(|direct| direct.products.is_some())
                 && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
     )
 }
@@ -425,32 +426,58 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
 
     // Production-only x86 route: retain AB as four low-coordinate banks and
-    // materialize it only after the first two sumcheck challenges. C remains
-    // on the incumbent deferred-dense combine path.
+    // materialize it only after the first two sumcheck challenges. The next
+    // experiment retains C too, eliminating the remaining full basis buffer.
     let use_direct_ab = cfg!(target_arch = "x86_64")
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && direct_ab_claim_mix_supported(&rs_results);
+    let use_direct_c = use_direct_ab
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+        && rs_results[1].1.direct_fold2.is_some();
     let direct_fold2 = if use_direct_ab {
-        Some(vec![
+        let mut direct = vec![
             rs_results[0]
                 .1
                 .direct_fold2
                 .take()
                 .expect("direct AB gate checked claim zero"),
-        ])
+        ];
+        if use_direct_c {
+            direct.push(
+                rs_results[1]
+                    .1
+                    .direct_fold2
+                    .take()
+                    .expect("direct C gate checked claim one"),
+            );
+        }
+        Some(direct)
     } else {
         None
     };
-    let direct_count = usize::from(direct_fold2.is_some());
+    let direct_count = direct_fold2.as_ref().map_or(0, Vec::len);
+
+    let direct_c_stats = if use_direct_c {
+        match &rs_results[1].1.rs_eq_ind {
+            ring_switch::RsEqInd::DeferredDense {
+                eq_lo,
+                eq_hi,
+                table,
+            } => Some((eq_lo.as_slice(), eq_hi.as_slice(), table.as_slice())),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            if use_direct_ab && index == 0 {
+            if index < direct_count {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -467,7 +494,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            if use_direct_ab && index == 0 {
+            if index < direct_count {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -496,7 +523,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    let mut b_combined: Vec<F128> = if use_direct_c {
+        Vec::new()
+    } else {
+        crate::scratch::take_f128(l)
+    };
     crate::gaptime::mark("open: b_combined taken");
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
@@ -517,7 +548,15 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && pd_dense.is_empty();
 
     let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
-        in_wide_combine_pool(l, || if use_fast {
+        in_wide_combine_pool(l, || if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
+        let (prime, lookahead) = deferred_stats_lookahead(
+            packed_witness,
+            eq_lo,
+            eq_hi,
+            table,
+        );
+        (prime, Some(lookahead))
+    } else if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -818,6 +857,72 @@ fn fused_fast_combine_lookahead(
                 out_block[i + 2] = b2;
                 out_block[i + 3] = b3;
 
+                let a0 = packed_witness[base + i];
+                let a1 = packed_witness[base + i + 1];
+                let a2 = packed_witness[base + i + 2];
+                let a3 = packed_witness[base + i + 3];
+                let sa0 = a0 + a1;
+                let sb0 = b0 + b1;
+                let sa1 = a2 + a3;
+                let sb1 = b2 + b3;
+                let p_even0 = a0 * b0;
+                let p_sum0 = sa0 * sb0;
+                u0 += p_even0 + a2 * b2;
+                u2 += p_sum0 + sa1 * sb1;
+                c[0] += p_even0;
+                c[1] += a1 * b1 + p_even0 + p_sum0;
+                c[2] += p_sum0;
+                let e_a = a0 + a2;
+                let e_b = b0 + b2;
+                let se_a = sa0 + sa1;
+                let se_b = sb0 + sb1;
+                let p_even = e_a * e_b;
+                let p_sum = se_a * se_b;
+                let p_odd = (se_a + e_a) * (se_b + e_b);
+                c[3] += p_even;
+                c[4] += p_odd + p_even + p_sum;
+                c[5] += p_sum;
+            }
+            ((u0, u2), c)
+        })
+        .reduce(
+            || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
+            |((x0, x2), mut xc), ((y0, y2), yc)| {
+                for (x, y) in xc.iter_mut().zip(yc) {
+                    *x += y;
+                }
+                ((x0 + y0, x2 + y2), xc)
+            },
+        )
+}
+
+/// Evaluate one deferred-dense basis only long enough to obtain its first two
+/// sumcheck messages. No length-`L` basis is written: C is reconstructed
+/// directly at `L/4` once both challenges are known.
+fn deferred_stats_lookahead(
+    packed_witness: &[F128],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    table: &[F128],
+) -> ((F128, F128), [F128; 6]) {
+    use rayon::prelude::*;
+    let b = eq_lo.len();
+    debug_assert!(b >= 4 && b.is_multiple_of(4));
+    debug_assert_eq!(packed_witness.len(), b * eq_hi.len());
+    eq_hi
+        .par_iter()
+        .enumerate()
+        .map(|(hi, &e_hi)| {
+            let base = hi * b;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut c = [F128::ZERO; 6];
+            for t in 0..(b / 4) {
+                let i = 4 * t;
+                let b0 = ring_switch::fold_one_slot(eq_lo[i] * e_hi, table);
+                let b1 = ring_switch::fold_one_slot(eq_lo[i + 1] * e_hi, table);
+                let b2 = ring_switch::fold_one_slot(eq_lo[i + 2] * e_hi, table);
+                let b3 = ring_switch::fold_one_slot(eq_lo[i + 3] * e_hi, table);
                 let a0 = packed_witness[base + i];
                 let a1 = packed_witness[base + i + 1];
                 let a2 = packed_witness[base + i + 2];
@@ -1461,6 +1566,16 @@ mod tests {
             assert_eq!(got_round0, want_round0);
             assert_eq!(got_round0, oracle_round0);
             assert_eq!(got_lookahead, oracle_lookahead);
+            if n_claims == 1 {
+                let (stats_round0, stats_lookahead) = deferred_stats_lookahead(
+                    &packed_witness,
+                    deferred[0].0,
+                    deferred[0].1,
+                    deferred[0].2,
+                );
+                assert_eq!(stats_round0, oracle_round0);
+                assert_eq!(stats_lookahead, oracle_lookahead);
+            }
         }
     }
 
@@ -1483,7 +1598,7 @@ mod tests {
             eq_hi: Vec::new(),
             low_eq: [F128::ZERO; 4],
             table: Vec::new(),
-            products,
+            products: Some(products),
         };
         assert_eq!(
             messages_from_direct_products(&[factors]),

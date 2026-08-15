@@ -2201,16 +2201,18 @@ pub struct RingSwitchOutput {
     pub sumcheck_claim: F128,
 }
 
-/// Dense ingredients retained only for the x86 AB direct-fold2 path. The
-/// table and all products already include this claim's ring-switch γ.
+/// Dense ingredients retained for the x86 direct-fold2 path. The table and
+/// optional products already include this claim's ring-switch γ.
 #[derive(Clone, Debug)]
 pub(crate) struct DirectFold2Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
     pub(crate) low_eq: [F128; 4],
     pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[4h+e] B_k[4h+d]`.
-    pub(crate) products: [F128; 16],
+    /// `H[e,d] = Σ_h f[4h+e] B_k[4h+d]`. Available for AB because its
+    /// four-bank witness statistic makes these products cheap; C obtains its
+    /// initial messages from a stats-only streaming pass instead.
+    pub(crate) products: Option<[F128; 16]>,
 }
 
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
@@ -2708,6 +2710,17 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // fold output is γ_k · B_k directly. pcs combine just adds.
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
 
+    // The production all-direct experiment also retains C's materialization
+    // factors. C has no four-bank witness statistic, so only AB carries the
+    // optional H-products used for the first two messages.
+    let retain_direct_c = cfg!(target_arch = "x86_64")
+        && l == (1usize << 25)
+        && n == 2
+        && work.first().is_some_and(|claim| claim.s_hat_v_quad.is_some())
+        && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none();
+
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
         .into_iter()
         .zip(gammas_rs.iter())
@@ -2716,25 +2729,29 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
-            let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
-                (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
+            let wants_direct = w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1);
+            let direct_fold2 = match kinds[i] {
+                Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
                     let suffix = dense_suffixes[d];
                     let low_eq: [F128; 4] = build_eq(&suffix[..2])
                         .try_into()
                         .expect("two-coordinate eq has four entries");
-                    let mut products = [F128::ZERO; 16];
-                    let mut scaled_bank = vec![F128::ZERO; n_packed];
-                    for e in 0..4 {
-                        let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                        for d_low in 0..4 {
-                            for p in 0..n_packed {
-                                scaled_bank[p] = low_eq[d_low] * bank[p];
+                    let products = w.s_hat_v_quad.as_deref().map(|quad| {
+                        let mut products = [F128::ZERO; 16];
+                        let mut scaled_bank = vec![F128::ZERO; n_packed];
+                        for e in 0..4 {
+                            let bank = &quad[e * n_packed..(e + 1) * n_packed];
+                            for d_low in 0..4 {
+                                for p in 0..n_packed {
+                                    scaled_bank[p] = low_eq[d_low] * bank[p];
+                                }
+                                let transposed = tensor_algebra_transpose(&scaled_bank);
+                                products[e * 4 + d_low] =
+                                    inner_product(&transposed, &scaled_eq_r_dprime);
                             }
-                            let transposed = tensor_algebra_transpose(&scaled_bank);
-                            products[e * 4 + d_low] =
-                                inner_product(&transposed, &scaled_eq_r_dprime);
                         }
-                    }
+                        products
+                    });
                     let tail = &suffix[2..];
                     let (eq_lo, eq_hi) =
                         build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -3637,8 +3654,13 @@ mod tests {
             }
         }
         assert_eq!(
-            direct[0].1.direct_fold2.as_ref().unwrap().products,
-            product_oracle
+            direct[0]
+                .1
+                .direct_fold2
+                .as_ref()
+                .unwrap()
+                .products,
+            Some(product_oracle)
         );
     }
 
