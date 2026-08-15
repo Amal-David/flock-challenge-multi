@@ -110,8 +110,25 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     r: usize,
     twiddles: &[F128; 3],
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from(src, dst, quarter, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
     // SAFETY: forwarded caller contract.
-    unsafe { portable::butterfly_fused_2layer_row_from(src, dst, quarter, num_ntts, r, twiddles) }
+    unsafe {
+        portable::butterfly_fused_2layer_row_from(src, dst, quarter, num_ntts, r, twiddles);
+    }
 }
 
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
@@ -135,6 +152,28 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     r: usize,
     right_twiddle: F128,
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse(
+            src,
+            dst,
+            quarter,
+            num_ntts,
+            r,
+            right_twiddle,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_2layer_row_from_sparse(

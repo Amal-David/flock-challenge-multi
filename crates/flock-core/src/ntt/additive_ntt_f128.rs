@@ -492,9 +492,10 @@ impl AdditiveNttF128 {
     /// from its message. Layer zero turns `[msg, 0]` into `[msg, msg]`; each
     /// half then follows its own fused two-layer twiddle tree.
     ///
-    /// x86 always uses the portable row-from pair (regular stores). Apple may
-    /// publish with `stnp` unless `FLOCK_NO_SEED_NT` is set. Do not lift
-    /// `seed_fused_2layer_row_group_nt`.
+    /// x86 uses the AVX-512 row-from pair when `avx512f+vpclmulqdq` is
+    /// available (regular stores, 4-lane `ghash_mul_x4`; portable otherwise).
+    /// Apple may publish with `stnp` unless `FLOCK_NO_SEED_NT` is set. Do not
+    /// lift `seed_fused_2layer_row_group_nt`.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -2337,6 +2338,142 @@ mod tests {
         // At layer log_d - 1 = 3, there are 2^3 = 8 blocks. twiddle(3, b) for b ∈ 0..8.
         for b in 0..8 {
             let _t = ntt.twiddle(log_d - 1, b);
+        }
+    }
+
+    /// Portable replica of `butterfly_fused_2layer_row_from` (dense).
+    fn portable_row_from_replica(
+        src: &[F128],
+        dst: &mut [F128],
+        quarter: usize,
+        num_ntts: usize,
+        r: usize,
+        twiddles: [F128; 3],
+    ) {
+        let [t_outer, t_inner_a, t_inner_b] = twiddles;
+        for lane in 0..num_ntts {
+            let mut a = src[r * num_ntts + lane];
+            let mut b = src[(quarter + r) * num_ntts + lane];
+            let mut c = src[(2 * quarter + r) * num_ntts + lane];
+            let mut d = src[(3 * quarter + r) * num_ntts + lane];
+
+            let new_a = a + c * t_outer;
+            c += new_a;
+            a = new_a;
+            let new_b = b + d * t_outer;
+            d += new_b;
+            b = new_b;
+
+            let new_a = a + b * t_inner_a;
+            b += new_a;
+            a = new_a;
+            let new_c = c + d * t_inner_b;
+            d += new_c;
+            c = new_c;
+
+            dst[r * num_ntts + lane] = a;
+            dst[(quarter + r) * num_ntts + lane] = b;
+            dst[(2 * quarter + r) * num_ntts + lane] = c;
+            dst[(3 * quarter + r) * num_ntts + lane] = d;
+        }
+    }
+
+    /// Portable replica of `butterfly_fused_2layer_row_from_sparse`.
+    /// `a` is unchanged (layer-1 / left layer-2 twiddles are zero).
+    fn portable_row_from_sparse_replica(
+        src: &[F128],
+        dst: &mut [F128],
+        quarter: usize,
+        num_ntts: usize,
+        r: usize,
+        right_twiddle: F128,
+    ) {
+        for lane in 0..num_ntts {
+            let a = src[r * num_ntts + lane];
+            let mut b = src[(quarter + r) * num_ntts + lane];
+            let mut c = src[(2 * quarter + r) * num_ntts + lane];
+            let mut d = src[(3 * quarter + r) * num_ntts + lane];
+
+            c += a;
+            d += b;
+            b += a;
+            let new_c = c + d * right_twiddle;
+            d += new_c;
+            c = new_c;
+
+            dst[r * num_ntts + lane] = a;
+            dst[(quarter + r) * num_ntts + lane] = b;
+            dst[(2 * quarter + r) * num_ntts + lane] = c;
+            dst[(3 * quarter + r) * num_ntts + lane] = d;
+        }
+    }
+
+    /// AVX-512 (or portable fallback) row-from matches the scalar replica
+    /// on small remainders and the ranked `num_ntts=64` shape.
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
+    fn avx512_row_from_matches_portable_replica() {
+        let mut rng = Rng::new(0xA512_F20);
+        // Small / remainder lanes, then ranked-shaped 64-lane groups.
+        for (quarter, num_ntts) in [
+            (1usize, 1usize),
+            (2, 3),
+            (4, 5),
+            (4, 7),
+            (8, 8),
+            (8, 64),
+            (16, 64),
+        ] {
+            let n = 4 * quarter * num_ntts;
+            let src = rand_vec(&mut rng, n);
+            let twiddles = [rng.f128(), rng.f128(), rng.f128()];
+            let right = rng.f128();
+
+            for r in 0..quarter {
+                let mut expect = junk_vec(n);
+                portable_row_from_replica(&src, &mut expect, quarter, num_ntts, r, twiddles);
+                let mut got = junk_vec(n);
+                unsafe {
+                    kernels::butterfly_fused_2layer_row_from(
+                        src.as_ptr(),
+                        got.as_mut_ptr(),
+                        quarter,
+                        num_ntts,
+                        r,
+                        &twiddles,
+                    );
+                }
+                assert_eq!(
+                    got, expect,
+                    "dense row-from mismatch quarter={quarter} num_ntts={num_ntts} r={r}"
+                );
+
+                let mut expect_s = junk_vec(n);
+                portable_row_from_sparse_replica(&src, &mut expect_s, quarter, num_ntts, r, right);
+                let mut got_s = junk_vec(n);
+                unsafe {
+                    kernels::butterfly_fused_2layer_row_from_sparse(
+                        src.as_ptr(),
+                        got_s.as_mut_ptr(),
+                        quarter,
+                        num_ntts,
+                        r,
+                        right,
+                    );
+                }
+                assert_eq!(
+                    got_s, expect_s,
+                    "sparse row-from mismatch quarter={quarter} num_ntts={num_ntts} r={r}"
+                );
+                // Sparse contract: destination row `a` equals source row `a`.
+                for lane in 0..num_ntts {
+                    assert_eq!(
+                        got_s[r * num_ntts + lane],
+                        src[r * num_ntts + lane],
+                        "sparse must leave a unchanged"
+                    );
+                }
+            }
         }
     }
 }
