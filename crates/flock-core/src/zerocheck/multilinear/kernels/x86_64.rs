@@ -1,13 +1,60 @@
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
+/// Fold one packed row (8 bytes) via the univariate-skip table in x86 SIMD.
+///
+/// The table lookups are data-dependent, so this is one aligned 128-bit load +
+/// XOR per byte (`n_chunks = 8` for the `k_skip = 6` protocol size). Constant
+/// skip-fibers are common in hash R1CS layouts (especially the B=1 identity
+/// rows): an all-zero row folds to `F128::ZERO` (every chunk table indexes 0 =
+/// 0) and an all-ones row folds to `F128::ONE` (Lagrange partition of unity
+/// over the skip domain). Both are known without any of the eight table loads.
+///
+/// # Safety
+/// `table_data` must point to an 8 × 256 `F128` table and `bytes_ptr` must
+/// expose 8 readable bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+pub(crate) unsafe fn fold_one_row_x86_unchecked_8(
+    table_data: *const F128,
+    bytes_ptr: *const u8,
+) -> F128 {
+    use core::arch::x86_64::*;
+
+    // SAFETY: the caller guarantees the row exposes 8 readable bytes, so the
+    // packed u64 read is in bounds.
+    unsafe {
+        let packed = (bytes_ptr as *const u64).read_unaligned();
+        if packed == 0 {
+            return F128::ZERO;
+        }
+        if packed == u64::MAX {
+            return F128::ONE;
+        }
+
+        const STRIDE: usize = 256;
+        let mut acc = _mm_setzero_si128();
+        for chunk in 0..8 {
+            let entry = table_data.add(chunk * STRIDE + *bytes_ptr.add(chunk) as usize);
+            acc = _mm_xor_si128(acc, _mm_load_si128(entry.cast::<__m128i>()));
+        }
+        // F128 is exactly two u64 words and accepts every bit pattern.
+        core::mem::transmute::<__m128i, F128>(acc)
+    }
+}
+
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.
 ///
-/// The table lookups are data-dependent, so they remain four independent
-/// aligned 128-bit loads per chunk. Keeping four XOR chains in flight exposes
-/// their load-level parallelism; the caller then batches four returned pairs
-/// into the AVX-512 GHASH message kernel.
+/// Each word gets its own constant-fiber early exit via
+/// [`fold_one_row_x86_unchecked_8`]; mixed words keep the same 8 dependent
+/// table loads + XORs as the unconditional kernel. The four folds are
+/// independent, so the out-of-order core still overlaps their load chains
+/// exactly as the original interleaved loop did.
 ///
 /// # Safety
 /// `table_data` must point to an 8 × 256 `F128` table and every row pointer
@@ -25,22 +72,14 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     b0_bytes: *const u8,
     b1_bytes: *const u8,
 ) -> [F128; 4] {
-    use core::arch::x86_64::*;
-
-    // SAFETY: the caller guarantees all table and row bounds. Every table
-    // entry is 16-byte aligned because F128 has align(16).
+    // SAFETY: forwarded to the per-word fold; caller guarantees all bounds.
     unsafe {
-        let rows = [a0_bytes, a1_bytes, b0_bytes, b1_bytes];
-        let mut acc = [_mm_setzero_si128(); 4];
-        for chunk in 0..8 {
-            let table_chunk = table_data.add(chunk * 256);
-            for lane in 0..4 {
-                let entry = table_chunk.add(*rows[lane].add(chunk) as usize);
-                acc[lane] = _mm_xor_si128(acc[lane], _mm_load_si128(entry.cast::<__m128i>()));
-            }
-        }
-        // F128 is exactly two u64 words and accepts every bit pattern.
-        acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+        [
+            fold_one_row_x86_unchecked_8(table_data, a0_bytes),
+            fold_one_row_x86_unchecked_8(table_data, a1_bytes),
+            fold_one_row_x86_unchecked_8(table_data, b0_bytes),
+            fold_one_row_x86_unchecked_8(table_data, b1_bytes),
+        ]
     }
 }
 

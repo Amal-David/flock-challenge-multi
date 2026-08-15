@@ -1618,6 +1618,77 @@ mod tests {
         }
     }
 
+    /// The x86 round-2 pair fold with per-word constant-fiber early exits stays
+    /// bit-identical to the unconditional kernel path (`table.fold_one_row`),
+    /// across shapes that interleave all-zero, all-ones, and mixed words.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold_round2_pair_x86_skip_matches_scalar() {
+        let mut rng = Rng::new(7171);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+
+        // Constant fibers: zero is 8×0x00, one is 8×0xff.
+        let zero = [0x00u8; 8];
+        let one = [0xffu8; 8];
+
+        for _ in 0..256 {
+            // Four fresh mixed rows.
+            let mut mixed = [[0u8; 8]; 4];
+            for row in &mut mixed {
+                for byte in row.iter_mut() {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+            }
+            // 2-bit selector per word: 0 → zero fiber, 1 → one fiber,
+            // 2/3 → mixed row. Over 256 draws every lane position sees all
+            // three kinds, including interleaved zero/one/mixed words.
+            let selector = rng.next_u64();
+            let pick = |s: usize| match (selector >> (2 * s)) & 3 {
+                0 => zero,
+                1 => one,
+                _ => mixed[s],
+            };
+            let rows = [pick(0), pick(1), pick(2), pick(3)];
+
+            let expected = rows.map(|row| table.fold_one_row(&row));
+            // SAFETY: each row has 8 bytes and the table has 8 × 256 entries.
+            let actual = unsafe {
+                fold_round2_pair_x86_unchecked_8(
+                    table.data.as_ptr(),
+                    rows[0].as_ptr(),
+                    rows[1].as_ptr(),
+                    rows[2].as_ptr(),
+                    rows[3].as_ptr(),
+                )
+            };
+            assert_eq!(actual, expected, "skip-path mismatch rows={rows:02x?}");
+        }
+
+        // Pure-constant corners.
+        for rows in [
+            [[0u8; 8]; 4],
+            [[0xffu8; 8]; 4],
+            [[0u8; 8], [0xffu8; 8], [0u8; 8], [0xffu8; 8]],
+        ] {
+            let expected = rows.map(|row| table.fold_one_row(&row));
+            // SAFETY: each row has 8 bytes and the table has 8 × 256 entries.
+            let actual = unsafe {
+                fold_round2_pair_x86_unchecked_8(
+                    table.data.as_ptr(),
+                    rows[0].as_ptr(),
+                    rows[1].as_ptr(),
+                    rows[2].as_ptr(),
+                    rows[3].as_ptr(),
+                )
+            };
+            assert_eq!(actual, expected, "constant corner mismatch");
+        }
+    }
+
     /// `fold_in_place_pair` correctness: post-fold a[x] = a[2x] + X·(a[2x+1]+a[2x]).
     #[test]
     fn fold_in_place_pair_matches_formula() {
