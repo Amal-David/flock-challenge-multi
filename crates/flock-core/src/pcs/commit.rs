@@ -291,7 +291,12 @@ fn finalize_commit(
     let kind = params.merkle_hash;
     let leaf_size = params.leaf_size_bytes();
     let num_ntts = params.num_ntts();
-    let mut merkle_tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
+    // Pooled like every other prove-cycle buffer: `ProverData::drop` returns
+    // the tree to TREE_POOL, so on all proves after the first the 64 MiB
+    // (ranked shape) allocation is already resident — no mmap/fault-in here
+    // and no munmap/TLB-shootdown at drop. Same write-before-read contract
+    // as the uninit alloc this replaces.
+    let mut merkle_tree: Vec<Hash> = take_tree(2 * n_leaves - 1);
     let tree_addr = merkle_tree.as_mut_ptr() as usize;
 
     let t_ntt = std::time::Instant::now();
