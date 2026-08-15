@@ -1017,17 +1017,26 @@ struct PackedRowStream<'a> {
 
 impl<'a> PackedRowStream<'a> {
     #[inline(always)]
-    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64], start_bit: usize) -> Self {
-        debug_assert_eq!(start_bit & 63, 0);
+    fn resume(
+        z: &'a mut [u64],
+        a: &'a mut [u64],
+        b: &'a mut [u64],
+        word_idx: usize,
+        used: usize,
+        z_word: u64,
+        a_word: u64,
+        b_word: u64,
+    ) -> Self {
+        debug_assert!(used < 64);
         Self {
             z,
             a,
             b,
-            word_idx: start_bit >> 6,
-            used: 0,
-            z_word: 0,
-            a_word: 0,
-            b_word: 0,
+            word_idx,
+            used,
+            z_word,
+            a_word,
+            b_word,
         }
     }
 
@@ -1138,19 +1147,30 @@ fn build_block_witness_ab_packed_into(
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
 
-    // CV occupies an aligned region before the contiguous stream. OUT_LO is
-    // filled after the state evolution below.
+    // CV occupies the first four aligned words. OUT_LO reserves words 4..8
+    // and is filled after the state evolution below.
     write_aligned_lin_words(CV_BASE, cv, z, a, b);
 
-    let mut rows = PackedRowStream::new(z, a, b, Z_CONST_POS);
-    rows.push::<1>(1, 1, 1);
-    for &word in m {
-        rows.push_lin(word);
+    // Initialize the fixed 641-bit constant/input interval directly. It ends
+    // at word 18 with one pending bit, so the generated G sequence starts from
+    // a compile-time-known packing phase and avoids 21 streaming-writer calls.
+    let values = [
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+        m[14], m[15], counter_lo, counter_hi, block_len, flags,
+    ];
+    for i in 0..10 {
+        let low = if i == 0 {
+            1
+        } else {
+            (values[2 * i - 1] >> 31) as u64
+        };
+        let value = low | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
+        z[8 + i] = value;
+        a[8 + i] = value;
+        b[8 + i] = u64::MAX;
     }
-    rows.push_lin(counter_lo);
-    rows.push_lin(counter_hi);
-    rows.push_lin(block_len);
-    rows.push_lin(flags);
+    let pending = (flags >> 31) as u64;
+    let mut rows = PackedRowStream::resume(z, a, b, 18, 1, pending, pending, 1);
     debug_assert_eq!(rows.position(), GS_BASE);
 
     // BLAKE3 state evolution.
@@ -1172,19 +1192,18 @@ fn build_block_witness_ab_packed_into(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
-    for r in 0..N_ROUNDS {
-        for g_in_round in 0..N_G_PER_ROUND {
-            let [la, lb, lc, ld] = G_LANES[g_in_round];
-            let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
-
-            let a_val = state[la];
-            let b_val = state[lb];
-            let c_val = state[lc];
-            let d_val = state[ld];
-
+    // The circuit shape and BLAKE3 message schedule are fixed. Expanding the
+    // 56 G functions gives LLVM literal state/message indices and exposes the
+    // dependency graph to register allocation instead of indexing two tables
+    // in the hottest per-compression loop.
+    macro_rules! g {
+        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
+            let mx = m[$mx];
+            let my = m[$my];
+            let a_val = state[$la];
+            let b_val = state[$lb];
+            let c_val = state[$lc];
+            let d_val = state[$ld];
             let tmp_0 = rows.push_add(a_val, b_val);
             let a_1 = rows.push_add(tmp_0, mx);
             let d_1 = (d_val ^ a_1).rotate_right(16);
@@ -1199,12 +1218,34 @@ fn build_block_witness_ab_packed_into(
             rows.push_lin(b_new);
             rows.push_lin(d_new);
 
-            state[la] = a_2;
-            state[lb] = b_new;
-            state[lc] = c_2;
-            state[ld] = d_new;
-        }
+            state[$la] = a_2;
+            state[$lb] = b_new;
+            state[$lc] = c_2;
+            state[$ld] = d_new;
+        }};
     }
+    macro_rules! round {
+        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
+         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+            g!(0, 4, 8, 12, $m0, $m1);
+            g!(1, 5, 9, 13, $m2, $m3);
+            g!(2, 6, 10, 14, $m4, $m5);
+            g!(3, 7, 11, 15, $m6, $m7);
+            g!(0, 5, 10, 15, $m8, $m9);
+            g!(1, 6, 11, 12, $m10, $m11);
+            g!(2, 7, 8, 13, $m12, $m13);
+            g!(3, 4, 9, 14, $m14, $m15);
+        }};
+    }
+    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
 
     debug_assert_eq!(rows.position(), OUT_HI_BASE);
 
