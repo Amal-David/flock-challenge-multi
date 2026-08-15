@@ -2338,11 +2338,14 @@ pub(crate) struct LigeroWitness {
     pub num_interleaved: usize,
 }
 
-// Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
-// pool when a level's witness is replaced/dropped.
+// Recycle the codeword matrix through the F128 scratch pool and the Merkle
+// tree through TREE_POOL when a level's witness is replaced/dropped. Ranked
+// L1 is 16 MiB (2^18 leaves x 32 B x ~2); without give_tree the extra-warmup
+// prove munmaps it and the timed path mmap/faults a fresh one.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        crate::pcs::commit::give_tree(std::mem::take(&mut self.tree));
     }
 }
 
@@ -2429,7 +2432,15 @@ pub(crate) fn ligero_commit(
         None
     };
     let on_gpu = gpu_tree.is_some();
-    let tree = gpu_tree.unwrap_or_else(|| merkle::merkle_tree(data_bytes, block_len, kind));
+    let tree = gpu_tree.unwrap_or_else(|| {
+        // Same write-before-read contract as merkle_tree(); take from TREE_POOL
+        // so the ranked L1 16 MiB tree is already resident after untimed warmup
+        // (LigeroWitness::drop parks it). Public merkle_tree() stays unpooled
+        // so tests/oracles cannot steal the L0 64 MiB slot.
+        let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
+        merkle::fill_merkle_tree(&mut tree, data_bytes, block_len, kind);
+        tree
+    });
     if ot {
         eprintln!(
             "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \

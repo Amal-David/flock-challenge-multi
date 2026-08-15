@@ -582,12 +582,31 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
         "data length must be a multiple of num_leaves"
     );
 
-    let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
     // Uninit alloc — every node is written exactly once before being read:
     // leaves at step 1, then each internal level reads the level below (which
-    // was just written) and writes itself.
+    // was just written) and writes itself. Production ligero_commit takes
+    // from TREE_POOL instead and calls [`fill_merkle_tree`] so the 16 MiB
+    // L1 tree is not mmap'd on the timed path.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+    fill_merkle_tree(&mut tree, data, num_leaves, kind);
+    tree
+}
+
+/// Write the flat `2n-1` tree into `tree`. Same leaves-then-parents sequence
+/// as [`merkle_tree`]; every node is written before it is read.
+pub(crate) fn fill_merkle_tree(tree: &mut [Hash], data: &[u8], num_leaves: usize, kind: HashKind) {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    let leaf_size = data.len() / num_leaves;
 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
@@ -607,8 +626,6 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
         read_start += read_len;
         read_len = next_len;
     }
-
-    tree
 }
 
 /// Incremental builder for the same `2n−1` flat tree as [`merkle_tree`].
@@ -1169,6 +1186,28 @@ mod tests {
                     "{kind} n={n_leaves}: root at 2n-2"
                 );
             }
+        }
+    }
+
+    /// L1 recycle oracle: `take_tree` + [`fill_merkle_tree`] must be
+    /// node-for-node identical to a fresh [`merkle_tree`] at the ranked L1
+    /// leaf count (`2^18`). Uses a 32 B leaf so the test stays small while
+    /// still parking a floor-clearing `2^19-1`-node buffer.
+    #[test]
+    fn pooled_l1_tree_matches_merkle_tree_node_for_node() {
+        let n_leaves = 1 << 18;
+        let leaf_size = 32;
+        let data = random_data(n_leaves, leaf_size, 0x0001_1870);
+        for kind in KINDS {
+            let oracle = merkle_tree(&data, n_leaves, kind);
+            let mut pooled = crate::pcs::commit::take_tree(2 * n_leaves - 1);
+            assert_eq!(pooled.len(), 2 * n_leaves - 1, "{kind}: take_tree length");
+            fill_merkle_tree(&mut pooled, &data, n_leaves, kind);
+            assert_eq!(
+                pooled, oracle,
+                "{kind}: pooled L1 tree != merkle_tree() node-for-node"
+            );
+            crate::pcs::commit::give_tree(pooled);
         }
     }
 

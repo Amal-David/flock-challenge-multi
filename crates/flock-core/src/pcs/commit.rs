@@ -411,9 +411,21 @@ pub fn set_gpu_merkle_split(chunks: usize) {
 /// re-allocating it would churn a fresh wire+wrap every prove (season-1 rule).
 static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
 
-fn take_tree(total_nodes: usize) -> Vec<Hash> {
+pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
     if let Ok(mut pool) = TREE_POOL.lock() {
-        if let Some(idx) = pool.iter().position(|v| v.capacity() >= total_nodes) {
+        // Smallest-fit: an L1 (16 MiB) take must not steal the parked L0
+        // (64 MiB) tree. First-fit would force a fresh mmap of the 64 MiB
+        // buffer on the next commit — the exact cost this pool exists to
+        // delete.
+        let mut best: Option<usize> = None;
+        for (i, v) in pool.iter().enumerate() {
+            if v.capacity() >= total_nodes
+                && best.is_none_or(|b| v.capacity() < pool[b].capacity())
+            {
+                best = Some(i);
+            }
+        }
+        if let Some(idx) = best {
             let mut v = pool.swap_remove(idx);
             // SAFETY: capacity checked; Hash is plain bytes, every node is
             // written before it is read (same contract as merkle_tree()).
@@ -424,7 +436,7 @@ fn take_tree(total_nodes: usize) -> Vec<Hash> {
     crate::alloc_uninit_vec(total_nodes)
 }
 
-fn give_tree(mut tree: Vec<Hash>) {
+pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
     if tree.capacity() < (1 << 18) {
         return;
@@ -1285,5 +1297,47 @@ mod tests {
             crate::gpu::merkle::available(),
             "GPU latched off during the production-scale hybrid commit"
         );
+    }
+
+    /// TREE_POOL smallest-fit: a small take must reuse the small parked
+    /// buffer, not steal the large one (L1 must not evict L0).
+    #[test]
+    fn tree_pool_smallest_fit_reuses_matching_buffer() {
+        // Both sizes clear give_tree's 1<<18-node (8 MiB) floor.
+        let n_small = 1 << 18;
+        let n_large = 1 << 19;
+        {
+            let mut pool = TREE_POOL.lock().unwrap();
+            pool.clear();
+        }
+        let small = take_tree(n_small);
+        let ptr_small = small.as_ptr();
+        give_tree(small);
+        let large = take_tree(n_large);
+        let ptr_large = large.as_ptr();
+        give_tree(large);
+        let again_small = take_tree(n_small);
+        assert_eq!(
+            again_small.as_ptr(),
+            ptr_small,
+            "small take must reuse the small parked tree"
+        );
+        assert_ne!(
+            again_small.as_ptr(),
+            ptr_large,
+            "small take must not steal the large parked tree"
+        );
+        give_tree(again_small);
+        let again_large = take_tree(n_large);
+        assert_eq!(
+            again_large.as_ptr(),
+            ptr_large,
+            "large take must reuse the large parked tree"
+        );
+        give_tree(again_large);
+        {
+            let mut pool = TREE_POOL.lock().unwrap();
+            pool.clear();
+        }
     }
 }
