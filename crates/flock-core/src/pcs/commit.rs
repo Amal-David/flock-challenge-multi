@@ -282,17 +282,31 @@ fn finalize_commit(
         }
     }
 
-    // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
-    // each NTT deep-pass sub-group retires (regular stores, same worker).
-    // Parents fold after the encode join via [`build_upper_levels`] — the
-    // same `hash_pairs_level` sequence `merkle_tree()` uses. No
-    // `wide_hash_pool` (same-width hop / nested-install footgun). No Metal.
+    // ---- Merkle leftover 2: same-worker leaf hash as each NTT deep-pass
+    // sub-group retires, then a coordinator folds parents on a contiguous
+    // written prefix (StreamMerkle). `on_range_done` is `par_chunks_mut`
+    // and may complete out of order — absorb from that callback is a
+    // reject (`absorb_leaf_range` requires lo == prefix and uses parallel
+    // `hash_leaves`). Leaves stay `hash_leaves_serial`. No `wide_hash_pool`.
+    // No Metal. `build_upper_levels` after join stays the legal non-streamed
+    // parent path (GPU top / if this wire is not used).
     let n_leaves = params.n_leaves();
     let kind = params.merkle_hash;
     let leaf_size = params.leaf_size_bytes();
     let num_ntts = params.num_ntts();
-    let mut merkle_tree: Vec<Hash> = crate::alloc_uninit_vec(2 * n_leaves - 1);
-    let tree_addr = merkle_tree.as_mut_ptr() as usize;
+    let mut inbox = merkle::StreamMerkleInbox::new(n_leaves, leaf_size, kind);
+    let tree_addr = inbox.tree_as_mut_ptr() as usize;
+
+    let (tx, rx) = std::sync::mpsc::channel::<core::ops::Range<usize>>();
+    let coord = std::thread::Builder::new()
+        .name("flock-merkle-parents".into())
+        .spawn(move || {
+            for range in rx {
+                inbox.note_hashed_range(range.start, range.end);
+            }
+            inbox.into_tree()
+        })
+        .expect("spawn merkle parent coordinator");
 
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
@@ -311,7 +325,11 @@ fn finalize_commit(
             };
             // SAFETY: each deep-pass sub-group maps to a disjoint leaf-index
             // range; only this worker writes `tree[range]`, and NTT writes to
-            // those leaves have retired on this thread.
+            // those leaves have retired on this thread. The coordinator does
+            // not read a leaf slot until this range is received (mpsc
+            // happens-before). `fold_ready_parents` borrows only the hashed
+            // child prefix and the new parent slots — later leaf slots stay
+            // writable here.
             let out = unsafe {
                 core::slice::from_raw_parts_mut(
                     (tree_addr as *mut Hash).add(range.start),
@@ -319,6 +337,10 @@ fn finalize_commit(
                 )
             };
             merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            // Enqueue only. Do not absorb / fold parents on this NTT worker.
+            // Range may be a 4-leaf last-layer group or a whole sub-group
+            // (fused last layer / scalar encode). Inbox accepts either.
+            tx.send(range).expect("merkle parent coordinator alive");
         },
     );
     if timing {
@@ -328,7 +350,8 @@ fn finalize_commit(
         );
     }
     let t_merkle = std::time::Instant::now();
-    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves, kind);
+    drop(tx);
+    let merkle_tree = coord.join().expect("merkle parent coordinator");
     let root = merkle_tree[2 * n_leaves - 2];
     if timing {
         eprintln!(
@@ -1104,55 +1127,57 @@ mod tests {
         // m=20 / log_batch=6 → k_code=8, 256 leaves (scalar deep pass).
         // m=24 / log_batch=6 → k_code=12, 4096 leaves (parallel deep pass).
         for m in [20usize, 24] {
-            let params = PcsParams {
-                m,
-                log_inv_rate: 1,
-                log_batch_size: 6,
-                profile: Default::default(),
-                merkle_hash: HashKind::Blake3,
-            };
-            let z = rng.bits(1 << m);
-            let z_packed = super::super::pack::pack_witness(&z, m);
-            let (commitment, pd) = commit(&z_packed, &params);
+            for kind in [HashKind::Blake3, HashKind::Sha256] {
+                let params = PcsParams {
+                    m,
+                    log_inv_rate: 1,
+                    log_batch_size: 6,
+                    profile: Default::default(),
+                    merkle_hash: kind,
+                };
+                let z = rng.bits(1 << m);
+                let z_packed = super::super::pack::pack_witness(&z, m);
+                let (commitment, pd) = commit(&z_packed, &params);
 
-            // Independent encode oracle (same construction as
-            // `commit_matches_full_ntt_oracle`): zero-pad + full interleaved
-            // NTT. The streamed path uses `rs_encode_interleaved_on_range_done`;
-            // a wrong encode must not pass just because the tree hashes
-            // `pd.codeword`.
-            let mut encode_oracle = vec![F128::ZERO; params.codeword_len_f128()];
-            encode_oracle[..z_packed.len()].copy_from_slice(&z_packed);
-            let ntt = AdditiveNttF128::standard(params.k_code());
-            ntt.forward_transform_interleaved(&mut encode_oracle, params.num_ntts());
-            assert_eq!(
-                pd.codeword,
-                encode_oracle,
-                "streamed codeword != full-NTT encode at m={m} r={} ntts={}",
-                params.log_inv_rate,
-                params.num_ntts()
-            );
+                // Independent encode oracle (same construction as
+                // `commit_matches_full_ntt_oracle`): zero-pad + full interleaved
+                // NTT. The streamed path uses `rs_encode_interleaved_on_range_done`;
+                // a wrong encode must not pass just because the tree hashes
+                // `pd.codeword`.
+                let mut encode_oracle = vec![F128::ZERO; params.codeword_len_f128()];
+                encode_oracle[..z_packed.len()].copy_from_slice(&z_packed);
+                let ntt = AdditiveNttF128::standard(params.k_code());
+                ntt.forward_transform_interleaved(&mut encode_oracle, params.num_ntts());
+                assert_eq!(
+                    pd.codeword,
+                    encode_oracle,
+                    "streamed codeword != full-NTT encode at m={m} {kind} r={} ntts={}",
+                    params.log_inv_rate,
+                    params.num_ntts()
+                );
 
-            let codeword_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    pd.codeword.as_ptr() as *const u8,
-                    pd.codeword.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let oracle = merkle::merkle_tree(codeword_bytes, params.n_leaves(), HashKind::Blake3);
-            assert_eq!(
-                pd.merkle_tree.len(),
-                2 * params.n_leaves() - 1,
-                "flat 2n-1 layout at m={m}"
-            );
-            assert_eq!(
-                pd.merkle_tree, oracle,
-                "streamed CPU tree != merkle_tree() node-for-node at m={m}"
-            );
-            assert_eq!(
-                commitment.root,
-                oracle[2 * params.n_leaves() - 2],
-                "root at 2n-2 at m={m}"
-            );
+                let codeword_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        pd.codeword.as_ptr() as *const u8,
+                        pd.codeword.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                let oracle = merkle::merkle_tree(codeword_bytes, params.n_leaves(), kind);
+                assert_eq!(
+                    pd.merkle_tree.len(),
+                    2 * params.n_leaves() - 1,
+                    "flat 2n-1 layout at m={m} {kind}"
+                );
+                assert_eq!(
+                    pd.merkle_tree, oracle,
+                    "streamed CPU tree != merkle_tree() node-for-node at m={m} {kind}"
+                );
+                assert_eq!(
+                    commitment.root,
+                    oracle[2 * params.n_leaves() - 2],
+                    "root at 2n-2 at m={m} {kind}"
+                );
+            }
         }
     }
 

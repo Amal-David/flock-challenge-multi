@@ -877,7 +877,43 @@ impl AdditiveNttF128 {
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
 
-        let deep_sub = |sub_idx: usize, sub_data: &mut [F128]| {
+        // Leftover 1 (retargeted): after the *scalar last deep layer* only.
+        // Ranked: layer 19. Fused-4 (9–12 / 13–16) and fused-2 (17–18) are
+        // intermediate — hashing those is hash-before-final-write (REJECT).
+        // Last-layer butterfly writes pairs; hash4 needs two pair-writes.
+        // Groups are leaf_index % 4 == 0 (sub-group size is a multiple of 4).
+        // Same `on_range_done` / `hash_leaves_serial` CVs as the post-sub
+        // walk. If the last layer is fused (no scalar tail), this is a
+        // no-op and the after-sub-group callback still hashes.
+        let last_layer_pair_and_maybe_hash =
+            |sub_idx: usize, sub_data: &mut [F128], layer: usize| -> bool {
+                debug_assert_eq!(layer + 1, log_d);
+                let layer_in_sub = layer - n_top;
+                let num_blocks_in_sub = 1usize << layer_in_sub;
+                let block_size = 1usize << (log_d - layer);
+                debug_assert_eq!(block_size, 2);
+                let block_bytes = 2 * num_ntts;
+                for block_in_sub in 0..num_blocks_in_sub {
+                    let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                    let twiddle = self.twiddle(layer, global_block);
+                    let block_start = block_in_sub * block_bytes;
+                    let block = &mut sub_data[block_start..block_start + block_bytes];
+                    butterfly_interleaved_block(block, twiddle, 1, num_ntts);
+                    if let Some(cb) = on_sub_done {
+                        if block_in_sub % 2 == 1 {
+                            let pos_in_sub = (block_in_sub - 1) * 2;
+                            debug_assert_eq!(pos_in_sub % 4, 0);
+                            let lo = sub_idx * sub_size_positions + pos_in_sub;
+                            let slice = &sub_data
+                                [pos_in_sub * num_ntts..(pos_in_sub + 4) * num_ntts];
+                            cb(lo..lo + 4, slice);
+                        }
+                    }
+                }
+                on_sub_done.is_some()
+            };
+
+        let deep_sub = |sub_idx: usize, sub_data: &mut [F128]| -> bool {
             // The cache-blocked tail normally sweeps each subgroup once per
             // remaining layer. On AVX-512, reuse the fused-four kernel from
             // the top layers so a row group remains in registers across four
@@ -888,6 +924,7 @@ impl AdditiveNttF128 {
             // Keep the existing schedule verbatim on other targets: the
             // portable fused-four kernel is scalar and loses to the ordinary
             // row-pair path outside correctness tests.
+            let mut hashed_last_layer = false;
             if deep_fused4_ok {
                 let mut layer = n_top.max(start_layer);
                 while layer < log_d {
@@ -942,21 +979,24 @@ impl AdditiveNttF128 {
                         }
                         layer += 2;
                     } else {
-                        let block_size_half = block_size >> 1;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let twiddle = self.twiddle(layer, global_block);
-                            let block_start = block_in_sub * block_bytes;
-                            let block = &mut sub_data[block_start..block_start + block_bytes];
-                            butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
-                        }
+                        // Scalar last deep layer (ranked: 19). Not fused-4/2.
+                        debug_assert_eq!(block_size, 2);
+                        debug_assert_eq!(num_blocks_in_sub, 1usize << (layer - n_top));
+                        let _ = block_bytes;
+                        hashed_last_layer =
+                            last_layer_pair_and_maybe_hash(sub_idx, sub_data, layer);
                         layer += 1;
                     }
                 }
-                return;
+                return hashed_last_layer;
             }
 
             for layer in n_top.max(start_layer)..log_d {
+                if layer + 1 == log_d {
+                    hashed_last_layer =
+                        last_layer_pair_and_maybe_hash(sub_idx, sub_data, layer);
+                    continue;
+                }
                 let layer_in_sub = layer - n_top;
                 let num_blocks_in_sub = 1usize << layer_in_sub;
                 let block_size = 1usize << (log_d - layer);
@@ -971,6 +1011,7 @@ impl AdditiveNttF128 {
                     butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                 }
             }
+            hashed_last_layer
         };
 
         match stream {
@@ -982,10 +1023,16 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        deep_sub(sub_idx, sub_data);
+                        let hashed_last_layer = deep_sub(sub_idx, sub_data);
                         if let Some(cb) = on_sub_done {
-                            let lo = sub_idx * sub_size_positions;
-                            cb(lo..lo + sub_size_positions, sub_data);
+                            // Last-layer 4-leaf emit already covered this
+                            // sub-group (do not re-enqueue — inbox rejects
+                            // overlap). Fused last layer: hash the whole
+                            // retired sub-group here.
+                            if !hashed_last_layer {
+                                let lo = sub_idx * sub_size_positions;
+                                cb(lo..lo + sub_size_positions, sub_data);
+                            }
                         }
                     });
             }
@@ -1007,7 +1054,7 @@ impl AdditiveNttF128 {
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
-                            .for_each(|(i, sub_data)| deep_sub(sub_cursor + i, sub_data));
+                            .for_each(|(i, sub_data)| { let _ = deep_sub(sub_cursor + i, sub_data); });
                         on_chunk(
                             c,
                             sub_cursor * sub_size_positions..end_sub * sub_size_positions,
@@ -1103,7 +1150,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data);
+                    let _ = deep_sub(i, sub_data);
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);

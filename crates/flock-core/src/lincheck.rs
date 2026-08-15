@@ -1483,11 +1483,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let prepared = LAST_RHO.with(|slot| {
         let mut slot = slot.borrow_mut();
         match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
-            LastRhoSlot::Prepared(p)
-                if mlv.len() == p.inner_rest_len + (p.m - p.k_log) =>
-            {
-                Some(p)
-            }
+            LastRhoSlot::Prepared(p) if mlv.len() == p.inner_rest_len + (p.m - p.k_log) => Some(p),
             LastRhoSlot::Prepared(p) => {
                 *slot = LastRhoSlot::Prepared(p);
                 None
@@ -1537,6 +1533,125 @@ pub fn wait_last_rho_z_fold() -> Option<Vec<F128>> {
         }
     });
     handle.map(|h| h.join().expect("last-ρ z-fold thread"))
+}
+
+// ---------------------------------------------------------------------------
+// eq_inner after ρ_7 (main-thread only)
+// ---------------------------------------------------------------------------
+//
+// `build_quirky_eq_table` needs only `z_skip` + `x_inner_rest = mlv[0..8]`
+// (RowMajor). Those exist after the 8th ML sample — 18 rounds before last ρ.
+// Build on the main thread in that serial gap. Do not par_* (zc tail owns
+// the pool). Do not start the leftover z-fold (`x_outer` incomplete). Do
+// not fold_alpha (α is after OBS â/b̂). Lincheck takes the table only if
+// `(z_skip, x_inner_rest)` match; BatchMajor / short mlv miss and rebuild.
+
+struct EqInnerPrepared {
+    z_skip: F128,
+    x_inner_rest: Vec<F128>,
+    table: Vec<F128>,
+}
+
+thread_local! {
+    static EQ_INNER: RefCell<Option<EqInnerPrepared>> = const { RefCell::new(None) };
+}
+
+/// Main-thread precompute of `eq_inner` after the 8th ML ρ.
+/// Compute only — no observe, no `par_*`, no z-fold, no fold_alpha.
+pub fn store_eq_inner_after_rho7(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) {
+    let table = build_quirky_eq_table(z_skip, x_inner_rest, k_skip);
+    EQ_INNER.with(|slot| {
+        *slot.borrow_mut() = Some(EqInnerPrepared {
+            z_skip,
+            x_inner_rest: x_inner_rest.to_vec(),
+            table,
+        });
+    });
+}
+
+fn take_eq_inner_if_matches(
+    z_skip: F128,
+    x_inner_rest: &[F128],
+    k_skip: usize,
+) -> Option<Vec<F128>> {
+    EQ_INNER.with(|slot| match slot.borrow_mut().take() {
+        Some(p)
+            if p.z_skip == z_skip
+                && p.x_inner_rest.as_slice() == x_inner_rest
+                && p.table.len() == (1usize << (k_skip + x_inner_rest.len())) =>
+        {
+            Some(p.table)
+        }
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// s_hat_v_ab after 7 of 8 lincheck r's (wait-not-join)
+// ---------------------------------------------------------------------------
+//
+// Top-bit bind + reverse ⇒ `r_inner_rest[1..] = reverse(r_rounds[0..=6])`.
+// `r_rounds[7]` is ring-switch prefix0. Kick after the 7th sample uses the
+// captured pre-sumcheck `z_vec`. Compute only — no observe. 8th bind +
+// OBS `z_partial` + SAMP `r_inner_skip` stay on main, order unchanged.
+// Must finish before any AB observe in the open. Not during the whole SC.
+// Not C-first.
+
+enum SHatVAbSlot {
+    Empty,
+    Running(JoinHandle<Vec<F128>>),
+    Ready(Vec<F128>),
+}
+
+thread_local! {
+    static S_HAT_V_AB: RefCell<SHatVAbSlot> = const { RefCell::new(SHatVAbSlot::Empty) };
+}
+
+fn should_kick_s_hat_v_ab(m: usize, k_log: usize, inner_rest_len: usize, capture: bool) -> bool {
+    cfg!(target_arch = "x86_64")
+        && capture
+        && inner_rest_len == 8
+        && m == 32
+        && k_log >= crate::pcs::LOG_PACKING + 2
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+}
+
+fn kick_s_hat_v_ab_after_7(z_vec: &[F128], r_rounds_first7: &[F128]) {
+    let _ = take_s_hat_v_ab();
+    let z_vec = z_vec.to_vec();
+    let mut tail = r_rounds_first7.to_vec();
+    tail.reverse();
+    let handle = std::thread::Builder::new()
+        .name("flock-s-hat-v-ab".into())
+        .spawn(move || crate::pcs::ring_switch::s_hat_v_quad_from_z_vec(&z_vec, &tail))
+        .expect("spawn s_hat_v_ab");
+    S_HAT_V_AB.with(|slot| {
+        *slot.borrow_mut() = SHatVAbSlot::Running(handle);
+    });
+}
+
+fn wait_s_hat_v_ab() {
+    S_HAT_V_AB.with(|slot| {
+        let cur = std::mem::replace(&mut *slot.borrow_mut(), SHatVAbSlot::Empty);
+        match cur {
+            SHatVAbSlot::Running(h) => {
+                *slot.borrow_mut() = SHatVAbSlot::Ready(h.join().expect("s_hat_v_ab thread"));
+            }
+            other => *slot.borrow_mut() = other,
+        }
+    });
+}
+
+/// Take a kicked AB `s_hat_v` (joins first). `None` if nothing was kicked.
+pub fn take_s_hat_v_ab() -> Option<Vec<F128>> {
+    wait_s_hat_v_ab();
+    S_HAT_V_AB.with(
+        |slot| match std::mem::replace(&mut *slot.borrow_mut(), SHatVAbSlot::Empty) {
+            SHatVAbSlot::Ready(v) => Some(v),
+            SHatVAbSlot::Empty => None,
+            SHatVAbSlot::Running(_) => unreachable!("wait_s_hat_v_ab joins first"),
+        },
+    )
 }
 
 /// Prove the lincheck statement for the block-diagonal R1CS instance
@@ -1693,6 +1808,8 @@ fn prove_padded_inner<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
     let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    // Drop a stale leftover from a previous prove on this thread.
+    let _ = take_s_hat_v_ab();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1707,7 +1824,8 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let eq_inner = take_eq_inner_if_matches(x_ab.z_skip, &x_ab.x_inner_rest, k_skip)
+        .unwrap_or_else(|| build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip));
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1813,6 +1931,17 @@ fn prove_padded_inner<Ch: Challenger>(
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
                 e1 = ne1;
                 einf = neinf;
+                // After the 7th sample (`t == 6` of 8): `r_rounds[0..=6]`
+                // reverse to the future `r_inner_rest[1..]`. Kick AB s_hat_v
+                // on a dedicated OS thread. 8th bind stays on main (length
+                // 128 < par threshold — serial, no pool split).
+                if t + 1 == inner_rest_len - 1
+                    && should_kick_s_hat_v_ab(m, k_log, inner_rest_len, capture_z_vec)
+                {
+                    if let Some(ref z_pre) = captured_z_vec {
+                        kick_s_hat_v_ab_after_7(z_pre, &r_rounds);
+                    }
+                }
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
@@ -1856,6 +1985,10 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
+    // Join the AB s_hat_v kick (if any) before return so it is Ready for
+    // the open and cannot race an AB observe. 8th-round + z_partial +
+    // r_inner_skip order above is unchanged.
+    wait_s_hat_v_ab();
     (proof, claim, captured_z_vec)
 }
 
@@ -2410,8 +2543,7 @@ mod tests {
             (25, 7, 121), // n_log=18 factorized dispatch
         ];
         for &(m, k_log, useful_bits) in cases {
-            let mut rng =
-                Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
+            let mut rng = Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
             let n_log = m - k_log;
             let n_outer = 1usize << n_log;
             let chunks_per_block = (1usize << k_log) / 128;
@@ -2443,13 +2575,8 @@ mod tests {
                 )
             };
 
-            let _guard = prepare_last_rho_z_fold(
-                &z_block_major,
-                m,
-                k_log,
-                useful_bits,
-                inner_rest_len,
-            );
+            let _guard =
+                prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
             kick_last_rho_z_fold(&mlv);
             let got = wait_last_rho_z_fold().expect("kick at complete mlv must run");
             assert_eq!(
@@ -2485,19 +2612,67 @@ mod tests {
         let inner_rest_len = k_log - 6;
         let short_mlv = rng.f128_vec(inner_rest_len + n_log - 1);
 
-        let _guard = prepare_last_rho_z_fold(
-            &z_block_major,
-            m,
-            k_log,
-            useful_bits,
-            inner_rest_len,
-        );
+        let _guard = prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
         kick_last_rho_z_fold(&short_mlv);
         assert!(
             wait_last_rho_z_fold().is_none(),
             "incomplete mlv must not start the leftover fold"
         );
         assert_eq!(z_block_major, z_before, "no-op kick must not mutate z");
+    }
+
+    /// Main-thread eq_inner after ρ_7 matches `build_quirky_eq_table`.
+    /// A mismatched quirky point must miss (BatchMajor / wrong z).
+    #[test]
+    fn eq_inner_after_rho7_matches_quirky_table() {
+        let mut rng = Rng::new(0xE01A_0007);
+        let z_skip = rng.f128();
+        let x_inner_rest = rng.f128_vec(8);
+        let k_skip = 6usize;
+        store_eq_inner_after_rho7(z_skip, &x_inner_rest, k_skip);
+        let want = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+        let got = take_eq_inner_if_matches(z_skip, &x_inner_rest, k_skip)
+            .expect("matching store must hit");
+        assert_eq!(got, want, "stored eq_inner ≠ build_quirky_eq_table");
+        store_eq_inner_after_rho7(z_skip, &x_inner_rest, k_skip);
+        assert!(
+            take_eq_inner_if_matches(rng.f128(), &x_inner_rest, k_skip).is_none(),
+            "mismatched z_skip must miss"
+        );
+        store_eq_inner_after_rho7(z_skip, &x_inner_rest, k_skip);
+        let mut wrong = x_inner_rest.clone();
+        wrong[0] = rng.f128();
+        assert!(
+            take_eq_inner_if_matches(z_skip, &wrong, k_skip).is_none(),
+            "mismatched x_inner_rest must miss"
+        );
+    }
+
+    /// Top-bit bind + reverse: `reverse(r[0..=6]) == reverse(r[0..=7])[1..]`.
+    /// Kicked quad on the 7-round tail matches the sync quad on `r_inner_rest[1..]`.
+    #[test]
+    fn s_hat_v_ab_after_7_rounds_matches_full_reverse_tail() {
+        let mut rng = Rng::new(0x5A7A_0007);
+        let r_rounds = rng.f128_vec(8);
+        let mut first7 = r_rounds[..7].to_vec();
+        first7.reverse();
+        let mut full = r_rounds.clone();
+        full.reverse();
+        assert_eq!(
+            first7.as_slice(),
+            &full[1..],
+            "reverse(r[0..=6]) must equal reverse(r[0..=7])[1..]"
+        );
+        let tail_len = 7usize;
+        let z_len = 1usize << (crate::pcs::LOG_PACKING + tail_len);
+        let z_vec = rng.f128_vec(z_len);
+        let want = crate::pcs::ring_switch::s_hat_v_quad_from_z_vec(&z_vec, &full[1..]);
+        kick_s_hat_v_ab_after_7(&z_vec, &r_rounds[..7]);
+        let got = take_s_hat_v_ab().expect("kick after 7 rounds must run");
+        assert_eq!(
+            got, want,
+            "kicked s_hat_v_ab ≠ sync quad on r_inner_rest[1..]"
+        );
     }
 
     #[test]
@@ -2907,9 +3082,7 @@ mod tests {
             x_outer: x_ab.x_outer.clone(),
         };
         assert!(matches!(
-            verify(
-                m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch
-            ),
+            verify(m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch),
             Err(VerifyError::BadInnerRestLength { .. })
         ));
 

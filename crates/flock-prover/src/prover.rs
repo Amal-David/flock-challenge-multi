@@ -26,10 +26,10 @@
 //! ```
 
 use flock_core::challenger::Challenger;
-use flock_core::field::{F8, F128};
-use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
+use flock_core::field::{F128, F8};
+use flock_core::lincheck::{self, pack_z_lincheck_from_packed, QuirkyPoint};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
+use flock_core::proof::{bind_statement, R1csClaim, R1csProofLigerito, ZClaim};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
@@ -39,6 +39,29 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+}
+
+/// Prefer a lincheck leftover kick (after 7 of 8 r's). Fall back to today's
+/// sync build. Drain a stray kick on the non-quad path so TLS cannot leak.
+fn s_hat_v_ab_from_lincheck(
+    r1cs: &BlockR1cs,
+    z_vec_pre: &[F128],
+    r_inner_rest: &[F128],
+) -> Option<Vec<F128>> {
+    if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(lincheck::take_s_hat_v_ab().unwrap_or_else(|| {
+            pcs::ring_switch::s_hat_v_quad_from_z_vec(z_vec_pre, &r_inner_rest[1..])
+        }))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
+        let _ = lincheck::take_s_hat_v_ab();
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            z_vec_pre,
+            &r_inner_rest[1..],
+        ))
+    } else {
+        let _ = lincheck::take_s_hat_v_ab();
+        None
+    }
 }
 
 enum FastLincheckInput {
@@ -257,19 +280,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab = s_hat_v_ab_from_lincheck(r1cs, &z_vec_pre, &lc_claim.r_inner_rest);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -786,19 +797,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab = s_hat_v_ab_from_lincheck(r1cs, &z_vec_pre, &lc_claim.r_inner_rest);
     flock_core::gaptime::mark("s_hat_v_ab built (core exit)");
 
     ProveCore {
@@ -1013,19 +1012,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab = s_hat_v_ab_from_lincheck(r1cs, &z_vec_pre, &lc_claim.r_inner_rest);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
