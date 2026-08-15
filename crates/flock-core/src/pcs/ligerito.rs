@@ -2963,6 +2963,10 @@ fn fold_and_msg_lsb(
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // x86: the gate is computed below, AFTER the output buffers are carved —
+    // the AVX-512 leaf needs 64 B-aligned destinations and the gate must
+    // inspect both output bases once (chunk bases inherit the slice base
+    // alignment because CHUNK = 2048 F128 = 32 KiB is a multiple of 64 B).
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -3006,12 +3010,53 @@ fn fold_and_msg_lsb(
         }
     };
     let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
+
+    // x86 gate: the size gate and kill switch are unchanged, but the AVX-512
+    // build only takes the NT path when the two carved output BASES are both
+    // 64 B-aligned (every chunk base inherits that alignment because
+    // CHUNK = 2048 F128 = 32 KiB is a multiple of 64 B) and the length is a
+    // multiple of 8. Otherwise it falls through to the untouched frontier
+    // body (`fold_pairs` + `msg_reduce_avx512`); the SSE2 scalar leaf is
+    // never reached on an AVX-512 build. Non-AVX-512 x86 keeps the exact
+    // prior SSE2 path.
+    #[cfg(target_arch = "x86_64")]
+    let use_nt = {
+        let size_gate = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        {
+            let both_bases_64b =
+                nf_s.as_ptr().addr() & 63 == 0 && nb_s.as_ptr().addr() & 63 == 0;
+            let len_multiple_of_8 = half.is_multiple_of(8);
+            size_gate && both_bases_64b && len_multiple_of_8
+        }
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        {
+            size_gate
+        }
+    };
+
     let (u_0, u_2) = nf_s
         .par_chunks_mut(CHUNK)
         .zip(nb_s.par_chunks_mut(CHUNK))
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
+            #[cfg(target_arch = "x86_64")]
+            if use_nt {
+                // SAFETY: chunk geometry supplies two source elements per
+                // output and every chunk has even length (CHUNK is even and
+                // `base` is even). The x86 leaves publish folded values with
+                // streaming stores and compute the message terms from
+                // registers; a `_mm_sfence()` is issued once per closure
+                // before the partial sums return.
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                let (u0, u2) =
+                    unsafe { fold_and_msg_chunk_x86_avx512(f, b, base, fc, bc, r) };
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                let (u0, u2) =
+                    unsafe { fold_and_msg_chunk_x86(f, b, base, fc, bc, r) };
+                return (u0, u2);
+            }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
                 // SAFETY: aes is cfg-guaranteed (sha3 checked by `use_soa`);
@@ -3270,6 +3315,208 @@ fn materialize_direct_ab_fold2(
 /// # Safety
 /// Requires the `aes` target feature. `fc`/`bc` must have equal, even length;
 /// `f`/`b` must contain `2 * (base + fc.len())` elements.
+/// x86 fused fold + message leaf for one [`fold_and_msg_lsb`] chunk.
+///
+/// This is the SSE2 (baseline x86_64) flavor: it keeps the existing scalar
+/// fold + message math from the small-rounds path, but publishes each folded
+/// F128 with `_mm_stream_si128` (sequential 16 B streaming stores, so the
+/// write-combining buffers coalesce) and computes `(u_0, u_2)` from the
+/// folded register values — never re-reading the just-streamed output.
+///
+/// The AVX-512 flavor (see [`fold_and_msg_chunk_x86_avx512`]) takes over when
+/// `avx512f` + `vpclmulqdq` are enabled AND both destination bases are 64 B
+/// aligned. Both flavors are value-identical to the generic fold-then-reload
+/// chunk body: same `fold(e, o) = e + r·(e⊕o)` arithmetic and same reduced
+/// message products XOR-accumulated (order-independent in GF(2^128)).
+///
+/// # Safety
+/// Requires SSE2 (baseline on x86_64). `fc`/`bc` must have equal, even
+/// length; `f`/`b` must contain `2 * (base + fc.len())` elements.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn fold_and_msg_chunk_x86(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    unsafe {
+        let mut src_f = f.as_ptr().add(2 * base);
+        let mut src_b = b.as_ptr().add(2 * base);
+        let mut dst_f = fc.as_mut_ptr();
+        let mut dst_b = bc.as_mut_ptr();
+        let mut remaining = len / 2;
+        while remaining != 0 {
+            let fe0 = src_f.read();
+            let fo0 = src_f.add(1).read();
+            let fe1 = src_f.add(2).read();
+            let fo1 = src_f.add(3).read();
+            let be0 = src_b.read();
+            let bo0 = src_b.add(1).read();
+            let be1 = src_b.add(2).read();
+            let bo1 = src_b.add(3).read();
+
+            let f0 = fe0 + r * (fe0 + fo0);
+            let f1 = fe1 + r * (fe1 + fo1);
+            let b0 = be0 + r * (be0 + bo0);
+            let b1 = be1 + r * (be1 + bo1);
+
+            // Streaming 16 B stores; sequential order keeps the WC buffers
+            // coalescing. F128 is 16-byte aligned by construction.
+            _mm_stream_si128(dst_f.cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(f0));
+            _mm_stream_si128(dst_f.add(1).cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(f1));
+            _mm_stream_si128(dst_b.cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(b0));
+            _mm_stream_si128(dst_b.add(1).cast::<__m128i>(), core::mem::transmute::<F128, __m128i>(b1));
+
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+
+            src_f = src_f.add(4);
+            src_b = src_b.add(4);
+            dst_f = dst_f.add(2);
+            dst_b = dst_b.add(2);
+            remaining -= 1;
+        }
+        _mm_sfence();
+    }
+    (u0, u2)
+}
+
+/// AVX-512 fused fold + message leaf: four folded pairs per iteration with
+/// VPCLMULQDQ, published with `_mm512_stream_si512` and consumed for the
+/// message while still in ZMM registers (the exact [`msg_reduce_avx512`]
+/// even-position / pair-sum lane structure).
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq` (cfg-gated at the dispatch site) and
+/// `fc`/`bc` both 64-byte aligned. `fc`/`bc` must have equal length ≥ 8 and
+/// a multiple of 8; `f`/`b` must contain `2 * (base + fc.len())` elements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_x86_avx512(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4};
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(8));
+    debug_assert_eq!(fc.as_ptr().addr() & 63, 0);
+    debug_assert_eq!(bc.as_ptr().addr() & 63, 0);
+
+    // Fold four adjacent pairs of one input array into one ZMM and publish it.
+    #[inline(always)]
+    unsafe fn fold_store_x4(
+        src: *const F128,
+        dst: *mut F128,
+        r: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+    ) -> __m512i {
+        use core::arch::x86_64::*;
+        // SAFETY: caller supplies eight readable F128 values at src and a
+        // 64-byte-aligned destination valid for four F128.
+        unsafe {
+            let lo = _mm512_loadu_si512(src.cast::<__m512i>());
+            let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
+            let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
+            let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
+            let folded = _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)));
+            _mm512_stream_si512(dst.cast::<__m512i>(), folded);
+            folded
+        }
+    }
+
+    // SAFETY: caller guarantees the target features and the alignment/slice
+    // invariants; the selectors below reuse the exact `msg_reduce_avx512`
+    // even-position / pair-sum lane structure.
+    unsafe {
+        let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let pair_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let mut src_f = f.as_ptr().add(2 * base);
+        let mut src_b = b.as_ptr().add(2 * base);
+        let mut dst_f = fc.as_mut_ptr();
+        let mut dst_b = bc.as_mut_ptr();
+        let mut remaining = len / 8;
+        while remaining != 0 {
+            let f0 = fold_store_x4(src_f, dst_f, r_bcast, even_idx, odd_idx);
+            let f1 = fold_store_x4(src_f.add(8), dst_f.add(4), r_bcast, even_idx, odd_idx);
+            let b0 = fold_store_x4(src_b, dst_b, r_bcast, even_idx, odd_idx);
+            let b1 = fold_store_x4(src_b.add(8), dst_b.add(4), r_bcast, even_idx, odd_idx);
+
+            // u0: products at even pair-positions.
+            let f_even = _mm512_permutex2var_epi64(f0, even_idx, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, even_idx, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            // u2: pair sums.
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(pair_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(pair_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, even_idx, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(pair_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(pair_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, even_idx, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            src_f = src_f.add(16);
+            src_b = src_b.add(16);
+            dst_f = dst_f.add(8);
+            dst_b = dst_b.add(8);
+            remaining -= 1;
+        }
+        _mm_sfence();
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        // Scalar tail for any remaining pairs (len is a multiple of 8, so
+        // only the parallel body is needed in production chunks).
+        let mut k = len & !7;
+        while k + 1 < len {
+            let f0 = *fc.get_unchecked(k);
+            let f1 = *fc.get_unchecked(k + 1);
+            let b0 = *bc.get_unchecked(k);
+            let b1 = *bc.get_unchecked(k + 1);
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+        (u0, u2)
+    }
+}
+
+/// x86 dispatch for the fused NT leaf.
+///
+/// The gate in [`fold_and_msg_lsb`] now selects the leaf per-build directly:
+/// AVX-512 builds call [`fold_and_msg_chunk_x86_avx512`] (which requires
+/// 64 B-aligned destinations) only after the gate confirmed both output
+/// bases are 64 B-aligned and `len` is a multiple of 8, and otherwise fall
+/// through to the frontier body. Non-AVX-512 x86 builds call
+/// [`fold_and_msg_chunk_x86`] on the NT path. This per-chunk dispatcher and
+/// its scalar fallback are gone so an AVX-512 build can never silently run
+/// the SSE2 scalar leaf.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[target_feature(enable = "aes")]
 unsafe fn fold_and_msg_chunk_nt_neon(
@@ -3695,7 +3942,11 @@ impl FoldArena {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         assert!(cap > 0);
-        let layout = std::alloc::Layout::array::<F128>(cap).expect("FoldArena layout");
+        let layout = std::alloc::Layout::from_size_align(
+            cap * core::mem::size_of::<F128>(),
+            64,
+        )
+        .expect("FoldArena layout");
         // SAFETY: layout is non-zero-sized (cap > 0, F128 is 16 bytes).
         let raw = unsafe { std::alloc::alloc(layout) } as *mut F128;
         let Some(ptr) = std::ptr::NonNull::new(raw) else {
@@ -3818,7 +4069,11 @@ impl Drop for FoldArena {
         for h in self.threads.drain(..) {
             let _ = h.join();
         }
-        let layout = std::alloc::Layout::array::<F128>(self.cap).expect("FoldArena layout");
+        let layout = std::alloc::Layout::from_size_align(
+            self.cap * core::mem::size_of::<F128>(),
+            64,
+        )
+        .expect("FoldArena layout");
         // SAFETY: ptr/layout are exactly what `new_prefaulted` allocated.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout) };
     }
@@ -6669,6 +6924,152 @@ mod tests {
             assert_eq!(bc_soa, bc_soa_r, "folded b NT vs stp n_pairs={n_pairs}");
             assert_eq!(u0_soa, u0_soa_r, "u0 NT vs stp n_pairs={n_pairs}");
             assert_eq!(u2_soa, u2_soa_r, "u2 NT vs stp n_pairs={n_pairs}");
+        }
+    }
+
+    /// x86 SSE2 fused leaf: bit-identical to the generic fold-then-reload
+    /// chunk body. The streaming stores change cache allocation only.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fold_and_msg_x86_sse2_leaf_matches_generic() {
+        let mut state = 0xC0FF_EE12_3456_789A_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for (n_pairs, base) in [
+            (2usize, 0usize),
+            (8, 0),
+            (32, 4),
+            (64, 16),
+            (2048, 2048),
+        ] {
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            let mut fc_ref = vec![F128::ZERO; n_pairs];
+            let mut bc_ref = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
+            let mut u0_ref = F128::ZERO;
+            let mut u2_ref = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < n_pairs {
+                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
+                u0_ref += f0 * b0;
+                u2_ref += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+
+            let mut fc_nt = vec![F128::ZERO; n_pairs];
+            let mut bc_nt = vec![F128::ZERO; n_pairs];
+            // SAFETY: SSE2 is baseline on x86_64; slices sized per contract.
+            let (u0_nt, u2_nt) =
+                unsafe { fold_and_msg_chunk_x86(&f, &b, base, &mut fc_nt, &mut bc_nt, r) };
+            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
+            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
+            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
+            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+        }
+    }
+
+    /// x86 AVX-512 fused leaf: bit-identical to the generic body across
+    /// power-of-two chunks. The leaf is exercised on 64 B-aligned bases
+    /// (manual over-alignment), matching the gate's aligned-only contract.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold_and_msg_x86_avx512_leaf_matches_generic() {
+        let mut state = 0xDEAD_BEEF_0123_4567_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for n_pairs in [8usize, 64, 2048, 2048 + 2048] {
+            let base = 0usize;
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            let mut fc_ref = vec![F128::ZERO; n_pairs];
+            let mut bc_ref = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
+            let mut u0_ref = F128::ZERO;
+            let mut u2_ref = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < n_pairs {
+                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
+                u0_ref += f0 * b0;
+                u2_ref += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+
+            // 64-byte over-aligned allocation so the AVX-512 stream stores
+            // have an aligned destination. Over-allocate and offset into the
+            // next 64-byte boundary.
+            let bytes = n_pairs * core::mem::size_of::<F128>();
+            let backing_f = vec![0u8; bytes + 64];
+            let backing_b = vec![0u8; bytes + 64];
+            let align64 = |p: usize| (p + 63) & !63;
+            let f_ptr = align64(backing_f.as_ptr() as usize) as *mut F128;
+            let b_ptr = align64(backing_b.as_ptr() as usize) as *mut F128;
+            let fc_nt = unsafe { core::slice::from_raw_parts_mut(f_ptr, n_pairs) };
+            let bc_nt = unsafe { core::slice::from_raw_parts_mut(b_ptr, n_pairs) };
+            assert_eq!(fc_nt.as_ptr().addr() & 63, 0);
+            assert_eq!(bc_nt.as_ptr().addr() & 63, 0);
+            let (u0_nt, u2_nt) =
+                unsafe { fold_and_msg_chunk_x86_avx512(&f, &b, base, fc_nt, bc_nt, r) };
+            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
+            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
+            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
+            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+        }
+    }
+
+    /// Regression test for the silent-fallback fix: the prefaulted arena must
+    /// allocate 64 B-aligned so the AVX-512 NT leaf's 64 B stream stores are
+    /// valid, and a large carve (the gated path starts at half ≥ 2^21) must
+    /// inherit that alignment. Caps are ≥ 2^18 so the allocator takes its
+    /// mmap path, and ≥ 2^22 so a half = 2^21 carve fits.
+    #[test]
+    fn fold_arena_is_64b_aligned() {
+        for cap in [1usize << 22, (1usize << 22) + (1usize << 21), 3 * (1usize << 21)] {
+            let mut arena = FoldArena::new_prefaulted(cap);
+            let base = arena.ptr.as_ptr().addr();
+            assert_eq!(base & 63, 0, "arena base not 64 B-aligned cap={cap}");
+            // carve_pair never blocks; the prefault threads finish quickly.
+            let pair = (0..1_000_000)
+                .find_map(|_| {
+                    arena.carve_pair(1usize << 21).or_else(|| {
+                        std::thread::yield_now();
+                        None
+                    })
+                })
+                .expect("prefault should finish and a gated carve must fit");
+            let (a, b) = pair;
+            let a_ptr = match &a {
+                FoldBuf::Owned(v) => v.as_ptr().addr(),
+                FoldBuf::Arena { ptr, .. } => ptr.as_ptr().addr(),
+            };
+            let b_ptr = match &b {
+                FoldBuf::Owned(v) => v.as_ptr().addr(),
+                FoldBuf::Arena { ptr, .. } => ptr.as_ptr().addr(),
+            };
+            assert_eq!(a_ptr & 63, 0, "carved a not 64 B-aligned cap={cap}");
+            assert_eq!(b_ptr & 63, 0, "carved b not 64 B-aligned cap={cap}");
         }
     }
 
