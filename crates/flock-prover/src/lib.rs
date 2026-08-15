@@ -19,3 +19,13 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
+
+// dispersion-resample marker hermes-x86-r1-1786797518-12057
+// dispersion-resample marker hermes-x86-r2-1786797518-32723
+// dispersion-resample marker hermes-x86-r3-1786797518-26018
+// dispersion-resample marker hermes-x86-r4-1786797518-29141
+// dispersion-resample marker hermes-x86-r5-1786797518-24902
+
+// dispersion-resample marker hermes-x86-s2-1786798338-26580
+// dispersion-resample marker hermes-x86-s3-1786798338-9623
+// dispersion-resample marker hermes-x86-s4-1786798338-22226
