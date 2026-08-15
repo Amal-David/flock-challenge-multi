@@ -3065,8 +3065,6 @@ fn materialize_direct_ab_fold2(
                     let high = a2 + r0 * (a2 + a3);
                     low + r1 * (low + high)
                 };
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
                 if let [only] = claims {
                     // Single-claim specialization.
                     let table = &scratch[..table_len];
@@ -3083,14 +3081,12 @@ fn materialize_direct_ab_fold2(
                         f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
                     }
                 } else if let [first, second] = claims {
                     debug_assert!(b_in.is_none());
                     // Table-hot two-phase: only one 64 KiB composed table live.
                     // Phase 1: first table hot → store f + partial b.
-                    // Phase 2: second table hot → complete b + accumulate.
+                    // Phase 2: second table hot → complete b.
                     // Algebra identical to interleaved original.
                     let table = &mut scratch[..table_len];
                     super::ring_switch::compose_block_table(
@@ -3114,16 +3110,12 @@ fn materialize_direct_ab_fold2(
                     for pair in 0..(block_len / 2) {
                         let slot0 = 2 * pair;
                         let slot1 = slot0 + 1;
-                        let f0 = f_out[slot0];
-                        let f1 = f_out[slot1];
                         let b0 = b_out[slot0]
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot0], table);
                         let b1 = b_out[slot1]
                             + super::ring_switch::fold_one_slot(second.eq_lo[slot1], table);
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
                     }
                 } else {
                     for pair in 0..(block_len / 2) {
@@ -3152,11 +3144,31 @@ fn materialize_direct_ab_fold2(
                         f_out[slot1] = f1;
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
                     }
                 }
-                (u0, u2)
+                // Vectorized message-term reduction over the folded chunk.
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: target features cfg-guaranteed; f_out/b_out
+                    // have equal length (block_len, a multiple of 2).
+                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    let mut k = 0;
+                    while k + 1 < f_out.len() {
+                        let f0 = f_out[k];
+                        let f1 = f_out[k + 1];
+                        let b0 = b_out[k];
+                        let b1 = b_out[k + 1];
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                        k += 2;
+                    }
+                    (u0, u2)
+                }
             },
         )
         .reduce(
