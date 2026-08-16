@@ -66,6 +66,73 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Fused pair-fold + sumcheck message accumulation.
+///
+/// Folds `f_src` and `b_src` at `r` (halving), stores the results to
+/// `f_dst`/`b_dst`, and returns the sumcheck message `(u_0, u_2)`
+/// computed from the register-resident folded values — avoiding the
+/// store-then-reload cycle of `fold_pairs` + separate message reduce.
+///
+/// On AVX-512 x86 this uses the fused kernel; everywhere else it falls
+/// back to `fold_pairs` + scalar message reduce (bit-identical result).
+#[inline]
+pub(crate) fn fold_pairs_and_msg(
+    f_src: &[F128],
+    f_base: usize,
+    f_dst: &mut [F128],
+    b_src: &[F128],
+    b_base: usize,
+    b_dst: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    assert!(
+        f_base <= f_src.len() / 2 && f_dst.len() <= f_src.len() / 2 - f_base,
+        "fold_pairs_and_msg f source must contain both elements for every destination pair"
+    );
+    assert!(
+        b_base <= b_src.len() / 2 && b_dst.len() <= b_src.len() / 2 - b_base,
+        "fold_pairs_and_msg b source must contain both elements for every destination pair"
+    );
+    assert_eq!(f_dst.len(), b_dst.len());
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds checks above guarantee both source elements for every output.
+    {
+        return unsafe {
+            x86_64::fold_pairs_and_msg(f_src, f_base, f_dst, b_src, b_base, b_dst, r)
+        };
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        // Fallback: two-pass fold + scalar message reduce.
+        fold_pairs(f_src, f_base, f_dst, r);
+        fold_pairs(b_src, b_base, b_dst, r);
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        let mut k = 0;
+        while k + 1 < f_dst.len() {
+            let f0 = f_dst[k];
+            let f1 = f_dst[k + 1];
+            let b0 = b_dst[k];
+            let b1 = b_dst[k + 1];
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+        (u0, u2)
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where
