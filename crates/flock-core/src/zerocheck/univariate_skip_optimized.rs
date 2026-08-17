@@ -222,6 +222,37 @@ pub(crate) fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
 
+
+const C_MASK_TABLE_STRIDE: usize = 512;
+
+fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let mut tables = crate::scratch::take_f128(eq_lo_scaled.len() * C_MASK_TABLE_STRIDE);
+    tables
+        .par_chunks_mut(C_MASK_TABLE_STRIDE)
+        .zip(eq_lo_scaled.par_iter())
+        .for_each(|(slot, eq)| {
+            let mut basis = [F128::ZERO; 16];
+            basis[0] = *eq;
+            for b in 1..16 {
+                basis[b] = mul_by_x(basis[b - 1]);
+            }
+            let (t_lo, t_hi) = slot.split_at_mut(256);
+            for (half, table) in [t_lo, t_hi].into_iter().enumerate() {
+                table[0] = F128::ZERO;
+                for b in 0..8 {
+                    let (done, rest) = table.split_at_mut(1 << b);
+                    let add = basis[half * 8 + b];
+                    for (out, seen) in rest[..1 << b].iter_mut().zip(done.iter()) {
+                        *out = *seen + add;
+                    }
+                }
+            }
+        });
+    tables
+}
+
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
@@ -789,57 +820,43 @@ fn process_one_x_hi(
 }
 
 // ---------------------------------------------------------------------------
-// Fusion: two-bank C accumulator that produces s_hat_v_c alongside round 1.
-//
-// The only structural change from `process_one_x_hi` is in the C-side inner
-// loop: instead of one `cf_c` accumulator collapsing all 3 small bits, we
-// keep `b_3[0]` (= bit `k_skip` of the witness, = `b_7` in ring-switch's
-// packed-prefix index) as a routing dim. Two `cf_c` banks: bank 0 takes
-// the K-even contributions (`v_c & 0x55`), bank 1 takes K-odd (`v_c & 0xAA`).
-// By F_2-linearity of φ_8, `PHI_8(v) == PHI_8(v & 0x55) + PHI_8(v & 0xAA)`,
-// so summing the two banks reconstructs the original `cf_c` → wire `res_c_s`.
-//
-// Per chunk-lane-b_med, this costs +1 `vld1q_u8` + +1 `veorq_u8`. Everything
-// else (shift_reduce_inner_ab, bit_transpose, partial_ab/c fold, eq_hi
-// outer fold) is unchanged.
+// DirectC eight-bank capture.
 // ---------------------------------------------------------------------------
 
-/// Per-worker scratch + local accumulator for the two-bank C variant.
-/// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
-/// split into bank 0 / bank 1.
+const N_C_BANKS: usize = 8;
+
 pub(crate) struct WorkerStateWithSHatV {
     partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    // Boxed: the eight DirectC banks are ELL * 16 * 8 = 8 KiB each, and this
+    // state travels BY VALUE through rayon's fold/reduce plumbing (which
+    // materializes several copies per split level in debug builds). With the
+    // arrays inline the state is ~20 KiB and overflows the fixed ~8 MiB
+    // test-thread stack; heap-allocating keeps the carried state ~4 KiB —
+    // smaller than the pre-DirectC two-bank layout that tested clean.
+    partial_c: Box<[[F128; ELL]; N_C_BANKS]>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     pub(crate) local_res_ab: [F128; ELL],
-    pub(crate) local_res_c_s_0: [F128; ELL],
-    pub(crate) local_res_c_s_1: [F128; ELL],
+    pub(crate) local_res_c_s: Box<[[F128; ELL]; N_C_BANKS]>,
 }
 
 impl WorkerStateWithSHatV {
     pub(crate) fn new() -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_c: Box::new([[F128::ZERO; ELL]; N_C_BANKS]),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
-            local_res_c_s_0: [F128::ZERO; ELL],
-            local_res_c_s_1: [F128::ZERO; ELL],
+            local_res_c_s: Box::new([[F128::ZERO; ELL]; N_C_BANKS]),
         }
     }
 }
 
-/// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
-/// unchanged; the only modification is the C-side inner loop now maintains
-/// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_one_x_hi_with_s_hat_v(
@@ -855,87 +872,56 @@ pub(crate) fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
+    mask_tables: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
-
+    state.partial_ab.fill(F128::ZERO);
+    for bank in state.partial_c.iter_mut() {
+        bank.fill(F128::ZERO);
+    }
     let n_lo = n_lo_and_inner - N_INNER;
-
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let within_hash_outer = x_outer & within_outer_mask;
-        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
         if n_b_med == 0 {
             continue;
         }
-
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let eq_lo_val = eq_lo_scaled[x_outer_lo];
-
-        if n_b_med == (1 << N_MEDIUM) {
-            shift_reduce_transpose_windows(
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                chunk_byte_base,
-                1 << N_MEDIUM,
-                &mut state.chunk_ab_bytes,
-                &mut state.chunk_c_bytes,
-                &mut state.a_col,
-                &mut state.b_col,
-            );
-
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                1 << N_MEDIUM,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
-        } else {
-            shift_reduce_transpose_windows(
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                chunk_byte_base,
-                n_b_med,
-                &mut state.chunk_ab_bytes,
-                &mut state.chunk_c_bytes,
-                &mut state.a_col,
-                &mut state.b_col,
-            );
-
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
-        }
+        shift_reduce_transpose_windows(
+            a_packed,
+            b_packed,
+            c_packed,
+            inv_table,
+            chunk_byte_base,
+            n_b_med,
+            &mut state.chunk_ab_bytes,
+            &mut state.chunk_c_bytes,
+            &mut state.a_col,
+            &mut state.b_col,
+        );
+        kernels::accumulate_convert_ab(
+            &state.chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_scaled[x_outer_lo],
+            &mut state.partial_ab,
+        );
+        // SAFETY: `[[u8; 64]; 16]` is contiguous and has exactly 1024 bytes.
+        let c_block: &[u8; 16 * 64] = unsafe {
+            &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>()
+        };
+        let c_tables = &mask_tables
+            [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        kernels::accumulate_c_banks(c_block, n_b_med, c_tables, &mut state.partial_c);
     }
-
-    // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        for bank in 0..N_C_BANKS {
+            state.local_res_c_s[bank][lane] += eq_hi_val * state.partial_c[bank][lane];
+        }
     }
 }
 
-/// Challenge-weighted half of [`process_one_x_hi_with_s_hat_v`] when the AB
-/// shift-reduce blocks were produced earlier.  C remains live and is handled
-/// exactly as in the fused path so wire output and `s_hat_v_c` stay identical.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn process_one_x_hi_with_precomputed_ab(
@@ -949,50 +935,50 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
+    mask_tables: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
-
+    state.partial_ab.fill(F128::ZERO);
+    for bank in state.partial_c.iter_mut() {
+        bank.fill(F128::ZERO);
+    }
     let n_lo = n_lo_and_inner - N_INNER;
-
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let within_hash_outer = x_outer & within_outer_mask;
-        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
         if n_b_med == 0 {
             continue;
         }
-
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let eq_lo_val = eq_lo_scaled[x_outer_lo];
-
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            state.chunk_ab_bytes[b_med]
+                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
             bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
-
-        kernels::accumulate_convert_with_s_hat_v(
+        kernels::accumulate_convert_ab(
             &state.chunk_ab_bytes,
-            &state.chunk_c_bytes,
             n_b_med,
             convert,
-            eq_lo_val,
+            eq_lo_scaled[x_outer_lo],
             &mut state.partial_ab,
-            &mut state.partial_c_0,
-            &mut state.partial_c_1,
         );
+        // SAFETY: `[[u8; 64]; 16]` is contiguous and has exactly 1024 bytes.
+        let c_block: &[u8; 16 * 64] = unsafe {
+            &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>()
+        };
+        let c_tables = &mask_tables
+            [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        kernels::accumulate_c_banks(c_block, n_b_med, c_tables, &mut state.partial_c);
     }
-
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        for bank in 0..N_C_BANKS {
+            state.local_res_c_s[bank][lane] += eq_hi_val * state.partial_c[bank][lane];
+        }
     }
 }
 
@@ -1144,6 +1130,43 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     (res_ab.to_vec(), res_c_lifted)
 }
 
+fn finish_c_banks(
+    banks: &[[F128; ELL]; N_C_BANKS],
+) -> ([F128; ELL], Vec<F128>, Vec<F128>) {
+    let alpha = phi8(F8(0x02));
+    let mut alpha_pow = [F128::ONE; N_C_BANKS];
+    for k in 1..N_C_BANKS {
+        alpha_pow[k] = alpha_pow[k - 1] * alpha;
+    }
+    let mut res_c_s_0 = [F128::ZERO; ELL];
+    let mut res_c_s_1 = [F128::ZERO; ELL];
+    for (k, bank) in banks.iter().enumerate() {
+        let target = if k & 1 == 0 { &mut res_c_s_0 } else { &mut res_c_s_1 };
+        for lane in 0..ELL {
+            target[lane] += alpha_pow[k] * bank[lane];
+        }
+    }
+    let mut res_c_s = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        res_c_s[lane] = res_c_s_0[lane] + res_c_s_1[lane];
+    }
+    let c_2 = c_2_small_f128();
+    let c_2_alpha_inv = c_2 * alpha_inv_f128();
+    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+    for lane in 0..ELL {
+        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
+        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
+    }
+    let mut quad_c = vec![F128::ZERO; 4 * 2 * ELL];
+    for e in 0..4 {
+        for b_0 in 0..2 {
+            let base = e * 2 * ELL + b_0 * ELL;
+            quad_c[base..base + ELL].copy_from_slice(&banks[b_0 + 2 * e]);
+        }
+    }
+    (res_c_s, s_hat_v_c, quad_c)
+}
+
 /// Same as [`round1_shift_reduce_extract_c_packed_padded`] but **also returns
 /// `s_hat_v_c`** — the length-128 vector ring-switch would otherwise produce
 /// via `fold_1b_rows` for the c-claim's PCS opening at suffix `r[k_skip+1..m]`.
@@ -1160,15 +1183,19 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
 /// are unchanged. See module-level docs for the F_2-linearity argument that
 /// makes `s_hat_v_c[(λ, 0)] + s_hat_v_c[(λ, 1)] · α == res_c_s_opt[λ]`.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
+    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], m: usize, k_skip: usize,
+    r: &[F128], inv_table: &InvNttTableByteSingleGf8, padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    let (ab, c, s, _) = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+    );
+    (ab, c, s)
+}
+
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], m: usize, k_skip: usize,
+    r: &[F128], inv_table: &InvNttTableByteSingleGf8, padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_s_hat_v_impl(
         a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
     )
@@ -1194,177 +1221,51 @@ pub(crate) fn round1_with_s_hat_v_impl(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     g_override: Option<usize>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
-
+    let _ = g_override;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
-    assert!(
-        m >= k_skip + N_INNER,
-        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
-        k_skip + N_INNER
-    );
+    assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), total_bytes);
     assert_eq!(b_packed.len(), total_bytes);
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
-
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let eq_hi = &eq.hi;
-
+    let mask_tables = build_c_mask_tables(&eq_lo_scaled);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-
-    // Rayon fold/reduce over an arbitrary x_hi range (the CPU share, and the
-    // recovery path when the GPU share fails mid-flight).
-    let cpu_fold = |range: core::ops::Range<usize>| {
-        range
-            .into_par_iter()
-            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-                let eq_hi_val = eq_hi[x_hi];
-                process_one_x_hi_with_s_hat_v(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    a_packed,
-                    b_packed,
-                    c_packed,
-                    inv_table,
-                    &eq_lo_scaled,
-                    eq_hi_val,
-                    convert,
-                    &mut state,
-                );
-                state
-            })
-            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-            .reduce(
-                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-                    for i in 0..ELL {
-                        ab1[i] += ab2[i];
-                        c0_1[i] += c0_2[i];
-                        c1_1[i] += c1_2[i];
-                    }
-                    (ab1, c0_1, c1_1)
-                },
-            )
-    };
-
-    // Kick off the GPU share (x_hi ∈ [0, g)) before the CPU rayon section so
-    // the two run concurrently. Any start failure degrades to g = 0. No clock
-    // keepalive to stop this season: the GPU Merkle stream during commit kept
-    // the clocks warm through the last ~100 ms (see pcs::commit).
-    let g_planned = match g_override {
-        Some(g) => g.min(hi_size),
-        None => crate::gpu::urm::planned_g(hi_size, m),
-    };
-    crate::gpu::gpu_dbg_trace(&format!(
-        "plan: m={m} hi_size={hi_size} g_planned={g_planned}"
-    ));
-    if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
-        eprintln!("[gpu-urm] plan: m={m} hi_size={hi_size} g_planned={g_planned}");
-    }
-    let gpu_job = if g_planned > 0 {
-        crate::gpu::urm::start_share(crate::gpu::urm::ShareArgs {
-            a_packed,
-            b_packed,
-            c_packed,
-            inv_table,
-            eq_lo_scaled: &eq_lo_scaled,
-            eq_hi,
-            b_med_counts: &b_med_counts,
-            within_outer_mask,
-            n_lo: eq.n_lo,
-            n_lo_and_inner,
-            g: g_planned,
-            tile_x_outer_lo: None,
+    let (res_ab, banks) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+            process_one_x_hi_with_s_hat_v(
+                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
+                a_packed, b_packed, c_packed, inv_table, &eq_lo_scaled, eq.hi[x_hi],
+                convert, &mask_tables, &mut state,
+            );
+            state
         })
-    } else {
-        None
-    };
-    let g = if gpu_job.is_some() { g_planned } else { 0 };
-
-    let cpu_start = std::time::Instant::now();
-    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = cpu_fold(g..hi_size);
-    let cpu_seconds = cpu_start.elapsed().as_secs_f64();
-
-    if let Some(job) = gpu_job {
-        let wait_start = std::time::Instant::now();
-        match job.finish() {
-            Some(share) => {
-                crate::gpu::gpu_dbg_trace(&format!(
-                    "prove: g={g} gpu_ts={:.2}ms cpu_share={:.2}ms wait={:.2}ms",
-                    share.gpu_seconds * 1e3,
-                    cpu_seconds * 1e3,
-                    wait_start.elapsed().as_secs_f64() * 1e3
-                ));
-                if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
-                    eprintln!(
-                        "[gpu-urm] prove: g={g} gpu_ts={:.2}ms cpu_share={:.2}ms gpu_extra_wait={:.2}ms",
-                        share.gpu_seconds * 1e3,
-                        cpu_seconds * 1e3,
-                        wait_start.elapsed().as_secs_f64() * 1e3,
-                    );
+        .map(|s| (s.local_res_ab, s.local_res_c_s))
+        .reduce(
+            || ([F128::ZERO; ELL], Box::new([[F128::ZERO; ELL]; N_C_BANKS])),
+            |(mut ab1, mut c1), (ab2, c2)| {
+                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for (left, right) in c1.iter_mut().zip(c2.iter()) {
+                    for i in 0..ELL { left[i] += right[i]; }
                 }
-                for i in 0..ELL {
-                    res_ab[i] += share.res_ab[i];
-                    res_c_s_0[i] += share.res_c0[i];
-                    res_c_s_1[i] += share.res_c1[i];
-                }
-                if g_override.is_none() {
-                    crate::gpu::urm::note_calibration(
-                        g,
-                        hi_size - g,
-                        share.gpu_seconds,
-                        cpu_seconds,
-                        wait_start.elapsed().as_secs_f64(),
-                    );
-                }
-            }
-            None => {
-                crate::gpu::gpu_dbg_trace("prove: GPU job FAILED mid-flight; CPU recompute");
-                // GPU failed mid-flight (fallback already latched inside
-                // `finish`): recompute its share on the CPU.
-                let (ab, c0, c1) = cpu_fold(0..g);
-                for i in 0..ELL {
-                    res_ab[i] += ab[i];
-                    res_c_s_0[i] += c0[i];
-                    res_c_s_1[i] += c1[i];
-                }
-            }
-        }
-    }
-
-    // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
-    // F_2-linearity of φ_8 over the masked-byte sum).
-    let mut res_c_s_combined = [F128::ZERO; ELL];
-    for i in 0..ELL {
-        res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
-    }
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
-
-    // s_hat_v_c canonical form: apply residual C_2 (small-eq constant for
-    // r[k_skip+1..k_skip+3]) and α⁻¹ (strips bank 1's extra α factor).
-    let c_2 = c_2_small_f128();
-    let alpha_inv = alpha_inv_f128();
-    let c_2_alpha_inv = c_2 * alpha_inv;
-    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
-    for lane in 0..ELL {
-        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
-        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
-    }
-
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
+                (ab1, c1)
+            },
+        );
+    crate::scratch::give_f128(mask_tables);
+    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks);
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
 }
 
 /// Challenge-weighted completion of round 1 using AB blocks returned by
@@ -1378,16 +1279,22 @@ pub(crate) fn round1_with_s_hat_v_impl(
 /// season-1 URM kernel, which is bit-identical per x_hi to the precomputed
 /// path, so the XOR merge is exact for any split point.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-    ab_inner: &mut Round1AbInner,
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
+    ab_inner: &mut Round1AbInner, a_packed: &[u8], b_packed: &[u8], c_packed: &[u8],
+    m: usize, k_skip: usize, r: &[F128], inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    let (ab, c, s, _) =
+        round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+            ab_inner, a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+        );
+    (ab, c, s)
+}
+
+pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+    ab_inner: &mut Round1AbInner, a_packed: &[u8], b_packed: &[u8], c_packed: &[u8],
+    m: usize, k_skip: usize, r: &[F128], inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_precomputed_ab_impl(
         ab_inner, a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
     )
@@ -1407,15 +1314,11 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     g_override: Option<usize>,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
-
+    let _ = g_override;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
-    assert!(
-        m >= k_skip + N_INNER,
-        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
-        k_skip + N_INNER
-    );
+    assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
@@ -1423,172 +1326,42 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-
+    ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
-
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let eq_hi = &eq.hi;
+    let mask_tables = build_c_mask_tables(&eq_lo_scaled);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-
-    // Producer-skipped prefix (see [`planned_round1_gpu_prefix_bytes`]): the
-    // leading `skipped_w` x_hi windows of ab_inner were never written and
-    // MUST be covered by the GPU share (which reads raw a/b) or recomputed
-    // on CPU before any fold reads them.
-    let bytes_per_window = total_bytes >> eq.n_hi;
-    let invalid_bytes = ab_inner.invalid_prefix_bytes();
-    assert_eq!(
-        invalid_bytes % bytes_per_window,
-        0,
-        "invalid ab_inner prefix must be whole x_hi windows"
-    );
-    let skipped_w = invalid_bytes / bytes_per_window;
-    assert!(skipped_w <= hi_size);
-
-    let cpu_fold = |ab_inner_bytes: &[u8], range: core::ops::Range<usize>| {
-        range
-            .into_par_iter()
-            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-                process_one_x_hi_with_precomputed_ab(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    ab_inner_bytes,
-                    c_packed,
-                    &eq_lo_scaled,
-                    eq_hi[x_hi],
-                    convert,
-                    &mut state,
-                );
-                state
-            })
-            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-            .reduce(
-                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-                    for i in 0..ELL {
-                        ab1[i] += ab2[i];
-                        c0_1[i] += c0_2[i];
-                        c1_1[i] += c1_2[i];
-                    }
-                    (ab1, c0_1, c1_1)
-                },
-            )
-    };
-
-    // GPU share (x_hi ∈ [0, g)) from the raw a/b/c buffers, concurrent with
-    // the CPU's precomputed-AB fold over [g, hi_size). See
-    // [`round1_with_s_hat_v_impl`] for the season-1 hook shape.
-    let g_planned = match g_override {
-        Some(g) => g.min(hi_size),
-        None => crate::gpu::urm::planned_g(hi_size, m),
-    }
-    // The GPU share must cover at least the producer-skipped prefix.
-    .max(skipped_w);
-    crate::gpu::gpu_dbg_trace(&format!(
-        "plan(pre-ab): m={m} hi_size={hi_size} g_planned={g_planned}"
-    ));
-    if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
-        eprintln!("[gpu-urm] plan(pre-ab): m={m} hi_size={hi_size} g_planned={g_planned}");
-    }
-    let gpu_job = if g_planned > 0 {
-        crate::gpu::urm::start_share(crate::gpu::urm::ShareArgs {
-            a_packed,
-            b_packed,
-            c_packed,
-            inv_table,
-            eq_lo_scaled: &eq_lo_scaled,
-            eq_hi,
-            b_med_counts: &b_med_counts,
-            within_outer_mask,
-            n_lo: eq.n_lo,
-            n_lo_and_inner,
-            g: g_planned,
-            tile_x_outer_lo: None,
+    let ab_inner_bytes = ab_inner.as_bytes();
+    let (res_ab, banks) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+            process_one_x_hi_with_precomputed_ab(
+                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
+                ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
+                &mask_tables, &mut state,
+            );
+            state
         })
-    } else {
-        None
-    };
-    let g = if gpu_job.is_some() { g_planned } else { 0 };
-    if g < skipped_w {
-        // The planned GPU share didn't start (disable latch / no Metal):
-        // recompute the skipped prefix from raw a/b before the CPU fold.
-        ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    }
-
-    let cpu_start = std::time::Instant::now();
-    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = cpu_fold(ab_inner.as_bytes(), g..hi_size);
-    let cpu_seconds = cpu_start.elapsed().as_secs_f64();
-
-    if let Some(job) = gpu_job {
-        let wait_start = std::time::Instant::now();
-        match job.finish() {
-            Some(share) => {
-                crate::gpu::gpu_dbg_trace(&format!(
-                    "prove(pre-ab): g={g} gpu_ts={:.2}ms cpu_share={:.2}ms wait={:.2}ms",
-                    share.gpu_seconds * 1e3,
-                    cpu_seconds * 1e3,
-                    wait_start.elapsed().as_secs_f64() * 1e3
-                ));
-                if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
-                    eprintln!(
-                        "[gpu-urm] prove(pre-ab): g={g} gpu_ts={:.2}ms cpu_share={:.2}ms gpu_extra_wait={:.2}ms",
-                        share.gpu_seconds * 1e3,
-                        cpu_seconds * 1e3,
-                        wait_start.elapsed().as_secs_f64() * 1e3,
-                    );
+        .map(|s| (s.local_res_ab, s.local_res_c_s))
+        .reduce(
+            || ([F128::ZERO; ELL], Box::new([[F128::ZERO; ELL]; N_C_BANKS])),
+            |(mut ab1, mut c1), (ab2, c2)| {
+                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for (left, right) in c1.iter_mut().zip(c2.iter()) {
+                    for i in 0..ELL { left[i] += right[i]; }
                 }
-                for i in 0..ELL {
-                    res_ab[i] += share.res_ab[i];
-                    res_c_s_0[i] += share.res_c0[i];
-                    res_c_s_1[i] += share.res_c1[i];
-                }
-                if g_override.is_none() {
-                    crate::gpu::urm::note_calibration(
-                        g,
-                        hi_size - g,
-                        share.gpu_seconds,
-                        cpu_seconds,
-                        wait_start.elapsed().as_secs_f64(),
-                    );
-                }
-            }
-            None => {
-                crate::gpu::gpu_dbg_trace(
-                    "prove(pre-ab): GPU job FAILED mid-flight; CPU recompute",
-                );
-                ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-                let (ab, c0, c1) = cpu_fold(ab_inner.as_bytes(), 0..g);
-                for i in 0..ELL {
-                    res_ab[i] += ab[i];
-                    res_c_s_0[i] += c0[i];
-                    res_c_s_1[i] += c1[i];
-                }
-            }
-        }
-    }
-
-    let mut res_c_s_combined = [F128::ZERO; ELL];
-    for i in 0..ELL {
-        res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
-    }
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
-
-    let c_2 = c_2_small_f128();
-    let c_2_alpha_inv = c_2 * alpha_inv_f128();
-    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
-    for lane in 0..ELL {
-        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
-        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
-    }
-
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
+                (ab1, c1)
+            },
+        );
+    crate::scratch::give_f128(mask_tables);
+    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks);
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -2555,4 +2328,57 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn quad_collapses_to_wire_s_hat_v_c() {
+        use crate::pcs::ring_switch::collapse_s_hat_v_quad;
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        let small = small_challenges_ghash();
+        let low_point = [small[1], small[2]];
+        let cases = [
+            (13usize, None),
+            (14, Some((14usize, 15_409usize))),
+            (17, Some((14usize, 15_409usize))),
+        ];
+        for (m, padded) in cases {
+            let mut rng = Rng::new(0x9AD_C011_u64.wrapping_add(m as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let mut c = rng.bits(total_bits);
+            let padding = match padded {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for block in 0..(total_bits / block_size) {
+                        for offset in useful_bits..block_size {
+                            let index = block * block_size + offset;
+                            a[index] = false;
+                            b[index] = false;
+                            c[index] = false;
+                        }
+                    }
+                    PaddingSpec { k_log, useful_bits_per_block: useful_bits }
+                }
+            };
+            let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let fused = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+                &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+            );
+            assert_eq!(fused.3.len(), 4 * 2 * ELL);
+            assert_eq!(collapse_s_hat_v_quad(&fused.3, &low_point), fused.2);
+
+            let mut precomputed = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let pre = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+                &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+            );
+            assert_eq!(pre, fused, "precomputed DirectC mismatch at m={m}");
+        }
+    }
+
 }

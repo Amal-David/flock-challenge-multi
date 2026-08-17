@@ -224,7 +224,70 @@ pub(super) fn accumulate_convert(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn accumulate_convert_ab(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate supplies the SIMD features and fixed arrays bound all accesses.
+    unsafe {
+        x86_64::accumulate_convert_ab_x86_avx512(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for lane in 0..64 {
+        let mut converted_ab = super::F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + usize::from(chunk_ab_bytes[b_med][lane])];
+        }
+        partial_ab[lane] += converted_ab * eq_lo_val;
+    }
+}
+
+/// Accumulate the eight alpha-free C banks from already-transposed C rows.
+#[inline]
+pub(super) fn accumulate_c_banks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(mask_tables.len(), 512);
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+    for lane in 0..64 {
+        let mut masks = [0u16; 8];
+        for b_med in 0..n_b_med {
+            let c = c_block[b_med * 64 + lane];
+            for (bank, mask) in masks.iter_mut().enumerate() {
+                *mask |= u16::from((c >> bank) & 1) << b_med;
+            }
+        }
+        for (bank, mask) in partial_c.iter_mut().zip(masks) {
+            bank[lane] += t_lo[usize::from(mask & 0xff)] + t_hi[usize::from(mask >> 8)];
+        }
+    }
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_ab_bytes: &[[u8; 64]; 16],

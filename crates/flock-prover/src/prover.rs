@@ -41,6 +41,24 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
 }
 
+
+#[inline]
+fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_c_enabled()
+}
+
+#[inline]
+fn pre_c_slot<'a>(
+    r1cs: &BlockR1cs,
+    captured: &'a zerocheck::CapturedSHatVC,
+) -> Option<&'a [F128]> {
+    Some(if ranked_direct_c_precompute_enabled(r1cs) {
+        captured.quad.as_slice()
+    } else {
+        captured.s_hat_v_c.as_slice()
+    })
+}
+
 enum FastLincheckInput {
     Stripe(Vec<u8>),
     BlockMajor,
@@ -271,7 +289,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         None
     };
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -423,7 +441,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
 
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     flock_core::gaptime::mark("open: begin");
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
@@ -480,7 +498,7 @@ pub struct ProveCore {
     /// two-bank fusion kernel (one extra `vld1q+veorq` per chunk-lane-b_med
     /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
     /// claim at PCS-open time.
-    pub s_hat_v_c: Vec<F128>,
+    pub s_hat_v_c: zerocheck::CapturedSHatVC,
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -1030,7 +1048,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- Ligerito recursive PCS open ---
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let t0 = Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,

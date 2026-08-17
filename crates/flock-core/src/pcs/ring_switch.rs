@@ -1368,7 +1368,7 @@ pub fn s_hat_v_quad_from_z_vec(
         )
 }
 
-fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
+pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_quad.len(), 4 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
