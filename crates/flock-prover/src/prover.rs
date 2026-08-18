@@ -667,6 +667,20 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         prefaulted_codeword.as_deref(),
     );
     flock_core::gaptime::mark("core: gpu prewire spawned");
+    // The BLAKE3 padding rows force every block's tail words to zero, which in
+    // the SoA codeword is a static all-zero pattern on the top lanes of every
+    // odd position. Publish it for the duration of this commitment so the NTT
+    // can drop those butterflies; the guard restores the previous value on
+    // drop, and recursive Ligerito commits run at a different lane count and
+    // never match the ranked gate.
+    let _zero_lane_skip = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
+        pcs_params.num_ntts(),
+        flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+            pcs_params.num_ntts(),
+            padding.k_log,
+            padding.useful_bits_per_block,
+        ),
+    );
     let ((commitment, prover_data), ab_inner) = if let Some(ab_inner) = ab_inner {
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");

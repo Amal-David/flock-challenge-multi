@@ -2763,6 +2763,63 @@ mod tests {
             assert!(setup.n_block_slots() >= n_blocks);
         }
     }
+
+    /// The zero-lane commit skip assumes the ranked packed witness leaves
+    /// lanes 57..=63 of every ODD codeword position identically zero, and
+    /// lane 56 NOT zero (word 120 still carries 49 useful bits). Verify that
+    /// against the real witness generator rather than trusting the layout doc.
+    #[test]
+    fn commit_zero_lane_geometry_probe() {
+        const NUM_NTTS: usize = 64;
+        let mut rng = Rng::new(0x5EED_0BEE);
+        let n_blocks = 96usize;
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (
+                    cv,
+                    m,
+                    t,
+                    rng.next_u32() & 0xFF,
+                    CHUNK_START | CHUNK_END | ROOT,
+                )
+            })
+            .collect();
+        let setup = Blake3Setup::new(n_blocks);
+        let z_packed = setup.generate_witness_packed(&blocks);
+
+        // Occupancy per (lane, pos parity) slot over the whole packed witness.
+        let mut nonzero = [[0usize; 2]; NUM_NTTS];
+        for (i, v) in z_packed.iter().enumerate() {
+            if *v != F128::ZERO {
+                nonzero[i % NUM_NTTS][(i / NUM_NTTS) & 1] += 1;
+            }
+        }
+        let mut all_zero: Vec<(usize, usize)> = Vec::new();
+        for lane in 0..NUM_NTTS {
+            for par in 0..2 {
+                if nonzero[lane][par] == 0 {
+                    all_zero.push((lane, par));
+                }
+            }
+        }
+
+        // Expected: exactly lanes 57..=63 at ODD pos are identically zero.
+        let expected: Vec<(usize, usize)> = (57..64).map(|l| (l, 1)).collect();
+        assert_eq!(all_zero, expected, "observed zero geometry differs");
+        // Word 120 (lane 56, odd pos) keeps 49 useful bits — must NOT be zero.
+        assert!(nonzero[56][1] > 0, "lane 56 odd pos unexpectedly all zero");
+
+        // And the published tail must agree with what the descriptor derives.
+        assert_eq!(
+            flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                NUM_NTTS, K_LOG, USEFUL_BITS,
+            ),
+            7,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2,9 +2,29 @@ use crate::field::F128;
 
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
+    butterfly_row_pair_gen::<false>(top, bot, twiddle)
+}
+
+/// `v * t` where `LOW` asserts `t.hi == 0`. Monomorphized so the choice is
+/// resolved at compile time and no branch enters the lane loop.
+#[inline(always)]
+fn mul_t<const LOW: bool>(v: F128, t: F128) -> F128 {
+    if LOW {
+        crate::field::gf2_128::mul_low_rhs(v, t)
+    } else {
+        v * t
+    }
+}
+
+#[inline]
+pub(super) fn butterfly_row_pair_gen<const LOW: bool>(
+    top: &mut [F128],
+    bot: &mut [F128],
+    twiddle: F128,
+) {
     for lane in 0..top.len() {
         let v = bot[lane];
-        let new_u = top[lane] + v * twiddle;
+        let new_u = top[lane] + mul_t::<LOW>(v, twiddle);
         top[lane] = new_u;
         bot[lane] = v + new_u;
     }
@@ -21,21 +41,35 @@ pub(super) fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
+    butterfly_fused_2layer_gen::<false, false>(a, b, c, d, t_outer, t_inner_a, t_inner_b)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_gen<const OUTER_LOW: bool, const INNER_LOW: bool>(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
     for lane in 0..a.len() {
         let mut xa = a[lane];
         let mut xb = b[lane];
         let mut xc = c[lane];
         let mut xd = d[lane];
-        let na = xa + xc * t_outer;
+        let na = xa + mul_t::<OUTER_LOW>(xc, t_outer);
         xc += na;
         xa = na;
-        let nb = xb + xd * t_outer;
+        let nb = xb + mul_t::<OUTER_LOW>(xd, t_outer);
         xd += nb;
         xb = nb;
-        let na2 = xa + xb * t_inner_a;
+        let na2 = xa + mul_t::<INNER_LOW>(xb, t_inner_a);
         xb += na2;
         xa = na2;
-        let nc2 = xc + xd * t_inner_b;
+        let nc2 = xc + mul_t::<INNER_LOW>(xd, t_inner_b);
         xd += nc2;
         xc = nc2;
         a[lane] = xa;
@@ -171,12 +205,13 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
+    active_lanes: usize,
     r: usize,
     twiddles: &[F128; 15],
 ) {
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..active_lanes {
             let mut values = [F128::ZERO; 16];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add((i * sixteenth + r) * num_ntts + lane);

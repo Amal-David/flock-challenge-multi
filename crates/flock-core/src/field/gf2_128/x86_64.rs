@@ -28,6 +28,26 @@ unsafe fn lane1(v: __m128i) -> u64 {
     _mm_extract_epi64::<1>(v) as u64
 }
 
+/// `a · b` for a multiplier whose high limb is zero.
+///
+/// With `b.hi == 0` both limb products that involve `b.hi` vanish, so the
+/// 256-bit product is exactly `a.lo·b_lo + (a.hi·b_lo)·x^64`. That is **2
+/// CLMUL** plus the shift-only `ghash_reduce`, against the 5 CLMUL of the
+/// general Karatsuba+Barrett path this crate's `Mul` uses on x86.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
+/// attribute. `b_lo` is the multiplier's low limb; its high limb must be 0.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        let p0 = pmull(a.lo, b_lo);
+        let q = pmull(a.hi, b_lo);
+        super::ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
+    }
+}
+
 /// Schoolbook 4 CLMUL — fully independent products, then scalar reduction.
 ///
 /// # Safety
@@ -252,6 +272,31 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
         let t2 = _mm512_clmulepi64_epi128::<0x11>(x, y);
         t1 = gf2_128_reduce_x4(t1, t2);
         // Low product x.lo·y.lo (imm 0x00), then fold t1 down to the result.
+        let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        gf2_128_reduce_x4(t0, t1)
+    }
+}
+
+/// [`ghash_mul_x4`] specialized for a multiplier `x` whose high limb is zero
+/// in **every** lane.
+///
+/// `x.hi = 0` kills the `0x01` (`x.hi·y.lo`) and `0x11` (`x.hi·y.hi`)
+/// products, and the first reduction then folds a zero high operand, so it
+/// disappears with them: **3 CLMUL instead of 6**, same reduced result.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
+/// cfg gate) and that every 128-bit lane of `x` has a zero high qword.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the zero-high-limb
+    // precondition.
+    unsafe {
+        // Only the cross term x.lo·y.hi survives at x^64; x.hi·y.hi is zero,
+        // so `gf2_128_reduce_x4(t1, 0) == t1` and is skipped entirely.
+        let t1 = _mm512_clmulepi64_epi128::<0x10>(x, y);
         let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
         gf2_128_reduce_x4(t0, t1)
     }
