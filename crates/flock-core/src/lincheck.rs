@@ -128,7 +128,9 @@ use std::thread::JoinHandle;
 mod kernels;
 
 #[cfg(target_arch = "x86_64")]
-pub use kernels::partial_fold_packed_z_x86_tiled_padded;
+pub use kernels::{
+    partial_fold_packed_z_x86_oblock_padded, partial_fold_packed_z_x86_tiled_padded,
+};
 #[cfg(target_arch = "aarch64")]
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
@@ -686,7 +688,7 @@ const BLOCK_MAJOR_FACTORED_EQ_LO_LOG: usize = 9;
 /// shape consumed by a lincheck sum table. Output byte `b` has bit `r` equal
 /// to bit `b` of `lanes[r]`.
 #[inline(always)]
-fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
+pub(crate) fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
     debug_assert_eq!(out.len(), 128);
     let lo: [u64; 8] = std::array::from_fn(|r| lanes[r].lo);
     let hi: [u64; 8] = std::array::from_fn(|r| lanes[r].hi);
@@ -887,7 +889,22 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         false
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
+                        unsafe {
+                            kernels::gather_transpose_tile_x86(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let transposed_done = false;
                     if !transposed_done {
                         for t in 0..tile_stripes {
@@ -902,11 +919,11 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                         }
                     }
                     let group = &mut partial[inner_base..inner_base + chunk_bits];
-                    // Full tiles take the two-stream NEON wavefront leaf
+                    // Full tiles take the two-stream wavefront leaf
                     // (paired 8-column blocks, 16 register accumulators —
                     // bit-identical XOR order, ~2× the independent lookup
                     // chains in flight). Partial last tiles and the
-                    // `chunk_bits % 8` remainder use the scalar chain below.
+                    // `chunk_bits % 16` remainder use the scalar chain below.
                     #[cfg(target_arch = "aarch64")]
                     let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
                         kernels::fold_block_major_chunk_neon_x2(
@@ -918,7 +935,18 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         0
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
+                        kernels::fold_block_major_chunk_x86_x2(
+                            &transposed,
+                            &tables,
+                            group,
+                            chunk_bits,
+                        )
+                    } else {
+                        0
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let b_done = 0;
                     for b in b_done..chunk_bits {
                         let mut acc = group[b];
@@ -985,6 +1013,16 @@ fn partial_fold_packed_z_best(
         }
         #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
         {
+            let n_log = m - k_log;
+            if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed) {
+                return partial_fold_packed_z_x86_oblock_padded(
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer,
+                );
+            }
             partial_fold_packed_z_x86_tiled_padded(z_packed, m, k_log, useful_bits, eq_outer)
         }
         #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
@@ -999,7 +1037,6 @@ fn partial_fold_packed_z_best(
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
 /// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
 /// [`partial_fold_packed_z_best`] for the crossover calibration.
-#[cfg(target_arch = "aarch64")]
 const OBLOCK_MIN_N_LOG: usize = 16;
 
 /// Quick test for "can we use the tiled fast path?". Tile uses `TILE_T`
@@ -2596,7 +2633,9 @@ mod tests {
             let k = 1usize << k_log;
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
             let tiled = partial_fold_packed_z_x86_tiled_padded(&z_packed, m, k_log, k, &eq);
-            assert_eq!(serial, tiled, "at m={m}, k_log={k_log}");
+            let oblock = partial_fold_packed_z_x86_oblock_padded(&z_packed, m, k_log, k, &eq);
+            assert_eq!(serial, tiled, "tiled at m={m}, k_log={k_log}");
+            assert_eq!(serial, oblock, "oblock at m={m}, k_log={k_log}");
         }
     }
 

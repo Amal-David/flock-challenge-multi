@@ -154,3 +154,233 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
             },
         )
 }
+
+/// Outer(tile)-partitioned sibling of [`partial_fold_packed_z_x86_tiled_padded`]
+/// — builds each tile's sum-tables once instead of per worker/chunk.
+#[cfg(target_arch = "x86_64")]
+pub fn partial_fold_packed_z_x86_oblock_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const TILE_T: usize = 8;
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 8);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 6, "need n_outer >= 64 for tile of 8 stripes");
+    assert!(k_log >= 3, "need k >= 8");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+    assert_eq!(k % BLOCK_K, 0);
+    let n_tiles = n_stripes / TILE_T;
+
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(w, partial)| {
+            let tile_lo = w * tiles_per_worker;
+            let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+                let mut bs = 0usize;
+                while bs < useful {
+                    unsafe {
+                        process_block_x86(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += BLOCK_K;
+                }
+            }
+        });
+
+    let (first, rest) = partials.split_at(k);
+    let mut out = first.to_vec();
+    for chunk in rest.chunks(k) {
+        out.par_iter_mut()
+            .zip(chunk.par_iter())
+            .for_each(|(o, s)| *o += *s);
+    }
+    out
+}
+
+/// All-lane gather and bit-transpose for one full 8-stripe tile chunk on x86_64.
+/// Lane (t, r) is read at `src + (8*t + r) * stride` (F128 elements).
+/// Output layout: row `t` at `out + 128*t`.
+/// # Safety
+/// - `src` must expose all 64 lane reads in bounds.
+/// - `out` must point to at least 8 * 128 = 1024 mutable bytes.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn gather_transpose_tile_x86(src: *const F128, stride: usize, out: *mut u8) {
+    let stride_bytes = stride * 16;
+    let mut p = src as *const u8;
+    let mut row = out;
+    for _t in 0..8 {
+        let lanes: [F128; 8] = [
+            (p as *const F128).read_unaligned(),
+            (p.add(stride_bytes) as *const F128).read_unaligned(),
+            (p.add(2 * stride_bytes) as *const F128).read_unaligned(),
+            (p.add(3 * stride_bytes) as *const F128).read_unaligned(),
+            (p.add(4 * stride_bytes) as *const F128).read_unaligned(),
+            (p.add(5 * stride_bytes) as *const F128).read_unaligned(),
+            (p.add(6 * stride_bytes) as *const F128).read_unaligned(),
+            (p.add(7 * stride_bytes) as *const F128).read_unaligned(),
+        ];
+        super::super::transpose_8_f128s_to_128_bytes(&lanes, core::slice::from_raw_parts_mut(row, 128));
+        p = p.add(8 * stride_bytes);
+        row = row.add(128);
+    }
+}
+
+/// Two-stream leaf for x86_64: fold 8 stripe tables into two adjacent 8-column accumulator blocks.
+#[cfg(target_arch = "x86_64")]
+pub fn fold_block_major_chunk_x86_x2(
+    transposed: &[u8; 8 * 128],
+    tables: &[F128],
+    group: &mut [F128],
+    chunk_bits: usize,
+) -> usize {
+    const TILE_T: usize = 8;
+    assert_eq!(tables.len(), TILE_T * 256);
+    let b_pairs = chunk_bits / 16;
+    let b_done = b_pairs * 16;
+    let tables_ptr = tables.as_ptr() as *const u8;
+    for pair in 0..b_pairs {
+        let b0 = pair * 16;
+        let bytes0 = unsafe { transposed.as_ptr().add(b0) };
+        let acc_ptr = unsafe { group.as_mut_ptr().add(b0) };
+        unsafe {
+            fold_block_major_bpair_x2_x86(bytes0, tables_ptr, acc_ptr);
+        }
+    }
+    b_done
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn fold_seg8_x86(
+    idx_ptr: *const u8,
+    table_ptr: *const u8,
+    a0: &mut core::arch::x86_64::__m128i,
+    a1: &mut core::arch::x86_64::__m128i,
+    a2: &mut core::arch::x86_64::__m128i,
+    a3: &mut core::arch::x86_64::__m128i,
+    a4: &mut core::arch::x86_64::__m128i,
+    a5: &mut core::arch::x86_64::__m128i,
+    a6: &mut core::arch::x86_64::__m128i,
+    a7: &mut core::arch::x86_64::__m128i,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let bits = (idx_ptr as *const u64).read_unaligned();
+        let i0 = (bits & 0xff) as usize;
+        let i1 = ((bits >> 8) & 0xff) as usize;
+        let i2 = ((bits >> 16) & 0xff) as usize;
+        let i3 = ((bits >> 24) & 0xff) as usize;
+        let i4 = ((bits >> 32) & 0xff) as usize;
+        let i5 = ((bits >> 40) & 0xff) as usize;
+        let i6 = ((bits >> 48) & 0xff) as usize;
+        let i7 = (bits >> 56) as usize;
+        *a0 = _mm_xor_si128(*a0, _mm_loadu_si128(table_ptr.add(i0 << 4) as *const __m128i));
+        *a1 = _mm_xor_si128(*a1, _mm_loadu_si128(table_ptr.add(i1 << 4) as *const __m128i));
+        *a2 = _mm_xor_si128(*a2, _mm_loadu_si128(table_ptr.add(i2 << 4) as *const __m128i));
+        *a3 = _mm_xor_si128(*a3, _mm_loadu_si128(table_ptr.add(i3 << 4) as *const __m128i));
+        *a4 = _mm_xor_si128(*a4, _mm_loadu_si128(table_ptr.add(i4 << 4) as *const __m128i));
+        *a5 = _mm_xor_si128(*a5, _mm_loadu_si128(table_ptr.add(i5 << 4) as *const __m128i));
+        *a6 = _mm_xor_si128(*a6, _mm_loadu_si128(table_ptr.add(i6 << 4) as *const __m128i));
+        *a7 = _mm_xor_si128(*a7, _mm_loadu_si128(table_ptr.add(i7 << 4) as *const __m128i));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn fold_block_major_bpair_x2_x86(
+    bytes0: *const u8,
+    tables_ptr: *const u8,
+    acc_ptr: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let o = acc_ptr as *mut u8;
+        let mut a0 = _mm_loadu_si128(o as *const __m128i);
+        let mut a1 = _mm_loadu_si128(o.add(16) as *const __m128i);
+        let mut a2 = _mm_loadu_si128(o.add(32) as *const __m128i);
+        let mut a3 = _mm_loadu_si128(o.add(48) as *const __m128i);
+        let mut a4 = _mm_loadu_si128(o.add(64) as *const __m128i);
+        let mut a5 = _mm_loadu_si128(o.add(80) as *const __m128i);
+        let mut a6 = _mm_loadu_si128(o.add(96) as *const __m128i);
+        let mut a7 = _mm_loadu_si128(o.add(112) as *const __m128i);
+
+        let mut c0 = _mm_loadu_si128(o.add(128) as *const __m128i);
+        let mut c1 = _mm_loadu_si128(o.add(144) as *const __m128i);
+        let mut c2 = _mm_loadu_si128(o.add(160) as *const __m128i);
+        let mut c3 = _mm_loadu_si128(o.add(176) as *const __m128i);
+        let mut c4 = _mm_loadu_si128(o.add(192) as *const __m128i);
+        let mut c5 = _mm_loadu_si128(o.add(208) as *const __m128i);
+        let mut c6 = _mm_loadu_si128(o.add(224) as *const __m128i);
+        let mut c7 = _mm_loadu_si128(o.add(240) as *const __m128i);
+
+        for t in 0..8 {
+            let idx_a = bytes0.add(t * 128);
+            let idx_c = idx_a.add(8);
+            let ta = tables_ptr.add(t * 256 * 16);
+            fold_seg8_x86(
+                idx_a, ta, &mut a0, &mut a1, &mut a2, &mut a3, &mut a4, &mut a5, &mut a6, &mut a7,
+            );
+            fold_seg8_x86(
+                idx_c, ta, &mut c0, &mut c1, &mut c2, &mut c3, &mut c4, &mut c5, &mut c6, &mut c7,
+            );
+        }
+
+        _mm_storeu_si128(o as *mut __m128i, a0);
+        _mm_storeu_si128(o.add(16) as *mut __m128i, a1);
+        _mm_storeu_si128(o.add(32) as *mut __m128i, a2);
+        _mm_storeu_si128(o.add(48) as *mut __m128i, a3);
+        _mm_storeu_si128(o.add(64) as *mut __m128i, a4);
+        _mm_storeu_si128(o.add(80) as *mut __m128i, a5);
+        _mm_storeu_si128(o.add(96) as *mut __m128i, a6);
+        _mm_storeu_si128(o.add(112) as *mut __m128i, a7);
+
+        _mm_storeu_si128(o.add(128) as *mut __m128i, c0);
+        _mm_storeu_si128(o.add(144) as *mut __m128i, c1);
+        _mm_storeu_si128(o.add(160) as *mut __m128i, c2);
+        _mm_storeu_si128(o.add(176) as *mut __m128i, c3);
+        _mm_storeu_si128(o.add(192) as *mut __m128i, c4);
+        _mm_storeu_si128(o.add(208) as *mut __m128i, c5);
+        _mm_storeu_si128(o.add(224) as *mut __m128i, c6);
+        _mm_storeu_si128(o.add(240) as *mut __m128i, c7);
+    }
+}
