@@ -231,6 +231,37 @@ fn ntt_seed_top_fusion_disabled() -> bool {
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// L2 blocking of the deep pass: how many of the deep layers to run across the
+/// whole sub-group before splitting it into regions that fit the per-thread
+/// L2 budget (1 MiB). 0 = no blocking (sub-group already fits, or disabled).
+fn deep_l2_outer_layers(sub_bytes_f128: usize, deep_layers: usize) -> usize {
+    const L2_BUDGET_LOG_BYTES: usize = 20; // 1 MiB effective per thread
+    if deep_layers < 2 || ntt_deep_l2block_disabled() {
+        return 0;
+    }
+    let sub_log_bytes = log2_pow2(sub_bytes_f128) + 4;
+    let outer = sub_log_bytes.saturating_sub(L2_BUDGET_LOG_BYTES);
+    // Leave at least one layer for the per-region schedule.
+    outer.min(deep_layers - 1)
+}
+
+/// `FLOCK_NO_NTT_DEEP_L2BLOCK=1` restores the whole-sub-group deep schedule.
+fn ntt_deep_l2block_disabled() -> bool {
+    #[cfg(test)]
+    if DEEP_L2BLOCK_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_L2BLOCK").is_some())
+}
+
+/// Test-only latch for the deep-pass L2 blocking.
+#[cfg(test)]
+static DEEP_L2BLOCK_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static DEEP_L2BLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Test-only counters: how many times each fused pass actually ran (so the
 /// equality tests can assert they exercised the fused route, not a fallback).
 #[cfg(test)]
@@ -818,6 +849,92 @@ impl AdditiveNttF128 {
             }
         } else {
             (0..quarter).into_par_iter().for_each(seed_row);
+        }
+    }
+
+    /// Greedy fused deep schedule (fused-four, then fused-two, then single)
+    /// over `region`, which is exactly one block at `first_layer` with global
+    /// block index `region_block`, applying layers `first_layer..end_layer`
+    /// (`end_layer ≤ log_d`). Sequential inside the caller's rayon task.
+    #[allow(clippy::too_many_arguments)]
+    fn deep_region_layers(
+        &self,
+        region: &mut [F128],
+        region_block: usize,
+        first_layer: usize,
+        end_layer: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+    ) {
+        debug_assert_eq!(region.len(), (1usize << (log_d - first_layer)) * num_ntts);
+        let mut layer = first_layer;
+        while layer < end_layer {
+            let num_blocks_in_region = 1usize << (layer - first_layer);
+            let block_size = 1usize << (log_d - layer);
+            let block_bytes = block_size * num_ntts;
+
+            if layer + 3 < end_layer {
+                let sixteenth = block_size >> 4;
+                for block_in_region in 0..num_blocks_in_region {
+                    let global_block = region_block * num_blocks_in_region + block_in_region;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                    tw[0] = self.twiddle(layer, global_block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                    }
+                    for s in 0..8 {
+                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                    }
+                    let block_start = block_in_region * block_bytes;
+                    butterfly_interleaved_fused_4layer_rows(
+                        &mut region[block_start..block_start + block_bytes],
+                        &tw,
+                        sixteenth,
+                        num_ntts,
+                        if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
+                    );
+                }
+                layer += 4;
+            } else if layer + 1 < end_layer {
+                let quarter = block_size >> 2;
+                for block_in_region in 0..num_blocks_in_region {
+                    let global_block = region_block * num_blocks_in_region + block_in_region;
+                    let t_outer = self.twiddle(layer, global_block);
+                    let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                    let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                    let block_start = block_in_region * block_bytes;
+                    butterfly_interleaved_fused_2layer_par_rows(
+                        &mut region[block_start..block_start + block_bytes],
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        quarter,
+                        num_ntts,
+                        if quarter.is_multiple_of(2) { odd_tail } else { 0 },
+                    );
+                }
+                layer += 2;
+            } else {
+                let block_size_half = block_size >> 1;
+                for block_in_region in 0..num_blocks_in_region {
+                    let global_block = region_block * num_blocks_in_region + block_in_region;
+                    let twiddle = self.twiddle(layer, global_block);
+                    let block_start = block_in_region * block_bytes;
+                    let block = &mut region[block_start..block_start + block_bytes];
+                    butterfly_interleaved_block(
+                        block,
+                        twiddle,
+                        block_size_half,
+                        num_ntts,
+                        if block_size_half.is_multiple_of(2) { odd_tail } else { 0 },
+                    );
+                }
+                layer += 1;
+            }
         }
     }
 
@@ -1479,7 +1596,41 @@ impl AdditiveNttF128 {
             // portable fused-four kernel is scalar and loses to the ordinary
             // row-pair path outside correctness tests.
             if deep_fused4_ok {
-                let mut layer = n_top.max(start_layer);
+                let first_layer = n_top.max(start_layer);
+                // L2 blocking: a 2 MiB sub-group (ranked shape) is larger than
+                // the L2 each thread effectively owns (~1 MiB: 1 MiB/core on
+                // Zen 5, 2 MiB shared by two SMT siblings on Sapphire Rapids),
+                // so sweeping it once per fused group spills to L3. Run the
+                // first `outer` deep layers across the whole sub-group, then
+                // the remaining layers on each 2^outer-th region sequentially,
+                // so the ten deepest layers work on a ≤ 1 MiB set. Same
+                // butterflies per layer, layers still applied in order per
+                // row → bit-identical. `FLOCK_NO_NTT_DEEP_L2BLOCK=1` restores
+                // the whole-sub-group schedule.
+                let outer = deep_l2_outer_layers(sub_bytes, log_d - first_layer);
+                if outer > 0 {
+                    #[cfg(test)]
+                    DEEP_L2BLOCK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.deep_region_layers(
+                        sub_data, sub_idx, first_layer, first_layer + outer, log_d, num_ntts, odd_tail,
+                    );
+                    let regions = 1usize << outer;
+                    let region_len = sub_data.len() >> outer;
+                    for (i, region) in sub_data.chunks_mut(region_len).enumerate() {
+                        self.deep_region_layers(
+                            region,
+                            (sub_idx << outer) + i,
+                            first_layer + outer,
+                            log_d,
+                            log_d,
+                            num_ntts,
+                            odd_tail,
+                        );
+                    }
+                    debug_assert_eq!(regions * region_len, sub_data.len());
+                    return;
+                }
+                let mut layer = first_layer;
                 while layer < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -2938,6 +3089,36 @@ mod tests {
         });
     }
 
+    /// Deep-pass L2 blocking (first deep layer across the 2 MiB sub-group,
+    /// the rest per 1 MiB region) vs the whole-sub-group schedule vs the
+    /// scalar reference; asserts the blocked route ran.
+    #[test]
+    fn deep_l2block_matches_unblocked() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0xD2B1);
+        // Shapes whose sub-group is the 2 MiB target (cache_n_top ≥ the
+        // parallelism floor): num_ntts=64 → 2^11 positions, num_ntts=32 → 2^12.
+        for &(log_d, num_ntts, start_layer) in &[(17usize, 64usize, 0usize), (17, 64, 3), (17, 32, 1)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+            DEEP_L2BLOCK_TEST_OFF.store(true, Ordering::Relaxed);
+            let mut control = original.clone();
+            ntt.forward_transform_interleaved_parallel_from_layer(&mut control, num_ntts, start_layer);
+            DEEP_L2BLOCK_TEST_OFF.store(false, Ordering::Relaxed);
+            let hits_before = DEEP_L2BLOCK_HITS.load(Ordering::Relaxed);
+            let mut candidate = original.clone();
+            ntt.forward_transform_interleaved_parallel_from_layer(&mut candidate, num_ntts, start_layer);
+            assert!(
+                DEEP_L2BLOCK_HITS.load(Ordering::Relaxed) > hits_before,
+                "deep L2 blocking did not run at log_d={log_d} num_ntts={num_ntts}"
+            );
+            let mut expected = original.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, num_ntts, start_layer);
+            assert!(control == expected, "unblocked deep mismatch at log_d={log_d} num_ntts={num_ntts}");
+            assert!(candidate == expected, "L2-blocked deep mismatch at log_d={log_d} num_ntts={num_ntts}");
+        }
+    }
+
     /// Six-layer top fusion vs the incumbent two-sweep schedule, same
     /// process (test latch), at shapes whose top has ≥ 6 layers. The 512-thread
     /// pool raises `n_top` to 9 so `start_layer = 3` reproduces the ranked top
@@ -3270,6 +3451,51 @@ mod zero_lane_ranked_ab_probe {
         data.extend_from_slice(&msg);
         data.extend_from_slice(&msg);
         data
+    }
+
+    /// Ranked commit geometry, full rate-1/2 encode: deep-pass L2 blocking on
+    /// vs off (all fusions on in both), byte-equality plus interleaved timing.
+    #[test]
+    #[ignore = "ranked shape: ~2.5 GiB resident"]
+    fn deep_l2block_ranked_ab() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        const NUM_NTTS: usize = 64;
+        const MSG_POS: usize = 1 << 19;
+        let ntt = AdditiveNttF128::standard(20);
+        let msg: Vec<F128> = ranked_buffer(0xD2B1_0BEE_D00D_9ABC)[..MSG_POS * NUM_NTTS].to_vec();
+        let _g = ZeroOddTailLanes::scope(NUM_NTTS, 7);
+
+        DEEP_L2BLOCK_TEST_OFF.store(true, Ordering::Relaxed);
+        let mut control = vec![F128::ZERO; 2 * msg.len()];
+        ntt.rs_encode_interleaved(&msg, &mut control, NUM_NTTS);
+        DEEP_L2BLOCK_TEST_OFF.store(false, Ordering::Relaxed);
+        let mut candidate = vec![F128 { lo: !0, hi: !0 }; 2 * msg.len()];
+        ntt.rs_encode_interleaved(&msg, &mut candidate, NUM_NTTS);
+        assert!(control == candidate, "deep L2 blocking changed the ranked encode output");
+        drop(control);
+
+        let mut best = [f64::MAX; 2];
+        for rep in 0..6 {
+            for arm in 0..2 {
+                DEEP_L2BLOCK_TEST_OFF.store(arm == 0, Ordering::Relaxed);
+                let t = Instant::now();
+                ntt.rs_encode_interleaved(&msg, &mut candidate, NUM_NTTS);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(&candidate);
+                if ms < best[arm] {
+                    best[arm] = ms;
+                }
+                let name = if arm == 0 { "deep-2MiB" } else { "deep-l2block" };
+                println!("rep={rep} arm={name} ms={ms:.2}");
+            }
+        }
+        DEEP_L2BLOCK_TEST_OFF.store(false, Ordering::Relaxed);
+        let delta = (best[0] - best[1]) / best[0] * 100.0;
+        println!(
+            "MIN deep-2MiB={:.2} ms  deep-l2block={:.2} ms  delta={delta:+.2}%",
+            best[0], best[1]
+        );
     }
 
     /// Ranked commit geometry, full rate-1/2 encode (`rs_encode_interleaved`
