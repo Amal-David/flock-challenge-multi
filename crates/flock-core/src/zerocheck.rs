@@ -28,10 +28,11 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
-    fold2_plain_and_round_pair_lookahead_into, fold2_plain_and_round4_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded,
+    fold2_from_packed_and_round_pair_lookahead_into, fold2_plain_and_round_pair_lookahead_into,
+    fold2_plain_and_round4_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
+    uni_skip_round_pair_lookahead_nomat_packed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -90,6 +91,30 @@ fn cascade2_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some()
+}
+
+/// Test-only forced-off latch for the no-materialize sweep.
+#[cfg(test)]
+pub(crate) static ZC_NOMAT_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only: whether the last prove ran the no-materialize route.
+#[cfg(test)]
+pub(crate) static ZC_NOMAT_LAST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_SWEEP_NOMAT=1` makes the round-two sweep materialize the two
+/// folded tables again (the `5d4d2a9` lookahead behavior); the default
+/// no-materialize route computes only the round-two message and the deferred
+/// round-three coefficients in the sweep and re-derives the folded rows from
+/// the packed witness inside the composed rounds-3+4 pass. Independent
+/// same-binary control; the ranked worker's cleared environment never sets it.
+#[inline]
+fn nomat_off() -> bool {
+    #[cfg(test)]
+    if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
@@ -493,7 +518,30 @@ fn prove_packed_padded_inner<C: Challenger>(
         && !no_tail_fusion
         && !lookahead_off();
 
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
+    // No-materialize sweep: with the lookahead on, the round-two sweep no
+    // longer needs to write its two folded tables (2 GiB of stores at the
+    // ranked shape) — the composed rounds-3+4 pass re-derives the folded rows
+    // it consumes straight from the packed witness through the same byte-
+    // table gathers (1 GiB of reads instead of 2 GiB of dense F128), and the
+    // peak zerocheck footprint drops by 2 GiB. The pass always emits the
+    // round-five lookahead too, so it needs `r[k_skip+3] ≠ 0` (β₀ at the
+    // ranked shape). Kill switch: FLOCK_NO_ZC_SWEEP_NOMAT.
+    let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
+    #[cfg(test)]
+    ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
+
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
+        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (Vec::new(), Vec::new(), m1, mi, Some(la))
+    } else if use_lookahead {
         let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             a_packed,
             b_packed,
@@ -549,8 +597,18 @@ fn prove_packed_padded_inner<C: Challenger>(
     // With the lookahead, the first output of the tail is the composed pass's
     // quarter-size table, so the scratch pair is taken at N/4 (the pool's
     // best-fit hands back the same 2^(m-7)-class buffer either way).
-    let n_in = a_mlv.len();
-    let first_out = if lookahead.is_some() { n_in / 4 } else { n_in / 2 };
+    //
+    // No-materialize: `a_mlv`/`b_mlv` are empty; the composed pass writes its
+    // N/4 outputs into freshly taken buffers and the scratch pair is sized for
+    // the fold after it (N/8).
+    let n_in = 1usize << n_mlv;
+    let first_out = if use_nomat {
+        n_in / 8
+    } else if lookahead.is_some() {
+        n_in / 4
+    } else {
+        n_in / 2
+    };
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 || lookahead.is_some() {
         (
             crate::scratch::take_f128(first_out),
@@ -611,12 +669,37 @@ fn prove_packed_padded_inner<C: Challenger>(
         // + 512 MiB of writes into one 2 GiB read + 512 MiB write; level 1
         // turns 512 + 256 MiB reads / 256 + 128 MiB writes into 512 / 128.
         let t_round = std::time::Instant::now();
-        let n_cur = a_mlv.len();
+        let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         let log_n_cur = n_cur.trailing_zeros() as usize;
         let quarter = n_cur / 4;
         let mut r_next = vec![F128::ONE; log_n_cur - 2];
         r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 3..]);
-        let (m_even_1, m_even_inf) = if level + 1 < n_levels {
+        let (m_even_1, m_even_inf) = if level == 0 && use_nomat {
+            // Rounds 3+4 straight from the packed witness (see above); the
+            // outputs land in freshly taken N/4 buffers, and the old (empty)
+            // pair is dropped. Also yields the round-five lookahead.
+            let mut a4 = crate::scratch::take_f128(quarter);
+            let mut b4 = crate::scratch::take_f128(quarter);
+            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                padding,
+                &mut a4,
+                &mut b4,
+                mlv_rhos[0],
+                mlv_rhos[1],
+                &r_next,
+            );
+            a_mlv = a4;
+            b_mlv = b4;
+            if level + 1 < n_levels {
+                la = Some(la_next);
+            }
+            (m1, mi)
+        } else if level + 1 < n_levels {
             let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into(
                 &a_mlv,
                 &b_mlv,
@@ -639,10 +722,12 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next,
             )
         };
-        std::mem::swap(&mut a_mlv, &mut a_nxt);
-        std::mem::swap(&mut b_mlv, &mut b_nxt);
-        a_mlv.truncate(quarter);
-        b_mlv.truncate(quarter);
+        if !(level == 0 && use_nomat) {
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(quarter);
+            b_mlv.truncate(quarter);
+        }
         if level == 0 {
             crate::gaptime::mark("zc: rounds 3+4 composed fold done");
         }
@@ -1076,25 +1161,25 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            // Arms: (lookahead off, cascade2 off, cascade3 off).
+            // Arms: (lookahead off, cascade2 off, cascade3 off, nomat off).
             let arms = [
-                (false, false, false), // full cascade
-                (false, false, true),  // lookahead + cascade2
-                (false, true, true),   // lookahead only
-                (true, true, true),    // incumbent
+                (false, false, false, false), // full: no-materialize sweep + all levels
+                (false, false, false, true),  // materializing sweep + all levels
+                (false, false, true, false),  // nomat + lookahead + cascade2
+                (false, true, true, false),   // nomat + lookahead only
+                (false, true, true, true),    // materializing lookahead only (5d4d2a9)
+                (true, true, true, true),     // incumbent
             ];
             let n_mlv = m - K_SKIP;
-            let expect_levels = [
-                if n_mlv >= 8 { 3 } else if n_mlv >= 7 { 2 } else { 1 },
-                if n_mlv >= 7 { 2 } else { 1 },
-                1,
-                0,
-            ];
+            let all = if n_mlv >= 8 { 3 } else if n_mlv >= 7 { 2 } else { 1 };
+            let expect_levels = [all, all, if n_mlv >= 7 { 2 } else { 1 }, 1, 1, 0];
+            let expect_nomat = [true, false, true, true, false, false];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, nm_off)) in arms.iter().enumerate() {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
+                ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
                 assert_eq!(
@@ -1102,10 +1187,16 @@ mod tests {
                     expect_levels[k],
                     "arm {k} ran the wrong number of levels at m={m}"
                 );
+                assert_eq!(
+                    ZC_NOMAT_LAST.load(Ordering::Relaxed),
+                    expect_nomat[k],
+                    "arm {k} nomat engagement wrong at m={m}"
+                );
             }
             ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
             for (k, (proof, claim)) in results.iter().enumerate().skip(1) {
