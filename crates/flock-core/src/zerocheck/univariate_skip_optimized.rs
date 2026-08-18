@@ -629,6 +629,18 @@ pub fn precompute_round1_ab_inner_windows(
 /// [`Round1AbInner::set_invalid_prefix_bytes`], and round 1 recomputes it on
 /// CPU if the GPU share fails to materialize.
 ///
+/// Round-1 AB completion reads the precomputed AB rows in place instead of
+/// copying each 64-byte row into per-worker scratch first.
+/// `FLOCK_NO_ZC_DIRECT_AB_ROWS=1` restores the scratch copy (exact A/B
+/// control; the kernel consumes identical bytes either way). Resolved once
+/// per process; the hot loop sees a plain bool.
+pub(crate) fn direct_ab_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none()
+    });
+    *ON
+}
+
 /// `FLOCK_NO_AB_INNER_SKIP=1` force-disables the skip (diagnostics).
 pub fn planned_round1_gpu_prefix_bytes(m: usize) -> usize {
     if m < K_SKIP + N_INNER || std::env::var_os("FLOCK_NO_AB_INNER_SKIP").is_some() {
@@ -949,6 +961,7 @@ fn process_one_x_hi_with_precomputed_ab(
         bank.fill(F128::ZERO);
     }
     let n_lo = n_lo_and_inner - N_INNER;
+    let direct_ab_rows = direct_ab_rows_enabled();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -958,15 +971,35 @@ fn process_one_x_hi_with_precomputed_ab(
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med]
-                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            if !direct_ab_rows {
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
             bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
+        // Direct AB rows: the challenge-independent precompute already lays
+        // every window out as sixteen contiguous 64-byte rows (`OUTER_BYTES`
+        // = 1024 per x_outer, so the borrow below is always in bounds even
+        // when only `n_b_med` < 16 rows are consumed). Reading them in place
+        // deletes the per-window 1 KiB scratch copy + reread (~512 MiB of
+        // stores and ~512 MiB of rereads per ranked proof). Same bytes, same
+        // order; the convert kernel only reads rows `0..n_b_med`.
+        let ab_rows: &[[u8; 64]; 1 << N_MEDIUM] = if direct_ab_rows {
+            let block: &[u8; (1 << N_MEDIUM) * 64] = (&ab_inner
+                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+                .try_into()
+                .expect("1024 ab_inner bytes per x_outer window");
+            // SAFETY: `[[u8; 64]; 16]` and `[u8; 1024]` have identical size,
+            // byte alignment and no padding.
+            unsafe { &*block.as_ptr().cast::<[[u8; 64]; 1 << N_MEDIUM]>() }
+        } else {
+            &state.chunk_ab_bytes
+        };
         kernels::accumulate_convert_ab(
-            &state.chunk_ab_bytes,
+            ab_rows,
             n_b_med,
             convert,
             eq_lo_scaled[x_outer_lo],
