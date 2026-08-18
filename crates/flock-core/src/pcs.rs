@@ -105,7 +105,10 @@ pub struct PackedDirectClaim {
 /// diagnostics; the ranked worker's cleared env never sets it). Pool width
 /// cannot change wire bytes: every parallel reduction here is an XOR sum.
 fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "linux"),
+    ))]
     if l >= (1 << 22)
         && std::thread::available_parallelism()
             .is_ok_and(|n| n.get() > rayon::current_num_threads())
