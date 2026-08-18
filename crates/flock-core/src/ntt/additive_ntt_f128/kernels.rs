@@ -186,6 +186,113 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     }
 }
 
+/// [`butterfly_fused_2layer_row_from`] with independent source/destination
+/// row geometry (source rows `i·src_quarter + src_r`, destination rows
+/// `i·dst_quarter + dst_r`).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 3],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_geo(
+            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_geo(
+            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+        );
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse`] with independent
+/// source/destination row geometry.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        )
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only

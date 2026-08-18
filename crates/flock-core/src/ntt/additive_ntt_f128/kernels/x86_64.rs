@@ -160,6 +160,32 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     r: usize,
     twiddles: &[F128; 3],
 ) {
+    // SAFETY: forwarded caller contract; identical geometry on both sides.
+    unsafe {
+        butterfly_fused_2layer_row_from_geo(
+            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+        )
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from`] with independent source and
+/// destination row geometry: source rows `(i·src_quarter + src_r)`,
+/// destination rows `(i·dst_quarter + dst_r)`, `i ∈ 0..4`.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 3],
+) {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -172,8 +198,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
         let outer = broadcast(t_outer);
         let inner_a = broadcast(t_inner_a);
         let inner_b = broadcast(t_inner_b);
-        let src_row = |i: usize| src.add((i * quarter + r) * num_ntts);
-        let dst_row = |i: usize| dst.add((i * quarter + r) * num_ntts);
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
         let mut lane = 0;
         while lane < lanes {
@@ -245,6 +271,38 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     r: usize,
     right_twiddle: F128,
 ) {
+    // SAFETY: forwarded caller contract; identical geometry on both sides.
+    unsafe {
+        butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            quarter,
+            r,
+            dst,
+            quarter,
+            r,
+            num_ntts,
+            right_twiddle,
+        )
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse`] with independent source and
+/// destination row geometry (see [`butterfly_fused_2layer_row_from_geo`]).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+) {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -255,8 +313,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
             right_twiddle.hi as i64,
             right_twiddle.lo as i64,
         ));
-        let src_row = |i: usize| src.add((i * quarter + r) * num_ntts);
-        let dst_row = |i: usize| dst.add((i * quarter + r) * num_ntts);
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
         let mut lane = 0;
         while lane < lanes {

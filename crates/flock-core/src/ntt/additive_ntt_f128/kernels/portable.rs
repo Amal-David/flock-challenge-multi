@@ -96,13 +96,38 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     r: usize,
     twiddles: &[F128; 3],
 ) {
+    // SAFETY: forwarded caller contract; identical geometry on both sides.
+    unsafe {
+        butterfly_fused_2layer_row_from_geo(
+            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+        )
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from`] with independent source and
+/// destination row geometry: source rows `(i·src_quarter + src_r)`,
+/// destination rows `(i·dst_quarter + dst_r)`, `i ∈ 0..4`.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 3],
+) {
     let [t_outer, t_inner_a, t_inner_b] = *twiddles;
     unsafe {
         for lane in 0..num_ntts {
-            let mut a = *src.add(r * num_ntts + lane);
-            let mut b = *src.add((quarter + r) * num_ntts + lane);
-            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
-            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+            let mut a = *src.add(src_r * num_ntts + lane);
+            let mut b = *src.add((src_quarter + src_r) * num_ntts + lane);
+            let mut c = *src.add((2 * src_quarter + src_r) * num_ntts + lane);
+            let mut d = *src.add((3 * src_quarter + src_r) * num_ntts + lane);
 
             let new_a = a + c * t_outer;
             c += new_a;
@@ -118,10 +143,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
             d += new_c;
             c = new_c;
 
-            *dst.add(r * num_ntts + lane) = a;
-            *dst.add((quarter + r) * num_ntts + lane) = b;
-            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
-            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+            *dst.add(dst_r * num_ntts + lane) = a;
+            *dst.add((dst_quarter + dst_r) * num_ntts + lane) = b;
+            *dst.add((2 * dst_quarter + dst_r) * num_ntts + lane) = c;
+            *dst.add((3 * dst_quarter + dst_r) * num_ntts + lane) = d;
         }
     }
 }
@@ -143,12 +168,43 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     r: usize,
     right_twiddle: F128,
 ) {
+    // SAFETY: forwarded caller contract; identical geometry on both sides.
+    unsafe {
+        butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            quarter,
+            r,
+            dst,
+            quarter,
+            r,
+            num_ntts,
+            right_twiddle,
+        )
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse`] with independent source and
+/// destination row geometry (see [`butterfly_fused_2layer_row_from_geo`]).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+) {
     unsafe {
         for lane in 0..num_ntts {
-            let a = *src.add(r * num_ntts + lane);
-            let mut b = *src.add((quarter + r) * num_ntts + lane);
-            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
-            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+            let a = *src.add(src_r * num_ntts + lane);
+            let mut b = *src.add((src_quarter + src_r) * num_ntts + lane);
+            let mut c = *src.add((2 * src_quarter + src_r) * num_ntts + lane);
+            let mut d = *src.add((3 * src_quarter + src_r) * num_ntts + lane);
 
             // Layer 1 and the left layer-2 butterfly have zero twiddle.
             c += a;
@@ -158,10 +214,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
             d += new_c;
             c = new_c;
 
-            *dst.add(r * num_ntts + lane) = a;
-            *dst.add((quarter + r) * num_ntts + lane) = b;
-            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
-            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+            *dst.add(dst_r * num_ntts + lane) = a;
+            *dst.add((dst_quarter + dst_r) * num_ntts + lane) = b;
+            *dst.add((2 * dst_quarter + dst_r) * num_ntts + lane) = c;
+            *dst.add((3 * dst_quarter + dst_r) * num_ntts + lane) = d;
         }
     }
 }

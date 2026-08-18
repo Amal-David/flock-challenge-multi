@@ -204,6 +204,33 @@ fn ntt_top_fusion_disabled() -> bool {
 static TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `FLOCK_NO_NTT_SEED_TOP_FUSION=1` keeps the rate-1/2 seed (layers 1–2) as
+/// its own out-of-place pass; the default folds it into the six-layer top
+/// task ([`AdditiveNttF128::seed_top_fused8_pass`]) so the codeword is
+/// written once, already at layer 9. Independent of `FLOCK_NO_NTT_TOP_FUSION`
+/// (which disables both).
+fn ntt_seed_top_fusion_disabled() -> bool {
+    #[cfg(test)]
+    if SEED_TOP_FUSION_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
+}
+
+/// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
+#[cfg(test)]
+static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only counters: how many times each fused pass actually ran (so the
+/// equality tests can assert they exercised the fused route, not a fallback).
+#[cfg(test)]
+static TOP_FUSION_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
 ///
 /// The ambient publication is honored ONLY at the exact ranked production
@@ -453,13 +480,75 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         if log_inv_rate == 1 && log_d >= 12 && !rate_half_seed_disabled() {
-            self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
-            self.forward_transform_interleaved_from_layer(codeword, num_ntts, 3);
+            self.seed_rate_half_then_transform(msg, codeword, num_ntts, log_d, None);
             return;
         }
 
         replicate_message_fill(codeword, msg);
         self.forward_transform_interleaved_from_layer(codeword, num_ntts, log_inv_rate);
+    }
+
+    /// Rate-1/2 seed fast path: layers 1–2 come straight from the message,
+    /// then the interleaved parallel transform continues from layer 3.
+    ///
+    /// When the six-layer top fusion is on and layers 3..8 are all top layers
+    /// (`n_top ≥ 9`), the seed is folded INTO the first top task
+    /// ([`Self::seed_top_fused8_pass`]) so the 1 GiB codeword is written once,
+    /// already at layer 9, instead of written by the seed and then read+written
+    /// by the top pass. `FLOCK_NO_NTT_SEED_TOP_FUSION=1` (or the top-fusion
+    /// switch) restores the separate seed pass.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn seed_rate_half_then_transform(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
+    ) {
+        let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        let fuse_seed = Self::top_fusion_available()
+            && !ntt_top_fusion_disabled()
+            && !ntt_seed_top_fusion_disabled()
+            && n_top >= 9
+            && log_d >= 9;
+        if fuse_seed {
+            // The impl re-checks the preconditions and runs the separate seed
+            // pass itself if anything disagrees.
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                3,
+                None,
+                on_sub_done,
+                Some(msg),
+            );
+        } else {
+            self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                3,
+                None,
+                on_sub_done,
+                None,
+            );
+        }
+    }
+
+    /// Whether the fused top-layer kernels are worth using on this build: the
+    /// AVX-512 fused-four kernel in production, and the portable kernels in
+    /// test builds so the schedule is exercised everywhere.
+    #[inline]
+    const fn top_fusion_available() -> bool {
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )) || cfg!(test)
     }
 
     /// [`Self::rs_encode_interleaved`] plus a same-worker hook: after the
@@ -497,14 +586,7 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         if log_inv_rate == 1 && log_d >= 12 && !rate_half_seed_disabled() {
-            self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
-            self.forward_transform_interleaved_parallel_from_layer_impl(
-                codeword,
-                num_ntts,
-                3,
-                None,
-                Some(on_range_done),
-            );
+            self.seed_rate_half_then_transform(msg, codeword, num_ntts, log_d, Some(on_range_done));
             return;
         }
 
@@ -520,6 +602,7 @@ impl AdditiveNttF128 {
                 log_inv_rate,
                 None,
                 Some(on_range_done),
+                None,
             );
         }
         #[cfg(not(any(
@@ -589,6 +672,7 @@ impl AdditiveNttF128 {
                     3,
                     Some((n_chunks, on_chunk)),
                     None,
+                    None,
                 );
                 return;
             }
@@ -598,6 +682,7 @@ impl AdditiveNttF128 {
                 num_ntts,
                 log_inv_rate,
                 Some((n_chunks, on_chunk)),
+                None,
                 None,
             );
         }
@@ -754,6 +839,8 @@ impl AdditiveNttF128 {
         odd_tail: usize,
     ) {
         use rayon::prelude::*;
+        #[cfg(test)]
+        TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug_assert!(layer + 6 <= log_d);
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
@@ -790,7 +877,6 @@ impl AdditiveNttF128 {
             let block = idx / sub_stride;
             let r = idx % sub_stride;
             let block_start = block * block_bytes;
-            let lanes4 = row_lanes(r, num_ntts, lanes4_tail);
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: rows `block_start + (r + k·S)·num_ntts`, k ∈ 0..64, lie
             // inside block `block` of `data`; distinct (block, r) select
@@ -807,6 +893,8 @@ impl AdditiveNttF128 {
                 // sixteenth = 4 in staging-row units, r' = j.
                 let tw = &tw4[block];
                 for j in 0..4 {
+                    // The incumbent fused-four row group is r' = r + j·S.
+                    let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
                     kernels::butterfly_fused_4layer_row(buf.as_mut_ptr(), 4, row_len, lanes4, j, tw);
                 }
                 // Layers layer+4, layer+5: fused-two on quads {4m..4m+4};
@@ -840,6 +928,168 @@ impl AdditiveNttF128 {
             (0..n_tasks)
                 .into_par_iter()
                 .for_each_init(|| vec![F128::ZERO; 64 * row_len], |buf, idx| task(buf, idx));
+        }
+    }
+
+    /// [`Self::top_fused6_pass`] for layers 3..9 with the rate-1/2 seed
+    /// (layers 1–2, out of place from `msg`) folded into the same task, so
+    /// the codeword is written exactly once — already at layer 9 — instead of
+    /// being written by the seed pass and then read + written by the top pass.
+    ///
+    /// Geometry (`B = 2^(log_d − 3)` positions per layer-3 block, eight
+    /// blocks, `S = B / 64`): the seed row group `r_s ∈ 0..B` reads message
+    /// rows `r_s + i·B` (`i ∈ 0..4`) and produces codeword rows `r_s + i·B`
+    /// (blocks 0..4, sparse-twiddle kernel) and `4B + r_s + i·B` (blocks
+    /// 4..8) — one row at offset `r_s` in every layer-3 block. A task is one
+    /// `r ∈ 0..S`; it seeds the 64 row groups `r_s = r + k·S` (`k ∈ 0..64`)
+    /// straight into a contiguous 512-row staging block laid out as
+    /// `[block][k]`, then runs the six top layers on each block's 64 rows
+    /// exactly as [`Self::top_fused6_pass`] does, then scatters the 512 rows
+    /// to their codeword positions. Every codeword row is produced by exactly
+    /// one task. Byte-identical to seed pass + top pass by construction (same
+    /// kernels, same twiddles, same lane bounds; the seed kernels write all
+    /// lanes, so the structurally zero tail lanes stay zero).
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn seed_top_fused8_pass(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        odd_tail: usize,
+    ) {
+        use rayon::prelude::*;
+        #[cfg(test)]
+        SEED_TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        const LAYER: usize = 3;
+        debug_assert!(log_d >= 9);
+        debug_assert_eq!(data.len(), 2 * msg.len());
+        let block_size = 1usize << (log_d - LAYER); // B, also the seed quarter
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert_eq!(msg_positions >> 2, block_size);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6; // S
+        debug_assert!(sub_stride >= 1);
+        let sixteenth = block_size >> 4;
+        let quarter = sub_stride;
+        let lanes4_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        let lanes2_tail = if quarter.is_multiple_of(2) { odd_tail } else { 0 };
+        let row_len = num_ntts;
+
+        // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let seed_right = seed_tw[0][2];
+        let seed_dense = seed_tw[1];
+
+        let tw4: Vec<[F128; 15]> = (0..8)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(LAYER, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+
+        let src_addr = msg.as_ptr() as usize;
+        let base_addr = data.as_mut_ptr() as usize;
+        let task = |buf: &mut Vec<F128>, r: usize| {
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
+            // `msg`; codeword rows `block·B + r + k·S` are inside `data`;
+            // distinct `r` select pairwise-disjoint codeword row sets, so no two
+            // concurrent tasks write the same element. `buf` (512 rows) is this
+            // worker's private staging block.
+            unsafe {
+                let src = src_addr as *const F128;
+                let base = base_addr as *mut F128;
+                let bufp = buf.as_mut_ptr();
+                // Seed: 64 row groups → staging rows [block][k].
+                for k in 0..64 {
+                    let r_s = r + k * sub_stride;
+                    kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                        src,
+                        block_size,
+                        r_s,
+                        bufp.add(k * row_len),
+                        64,
+                        0,
+                        row_len,
+                        seed_right,
+                    );
+                    kernels::butterfly_fused_2layer_row_from_geo(
+                        src,
+                        block_size,
+                        r_s,
+                        bufp.add((256 + k) * row_len),
+                        64,
+                        0,
+                        row_len,
+                        &seed_dense,
+                    );
+                }
+                // Layers 3..9 per block, in the staging block.
+                for block in 0..8 {
+                    let region = bufp.add(block * 64 * row_len);
+                    let tw = &tw4[block];
+                    for j in 0..4 {
+                        let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                        kernels::butterfly_fused_4layer_row(region, 4, row_len, lanes4, j, tw);
+                    }
+                    for m in 0..16 {
+                        let outer_block = block * 16 + m;
+                        let t_outer = self.twiddle(LAYER + 4, outer_block);
+                        let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
+                        let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                        let p = region.add(4 * m * row_len);
+                        let a = std::slice::from_raw_parts_mut(p, lanes2);
+                        let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
+                        let c = std::slice::from_raw_parts_mut(p.add(2 * row_len), lanes2);
+                        let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
+                        kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+                    }
+                }
+                // Scatter: staging [block][k] → codeword row block·B + r + k·S.
+                for block in 0..8 {
+                    for k in 0..64 {
+                        core::ptr::copy_nonoverlapping(
+                            bufp.add((block * 64 + k) * row_len),
+                            base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                            row_len,
+                        );
+                    }
+                }
+            }
+        };
+
+        const PARALLEL_TASK_THRESHOLD: usize = 32;
+        if sub_stride < PARALLEL_TASK_THRESHOLD {
+            let mut buf = vec![F128::ZERO; 512 * row_len];
+            for r in 0..sub_stride {
+                task(&mut buf, r);
+            }
+        } else {
+            (0..sub_stride)
+                .into_par_iter()
+                .for_each_init(|| vec![F128::ZERO; 512 * row_len], |buf, r| task(buf, r));
         }
     }
 
@@ -917,36 +1167,17 @@ impl AdditiveNttF128 {
             start_layer,
             None,
             None,
+            None,
         );
     }
 
     /// Body of [`Self::forward_transform_interleaved_parallel_from_layer`],
     /// with an optional ordered-chunk streaming hook `(n_chunks, on_chunk)` —
     /// see [`Self::rs_encode_interleaved_streamed`] for the callback contract.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
-    fn forward_transform_interleaved_parallel_from_layer_impl(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        stream: Option<(
-            usize,
-            &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
-        )>,
-        on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
-    ) {
-        use rayon::prelude::*;
-        let n_total = data.len();
-        let log_d = log2_pow2(n_total / num_ntts);
-        // Trailing lanes that are statically zero on every odd position of
-        // this buffer (ranked commit only; 0 everywhere else). Each sweep
-        // below re-guards it on its own sub-block stride being even, which is
-        // what keeps a row group single-parity.
-        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
-
+    /// Number of whole-buffer ("top") layers of the interleaved parallel
+    /// transform; the remaining `log_d − n_top` layers run cache-resident per
+    /// sub-group. Depends on the rayon pool width at call time.
+    fn interleaved_n_top(log_d: usize, num_ntts: usize) -> usize {
         // Target sub-group size = 2 MB total bytes. Each position is
         // `num_ntts × 16` bytes, so positions per sub-group =
         // 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
@@ -973,13 +1204,62 @@ impl AdditiveNttF128 {
         // than the ~0.04 ms of work, so those stay scalar.
         const PARALLEL_FLOOR_LOG_D: usize = 12;
         const MIN_SUB_LOG: usize = 8;
-        let n_top = if log_d >= PARALLEL_FLOOR_LOG_D {
+        if log_d >= PARALLEL_FLOOR_LOG_D {
             let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two());
             let max_n_top = log_d.saturating_sub(MIN_SUB_LOG);
             cache_n_top.max(want_subs_log.min(max_n_top))
         } else {
             cache_n_top
-        };
+        }
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_impl(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        stream: Option<(
+            usize,
+            &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
+        )>,
+        on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
+        seed_msg: Option<&[F128]>,
+    ) {
+        use rayon::prelude::*;
+        let n_total = data.len();
+        let log_d = log2_pow2(n_total / num_ntts);
+        // Trailing lanes that are statically zero on every odd position of
+        // this buffer (ranked commit only; 0 everywhere else). Each sweep
+        // below re-guards it on its own sub-block stride being even, which is
+        // what keeps a row group single-parity.
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+
+        let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        // Six top layers per DRAM pass (default on AVX-512; portable in
+        // tests): a fused-four sweep followed by a fused-two sweep would read
+        // and write the whole buffer twice; the cache-blocked task below does
+        // both on a 64-row working set that stays in L2, so each top row is
+        // read once and written once for all six layers. Same butterflies,
+        // same order per row, same lane bounds and twiddles → bit-identical.
+        // Not applied on the (dead-on-x86) ordered-streaming arm.
+        let top_fusion_ok =
+            Self::top_fusion_available() && stream.is_none() && !ntt_top_fusion_disabled();
+        // Seed fusion: `seed_msg` means layers 1–2 have NOT been applied yet
+        // and the caller expects the first top task to apply them from the
+        // message. That is only possible when layers 3..8 are all top layers;
+        // otherwise run the separate seed pass here and continue as usual.
+        let mut seed_msg = seed_msg;
+        if let Some(msg) = seed_msg {
+            let fits = start_layer == 3 && top_fusion_ok && n_top >= 9 && log_d >= 9;
+            if !fits {
+                self.seed_rate_half_layers_1_through_2(msg, data, num_ntts);
+                seed_msg = None;
+            }
+        }
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             let n_positions = n_total / num_ntts;
@@ -1016,21 +1296,18 @@ impl AdditiveNttF128 {
         // portable kernel without changing the production dispatch on CPUs
         // that do not provide AVX-512 VPCLMULQDQ.
         let deep_fused4_ok = fused4_ok || cfg!(test);
-        // Six top layers per DRAM pass (default on AVX-512; portable in
-        // tests): a fused-four sweep followed by a fused-two sweep would read
-        // and write the whole buffer twice; the cache-blocked task below does
-        // both on a 64-row working set that stays in L2, so each top row is
-        // read once and written once for all six layers. Same butterflies,
-        // same order per row, same lane bounds and twiddles → bit-identical.
-        // Not applied on the (dead-on-x86) ordered-streaming arm.
-        let top_fusion_ok = (fused4_ok || cfg!(test)) && stream.is_none() && !ntt_top_fusion_disabled();
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
             let block_bytes = block_size * num_ntts;
 
-            if top_fusion_ok && layer + 5 < n_top {
+            if let Some(msg) = seed_msg.take() {
+                // Checked above: layer == 3, top fusion on, n_top ≥ 9.
+                debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
+                self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
+                layer += 6;
+            } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
                 layer += 6;
             } else if fused4_ok && layer + 3 < n_top && block_size >= 16 {
@@ -2657,11 +2934,16 @@ mod tests {
                     start_layer,
                 );
                 TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+                let hits_before = TOP_FUSION_HITS.load(Ordering::Relaxed);
                 let mut candidate = original.clone();
                 ntt.forward_transform_interleaved_parallel_from_layer(
                     &mut candidate,
                     num_ntts,
                     start_layer,
+                );
+                assert!(
+                    TOP_FUSION_HITS.load(Ordering::Relaxed) > hits_before,
+                    "top fusion did not run at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
                 );
                 (control, candidate)
             });
@@ -2675,6 +2957,64 @@ mod tests {
                 candidate == expected,
                 "top fusion mismatch at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
             );
+        }
+    }
+
+    /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs
+    /// the separate seed pass + fused top, vs the scalar full NTT, on the
+    /// `rs_encode_interleaved` path (which the ranked commit uses through
+    /// `rs_encode_interleaved_on_range_done`). Junk-filled codewords catch any
+    /// row a task fails to produce. The 512-thread pool raises `n_top` to 9
+    /// so the small shapes reproduce the ranked top structure.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn seed_top_fusion_matches_seed_pass() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0x5EED_F8);
+        // (log_d, num_ntts, threads): n_top ≥ 9 in each (log_d − 8 ≥ 9 caps at log_d ≥ 17)
+        for &(log_d, num_ntts, threads) in &[(17usize, 8usize, 512usize), (17, 4, 512), (18, 8, 512)] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> 1;
+            let msg = rand_vec(&mut rng, msg_len);
+            let (control, candidate, ranges_ok) = pool.install(|| {
+                assert!(
+                    AdditiveNttF128::interleaved_n_top(log_d, num_ntts) >= 9,
+                    "test shape must have ≥ 9 top layers"
+                );
+                SEED_TOP_FUSION_TEST_OFF.store(true, Ordering::Relaxed);
+                let mut control = junk_vec(codeword_len);
+                ntt.rs_encode_interleaved(&msg, &mut control, num_ntts);
+                SEED_TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+                let mut candidate = junk_vec(codeword_len);
+                let hits_before = SEED_TOP_FUSION_HITS.load(Ordering::Relaxed);
+                // Through the callback entry the ranked commit uses; count
+                // the covered positions to make sure the deep pass still
+                // fires the sub-group hooks exactly once each.
+                let covered = std::sync::atomic::AtomicUsize::new(0);
+                ntt.rs_encode_interleaved_on_range_done(&msg, &mut candidate, num_ntts, &|range, sub| {
+                    assert_eq!(sub.len(), range.len() * num_ntts);
+                    covered.fetch_add(range.len(), Ordering::Relaxed);
+                });
+                assert!(
+                    SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) > hits_before,
+                    "seed fusion did not run at log_d={log_d} num_ntts={num_ntts}"
+                );
+                (control, candidate, covered.load(Ordering::Relaxed) == 1 << log_d)
+            });
+            assert!(ranges_ok, "on_range_done did not cover the codeword once at log_d={log_d}");
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert!(control == oracle, "separate seed pass mismatch at log_d={log_d} num_ntts={num_ntts}");
+            assert!(candidate == oracle, "seed fusion mismatch at log_d={log_d} num_ntts={num_ntts}");
         }
     }
 
@@ -2895,6 +3235,55 @@ mod zero_lane_ranked_ab_probe {
         data.extend_from_slice(&msg);
         data.extend_from_slice(&msg);
         data
+    }
+
+    /// Ranked commit geometry, full rate-1/2 encode (`rs_encode_interleaved`
+    /// = seed + top + deep) with the odd-row zero-lane tail armed: byte-equality
+    /// of the 1 GiB codeword with the seed fusion on vs off (top fusion on in
+    /// both), plus interleaved min-of-N timing of the whole encode.
+    #[test]
+    #[ignore = "ranked shape: ~2.5 GiB resident"]
+    fn seed_top_fusion_ranked_ab() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        const NUM_NTTS: usize = 64;
+        const MSG_POS: usize = 1 << 19;
+        let ntt = AdditiveNttF128::standard(20);
+        // Message with the ranked padding pattern (lanes 57..63 zero on odd
+        // positions), same generator as `ranked_buffer`'s first half.
+        let msg: Vec<F128> = ranked_buffer(0x5EED_F8_0BEE_D00D)[..MSG_POS * NUM_NTTS].to_vec();
+        let _g = ZeroOddTailLanes::scope(NUM_NTTS, 7);
+
+        SEED_TOP_FUSION_TEST_OFF.store(true, Ordering::Relaxed);
+        let mut control = vec![F128::ZERO; 2 * msg.len()];
+        ntt.rs_encode_interleaved(&msg, &mut control, NUM_NTTS);
+        SEED_TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+        let mut candidate = vec![F128 { lo: !0, hi: !0 }; 2 * msg.len()];
+        ntt.rs_encode_interleaved(&msg, &mut candidate, NUM_NTTS);
+        assert!(control == candidate, "seed fusion changed the ranked encode output");
+        drop(control);
+
+        let mut best = [f64::MAX; 2];
+        for rep in 0..6 {
+            for arm in 0..2 {
+                SEED_TOP_FUSION_TEST_OFF.store(arm == 0, Ordering::Relaxed);
+                let t = Instant::now();
+                ntt.rs_encode_interleaved(&msg, &mut candidate, NUM_NTTS);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(&candidate);
+                if ms < best[arm] {
+                    best[arm] = ms;
+                }
+                let name = if arm == 0 { "seed+top6" } else { "seedtop8" };
+                println!("rep={rep} arm={name} ms={ms:.2}");
+            }
+        }
+        SEED_TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+        let delta = (best[0] - best[1]) / best[0] * 100.0;
+        println!(
+            "MIN seed+top6={:.2} ms  seedtop8={:.2} ms  delta={delta:+.2}%",
+            best[0], best[1]
+        );
     }
 
     /// Ranked commit geometry: six-layer top fusion vs the incumbent schedule
