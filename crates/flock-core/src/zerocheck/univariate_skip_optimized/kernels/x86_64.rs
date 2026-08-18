@@ -1,7 +1,7 @@
+#[cfg(target_feature = "gfni")]
+use super::super::{InvNttTableByteSingleGf8, F8, N_CHUNKS};
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 use super::super::{ELL, F128, N_MEDIUM};
-#[cfg(target_feature = "gfni")]
-use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
@@ -138,7 +138,9 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
         _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }
 }
-/// partials. The C side is table-free (see `kernels::accumulate_c_banks`).
+
+/// Scalar 256-entry GPR convert. Kill-switch / oracle for the nibble kernel.
+/// The C side is table-free (see `kernels::accumulate_c_banks`).
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -179,6 +181,172 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 ab_ptr,
                 _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
             );
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[repr(C, align(64))]
+struct ConvertNibbleLut {
+    n0_lo: [[u64; 16]; 16],
+    n0_hi: [[u64; 16]; 16],
+    n1_lo: [[u64; 16]; 16],
+    n1_hi: [[u64; 16]; 16],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_convert_nibble_lut(convert: &[F128]) -> ConvertNibbleLut {
+    debug_assert!(convert.len() >= 16 * 256);
+    let mut lut = ConvertNibbleLut {
+        n0_lo: [[0; 16]; 16],
+        n0_hi: [[0; 16]; 16],
+        n1_lo: [[0; 16]; 16],
+        n1_hi: [[0; 16]; 16],
+    };
+    for b in 0..16 {
+        let base = b * 256;
+        for i in 0..16 {
+            lut.n0_lo[b][i] = convert[base + i].lo;
+            lut.n0_hi[b][i] = convert[base + i].hi;
+            lut.n1_lo[b][i] = convert[base + (i << 4)].lo;
+            lut.n1_hi[b][i] = convert[base + (i << 4)].hi;
+        }
+    }
+    lut
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn production_convert_nibble_lut() -> &'static ConvertNibbleLut {
+    static LUT: std::sync::OnceLock<ConvertNibbleLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| build_convert_nibble_lut(super::super::convert_table()))
+}
+
+/// F₂-linear nibble-LUT AB convert. Production `convert[b][v] = γ^b · φ₈(v)`
+/// is F₂-linear in the bits of `v`: `φ₈` is a field homomorphism (AES-GF(256)
+/// addition is XOR) and multiplication by `γ^b` is F₂-linear, so
+/// `T[byte] = T[n0] ⊕ T[n1 << 4]`. Same 16-entry SoA `vpermi2q` path as the
+/// C-drain nibble kernel; replaces 4 scalar 256-entry GPR loads per 4-lane
+/// group. Bit-identical to [`accumulate_convert_ab_x86_avx512`] on linear
+/// tables.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::*;
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    debug_assert!(convert.len() >= n_b_med * 256);
+
+    let owned;
+    let production = super::super::convert_table();
+    let lut: &ConvertNibbleLut =
+        if convert.as_ptr() == production.as_ptr() && convert.len() == production.len() {
+            production_convert_nibble_lut()
+        } else {
+            owned = build_convert_nibble_lut(convert);
+            &owned
+        };
+
+    #[inline(always)]
+    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
+        unsafe {
+            let a = _mm512_load_si512(table as *const __m512i);
+            let b = _mm512_load_si512(table.add(8) as *const __m512i);
+            _mm512_permutex2var_epi64(a, idx, b)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn interleave_aos(los: __m512i, his: __m512i) -> (__m512i, __m512i) {
+        unsafe {
+            let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+            let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+            (
+                _mm512_permutex2var_epi64(los, idx0, his),
+                _mm512_permutex2var_epi64(los, idx1, his),
+            )
+        }
+    }
+
+    // SAFETY: each 16-byte row load is inside a 64-byte AB row; nibble
+    // indices are 0..=15 by AND-0xf so every vpermi2q stays in a 16-entry
+    // table half. Eq scaling and partial XOR cover four F128s per store.
+    unsafe {
+        let nibble_mask = _mm512_set1_epi32(0xf);
+        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        for lane_base in (0..ELL).step_by(16) {
+            let mut los = [_mm512_setzero_si512(); 2];
+            let mut his = [_mm512_setzero_si512(); 2];
+            for b_med in 0..n_b_med {
+                let row_ptr = chunk_ab_bytes[b_med].as_ptr().add(lane_base);
+                let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
+                let row = _mm512_cvtepu8_epi32(row_bytes);
+                let n0 = _mm512_and_si512(row, nibble_mask);
+                let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(row), nibble_mask);
+                for group in 0..2 {
+                    let n0_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
+                    };
+                    let n1_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
+                    };
+                    los[group] = _mm512_xor_si512(
+                        los[group],
+                        _mm512_xor_si512(
+                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
+                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
+                        ),
+                    );
+                    his[group] = _mm512_xor_si512(
+                        his[group],
+                        _mm512_xor_si512(
+                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
+                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
+                        ),
+                    );
+                }
+            }
+            for group in 0..2 {
+                let (aos0, aos1) = interleave_aos(los[group], his[group]);
+                let scaled0 = ghash_mul_x4(aos0, eq);
+                let scaled1 = ghash_mul_x4(aos1, eq);
+                let partial_ptr =
+                    partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
+                _mm512_storeu_si512(
+                    partial_ptr,
+                    _mm512_xor_si512(_mm512_loadu_si512(partial_ptr), scaled0),
+                );
+                _mm512_storeu_si512(
+                    partial_ptr.add(1),
+                    _mm512_xor_si512(_mm512_loadu_si512(partial_ptr.add(1)), scaled1),
+                );
+            }
         }
     }
 }
@@ -275,18 +443,12 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
                         2 * (m0 >> 8),
                     );
 
-                    let from_lo = _mm512_i64gather_epi64::<8>(
-                        lo_indices,
-                        t_lo.as_ptr() as *const i64,
-                    );
-                    let from_hi = _mm512_i64gather_epi64::<8>(
-                        hi_indices,
-                        t_hi.as_ptr() as *const i64,
-                    );
-                    let partial_ptr = bank
-                        .as_mut_ptr()
-                        .add(lane_base + lane_in_group)
-                        as *mut __m512i;
+                    let from_lo =
+                        _mm512_i64gather_epi64::<8>(lo_indices, t_lo.as_ptr() as *const i64);
+                    let from_hi =
+                        _mm512_i64gather_epi64::<8>(hi_indices, t_hi.as_ptr() as *const i64);
+                    let partial_ptr =
+                        bank.as_mut_ptr().add(lane_base + lane_in_group) as *mut __m512i;
                     let updated = _mm512_xor_si512(
                         _mm512_loadu_si512(partial_ptr),
                         _mm512_xor_si512(from_lo, from_hi),
@@ -517,17 +679,15 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
 mod tests {
     use super::super::accumulate_c_banks_scalar;
     use super::{
-        accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble, F128,
+        accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
+        accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble, F128,
     };
 
     #[test]
     fn accumulate_c_banks_avx512_matches_scalar() {
         let mut c_block = [0u8; 16 * 64];
         for (i, byte) in c_block.iter_mut().enumerate() {
-            *byte = (i as u8)
-                .wrapping_mul(0x9d)
-                .rotate_left((i & 7) as u32)
-                ^ (i >> 3) as u8;
+            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32) ^ (i >> 3) as u8;
         }
 
         let mut mask_tables = [F128::ZERO; 512];
@@ -535,8 +695,7 @@ mod tests {
             let x = i as u64;
             *value = F128::new(
                 x.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x0123_4567_89ab_cdef,
-                x.rotate_left(29).wrapping_mul(0xd6e8_feb8_6659_fd93)
-                    ^ 0xfedc_ba98_7654_3210,
+                x.rotate_left(29).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ 0xfedc_ba98_7654_3210,
             );
         }
 
@@ -556,12 +715,7 @@ mod tests {
             // SAFETY: this test is compiled only when the kernel's target
             // features are statically enabled; all buffers have exact sizes.
             unsafe {
-                accumulate_c_banks_x86_avx512(
-                    &c_block,
-                    n_b_med,
-                    &mask_tables,
-                    &mut simd,
-                );
+                accumulate_c_banks_x86_avx512(&c_block, n_b_med, &mask_tables, &mut simd);
             }
             assert_eq!(simd, scalar, "n_b_med={n_b_med}");
         }
@@ -608,10 +762,7 @@ mod tests {
     fn ranked_shape_c_block() -> [u8; 16 * 64] {
         let mut c_block = [0u8; 16 * 64];
         for (i, byte) in c_block.iter_mut().enumerate() {
-            *byte = (i as u8)
-                .wrapping_mul(0x9d)
-                .rotate_left((i & 7) as u32)
-                ^ (i >> 3) as u8;
+            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32) ^ (i >> 3) as u8;
         }
         c_block
     }
@@ -628,16 +779,45 @@ mod tests {
 
             accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut scalar);
             unsafe {
-                accumulate_c_banks_x86_avx512_nibble(
-                    &c_block,
-                    n_b_med,
-                    &mask_tables,
-                    &mut nibble,
-                );
+                accumulate_c_banks_x86_avx512_nibble(&c_block, n_b_med, &mask_tables, &mut nibble);
                 accumulate_c_banks_x86_avx512(&c_block, n_b_med, &mask_tables, &mut gather);
             }
             assert_eq!(nibble, scalar, "nibble vs scalar n_b_med={n_b_med}");
             assert_eq!(gather, scalar, "gather vs scalar n_b_med={n_b_med}");
+        }
+    }
+
+    #[test]
+    fn accumulate_convert_ab_nibble_matches_gpr_on_convert_table() {
+        let convert = super::super::super::convert_table();
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for b_med in 0..16 {
+            for lane in 0..64 {
+                chunk_ab_bytes[b_med][lane] = (b_med * 17 + lane * 13) as u8 ^ 0x5a;
+            }
+        }
+        let eq = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for n_b_med in 0..=16 {
+            let mut seed = [F128::ZERO; 64];
+            for (lane, value) in seed.iter_mut().enumerate() {
+                *value = F128::new(
+                    (lane as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                    (lane as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                );
+            }
+            let mut gpr = seed;
+            let mut nibble = seed;
+            unsafe {
+                accumulate_convert_ab_x86_avx512(&chunk_ab_bytes, n_b_med, convert, eq, &mut gpr);
+                accumulate_convert_ab_x86_avx512_nibble(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq,
+                    &mut nibble,
+                );
+            }
+            assert_eq!(nibble, gpr, "n_b_med={n_b_med}");
         }
     }
 }

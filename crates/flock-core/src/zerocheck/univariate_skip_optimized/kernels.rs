@@ -1,4 +1,4 @@
-use super::{F8, InvNttTableByteSingleGf8};
+use super::{InvNttTableByteSingleGf8, F8};
 
 mod portable;
 
@@ -239,13 +239,23 @@ pub(super) fn accumulate_convert_ab(
     ))]
     // SAFETY: the cfg gate supplies the SIMD features and fixed arrays bound all accesses.
     unsafe {
-        x86_64::accumulate_convert_ab_x86_avx512(
-            chunk_ab_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-        );
+        if ab_nibble_lut_enabled() {
+            x86_64::accumulate_convert_ab_x86_avx512_nibble(
+                chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+            );
+        } else {
+            x86_64::accumulate_convert_ab_x86_avx512(
+                chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+            );
+        }
     }
 
     #[cfg(not(all(
@@ -260,6 +270,20 @@ pub(super) fn accumulate_convert_ab(
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
     }
+}
+
+/// Ranked default is the nibble-LUT AB convert. `FLOCK_NO_AB_NIBBLE=1`
+/// restores the scalar 256-entry GPR kernel for one-process A/B; the ranked
+/// worker's cleared env never sets it. Production `convert[b][v] = γ^b · φ₈(v)`
+/// is F₂-linear in `v`, so a byte lookup equals the XOR of two nibble lookups.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ab_nibble_lut_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_AB_NIBBLE").is_none())
 }
 
 /// Ranked default is the nibble-LUT drain. `FLOCK_NO_C_NIBBLE=1` restores the
@@ -296,19 +320,9 @@ pub(super) fn accumulate_c_banks(
     // partial arrays and the asserted 512-entry table bound every access.
     unsafe {
         if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble(
-                c_block,
-                n_b_med,
-                mask_tables,
-                partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512_nibble(c_block, n_b_med, mask_tables, partial_c);
         } else {
-            x86_64::accumulate_c_banks_x86_avx512(
-                c_block,
-                n_b_med,
-                mask_tables,
-                partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512(c_block, n_b_med, mask_tables, partial_c);
         }
     }
 
@@ -415,8 +429,8 @@ pub(super) fn accumulate_convert_with_s_hat_v(
 
 #[cfg(test)]
 mod nibble_algebra_tests {
-    use super::accumulate_c_banks_scalar;
     use super::super::F128;
+    use super::accumulate_c_banks_scalar;
 
     fn xor_doubling_tables() -> [F128; 512] {
         let mut tables = [F128::ZERO; 512];
@@ -481,10 +495,8 @@ mod nibble_algebra_tests {
             for (bank, mask) in partial_c.iter_mut().zip(masks) {
                 let lo = usize::from(mask & 0xff);
                 let hi = usize::from(mask >> 8);
-                bank[lane] += t_lo[lo & 0xf]
-                    + t_lo[(lo >> 4) << 4]
-                    + t_hi[hi & 0xf]
-                    + t_hi[(hi >> 4) << 4];
+                bank[lane] +=
+                    t_lo[lo & 0xf] + t_lo[(lo >> 4) << 4] + t_hi[hi & 0xf] + t_hi[(hi >> 4) << 4];
             }
         }
     }
@@ -493,10 +505,7 @@ mod nibble_algebra_tests {
     fn nibble_drain_matches_scalar_on_linear_tables() {
         let mut c_block = [0u8; 16 * 64];
         for (i, byte) in c_block.iter_mut().enumerate() {
-            *byte = (i as u8)
-                .wrapping_mul(0x9d)
-                .rotate_left((i & 7) as u32)
-                ^ (i >> 3) as u8;
+            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32) ^ (i >> 3) as u8;
         }
         let tables = xor_doubling_tables();
         for n_b_med in 0..=16 {
@@ -514,6 +523,83 @@ mod nibble_algebra_tests {
             accumulate_c_banks_scalar(&c_block, n_b_med, &tables, &mut scalar);
             nibble_drain(&c_block, n_b_med, &tables, &mut nibble);
             assert_eq!(nibble, scalar, "n_b_med={n_b_med}");
+        }
+    }
+
+    fn ab_nibble_convert(
+        chunk_ab_bytes: &[[u8; 64]; 16],
+        n_b_med: usize,
+        convert: &[F128],
+        eq_lo_val: F128,
+        partial_ab: &mut [F128; 64],
+    ) {
+        for lane in 0..64 {
+            let mut converted = F128::ZERO;
+            for b_med in 0..n_b_med {
+                let byte = usize::from(chunk_ab_bytes[b_med][lane]);
+                let base = b_med * 256;
+                converted += convert[base + (byte & 0xf)] + convert[base + ((byte >> 4) << 4)];
+            }
+            partial_ab[lane] += converted * eq_lo_val;
+        }
+    }
+
+    fn ab_byte_convert(
+        chunk_ab_bytes: &[[u8; 64]; 16],
+        n_b_med: usize,
+        convert: &[F128],
+        eq_lo_val: F128,
+        partial_ab: &mut [F128; 64],
+    ) {
+        for lane in 0..64 {
+            let mut converted = F128::ZERO;
+            for b_med in 0..n_b_med {
+                converted += convert[b_med * 256 + usize::from(chunk_ab_bytes[b_med][lane])];
+            }
+            partial_ab[lane] += converted * eq_lo_val;
+        }
+    }
+
+    #[test]
+    fn convert_table_byte_equals_nibble_xor() {
+        let convert = super::super::convert_table();
+        for b in 0..16 {
+            let base = b * 256;
+            for byte in 0usize..256 {
+                let n0 = byte & 0xf;
+                let n1 = (byte >> 4) << 4;
+                assert_eq!(
+                    convert[base + byte],
+                    convert[base + n0] + convert[base + n1],
+                    "b={b} byte={byte:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ab_nibble_matches_byte_lookup_on_convert_table() {
+        let convert = super::super::convert_table();
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for b_med in 0..16 {
+            for lane in 0..64 {
+                chunk_ab_bytes[b_med][lane] = (b_med * 17 + lane * 13) as u8 ^ 0x5a;
+            }
+        }
+        let eq = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for n_b_med in 0..=16 {
+            let mut seed = [F128::ZERO; 64];
+            for (lane, value) in seed.iter_mut().enumerate() {
+                *value = F128::new(
+                    (lane as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                    (lane as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                );
+            }
+            let mut byte_acc = seed;
+            let mut nibble_acc = seed;
+            ab_byte_convert(&chunk_ab_bytes, n_b_med, convert, eq, &mut byte_acc);
+            ab_nibble_convert(&chunk_ab_bytes, n_b_med, convert, eq, &mut nibble_acc);
+            assert_eq!(nibble_acc, byte_acc, "n_b_med={n_b_med}");
         }
     }
 }
