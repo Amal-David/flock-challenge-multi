@@ -111,6 +111,53 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
 
 #[cfg(test)]
 mod tests {
+    /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
+    /// elsewhere) equals the straight reduced sum `Σ w[b]·src[16t+b]` at
+    /// lengths that hit the four-slot vector body and the scalar tail.
+    #[test]
+    fn fold16_banked_matches_scalar_reduced_sum() {
+        use super::*;
+        let mut state = 0x5eed_f01d_16u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let mut got = vec![F128::ZERO; n];
+            fold16_banked(&src, &mut got, &w);
+            for t in 0..n {
+                let mut want = F128::ZERO;
+                for b in 0..16 {
+                    want += w[b] * src[16 * t + b];
+                }
+                assert_eq!(got[t], want, "n={n} t={t}");
+            }
+        }
+        // Degenerate weights: one-hot, all-zero, all-one.
+        let src: Vec<F128> = (0..16 * 8).map(|i| F128 { lo: i as u64 * 7 + 1, hi: (i as u64) << 40 }).collect();
+        for b0 in 0..16 {
+            let mut w = [F128::ZERO; 16];
+            w[b0] = F128::ONE;
+            let mut got = vec![F128::ZERO; 8];
+            fold16_banked(&src, &mut got, &w);
+            for t in 0..8 {
+                assert_eq!(got[t], src[16 * t + b0]);
+            }
+        }
+        let w = [F128::ONE; 16];
+        let mut got = vec![F128::ZERO; 8];
+        fold16_banked(&src, &mut got, &w);
+        for t in 0..8 {
+            let want = src[16 * t..16 * t + 16].iter().fold(F128::ZERO, |a, &b| a + b);
+            assert_eq!(got[t], want);
+        }
+    }
+
+
     use super::*;
 
     #[test]
@@ -220,6 +267,45 @@ mod tests {
             fold_pairs(&src[..4 * n], 0, &mut mid, r0);
             fold_pairs(&mid, 0, &mut via_pairs, r1);
             assert_eq!(got, via_pairs, "two-pass pairs n={n}");
+        }
+    }
+}
+
+/// Sixteen-bank weighted fold: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
+///
+/// AVX-512: deferred-reduction kernel (one reduce per output lane). Other
+/// targets: the straightforward reduced form. Same field element either way.
+#[inline]
+pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
+    assert_eq!(
+        src.len(),
+        16 * dst.len(),
+        "fold16 source must contain sixteen elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all sixteen source elements per output.
+    unsafe {
+        x86_64::fold16_banked(src, dst, w);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let mut v = F128::ZERO;
+            for b in 0..16 {
+                v += w[b] * src[16 * t + b];
+            }
+            *value = v;
         }
     }
 }

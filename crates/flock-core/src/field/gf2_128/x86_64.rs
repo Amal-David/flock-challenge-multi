@@ -251,6 +251,26 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     }
 }
 
+/// Reduce four lanes of an XOR-accumulated unreduced product triple
+/// `(lo = Σ x.lo·y.lo, mid = Σ (x.hi·y.lo ^ x.lo·y.hi), hi = Σ x.hi·y.hi)`
+/// — the same two-step fold [`ghash_mul_x4`] applies to a single product.
+/// Reduction is F₂-linear, so this equals the XOR of the individually
+/// reduced products, lane by lane (deferred reduction).
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
+/// cfg gate and target-feature attribute).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let t1 = gf2_128_reduce_x4(mid, hi);
+        gf2_128_reduce_x4(lo, t1)
+    }
+}
+
 /// 4 independent GF(2^128) products. `x` and `y` each hold 4 contiguous
 /// `F128`; the result holds the 4 reduced products. Field-identical to
 /// applying `ghash_mul_binius` to each lane.
@@ -401,6 +421,19 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
+    }
+
+    /// Reduce each of the 4 lanes independently (no horizontal fold): the
+    /// result holds the 4 reduced lane sums, field-identical to reducing every
+    /// accumulated product separately and XORing per lane.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn reduce_lanes(self) -> __m512i {
+        // SAFETY: caller carries avx512f+vpclmulqdq.
+        unsafe { ghash_reduce_acc_x4(self.lo, self.mid, self.hi) }
     }
 
     /// Horizontally XOR the 4 lanes and assemble a scalar `F256Unreduced`

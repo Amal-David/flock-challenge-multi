@@ -730,9 +730,7 @@ pub fn partial_fold_packed_z_block_major_padded(
         m,
         k_log,
         useful_bits,
-        |outer_base, table| {
-            build_sum_table(&eq_outer[outer_base..outer_base + 8], table);
-        },
+        |outer_base| std::array::from_fn(|r| eq_outer[outer_base + r]),
     )
 }
 
@@ -763,12 +761,11 @@ fn partial_fold_packed_z_block_major_factorized_padded(
         m,
         k_log,
         useful_bits,
-        |outer_base, table| {
-            let eq8: [F128; 8] = std::array::from_fn(|r| {
+        |outer_base| {
+            std::array::from_fn(|r| {
                 let outer = outer_base + r;
                 eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            });
-            build_sum_table(&eq8, table);
+            })
         },
     )
 }
@@ -804,14 +801,46 @@ fn fold_block_major_one_shot(
     }
 }
 
-/// Shared block-major witness sweep. `build_table` fills the 256-entry subset
-/// table for the eight outer positions beginning at `outer_base`.
+/// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
+/// of the block-major sweep (exact A/B control: the scalar 256-entry
+/// byte-table loop runs instead). Resolved once per process.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+fn lincheck_nibble_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none()
+    });
+    *ON
+}
+
+/// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
+/// per worker in the block-major sweep (exact A/B control).
+fn dynamic_tiles_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none()
+    });
+    *ON
+}
+
+/// `FLOCK_NO_LC_REDUCE_SINGLE_PASS=1` restores the per-worker sequence of
+/// rayon reductions of the block-major partials (exact A/B control).
+fn reduce_single_pass_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none()
+    });
+    *ON
+}
+
+/// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
+/// outer weights for the stripe beginning at `outer_base`; the sweep builds
+/// whichever subset tables its accumulate kernel needs from them (the
+/// 256-entry byte table for the scalar loop, or the AVX-512 kernel's two
+/// 16-entry nibble tables — both are exact splits of the same subset sums).
 fn partial_fold_packed_z_block_major_padded_with_tables(
     z_packed: &[F128],
     m: usize,
     k_log: usize,
     useful_bits: usize,
-    build_table: impl Fn(usize, &mut [F128]) + Sync,
+    eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -831,33 +860,108 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     let tiles_per_worker = n_tiles.div_ceil(p);
     let n_workers = n_tiles.div_ceil(tiles_per_worker);
     let useful_chunks = useful_bits.div_ceil(128);
+    // Dynamic tile claiming: workers grab `TILE_GRAB` tiles at a time from a
+    // shared counter instead of a fixed contiguous range, so a worker whose
+    // thread was descheduled (or shares a core) does not gate the join.
+    // Every tile is still swept exactly once by exactly one worker; the
+    // per-column XOR association changes but the sum does not.
+    const TILE_GRAB: usize = 4;
+    let next_tile = std::sync::atomic::AtomicUsize::new(0);
+    let dynamic = dynamic_tiles_enabled();
 
     // Outer-tile partitioning reads every useful z chunk exactly once and
     // builds every sum table once. Each worker owns a private length-k partial;
     // the final XOR reduction is small relative to the witness pass.
+    let probe_t0 = std::time::Instant::now();
     let mut partials = vec![F128::ZERO; n_workers * k];
+    let probe_t1 = std::time::Instant::now();
     partials
         .par_chunks_mut(k)
         .enumerate()
         .for_each(|(worker, partial)| {
+            let wt0 = std::time::Instant::now();
+            let mut t_tables = std::time::Duration::ZERO;
+            let mut t_tr = std::time::Duration::ZERO;
+            let mut t_acc = std::time::Duration::ZERO;
             let tile_lo = worker * tiles_per_worker;
             let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            // Static range (kill switch) or dynamic claims from the counter.
+            let mut claim_lo = tile_lo;
+            let mut claim_hi = tile_hi;
+            if dynamic {
+                claim_lo = 0;
+                claim_hi = 0;
+            }
             let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
             let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ))]
+            let mut nib_tables = [[0u64; 64]; DIRECT_FOLD_TILE_STRIPES];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ))]
+            let nibble_ok = lincheck_nibble_fold_enabled();
 
-            for tile in tile_lo..tile_hi {
+            loop {
+                let tile = if claim_lo < claim_hi {
+                    claim_lo += 1;
+                    claim_lo - 1
+                } else if dynamic {
+                    let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
+                    if lo >= n_tiles {
+                        break;
+                    }
+                    claim_lo = lo + 1;
+                    claim_hi = (lo + TILE_GRAB).min(n_tiles);
+                    lo
+                } else {
+                    break;
+                };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
                 let tile_stripes = (n_stripes - stripe_base).min(DIRECT_FOLD_TILE_STRIPES);
+                // Full tiles on AVX-512 take the nibble-table kernel and never
+                // build the 256-entry tables; every other tile builds them for
+                // the scalar loop.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw"
+                ))]
+                let use_nibble = nibble_ok && tile_stripes == DIRECT_FOLD_TILE_STRIPES;
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw"
+                )))]
+                let use_nibble = false;
+                let tt0 = std::time::Instant::now();
                 for t in 0..tile_stripes {
                     let outer_base = 8 * (stripe_base + t);
-                    build_table(outer_base, &mut tables[t * 256..(t + 1) * 256]);
+                    let eq8 = eq8_at(outer_base);
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw"
+                    ))]
+                    if use_nibble {
+                        kernels::build_nibble_tables(&eq8, &mut nib_tables[t]);
+                        continue;
+                    }
+                    build_sum_table(&eq8, &mut tables[t * 256..(t + 1) * 256]);
                 }
 
+                t_tables += tt0.elapsed();
                 // Keep one 128-column (2 KiB) output group hot while applying
                 // all tables in this outer tile.
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
+                    let tq0 = std::time::Instant::now();
                     // Full tiles take the all-NEON gather + bit-transpose
                     // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
                     // swap rounds, no bounds checks) — byte-identical output
@@ -901,6 +1005,8 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                             );
                         }
                     }
+                    t_tr += tq0.elapsed();
+                    let ta0 = std::time::Instant::now();
                     let group = &mut partial[inner_base..inner_base + chunk_bits];
                     // Full tiles take the two-stream NEON wavefront leaf
                     // (paired 8-column blocks, 16 register accumulators —
@@ -918,8 +1024,37 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         0
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw"
+                    ))]
+                    let b_done = if use_nibble {
+                        // SAFETY: cfg guarantees AVX-512F/BW; `transposed`
+                        // has 8×128 bytes, `nib_tables` 8 stripes, `group`
+                        // exactly `chunk_bits` F128.
+                        unsafe {
+                            kernels::fold_block_major_chunk_x86_avx512(
+                                &transposed,
+                                &nib_tables,
+                                group,
+                                chunk_bits,
+                            );
+                        }
+                        chunk_bits
+                    } else {
+                        0
+                    };
+                    #[cfg(not(any(
+                        target_arch = "aarch64",
+                        all(
+                            target_arch = "x86_64",
+                            target_feature = "avx512f",
+                            target_feature = "avx512bw"
+                        )
+                    )))]
                     let b_done = 0;
+                    let _ = use_nibble;
                     for b in b_done..chunk_bits {
                         let mut acc = group[b];
                         for t in 0..tile_stripes {
@@ -928,16 +1063,60 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                         }
                         group[b] = acc;
                     }
+                    t_acc += ta0.elapsed();
                 }
             }
+            if std::env::var_os("LINCHECK_TRACE").is_some() {
+                eprintln!(
+                    "[lc] fold worker {worker}: total {:.2} ms tables {:.2} transpose+read {:.2} acc {:.2}",
+                    wt0.elapsed().as_secs_f64() * 1e3,
+                    t_tables.as_secs_f64() * 1e3,
+                    t_tr.as_secs_f64() * 1e3,
+                    t_acc.as_secs_f64() * 1e3
+                );
+            }
         });
+    let probe_t2 = std::time::Instant::now();
 
-    let (first, rest) = partials.split_at(k);
-    let mut out = first.to_vec();
-    for partial in rest.chunks(k) {
-        out.par_iter_mut()
-            .zip(partial.par_iter())
-            .for_each(|(o, p)| *o += *p);
+    // Reduce the per-worker partials in ONE parallel pass over column ranges
+    // (each task XORs every worker's slice of its range), instead of one
+    // rayon dispatch per worker over the whole length-k vector: on a 16-way
+    // pool the latter is fifteen back-to-back fork/joins over 16 K tiny
+    // items and measured ~30 ms at the ranked shape — more than the sweep
+    // itself. Same XORs, same association order per column (worker 0 first,
+    // then 1..n_workers), so the result is bit-identical.
+    let mut out = vec![F128::ZERO; k];
+    if reduce_single_pass_enabled() {
+        let cols_per_task = k.div_ceil(4 * p).max(64);
+        out.par_chunks_mut(cols_per_task)
+            .enumerate()
+            .for_each(|(ti, o)| {
+                let base = ti * cols_per_task;
+                let len = o.len();
+                o.copy_from_slice(&partials[base..base + len]);
+                for w in 1..n_workers {
+                    let src = &partials[w * k + base..w * k + base + len];
+                    for (a, b) in o.iter_mut().zip(src) {
+                        *a += *b;
+                    }
+                }
+            });
+    } else {
+        let (first, rest) = partials.split_at(k);
+        out.copy_from_slice(first);
+        for partial in rest.chunks(k) {
+            out.par_iter_mut()
+                .zip(partial.par_iter())
+                .for_each(|(o, p)| *o += *p);
+        }
+    }
+    if std::env::var_os("LINCHECK_TRACE").is_some() {
+        eprintln!(
+            "[lc] fold alloc {:.2} ms par {:.2} ms reduce {:.2} ms",
+            (probe_t1 - probe_t0).as_secs_f64() * 1e3,
+            (probe_t2 - probe_t1).as_secs_f64() * 1e3,
+            probe_t2.elapsed().as_secs_f64() * 1e3
+        );
     }
     out
 }
@@ -1517,7 +1696,17 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             // the leftover fold starts after the last ρ, when C is no
             // longer written).
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
-            fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer)
+            let trace = std::env::var_os("LINCHECK_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            let out = fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer);
+            if trace {
+                eprintln!(
+                    "[lc] {:<26} {:>7.2} ms",
+                    "kicked z-fold (thread)",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            out
         })
         .expect("spawn last-ρ z-fold");
     LAST_RHO.with(|slot| {
@@ -1719,7 +1908,19 @@ fn prove_padded_inner<Ch: Challenger>(
     // handle here — after serial FS (label, α, eq_inner) and BEFORE
     // fold_alpha. Do not rayon::join / rayon::scope with CSC (that pulls
     // this thread into the fold and splits the pool). Residual join HOLD.
+    let t_wait = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let kicked_z_vec = wait_last_rho_z_fold();
+    if let Some(t) = t_wait {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "wait kicked z-fold",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -2288,6 +2489,53 @@ mod tests {
     /// The direct block-major F128 fold is exactly the existing stripe fold,
     /// including padded, non-128-aligned useful regions and partial outer
     /// tiles.
+    /// The AVX-512 nibble-table accumulate must reproduce the scalar
+    /// 256-entry byte-table loop bit-for-bit for every column count
+    /// 1..=128 (exercises the masked tail store) on random weights, random
+    /// index bytes and a random pre-filled `partial`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn block_major_nibble_kernel_matches_scalar_tables() {
+        let mut rng = Rng::new(0x51B_B1E5);
+        for chunk_bits in (1..=128).chain([8, 16, 120, 121, 127, 128]) {
+            let eq8s: Vec<[F128; 8]> = (0..DIRECT_FOLD_TILE_STRIPES)
+                .map(|_| std::array::from_fn(|_| rng.f128()))
+                .collect();
+            let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
+            let mut nib = [[0u64; 64]; DIRECT_FOLD_TILE_STRIPES];
+            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                build_sum_table(&eq8s[t], &mut tables[t * 256..(t + 1) * 256]);
+                kernels::build_nibble_tables(&eq8s[t], &mut nib[t]);
+            }
+            let transposed: Vec<u8> = (0..DIRECT_FOLD_TILE_STRIPES * 128)
+                .map(|_| (rng.f128().lo & 0xFF) as u8)
+                .collect();
+            let base: Vec<F128> = (0..chunk_bits).map(|_| rng.f128()).collect();
+            // scalar reference
+            let mut want = base.clone();
+            for b in 0..chunk_bits {
+                let mut acc = want[b];
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    acc += tables[t * 256 + transposed[t * 128 + b] as usize];
+                }
+                want[b] = acc;
+            }
+            // kernel, with a poison guard word past the end
+            let mut got = base.clone();
+            got.push(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE });
+            unsafe {
+                kernels::fold_block_major_chunk_x86_avx512(
+                    &transposed,
+                    &nib,
+                    &mut got[..chunk_bits],
+                    chunk_bits,
+                );
+            }
+            assert_eq!(got.pop(), Some(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE }));
+            assert_eq!(got, want, "chunk_bits={chunk_bits}");
+        }
+    }
+
     #[test]
     fn partial_fold_block_major_matches_stripe() {
         let cases: &[(usize, usize, usize)] = &[

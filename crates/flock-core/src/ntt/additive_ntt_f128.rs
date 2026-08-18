@@ -188,6 +188,14 @@ fn zero_lane_skip_disabled() -> bool {
 /// `FLOCK_NO_NTT_TOP_FUSION=1` restores the incumbent two-pass top-layer
 /// schedule (fused-four sweep, then fused-two sweep) in the same binary; the
 /// default fuses six top layers into one cache-blocked DRAM pass. See
+/// `FLOCK_NO_NTT_LONE_TOP_BUMP=1` restores the incumbent `n_top` choice when
+/// exactly one top layer would remain (diagnostics; the ranked worker's
+/// cleared env never sets it).
+fn ntt_lone_top_bump_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LONE_TOP_BUMP").is_some())
+}
+
 /// [`AdditiveNttF128::top_fused6_pass`].
 fn ntt_top_fusion_disabled() -> bool {
     #[cfg(test)]
@@ -590,12 +598,20 @@ impl AdditiveNttF128 {
             return;
         }
 
+        // `FLOCK_NTT_TIMING`: fill/transform split per encode (diagnostics;
+        // read once per process, the ranked worker's cleared env never sets it).
+        static NTT_TIMING: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_TIMING").is_some());
+        let ntt_timing = *NTT_TIMING;
+        let t_fill = std::time::Instant::now();
         replicate_message_fill(codeword, msg);
+        let fill_ms = t_fill.elapsed().as_secs_f64() * 1e3;
         #[cfg(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
+            let t_tr = std::time::Instant::now();
             self.forward_transform_interleaved_parallel_from_layer_impl(
                 codeword,
                 num_ntts,
@@ -604,6 +620,13 @@ impl AdditiveNttF128 {
                 Some(on_range_done),
                 None,
             );
+            if ntt_timing {
+                eprintln!(
+                    "[ntt-timing] rs_encode_on_range_done log_d={log_d} n={num_ntts} rate=1/{}: fill {fill_ms:.2} ms transform {:.2} ms",
+                    1usize << log_inv_rate,
+                    t_tr.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -1238,7 +1261,19 @@ impl AdditiveNttF128 {
         // what keeps a row group single-parity.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
-        let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        let mut n_top = Self::interleaved_n_top(log_d, num_ntts);
+        // A lone top layer (`n_top == start_layer + 1`) would run as one
+        // rayon region PER BLOCK through the single-layer fallback (the
+        // Ligerito rate-1/8 recursive commit: log_d 16, num_ntts 8, start
+        // layer 3, n_top 4 → 8 blocks → 8 barriers for one layer). Taking one
+        // more layer into the top makes that a single fused-two region and
+        // doubles the deep sub-group count (better balance), as long as the
+        // sub-groups stay ≥ 2^8 positions. Same butterflies, same twiddles,
+        // same lane bounds → bit-identical. Disjoint from the seed-fused top
+        // task, which requires `n_top ≥ 9` at start layer 3.
+        if n_top == start_layer + 1 && n_top + 1 + 8 <= log_d && !ntt_lone_top_bump_disabled() {
+            n_top += 1;
+        }
         // Six top layers per DRAM pass (default on AVX-512; portable in
         // tests): a fused-four sweep followed by a fused-two sweep would read
         // and write the whole buffer twice; the cache-blocked task below does

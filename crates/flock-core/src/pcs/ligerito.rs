@@ -2436,6 +2436,51 @@ impl LigeroWitness {
 /// The first `log_num_interleaved` LSB variables of the multilinear poly are the
 /// lane indices, so `partial_eval_lsb(poly, lane_challenges)` produces the
 /// next-level poly directly. This composes cleanly with sumcheck folds.
+/// Diagnostics: this process's minor page-fault count (`ru_minflt`), for the
+/// `FLOCK_OPEN_TIMING` commit lines. 0 on non-unix.
+#[cfg(unix)]
+fn minor_faults() -> u64 {
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i64,
+    }
+    #[repr(C)]
+    struct Rusage {
+        ru_utime: Timeval,
+        ru_stime: Timeval,
+        ru_maxrss: i64,
+        ru_ixrss: i64,
+        ru_idrss: i64,
+        ru_isrss: i64,
+        ru_minflt: i64,
+        ru_majflt: i64,
+        ru_nswap: i64,
+        ru_inblock: i64,
+        ru_oublock: i64,
+        ru_msgsnd: i64,
+        ru_msgrcv: i64,
+        ru_nsignals: i64,
+        ru_nvcsw: i64,
+        ru_nivcsw: i64,
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut ru = std::mem::MaybeUninit::<Rusage>::uninit();
+    // SAFETY: RUSAGE_SELF = 0; the struct matches glibc's layout on x86_64/aarch64 Linux.
+    let rc = unsafe { getrusage(0, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return 0;
+    }
+    // SAFETY: getrusage succeeded and initialized the struct.
+    unsafe { ru.assume_init() }.ru_minflt as u64
+}
+#[cfg(not(unix))]
+fn minor_faults() -> u64 {
+    0
+}
+
 pub(crate) fn ligero_commit(
     poly: &[F128],
     log_msg_cols: usize,
@@ -2455,14 +2500,61 @@ pub(crate) fn ligero_commit(
     // The semantic encoder owns zero-padding shortcuts and target-specific
     // fusion while overwriting every slot of the recycled matrix.
     let codeword_len = block_len * num_interleaved;
-    let mut mat = crate::scratch::take_f128(codeword_len);
     let ot = open_timing();
+    let t_alloc = std::time::Instant::now();
+    let mut mat = crate::scratch::take_f128(codeword_len);
+    let mat_alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
+    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
+    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
+
+    // Fused recursive commit (x86 production route): the NTT deep pass hands
+    // each finalized sub-group to the worker that produced it, which hashes
+    // those leaves serially while they are cache-resident and folds the
+    // sub-group's own Merkle subtree — no separate cold leaf pass over the
+    // codeword and no per-level rayon barrier for the wide levels. Same shape
+    // the L0 commit uses; bit-identical to encode-then-fill_merkle_tree.
+    // Skipped when a GPU Merkle session could take the leaves instead.
+    if crate::pcs::commit::lig_fused_commit_enabled() && !crate::gpu::merkle::available() {
+        let faults_before = if ot { minor_faults() } else { 0 };
+        let mat_cap = mat.capacity();
+        let t_encode = std::time::Instant::now();
+        let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
+        let folded = crate::pcs::commit::fused_encode_leaves_subtree(
+            ntt,
+            poly,
+            &mut mat,
+            num_interleaved,
+            &mut tree,
+            block_len,
+            leaf_size_bytes,
+            kind,
+        );
+        let fused_ms = t_encode.elapsed().as_secs_f64() * 1e3;
+        let t_upper = std::time::Instant::now();
+        crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
+        if ot {
+            eprintln!(
+                "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
+                 ({:.1} MiB) mat-alloc {mat_alloc_ms:.2} ms (cap {} F128, tree cap {}) FUSED \
+                 encode+leaves+subtree({folded}) {fused_ms:.2} ms upper {:.2} ms minflt +{}",
+                (codeword_len * 16) as f64 / (1024.0 * 1024.0),
+                mat_cap,
+                tree.capacity(),
+                t_upper.elapsed().as_secs_f64() * 1e3,
+                minor_faults().saturating_sub(faults_before),
+            );
+        }
+        return LigeroWitness {
+            mat,
+            tree,
+            block_len,
+            num_interleaved,
+        };
+    }
+
     let t_encode = std::time::Instant::now();
     ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1e3;
-
-    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let data_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             mat.as_ptr() as *const u8,
@@ -2482,19 +2574,31 @@ pub(crate) fn ligero_commit(
         None
     };
     let on_gpu = gpu_tree.is_some();
+    let mut tree_alloc_ms = 0.0f64;
+    let mut leaves_ms = 0.0f64;
     let tree = gpu_tree.unwrap_or_else(|| {
         // Same write-before-read contract as merkle_tree(); take from TREE_POOL
         // so the ranked L1 16 MiB tree is already resident after untimed warmup
         // (LigeroWitness::drop parks it). Public merkle_tree() stays unpooled
         // so tests/oracles cannot steal the L0 64 MiB slot.
+        let t_ta = std::time::Instant::now();
         let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
-        merkle::fill_merkle_tree(&mut tree, data_bytes, block_len, kind);
+        tree_alloc_ms = t_ta.elapsed().as_secs_f64() * 1e3;
+        if ot {
+            let t_l = std::time::Instant::now();
+            merkle::hash_leaves(data_bytes, leaf_size_bytes, &mut tree[..block_len], kind);
+            leaves_ms = t_l.elapsed().as_secs_f64() * 1e3;
+            crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len, kind);
+        } else {
+            merkle::fill_merkle_tree(&mut tree, data_bytes, block_len, kind);
+        }
         tree
     });
     if ot {
         eprintln!(
             "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
-             ({:.1} MiB) encode {encode_ms:.2} ms merkle({}) {:.2} ms (gpu busy {gpu_busy_ms:.2} ms)",
+             ({:.1} MiB) mat-alloc {mat_alloc_ms:.2} ms encode {encode_ms:.2} ms merkle({}) {:.2} ms \
+             [tree-alloc {tree_alloc_ms:.2} leaves {leaves_ms:.2}] (gpu busy {gpu_busy_ms:.2} ms)",
             (codeword_len * 16) as f64 / (1024.0 * 1024.0),
             if on_gpu { "gpu" } else { "cpu" },
             t_merkle.elapsed().as_secs_f64() * 1e3,
@@ -3168,6 +3272,7 @@ fn materialize_direct_fold4(
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     const SUB: usize = 256;
+    let deferred_reduce = super::fold_deferred_reduce_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let (u_0, u_2) = folded_b
@@ -3179,24 +3284,30 @@ fn materialize_direct_fold4(
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
-                // ---- f: 16:1 nested pair folds, sub-block at a time.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let mid = &mut mid[..4 * n];
-                    crate::field::f128_slice::fold4_nested(
-                        &f_in[16 * slot..16 * (slot + n)],
-                        mid,
-                        r0,
-                        r1,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        mid,
-                        &mut f_out[slot..slot + n],
-                        r2,
-                        r3,
-                    );
-                    slot += n;
+                if deferred_reduce {
+                    // ---- f: 16:1 in one deferred-reduction pass (one reduce
+                    // per output lane; same field element as the nested form).
+                    crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
+                } else {
+                    // ---- f: 16:1 nested pair folds, sub-block at a time.
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let mid = &mut mid[..4 * n];
+                        crate::field::f128_slice::fold4_nested(
+                            &f_in[16 * slot..16 * (slot + n)],
+                            mid,
+                            r0,
+                            r1,
+                        );
+                        crate::field::f128_slice::fold4_nested(
+                            mid,
+                            &mut f_out[slot..slot + n],
+                            r2,
+                            r3,
+                        );
+                        slot += n;
+                    }
                 }
                 // ---- b: ordinary basis (if any) folded 16:1 with the same weights.
                 if has_ordinary {
