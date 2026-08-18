@@ -2,16 +2,36 @@ use crate::field::F128;
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_pair};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and equal slice lengths.
     unsafe {
         let twiddle_lanes =
             _mm512_broadcast_i32x4(_mm_set_epi64x(twiddle.hi as i64, twiddle.lo as i64));
-        let lanes = top.len() & !3;
+        let lanes8 = top.len() & !7;
         let mut i = 0;
-        while i < lanes {
+        while i < lanes8 {
+            let top0 = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+            let top1 = _mm512_loadu_si512(top.as_ptr().add(i + 4) as *const __m512i);
+            let bot0 = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+            let bot1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4) as *const __m512i);
+
+            let (m0, m1) = ghash_mul_x4_pair(twiddle_lanes, bot0, twiddle_lanes, bot1);
+
+            let new_top0 = _mm512_xor_si512(top0, m0);
+            let new_top1 = _mm512_xor_si512(top1, m1);
+            let new_bot0 = _mm512_xor_si512(bot0, new_top0);
+            let new_bot1 = _mm512_xor_si512(bot1, new_top1);
+
+            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, new_top0);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i + 4) as *mut __m512i, new_top1);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot0);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i + 4) as *mut __m512i, new_bot1);
+            i += 8;
+        }
+        let lanes4 = top.len() & !3;
+        while i < lanes4 {
             let top_lanes = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let bot_lanes = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let new_top = _mm512_xor_si512(top_lanes, ghash_mul_x4(twiddle_lanes, bot_lanes));
@@ -35,7 +55,7 @@ pub(super) unsafe fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::ghash_mul_x4_pair;
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and equal slice lengths.
@@ -53,17 +73,21 @@ pub(super) unsafe fn butterfly_fused_2layer(
             let mut vc = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
             let mut vd = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, ghash_mul_x4(outer, vc));
+            // Layer 1: compute (outer * vc, outer * vd) interleaved
+            let (m_vc, m_vd) = ghash_mul_x4_pair(outer, vc, outer, vd);
+            let new_a = _mm512_xor_si512(va, m_vc);
             vc = _mm512_xor_si512(vc, new_a);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, ghash_mul_x4(outer, vd));
+            let new_b = _mm512_xor_si512(vb, m_vd);
             vd = _mm512_xor_si512(vd, new_b);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, ghash_mul_x4(inner_a, vb));
+            // Layer 2: compute (inner_a * vb, inner_b * vd) interleaved
+            let (m_vb, m_vd2) = ghash_mul_x4_pair(inner_a, vb, inner_b, vd);
+            let new_a = _mm512_xor_si512(va, m_vb);
             vb = _mm512_xor_si512(vb, new_a);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, ghash_mul_x4(inner_b, vd));
+            let new_c = _mm512_xor_si512(vc, m_vd2);
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
@@ -101,7 +125,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     r: usize,
     twiddles: &[F128; 3],
 ) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::ghash_mul_x4_pair;
     use core::arch::x86_64::*;
 
     let [t_outer, t_inner_a, t_inner_b] = *twiddles;
@@ -123,17 +147,21 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
             let mut vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
             let mut vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, ghash_mul_x4(outer, vc));
+            // Layer 1: compute (outer * vc, outer * vd) interleaved
+            let (m_vc, m_vd) = ghash_mul_x4_pair(outer, vc, outer, vd);
+            let new_a = _mm512_xor_si512(va, m_vc);
             vc = _mm512_xor_si512(vc, new_a);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, ghash_mul_x4(outer, vd));
+            let new_b = _mm512_xor_si512(vb, m_vd);
             vd = _mm512_xor_si512(vd, new_b);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, ghash_mul_x4(inner_a, vb));
+            // Layer 2: compute (inner_a * vb, inner_b * vd) interleaved
+            let (m_vb, m_vd2) = ghash_mul_x4_pair(inner_a, vb, inner_b, vd);
+            let new_a = _mm512_xor_si512(va, m_vb);
             vb = _mm512_xor_si512(vb, new_a);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, ghash_mul_x4(inner_b, vd));
+            let new_c = _mm512_xor_si512(vc, m_vd2);
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 

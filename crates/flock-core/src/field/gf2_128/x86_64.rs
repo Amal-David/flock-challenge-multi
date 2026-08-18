@@ -257,6 +257,62 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
     }
 }
 
+/// Two concurrent 4-lane GF(2^128) products: computes `(ghash_mul_x4(t0, a), ghash_mul_x4(t1, b))`
+/// with interleaved VPCLMULQDQ instructions to maximize processor execution port utilization and ILP.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_pair(
+    t0: __m512i,
+    a: __m512i,
+    t1: __m512i,
+    b: __m512i,
+) -> (__m512i, __m512i) {
+    unsafe {
+        let poly = ghash_poly_x4();
+
+        // 1. Cross terms (imm 0x01 and 0x10) interleaved for both streams
+        let t1a_0 = _mm512_clmulepi64_epi128::<0x01>(t0, a);
+        let t1a_1 = _mm512_clmulepi64_epi128::<0x01>(t1, b);
+        let t1b_0 = _mm512_clmulepi64_epi128::<0x10>(t0, a);
+        let t1b_1 = _mm512_clmulepi64_epi128::<0x10>(t1, b);
+
+        let mut cross_0 = _mm512_xor_si512(t1a_0, t1b_0);
+        let mut cross_1 = _mm512_xor_si512(t1a_1, t1b_1);
+
+        // 2. High products (imm 0x11)
+        let t2_0 = _mm512_clmulepi64_epi128::<0x11>(t0, a);
+        let t2_1 = _mm512_clmulepi64_epi128::<0x11>(t1, b);
+
+        // First reduction step: cross ^= (t2 << 64) ^ (t2.hi * poly)
+        cross_0 = _mm512_xor_si512(cross_0, _mm512_bslli_epi128::<8>(t2_0));
+        cross_1 = _mm512_xor_si512(cross_1, _mm512_bslli_epi128::<8>(t2_1));
+
+        let t2_red_0 = _mm512_clmulepi64_epi128::<0x01>(t2_0, poly);
+        let t2_red_1 = _mm512_clmulepi64_epi128::<0x01>(t2_1, poly);
+
+        cross_0 = _mm512_xor_si512(cross_0, t2_red_0);
+        cross_1 = _mm512_xor_si512(cross_1, t2_red_1);
+
+        // 3. Low products (imm 0x00)
+        let mut t0_0 = _mm512_clmulepi64_epi128::<0x00>(t0, a);
+        let mut t0_1 = _mm512_clmulepi64_epi128::<0x00>(t1, b);
+
+        // Second reduction step: t0 ^= (cross << 64) ^ (cross.hi * poly)
+        t0_0 = _mm512_xor_si512(t0_0, _mm512_bslli_epi128::<8>(cross_0));
+        t0_1 = _mm512_xor_si512(t0_1, _mm512_bslli_epi128::<8>(cross_1));
+
+        let cross_red_0 = _mm512_clmulepi64_epi128::<0x01>(cross_0, poly);
+        let cross_red_1 = _mm512_clmulepi64_epi128::<0x01>(cross_1, poly);
+
+        t0_0 = _mm512_xor_si512(t0_0, cross_red_0);
+        t0_1 = _mm512_xor_si512(t0_1, cross_red_1);
+
+        (t0_0, t0_1)
+    }
+}
+
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many

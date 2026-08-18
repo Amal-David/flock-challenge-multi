@@ -10,4 +10,7 @@ pub use aarch64::{
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::partial_fold_packed_z_x86_tiled_padded;
+pub use x86_64::{
+    fold_block_major_chunk_x86_x2, gather_transpose_tile_x86,
+    partial_fold_packed_z_x86_oblock_padded, partial_fold_packed_z_x86_tiled_padded,
+};
