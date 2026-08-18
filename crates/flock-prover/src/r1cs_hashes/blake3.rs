@@ -1310,15 +1310,17 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     // 2^m bits) are pure write-only streams here — ~2 GiB at the ranked
     // m = 32 — next read only in later phases, far beyond any cache, so
     // regular stores' write-allocate costs one hidden DRAM read per line.
-    // On aarch64, build each block in L1-resident per-worker staging and
-    // publish with `stnp` (same design as `drive_witness_packed`); the
-    // ab_inner projection reads a/b from the hot staging copies, never
-    // from the NT-flushed destinations. `FLOCK_NO_WITNESS_NT` is a
-    // local-diagnostics kill switch; the ranked worker's cleared
-    // environment never sets it.
-    let use_nt = cfg!(target_arch = "aarch64")
-        && super::common::u64_per_block_is_nt_compatible(K / 64)
-        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+    // On aarch64/x86_64, build each block in L1-resident per-worker staging
+    // and publish with `stnp` / `vmovntdq` (same design as
+    // `drive_witness_packed`); the ab_inner projection reads a/b from the hot
+    // staging copies, never from the NT-flushed destinations. x86 gains more
+    // than aarch64: every plain store to a non-resident line there also costs
+    // a read-for-ownership, so these ~2 GiB of writes carry ~2 GiB of hidden
+    // DRAM reads, and nothing re-reads z/a/b/ab_inner until zerocheck round 1
+    // (~150 ms of commit work later), so there is no cache-residency to lose.
+    // `FLOCK_NO_WITNESS_NT` is a local-diagnostics kill switch; the ranked
+    // worker's cleared environment never sets it.
+    let use_nt = super::common::witness_nt_enabled(K / 64);
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
@@ -1376,12 +1378,17 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
                         vec![0u64; U64_PER_BLOCK],
                         vec![0u64; U64_PER_BLOCK],
                         vec![0u64; U64_PER_BLOCK],
+                        // Dropped when this rayon leaf job finishes (rayon
+                        // drops the per-job init state inside the job, before
+                        // its latch is set), so every x86 streaming store is
+                        // fenced exactly once per task rather than per block.
+                        Some(super::common::NtFenceGuard),
                     )
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
                 }
             },
-            |(z_stage, a_stage, b_stage, ab_stage),
+            |(z_stage, a_stage, b_stage, ab_stage, _fence),
              (block_idx, (((z_out, a_out), b_out), ab_out))| {
                 let (cv, msg, counter, block_len, flags) =
                     blocks.get(block_idx).unwrap_or(&padding);
@@ -1474,6 +1481,12 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
             },
         );
 
+    if use_nt {
+        // Belt and braces: if the caller thread itself folded leaf jobs its
+        // guards already fenced, but one more `sfence` here costs nothing and
+        // makes the publish independent of rayon's drop timing on this thread.
+        super::common::nt_fence();
+    }
     (z, a, b, ab_inner)
 }
 
@@ -2420,6 +2433,73 @@ mod tests {
             ab_nt.as_bytes_mut(),
             ab_rg.as_bytes_mut(),
             "ab_inner mismatch between NT and regular paths"
+        );
+    }
+
+    /// Same as [`round1_inner_nt_matches_regular`] but with every scratch
+    /// buffer the generator can be handed pre-filled with a poison pattern.
+    /// A slot the staged/NT publish forgets to write would survive as poison
+    /// (regular stores fill it), so this catches head/tail or padding-slot
+    /// gaps that an uninitialized-vs-uninitialized comparison could miss.
+    #[test]
+    fn round1_inner_nt_writes_every_slot_over_poison() {
+        const POISON: F128 = F128 {
+            lo: 0xA5A5_A5A5_A5A5_A5A5,
+            hi: 0x5A5A_5A5A_5A5A_5A5A,
+        };
+        let mut rng = Rng::new(0x9E37_79B9);
+        let n_blocks = 500usize;
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let n_log = min_n_blocks_log(n_blocks);
+        let n_f128 = (1usize << n_log) * (K / 128);
+        // The generator takes four buffers of exactly this size (z, a, b and
+        // ab_inner's storage); park poisoned ones so it gets those.
+        let poison_pool = || {
+            flock_core::scratch::clear();
+            for _ in 0..4 {
+                let mut v = flock_core::scratch::take_f128(n_f128);
+                v.fill(POISON);
+                flock_core::scratch::give_f128(v);
+            }
+        };
+
+        poison_pool();
+        let (z_nt, a_nt, b_nt, mut ab_nt) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, true);
+        poison_pool();
+        let (z_rg, a_rg, b_rg, mut ab_rg) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, false);
+        flock_core::scratch::clear();
+
+        assert_eq!(z_nt, z_rg, "z mismatch over poisoned scratch");
+        assert_eq!(a_nt, a_rg, "a mismatch over poisoned scratch");
+        assert_eq!(b_nt, b_rg, "b mismatch over poisoned scratch");
+        assert_eq!(
+            ab_nt.as_bytes_mut(),
+            ab_rg.as_bytes_mut(),
+            "ab_inner mismatch over poisoned scratch"
+        );
+        // Independent of the pairwise comparison: no untouched slot survived.
+        let skipped = flock_core::zerocheck::univariate_skip_optimized::
+            planned_round1_gpu_prefix_bytes(K_LOG + n_log) / 16;
+        let mut poison_bytes = [0u8; 16];
+        poison_bytes[..8].copy_from_slice(&POISON.lo.to_le_bytes());
+        poison_bytes[8..].copy_from_slice(&POISON.hi.to_le_bytes());
+        assert!(!z_nt.contains(&POISON), "NT z left a poisoned slot");
+        assert!(!a_nt.contains(&POISON), "NT a left a poisoned slot");
+        assert!(!b_nt.contains(&POISON), "NT b left a poisoned slot");
+        assert!(
+            !ab_nt.as_bytes_mut()[skipped * 16..]
+                .chunks_exact(16)
+                .any(|c| c == poison_bytes),
+            "NT ab_inner left a poisoned slot"
         );
     }
 

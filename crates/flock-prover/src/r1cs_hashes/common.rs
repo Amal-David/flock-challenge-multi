@@ -356,13 +356,11 @@ where
     // The three destination streams total 3 · 2^m bits (1.5 GiB at the ranked
     // m = 32) and are next read only in later phases — far beyond any cache —
     // so regular stores' write-allocate costs one hidden DRAM read per line.
-    // On aarch64, build each block in an L1-resident staging buffer and
-    // publish it with `stnp` (same shape as the batch-major driver's
-    // `flush_rows_nt`). `FLOCK_NO_WITNESS_NT` is a local-diagnostics kill
-    // switch; the ranked worker's cleared environment never sets it.
-    let use_nt = cfg!(target_arch = "aarch64")
-        && u64_per_block_is_nt_compatible(f128_per_block * 2)
-        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+    // On aarch64/x86_64, build each block in an L1-resident staging buffer and
+    // publish it with `stnp` / `vmovntdq` (same shape as the batch-major
+    // driver's `flush_rows_nt`). `FLOCK_NO_WITNESS_NT` is a local-diagnostics
+    // kill switch; the ranked worker's cleared environment never sets it.
+    let use_nt = witness_nt_enabled(f128_per_block * 2);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -418,6 +416,12 @@ where
                         )
                     };
                     per_block(initial, z_u64, a_u64, b_u64);
+                }
+                if use_nt {
+                    // x86 streaming stores are weakly ordered: publish this
+                    // group's writes before rayon's completion protocol lets
+                    // another thread (or a later phase) read them.
+                    nt_fence();
                 }
             },
         );
@@ -540,19 +544,135 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     }
 }
 
-/// Non-temporal copy of `n` u64s (`n` divisible by 16) in 128-byte
-/// `ldp q / stnp q` chunks. Fallback: plain copy off-aarch64.
+/// Non-temporal copy of `n` u64s (`n` divisible by 16) from an L1-resident
+/// staging buffer to a destination that will not be read again for a long
+/// time.
+///
+/// * aarch64: 128-byte `ldp q / stnp q` chunks.
+/// * x86_64: whole 64-byte cache lines with `vmovntdq`
+///   (`_mm512_stream_si512`, or four `movntdq` when the build has no
+///   AVX-512), preceded/followed by plain stores for the sub-line head/tail.
+///   Streaming stores matter more here than on aarch64: on x86 a plain store
+///   to a line that is not cache-resident costs a read-for-ownership, so the
+///   witness streams' ~2 GiB of writes drag ~2 GiB of hidden DRAM reads with
+///   them. The head/tail exist because `Vec<F128>` is only 16-byte aligned
+///   (glibc hands back page+16 for the 512 MiB witness buffers), so at the
+///   ranked 2 KiB block stride exactly 2 of every 33 touched lines stay on
+///   the RFO path.
+/// * elsewhere: plain copy.
+///
+/// x86 streaming stores are weakly ordered — the caller must publish them
+/// with [`nt_fence`] before another thread may observe the destination.
 ///
 /// SAFETY: `src` valid for `n` u64 reads, `dst` for `n` u64 writes; ranges
 /// must not overlap.
 #[inline]
 pub(crate) unsafe fn nt_copy_u64s(src: *const u64, dst: *mut u64, n: usize) {
     debug_assert!(n.is_multiple_of(16));
-    let mut i = 0;
-    while i < n {
-        unsafe { nt_store_row(src.add(i), dst.add(i)) };
-        i += 16;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        nt_copy_u64s_x86(src, dst, n);
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: forwarded caller contract; `n` is a multiple of 16 u64s, i.e. a
+    // whole number of 128-byte rows.
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            nt_store_row(src.add(i), dst.add(i));
+            i += 16;
+        }
+    }
+}
+
+/// x86_64 line-granular streaming copy; see [`nt_copy_u64s`].
+///
+/// SAFETY: as [`nt_copy_u64s`].
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn nt_copy_u64s_x86(src: *const u64, dst: *mut u64, n: usize) {
+    #[allow(unused_imports)]
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded caller contract; every offset used below is < n.
+    unsafe {
+        // Head: plain stores until `dst` sits on a 64-byte line boundary.
+        // `dst` is at least 8-byte aligned (u64), so this is a whole number
+        // of u64s, at most 7 of them.
+        let head = (((64 - ((dst as usize) & 63)) & 63) / 8).min(n);
+        let mut i = 0usize;
+        while i < head {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+        // Body: whole 64-byte lines, streamed past the caches.
+        let body_end = head + ((n - head) & !7);
+        while i < body_end {
+            #[cfg(target_feature = "avx512f")]
+            {
+                let v = _mm512_loadu_si512(src.add(i).cast());
+                _mm512_stream_si512(dst.add(i).cast(), v);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            {
+                // SSE2 baseline: four 16-byte streaming stores fill one
+                // write-combining buffer, which evicts as one full-line write.
+                let mut j = 0usize;
+                while j < 8 {
+                    let v = _mm_loadu_si128(src.add(i + j).cast());
+                    _mm_stream_si128(dst.add(i + j).cast(), v);
+                    j += 2;
+                }
+            }
+            i += 8;
+        }
+        // Tail: the ≤ 7 u64s that do not complete a line.
+        while i < n {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+    }
+}
+
+/// Publish everything this thread wrote through [`nt_copy_u64s`]. Required on
+/// x86_64 (weakly ordered streaming stores); a no-op elsewhere (`stnp` obeys
+/// the normal memory model).
+#[inline]
+pub(crate) fn nt_fence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `sfence` has no preconditions.
+    unsafe {
+        core::arch::x86_64::_mm_sfence();
+    }
+}
+
+/// Drop-time [`nt_fence`]. Handed to `for_each_init` as part of the per-job
+/// state: rayon builds the state when a leaf job starts folding and drops it
+/// when that fold completes — inside the job, before its latch is set — so
+/// one guard fences a whole task's streaming stores instead of one per block.
+pub(crate) struct NtFenceGuard;
+
+impl Drop for NtFenceGuard {
+    #[inline]
+    fn drop(&mut self) {
+        nt_fence();
+    }
+}
+
+/// Whether the staged non-temporal witness publish is available and wanted.
+///
+/// The staged flush copies whole rows, so `u64_per_block` must be a multiple
+/// of 16. `FLOCK_NO_WITNESS_NT=1` is a local-diagnostics kill switch that
+/// restores plain stores exactly; the ranked worker's cleared environment
+/// never sets it.
+#[inline]
+pub(crate) fn witness_nt_enabled(u64_per_block: usize) -> bool {
+    use std::sync::LazyLock;
+    static OFF: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_WITNESS_NT").is_some());
+    cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
+        && u64_per_block_is_nt_compatible(u64_per_block)
+        && !*OFF
 }
 
 /// NT-flush `useful_chunks` chunk-rows of an interleaved row buffer to the
@@ -700,4 +820,46 @@ where
     );
 
     (z, a, b, stripe)
+}
+
+#[cfg(test)]
+mod nt_tests {
+    use super::*;
+
+    /// `nt_copy_u64s` is a byte-exact copy at every destination alignment the
+    /// witness buffers can present. `Vec<F128>` is only 16-byte aligned in
+    /// practice (glibc returns page+16 for the large witness allocations), so
+    /// the x86 line-granular streaming path runs its head/tail fixups; those
+    /// must not drop or duplicate a single u64.
+    #[test]
+    fn nt_copy_is_exact_at_every_alignment() {
+        const N: usize = 256; // = K / 64 at the ranked blake3 shape.
+        let src: Vec<u64> = (0..N as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        // Over-aligned backing so the offsets below are the true alignments.
+        let mut backing: Vec<u64> = vec![0u64; N + 32];
+        let base_pad = (8 - ((backing.as_ptr() as usize / 8) % 8)) % 8;
+        for off_u64 in 0..8usize {
+            let start = base_pad + off_u64;
+            backing.iter_mut().for_each(|w| *w = 0xDEAD_BEEF_DEAD_BEEF);
+            // SAFETY: `start + N <= backing.len()`; src and backing are
+            // distinct allocations.
+            unsafe {
+                nt_copy_u64s(src.as_ptr(), backing.as_mut_ptr().add(start), N);
+                nt_fence();
+            }
+            assert_eq!(
+                &backing[start..start + N],
+                &src[..],
+                "nt_copy_u64s mismatch at u64 offset {off_u64}"
+            );
+            assert!(
+                backing[..start].iter().all(|&w| w == 0xDEAD_BEEF_DEAD_BEEF),
+                "nt_copy_u64s wrote before the destination at offset {off_u64}"
+            );
+            assert!(
+                backing[start + N..].iter().all(|&w| w == 0xDEAD_BEEF_DEAD_BEEF),
+                "nt_copy_u64s wrote past the destination at offset {off_u64}"
+            );
+        }
+    }
 }
