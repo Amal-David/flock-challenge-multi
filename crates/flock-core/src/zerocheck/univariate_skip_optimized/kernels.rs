@@ -300,6 +300,92 @@ fn c_nibble_lut_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C_NIBBLE").is_none())
 }
 
+/// SoA form of the four 16-entry F₂-linear nibble tables used by DirectC.
+/// One table depends only on `eq_lo`, so round one can build it once and reuse
+/// it across every `x_hi` instead of reconstructing it in the hot drain.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[repr(C, align(64))]
+pub(super) struct CBankNibbleLut {
+    pub(super) lo_n0_lo: [u64; 16],
+    pub(super) lo_n0_hi: [u64; 16],
+    pub(super) lo_n1_lo: [u64; 16],
+    pub(super) lo_n1_hi: [u64; 16],
+    pub(super) hi_n0_lo: [u64; 16],
+    pub(super) hi_n0_hi: [u64; 16],
+    pub(super) hi_n1_lo: [u64; 16],
+    pub(super) hi_n1_hi: [u64; 16],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl CBankNibbleLut {
+    fn new(mask_tables: &[super::F128]) -> Self {
+        debug_assert_eq!(mask_tables.len(), 512);
+        let (t_lo, t_hi) = mask_tables.split_at(256);
+        let mut lut = Self {
+            lo_n0_lo: [0; 16], lo_n0_hi: [0; 16],
+            lo_n1_lo: [0; 16], lo_n1_hi: [0; 16],
+            hi_n0_lo: [0; 16], hi_n0_hi: [0; 16],
+            hi_n1_lo: [0; 16], hi_n1_hi: [0; 16],
+        };
+        for i in 0..16 {
+            lut.lo_n0_lo[i] = t_lo[i].lo;
+            lut.lo_n0_hi[i] = t_lo[i].hi;
+            lut.lo_n1_lo[i] = t_lo[i << 4].lo;
+            lut.lo_n1_hi[i] = t_lo[i << 4].hi;
+            lut.hi_n0_lo[i] = t_hi[i].lo;
+            lut.hi_n0_hi[i] = t_hi[i].hi;
+            lut.hi_n1_lo[i] = t_hi[i << 4].lo;
+            lut.hi_n1_hi[i] = t_hi[i << 4].hi;
+        }
+        lut
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn build_c_bank_nibble_luts(mask_tables: &[super::F128]) -> Vec<CBankNibbleLut> {
+    debug_assert_eq!(mask_tables.len() % 512, 0);
+    mask_tables.chunks_exact(512).map(CBankNibbleLut::new).collect()
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn accumulate_c_banks_prebuilt(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    lut: &CBankNibbleLut,
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    // SAFETY: cfg supplies the features and fixed arrays bound all accesses.
+    unsafe {
+        if c_nibble_lut_enabled() {
+            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(
+                c_block, n_b_med, lut, partial_c,
+            );
+        } else {
+            x86_64::accumulate_c_banks_x86_avx512(
+                c_block, n_b_med, mask_tables, partial_c,
+            );
+        }
+    }
+}
+
 /// Accumulate the eight alpha-free C banks from already-transposed C rows.
 #[inline]
 pub(super) fn accumulate_c_banks(

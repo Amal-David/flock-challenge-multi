@@ -480,44 +480,30 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
     mask_tables: &[F128],
     partial_c: &mut [[F128; ELL]; 8],
 ) {
+    debug_assert_eq!(mask_tables.len(), 512);
+    let lut = super::CBankNibbleLut::new(mask_tables);
+    unsafe {
+        accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, &lut, partial_c)
+    }
+}
+
+/// DirectC nibble drain with the eq-dependent table already materialized.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
+    c_block: &[u8; 16 * ELL],
+    n_b_med: usize,
+    lut: &super::CBankNibbleLut,
+    partial_c: &mut [[F128; ELL]; 8],
+) {
     use core::arch::x86_64::*;
     debug_assert_eq!(ELL, 64);
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert_eq!(mask_tables.len(), 512);
-
-    #[repr(C, align(64))]
-    struct NibbleLut {
-        lo_n0_lo: [u64; 16],
-        lo_n0_hi: [u64; 16],
-        lo_n1_lo: [u64; 16],
-        lo_n1_hi: [u64; 16],
-        hi_n0_lo: [u64; 16],
-        hi_n0_hi: [u64; 16],
-        hi_n1_lo: [u64; 16],
-        hi_n1_hi: [u64; 16],
-    }
-
-    let (t_lo, t_hi) = mask_tables.split_at(256);
-    let mut lut = NibbleLut {
-        lo_n0_lo: [0; 16],
-        lo_n0_hi: [0; 16],
-        lo_n1_lo: [0; 16],
-        lo_n1_hi: [0; 16],
-        hi_n0_lo: [0; 16],
-        hi_n0_hi: [0; 16],
-        hi_n1_lo: [0; 16],
-        hi_n1_hi: [0; 16],
-    };
-    for i in 0..16 {
-        lut.lo_n0_lo[i] = t_lo[i].lo;
-        lut.lo_n0_hi[i] = t_lo[i].hi;
-        lut.lo_n1_lo[i] = t_lo[i << 4].lo;
-        lut.lo_n1_hi[i] = t_lo[i << 4].hi;
-        lut.hi_n0_lo[i] = t_hi[i].lo;
-        lut.hi_n0_hi[i] = t_hi[i].hi;
-        lut.hi_n1_lo[i] = t_hi[i << 4].lo;
-        lut.hi_n1_hi[i] = t_hi[i << 4].hi;
-    }
 
     #[inline(always)]
     unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {

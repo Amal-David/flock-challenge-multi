@@ -936,6 +936,12 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_hi_val: F128,
     convert: &[F128],
     mask_tables: &[F128],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    c_nibble_luts: &[kernels::CBankNibbleLut],
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.fill(F128::ZERO);
@@ -972,6 +978,23 @@ fn process_one_x_hi_with_precomputed_ab(
         };
         let c_tables = &mask_tables
             [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        kernels::accumulate_c_banks_prebuilt(
+            c_block,
+            n_b_med,
+            c_tables,
+            &c_nibble_luts[x_outer_lo],
+            &mut state.partial_c,
+        );
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         kernels::accumulate_c_banks(c_block, n_b_med, c_tables, &mut state.partial_c);
     }
     for lane in 0..ELL {
@@ -1335,6 +1358,12 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
     let mask_tables = build_c_mask_tables(&eq_lo_scaled);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let c_nibble_luts = kernels::build_c_bank_nibble_luts(&mask_tables);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
     let (res_ab, banks) = (0..hi_size)
@@ -1343,7 +1372,14 @@ pub(crate) fn round1_with_precomputed_ab_impl(
             process_one_x_hi_with_precomputed_ab(
                 x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
                 ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
-                &mask_tables, &mut state,
+                &mask_tables,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                &c_nibble_luts,
+                &mut state,
             );
             state
         })
