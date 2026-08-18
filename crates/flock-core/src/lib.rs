@@ -95,7 +95,64 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         v.set_len(n);
     }
+    hugepages::advise(v.as_mut_ptr() as *mut u8, n * core::mem::size_of::<T>());
     v
+}
+
+/// Transparent-huge-page hint for the prover's large buffers.
+///
+/// Every multi-hundred-MiB buffer of the ranked prove (packed witness rows,
+/// the AB precompute, the codeword, the zerocheck fold tables and ping-pong
+/// pair, the Merkle tree) is allocated through [`alloc_uninit_vec`] (mostly
+/// via the recycling scratch pool, so on the timed prove they are already
+/// resident). Ubuntu's kernel default is `transparent_hugepage=madvise`, so
+/// without a hint those buffers are backed by 4 KiB pages: the strided
+/// sweeps (top NTT layers touch rows MiBs apart, the tail folds stream
+/// GiB-scale tables) take a TLB miss + page walk per row. `MADV_HUGEPAGE`
+/// on the 2 MiB-aligned interior lets the first touch (in the untimed
+/// warm-up for pooled buffers) back them with 2 MiB pages, so the L2 TLB
+/// covers the whole working set. Pure hint: no functional effect, no bytes
+/// change; failures are ignored. Linux only.
+/// `FLOCK_NO_HUGEPAGES=1` disables the hint (exact A/B control).
+pub(crate) mod hugepages {
+    /// Below this size the hint is not worth a syscall.
+    const MIN_BYTES: usize = 4 << 20;
+    const PAGE: usize = 4096;
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int)
+            -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "linux")]
+    const MADV_HUGEPAGE: core::ffi::c_int = 14;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            cfg!(target_os = "linux") && std::env::var_os("FLOCK_NO_HUGEPAGES").is_none()
+        });
+        *ON
+    }
+
+    /// Advise the page-aligned interior of `[ptr, ptr + len)`.
+    pub(crate) fn advise(ptr: *mut u8, len: usize) {
+        if len < MIN_BYTES || !enabled() {
+            return;
+        }
+        let start = (ptr as usize).next_multiple_of(PAGE);
+        let end = (ptr as usize + len) & !(PAGE - 1);
+        if end <= start {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: `madvise` on a page-aligned sub-range of a live allocation
+        // owned by the caller; MADV_HUGEPAGE never unmaps or alters content.
+        unsafe {
+            let _ = madvise(start as *mut core::ffi::c_void, end - start, MADV_HUGEPAGE);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (start, end);
+    }
 }
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
