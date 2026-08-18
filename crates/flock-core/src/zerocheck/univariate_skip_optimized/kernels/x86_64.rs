@@ -138,10 +138,168 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
         _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }
 }
-/// x86 AVX-512 convert-table fold for the two-bank C path. Table lookups stay
-/// scalar because their byte-selected addresses are irregular, while four
-/// lanes of each resulting F128 accumulator are multiplied by `eq_lo_val` in
-/// one VPCLMULQDQ batch before being XORed into the worker partials.
+/// partials. The C side is table-free (see `kernels::accumulate_c_banks`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::*;
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    debug_assert_eq!(ELL % 4, 0);
+
+    // SAFETY: the fixed-size input/partial arrays contain every four-lane load
+    // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
+    // 16*256-entry table. The cfg gate supplies both required target features.
+    unsafe {
+        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        for lane in (0..ELL).step_by(4) {
+            let mut cf_ab = [F128::ZERO; 4];
+            for b_med in 0..n_b_med {
+                let table_base = b_med * 256;
+                for j in 0..4 {
+                    let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    cf_ab[j] += convert[table_base + v_ab];
+                }
+            }
+
+            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+
+            let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
+            _mm512_storeu_si512(
+                ab_ptr,
+                _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
+            );
+        }
+    }
+}
+
+/// AVX-512 DirectC drain. Mask construction works on 16 output lanes at once:
+/// each C row is widened from bytes to dwords, then eight `vptestmd` masks
+/// select the row's bit into the corresponding bank accumulator. Four F128s
+/// are updated per ZMM using two L1-resident qword gathers (one per table).
+///
+/// This deliberately requires only the dispatch contract's AVX-512F. In
+/// particular, it does not silently depend on AVX-512BW or VBMI even though
+/// the ranked machine also provides those extensions.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
+    c_block: &[u8; 16 * ELL],
+    n_b_med: usize,
+    mask_tables: &[F128],
+    partial_c: &mut [[F128; ELL]; 8],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(ELL, 64);
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    debug_assert_eq!(mask_tables.len(), 512);
+
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+
+    // SAFETY: each row load reads 16 bytes from a 64-byte row of `c_block`;
+    // n_b_med <= 16 bounds the row index. Each mask is at most 0xffff, and
+    // its low/high bytes therefore index the two 256-entry table halves.
+    // Gather indices address the two qwords of four selected F128 values.
+    // Each partial load/store covers exactly four lanes in a 64-lane bank.
+    unsafe {
+        for lane_base in (0..ELL).step_by(16) {
+            let mut masks = [_mm512_setzero_si512(); 8];
+            let bank_bits = [
+                _mm512_set1_epi32(1),
+                _mm512_set1_epi32(2),
+                _mm512_set1_epi32(4),
+                _mm512_set1_epi32(8),
+                _mm512_set1_epi32(16),
+                _mm512_set1_epi32(32),
+                _mm512_set1_epi32(64),
+                _mm512_set1_epi32(128),
+            ];
+
+            for b_med in 0..n_b_med {
+                let row_ptr = c_block.as_ptr().add(b_med * ELL + lane_base);
+                let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
+                let row = _mm512_cvtepu8_epi32(row_bytes);
+                let weight = _mm512_set1_epi32((1u32 << b_med) as i32);
+
+                for (mask, bank_bit) in masks.iter_mut().zip(bank_bits) {
+                    let selected = _mm512_test_epi32_mask(row, bank_bit);
+                    *mask = _mm512_mask_or_epi32(*mask, selected, *mask, weight);
+                }
+            }
+
+            for (bank, mask) in partial_c.iter_mut().zip(masks) {
+                let mut mask_words = [0u32; 16];
+                _mm512_storeu_si512(mask_words.as_mut_ptr() as *mut __m512i, mask);
+
+                for lane_in_group in (0..16).step_by(4) {
+                    let m0 = i64::from(mask_words[lane_in_group]);
+                    let m1 = i64::from(mask_words[lane_in_group + 1]);
+                    let m2 = i64::from(mask_words[lane_in_group + 2]);
+                    let m3 = i64::from(mask_words[lane_in_group + 3]);
+
+                    // F128 is two adjacent u64s. These qword indices preserve
+                    // the in-memory [lo, hi] order for four gathered values.
+                    let lo_indices = _mm512_set_epi64(
+                        2 * (m3 & 0xff) + 1,
+                        2 * (m3 & 0xff),
+                        2 * (m2 & 0xff) + 1,
+                        2 * (m2 & 0xff),
+                        2 * (m1 & 0xff) + 1,
+                        2 * (m1 & 0xff),
+                        2 * (m0 & 0xff) + 1,
+                        2 * (m0 & 0xff),
+                    );
+                    let hi_indices = _mm512_set_epi64(
+                        2 * (m3 >> 8) + 1,
+                        2 * (m3 >> 8),
+                        2 * (m2 >> 8) + 1,
+                        2 * (m2 >> 8),
+                        2 * (m1 >> 8) + 1,
+                        2 * (m1 >> 8),
+                        2 * (m0 >> 8) + 1,
+                        2 * (m0 >> 8),
+                    );
+
+                    let from_lo = _mm512_i64gather_epi64::<8>(
+                        lo_indices,
+                        t_lo.as_ptr() as *const i64,
+                    );
+                    let from_hi = _mm512_i64gather_epi64::<8>(
+                        hi_indices,
+                        t_hi.as_ptr() as *const i64,
+                    );
+                    let partial_ptr = bank
+                        .as_mut_ptr()
+                        .add(lane_base + lane_in_group)
+                        as *mut __m512i;
+                    let updated = _mm512_xor_si512(
+                        _mm512_loadu_si512(partial_ptr),
+                        _mm512_xor_si512(from_lo, from_hi),
+                    );
+                    _mm512_storeu_si512(partial_ptr, updated);
+                }
+            }
+        }
+    }
+}
+
+/// Legacy two-bank capture kernel retained for compatibility with the old
+/// entry point. DirectC does not call it.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -158,52 +316,77 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     partial_c_0: &mut [F128; ELL],
     partial_c_1: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
-    use core::arch::x86_64::*;
-    debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert_eq!(ELL % 4, 0);
+    for lane in 0..ELL {
+        let mut converted_ab = F128::ZERO;
+        let mut converted_c_0 = F128::ZERO;
+        let mut converted_c_1 = F128::ZERO;
+        for b_med in 0..n_b_med {
+            let table_base = b_med * 256;
+            let c = usize::from(chunk_c_bytes[b_med][lane]);
+            converted_ab += convert[table_base + usize::from(chunk_ab_bytes[b_med][lane])];
+            converted_c_0 += convert[table_base + (c & 0x55)];
+            converted_c_1 += convert[table_base + (c & 0xaa)];
+        }
+        partial_ab[lane] += converted_ab * eq_lo_val;
+        partial_c_0[lane] += converted_c_0 * eq_lo_val;
+        partial_c_1[lane] += converted_c_1 * eq_lo_val;
+    }
+}
 
-    // SAFETY: the fixed-size input/partial arrays contain every four-lane load
-    // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
-    // 16*256-entry table. The cfg gate supplies both required target features.
-    unsafe {
-        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
-        for lane in (0..ELL).step_by(4) {
-            let mut cf_ab = [F128::ZERO; 4];
-            let mut cf_c_0 = [F128::ZERO; 4];
-            let mut cf_c_1 = [F128::ZERO; 4];
-            for b_med in 0..n_b_med {
-                let table_base = b_med * 256;
-                for j in 0..4 {
-                    let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
-                    let v_c = chunk_c_bytes[b_med][lane + j] as usize;
-                    cf_ab[j] += convert[table_base + v_ab];
-                    cf_c_0[j] += convert[table_base + (v_c & 0x55)];
-                    cf_c_1[j] += convert[table_base + (v_c & 0xAA)];
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+mod tests {
+    use super::super::accumulate_c_banks_scalar;
+    use super::{accumulate_c_banks_x86_avx512, F128};
+
+    #[test]
+    fn accumulate_c_banks_avx512_matches_scalar() {
+        let mut c_block = [0u8; 16 * 64];
+        for (i, byte) in c_block.iter_mut().enumerate() {
+            *byte = (i as u8)
+                .wrapping_mul(0x9d)
+                .rotate_left((i & 7) as u32)
+                ^ (i >> 3) as u8;
+        }
+
+        let mut mask_tables = [F128::ZERO; 512];
+        for (i, value) in mask_tables.iter_mut().enumerate() {
+            let x = i as u64;
+            *value = F128::new(
+                x.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x0123_4567_89ab_cdef,
+                x.rotate_left(29).wrapping_mul(0xd6e8_feb8_6659_fd93)
+                    ^ 0xfedc_ba98_7654_3210,
+            );
+        }
+
+        for n_b_med in 0..=16 {
+            let mut scalar = [[F128::ZERO; 64]; 8];
+            for (bank_index, bank) in scalar.iter_mut().enumerate() {
+                for (lane, value) in bank.iter_mut().enumerate() {
+                    *value = F128::new(
+                        ((bank_index * 64 + lane) as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                        ((lane * 8 + bank_index) as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                    );
                 }
             }
+            let mut simd = scalar;
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
-            let scaled_c_0 =
-                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
-            let scaled_c_1 =
-                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
-
-            let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
-            let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;
-            let c1_ptr = partial_c_1.as_mut_ptr().add(lane) as *mut __m512i;
-            _mm512_storeu_si512(
-                ab_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
-            );
-            _mm512_storeu_si512(
-                c0_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c0_ptr), scaled_c_0),
-            );
-            _mm512_storeu_si512(
-                c1_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c1_ptr), scaled_c_1),
-            );
+            accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut scalar);
+            // SAFETY: this test is compiled only when the kernel's target
+            // features are statically enabled; all buffers have exact sizes.
+            unsafe {
+                accumulate_c_banks_x86_avx512(
+                    &c_block,
+                    n_b_med,
+                    &mask_tables,
+                    &mut simd,
+                );
+            }
+            assert_eq!(simd, scalar, "n_b_med={n_b_med}");
         }
     }
 }

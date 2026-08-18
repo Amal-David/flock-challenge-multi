@@ -345,6 +345,27 @@ fn direct_ab_claim_mix_supported(
     )
 }
 
+
+#[inline]
+fn direct_all_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold2.as_ref().is_some_and(|direct| direct.products.is_some())
+                && c.direct_fold2.as_ref().is_some_and(|direct| direct.products.is_some())
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
+}
+
+#[inline]
+pub fn ranked_direct_c_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none())
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -428,16 +449,34 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // Production-only x86 route: retain AB as four low-coordinate banks and
     // materialize it only after the first two sumcheck challenges. The next
     // experiment retains C too, eliminating the remaining full basis buffer.
-    let use_direct_ab = cfg!(target_arch = "x86_64")
+    let direct_common = cfg!(target_arch = "x86_64")
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && direct_ab_claim_mix_supported(&rs_results);
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+    let use_direct_all = direct_common
+        && ranked_direct_c_enabled()
+        && direct_all_claim_mix_supported(&rs_results);
+    let use_direct_ab = direct_common
+        && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
     let use_direct_c = use_direct_ab
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+        && !use_direct_all
+        && ranked_direct_c_enabled()
         && rs_results[1].1.direct_fold2.is_some();
-    let direct_fold2 = if use_direct_ab {
+    let direct_fold2 = if use_direct_all {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct-all gate checked claim zero"),
+            rs_results[1]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct-all gate checked claim one"),
+        ])
+    } else if use_direct_ab {
         let mut direct = vec![
             rs_results[0]
                 .1
@@ -523,7 +562,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = if use_direct_c {
+    let mut b_combined: Vec<F128> = if use_direct_c || use_direct_all {
         Vec::new()
     } else {
         crate::scratch::take_f128(l)
@@ -548,7 +587,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && pd_dense.is_empty();
 
     let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
-        in_wide_combine_pool(l, || if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
+        in_wide_combine_pool(l, || if use_direct_all {
+        ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
+    } else if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
         let (prime, lookahead) = deferred_stats_lookahead(
             packed_witness,
             eq_lo,
@@ -1610,6 +1651,37 @@ mod tests {
         assert_eq!(
             messages_from_direct_products(&[factors]),
             round0_and_round1_lookahead(&witness, &basis),
+        );
+
+        let mut basis_c = [F128::ZERO; 4];
+        for value in &mut basis_c {
+            *value = rng.f128();
+        }
+        let mut products_ab = [F128::ZERO; 16];
+        let mut products_c = [F128::ZERO; 16];
+        for e in 0..4 {
+            for d in 0..4 {
+                products_ab[4 * e + d] = witness[e] * basis[d];
+                products_c[4 * e + d] = witness[e] * basis_c[d];
+            }
+        }
+        let make_factors = |products| ring_switch::DirectFold2Factors {
+            eq_lo: Vec::new(),
+            eq_hi: Vec::new(),
+            low_eq: [F128::ZERO; 4],
+            table: Vec::new(),
+            products: Some(products),
+        };
+        let mut combined_basis = basis;
+        for (out, value) in combined_basis.iter_mut().zip(basis_c) {
+            *out += value;
+        }
+        assert_eq!(
+            messages_from_direct_products(&[
+                make_factors(products_ab),
+                make_factors(products_c),
+            ]),
+            round0_and_round1_lookahead(&witness, &combined_basis),
         );
     }
 

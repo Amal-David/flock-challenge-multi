@@ -218,7 +218,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed, b_packed, c_packed, m, padding, true, None, challenger,
     );
@@ -227,6 +227,11 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
     )
+}
+
+pub struct CapturedSHatVC {
+    pub s_hat_v_c: Vec<F128>,
+    pub quad: Vec<F128>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -241,7 +246,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     padding: &PaddingSpec,
     ab_inner: univariate_skip_optimized::Round1AbInner,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
         b_packed,
@@ -269,7 +274,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
+) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -327,32 +332,17 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                ab_inner,
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                inv_table,
-                padding,
+        let (ab, c, s_hat_v_c, quad) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+                ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
             );
-        (ab, c, Some(s))
+        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad }))
     } else if capture_s_hat_v_c {
-        let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-                a_packed,
-                b_packed,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                inv_table,
-                padding,
+        let (ab, c, s_hat_v_c, quad) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+                a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
             );
-        (ab, c, Some(s))
+        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad }))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
