@@ -2,29 +2,9 @@ use crate::field::F128;
 
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
-    butterfly_row_pair_gen::<false>(top, bot, twiddle)
-}
-
-/// `v * t` where `LOW` asserts `t.hi == 0`. Monomorphized so the choice is
-/// resolved at compile time and no branch enters the lane loop.
-#[inline(always)]
-fn mul_t<const LOW: bool>(v: F128, t: F128) -> F128 {
-    if LOW {
-        crate::field::gf2_128::mul_low_rhs(v, t)
-    } else {
-        v * t
-    }
-}
-
-#[inline]
-pub(super) fn butterfly_row_pair_gen<const LOW: bool>(
-    top: &mut [F128],
-    bot: &mut [F128],
-    twiddle: F128,
-) {
     for lane in 0..top.len() {
         let v = bot[lane];
-        let new_u = top[lane] + mul_t::<LOW>(v, twiddle);
+        let new_u = top[lane] + v * twiddle;
         top[lane] = new_u;
         bot[lane] = v + new_u;
     }
@@ -41,35 +21,21 @@ pub(super) fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    butterfly_fused_2layer_gen::<false, false>(a, b, c, d, t_outer, t_inner_a, t_inner_b)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(super) fn butterfly_fused_2layer_gen<const OUTER_LOW: bool, const INNER_LOW: bool>(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
     for lane in 0..a.len() {
         let mut xa = a[lane];
         let mut xb = b[lane];
         let mut xc = c[lane];
         let mut xd = d[lane];
-        let na = xa + mul_t::<OUTER_LOW>(xc, t_outer);
+        let na = xa + xc * t_outer;
         xc += na;
         xa = na;
-        let nb = xb + mul_t::<OUTER_LOW>(xd, t_outer);
+        let nb = xb + xd * t_outer;
         xd += nb;
         xb = nb;
-        let na2 = xa + mul_t::<INNER_LOW>(xb, t_inner_a);
+        let na2 = xa + xb * t_inner_a;
         xb += na2;
         xa = na2;
-        let nc2 = xc + mul_t::<INNER_LOW>(xd, t_inner_b);
+        let nc2 = xc + xd * t_inner_b;
         xd += nc2;
         xc = nc2;
         a[lane] = xa;
@@ -79,89 +45,232 @@ pub(super) fn butterfly_fused_2layer_gen<const OUTER_LOW: bool, const INNER_LOW:
     }
 }
 
-/// # Safety
-/// The caller guarantees that every selected source and destination row is
-/// valid, source and destination do not overlap, and concurrent calls write
-/// disjoint destination row groups.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
+/// Fused three-layer (radix-8) butterfly on one lane's 8 values.
+///
+/// `twiddles` holds 7 values in the same breadth-first order
+/// [`butterfly_fused_4layer`] uses, truncated by one level: `[0]` is layer L
+/// (shared by all 4 pairs), `[1..3]` layer L+1 (one per half), `[3..7]`
+/// layer L+2 (one per quarter).
 #[inline]
-pub(super) unsafe fn butterfly_fused_2layer_row_from(
+pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    for i in 0..4 {
+        butterfly(values, i, i + 4, twiddles[0]);
+    }
+    for s in 0..2 {
+        for i in 0..2 {
+            butterfly(values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
+        }
+    }
+    for s in 0..4 {
+        butterfly(values, 2 * s, 2 * s + 1, twiddles[3 + s]);
+    }
+}
+
+/// Fused three-layer butterfly for the root block, whose left-spine
+/// twiddles are identically zero: `twiddles[0] == twiddles[1] ==
+/// twiddles[3] == 0`.
+///
+/// A zero-twiddle forward butterfly maps `(u, v)` to `(u, v + u)`, so the
+/// seven butterflies on that spine need only XORs. The remaining five use
+/// the ordinary field multiply. In particular, `values[0]` is unchanged by
+/// all three layers.
+#[inline]
+pub(super) fn butterfly_fused_3layer_zero_root(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // Layer L, t[0] = 0: four XOR-only butterflies.
+    for i in 0..4 {
+        let u = values[i];
+        values[i + 4] += u;
+    }
+
+    // Layer L+1. The top-half twiddle t[1] is zero; t[2] is general.
+    for i in 0..2 {
+        let u = values[i];
+        values[i + 2] += u;
+    }
+    butterfly(values, 4, 6, twiddles[2]);
+    butterfly(values, 5, 7, twiddles[2]);
+
+    // Layer L+2. The first quarter's twiddle t[3] is zero.
+    let u = values[0];
+    values[1] += u;
+    butterfly(values, 2, 3, twiddles[4]);
+    butterfly(values, 4, 5, twiddles[5]);
+    butterfly(values, 6, 7, twiddles[6]);
+}
+
+/// Rate-1/2 first-pass row kernel: load the radix-8 row group from `src`
+/// once, evaluate both layer-1 blocks' fused-3 butterflies — the zero-root
+/// set to `dst0`, the general set to `dst1`. Both destinations hold stale
+/// bytes on entry; every selected slot is written.
+///
+/// # Safety
+/// Row/lane geometry valid for all three pointers, disjoint row groups
+/// across concurrent calls, and `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     src: *const F128,
-    dst: *mut F128,
-    quarter: usize,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
     num_ntts: usize,
     r: usize,
-    twiddles: &[F128; 3],
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
 ) {
-    let [t_outer, t_inner_a, t_inner_b] = *twiddles;
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
         for lane in 0..num_ntts {
-            let mut a = *src.add(r * num_ntts + lane);
-            let mut b = *src.add((quarter + r) * num_ntts + lane);
-            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
-            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
-
-            let new_a = a + c * t_outer;
-            c += new_a;
-            a = new_a;
-            let new_b = b + d * t_outer;
-            d += new_b;
-            b = new_b;
-
-            let new_a = a + b * t_inner_a;
-            b += new_a;
-            a = new_a;
-            let new_c = c + d * t_inner_b;
-            d += new_c;
-            c = new_c;
-
-            *dst.add(r * num_ntts + lane) = a;
-            *dst.add((quarter + r) * num_ntts + lane) = b;
-            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
-            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+            let mut loaded = [F128::ZERO; 8];
+            for (i, value) in loaded.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            let mut v0 = loaded;
+            butterfly_fused_3layer_zero_root(&mut v0, t_zero);
+            for (i, value) in v0.iter().enumerate() {
+                *dst0.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+            let mut v1 = loaded;
+            butterfly_fused_3layer(&mut v1, t_gen);
+            for (i, value) in v1.iter().enumerate() {
+                *dst1.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
         }
     }
 }
 
+/// Out-of-place fused-three-layer row used by the recursive commitment's
+/// from-message first pass. `dst` may contain stale bytes; every selected
+/// slot is initialized from the corresponding radix-8 row group in `src`.
+///
 /// # Safety
-/// The caller guarantees that every selected source and destination row is
-/// valid, source and destination do not overlap, and concurrent calls write
-/// disjoint destination row groups.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
-#[inline]
-pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
+/// The caller supplies valid source/destination row geometry and ensures
+/// concurrent calls own disjoint destination row groups.
+pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     src: *const F128,
     dst: *mut F128,
-    quarter: usize,
+    eighth: usize,
     num_ntts: usize,
     r: usize,
-    right_twiddle: F128,
+    twiddles: &[F128; 7],
 ) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
         for lane in 0..num_ntts {
-            let a = *src.add(r * num_ntts + lane);
-            let mut b = *src.add((quarter + r) * num_ntts + lane);
-            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
-            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
 
-            // Layer 1 and the left layer-2 butterfly have zero twiddle.
-            c += a;
-            d += b;
-            b += a;
-            let new_c = c + d * right_twiddle;
-            d += new_c;
-            c = new_c;
+/// Zero-root specialization of [`butterfly_fused_3layer_from_src_row`].
+///
+/// # Safety
+/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and zero-root contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer_zero_root(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
 
-            *dst.add(r * num_ntts + lane) = a;
-            *dst.add((quarter + r) * num_ntts + lane) = b;
-            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
-            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
+/// Process one fused-three-layer row group across every interleaved lane.
+///
+/// Eight row streams at stride `eighth * num_ntts` elements. Every such
+/// stride is a multiple of the L1 set-repeat period at these shapes, so all
+/// eight streams map onto the same set — exactly 8 ways on an 8-way L1D, the
+/// widest fusion that still fits. Radix-16 would demand 16 ways and thrash.
+///
+/// # Safety
+/// The caller guarantees that every selected row and lane is valid and that
+/// concurrent calls use disjoint row groups.
+pub(super) unsafe fn butterfly_fused_3layer_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..lanes {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// Root-block specialization of [`butterfly_fused_3layer_row`].
+///
+/// The caller additionally guarantees that `twiddles[0]`, `twiddles[1]`, and
+/// `twiddles[3]` are zero. Row stream zero is not written back because the
+/// specialized butterfly proves it is unchanged.
+///
+/// # Safety
+/// The caller guarantees that every selected row and lane is valid and that
+/// concurrent calls use disjoint row groups.
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..lanes {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer_zero_root(&mut values, twiddles);
+            // values[0] is unchanged, so leave its cache line clean.
+            for (i, value) in values.iter().enumerate().skip(1) {
+                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
         }
     }
 }
@@ -205,13 +314,12 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
-    active_lanes: usize,
     r: usize,
     twiddles: &[F128; 15],
 ) {
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..active_lanes {
+        for lane in 0..num_ntts {
             let mut values = [F128::ZERO; 16];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add((i * sixteenth + r) * num_ntts + lane);

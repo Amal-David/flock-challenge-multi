@@ -19,9 +19,16 @@
 
 pub mod bits;
 pub mod challenger;
+pub mod cpu_keepalive;
+// Public but hidden: flock-prover's witness driver drains its groups through
+// the hetero queue (W-H1). Not a stable API surface.
+#[doc(hidden)]
+pub mod epool;
 pub mod field;
-pub mod gaptime;
-pub mod gpu;
+// Public only for `note_precompute_branch_wall_ms` (the prover's join arm
+// reports its wall to the hybrid-split warmup sweep); internals stay
+// pub(crate).
+pub mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -33,6 +40,23 @@ pub mod r1cs;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
+
+/// Shared kill switch for the micro-stack batch of small prover cuts
+/// (`eval_sk_at_vks` memoization, recursion-OOD optimized eq-table builder,
+/// fast `pcs_open` bundle encoder). Set exactly `FLOCK_NO_MICRO_STACK=1` to
+/// restore every incumbent path as a same-binary A/B control; any other value
+/// (or unset) keeps the micro-stack paths. All gated paths are byte-identical
+/// to the incumbents (each has its own equivalence test), so the switch exists
+/// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
+pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
+
+/// Unlike `ab_compact_store_enabled` this does **not** latch the first read
+/// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
+/// per-call `var_os` read is noise, and re-reading keeps same-process A/B
+/// tests (set var → prove → unset → prove) possible.
+pub fn micro_stack_enabled() -> bool {
+    std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+}
 
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
@@ -47,25 +71,179 @@ pub mod zerocheck;
 /// code runs (rayon's global pool is set on first use; if it's already
 /// created, this call is a no-op).
 ///
-/// Respects `RAYON_NUM_THREADS` — if that env var is set, this function
-/// does nothing (so explicit user configuration always wins).
+/// Respects `RAYON_NUM_THREADS` as an explicit size override while retaining
+/// the platform worker setup below.
 ///
 /// Returns the number of threads the pool was configured with, or `None`
-/// if no change was made (either because the env var was set or because
-/// rayon was already initialized).
+/// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
-        return None;
+    let mut n = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(perf_core_count);
+    // Linux x86: one thread per physical core. The harness pins
+    // RAYON_NUM_THREADS to all SMT threads, but the DRAM-bound fold phases
+    // measure faster without SMT sibling contention (paired A/B on the ranked
+    // 8c/16t shape: commit -19%, round2 -11%, round1 -8%, open -7%).
+    // `FLOCK_NO_PHYS_GLOBAL=1` keeps the harness width; unreadable topology
+    // or an SMT-less machine also keeps it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if std::env::var_os("FLOCK_NO_PHYS_GLOBAL").is_none() {
+        if let Some(w) = linux_physical_core_width() {
+            if w < n {
+                n = w;
+            }
+        }
     }
-    let n = perf_core_count();
+    // The main/calling thread runs *all* sequential work (seed expansion,
+    // Fiat-Shamir observe/sample, proof serialization, multi-proof extract)
+    // but rayon's start_handler only tags the pool workers. On Apple Silicon
+    // an unspecified-QoS thread is freely E-cluster-eligible, which can park
+    // that serial work on efficiency cores while the P-cluster's DVFS domain
+    // still participates in the QoS decision. Pin the caller first so the
+    // whole prover process is USER_INITIATED before any timed trial starts.
+    set_prover_thread_qos();
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
+        .start_handler(|_| set_prover_thread_qos())
         .build_global()
     {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
 }
+
+/// Apply the prover's QoS class to the calling thread.
+///
+/// Threads this crate's consumers spawn outside the Rayon pool (the ranked
+/// worker's seed-pipeline thread) still run timed serial work, so they need
+/// the same P-cluster pin [`init_perf_thread_pool`] gives the main thread.
+pub fn set_calling_thread_prover_qos() {
+    set_prover_thread_qos();
+}
+
+/// Move the calling thread onto the efficiency cluster for a span that nothing
+/// timed is waiting on.
+///
+/// The comment on [`init_perf_thread_pool`] — "the main/calling thread runs
+/// *all* sequential work" — predates seed pipelining and is no longer true of
+/// the ranked worker. Once stdin is spliced, the protected wrapper's main
+/// thread re-expands the seed and byte-compares the result *while the real
+/// proof is already running on the seed-pipe thread*, so across that span it
+/// holds no critical-path work at all. What it does hold is an eleventh
+/// runnable thread against a Rayon pool sized to the ten performance cores,
+/// plus ~29 MiB of expansion stores and ~59 MiB of comparison reads landing in
+/// the store-bound witness phase. `QOS_CLASS_UTILITY` is the same class
+/// [`epool`] uses to reach the E-cluster, so the scheduler parks that shadow
+/// work there instead. Reverse with [`set_calling_thread_prover_qos`] before
+/// any timed serial work resumes.
+pub fn set_calling_thread_shadow_qos() {
+    set_shadow_thread_qos();
+}
+
+#[cfg(target_os = "macos")]
+fn set_shadow_thread_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    // QOS_CLASS_UTILITY: the scheduler places these on efficiency cores.
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x11, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_shadow_thread_qos() {}
+
+/// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
+/// inherits default QoS, which lets sustained jobs drift onto efficiency cores
+/// even when the pool was deliberately sized to the performance-core count.
+#[cfg(target_os = "macos")]
+fn set_prover_thread_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_prover_thread_qos() {}
+
+/// SMT-sibling-derived physical core count (cpu0 topology); None when the
+/// topology is unreadable or the machine has no SMT.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn linux_physical_core_width() -> Option<usize> {
+    let available = std::thread::available_parallelism().ok()?.get();
+    let s =
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+            .ok()?;
+    let siblings: usize = s
+        .trim()
+        .split(',')
+        .map(|part| match part.split_once('-') {
+            Some((a, b)) => {
+                let a: usize = a.parse().unwrap_or(0);
+                let b: usize = b.parse().unwrap_or(a);
+                b.saturating_sub(a) + 1
+            }
+            None => 1,
+        })
+        .sum();
+    if siblings <= 1 {
+        return None;
+    }
+    Some((available / siblings).max(1))
+}
+
+/// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
+/// THP in `madvise` mode, so without this hint the prover's 32 MB-1 GB
+/// working buffers sit on 4 KiB pages through every strided sweep. Advising
+/// at allocation time means the setup-phase prewarm faults the pool's pages
+/// as 2 MiB pages once, before any timed proof. Raw syscall (no libc dep);
+/// errors ignored. `FLOCK_NO_HUGEPAGES` is a local-diagnostics kill switch.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn advise_hugepages(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
+    if *DISABLED {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = ptr as usize + bytes;
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_HUGEPAGE: usize = 14;
+    // SAFETY: the advised range lies within the just-allocated buffer, and
+    // MADV_HUGEPAGE never alters contents or mapping validity.
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_HUGEPAGE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
@@ -95,6 +273,7 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         v.set_len(n);
     }
+    advise_hugepages(v.as_mut_ptr().cast::<u8>(), n * core::mem::size_of::<T>());
     v
 }
 

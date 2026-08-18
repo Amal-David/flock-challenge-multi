@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{C_MASK_TABLE_STRIDE, F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -16,8 +16,64 @@ pub(super) use portable::shift_reduce_inner_ab_scalar;
 #[cfg(target_arch = "aarch64")]
 pub(super) mod aarch64;
 
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::StaticBContext;
+
+#[cfg(not(target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+pub(super) struct StaticBContext;
+
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
+
+/// Resolve the process-wide static-B policy and inverse-NTT partial table once
+/// per AB precompute, rather than once for every hot `(window, b_med)` call.
+#[inline]
+pub(super) fn prepare_static_b_context(
+    inv_table: &InvNttTableByteSingleGf8,
+    blake3_static_layout: bool,
+) -> Option<StaticBContext> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::prepare_static_b_context(inv_table, blake3_static_layout)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (inv_table, blake3_static_layout);
+        None
+    }
+}
+
+#[inline]
+pub(super) fn static_b_context_is_prepared(context: Option<StaticBContext>) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        matches!(context, Some(StaticBContext::Prepared { .. }))
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = context;
+        false
+    }
+}
+
+#[inline]
+pub(super) fn fast_shift_reduce_enabled() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fast_shift_reduce_enabled()
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+pub(super) const AB_FAST_POLICY_PROCESS: u8 = 0;
+pub(super) const AB_FAST_POLICY_FORCE_FAST: u8 = 1;
 
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -51,7 +107,7 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab(
+pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -60,17 +116,31 @@ pub(super) fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
 ) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = nt_store;
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon(
+        aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<FAST_POLICY>(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
             out,
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+            nt_store,
         );
     }
 
@@ -81,7 +151,15 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512bw"
     ))]
     {
-        let _ = (a_col, b_col);
+        let _ = (
+            a_col,
+            b_col,
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+        );
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
             x86_64::shift_reduce_inner_ab_x86_avx512(
@@ -102,6 +180,13 @@ pub(super) fn shift_reduce_inner_ab(
     ))]
     // SAFETY: gfni is enabled at compile time; SSE2 is baseline on x86_64.
     unsafe {
+        let _ = (
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+        );
         x86_64::shift_reduce_inner_ab_x86_sse(
             a_packed,
             b_packed,
@@ -118,68 +203,21 @@ pub(super) fn shift_reduce_inner_ab(
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "gfni")
     )))]
-    portable::shift_reduce_inner_ab_scalar(
-        a_packed,
-        b_packed,
-        inv_table,
-        chunk_byte_base,
-        b_med,
-        out,
-        a_col,
-        b_col,
-    );
-}
-
-/// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
-/// call. On aarch64 this takes the interleaved two-window NEON wavefront
-/// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
-/// sequential single-window calls. Bit-identical to two calls of
-/// [`shift_reduce_inner_ab`] on every path.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab_x2(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out0: &mut [u8; 64],
-    out1: &mut [u8; 64],
-    a_col: &mut [F8],
-    b_col: &mut [F8],
-) {
-    #[cfg(target_arch = "aarch64")]
     {
-        let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon_x2(
+        let _ = (
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+        );
+        portable::shift_reduce_inner_ab_scalar(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
-            out0,
-            out1,
-        );
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out0,
-            a_col,
-            b_col,
-        );
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med + 1,
-            out1,
+            out,
             a_col,
             b_col,
         );
@@ -224,6 +262,215 @@ pub(super) fn accumulate_convert(
     );
 }
 
+/// The eight α-free single-bit-`K` C banks for one `x_outer_lo`.
+///
+/// Bank `s` accumulates `Σ_b γ^b · bit_s(chunk_c_bytes[b][lane])`. For `b < 16`
+/// `γ^b = F128 { lo: 1 << b }` — `gamma_pow` is repeated `mul_by_x` from ONE and
+/// never reduces below bit 128 — so the entire bank value is the u16 mask of
+/// bit `s` across the 16 `b_med` C bytes. The C side therefore needs **no
+/// convert table, no gathers and no F128 XOR accumulators at all**.
+///
+/// The remaining `F128 { lo: mask } * eq_lo_val` is F₂-linear in the mask bits,
+/// so it is a table lookup rather than a multiply: `mask_tables` is this
+/// `x_outer_lo`'s [`C_MASK_TABLE_STRIDE`]-entry slice with
+/// `[v] = F128 { lo: v } * eq_lo` and `[256 + v] = F128 { lo: v << 8 } * eq_lo`,
+/// built once per prove by [`super::build_c_mask_tables`]. **Zero multiplies in
+/// the hot loop.**
+///
+/// The banks are **α-free** and carry **no `C_2`**: `α^K` and `C_2` are exactly
+/// the small-eq weights that `low_eq = build_eq([r[k_skip+1], r[k_skip+2]])`
+/// re-applies downstream — in `collapse_s_hat_v_quad` on intake *and* in
+/// `build_direct_fold2_table` at materialize time. Folding either constant in
+/// here would double-count it. The wire `s_hat_v_c` re-applies them once, at
+/// reduction time (`α^K` per bank, then `C_2 · α^{-b_3[0]}`).
+///
+/// Padding: with `n_b_med < 16` the missing `b_med` simply leave their mask bit
+/// clear, which is the same field element the per-`b_med` form would have
+/// accumulated (those windows are all-zero witness).
+#[inline]
+pub(super) fn accumulate_c_banks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    accumulate_c_banks_with_policy(c_block, n_b_med, mask_tables, partial_c, true);
+}
+
+#[inline]
+pub(super) fn accumulate_c_banks_with_policy(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+    drain4: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
+    // every load/store and the table halves bound every `u8`-scaled index.
+    unsafe {
+        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c, drain4);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = drain4;
+        accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
+    }
+}
+
+/// Thirty-two-bank C drain for the experimental direct-fold4 capture.
+/// `q = b_med & 3` is retained alongside the incumbent eight small-bit banks;
+/// the 16-entry table folds only `h = b_med >> 2`.
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn accumulate_c_fold4_banks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_table: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; fixed-size arrays cover
+    // every load/store and each mask-table index is a four-bit nibble.
+    unsafe {
+        aarch64::accumulate_c_fold4_banks(c_block, n_b_med, mask_table, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    super::accumulate_c_fold4_banks_scalar(c_block, n_b_med, mask_table, partial_c);
+}
+
+/// Pair-fused Fold4 drain with the original 32-bank accumulator shape.  This
+/// is the first A/B candidate: it halves drain traffic without changing the
+/// 128-job schedule or allocating additional partials.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_pair_banks(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    pair_mask_table: &[super::F128; 256],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    for q in 0..4 {
+        let q_banks: &mut [[super::F128; 64]; 8] = (&mut partial_c[q * 8..(q + 1) * 8])
+            .try_into()
+            .expect("eight Fold4 banks per retained q group");
+        accumulate_c_fold4_q_pair_banks(
+            c_block_even,
+            n_b_med_even,
+            c_block_odd,
+            n_b_med_odd,
+            q,
+            pair_mask_table,
+            q_banks,
+        );
+    }
+}
+
+/// Four-block Fold4 drain for the monolithic 32-bank candidate. Two composed
+/// pair tables cover blocks (0,1) and (2,3); the architecture kernel combines
+/// their contributions before one accumulator read/modify/write.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_four_banks(
+    c_blocks: [&[u8; 16 * 64]; 4],
+    n_b_med: [usize; 4],
+    pair_mask_tables: [&[super::F128; 256]; 2],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    assert!(
+        n_b_med.into_iter().all(|count| count <= 16),
+        "Fold4 padding count exceeds 16 rows"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: fixed arrays cover all selected rows and both table indices are
+    // assembled from two four-bit masks.
+    unsafe {
+        aarch64::accumulate_c_fold4_four_banks(c_blocks, n_b_med, pair_mask_tables, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for q in 0..4 {
+        let q_banks: &mut [[super::F128; 64]; 8] = (&mut partial_c[q * 8..(q + 1) * 8])
+            .try_into()
+            .expect("eight Fold4 banks per retained q group");
+        super::accumulate_c_fold4_q_pair_banks_scalar(
+            c_blocks[0],
+            n_b_med[0],
+            c_blocks[1],
+            n_b_med[1],
+            q,
+            pair_mask_tables[0],
+            q_banks,
+        );
+        super::accumulate_c_fold4_q_pair_banks_scalar(
+            c_blocks[2],
+            n_b_med[2],
+            c_blocks[3],
+            n_b_med[3],
+            q,
+            pair_mask_tables[1],
+            q_banks,
+        );
+    }
+}
+
+/// Pair-fused q-local Fold4 drain. The low and high nibbles come from two
+/// adjacent low-coordinate witness blocks with independent padding bounds;
+/// the 256-entry table contains their already-added field contributions.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_q_pair_banks(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    q: usize,
+    pair_mask_table: &[super::F128; 256],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    assert!(
+        n_b_med_even <= 16,
+        "even Fold4 padding count exceeds 16 rows"
+    );
+    assert!(n_b_med_odd <= 16, "odd Fold4 padding count exceeds 16 rows");
+    assert!(q < 4, "Fold4 retained-medium group must be in 0..4");
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; both fixed arrays cover
+    // every selected row, q is checked by the kernel, and the two four-bit
+    // masks form a bounded eight-bit table index.
+    unsafe {
+        aarch64::accumulate_c_fold4_q_pair_banks(
+            c_block_even,
+            n_b_med_even,
+            c_block_odd,
+            n_b_med_odd,
+            q,
+            pair_mask_table,
+            partial_c,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    super::accumulate_c_fold4_q_pair_banks_scalar(
+        c_block_even,
+        n_b_med_even,
+        c_block_odd,
+        n_b_med_odd,
+        q,
+        pair_mask_table,
+        partial_c,
+    );
+}
+
+/// AB-only half of [`accumulate_convert_with_s_hat_v`].  Keeping this as a
+/// separate entry point lets the ranked precomputed-AB path finish a whole
+/// `x_hi` band with the 64 KiB convert table resident before switching to the
+/// unrelated C-mask tables.
 #[inline]
 pub(super) fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -232,245 +479,11 @@ pub(super) fn accumulate_convert_ab(
     eq_lo_val: super::F128,
     partial_ab: &mut [super::F128; 64],
 ) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    // SAFETY: the cfg gate supplies the SIMD features and fixed arrays bound all accesses.
-    unsafe {
-        if ab_nibble_lut_enabled() {
-            x86_64::accumulate_convert_ab_x86_avx512_nibble(
-                chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                partial_ab,
-            );
-        } else {
-            x86_64::accumulate_convert_ab_x86_avx512(
-                chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                partial_ab,
-            );
-        }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    for lane in 0..64 {
-        let mut converted_ab = super::F128::ZERO;
-        for b_med in 0..n_b_med {
-            converted_ab += convert[b_med * 256 + usize::from(chunk_ab_bytes[b_med][lane])];
-        }
-        partial_ab[lane] += converted_ab * eq_lo_val;
-    }
-}
-
-/// Ranked default is the nibble-LUT AB convert. `FLOCK_NO_AB_NIBBLE=1`
-/// restores the scalar 256-entry GPR kernel for one-process A/B; the ranked
-/// worker's cleared env never sets it. Production `convert[b][v] = γ^b · φ₈(v)`
-/// is F₂-linear in `v`, so a byte lookup equals the XOR of two nibble lookups.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn ab_nibble_lut_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_AB_NIBBLE").is_none())
-}
-
-/// Ranked default is the nibble-LUT drain. `FLOCK_NO_C_NIBBLE=1` restores the
-/// gather kernel for one-process A/B; the ranked worker's cleared env never
-/// sets it. Production mask tables are F₂-linear XOR-doubling subset sums, so
-/// a byte lookup equals the XOR of two nibble lookups.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn c_nibble_lut_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C_NIBBLE").is_none())
-}
-
-/// SoA form of the four 16-entry F₂-linear nibble tables used by DirectC.
-/// One table depends only on `eq_lo`, so round one can build it once and reuse
-/// it across every `x_hi` instead of reconstructing it in the hot drain.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[repr(C, align(64))]
-pub(super) struct CBankNibbleLut {
-    pub(super) lo_n0_lo: [u64; 16],
-    pub(super) lo_n0_hi: [u64; 16],
-    pub(super) lo_n1_lo: [u64; 16],
-    pub(super) lo_n1_hi: [u64; 16],
-    pub(super) hi_n0_lo: [u64; 16],
-    pub(super) hi_n0_hi: [u64; 16],
-    pub(super) hi_n1_lo: [u64; 16],
-    pub(super) hi_n1_hi: [u64; 16],
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-impl CBankNibbleLut {
-    fn new(mask_tables: &[super::F128]) -> Self {
-        debug_assert_eq!(mask_tables.len(), 512);
-        let (t_lo, t_hi) = mask_tables.split_at(256);
-        let mut lut = Self {
-            lo_n0_lo: [0; 16], lo_n0_hi: [0; 16],
-            lo_n1_lo: [0; 16], lo_n1_hi: [0; 16],
-            hi_n0_lo: [0; 16], hi_n0_hi: [0; 16],
-            hi_n1_lo: [0; 16], hi_n1_hi: [0; 16],
-        };
-        for i in 0..16 {
-            lut.lo_n0_lo[i] = t_lo[i].lo;
-            lut.lo_n0_hi[i] = t_lo[i].hi;
-            lut.lo_n1_lo[i] = t_lo[i << 4].lo;
-            lut.lo_n1_hi[i] = t_lo[i << 4].hi;
-            lut.hi_n0_lo[i] = t_hi[i].lo;
-            lut.hi_n0_hi[i] = t_hi[i].hi;
-            lut.hi_n1_lo[i] = t_hi[i << 4].lo;
-            lut.hi_n1_hi[i] = t_hi[i << 4].hi;
-        }
-        lut
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-pub(super) fn build_c_bank_nibble_luts(mask_tables: &[super::F128]) -> Vec<CBankNibbleLut> {
-    debug_assert_eq!(mask_tables.len() % 512, 0);
-    mask_tables.chunks_exact(512).map(CBankNibbleLut::new).collect()
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline]
-pub(super) fn accumulate_c_banks_prebuilt(
-    c_block: &[u8; 16 * 64],
-    n_b_med: usize,
-    mask_tables: &[super::F128],
-    lut: &CBankNibbleLut,
-    partial_c: &mut [[super::F128; 64]; 8],
-) {
-    // SAFETY: cfg supplies the features and fixed arrays bound all accesses.
-    unsafe {
-        if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(
-                c_block, n_b_med, lut, partial_c,
-            );
-        } else {
-            x86_64::accumulate_c_banks_x86_avx512(
-                c_block, n_b_med, mask_tables, partial_c,
-            );
-        }
-    }
-}
-
-/// Accumulate the eight alpha-free C banks from already-transposed C rows.
-#[inline]
-pub(super) fn accumulate_c_banks(
-    c_block: &[u8; 16 * 64],
-    n_b_med: usize,
-    mask_tables: &[super::F128],
-    partial_c: &mut [[super::F128; 64]; 8],
-) {
-    debug_assert!(n_b_med <= 16);
-    debug_assert_eq!(mask_tables.len(), 512);
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    // SAFETY: the cfg gate supplies the SIMD features; the fixed-size C and
-    // partial arrays and the asserted 512-entry table bound every access.
-    unsafe {
-        if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble(c_block, n_b_med, mask_tables, partial_c);
-        } else {
-            x86_64::accumulate_c_banks_x86_avx512(c_block, n_b_med, mask_tables, partial_c);
-        }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
-}
-
-/// Portable DirectC drain and cross-check oracle for the AVX-512 kernel.
-#[allow(dead_code)] // unused outside tests in native AVX-512 builds
-#[inline]
-pub(super) fn accumulate_c_banks_scalar(
-    c_block: &[u8; 16 * 64],
-    n_b_med: usize,
-    mask_tables: &[super::F128],
-    partial_c: &mut [[super::F128; 64]; 8],
-) {
-    debug_assert!(n_b_med <= 16);
-    debug_assert_eq!(mask_tables.len(), 512);
-    let (t_lo, t_hi) = mask_tables.split_at(256);
-    for lane in 0..64 {
-        let mut masks = [0u16; 8];
-        for b_med in 0..n_b_med {
-            let c = c_block[b_med * 64 + lane];
-            for (bank, mask) in masks.iter_mut().enumerate() {
-                *mask |= u16::from((c >> bank) & 1) << b_med;
-            }
-        }
-        for (bank, mask) in partial_c.iter_mut().zip(masks) {
-            bank[lane] += t_lo[usize::from(mask & 0xff)] + t_hi[usize::from(mask >> 8)];
-        }
-    }
-}
-#[allow(dead_code, clippy::too_many_arguments)]
-#[inline]
-pub(super) fn accumulate_convert_with_s_hat_v(
-    chunk_ab_bytes: &[[u8; 64]; 16],
-    chunk_c_bytes: &[[u8; 64]; 16],
-    n_b_med: usize,
-    convert: &[super::F128],
-    eq_lo_val: super::F128,
-    partial_ab: &mut [super::F128; 64],
-    partial_c_0: &mut [super::F128; 64],
-    partial_c_1: &mut [super::F128; 64],
-) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
-    // all table-selected loads.
+    // every table-selected load.
     unsafe {
-        aarch64::accumulate_convert_with_s_hat_v(
-            chunk_ab_bytes,
-            chunk_c_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-            partial_c_0,
-            partial_c_1,
-        );
+        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     }
 
     #[cfg(all(
@@ -481,15 +494,12 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
-        x86_64::accumulate_convert_with_s_hat_v_x86_avx512(
+        x86_64::accumulate_convert_ab_x86_avx512(
             chunk_ab_bytes,
-            chunk_c_bytes,
             n_b_med,
             convert,
             eq_lo_val,
             partial_ab,
-            partial_c_0,
-            partial_c_1,
         );
     }
 
@@ -501,191 +511,127 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             target_feature = "vpclmulqdq"
         )
     )))]
-    portable::accumulate_convert_with_s_hat_v(
-        chunk_ab_bytes,
-        chunk_c_bytes,
-        n_b_med,
-        convert,
-        eq_lo_val,
-        partial_ab,
-        partial_c_0,
-        partial_c_1,
-    );
+    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
-#[cfg(test)]
-mod nibble_algebra_tests {
-    use super::super::F128;
-    use super::accumulate_c_banks_scalar;
-
-    fn xor_doubling_tables() -> [F128; 512] {
-        let mut tables = [F128::ZERO; 512];
-        let mut basis = [F128::ZERO; 16];
-        basis[0] = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
-        for b in 1..16 {
-            let x = basis[b - 1];
-            basis[b] = F128::new(
-                x.lo.rotate_left(1) ^ x.hi.wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                x.hi.rotate_left(1) ^ x.lo.wrapping_mul(0xd6e8_feb8_6659_fd93),
-            );
-        }
-        let (t_lo, t_hi) = tables.split_at_mut(256);
-        for (half, table) in [t_lo, t_hi].into_iter().enumerate() {
-            table[0] = F128::ZERO;
-            for b in 0..8 {
-                let add = basis[half * 8 + b];
-                let (done, rest) = table.split_at_mut(1 << b);
-                for (out, seen) in rest[..1 << b].iter_mut().zip(done.iter()) {
-                    *out = F128::new(seen.lo ^ add.lo, seen.hi ^ add.hi);
-                }
-            }
-        }
-        tables
+/// Multiply-free twin of [`accumulate_convert_ab`], for the banked `eq_lo`
+/// tensor fold.
+///
+/// `convert` is the pre-scaled table `T_w[i] = convert[i] * eq_top[w]` for the
+/// current chunk's high `x_lo` bits, and `bank` is the accumulator for its low
+/// `x_lo` bits; the caller applies `eq_bot[u]` to each bank once per `x_hi`
+/// band. Same gathers as the incumbent, zero GHASH multiplies.
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every table-selected load and every bank slot drained.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
     }
 
-    #[test]
-    fn xor_doubling_byte_equals_nibble_xor() {
-        let tables = xor_doubling_tables();
-        let (t_lo, t_hi) = tables.split_at(256);
-        for byte in 0usize..256 {
-            let n0 = byte & 0xf;
-            let n1 = (byte >> 4) << 4;
-            assert_eq!(
-                t_lo[byte],
-                F128::new(t_lo[n0].lo ^ t_lo[n1].lo, t_lo[n0].hi ^ t_lo[n1].hi),
-                "t_lo byte={byte}"
-            );
-            assert_eq!(
-                t_hi[byte],
-                F128::new(t_hi[n0].lo ^ t_hi[n1].lo, t_hi[n0].hi ^ t_hi[n1].hi),
-                "t_hi byte={byte}"
-            );
-        }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
+    // cover every four-lane load/store.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_avx512(chunk_ab_bytes, n_b_med, convert, bank);
     }
 
-    fn nibble_drain(
-        c_block: &[u8; 16 * 64],
-        n_b_med: usize,
-        mask_tables: &[F128],
-        partial_c: &mut [[F128; 64]; 8],
-    ) {
-        let (t_lo, t_hi) = mask_tables.split_at(256);
-        for lane in 0..64 {
-            let mut masks = [0u16; 8];
-            for b_med in 0..n_b_med {
-                let c = c_block[b_med * 64 + lane];
-                for (bank, mask) in masks.iter_mut().enumerate() {
-                    *mask |= u16::from((c >> bank) & 1) << b_med;
-                }
-            }
-            for (bank, mask) in partial_c.iter_mut().zip(masks) {
-                let lo = usize::from(mask & 0xff);
-                let hi = usize::from(mask >> 8);
-                bank[lane] +=
-                    t_lo[lo & 0xf] + t_lo[(lo >> 4) << 4] + t_hi[hi & 0xf] + t_hi[(hi >> 4) << 4];
-            }
-        }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
+    portable::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
+}
+
+/// GFNI bit-matrix twin of [`accumulate_convert_ab_nomul`]: `mats` is the
+/// 16×16 qword matrix block for the current table slice and `bank_planes`
+/// the byte-plane-major bank accumulator. Bit-identical sums; see the kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_gfni(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
+    // cover every 64-byte load/store.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
+    }
+}
+
+/// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
+/// kernel is tested against.
+///
+/// Deliberately written as the **composition** the fused kernel replaces —
+/// per-`b_med` [`bit_transpose_64bytes`] into a scratch row, then the
+/// cross-`b_med` mask scatter — so the differential test compares two
+/// genuinely different routes to the same bytes rather than two spellings of
+/// one route.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(super) fn accumulate_c_banks_scalar(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(mask_tables.len(), C_MASK_TABLE_STRIDE);
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+
+    let mut transposed = [[0u8; 64]; 16];
+    for b_med in 0..n_b_med {
+        let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64]
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(row, &mut transposed[b_med]);
     }
 
-    #[test]
-    fn nibble_drain_matches_scalar_on_linear_tables() {
-        let mut c_block = [0u8; 16 * 64];
-        for (i, byte) in c_block.iter_mut().enumerate() {
-            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32) ^ (i >> 3) as u8;
-        }
-        let tables = xor_doubling_tables();
-        for n_b_med in 0..=16 {
-            let mut scalar = [[F128::ZERO; 64]; 8];
-            let mut nibble = [[F128::ZERO; 64]; 8];
-            for (bank_index, bank) in scalar.iter_mut().enumerate() {
-                for (lane, value) in bank.iter_mut().enumerate() {
-                    *value = F128::new(
-                        ((bank_index * 64 + lane) as u64).wrapping_mul(0xa24b_aed4_963e_e407),
-                        ((lane * 8 + bank_index) as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
-                    );
-                }
+    for lane in 0..64 {
+        let mut masks = [0u16; 8];
+        for (b_med, row) in transposed.iter().enumerate().take(n_b_med) {
+            let c = row[lane];
+            for (s, mask) in masks.iter_mut().enumerate() {
+                *mask |= u16::from((c >> s) & 1) << b_med;
             }
-            nibble.copy_from_slice(&scalar);
-            accumulate_c_banks_scalar(&c_block, n_b_med, &tables, &mut scalar);
-            nibble_drain(&c_block, n_b_med, &tables, &mut nibble);
-            assert_eq!(nibble, scalar, "n_b_med={n_b_med}");
+        }
+        for (bank, mask) in partial_c.iter_mut().zip(masks) {
+            bank[lane] += t_lo[usize::from(mask & 0xff)] + t_hi[usize::from(mask >> 8)];
         }
     }
+}
 
-    fn ab_nibble_convert(
-        chunk_ab_bytes: &[[u8; 64]; 16],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; 64],
-    ) {
-        for lane in 0..64 {
-            let mut converted = F128::ZERO;
-            for b_med in 0..n_b_med {
-                let byte = usize::from(chunk_ab_bytes[b_med][lane]);
-                let base = b_med * 256;
-                converted += convert[base + (byte & 0xf)] + convert[base + ((byte >> 4) << 4)];
-            }
-            partial_ab[lane] += converted * eq_lo_val;
-        }
-    }
-
-    fn ab_byte_convert(
-        chunk_ab_bytes: &[[u8; 64]; 16],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; 64],
-    ) {
-        for lane in 0..64 {
-            let mut converted = F128::ZERO;
-            for b_med in 0..n_b_med {
-                converted += convert[b_med * 256 + usize::from(chunk_ab_bytes[b_med][lane])];
-            }
-            partial_ab[lane] += converted * eq_lo_val;
-        }
-    }
-
-    #[test]
-    fn convert_table_byte_equals_nibble_xor() {
-        let convert = super::super::convert_table();
-        for b in 0..16 {
-            let base = b * 256;
-            for byte in 0usize..256 {
-                let n0 = byte & 0xf;
-                let n1 = (byte >> 4) << 4;
-                assert_eq!(
-                    convert[base + byte],
-                    convert[base + n0] + convert[base + n1],
-                    "b={b} byte={byte:#04x}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ab_nibble_matches_byte_lookup_on_convert_table() {
-        let convert = super::super::convert_table();
-        let mut chunk_ab_bytes = [[0u8; 64]; 16];
-        for b_med in 0..16 {
-            for lane in 0..64 {
-                chunk_ab_bytes[b_med][lane] = (b_med * 17 + lane * 13) as u8 ^ 0x5a;
-            }
-        }
-        let eq = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
-        for n_b_med in 0..=16 {
-            let mut seed = [F128::ZERO; 64];
-            for (lane, value) in seed.iter_mut().enumerate() {
-                *value = F128::new(
-                    (lane as u64).wrapping_mul(0xa24b_aed4_963e_e407),
-                    (lane as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
-                );
-            }
-            let mut byte_acc = seed;
-            let mut nibble_acc = seed;
-            ab_byte_convert(&chunk_ab_bytes, n_b_med, convert, eq, &mut byte_acc);
-            ab_nibble_convert(&chunk_ab_bytes, n_b_med, convert, eq, &mut nibble_acc);
-            assert_eq!(nibble_acc, byte_acc, "n_b_med={n_b_med}");
-        }
-    }
+#[inline]
+pub(super) fn accumulate_convert_with_s_hat_v(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    mask_tables: &[super::F128],
+    partial_ab: &mut [super::F128; 64],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+    accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
 }

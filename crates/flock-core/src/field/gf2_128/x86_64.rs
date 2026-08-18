@@ -28,26 +28,6 @@ unsafe fn lane1(v: __m128i) -> u64 {
     _mm_extract_epi64::<1>(v) as u64
 }
 
-/// `a · b` for a multiplier whose high limb is zero.
-///
-/// With `b.hi == 0` both limb products that involve `b.hi` vanish, so the
-/// 256-bit product is exactly `a.lo·b_lo + (a.hi·b_lo)·x^64`. That is **2
-/// CLMUL** plus the shift-only `ghash_reduce`, against the 5 CLMUL of the
-/// general Karatsuba+Barrett path this crate's `Mul` uses on x86.
-///
-/// # Safety
-/// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
-/// attribute. `b_lo` is the multiplier's low limb; its high limb must be 0.
-#[target_feature(enable = "pclmulqdq,sse4.1")]
-pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
-    // SAFETY: function carries the required target features.
-    unsafe {
-        let p0 = pmull(a.lo, b_lo);
-        let q = pmull(a.hi, b_lo);
-        super::ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
-    }
-}
-
 /// Schoolbook 4 CLMUL — fully independent products, then scalar reduction.
 ///
 /// # Safety
@@ -277,25 +257,24 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
     }
 }
 
-/// [`ghash_mul_x4`] specialized for a multiplier `x` whose high limb is zero
-/// in **every** lane.
-///
-/// `x.hi = 0` kills the `0x01` (`x.hi·y.lo`) and `0x11` (`x.hi·y.hi`)
-/// products, and the first reduction then folds a zero high operand, so it
-/// disappears with them: **3 CLMUL instead of 6**, same reduced result.
+/// [`ghash_mul_x4`] specialized for a multiplier whose HIGH limb is zero in
+/// every lane (`x.hi == 0`): the two `x.hi` products are identically zero and
+/// the first reduction stage collapses (`reduce(t1, 0) = t1`), leaving
+/// **3 CLMUL instead of 6**. The reduced result is the same field element —
+/// this is the exact schoolbook product with the vanished terms deleted, not
+/// an approximation.
 ///
 /// # Safety
-/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
-/// cfg gate) and that every 128-bit lane of `x` has a zero high qword.
+/// Caller must ensure `avx512f` + `vpclmulqdq` are available AND that every
+/// 128-bit lane of `x` has a zero high qword.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
-    // SAFETY: caller carries avx512f+vpclmulqdq and the zero-high-limb
-    // precondition.
+pub unsafe fn ghash_mul_x4_low(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
-        // Only the cross term x.lo·y.hi survives at x^64; x.hi·y.hi is zero,
-        // so `gf2_128_reduce_x4(t1, 0) == t1` and is skipped entirely.
+        // Only x.lo·y.hi survives of the cross terms; x.hi·y.hi is zero, so
+        // the first reduction stage is the identity.
         let t1 = _mm512_clmulepi64_epi128::<0x10>(x, y);
         let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
         gf2_128_reduce_x4(t0, t1)
@@ -408,6 +387,32 @@ impl WideGhashX4 {
     ///
     /// # Safety
     /// `avx512f` + `sse4.1` available (cfg-gated + attr).
+    /// Per-lane variant of [`Self::fold`]: assemble the four lanes'
+    /// unreduced accumulators separately, for kernels whose four lanes are
+    /// DISTINCT outputs rather than one horizontal sum.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated + attr).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn fold_lanes(self) -> [F256Unreduced; 4] {
+        // SAFETY: caller carries avx512f.
+        unsafe {
+            let mut lo = [0u64; 8];
+            let mut hi = [0u64; 8];
+            let mut mid = [0u64; 8];
+            _mm512_storeu_si512(lo.as_mut_ptr().cast::<__m512i>(), self.lo);
+            _mm512_storeu_si512(hi.as_mut_ptr().cast::<__m512i>(), self.hi);
+            _mm512_storeu_si512(mid.as_mut_ptr().cast::<__m512i>(), self.mid);
+            core::array::from_fn(|i| F256Unreduced {
+                r0: lo[2 * i],
+                r1: lo[2 * i + 1] ^ mid[2 * i],
+                r2: hi[2 * i] ^ mid[2 * i + 1],
+                r3: hi[2 * i + 1],
+            })
+        }
+    }
+
     #[inline]
     #[target_feature(enable = "avx512f,sse4.1")]
     pub unsafe fn fold(self) -> F256Unreduced {

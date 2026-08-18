@@ -1314,6 +1314,7 @@ unsafe fn build_group_batch_major(
         wa.flush();
         wb.flush();
     }
+    super::common::nt_publish_fence();
 }
 
 /// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]:

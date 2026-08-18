@@ -40,15 +40,31 @@
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
+use crate::scratch::ScratchBytes;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
+#[cfg(all(target_arch = "aarch64", test))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
-use kernels::aarch64::{round2_chunk_raw_neon, round2_chunk_raw_neon_q};
+use kernels::aarch64::{
+    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
+    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
+    fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
+    fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
+};
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use kernels::aarch64::{
+    fold2_and_message_lookahead_normal_expanded_aarch64,
+    fold2_and_message_lookahead_nt_expanded_aarch64, fold2_and_message_normal_expanded_aarch64,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -67,6 +83,138 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
+/// Kill switch for the b≡1 chunk-class degeneration in the compact round-2 /
+/// round-3 kernels: `FLOCK_NO_R2_DEGEN=1` restores the plain gather path
+/// (bit-identical output either way — the degeneration only skips
+/// value-forced work). Read once per phase call, off the hot path.
+#[cfg(target_arch = "aarch64")]
+fn r2_degen_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for the ranked BLAKE3 periodic-padding schedule in round two:
+/// `FLOCK_NO_ZC_R2_PERIODIC=1` restores the generic per-group mask checks.
+/// The specialized kernel only changes loop control; every useful, boundary,
+/// and padded group executes the same arithmetic and stores as the oracle.
+#[cfg(target_arch = "aarch64")]
+fn r2_periodic_padding_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for adopting the round-two GPU arm's odd-parity products as the
+/// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
+/// CPU recompute the odd pair on offloaded chunks, which is the incumbent
+/// division of labour. Output is bit-identical either way — the GPU's
+/// odd-parity half is the same sum the CPU would form, and the calibration
+/// oracle verifies that on the target before the arm is ever admitted.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_odd_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_ODD_OFFLOAD").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
+/// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
+/// flight. Everything staged derives from inputs bound BEFORE the fold
+/// submit — `a_packed`/`b_packed` are the round-one operands, and round
+/// two's eq split is built from the zerocheck challenge tail
+/// `r[k_skip+1..]` (`uni_skip_fold_and_round_pair*` receives it as
+/// `mlv_challenges[1..]` = exactly this slice, so the staged bytes are the
+/// bytes the window will upload). The round-2 fold point `z` is NOT
+/// required: the z-dependent nibble table stays a window-time upload.
+///
+/// The duplicate `SplitEqGhash` build costs microseconds against the
+/// ~10 ms AB head this call precedes; misses (shape, kill switches, Metal
+/// failures) are silent no-ops and the window pays its incumbent setup.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+) {
+    if k_skip != 6 || m <= k_skip + 1 || r.len() != m {
+        return;
+    }
+    let n_pairs = (1usize << (m - k_skip)) / 2;
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + 1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    if lo_size * hi_size != n_pairs {
+        return;
+    }
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    crate::gpu_commit::stage_zc_r2_idle_fill(
+        a_packed,
+        b_packed,
+        &eq.lo,
+        &eq.hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    // The upload above copies eq.lo/eq.hi into persistent GPU buffers, so the
+    // CPU-side tables are free to be re-used by the round-two sweep.
+    stash_staged_r2_eq(&r[k_skip + 1..], eq);
+}
+
+/// Round-two eq-split reuse: the ZC-window idle-fill staging (above) builds
+/// the exact `SplitEqGhash` the round-two sweep needs — same challenge slice
+/// `r[k_skip+1..]`, same `n_hi` — while the round-one window is still open.
+/// Stash it so the sweep adopts it instead of rebuilding it inside the
+/// FS-serial gap between sampling `z` and round two. Adoption is gated on
+/// exact equality of the challenge slice and the split, so a stale entry
+/// from a previous prove (different Fiat-Shamir challenges) can never be
+/// consumed. Bytes are identical either way: `SplitEqGhash::with_n_hi` is
+/// deterministic in its inputs. `FLOCK_NO_R2_EQ_REUSE=1` disables adoption.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static STAGED_R2_EQ: std::sync::Mutex<Option<(Vec<F128>, SplitEqGhash)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_eq_reuse_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_EQ_REUSE").is_none());
+    *ENABLED
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn stash_staged_r2_eq(challenges: &[F128], eq: SplitEqGhash) {
+    if !r2_eq_reuse_enabled() {
+        return;
+    }
+    if let Ok(mut slot) = STAGED_R2_EQ.lock() {
+        *slot = Some((challenges.to_vec(), eq));
+    }
+}
+
+/// Adopt the staged round-two eq split when it matches `(challenges, n_hi)`
+/// exactly; otherwise build it fresh. Non-matching stash entries are left in
+/// place (they are not ours to consume).
+fn take_or_build_r2_eq(challenges: &[F128], n_hi: usize) -> SplitEqGhash {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if r2_eq_reuse_enabled() {
+        if let Ok(mut slot) = STAGED_R2_EQ.lock() {
+            let stashed = slot.take();
+            match stashed {
+                Some((ch, eq))
+                    if eq.n_hi == n_hi.min(challenges.len()) && ch.as_slice() == challenges =>
+                {
+                    return eq;
+                }
+                other => *slot = other,
+            }
+        }
+    }
+    SplitEqGhash::with_n_hi(challenges, n_hi)
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -80,6 +228,114 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
+/// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
+/// them on the main rayon pool. Bit-identical either way — chunk ownership
+/// and output ranges are unchanged; only scheduling differs.
+#[cfg(target_arch = "aarch64")]
+fn zc_tail_hetero_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_HETERO").is_none());
+    *ENABLED
+}
+
+/// Hetero admission floor for the composed tail folds, decoupled from the
+/// NT-store policy that shares the historical `2^19` size test. The 2^21→2^19
+/// lowering (promoted `db0b668`) admitted the 7+8 fold; this floor extends
+/// the same scheduling — and only the scheduling — down to the 9+10 and 11+12
+/// composed folds and the first loop rounds, whose 2×≤8 MiB ping-pong outputs
+/// are LLC-resident and must therefore keep cached stores (the NT gates stay
+/// keyed on `2^19`). Compile-time default per the cleared ranked environment;
+/// `FLOCK_NO_ZC_TAIL_HETERO_LOW=1` (exactly `"1"`) restores the incumbent
+/// `2^19` admission as the same-binary A/B control. Bit-identical either way:
+/// the hetero branch owns the same disjoint per-`x_hi` output ranges, and the
+/// message partials are XOR sums.
+#[cfg(target_arch = "aarch64")]
+const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 17;
+
+#[cfg(target_arch = "aarch64")]
+fn zc_tail_hetero_low_floor() -> usize {
+    use std::sync::LazyLock;
+    static LOW: LazyLock<bool> = LazyLock::new(|| {
+        !std::env::var("FLOCK_NO_ZC_TAIL_HETERO_LOW").is_ok_and(|v| v == "1")
+    });
+    if *LOW { ZC_TAIL_HETERO_LOW_FLOOR } else { 1 << 19 }
+}
+
+/// Give the three largest ordinary tail rounds 2,048 independent chunks.
+///
+/// At log_n=25 this reduces each worker claim from roughly 3 MiB to 768 KiB
+/// and shrinks the repeatedly-read eq_lo table from 256 KiB to 64 KiB.  The
+/// accompanying 32 KiB eq_hi table keeps the complete equality state within
+/// a P-core's private cache.  Stop at half=2^22: below that point the chunks
+/// are already small enough that the extra claims and final partials can
+/// dominate the cache benefit.
+const LARGE_TAIL_EQ_N_HI: usize = 11;
+const LARGE_TAIL_EQ_MIN_HALF: usize = 1 << 22;
+
+/// Correctness-preserving kill switch for same-binary A/B screening.
+#[cfg(target_arch = "aarch64")]
+fn zc_tail_split11_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
+    *ENABLED
+}
+
+/// Exact same-binary rollback for the expanded fold4 pair. The control keeps
+/// the incumbent arithmetic and the same NT stores; only the fold schedule
+/// changes. Read once outside the per-chunk closure.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR").is_none_or(|value| value != *"1")
+    });
+    *ENABLED
+}
+
+/// The two ordinary-store lookahead outputs at the ranked `m = 32` shape:
+/// rounds 7/8 produce `2^20` values per table and rounds 9/10 produce `2^18`.
+/// Keep the next rung exact rather than changing smaller/non-ranked cascades.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn ranked_normal_fold4_pair_output(output_len: usize) -> bool {
+    matches!(output_len, 1_048_576 | 262_144)
+}
+
+/// Rung-local rollback: the parent switch still disables every expanded fold4
+/// pair, while this one disables only the ranked ordinary-store extension and
+/// leaves the already-screened NT rounds-5/6 specialization enabled.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_normal_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR_NORMAL").is_none_or(|value| value != *"1")
+    });
+    *ENABLED
+}
+
+/// The final direct composed pass at the ranked `m = 32` shape: rounds 11/12
+/// produce exactly `2^16` values per table. No earlier direct fallback or
+/// smaller non-ranked cascade enters this rung.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn ranked_direct_fold4_pair_output(output_len: usize) -> bool {
+    output_len == 65_536
+}
+
+/// Delta-only rollback for the direct rounds-11/12 expansion. The parent and
+/// normal-lookahead switches keep controlling E038/E039 independently.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_direct_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR_DIRECT").is_none_or(|value| value != *"1")
+    });
+    *ENABLED
+}
+
 // ---------------------------------------------------------------------------
 // Lagrange weights for the univariate-skip fold at z.
 // ---------------------------------------------------------------------------
@@ -91,9 +347,28 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
 /// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
 ///
 /// O(2^{2·k_skip}) field multiplies — one-time cost.
+///
+/// Fast path (default): the denominators `∏_{j≠i}(s_i + s_j)` do not depend
+/// on `z`, so their inverses are computed once per process and cached; the
+/// numerators `∏_{j≠i}(z + s_j)` are assembled from prefix/suffix products
+/// in O(ell) multiplies instead of O(ell²). This deletes `ell` field
+/// inversions (each ~254 muls) and ~`ell²` muls of FS-serial critical-path
+/// time from every call. Outputs are bit-identical to the reference loop:
+/// GF(2^128) multiplication is exactly associative and commutative, so
+/// regrouping the numerator product cannot change any bit, and the cached
+/// inverse is produced by the reference denominator loop itself.
+/// `FLOCK_NO_LAGRANGE_FAST=1` restores the reference implementation.
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
+    if lagrange_fast_enabled() {
+        return lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip));
+    }
+    lagrange_weights_naive_reference(k_skip, z)
+}
+
+fn lagrange_weights_naive_reference(k_skip: usize, z: F128) -> Vec<F128> {
+    let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
     for i in 0..ell {
         let si = PHI_8_TABLE[i];
@@ -112,6 +387,84 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     weights
 }
 
+/// Correctness-preserving kill switch for the O(ell) Lagrange fast path.
+fn lagrange_fast_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_LAGRANGE_FAST").is_none());
+    *ENABLED
+}
+
+/// Cached `(∏_{j≠i}(s_i + s_j))^{-1}` for the S-domain nodes
+/// `s_i = φ_8(i)`, indexed by `k_skip`. z-independent, so one inversion
+/// pass per process instead of one per call.
+static LAGRANGE_S_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 9] =
+    [const { std::sync::OnceLock::new() }; 9];
+
+/// Same cache for the Λ-domain nodes `s_i = φ_8(2^k_skip + i)` (k_skip ≤ 7).
+static LAGRANGE_LAMBDA_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 8] =
+    [const { std::sync::OnceLock::new() }; 8];
+
+fn lagrange_s_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_S_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+fn lagrange_lambda_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_LAMBDA_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[ell + i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[ell + j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+/// O(ell) Lagrange weights: `weights[i] = P_i · S_i · den_inv[i]` with
+/// `P_i = ∏_{j<i}(z + s_j)` and `S_i = ∏_{j>i}(z + s_j)`. Exact-field
+/// regrouping of the reference `∏_{j≠i}(z + s_j) · den.inv()`.
+fn lagrange_weights_fast(
+    k_skip: usize,
+    z: F128,
+    node_offset: usize,
+    den_inv: &[F128],
+) -> Vec<F128> {
+    let ell = 1usize << k_skip;
+    let mut weights = vec![F128::ZERO; ell];
+    let mut prefix = F128::ONE;
+    for i in 0..ell {
+        weights[i] = prefix;
+        prefix *= z + PHI_8_TABLE[node_offset + i];
+    }
+    let mut suffix = F128::ONE;
+    for i in (0..ell).rev() {
+        weights[i] = weights[i] * suffix * den_inv[i];
+        suffix *= z + PHI_8_TABLE[node_offset + i];
+    }
+    weights
+}
+
 /// Lagrange weights `L_i^Λ(z)` for `i ∈ 0..2^k_skip` at the fold point `z`,
 /// where the nodes are the **extension domain** `Λ = {2^k_skip, …, 2^(k_skip+1) − 1}`
 /// embedded via `φ_8` (offset by `2^k_skip` from the S-domain nodes).
@@ -121,6 +474,14 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
+    if lagrange_fast_enabled() {
+        return lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip));
+    }
+    lagrange_weights_lambda_naive_reference(k_skip, z)
+}
+
+fn lagrange_weights_lambda_naive_reference(k_skip: usize, z: F128) -> Vec<F128> {
+    let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
     for i in 0..ell {
         let si = PHI_8_TABLE[ell + i];
@@ -382,7 +743,7 @@ impl UniSkipFoldTable {
                 if (v & (v - 1)) == 0 {
                     continue; // skip powers of 2 (already written)
                 }
-                let lo_bit = v.isolate_lowest_one();
+                let lo_bit = v & v.wrapping_neg();
                 let parent = v ^ lo_bit;
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
@@ -401,6 +762,3169 @@ impl UniSkipFoldTable {
         }
         acc
     }
+
+    /// Return `rho * T_z` using XOR-linearity of every byte bank. Only the 64
+    /// one-hot basis entries require field multiplication; all other entries
+    /// are rebuilt by XOR instead of performing 2,048 independent products.
+    pub(crate) fn scaled_linear(&self, rho: F128) -> Vec<F128> {
+        assert_eq!(self.data.len(), self.n_chunks * 256);
+        let mut scaled = self.data.clone();
+        for chunk in 0..self.n_chunks {
+            let base = chunk * 256;
+            for bit in 0..8 {
+                scaled[base + (1 << bit)] = rho * scaled[base + (1 << bit)];
+            }
+            for value in 3usize..256 {
+                if value.is_power_of_two() {
+                    continue;
+                }
+                let low_bit = value & value.wrapping_neg();
+                scaled[base + value] = scaled[base + (value ^ low_bit)] + scaled[base + low_bit];
+            }
+        }
+        scaled
+    }
+}
+
+/// Local split for compact production/reconstruction; intentionally
+/// independent of [`SplitEqGhash::MAX_N_HI`].
+///
+/// At ranked m=32, 11 hi bits give 2,048 jobs. Each producer job streams
+/// about 1.5 MiB and each reconstruction job about 1.4 MiB: the latter reads
+/// 48 bytes of anchor/delta data and writes 32 bytes per output (3:2
+/// read/write), while its 32 KiB lookup table remains hot. Ten hi bits leave
+/// roughly 3 MiB jobs and excess shared-L2 pressure across ten workers;
+/// twelve halves the footprint again but only adds scheduling/reduction
+/// overhead to an already cache-sized streaming job. Keeping this as one
+/// local constant makes 10/11/12 straightforward to screen without changing
+/// the schedule-tuned global split.
+const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
+
+/// Compact materialization of the first multilinear level.
+///
+/// For each adjacent post-URM row pair this keeps the folded even-row anchor
+/// and the eight packed bytes `row0 XOR row1`.  Linearity of the univariate
+/// fold gives
+///
+/// `fold(row0) + rho * (fold(row0) + fold(row1))
+///    = anchor + fold_rho(row0 XOR row1)`,
+///
+/// where `fold_rho` uses the ordinary 32 KiB fold table with every entry
+/// multiplied by `rho`.  This is 48 bytes per A/B pair instead of the 64 bytes
+/// required by four materialized F128 rows, and it removes the two challenge
+/// multiplications per reconstructed output from the first tail round.
+pub struct UniSkipCompactFold {
+    /// Interleaved `[a_anchor, b_anchor]` entries, two F128s per row pair.
+    pub anchors: Vec<F128>,
+    /// Interleaved `[a_delta; 8], [b_delta; 8]`, sixteen bytes per row pair.
+    pub deltas: ScratchBytes,
+}
+
+impl UniSkipCompactFold {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.anchors.len() / 2
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.anchors.is_empty()
+    }
+
+    /// Return both large buffers to their process-wide scratch pools.
+    pub fn recycle(self) {
+        let Self { anchors, deltas } = self;
+        crate::scratch::give_f128(anchors);
+        deltas.recycle();
+    }
+}
+
+/// Compact counterpart of
+/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`].  It computes the
+/// identical round-two message but materializes one folded anchor and one
+/// packed adjacent-row delta per pair instead of two folded rows.
+pub fn uni_skip_fold_and_round_pair_compact_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (UniSkipCompactFold, F128, F128) {
+    uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        None,
+    )
+}
+
+/// Donation-aware implementation of
+/// [`uni_skip_fold_and_round_pair_compact_padded`]. `deltas_backing`, when
+/// present, must have exactly the compact delta byte length; its original
+/// allocation layout is preserved by [`ScratchBytes`].
+pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> (UniSkipCompactFold, F128, F128) {
+    assert_eq!(
+        k_skip, 6,
+        "optimized compact fold-and-round_pair variant is k_skip=6 only"
+    );
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let deltas_len = 2 * n_pairs * n_chunks;
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+    assert_eq!(
+        deltas.len(),
+        deltas_len,
+        "donated compact delta backing has the wrong byte length"
+    );
+    let mut compact = UniSkipCompactFold {
+        anchors: crate::scratch::take_f128(2 * n_pairs),
+        deltas,
+    };
+
+    let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let anchor_chunk_size = 2 * lo_size;
+    let delta_chunk_size = 2 * lo_size * n_chunks;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
+    // prefix of the hi-chunks gets its message products computed on the
+    // otherwise-idle GPU while the CPU writes those chunks' anchors and
+    // deltas through the anchors-only sibling kernel (byte-identical
+    // stores). Partials for prefix chunks are merged after the join; the
+    // XOR reduce below is order-independent, so the output is bit-identical
+    // to the all-CPU sweep. `None` = the exact incumbent path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    // Chunks drain through the hetero queue so the idle efficiency cores add
+    // throughput without an equal-band barrier penalty (see `epool`). Each
+    // chunk writes only its own anchors/deltas ranges and partials slot; the
+    // XOR reduce below is order-independent, so output is bit-identical to
+    // the rayon map-reduce.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
+        // queue's completion join publishes the writes before the reduction
+        // below reads them.
+        let (anchors, deltas) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    anchor_chunk_size,
+                ),
+                std::slice::from_raw_parts_mut(
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                    delta_chunk_size,
+                ),
+            )
+        };
+        {
+            let pair_idx_base = x_hi * lo_size;
+            let row_base = pair_idx_base * 2;
+
+            // GPU-covered prefix chunk: write the identical anchors and
+            // deltas, skip the products (the GPU partial replaces this
+            // chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                unsafe {
+                    fold_round2_compact_chunk_neon_anchors_only_8(
+                        table.data.as_ptr().cast::<u8>(),
+                        a_packed.as_ptr().add(row_base * n_chunks),
+                        b_packed.as_ptr().add(row_base * n_chunks),
+                        anchors.as_mut_ptr(),
+                        deltas.as_mut_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
+                }
+                return;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            let (p1, pinf) = unsafe {
+                fold_round2_compact_chunk_neon_unchecked_8(
+                    table.data.as_ptr().cast::<u8>(),
+                    a_packed.as_ptr().add(row_base * n_chunks),
+                    b_packed.as_ptr().add(row_base * n_chunks),
+                    anchors.as_mut_ptr(),
+                    deltas.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                )
+            };
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let (p1, pinf) = {
+                let mut p1_acc = F256Unreduced::ZERO;
+                let mut pinf_acc = F256Unreduced::ZERO;
+                for x_lo in 0..lo_size {
+                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                        anchors[2 * x_lo] = F128::ZERO;
+                        anchors[2 * x_lo + 1] = F128::ZERO;
+                        deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+                        continue;
+                    }
+
+                    let x0g = row_base + 2 * x_lo;
+                    let x1g = x0g + 1;
+                    let a0_bytes = &a_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+                    let a1_bytes = &a_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+                    let b0_bytes = &b_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+                    let b1_bytes = &b_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+                    let a0 = table.fold_one_row(a0_bytes);
+                    let a1 = table.fold_one_row(a1_bytes);
+                    let b0 = table.fold_one_row(b0_bytes);
+                    let b1 = table.fold_one_row(b1_bytes);
+                    anchors[2 * x_lo] = a0;
+                    anchors[2 * x_lo + 1] = b0;
+                    for j in 0..n_chunks {
+                        deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
+                        deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+                    }
+                    let eq_l = eq_lo[x_lo];
+                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                (p1_acc.reduce(), pinf_acc.reduce())
+            };
+
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    // Drain the GPU products arm: merge prefix partials (timed proves),
+    // finish calibration (untimed warmup), or CPU-redo the skipped prefix
+    // products on any post-admission Metal failure.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib {
+                Some(partials.as_slice())
+            } else {
+                None
+            },
+            // This sweep has no lookahead state, so there is no parity split
+            // to cross-check; the summed oracle is the whole contract here.
+            None,
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                // XOR the parities back together: this sweep only ever wanted
+                // the summed pair the arm used to return.
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                }
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact. Throwaway anchor/delta scratch: the real ranges
+                // were already written by the anchors-only pass.
+                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
+                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let (p1, pinf) = unsafe {
+                        fold_round2_compact_chunk_neon_unchecked_8(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            scr_anchors.as_mut_ptr(),
+                            scr_deltas.as_mut_ptr(),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (compact, mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Byte-lane-outer streaming variant of
+/// [`uni_skip_fold_and_round_pair_compact_padded`]. Bit-identical outputs
+/// (fold XOR trees are merely reassociated). `lanes_per_pass ∈ {1, 2, 4, 8}`
+/// is the lane-blocking factor: each pass over a 128-pair tile consumes that
+/// many byte lanes of the fold table while the tile's four fold accumulators
+/// stay L1-resident. Probe-only entry point; non-aarch64 builds delegate to
+/// the gather-shaped base implementation.
+pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    lanes_per_pass: usize,
+) -> (UniSkipCompactFold, F128, F128) {
+    assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = lanes_per_pass;
+        return uni_skip_fold_and_round_pair_compact_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(k_skip, 6, "compact stream variant is k_skip=6 only");
+        assert_eq!(table.n_chunks, 8);
+        let n_chunks = table.n_chunks;
+        let n_out = 1usize << (m - k_skip);
+        let n_pairs = n_out / 2;
+        assert_eq!(a_packed.len(), n_out * n_chunks);
+        assert_eq!(b_packed.len(), n_out * n_chunks);
+        assert_eq!(mlv_challenges.len(), m - k_skip);
+
+        let mut compact = UniSkipCompactFold {
+            anchors: crate::scratch::take_f128(2 * n_pairs),
+            deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
+        };
+
+        let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        assert_eq!(lo_size * hi_size, n_pairs);
+        let eq_hi = &eq.hi;
+        let eq_lo = &eq.lo;
+        let anchor_chunk_size = 2 * lo_size;
+        let delta_chunk_size = 2 * lo_size * n_chunks;
+        let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+        let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: same exclusive per-chunk ownership contract as
+            // `uni_skip_fold_and_round_pair_compact_padded_with_deltas`.
+            let (anchors, deltas) = unsafe {
+                (
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                )
+            };
+            let pair_idx_base = x_hi * lo_size;
+            let row_base = pair_idx_base * 2;
+            let (p1, pinf) = unsafe {
+                let a_ptr = a_packed.as_ptr().add(row_base * n_chunks);
+                let b_ptr = b_packed.as_ptr().add(row_base * n_chunks);
+                let t_ptr = table.data.as_ptr().cast::<u8>();
+                match lanes_per_pass {
+                    1 => fold_round2_compact_stream_chunk_neon::<1>(
+                        t_ptr,
+                        a_ptr,
+                        b_ptr,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                    2 => fold_round2_compact_stream_chunk_neon::<2>(
+                        t_ptr,
+                        a_ptr,
+                        b_ptr,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                    4 => fold_round2_compact_stream_chunk_neon::<4>(
+                        t_ptr,
+                        a_ptr,
+                        b_ptr,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                    _ => fold_round2_compact_stream_chunk_neon::<8>(
+                        t_ptr,
+                        a_ptr,
+                        b_ptr,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    ),
+                }
+            };
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        let (sum1, sum_inf) = partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            });
+
+        (compact, mlv_challenges[0] * sum1, sum_inf)
+    }
+}
+
+/// Byte-lane-outer streaming variant of
+/// [`fold_compact_and_compute_round_pair`]. Bit-identical outputs; see
+/// [`uni_skip_fold_and_round_pair_compact_padded_stream`] for the schedule and
+/// the `lanes_per_pass` contract. Probe-only entry point.
+pub fn fold_compact_and_compute_round_pair_stream(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    lanes_per_pass: usize,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = lanes_per_pass;
+        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n = compact.len();
+        assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
+        assert_eq!(compact.anchors.len(), 2 * n);
+        assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
+        assert_eq!(table.n_chunks, 8);
+        assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+        let scaled_table = table.scaled_linear(r_fold);
+
+        let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        assert_eq!(lo_size * hi_size * 2, n);
+        let chunk_size = 2 * lo_size;
+        let eq_hi = &eq.hi;
+        let eq_lo = &eq.lo;
+
+        let mut a_out = crate::scratch::take_f128(n);
+        let mut b_out = crate::scratch::take_f128(n);
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: same exclusive per-chunk ownership contract as
+            // `fold_compact_and_compute_round_pair`.
+            let (a_ptr, b_ptr) = unsafe {
+                (
+                    a_base.ptr().add(x_hi * chunk_size),
+                    b_base.ptr().add(x_hi * chunk_size),
+                )
+            };
+            let base = x_hi * chunk_size;
+            let (p1, pinf) = unsafe {
+                let t_ptr = scaled_table.as_ptr().cast::<u8>();
+                let anchors = compact.anchors.as_ptr().add(2 * base);
+                let deltas = compact.deltas.as_ptr().add(2 * base * table.n_chunks);
+                match lanes_per_pass {
+                    1 => fold_compact_stream_chunk_neon::<1>(
+                        t_ptr,
+                        anchors,
+                        deltas,
+                        a_ptr,
+                        b_ptr,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    ),
+                    2 => fold_compact_stream_chunk_neon::<2>(
+                        t_ptr,
+                        anchors,
+                        deltas,
+                        a_ptr,
+                        b_ptr,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    ),
+                    4 => fold_compact_stream_chunk_neon::<4>(
+                        t_ptr,
+                        anchors,
+                        deltas,
+                        a_ptr,
+                        b_ptr,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    ),
+                    _ => fold_compact_stream_chunk_neon::<8>(
+                        t_ptr,
+                        anchors,
+                        deltas,
+                        a_ptr,
+                        b_ptr,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    ),
+                }
+            };
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        let (sum1, sum_inf) = partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            });
+
+        (a_out, b_out, r_next[0] * sum1, sum_inf)
+    }
+}
+
+/// Bind the first multilinear challenge from a compact round-two
+/// materialization and compute the following round message.
+///
+/// `r_next` describes the post-fold table, matching the contract of
+/// [`fold_and_compute_round_pair_into`].  The returned tables have
+/// `compact.len()` entries each.
+pub fn fold_compact_and_compute_round_pair(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    let n = compact.len();
+    assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
+    assert_eq!(compact.anchors.len(), 2 * n);
+    assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+    // Compose the sampled challenge into the resident 32 KiB byte table once.
+    // Linearity makes each later row reconstruction lookup/XOR-only.
+    let scaled_table = table.scaled_linear(r_fold);
+
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+
+    // Unpinned takes: these buffers become the loop-round arm's no-copy
+    // wrap targets next round (and the T3 arm's output surface). The
+    // pinned slots already carry process-lifetime Metal views, and the
+    // ordinary pinned-first take preference can hand out exactly that
+    // collision on a worker where the pin is parked at this point in the
+    // prove — an overlapping second no-copy view is not legal. This is
+    // the diagnosed cause of the v7/v8/v9 scoreless job deaths.
+    let mut a_out = crate::scratch::take_f128_unpinned(n);
+    let mut b_out = crate::scratch::take_f128_unpinned(n);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    // GPU T3 products arm (see `ENV_NO_GPU_ZC_T3`): a measured prefix of
+    // the hi-chunks gets its message products computed on the GPU (which
+    // redundantly reconstructs its chunks' pairs from the same compact
+    // inputs via the nibble-decomposed scaled table) while the CPU writes
+    // those chunks' reconstruction outputs through a products-skipping
+    // sibling kernel (byte-identical stores). Partials for prefix chunks
+    // are merged after the join; the XOR reduce below is order-independent,
+    // so the output is bit-identical to the all-CPU sweep. `None` = the
+    // exact incumbent path.
+    // PARKED pending a wrap-budget probe: three archives carrying this
+    // integration died scoreless on the runner while a frontier-content
+    // draw from the same account scored cleanly in the same window, and
+    // halving the calibration did not change the outcome. The untouched
+    // suspect is this arm's +1.5 GiB of per-process no-copy wrap surface
+    // (the promoted r2 arm's 1 GiB is the largest proven-survivable
+    // wrap budget; the loop arm adds only 0.5 GiB and ships alone to
+    // bisect). The kernel, oracle test, and CPU sibling stay in-tree —
+    // re-enable by restoring this launch once the budget is understood.
+    // UN-PARKED (v11): the scoreless deaths were the job-wall timeout, not
+    // this arm — the static warmup latch frees minutes of wall and both
+    // arms' once-per-process costs fit in a fraction of it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = if ZC_T3_INTEGRATION_PARKED {
+        None
+    } else {
+        crate::gpu_commit::launch_zc_t3_products(
+            &compact.anchors,
+            &compact.deltas,
+            &scaled_table,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+        )
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    // Hetero-queue drain, same contract as the compact materialization above.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_size), chunk_size),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_size), chunk_size),
+            )
+        };
+        {
+            let base = x_hi * chunk_size;
+
+            // GPU-covered prefix chunk: write the identical reconstruction
+            // outputs, skip the products (the GPU partial replaces this
+            // chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                unsafe {
+                    fold_compact_chunk_neon_reconstruct_only_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        lo_size,
+                    );
+                }
+                return;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            let (p1, pinf) = unsafe {
+                fold_compact_chunk_neon_unchecked_8(
+                    scaled_table.as_ptr().cast::<u8>(),
+                    compact.anchors.as_ptr().add(2 * base),
+                    compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                    a_out.as_mut_ptr(),
+                    b_out.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    degen,
+                )
+            };
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let (p1, pinf) = {
+                let mut p1_acc = F256Unreduced::ZERO;
+                let mut pinf_acc = F256Unreduced::ZERO;
+                for x_lo in 0..lo_size {
+                    let out = 2 * x_lo;
+                    for lane in 0..2 {
+                        let index = base + out + lane;
+                        let mut a = compact.anchors[2 * index];
+                        let mut b = compact.anchors[2 * index + 1];
+                        for j in 0..table.n_chunks {
+                            let d = 2 * index * table.n_chunks + j;
+                            a += scaled_table[j * 256 + compact.deltas[d] as usize];
+                            b +=
+                                scaled_table[j * 256 + compact.deltas[d + table.n_chunks] as usize];
+                        }
+                        a_out[out + lane] = a;
+                        b_out[out + lane] = b;
+                    }
+                    let a0 = a_out[out];
+                    let a1 = a_out[out + 1];
+                    let b0 = b_out[out];
+                    let b1 = b_out[out + 1];
+                    let eq_l = eq_lo[x_lo];
+                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                (p1_acc.reduce(), pinf_acc.reduce())
+            };
+
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    // Drain the GPU products arm: merge prefix partials (timed proves),
+    // finish calibration (untimed warmup), or CPU-redo the skipped prefix
+    // products on any post-admission Metal failure.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_t3_wait(
+            job,
+            if calib {
+                Some(partials.as_slice())
+            } else {
+                None
+            },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcT3Result::Calibrated => {}
+            crate::gpu_commit::ZcT3Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcT3Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact. The full kernel rewrites the same reconstruction
+                // values into the real output ranges (byte-identical
+                // stores), so reusing them as targets is safe.
+                for x_hi in 0..prefix {
+                    let base = x_hi * chunk_size;
+                    let (p1, pinf) = unsafe {
+                        fold_compact_chunk_neon_unchecked_8(
+                            scaled_table.as_ptr().cast::<u8>(),
+                            compact.anchors.as_ptr().add(2 * base),
+                            compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                            a_out.as_mut_ptr().wrapping_add(base),
+                            b_out.as_mut_ptr().wrapping_add(base),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (a_out, b_out, r_next[0] * sum1, sum_inf)
+}
+
+// ---------------------------------------------------------------------------
+// Two-challenge symbolic lookahead ("variant K"): rounds 2..4 in two passes.
+//
+// Round three's message is a *quadratic in ρ₁*, so its three coefficients can
+// be accumulated during round two — before ρ₁ exists — and evaluated the
+// instant the challenge is drawn. That turns the round-3 pass from a
+// materializing 1.5 GiB → 1 GiB sweep into six scalars, and lets rounds 3 and
+// 4 share a single double-fold pass straight out of the compact state.
+//
+// Everything here is *value*-identical to the incumbent route: F128 is an
+// exact field, the transcript order is untouched, and only the association of
+// the sums changes.
+// ---------------------------------------------------------------------------
+
+/// Deferred round-three message: `G₃(1)` coefficients in `c[0..3]`, `G₃(∞)`
+/// in `c[3..6]`, each in the basis `{1, ρ, ρ²}`.
+///
+/// Mirrors the six-coefficient shape of `pcs::ligerito::fold2_and_msgs_lsb`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Round3Lookahead {
+    pub c: [F128; 6],
+}
+
+/// Evaluate the deferred round-three message at the sampled ρ₁.
+///
+/// `first_r_next[0] = ONE` in Convention A, so there is no prefactor: the two
+/// returned values are exactly what the incumbent
+/// [`fold_compact_and_compute_round_pair`] would have sent.
+#[inline]
+pub fn eval_round3_lookahead(la: &Round3Lookahead, rho1: F128) -> (F128, F128) {
+    let rho_sq = rho1 * rho1;
+    (
+        la.c[0] + la.c[1] * rho1 + la.c[2] * rho_sq,
+        la.c[3] + la.c[4] * rho1 + la.c[5] * rho_sq,
+    )
+}
+
+/// Local eq split for the lookahead round-two sweep. Identical to
+/// [`COMPACT_RECONSTRUCTION_N_HI`] at the ranked shape; clamped so the lo half
+/// always keeps at least one variable, because the sweep consumes pairs two at
+/// a time (one round-three group) inside a chunk.
+#[inline]
+fn lookahead_n_hi(n_vars: usize) -> usize {
+    COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
+}
+
+/// Round-two compact producer **plus** the deferred round-three coefficients.
+///
+/// The compact state, the round-two wire message and every store are
+/// bit-identical to
+/// [`uni_skip_fold_and_round_pair_compact_padded_with_deltas`]; the sweep
+/// merely also accumulates six aggregates over round-three groups
+/// `y = x'/2`:
+///
+/// ```text
+/// W0 = Σ_y eq₃(y)·a2b2   W1 = Σ eq₃·a3b3        W2 = Σ eq₃·(a2+a3)(b2+b3)
+/// W3 = Σ_y eq₃(y)·e_a e_b   W4 = Σ eq₃·o_a o_b   W5 = Σ eq₃·(e+o)_a (e+o)_b
+/// e = A[4y]+A[4y+2],  o = A[4y+1]+A[4y+3]
+/// ```
+///
+/// `W1` and `W2` cost **zero extra multiplies**: they are the odd-parity half
+/// of the two round-two accumulators, because `eq₂(2y+1) = r₁·eq₃(y)` and
+/// `eq₃.hi ≡ eq₂.hi`. The kernel therefore reports the round-two sums split by
+/// parity and the driver divides the odd half by `r₁` once.
+///
+/// Requires `r₁ = mlv_challenges[1] ≠ 0`; the caller falls back to the
+/// incumbent route otherwise.
+pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+    write_compact: bool,
+) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    // `write_compact = false` is the raw-K route's store elision: the
+    // returned compact state keeps its allocation and recorded length but
+    // its contents are never written (and never read — the caller feeds the
+    // K pass from the original rows; see `fold2_raw_and_round45_into`).
+    // Messages and the lookahead are identical either way.
+    debug_assert!(
+        write_compact
+            || cfg!(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )),
+        "compact-store elision is x86-only (raw-K gate)"
+    );
+    assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+    let r1 = mlv_challenges[1];
+    assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
+
+    let deltas_len = 2 * n_pairs * n_chunks;
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+    assert_eq!(
+        deltas.len(),
+        deltas_len,
+        "donated compact delta backing has the wrong byte length"
+    );
+    let mut compact = UniSkipCompactFold {
+        anchors: crate::scratch::take_f128(2 * n_pairs),
+        deltas,
+    };
+
+    let n_vars = mlv_challenges.len() - 1;
+    let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
+    // `eq₂(2y) = (1+r₁)·eq₃(y)` and `eq₂(2y+1) = r₁·eq₃(y)`, so the sweep uses
+    // the odd lane as the group's single weight and the two constants below
+    // put every aggregate back on its own scale, once, off the hot path.
+    let kappa = (F128::ONE + r1) * r1.inv();
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let anchor_chunk_size = 2 * lo_size;
+    let delta_chunk_size = 2 * lo_size * n_chunks;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let periodic_padding = r2_periodic_padding_enabled();
+
+    // Same GPU round-two products arm as the incumbent sweep: it still
+    // receives byte-identical anchors/deltas for every chunk and still owns
+    // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
+    // odd-parity halves on those chunks (the GPU's sums are not parity-split),
+    // which is what makes `W1`/`W2` recoverable everywhere.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    // The GPU arm now returns its round-two products parity-split, so on an
+    // offloaded chunk the CPU can skip the odd-parity pair as well as the even
+    // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
+    // restores the incumbent division of labour within the same binary.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let odd_on_gpu = false;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
+    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    // GFNI bit-matrix form of the fold table, built once per pass and shared
+    // read-only by every chunk (`FLOCK_NO_ZC_GFNI=1` keeps the gather fold).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let r2_mats = r2_gfni_enabled().then(|| build_uni_skip_fold_mats(table));
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns its anchors/deltas ranges and both partial slots.
+        let (anchors, deltas) = unsafe {
+            (
+                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                deltas_base.ptr().add(x_hi * delta_chunk_size),
+            )
+        };
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+        let mut out = [F128::ZERO; 8];
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let full = x_hi >= gpu_prefix;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let full = true;
+            unsafe {
+                let t = table.data.as_ptr().cast::<u8>();
+                let ap = a_packed.as_ptr().add(row_base * n_chunks);
+                let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                if full {
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        out.as_mut_ptr(),
+                    );
+                } else if odd_on_gpu {
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        out.as_mut_ptr(),
+                    );
+                } else {
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        out.as_mut_ptr(),
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
+            let deltas = unsafe { std::slice::from_raw_parts_mut(deltas, delta_chunk_size) };
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                let mats_arg = r2_mats.as_ref();
+                #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+                let mats_arg: Option<&[u64; 128]> = None;
+                out = round2_lookahead_chunk_x86_avx512(
+                    a_packed,
+                    b_packed,
+                    table,
+                    mats_arg,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    row_base,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    write_compact,
+                );
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            {
+                out = round2_lookahead_chunk_scalar(
+                    a_packed,
+                    b_packed,
+                    table,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    row_base,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+            }
+        }
+
+        let eq_h = eq_hi[x_hi];
+        // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
+        // `eq₂(2y)` exactly (field arithmetic, no rounding).
+        let p1 = kappa * out[0] + out[2];
+        let pinf = kappa * out[1] + out[3];
+        // SAFETY: exclusive owner of both partial slots (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            *la_base.ptr().add(x_hi) = [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ];
+        }
+    });
+
+    // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
+    // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
+    // summed pair the incumbent contract delivered, and the odd half is
+    // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
+    // to skip it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib {
+                Some(partials.as_slice())
+            } else {
+                None
+            },
+            if calib {
+                Some(la_partials.as_slice())
+            } else {
+                None
+            },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                    if odd_on_gpu {
+                        la_partials[x_hi][0] = v[2];
+                        la_partials[x_hi][1] = v[3];
+                    }
+                }
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact. Throwaway anchor/delta scratch: the real ranges were
+                // already written by the lookahead pass. The full-lookahead
+                // monomorphization is used so the odd-parity slots are
+                // recovered too when the CPU sweep skipped them.
+                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
+                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let mut out = [F128::ZERO; 8];
+                    unsafe {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            scr_anchors.as_mut_ptr(),
+                            scr_deltas.as_mut_ptr(),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            periodic_padding,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (
+                        eq_h * (kappa * out[0] + out[2]),
+                        eq_h * (kappa * out[1] + out[3]),
+                    );
+                    if odd_on_gpu {
+                        la_partials[x_hi][0] = eq_h * out[2];
+                        la_partials[x_hi][1] = eq_h * out[3];
+                    }
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+    let mut agg = [F128::ZERO; 6];
+    for slot in &la_partials {
+        for (a, v) in agg.iter_mut().zip(slot.iter()) {
+            *a += *v;
+        }
+    }
+    // Every aggregate was accumulated on the odd lane's weight `r₁·eq₃`, so a
+    // single `r₁⁻¹` puts all six back on `eq₃`.
+    let r1_inv = r1.inv();
+    let w1 = r1_inv * agg[0];
+    let w2 = r1_inv * agg[1];
+    let w0 = r1_inv * agg[2];
+    let w3 = r1_inv * agg[3];
+    let w4 = r1_inv * agg[4];
+    let w5 = r1_inv * agg[5];
+    let la = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (compact, mlv_challenges[0] * sum1, sum_inf, la)
+}
+
+/// AVX-512 lookahead round-two chunk: the exact scalar schedule with the
+/// four table folds batched through `fold_round2_pair_x86_unchecked_8` and
+/// the per-group field products batched 4 lanes at a time through
+/// `WideGhashX4`. Accumulation stays unreduced-XOR, which is linear, so any
+/// grouping reduces to the same eight output values — bit-identical
+/// transcript messages.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+/// Shared GFNI kill switch (`FLOCK_NO_ZC_GFNI=1` — see
+/// [`crate::zerocheck::univariate_skip_optimized::ENV_NO_ZC_GFNI`]) for the
+/// round-two batched fold. Output is bit-identical either way.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn r2_gfni_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(crate::zerocheck::univariate_skip_optimized::ENV_NO_ZC_GFNI).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// GFNI matrices for [`gfni_fold64_rows`]: the univariate-skip fold table's
+/// eight 256-entry byte banks are F2-linear (XOR-composed from eight basis
+/// weights, `T_j[0] = 0`), so bank `j` IS sixteen 8×8 bit matrices — one per
+/// output byte of the folded F128. `mats[j * 16 + k]` holds output byte `k`
+/// of bank `j`, in `VGF2P8AFFINEQB` encoding (`out.bit[i] =
+/// parity(byte[7-i] & in)`). 1 KiB per table instead of 32 KiB.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_uni_skip_fold_mats(table: &UniSkipFoldTable) -> [u64; 128] {
+    debug_assert_eq!(table.n_chunks, 8);
+    build_row_fold_mats(&table.data)
+}
+
+/// [`build_uni_skip_fold_mats`] over any 8×256-entry XOR-composed byte-table
+/// block (the cascade K pass feeds its λ-scaled tables through this too —
+/// scaling the basis scales every composed entry exactly, so the matrices
+/// of a scaled table are just the scaled-basis matrices).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_row_fold_mats(data: &[F128]) -> [u64; 128] {
+    debug_assert_eq!(data.len(), 8 * 256);
+    let mut mats = [0u64; 128];
+    for j in 0..8 {
+        let basis: [F128; 8] = std::array::from_fn(|bit| data[j * 256 + (1 << bit)]);
+        for k in 0..16 {
+            let mut qword = 0u64;
+            for i in 0..8 {
+                let bit_index = 8 * k + i;
+                let mut row = 0u8;
+                for (b, basis_val) in basis.iter().enumerate() {
+                    let bit = if bit_index < 64 {
+                        (basis_val.lo >> bit_index) & 1
+                    } else {
+                        (basis_val.hi >> (bit_index - 64)) & 1
+                    };
+                    row |= (bit as u8) << b;
+                }
+                qword |= (row as u64) << (8 * (7 - i));
+            }
+            mats[j * 16 + k] = qword;
+        }
+    }
+    mats
+}
+
+/// Fold 64 consecutive packed 8-byte rows through the univariate-skip byte
+/// tables in one GFNI batch: `out[r] = Σ_j T_j[rows[8r + j]]`, bit-identical
+/// to eight gathers per row (same XOR terms, reassociated).
+///
+/// Pipeline: per-ZMM 8×8 byte transpose (`vpermb`), 8×8 qword transpose
+/// (`vpunpck` + two `vpermt2q` stages) to chunk-byte planes, 8 GFNI products
+/// per output-byte plane folded with `vpternlogq`, then the inverse
+/// transposes to reassemble row-major F128s. Zero table loads; the working
+/// set is the 1 KiB matrix block.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
+    // F128s at `out`.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        }
+        gfni_fold64_regs(z, mats, out);
+    }
+}
+
+/// [`gfni_fold64_rows`] with the 64 rows already in registers (qword q of
+/// `z[i]` = row 8i+q), for callers that assemble row batches with their own
+/// permutations (the cascade K pass splits interleaved L1/L3 delta rows).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_regs(
+    z: [core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees 64 writable F128s at `out`;
+    // all shuffle indices are in range.
+    unsafe {
+        // 8×8 byte transpose inside each ZMM: result qword j = byte j of the
+        // ZMM's eight rows (idx[8j + i] = 8i + j).
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        // vpermt2q index vectors for the two combining stages of the 8×8
+        // qword transpose (and its inverse — the network is an involution).
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+        // qword_transpose(t0..t7) -> p0..p7 with p_j.qword[i] = t_i.qword[j].
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            // Halves for planes {0,2}, {4,6}, {1,3}, {5,7} over t0..t3 / t4..t7.
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b), // plane 0
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b), // plane 1
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b), // plane 2
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b), // plane 3
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b), // plane 4
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b), // plane 5
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b), // plane 6
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b), // plane 7
+            ]
+        };
+
+        // Input: 8 ZMMs of 8 rows each -> byte-transposed -> chunk planes.
+        let mut t = [_mm512_setzero_si512(); 8];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = _mm512_permutexvar_epi8(bt, z[i]);
+        }
+        let p = qword_transpose(t);
+
+        // Sixteen output-byte planes: eight GFNI products folded per plane.
+        let mut acc = [_mm512_setzero_si512(); 16];
+        for (k, slot) in acc.iter_mut().enumerate() {
+            let g = |j: usize| {
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
+            };
+            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+            *slot = _mm512_xor_si512(v2, v3);
+        }
+
+        // Reassemble: inverse qword transpose + inverse byte transpose per
+        // half, then interleave lo/hi qwords into row-major F128s.
+        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
+        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        for i in 0..8 {
+            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
+            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
+            let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
+            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
+            _mm512_storeu_si512(
+                out_ptr.add(1),
+                _mm512_permutex2var_epi64(lo, il_hi, hi),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round2_lookahead_chunk_x86_avx512(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    mats: Option<&[u64; 128]>,
+    anchors: &mut [F128],
+    deltas: &mut [u8],
+    eq_lo: &[F128],
+    lo_size: usize,
+    row_base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    write_compact: bool,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_set, ghash_mul_x4};
+
+    let n_chunks = table.n_chunks;
+    debug_assert_eq!(n_chunks, 8);
+    let table_ptr = table.data.as_ptr();
+    // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per side,
+    // prefolded in one bit-matrix batch (padded pairs fold garbage that the
+    // consume path below overwrites with zeros exactly as before). The cfg!
+    // guard keeps `use_batch` false on builds where the refill block below
+    // compiles out.
+    let use_batch = cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni"))
+        && mats.is_some()
+        && lo_size >= 32
+        && lo_size.is_multiple_of(32);
+
+    // SAFETY: avx512f/vpclmulqdq are cfg-guaranteed; every row slice below is
+    // bounds-checked before its pointer is taken, and the fold kernels read
+    // exactly their 8-byte rows (64 rows per batched block) within bounds.
+    unsafe {
+        let mut acc1 = WideGhashX4::zero(); // (p1_even, pinf_even, p1_odd, pinf_odd)
+        let mut acc2 = WideGhashX4::zero(); // (w0, w1, w2, w3)
+
+        let mut fa = [F128::ZERO; 64];
+        let mut fb = [F128::ZERO; 64];
+        let mut fold_pair = |x_lo: usize,
+                             anchors: &mut [F128],
+                             deltas: &mut [u8]|
+         -> Option<[F128; 4]> {
+            #[cfg(all(
+                target_feature = "avx512vbmi",
+                target_feature = "gfni"
+            ))]
+            if use_batch && x_lo.is_multiple_of(32) {
+                // Refill the 64-row fold caches for pairs x_lo..x_lo+32.
+                // Every block's rows lie inside the chunk's row range, so the
+                // batched loads read exactly the bytes the pair path reads.
+                let g0 = row_base + 2 * x_lo;
+                debug_assert!((g0 + 64) * n_chunks <= a_packed.len());
+                debug_assert!((g0 + 64) * n_chunks <= b_packed.len());
+                let m = mats.unwrap();
+                gfni_fold64_rows(a_packed.as_ptr().add(g0 * n_chunks), m, fa.as_mut_ptr());
+                gfni_fold64_rows(b_packed.as_ptr().add(g0 * n_chunks), m, fb.as_mut_ptr());
+            }
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                if write_compact {
+                    anchors[2 * x_lo] = F128::ZERO;
+                    anchors[2 * x_lo + 1] = F128::ZERO;
+                    deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+                }
+                return None;
+            }
+            let x0g = row_base + 2 * x_lo;
+            let x1g = x0g + 1;
+            let a0_bytes = &a_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+            let a1_bytes = &a_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+            let b0_bytes = &b_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+            let b1_bytes = &b_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+            let [a0, a1, b0, b1] = if use_batch {
+                let r = 2 * (x_lo % 32);
+                [fa[r], fa[r + 1], fb[r], fb[r + 1]]
+            } else {
+                fold_round2_pair_x86_unchecked_8(
+                    table_ptr,
+                    a0_bytes.as_ptr(),
+                    a1_bytes.as_ptr(),
+                    b0_bytes.as_ptr(),
+                    b1_bytes.as_ptr(),
+                )
+            };
+            if write_compact {
+                anchors[2 * x_lo] = a0;
+                anchors[2 * x_lo + 1] = b0;
+                for j in 0..n_chunks {
+                    deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
+                    deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+                }
+            }
+            Some([a0, a1, b0, b1])
+        };
+
+        for u in 0..lo_size / 2 {
+            let even = fold_pair(2 * u, anchors, deltas);
+            let odd = fold_pair(2 * u + 1, anchors, deltas);
+            if even.is_none() && odd.is_none() {
+                continue;
+            }
+            let [a0, a1, b0, b1] = even.unwrap_or([F128::ZERO; 4]);
+            let [a2, a3, b2, b3] = odd.unwrap_or([F128::ZERO; 4]);
+            let wt = eq_lo[2 * u + 1];
+
+            // (a0w, a1w, a2w, a3w) in one 4-lane GHASH batch, then back to
+            // scalars for the cheap XOR assembly of the product operands.
+            let aw_v = ghash_mul_x4(
+                f128x4_set(a0, a1, a2, a3),
+                f128x4_set(wt, wt, wt, wt),
+            );
+            let mut aw = [F128::ZERO; 4];
+            core::arch::x86_64::_mm512_storeu_si512(
+                aw.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
+                aw_v,
+            );
+            let [a0w, a1w, a2w, a3w] = aw;
+
+            // Lanes: (p1_even, pinf_even, p1_odd, pinf_odd). Padded sides are
+            // all-zero, so their lanes accumulate zero — identical to the
+            // scalar skip.
+            acc1.mul_acc(
+                f128x4_set(a1w, a0w + a1w, a3w, a2w + a3w),
+                f128x4_set(b1, b0 + b1, b3, b2 + b3),
+            );
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc2.mul_acc(
+                f128x4_set(a2w, e_aw, o_aw, e_aw + o_aw),
+                f128x4_set(b2, e_b, o_b, e_b + o_b),
+            );
+        }
+
+        let l1 = acc1.fold_lanes();
+        let l2 = acc2.fold_lanes();
+        [
+            l1[0].reduce(),
+            l1[1].reduce(),
+            l1[2].reduce(),
+            l1[3].reduce(),
+            l2[0].reduce(),
+            l2[1].reduce(),
+            l2[2].reduce(),
+            l2[3].reduce(),
+        ]
+    }
+}
+
+/// Portable reference for one lookahead round-two chunk (non-AArch64 builds).
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn round2_lookahead_chunk_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    anchors: &mut [F128],
+    deltas: &mut [u8],
+    eq_lo: &[F128],
+    lo_size: usize,
+    row_base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    let n_chunks = table.n_chunks;
+    let mut p1_even = F256Unreduced::ZERO;
+    let mut pinf_even = F256Unreduced::ZERO;
+    let mut p1_odd = F256Unreduced::ZERO;
+    let mut pinf_odd = F256Unreduced::ZERO;
+    let mut w = [F256Unreduced::ZERO; 4];
+
+    let mut fold_pair = |x_lo: usize, anchors: &mut [F128], deltas: &mut [u8]| {
+        if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+            anchors[2 * x_lo] = F128::ZERO;
+            anchors[2 * x_lo + 1] = F128::ZERO;
+            deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+            return None;
+        }
+        let x0g = row_base + 2 * x_lo;
+        let x1g = x0g + 1;
+        let a0_bytes = &a_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+        let a1_bytes = &a_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+        let b0_bytes = &b_packed[x0g * n_chunks..(x0g + 1) * n_chunks];
+        let b1_bytes = &b_packed[x1g * n_chunks..(x1g + 1) * n_chunks];
+        let a0 = table.fold_one_row(a0_bytes);
+        let a1 = table.fold_one_row(a1_bytes);
+        let b0 = table.fold_one_row(b0_bytes);
+        let b1 = table.fold_one_row(b1_bytes);
+        anchors[2 * x_lo] = a0;
+        anchors[2 * x_lo + 1] = b0;
+        for j in 0..n_chunks {
+            deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
+            deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+        }
+        Some((a0, a1, b0, b1))
+    };
+
+    for u in 0..lo_size / 2 {
+        let even = fold_pair(2 * u, anchors, deltas);
+        let odd = fold_pair(2 * u + 1, anchors, deltas);
+        if even.is_none() && odd.is_none() {
+            continue;
+        }
+        let (a0, a1, b0, b1) = even.unwrap_or((F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO));
+        let (a2, a3, b2, b3) = odd.unwrap_or((F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO));
+        // One weight per group: the odd lane. See the NEON kernel's doc.
+        let wt = eq_lo[2 * u + 1];
+        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        if even.is_some() {
+            p1_even ^= a1w.mul_unreduced(b1);
+            pinf_even ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        }
+        if odd.is_some() {
+            p1_odd ^= a3w.mul_unreduced(b3);
+            pinf_odd ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            w[0] ^= a2w.mul_unreduced(b2);
+        }
+        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+        w[1] ^= e_aw.mul_unreduced(e_b);
+        w[2] ^= o_aw.mul_unreduced(o_b);
+        w[3] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+
+    [
+        p1_even.reduce(),
+        pinf_even.reduce(),
+        p1_odd.reduce(),
+        pinf_odd.reduce(),
+        w[0].reduce(),
+        w[1].reduce(),
+        w[2].reduce(),
+        w[3].reduce(),
+    ]
+}
+
+/// Bind ρ₁ **and** ρ₂ in one pass over the compact round-two state and emit
+/// the round-four message — replacing the incumbent T3 reconstruction plus the
+/// first tail-loop iteration.
+///
+/// `a_out`/`b_out` receive `compact.len() / 2` entries each — exactly the
+/// tables the incumbent route hands to tail-loop iteration `i = 2`.
+/// `r_next4` follows the [`fold_and_compute_round_pair_into`] contract for
+/// that output size (`r_next4[0] = ONE`, `r_next4.len() = log2(a_out.len())`).
+pub(crate) fn fold2_compact_and_round4_into(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128) {
+    let n_pairs = compact.len();
+    let n_groups = n_pairs / 2;
+    assert!(n_groups >= 2 && n_groups.is_power_of_two());
+    assert_eq!(compact.anchors.len(), 2 * n_pairs);
+    assert_eq!(compact.deltas.len(), 2 * n_pairs * table.n_chunks);
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(a_out.len(), n_groups);
+    assert_eq!(b_out.len(), n_groups);
+    assert_eq!(r_next4.len(), n_groups.trailing_zeros() as usize);
+
+    // λ₀+λ₁ = 1+ρ₂ and λ₂+λ₃ = ρ₂ in characteristic two, so the anchors need a
+    // single ordinary ρ₂ fold and only the two deltas carry ρ₁.
+    let lambda1 = rho1 * (F128::ONE + rho2);
+    let lambda3 = rho1 * rho2;
+    let table_l1 = table.scaled_linear(lambda1);
+    let table_l3 = table.scaled_linear(lambda3);
+
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_groups);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let out_chunk = 2 * lo_size;
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; the queue join publishes the
+        // writes before the reduction below reads them.
+        let (a_ptr, b_ptr) = unsafe {
+            (
+                a_base.ptr().add(x_hi * out_chunk),
+                b_base.ptr().add(x_hi * out_chunk),
+            )
+        };
+        // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
+        let pair_base = 2 * x_hi * out_chunk;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            fold2_compact_and_round4_chunk_neon_8(
+                table_l1.as_ptr().cast::<u8>(),
+                table_l3.as_ptr().cast::<u8>(),
+                rho2,
+                compact.anchors.as_ptr().add(2 * pair_base),
+                compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                a_ptr,
+                b_ptr,
+                eq_lo.as_ptr(),
+                lo_size,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let a_out = unsafe { std::slice::from_raw_parts_mut(a_ptr, out_chunk) };
+            let b_out = unsafe { std::slice::from_raw_parts_mut(b_ptr, out_chunk) };
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            let nc = table.n_chunks;
+            for g_local in 0..out_chunk {
+                let g = x_hi * out_chunk + g_local;
+                let anc = &compact.anchors[4 * g..4 * g + 4];
+                let d = &compact.deltas[32 * g..32 * g + 32];
+                let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
+                let mut b = anc[1] + rho2 * (anc[1] + anc[3]);
+                for j in 0..nc {
+                    a += table_l1[j * 256 + d[j] as usize];
+                    b += table_l1[j * 256 + d[nc + j] as usize];
+                    a += table_l3[j * 256 + d[2 * nc + j] as usize];
+                    b += table_l3[j * 256 + d[3 * nc + j] as usize];
+                }
+                a_out[g_local] = a;
+                b_out[g_local] = b;
+            }
+            for x_lo in 0..lo_size {
+                let o = 2 * x_lo;
+                let (a0, a1) = (a_out[o], a_out[o + 1]);
+                let (b0, b1) = (b_out[o], b_out[o + 1]);
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: exclusive owner of partials[x_hi].
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (r_next4[0] * sum1, sum_inf)
+}
+
+// ---------------------------------------------------------------------------
+// Cascaded lookahead (variant K, one level deeper): rounds 2..6 in three
+// passes. The K double-fold materializes each round-4 output group in
+// registers before its store — exactly the position the round-2 sweep was in
+// before the round-3 promotion — so round FIVE's message (a quadratic in the
+// not-yet-sampled ρ₃) can be accumulated during the K pass, and rounds 5 and
+// 6 then share one plain composed double-fold. Everything is value-identical
+// to the incumbent route: exact F128, untouched transcript order, pure
+// reassociation.
+// ---------------------------------------------------------------------------
+
+/// Local eq split for the cascaded K pass. Identical to [`COMPACT_RECONSTRUCTION_N_HI`] at
+/// the ranked shape; clamped so the lo half always keeps at least one
+/// variable, because the sweep consumes round-4 pairs two at a time (one
+/// round-five group) inside a chunk — the same clamp [`lookahead_n_hi`]
+/// applies to the round-2 sweep. Any admissible value is bit-identical (the
+/// split is an exact lo/hi tensor factorisation).
+#[inline]
+fn cascade_k_pass_n_hi(n_vars: usize) -> usize {
+    COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
+}
+
+/// Cascade K pass: [`fold2_compact_and_round4_into`] **plus** the deferred
+/// round-five coefficients, in the same single pass over the compact state.
+///
+/// The output tables, every store, and the round-four wire message are
+/// value-identical to the incumbent K pass; the sweep merely also accumulates
+/// six aggregates over round-five groups `y'` (`a_i = a_out[4y'+i]`):
+///
+/// ```text
+/// W0' = Σ_y' eq₅(y')·a2b2   W1' = Σ eq₅·a3b3      W2' = Σ eq₅·(a2+a3)(b2+b3)
+/// W3' = Σ_y' eq₅(y')·e_a e_b   W4' = Σ eq₅·o_a o_b   W5' = Σ eq₅·(e+o)_a(e+o)_b
+/// e = out[4y']+out[4y'+2],  o = out[4y'+1]+out[4y'+3]
+/// ```
+///
+/// `W1'` and `W2'` cost **zero extra multiplies**: they are the odd-parity
+/// half of the two round-four accumulators, because the K pass's eq table is
+/// built over `r_next4[1..]` (LSB-first), so `eq₄(2y'+1) = r'·eq₅(y')` with
+/// `r' = r_next4[1]` and `eq₅.hi ≡ eq₄.hi`. The kernel reports the round-four
+/// sums split by parity and the driver divides the odd half by `r'` once —
+/// the exact mechanism the round-2 lookahead uses with `r₁`.
+///
+/// Returns `(round4_msg_1, round4_msg_inf, la5)` where `la5` evaluates via
+/// [`eval_round3_lookahead`] (the deferred-quadratic shape is round-agnostic)
+/// at the later-sampled ρ₃ to the round-five message, with no memory pass.
+///
+/// Requires `r_next4[1] ≠ 0`; the caller falls back to the incumbent route
+/// otherwise (probability 2⁻¹²⁸ for a sampled challenge; at the ranked shape
+/// this slot is the protocol constant β₀ ≠ 0).
+pub(crate) fn fold2_compact_and_round45_into(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128, Round3Lookahead) {
+    fold2_compact_and_round45_into_impl(compact, table, None, rho1, rho2, r_next4, a_out, b_out)
+}
+
+/// Raw-input K pass: identical messages and outputs, but the composed tables
+/// are folded straight from the ORIGINAL packed rows instead of the compact
+/// anchor+delta state. Expanding the compact algebra gives, per group `g`,
+///
+///   `a_out[g] = Σ_c s_c · F_z(row_{4g+c})`,
+///   `(s_0, s_1, s_2, s_3) = ((1+ρ₁)(1+ρ₂), ρ₁(1+ρ₂), ρ₂(1+ρ₁), ρ₁ρ₂)`
+///
+/// — the plain two-level tensor fold of four consecutive rows, exact field
+/// algebra, so the outputs are the same field elements bit-for-bit. With the
+/// GFNI row fold this needs no compact state at all: round two skips its
+/// 1.5 GiB of anchor/delta stores and this pass reads the 1 GiB of original
+/// rows instead of 1.5 GiB of compact state. Callers gate on
+/// [`zc_raw_k_supported`]; `compact` is still passed for its recorded length
+/// but its contents are never read.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_raw_and_round45_into(
+    compact: &UniSkipCompactFold,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128, Round3Lookahead) {
+    fold2_compact_and_round45_into_impl(
+        compact,
+        table,
+        Some((a_packed, b_packed)),
+        rho1,
+        rho2,
+        r_next4,
+        a_out,
+        b_out,
+    )
+}
+
+/// Whether the raw-input K pass (and round two's matching compact-store
+/// elision) is available for this shape: the GFNI build, the shared GFNI
+/// kill switch, an extra `FLOCK_NO_ZC_RAWK=1` rollback, and a group count
+/// whose per-chunk output is a multiple of the 64-group batch.
+pub(crate) fn zc_raw_k_supported(n_groups: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        if !r2_gfni_enabled() || std::env::var_os("FLOCK_NO_ZC_RAWK").is_some() {
+            return false;
+        }
+        if !(n_groups >= 4 && n_groups.is_power_of_two()) {
+            return false;
+        }
+        let n_vars = n_groups.trailing_zeros() as usize - 1;
+        let n_hi = cascade_k_pass_n_hi(n_vars);
+        let lo_size = n_groups >> (n_hi + 1);
+        let out_chunk = 2 * lo_size;
+        out_chunk >= 64 && out_chunk.is_multiple_of(64)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    {
+        let _ = n_groups;
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold2_compact_and_round45_into_impl(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    raw: Option<(&[u8], &[u8])>,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128, Round3Lookahead) {
+    let n_pairs = compact.len();
+    let n_groups = n_pairs / 2;
+    assert!(n_groups >= 4 && n_groups.is_power_of_two());
+    if let Some((a_packed, b_packed)) = raw {
+        assert_eq!(a_packed.len(), 2 * n_pairs * table.n_chunks);
+        assert_eq!(b_packed.len(), 2 * n_pairs * table.n_chunks);
+    } else {
+        assert_eq!(compact.anchors.len(), 2 * n_pairs);
+        assert_eq!(compact.deltas.len(), 2 * n_pairs * table.n_chunks);
+    }
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(a_out.len(), n_groups);
+    assert_eq!(b_out.len(), n_groups);
+    assert_eq!(r_next4.len(), n_groups.trailing_zeros() as usize);
+    let r_par = r_next4[1];
+    assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next4[1]");
+
+    // Same λ composition as the incumbent K pass: the anchors take one
+    // ordinary ρ₂ fold, only the two deltas carry ρ₁.
+    let lambda1 = rho1 * (F128::ONE + rho2);
+    let lambda3 = rho1 * rho2;
+    let table_l1 = table.scaled_linear(lambda1);
+    let table_l3 = table.scaled_linear(lambda3);
+
+    let n_vars = r_next4.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], cascade_k_pass_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_groups);
+    assert!(
+        lo_size >= 2,
+        "cascade sweep pairs two round-4 pairs per group"
+    );
+    // `eq₄(2y') = (1+r')·eq₅(y')` and `eq₄(2y'+1) = r'·eq₅(y')`: the sweep
+    // uses the odd lane as the group's single weight; the two constants below
+    // put every aggregate back on its own scale, once, off the hot path.
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let out_chunk = 2 * lo_size;
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
+    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    // GFNI bit-matrix forms of both λ-scaled tables, built once per pass and
+    // shared read-only by every chunk (`FLOCK_NO_ZC_GFNI=1` keeps gathers).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let k_mats = (r2_gfni_enabled() && std::env::var_os("FLOCK_NO_K_GFNI").is_none())
+        .then(|| (build_row_fold_mats(&table_l1), build_row_fold_mats(&table_l3)));
+    // Raw-input mode: the four tensor-fold scale classes as GFNI matrix
+    // blocks (see `fold2_raw_and_round45_into` — scaling the basis scales
+    // every composed table entry exactly).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let raw_mats = raw.map(|_| {
+        let scales = [
+            (F128::ONE + rho1) * (F128::ONE + rho2),
+            rho1 * (F128::ONE + rho2),
+            rho2 * (F128::ONE + rho1),
+            rho1 * rho2,
+        ];
+        let mats: [[u64; 128]; 4] = std::array::from_fn(|c| {
+            // Only the 64 one-hot basis entries feed the matrices; scaling
+            // them scales every composed entry exactly (F2-bilinearity).
+            let mut scaled = vec![F128::ZERO; 8 * 256];
+            for j in 0..8 {
+                for bit in 0..8 {
+                    let idx = j * 256 + (1 << bit);
+                    scaled[idx] = table.data[idx] * scales[c];
+                }
+            }
+            build_row_fold_mats(&scaled)
+        });
+        mats
+    });
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    assert!(
+        raw.is_none(),
+        "raw K pass requires the GFNI build (gate on zc_raw_k_supported)"
+    );
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; the queue join publishes the
+        // writes before the reduction below reads them.
+        let (a_ptr, b_ptr) = unsafe {
+            (
+                a_base.ptr().add(x_hi * out_chunk),
+                b_base.ptr().add(x_hi * out_chunk),
+            )
+        };
+        // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
+        let pair_base = 2 * x_hi * out_chunk;
+        let mut outv = [F128::ZERO; 8];
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            fold2_compact_and_round45_chunk_neon_8(
+                table_l1.as_ptr().cast::<u8>(),
+                table_l3.as_ptr().cast::<u8>(),
+                rho2,
+                compact.anchors.as_ptr().add(2 * pair_base),
+                compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                a_ptr,
+                b_ptr,
+                eq_lo.as_ptr(),
+                lo_size,
+                degen,
+                outv.as_mut_ptr(),
+            );
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            let a_out = unsafe { std::slice::from_raw_parts_mut(a_ptr, out_chunk) };
+            let b_out = unsafe { std::slice::from_raw_parts_mut(b_ptr, out_chunk) };
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let mats_arg = k_mats.as_ref().map(|(l1, l3)| (l1, l3));
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let mats_arg: Option<(&[u64; 128], &[u64; 128])> = None;
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let raw_arg = match (raw, raw_mats.as_ref()) {
+                (Some((ap, bp)), Some(mats4)) => Some((ap, bp, mats4)),
+                _ => None,
+            };
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let raw_arg: Option<(&[u8], &[u8], &[[u64; 128]; 4])> = None;
+            outv = fold2_round45_chunk_x86_avx512(
+                compact, table, &table_l1, &table_l3, mats_arg, raw_arg, rho2, a_out, b_out,
+                eq_lo, lo_size, x_hi,
+            );
+        }
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )
+        )))]
+        {
+            let a_out = unsafe { std::slice::from_raw_parts_mut(a_ptr, out_chunk) };
+            let b_out = unsafe { std::slice::from_raw_parts_mut(b_ptr, out_chunk) };
+            outv = fold2_round45_chunk_scalar(
+                compact, table, &table_l1, &table_l3, rho2, a_out, b_out, eq_lo, lo_size, x_hi,
+            );
+        }
+
+        let eq_h = eq_hi[x_hi];
+        // `outv[0..2]` carry the even round-4 pairs on the odd lane's weight;
+        // κ restores `eq₄(2y')` exactly (field arithmetic, no rounding).
+        let p1 = kappa * outv[0] + outv[2];
+        let pinf = kappa * outv[1] + outv[3];
+        // SAFETY: exclusive owner of both partial slots (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            *la_base.ptr().add(x_hi) = [
+                eq_h * outv[2],
+                eq_h * outv[3],
+                eq_h * outv[4],
+                eq_h * outv[5],
+                eq_h * outv[6],
+                eq_h * outv[7],
+            ];
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+    let mut agg = [F128::ZERO; 6];
+    for slot in &la_partials {
+        for (a, v) in agg.iter_mut().zip(slot.iter()) {
+            *a += *v;
+        }
+    }
+    // Every aggregate was accumulated on the odd lane's weight `r'·eq₅`, so a
+    // single `r'⁻¹` puts all six back on `eq₅`.
+    let r_inv = r_par.inv();
+    let w1 = r_inv * agg[0];
+    let w2 = r_inv * agg[1];
+    let w0 = r_inv * agg[2];
+    let w3 = r_inv * agg[3];
+    let w4 = r_inv * agg[4];
+    let w5 = r_inv * agg[5];
+    let la5 = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (r_next4[0] * sum1, sum_inf, la5)
+}
+
+/// AVX-512 cascade K chunk: the scalar schedule with the 32 delta-table
+/// lookups per two groups run as four independent XMM XOR chains, the anchor
+/// folds and the message products batched four lanes at a time through
+/// GHASH. Unreduced-XOR accumulation is linear, so the regrouped sums reduce
+/// to exactly the scalar outputs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn fold2_round45_chunk_x86_avx512(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    table_l1: &[F128],
+    table_l3: &[F128],
+    mats: Option<(&[u64; 128], &[u64; 128])>,
+    raw: Option<(&[u8], &[u8], &[[u64; 128]; 4])>,
+    rho2: F128,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    eq_lo: &[F128],
+    lo_size: usize,
+    x_hi: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::*;
+
+    let nc = table.n_chunks;
+    debug_assert_eq!(nc, 8);
+    let out_chunk = a_out.len();
+    debug_assert!(out_chunk.is_multiple_of(2));
+    let l1p = table_l1.as_ptr();
+    let l3p = table_l3.as_ptr();
+    // Raw-input fill (see `fold2_raw_and_round45_into`): the whole chunk's
+    // outputs come straight from the original packed rows in 64-group
+    // batches, then the identical message sweep below runs unchanged.
+    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+    if let Some((a_packed, b_packed, mats4)) = raw {
+        assert!(
+            out_chunk >= 64 && out_chunk.is_multiple_of(64),
+            "raw K fill requires 64-group chunks (gate on zc_raw_k_supported)"
+        );
+        // SAFETY: the caller sized a_packed/b_packed to exactly 4 rows per
+        // group; every batched load below stays inside the chunk's rows.
+        unsafe {
+            let g_base = x_hi * out_chunk;
+            debug_assert!((4 * (g_base + out_chunk)) * nc <= a_packed.len());
+            let mut blk = 0;
+            while blk < out_chunk {
+                gfni_fold256_rows_4scale(
+                    a_packed.as_ptr().add(4 * (g_base + blk) * nc),
+                    mats4,
+                    a_out[blk..blk + 64].as_mut_ptr(),
+                );
+                gfni_fold256_rows_4scale(
+                    b_packed.as_ptr().add(4 * (g_base + blk) * nc),
+                    mats4,
+                    b_out[blk..blk + 64].as_mut_ptr(),
+                );
+                blk += 64;
+            }
+        }
+        // SAFETY: same feature set; the sweep reads only the freshly filled
+        // outputs and the eq tables.
+        return unsafe {
+            fold2_round45_message_sweep_x86(a_out, b_out, eq_lo, lo_size)
+        };
+    }
+    // GFNI batch fold: 32 consecutive groups = 128 consecutive delta rows,
+    // split by their period-4 L1/L3 pattern into two 64-row bit-matrix
+    // batches. The cfg! guard keeps `use_batch` false on builds where the
+    // refill block below compiles out.
+    let use_batch = cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni"))
+        && mats.is_some()
+        && out_chunk >= 32
+        && out_chunk.is_multiple_of(32);
+
+    // SAFETY: features cfg-guaranteed; anchor/delta slices are bounds-checked
+    // below and every table index is a u8 into a 8*256-entry bank.
+    unsafe {
+        let _ = raw;
+        let rho2_v = f128x4_set(rho2, rho2, rho2, rho2);
+        let mut f_l1 = [F128::ZERO; 64];
+        let mut f_l3 = [F128::ZERO; 64];
+        let mut g_local = 0;
+        while g_local + 2 <= out_chunk {
+            let g = x_hi * out_chunk + g_local;
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            if use_batch && g_local.is_multiple_of(32) {
+                // Refill both 64-row fold caches for groups g..g+32: delta
+                // rows 4g..4g+128 (1 KiB) are [aL1, bL1, aL3, bL3] per group,
+                // so qword-permutes peel the L1 pairs and L3 pairs into
+                // register batches (row 2t+{0,1} of a batch = group g+t's
+                // a/b rows). Reads exactly the bytes the gather path reads.
+                let (m_l1, m_l3) = mats.unwrap();
+                debug_assert!(32 * g + 1024 <= compact.deltas.len());
+                let dp = compact.deltas.as_ptr().add(32 * g);
+                let sel_l1 = _mm512_setr_epi64(0, 1, 4, 5, 8, 9, 12, 13);
+                let sel_l3 = _mm512_setr_epi64(2, 3, 6, 7, 10, 11, 14, 15);
+                let mut z_l1 = [_mm512_setzero_si512(); 8];
+                let mut z_l3 = [_mm512_setzero_si512(); 8];
+                for k in 0..8 {
+                    let z_e = _mm512_loadu_si512(dp.add(128 * k) as *const __m512i);
+                    let z_o = _mm512_loadu_si512(dp.add(128 * k + 64) as *const __m512i);
+                    z_l1[k] = _mm512_permutex2var_epi64(z_e, sel_l1, z_o);
+                    z_l3[k] = _mm512_permutex2var_epi64(z_e, sel_l3, z_o);
+                }
+                gfni_fold64_regs(z_l1, m_l1, f_l1.as_mut_ptr());
+                gfni_fold64_regs(z_l3, m_l3, f_l3.as_mut_ptr());
+            }
+            let anc = &compact.anchors[4 * g..4 * g + 8];
+            let d = &compact.deltas[32 * g..32 * g + 64];
+            let folded = ghash_mul_x4(
+                f128x4_set(
+                    anc[0] + anc[2],
+                    anc[1] + anc[3],
+                    anc[4] + anc[6],
+                    anc[5] + anc[7],
+                ),
+                rho2_v,
+            );
+            let mut base4 = [F128::ZERO; 4];
+            _mm512_storeu_si512(base4.as_mut_ptr().cast::<__m512i>(), folded);
+            let init = [
+                anc[0] + base4[0],
+                anc[1] + base4[1],
+                anc[4] + base4[2],
+                anc[5] + base4[3],
+            ];
+            let mut acc = [
+                _mm_set_epi64x(init[0].hi as i64, init[0].lo as i64),
+                _mm_set_epi64x(init[1].hi as i64, init[1].lo as i64),
+                _mm_set_epi64x(init[2].hi as i64, init[2].lo as i64),
+                _mm_set_epi64x(init[3].hi as i64, init[3].lo as i64),
+            ];
+            if use_batch {
+                let gb = g_local % 32;
+                for (slot, r) in [(0usize, 2 * gb), (1, 2 * gb + 1), (2, 2 * gb + 2), (3, 2 * gb + 3)]
+                {
+                    acc[slot] = _mm_xor_si128(
+                        acc[slot],
+                        _mm_xor_si128(
+                            _mm_loadu_si128((f_l1.as_ptr().add(r)).cast::<__m128i>()),
+                            _mm_loadu_si128((f_l3.as_ptr().add(r)).cast::<__m128i>()),
+                        ),
+                    );
+                }
+            } else {
+                for j in 0..8 {
+                    let l1b = l1p.add(j * 256);
+                    let l3b = l3p.add(j * 256);
+                    acc[0] = _mm_xor_si128(
+                        acc[0],
+                        _mm_load_si128(l1b.add(d[j] as usize).cast::<__m128i>()),
+                    );
+                    acc[1] = _mm_xor_si128(
+                        acc[1],
+                        _mm_load_si128(l1b.add(d[8 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[2] = _mm_xor_si128(
+                        acc[2],
+                        _mm_load_si128(l1b.add(d[32 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[3] = _mm_xor_si128(
+                        acc[3],
+                        _mm_load_si128(l1b.add(d[40 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[0] = _mm_xor_si128(
+                        acc[0],
+                        _mm_load_si128(l3b.add(d[16 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[1] = _mm_xor_si128(
+                        acc[1],
+                        _mm_load_si128(l3b.add(d[24 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[2] = _mm_xor_si128(
+                        acc[2],
+                        _mm_load_si128(l3b.add(d[48 + j] as usize).cast::<__m128i>()),
+                    );
+                    acc[3] = _mm_xor_si128(
+                        acc[3],
+                        _mm_load_si128(l3b.add(d[56 + j] as usize).cast::<__m128i>()),
+                    );
+                }
+            }
+            a_out[g_local] = core::mem::transmute::<__m128i, F128>(acc[0]);
+            b_out[g_local] = core::mem::transmute::<__m128i, F128>(acc[1]);
+            a_out[g_local + 1] = core::mem::transmute::<__m128i, F128>(acc[2]);
+            b_out[g_local + 1] = core::mem::transmute::<__m128i, F128>(acc[3]);
+            g_local += 2;
+        }
+
+        // Message sweep — same batching as the round-two lookahead kernel.
+        fold2_round45_message_sweep_x86(a_out, b_out, eq_lo, lo_size)
+    }
+}
+
+/// The K chunk's message sweep, shared by the compact and raw fill arms:
+/// identical products and slot order over the freshly composed outputs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold2_round45_message_sweep_x86(
+    a_out: &[F128],
+    b_out: &[F128],
+    eq_lo: &[F128],
+    lo_size: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::*;
+    // SAFETY: pure register/product work over in-bounds slices.
+    unsafe {
+        let mut acc1 = WideGhashX4::zero(); // (p1_even, pinf_even, p1_odd, pinf_odd)
+        let mut acc2 = WideGhashX4::zero(); // (w0, w1, w2, w3)
+        for t in 0..lo_size / 2 {
+            let o = 4 * t;
+            let (a0, a1, a2, a3) = (a_out[o], a_out[o + 1], a_out[o + 2], a_out[o + 3]);
+            let (b0, b1, b2, b3) = (b_out[o], b_out[o + 1], b_out[o + 2], b_out[o + 3]);
+            let wt = eq_lo[2 * t + 1];
+            let aw_v = ghash_mul_x4(f128x4_set(a0, a1, a2, a3), f128x4_set(wt, wt, wt, wt));
+            let mut aw = [F128::ZERO; 4];
+            _mm512_storeu_si512(aw.as_mut_ptr().cast::<__m512i>(), aw_v);
+            let [a0w, a1w, a2w, a3w] = aw;
+            acc1.mul_acc(
+                f128x4_set(a1w, a0w + a1w, a3w, a2w + a3w),
+                f128x4_set(b1, b0 + b1, b3, b2 + b3),
+            );
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc2.mul_acc(
+                f128x4_set(a2w, e_aw, o_aw, e_aw + o_aw),
+                f128x4_set(b2, e_b, o_b, e_b + o_b),
+            );
+        }
+        let l1 = acc1.fold_lanes();
+        let l2 = acc2.fold_lanes();
+        [
+            l1[0].reduce(),
+            l1[1].reduce(),
+            l1[2].reduce(),
+            l1[3].reduce(),
+            l2[0].reduce(),
+            l2[1].reduce(),
+            l2[2].reduce(),
+            l2[3].reduce(),
+        ]
+    }
+}
+
+/// Fold 256 consecutive packed rows through four scale-class matrix blocks
+/// (row `4t + c` takes class `c`) and write the 64 class-summed outputs:
+/// `out[t] = Σ_c F_{s_c}(row_{4t+c})` — the raw K pass's composed output.
+/// The period-4 class peel is three `vpermt2q` per class per 32 rows; the
+/// per-class folds reuse [`gfni_fold64_regs`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold256_rows_4scale(rows: *const u8, mats4: &[[u64; 128]; 4], out: *mut F128) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees 2048 readable bytes at `rows`
+    // and 64 writable F128s at `out`; all shuffle indices are in range.
+    unsafe {
+        let combine = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let mut folded = [[F128::ZERO; 64]; 4];
+        for (c, class_out) in folded.iter_mut().enumerate() {
+            let sel = _mm512_setr_epi64(
+                c as i64,
+                c as i64 + 4,
+                c as i64 + 8,
+                c as i64 + 12,
+                0,
+                0,
+                0,
+                0,
+            );
+            let mut cls = [_mm512_setzero_si512(); 8];
+            for (q, slot) in cls.iter_mut().enumerate() {
+                let z0 = _mm512_loadu_si512(rows.add(256 * q) as *const __m512i);
+                let z1 = _mm512_loadu_si512(rows.add(256 * q + 64) as *const __m512i);
+                let z2 = _mm512_loadu_si512(rows.add(256 * q + 128) as *const __m512i);
+                let z3 = _mm512_loadu_si512(rows.add(256 * q + 192) as *const __m512i);
+                let t01 = _mm512_permutex2var_epi64(z0, sel, z1);
+                let t23 = _mm512_permutex2var_epi64(z2, sel, z3);
+                *slot = _mm512_permutex2var_epi64(t01, combine, t23);
+            }
+            gfni_fold64_regs(cls, &mats4[c], class_out.as_mut_ptr());
+        }
+        for t in 0..16 {
+            let f0 = _mm512_loadu_si512(folded[0].as_ptr().add(4 * t) as *const __m512i);
+            let f1 = _mm512_loadu_si512(folded[1].as_ptr().add(4 * t) as *const __m512i);
+            let f2 = _mm512_loadu_si512(folded[2].as_ptr().add(4 * t) as *const __m512i);
+            let f3 = _mm512_loadu_si512(folded[3].as_ptr().add(4 * t) as *const __m512i);
+            let v = _mm512_ternarylogic_epi64::<0x96>(f0, f1, f2);
+            _mm512_storeu_si512(
+                (out as *mut u8).add(64 * t) as *mut __m512i,
+                _mm512_xor_si512(v, f3),
+            );
+        }
+    }
+}
+
+/// Portable reference for one cascade K chunk (non-AArch64 builds). Same
+/// slot order as the NEON kernel:
+/// `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`.
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn fold2_round45_chunk_scalar(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    table_l1: &[F128],
+    table_l3: &[F128],
+    rho2: F128,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    eq_lo: &[F128],
+    lo_size: usize,
+    x_hi: usize,
+) -> [F128; 8] {
+    let nc = table.n_chunks;
+    let out_chunk = a_out.len();
+    let mut p1_even = F256Unreduced::ZERO;
+    let mut pinf_even = F256Unreduced::ZERO;
+    let mut p1_odd = F256Unreduced::ZERO;
+    let mut pinf_odd = F256Unreduced::ZERO;
+    let mut w = [F256Unreduced::ZERO; 4];
+
+    // Materialize the chunk's composed outputs first (identical expressions
+    // to the incumbent scalar path)…
+    for g_local in 0..out_chunk {
+        let g = x_hi * out_chunk + g_local;
+        let anc = &compact.anchors[4 * g..4 * g + 4];
+        let d = &compact.deltas[32 * g..32 * g + 32];
+        let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
+        let mut b = anc[1] + rho2 * (anc[1] + anc[3]);
+        for j in 0..nc {
+            a += table_l1[j * 256 + d[j] as usize];
+            b += table_l1[j * 256 + d[nc + j] as usize];
+            a += table_l3[j * 256 + d[2 * nc + j] as usize];
+            b += table_l3[j * 256 + d[3 * nc + j] as usize];
+        }
+        a_out[g_local] = a;
+        b_out[g_local] = b;
+    }
+    // …then sweep round-five groups with the shared odd-lane weight.
+    for t in 0..lo_size / 2 {
+        let o = 4 * t;
+        let (a0, a1, a2, a3) = (a_out[o], a_out[o + 1], a_out[o + 2], a_out[o + 3]);
+        let (b0, b1, b2, b3) = (b_out[o], b_out[o + 1], b_out[o + 2], b_out[o + 3]);
+        let wt = eq_lo[2 * t + 1];
+        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        p1_even ^= a1w.mul_unreduced(b1);
+        pinf_even ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        p1_odd ^= a3w.mul_unreduced(b3);
+        pinf_odd ^= (a2w + a3w).mul_unreduced(b2 + b3);
+        w[0] ^= a2w.mul_unreduced(b2);
+        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+        w[1] ^= e_aw.mul_unreduced(e_b);
+        w[2] ^= o_aw.mul_unreduced(o_b);
+        w[3] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+
+    [
+        p1_even.reduce(),
+        pinf_even.reduce(),
+        p1_odd.reduce(),
+        pinf_odd.reduce(),
+        w[0].reduce(),
+        w[1].reduce(),
+        w[2].reduce(),
+        w[3].reduce(),
+    ]
+}
+
+/// Bind ρ₃ **and** ρ₄ in one plain composed pass — quartering `a`/`b` instead
+/// of halving twice — and emit the round-six message from the composed
+/// outputs. Replaces tail-loop iterations `i = 2` and `i = 3` under the
+/// cascade: no compact-state complications at this depth, inputs are plain
+/// F128 arrays, so the composition is the direct
+/// `t0 + ρ₄·(t0+t1)` over the two ρ₃-folded halves — value-identical to the
+/// two sequential [`fold_and_compute_round_pair_into`] passes, term for term,
+/// with the intermediate half-size tables never written or re-read.
+///
+/// `r_next6` follows the usual contract for the OUTPUT size
+/// (`r_next6[0] = ONE`, `r_next6.len() = log2(a_out.len())`).
+pub(crate) fn fold2_plain_and_round6_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho3: F128,
+    rho4: F128,
+    r_next6: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let quarter = n / 4;
+    assert_eq!(a_out.len(), quarter);
+    assert_eq!(b_out.len(), quarter);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next6.len(), log_n - 2);
+
+    // Same clamp rationale as the K pass: the message consumes composed
+    // outputs two at a time, so the lo half must keep ≥ 1 variable.
+    let n_vars = r_next6.len() - 1;
+    let n_hi = SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1));
+    let eq = SplitEqGhash::with_n_hi(&r_next6[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
+    assert_eq!(lo_size * hi_size * 2, quarter);
+
+    let chunk_in = 8 * lo_size; // four inputs per composed output
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    // Same NT policy as the plain tail: the composed output (2^22 F128 = 64
+    // MiB per array at the ranked shape) is a ping-pong buffer not read until
+    // the next round's barrier, so `stnp` elides the write-allocate RFOs.
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 19)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_direct = !nt_stores
+        && ranked_direct_fold4_pair_output(quarter)
+        && zc_cascade_fold4_pair_enabled()
+        && zc_cascade_fold4_pair_direct_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_direct {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
+
+    let chunk_partial =
+        |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_direct {
+                    fold2_and_message_normal_expanded_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                    )
+                } else {
+                    fold2_and_message_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+            {
+                fold2_and_message_aarch64(a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut p1_acc = F256Unreduced::ZERO;
+                let mut pinf_acc = F256Unreduced::ZERO;
+                for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
+                    let i = 8 * x_lo;
+                    let o = 2 * x_lo;
+                    let fold4 = |v: &[F128], i: usize| {
+                        let t0 = v[i] + rho3 * (v[i] + v[i + 1]);
+                        let t1 = v[i + 2] + rho3 * (v[i + 2] + v[i + 3]);
+                        t0 + rho4 * (t0 + t1)
+                    };
+                    let a0 = fold4(a_in, i);
+                    let a1 = fold4(a_in, i + 4);
+                    let b0 = fold4(b_in, i);
+                    let b1 = fold4(b_in, i + 4);
+                    a_out[o] = a0;
+                    a_out[o + 1] = a1;
+                    b_out[o] = b0;
+                    b_out[o + 1] = b1;
+                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                (p1_acc.reduce(), pinf_acc.reduce())
+            }
+        };
+
+    // Same scheduling policy as the plain tail: DRAM-bound sizes drain
+    // through the hetero E-core queue, LLC-resident ones stay on rayon.
+    #[cfg(target_arch = "aarch64")]
+    let hetero = quarter >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    let (sum1, sum_inf) = if hetero {
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_out, b_out) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (p1, pinf) = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_out,
+                b_out,
+            );
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            })
+    } else {
+        use rayon::prelude::*;
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| {
+                let (p1, pinf) = chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_out,
+                    b_out,
+                );
+                let eq_h = eq_hi[x_hi];
+                (eq_h * p1, eq_h * pinf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    };
+
+    (r_next6[0] * sum1, sum_inf)
+}
+
+// ---------------------------------------------------------------------------
+// Cascaded lookahead, level three: rounds 2..8 in four passes. The composed
+// rounds-5/6 fold materializes each output group in registers before its
+// store — the same position the K pass was in before the round-5 promotion —
+// so round SEVEN's message (a quadratic in the not-yet-sampled ρ₅) can be
+// accumulated during the composed-5/6 pass, and rounds 7 and 8 then share one
+// more plain composed double-fold. Everything is value-identical to the
+// cascade2 route: exact F128, untouched transcript order, pure reassociation.
+// ---------------------------------------------------------------------------
+
+/// [`fold2_plain_and_round6_into`] **plus** the deferred round-seven
+/// coefficients, in the same single pass over the composed-5/6 traversal.
+///
+/// The output tables, every store, and the round-six wire message are
+/// value-identical to the plain composed pass; the sweep merely also
+/// accumulates six aggregates over round-seven groups `y''`
+/// (`a_i = a_out[4y''+i]`):
+///
+/// ```text
+/// W0'' = Σ_y'' eq₇(y'')·a2b2   W1'' = Σ eq₇·a3b3    W2'' = Σ eq₇·(a2+a3)(b2+b3)
+/// W3'' = Σ_y'' eq₇(y'')·e_a e_b   W4'' = Σ eq₇·o_a o_b   W5'' = Σ eq₇·(e+o)_a(e+o)_b
+/// e = out[4y'']+out[4y''+2],  o = out[4y''+1]+out[4y''+3]
+/// ```
+///
+/// `W1''` and `W2''` cost **zero extra multiplies**: they are the odd-parity
+/// half of the two round-six accumulators, because the pass's eq table is
+/// built over `r_next6[1..]` (LSB-first), so `eq₆(2y''+1) = r''·eq₇(y'')`
+/// with `r'' = r_next6[1]` and `eq₇.hi ≡ eq₆.hi` — the exact mechanism the
+/// cascade K pass uses with `r_next4[1]`.
+///
+/// Returns `(round6_msg_1, round6_msg_inf, la7)` where `la7` evaluates via
+/// [`eval_round3_lookahead`] (the deferred-quadratic shape is round-agnostic)
+/// at the later-sampled ρ₅ to the round-seven message, with no memory pass.
+///
+/// Requires `r_next6[1] ≠ 0`; the caller falls back to the cascade2 route
+/// otherwise (at the ranked shape this slot is the protocol constant β₂ ≠ 0;
+/// for a sampled slot it is probability 2⁻¹²⁸).
+/// AVX-512 chunk for the cascade rounds-7 lookahead pass: the eight fold4s
+/// per group run as two `fold4_nested`-style ZMM calls (four outputs per
+/// call, mids kept in registers) and the message products batch through
+/// two four-lane GHASH accumulators. Unreduced-XOR regrouping is linear, so
+/// the outputs are bit-identical to the scalar chunk.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+fn fold2_round67_chunk_x86_avx512(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho3: F128,
+    rho4: F128,
+    eq_lo: &[F128],
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::*;
+
+    /// Four nested pair-folds (16 source F128 -> 4 outputs) with the r0 mids
+    /// kept in ZMM — the exact `t0 + r1*(t0+t1)` over `v + r0*(v+v')` chain.
+    #[inline(always)]
+    unsafe fn fold4_x4(
+        src: *const F128,
+        r0: __m512i,
+        r1: __m512i,
+        idx_even: __m512i,
+        idx_odd: __m512i,
+    ) -> __m512i {
+        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        unsafe {
+            let v0 = _mm512_loadu_si512(src.cast::<__m512i>());
+            let v1 = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
+            let v2 = _mm512_loadu_si512(src.add(8).cast::<__m512i>());
+            let v3 = _mm512_loadu_si512(src.add(12).cast::<__m512i>());
+            let e01 = _mm512_permutex2var_epi64(v0, idx_even, v1);
+            let o01 = _mm512_permutex2var_epi64(v0, idx_odd, v1);
+            let mid01 = _mm512_xor_si512(e01, ghash_mul_x4(r0, _mm512_xor_si512(e01, o01)));
+            let e23 = _mm512_permutex2var_epi64(v2, idx_even, v3);
+            let o23 = _mm512_permutex2var_epi64(v2, idx_odd, v3);
+            let mid23 = _mm512_xor_si512(e23, ghash_mul_x4(r0, _mm512_xor_si512(e23, o23)));
+            let low = _mm512_permutex2var_epi64(mid01, idx_even, mid23);
+            let high = _mm512_permutex2var_epi64(mid01, idx_odd, mid23);
+            _mm512_xor_si512(low, ghash_mul_x4(r1, _mm512_xor_si512(low, high)))
+        }
+    }
+
+    // SAFETY: features cfg-guaranteed; chunk geometry supplies sixteen
+    // inputs per four outputs (bounds asserted by the caller's chunking).
+    unsafe {
+        let r0 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho3.hi as i64, rho3.lo as i64));
+        let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho4.hi as i64, rho4.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let mut acc1 = WideGhashX4::zero(); // (p1_even, pinf_even, p1_odd, pinf_odd)
+        let mut acc2 = WideGhashX4::zero(); // (w0, w1, w2, w3)
+        for t in 0..eq_lo.len() / 2 {
+            let i = 16 * t;
+            let o = 4 * t;
+            let av = fold4_x4(a_in.as_ptr().add(i), r0, r1, idx_even, idx_odd);
+            let bv = fold4_x4(b_in.as_ptr().add(i), r0, r1, idx_even, idx_odd);
+            _mm512_storeu_si512(a_out.as_mut_ptr().add(o).cast::<__m512i>(), av);
+            _mm512_storeu_si512(b_out.as_mut_ptr().add(o).cast::<__m512i>(), bv);
+            let mut aa = [F128::ZERO; 4];
+            let mut bb = [F128::ZERO; 4];
+            _mm512_storeu_si512(aa.as_mut_ptr().cast::<__m512i>(), av);
+            _mm512_storeu_si512(bb.as_mut_ptr().cast::<__m512i>(), bv);
+            let [a0, a1, a2, a3] = aa;
+            let [b0, b1, b2, b3] = bb;
+            let wt = eq_lo[2 * t + 1];
+            let aw_v = ghash_mul_x4(f128x4_set(a0, a1, a2, a3), f128x4_set(wt, wt, wt, wt));
+            let mut aw = [F128::ZERO; 4];
+            _mm512_storeu_si512(aw.as_mut_ptr().cast::<__m512i>(), aw_v);
+            let [a0w, a1w, a2w, a3w] = aw;
+            acc1.mul_acc(
+                f128x4_set(a1w, a0w + a1w, a3w, a2w + a3w),
+                f128x4_set(b1, b0 + b1, b3, b2 + b3),
+            );
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc2.mul_acc(
+                f128x4_set(a2w, e_aw, o_aw, e_aw + o_aw),
+                f128x4_set(b2, e_b, o_b, e_b + o_b),
+            );
+        }
+        let l1 = acc1.fold_lanes();
+        let l2 = acc2.fold_lanes();
+        [
+            l1[0].reduce(),
+            l1[1].reduce(),
+            l1[2].reduce(),
+            l1[3].reduce(),
+            l2[0].reduce(),
+            l2[1].reduce(),
+            l2[2].reduce(),
+            l2[3].reduce(),
+        ]
+    }
+}
+
+pub(crate) fn fold2_plain_and_round67_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho3: F128,
+    rho4: F128,
+    r_next6: &[F128],
+) -> (F128, F128, Round3Lookahead) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let quarter = n / 4;
+    assert_eq!(a_out.len(), quarter);
+    assert_eq!(b_out.len(), quarter);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next6.len(), log_n - 2);
+    let r_par = r_next6[1];
+    assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next6[1]");
+
+    // Same clamp rationale as the plain composed pass — and the lookahead
+    // sweep consumes composed outputs four at a time (two round-6 pairs = one
+    // round-7 group), so the lo half must keep ≥ 1 variable.
+    let n_vars = r_next6.len() - 1;
+    let n_hi = SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1));
+    let eq = SplitEqGhash::with_n_hi(&r_next6[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
+    assert_eq!(lo_size * hi_size * 2, quarter);
+    // `eq₆(2y'') = (1+r'')·eq₇(y'')` and `eq₆(2y''+1) = r''·eq₇(y'')`: the
+    // sweep uses the odd lane as the group's single weight; the two constants
+    // below put every aggregate back on its own scale, once, off the hot path.
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+
+    let chunk_in = 8 * lo_size; // four inputs per composed output
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    // Same NT policy as the plain composed pass: decided once from the
+    // round's output size (identical stores either way).
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 19)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_fold4_pair = zc_cascade_fold4_pair_enabled()
+        && (nt_stores
+            || (ranked_normal_fold4_pair_output(quarter)
+                && zc_cascade_fold4_pair_normal_enabled()));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_fold4_pair {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
+
+    let chunk_partial =
+        |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> [F128; 8] {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_fold4_pair {
+                    if nt_stores {
+                        fold2_and_message_lookahead_nt_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    } else {
+                        fold2_and_message_lookahead_normal_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    }
+                } else {
+                    fold2_and_message_lookahead_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+            {
+                fold2_and_message_lookahead_aarch64(
+                    a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                )
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                fold2_round67_chunk_x86_avx512(a_in, b_in, a_out, b_out, rho3, rho4, eq_lo)
+            }
+            #[cfg(not(any(
+                target_arch = "aarch64",
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )
+            )))]
+            {
+                let mut acc = [F256Unreduced::ZERO; 8];
+                let fold4 = |v: &[F128], i: usize| {
+                    let t0 = v[i] + rho3 * (v[i] + v[i + 1]);
+                    let t1 = v[i + 2] + rho3 * (v[i + 2] + v[i + 3]);
+                    t0 + rho4 * (t0 + t1)
+                };
+                for t in 0..eq_lo.len() / 2 {
+                    let i = 16 * t;
+                    let o = 4 * t;
+                    let a0 = fold4(a_in, i);
+                    let a1 = fold4(a_in, i + 4);
+                    let a2 = fold4(a_in, i + 8);
+                    let a3 = fold4(a_in, i + 12);
+                    let b0 = fold4(b_in, i);
+                    let b1 = fold4(b_in, i + 4);
+                    let b2 = fold4(b_in, i + 8);
+                    let b3 = fold4(b_in, i + 12);
+                    a_out[o] = a0;
+                    a_out[o + 1] = a1;
+                    a_out[o + 2] = a2;
+                    a_out[o + 3] = a3;
+                    b_out[o] = b0;
+                    b_out[o + 1] = b1;
+                    b_out[o + 2] = b2;
+                    b_out[o + 3] = b3;
+                    // One weight per round-7 group: the odd lane.
+                    let wt = eq_lo[2 * t + 1];
+                    let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+                    acc[0] ^= a1w.mul_unreduced(b1);
+                    acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+                    acc[2] ^= a3w.mul_unreduced(b3);
+                    acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+                    acc[4] ^= a2w.mul_unreduced(b2);
+                    let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+                    let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+                    acc[5] ^= e_aw.mul_unreduced(e_b);
+                    acc[6] ^= o_aw.mul_unreduced(o_b);
+                    acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+                }
+                [
+                    acc[0].reduce(),
+                    acc[1].reduce(),
+                    acc[2].reduce(),
+                    acc[3].reduce(),
+                    acc[4].reduce(),
+                    acc[5].reduce(),
+                    acc[6].reduce(),
+                    acc[7].reduce(),
+                ]
+            }
+        };
+
+    // Same scheduling policy as the plain composed pass.
+    #[cfg(target_arch = "aarch64")]
+    let hetero = quarter >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    // Per-chunk `[p1_even, pinf_even, p1_odd, pinf_odd, W0'', W3'', W4'',
+    // W5'']`, eq_hi-weighted after the κ recombination below.
+    let partials: Vec<[F128; 8]> = if hetero {
+        let mut partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_out, b_out) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let outv = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_out,
+                b_out,
+            );
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
+    } else {
+        use rayon::prelude::*;
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| {
+                chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_out,
+                    b_out,
+                )
+            })
+            .collect()
+    };
+
+    let mut sum1 = F128::ZERO;
+    let mut sum_inf = F128::ZERO;
+    let mut agg = [F128::ZERO; 6];
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        // `outv[0..2]` carry the even round-6 pairs on the odd lane's weight;
+        // κ restores `eq₆(2y'')` exactly (field arithmetic, no rounding).
+        sum1 += eq_h * (kappa * outv[0] + outv[2]);
+        sum_inf += eq_h * (kappa * outv[1] + outv[3]);
+        for (aslot, &v) in agg.iter_mut().zip(outv[2..].iter()) {
+            *aslot += eq_h * v;
+        }
+    }
+    // Every aggregate was accumulated on the odd lane's weight `r''·eq₇`, so
+    // a single `r''⁻¹` puts all six back on `eq₇`.
+    let r_inv = r_par.inv();
+    let w1 = r_inv * agg[0];
+    let w2 = r_inv * agg[1];
+    let w0 = r_inv * agg[2];
+    let w3 = r_inv * agg[3];
+    let w4 = r_inv * agg[4];
+    let w5 = r_inv * agg[5];
+    let la7 = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (r_next6[0] * sum1, sum_inf, la7)
 }
 
 /// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
@@ -485,12 +4009,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-    // q-form message gate: the scalar leaf extracts every folded value to
-    // GPRs for the message muls; the q leaf keeps them in NEON registers
-    // (bit-identical output). `FLOCK_NO_R2_QMSG` is a local-diagnostics kill
-    // switch for one-process A/B runs; the ranked worker never sets it.
-    #[cfg(target_arch = "aarch64")]
-    let r2_qmsg = std::env::var_os("FLOCK_NO_R2_QMSG").is_none();
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -499,24 +4017,20 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
         .map(|(x_hi, (a_chunk, b_chunk))| {
-            #[cfg(not(target_arch = "aarch64"))]
             let mut p1_acc = F256Unreduced::ZERO;
-            #[cfg(not(target_arch = "aarch64"))]
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) = unsafe {
+            unsafe {
+                let table_ptr = table.data.as_ptr() as *const u8;
+                let a_pkt_ptr = a_packed.as_ptr();
+                let b_pkt_ptr = b_packed.as_ptr();
                 let base = x_hi * chunk_size;
-                let kernel = if r2_qmsg {
-                    round2_chunk_raw_neon_q
-                } else {
-                    round2_chunk_raw_neon
-                };
-                kernel(
-                    table.data.as_ptr() as *const u8,
-                    a_packed.as_ptr().add(base * 8),
-                    b_packed.as_ptr().add(base * 8),
+                let (p1, pinf) = fold_round2_chunk_neon_unchecked_8(
+                    table_ptr,
+                    a_pkt_ptr.add(base * 8),
+                    b_pkt_ptr.add(base * 8),
                     a_chunk.as_mut_ptr(),
                     b_chunk.as_mut_ptr(),
                     eq_lo.as_ptr(),
@@ -524,8 +4038,20 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     pair_idx_base,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
-                )
-            };
+                );
+                p1_acc ^= F256Unreduced {
+                    r0: p1.lo,
+                    r1: p1.hi,
+                    r2: 0,
+                    r3: 0,
+                };
+                pinf_acc ^= F256Unreduced {
+                    r0: pinf.lo,
+                    r1: pinf.hi,
+                    r2: 0,
+                    r3: 0,
+                };
+            }
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -662,8 +4188,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 }
             }
 
-            #[cfg(not(target_arch = "aarch64"))]
-            let (p1, pinf) = (p1_acc.reduce(), pinf_acc.reduce());
+            let p1 = p1_acc.reduce();
+            let pinf = pinf_acc.reduce();
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
         })
@@ -673,644 +4199,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
         );
 
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
-}
-
-// ---------------------------------------------------------------------------
-// Two-challenge lookahead: round-3 message deferred as a quadratic in ρ₁, so
-// rounds 3+4 collapse into one composed double-fold pass (deletes the first
-// tail iteration — the largest DRAM pass of the ladder). Pure reassociation
-// of exact F128 arithmetic; every wire byte is identical to the incumbent.
-// ---------------------------------------------------------------------------
-
-/// Deferred round-three message: `G₃(1)` coefficients in `c[0..3]`, `G₃(∞)`
-/// in `c[3..6]`, each in the basis `{1, ρ, ρ²}`.
-///
-/// Mirrors the six-coefficient shape of `pcs::ligerito::eval_lookahead`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Round3Lookahead {
-    pub c: [F128; 6],
-}
-
-/// Evaluate the deferred round-three message at the sampled ρ₁.
-///
-/// The tail's `r_next[0] = ONE` in Convention A, so there is no prefactor:
-/// the two returned values are exactly what the incumbent
-/// [`fold_and_compute_round_pair_into`] would have sent for round three.
-#[inline]
-pub fn eval_round3_lookahead(la: &Round3Lookahead, rho1: F128) -> (F128, F128) {
-    let rho_sq = rho1 * rho1;
-    (
-        la.c[0] + la.c[1] * rho1 + la.c[2] * rho_sq,
-        la.c[3] + la.c[4] * rho1 + la.c[5] * rho_sq,
-    )
-}
-
-/// eq split for the lookahead round-two sweep and the composed passes.
-/// Identical to [`SplitEqGhash::new`] at the ranked shape (`n_vars ≥ 8`);
-/// clamped so the lo half always keeps at least one variable, because the
-/// sweep consumes pairs two at a time (one round-three group) inside a
-/// chunk. Any admissible split is value-identical (exact tensor
-/// factorization of eq).
-#[inline]
-fn lookahead_n_hi(n_vars: usize) -> usize {
-    SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1))
-}
-
-/// Round-two fused fold **plus** the deferred round-three coefficients.
-///
-/// The folded tables and the round-two wire message are bit-identical to
-/// [`uni_skip_fold_and_round_pair_optimized_packed_padded`]; the sweep merely
-/// also accumulates six aggregates over round-three groups `y = x'/2` (raw
-/// post-URM rows `a0..a3 = A[4y..4y+4]`, likewise `b`):
-///
-/// ```text
-/// W0 = Σ_y eq₃(y)·a2b2   W1 = Σ eq₃·a3b3        W2 = Σ eq₃·(a2+a3)(b2+b3)
-/// W3 = Σ_y eq₃(y)·e_a e_b   W4 = Σ eq₃·o_a o_b   W5 = Σ eq₃·(e+o)_a (e+o)_b
-/// e = a0+a2,  o = a1+a3
-/// ```
-///
-/// With the fold convention `A'[x'] = A[2x'] + ρ₁(A[2x']+A[2x'+1])`, both
-/// round-three message points expand over `{1, ρ₁, ρ₁²}`:
-///
-/// ```text
-/// G₃(1) = W0 + ρ₁(W0+W1+W2) + ρ₁²W2      G₃(∞) = W3 + ρ₁(W3+W4+W5) + ρ₁²W5
-/// ```
-///
-/// `W1` and `W2` cost **zero extra multiplies**: they are the odd-parity half
-/// of the two round-two accumulators, because `eq₂(2y+1) = r₁·eq₃(y)` and
-/// `eq₂(2y) = (1+r₁)·eq₃(y)` where `r₁ = mlv_challenges[1]`. The kernel uses
-/// the odd lane's weight `w = eq₂_lo[2u+1]` for the whole group (four
-/// reduced pre-scalings of the `a` rows, then every product is one unreduced
-/// multiply); the driver restores the even lane with `κ = (1+r₁)·r₁⁻¹` and
-/// puts all six aggregates back on `eq₃` with one `r₁⁻¹` — exact field
-/// arithmetic, so the round-two message is bit-identical to the incumbent.
-///
-/// Requires `r₁ ≠ 0`; the caller falls back to the incumbent route otherwise.
-///
-/// Returns `(a_folded, b_folded, mlv_challenges[0]·G₂(1), G₂(∞), lookahead)`.
-pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    mlv_challenges: &[F128],
-    padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, F128, F128, Round3Lookahead) {
-    use rayon::prelude::*;
-    assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
-    assert_eq!(table.n_chunks, 8);
-    let n_chunks = table.n_chunks;
-    let n_out = 1usize << (m - k_skip);
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
-    assert_eq!(mlv_challenges.len(), m - k_skip);
-    let r1 = mlv_challenges[1];
-    assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
-
-    // Uninit alloc — every slot is written below (see the incumbent).
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-
-    let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert_eq!(lo_size * hi_size * 2, n_out);
-    assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
-    // `eq₂(2y) = (1+r₁)·eq₃(y)` and `eq₂(2y+1) = r₁·eq₃(y)`: the sweep uses
-    // the odd lane as the group's single weight and the two constants below
-    // put every aggregate back on its own scale, once, off the hot path.
-    let kappa = (F128::ONE + r1) * r1.inv();
-    let r1_inv = r1.inv();
-    let chunk_size = 2 * lo_size;
-    let eq_hi = &eq.hi;
-    let eq_lo = &eq.lo;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-
-    // Per-chunk: (round-2 partial pair, six lookahead partials), both already
-    // scaled by eq_hi[x_hi]. Reduced by F128 XOR (commutative, associative).
-    let (sum1, sum_inf, agg) = a_folded
-        .par_chunks_mut(chunk_size)
-        .zip(b_folded.par_chunks_mut(chunk_size))
-        .enumerate()
-        .map(|(x_hi, (a_chunk, b_chunk))| {
-            let row_base = x_hi * chunk_size;
-            let pair_idx_base = x_hi * lo_size;
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the packed inputs expose 8 readable bytes per post-URM
-            // row of this chunk, the table has the protocol-fixed 8 × 256
-            // shape, and the cfg gate supplies every intrinsic feature.
-            let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    a_chunk,
-                    b_chunk,
-                    eq_lo,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out = round2_lookahead_chunk_scalar::<true>(
-                a_packed,
-                b_packed,
-                table,
-                a_chunk,
-                b_chunk,
-                eq_lo,
-                row_base,
-                pair_idx_base,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
-
-            let eq_h = eq_hi[x_hi];
-            // `out[0..2]` carry the even lane on the odd lane's weight; κ
-            // restores `eq₂(2y)` exactly (field arithmetic, no rounding).
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
-            (
-                eq_h * p1,
-                eq_h * pinf,
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
-
-    let la = lookahead_from_odd_weighted(&agg, r1_inv);
-    (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf, la)
-}
-
-/// Assemble the deferred quadratic from the six aggregates
-/// `[r·W1, r·W2, r·W0, r·W3, r·W4, r·W5]` (the order the chunk kernels report
-/// them in), all accumulated on the odd lane's weight `r·eq_next`; one `r⁻¹`
-/// puts them back on `eq_next`.
-#[inline]
-fn lookahead_from_odd_weighted(agg: &[F128; 6], r_inv: F128) -> Round3Lookahead {
-    let w1 = r_inv * agg[0];
-    let w2 = r_inv * agg[1];
-    let w0 = r_inv * agg[2];
-    let w3 = r_inv * agg[3];
-    let w4 = r_inv * agg[4];
-    let w5 = r_inv * agg[5];
-    Round3Lookahead {
-        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
-    }
-}
-
-/// No-materialize round-two sweep: the round-two message and the deferred
-/// round-three coefficients, computed exactly as
-/// [`uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead`] does,
-/// but **without writing the two folded tables** (2 GiB of stores at the
-/// ranked shape). The composed rounds-3+4 pass re-derives the folded rows it
-/// needs straight from the packed witness
-/// ([`fold2_from_packed_and_round_pair_lookahead_into`]).
-///
-/// Returns `(mlv_challenges[0]·G₂(1), G₂(∞), lookahead)`.
-pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    mlv_challenges: &[F128],
-    padding: &PaddingSpec,
-) -> (F128, F128, Round3Lookahead) {
-    use rayon::prelude::*;
-    assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
-    assert_eq!(table.n_chunks, 8);
-    let n_chunks = table.n_chunks;
-    let n_out = 1usize << (m - k_skip);
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
-    assert_eq!(mlv_challenges.len(), m - k_skip);
-    let r1 = mlv_challenges[1];
-    assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
-
-    let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert_eq!(lo_size * hi_size * 2, n_out);
-    assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
-    let kappa = (F128::ONE + r1) * r1.inv();
-    let r1_inv = r1.inv();
-    let chunk_size = 2 * lo_size;
-    let eq_hi = &eq.hi;
-    let eq_lo = &eq.lo;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-
-    let (sum1, sum_inf, agg) = (0..hi_size)
-        .into_par_iter()
-        .map(|x_hi| {
-            let row_base = x_hi * chunk_size;
-            let pair_idx_base = x_hi * lo_size;
-            let mut none_a: [F128; 0] = [];
-            let mut none_b: [F128; 0] = [];
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the packed inputs expose 8 readable bytes per post-URM
-            // row of this chunk, the table has the protocol-fixed 8 × 256
-            // shape, WRITE=false touches no chunk, and the cfg gate supplies
-            // every intrinsic feature.
-            let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut none_a,
-                    &mut none_b,
-                    eq_lo,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out = round2_lookahead_chunk_scalar::<false>(
-                a_packed,
-                b_packed,
-                table,
-                &mut none_a,
-                &mut none_b,
-                eq_lo,
-                row_base,
-                pair_idx_base,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
-
-            let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
-            (
-                eq_h * p1,
-                eq_h * pinf,
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
-
-    let la = lookahead_from_odd_weighted(&agg, r1_inv);
-    (mlv_challenges[0] * sum1, sum_inf, la)
-}
-
-/// Composed rounds-3+4 pass **from the packed witness**: re-derives the
-/// round-two folded rows through the same byte-table gathers the sweep uses
-/// (`fold_z` is linear over the packed bytes, so the same bytes give the same
-/// `F128`s the materializing sweep would have stored, padded pairs included),
-/// then applies exactly the composed fold of
-/// [`fold2_plain_and_round_pair_lookahead_into`] and emits the round-four
-/// message plus the deferred round-five coefficients.
-///
-/// Reads 1 GiB of packed bytes instead of 2 GiB of dense `F128` at the ranked
-/// shape, and lets the sweep skip its 2 GiB store stream entirely.
-///
-/// `a_out`/`b_out` have length `2^(m-k_skip-2)`; `r_next4.len() = m − k_skip
-/// − 2`, `r_next4[1] ≠ 0` (parity weight of the round-five lookahead).
-#[allow(clippy::too_many_arguments)]
-pub fn fold2_from_packed_and_round_pair_lookahead_into(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    padding: &PaddingSpec,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-) -> (F128, F128, Round3Lookahead) {
-    use rayon::prelude::*;
-    assert_eq!(k_skip, 6);
-    assert_eq!(table.n_chunks, 8);
-    let n_chunks = table.n_chunks;
-    let n = 1usize << (m - k_skip);
-    assert!(n >= 16);
-    assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
-    let quarter = n / 4;
-    assert_eq!(a_out.len(), quarter);
-    assert_eq!(b_out.len(), quarter);
-    assert_eq!(r_next4.len(), m - k_skip - 2);
-    let r = r_next4[1];
-    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
-
-    let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], lookahead_n_hi(n_vars));
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
-    assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
-    let r_inv = r.inv();
-    let chunk_out = 2 * lo_size;
-    let eq_lo = &eq.lo;
-    let eq_hi = &eq.hi;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-
-    let (sum1, sum_inf, agg) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            // Output x of this chunk ← packed rows 4x..4x+4 (pairs 2x, 2x+1).
-            let out_base = x_hi * chunk_out;
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the packed inputs expose 8 readable bytes for every row
-            // 4·out_base .. 4·(out_base + chunk_out); the table has the
-            // protocol-fixed shape; the cfg gate supplies every feature.
-            let out = unsafe {
-                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
-                    a_out,
-                    b_out,
-                    rho1,
-                    rho2,
-                    eq_lo,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out = fold2_from_packed_lookahead_scalar(
-                a_packed,
-                b_packed,
-                table,
-                out_base,
-                a_out,
-                b_out,
-                rho1,
-                rho2,
-                eq_lo,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
-
-            let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
-            (
-                eq_h * p1,
-                eq_h * pinf,
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
-
-    let la = lookahead_from_odd_weighted(&agg, r_inv);
-    (r_next4[0] * sum1, sum_inf, la)
-}
-
-/// Portable leaf of [`fold2_from_packed_and_round_pair_lookahead_into`] for
-/// one worker chunk (`out_base` = first output index of the chunk). Returns
-/// the eight per-chunk sums on the odd lane's weight, each reduced. Also the
-/// oracle for the AVX-512 kernel.
-#[cfg_attr(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ),
-    allow(dead_code)
-)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_from_packed_lookahead_scalar(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    table: &UniSkipFoldTable,
-    out_base: usize,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho1: F128,
-    rho2: F128,
-    eq_lo: &[F128],
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) -> [F128; 8] {
-    let n_chunks = table.n_chunks;
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
-    debug_assert!(eq_lo.len().is_multiple_of(2));
-    // Composed output `x` (global) from packed rows 4x..4x+4.
-    let out_at = |x: usize| -> (F128, F128) {
-        let mut ta = [F128::ZERO; 2];
-        let mut tb = [F128::ZERO; 2];
-        for half in 0..2 {
-            let pair = 2 * x + half;
-            if (pair & pair_in_block_mask) >= useful_pairs_inclusive {
-                continue; // the sweep wrote zeros here: t = 0
-            }
-            let r0 = 2 * pair;
-            let r1 = r0 + 1;
-            let a0 = table.fold_one_row(&a_packed[r0 * n_chunks..(r0 + 1) * n_chunks]);
-            let a1 = table.fold_one_row(&a_packed[r1 * n_chunks..(r1 + 1) * n_chunks]);
-            let b0 = table.fold_one_row(&b_packed[r0 * n_chunks..(r0 + 1) * n_chunks]);
-            let b1 = table.fold_one_row(&b_packed[r1 * n_chunks..(r1 + 1) * n_chunks]);
-            ta[half] = a0 + rho1 * (a0 + a1);
-            tb[half] = b0 + rho1 * (b0 + b1);
-        }
-        (ta[0] + rho2 * (ta[0] + ta[1]), tb[0] + rho2 * (tb[0] + tb[1]))
-    };
-    let mut acc = [F256Unreduced::ZERO; 8];
-    for u in 0..eq_lo.len() / 2 {
-        let o = 4 * u;
-        let (a0, b0) = out_at(out_base + o);
-        let (a1, b1) = out_at(out_base + o + 1);
-        let (a2, b2) = out_at(out_base + o + 2);
-        let (a3, b3) = out_at(out_base + o + 3);
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        a_out[o + 2] = a2;
-        a_out[o + 3] = a3;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
-        b_out[o + 2] = b2;
-        b_out[o + 3] = b3;
-        let wt = eq_lo[2 * u + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
-    acc.map(|x| x.reduce())
-}
-
-/// Portable reference for one lookahead round-two chunk. Returns the eight
-/// per-chunk sums `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`
-/// (all on the odd lane's weight `r₁·eq₃`, see the driver), each reduced.
-///
-/// Also the oracle for the AVX-512 kernel.
-#[cfg_attr(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ),
-    allow(dead_code)
-)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn round2_lookahead_chunk_scalar<const WRITE: bool>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    table: &UniSkipFoldTable,
-    a_chunk: &mut [F128],
-    b_chunk: &mut [F128],
-    eq_lo: &[F128],
-    row_base: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) -> [F128; 8] {
-    let n_chunks = table.n_chunks;
-    let lo_size = eq_lo.len();
-    debug_assert!(!WRITE || a_chunk.len() == 2 * lo_size);
-    debug_assert!(!WRITE || b_chunk.len() == 2 * lo_size);
-    debug_assert!(lo_size.is_multiple_of(2));
-    let mut acc = [F256Unreduced::ZERO; 8];
-
-    let mut fold_pair = |x_lo: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| {
-        let x0l = 2 * x_lo;
-        let x1l = x0l + 1;
-        if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-            if WRITE {
-                a_chunk[x0l] = F128::ZERO;
-                a_chunk[x1l] = F128::ZERO;
-                b_chunk[x0l] = F128::ZERO;
-                b_chunk[x1l] = F128::ZERO;
-            }
-            return None;
-        }
-        let x0g = row_base + x0l;
-        let x1g = x0g + 1;
-        let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-        let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-        let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
-        let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
-        if WRITE {
-            a_chunk[x0l] = a0;
-            a_chunk[x1l] = a1;
-            b_chunk[x0l] = b0;
-            b_chunk[x1l] = b1;
-        }
-        Some((a0, a1, b0, b1))
-    };
-
-    for u in 0..lo_size / 2 {
-        let even = fold_pair(2 * u, a_chunk, b_chunk);
-        let odd = fold_pair(2 * u + 1, a_chunk, b_chunk);
-        if even.is_none() && odd.is_none() {
-            continue;
-        }
-        let z = (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO);
-        let (a0, a1, b0, b1) = even.unwrap_or(z);
-        let (a2, a3, b2, b3) = odd.unwrap_or(z);
-        // One weight per group: the odd lane's. See the driver's doc.
-        let wt = eq_lo[2 * u + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
-    acc.map(|x| x.reduce())
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,6 +4302,33 @@ pub fn fold_and_compute_round_pair_optimized(
 /// buffers, so the ~22 decreasing-size buffers are allocated/freed once rather
 /// than per round. The per-round `munmap` of the old buffer (64 MB at m=29)
 /// runs single-threaded and otherwise caps the tail's parallel speedup.
+/// Floor on per-chunk output size for the small tail rounds: keep each
+/// chunk's output at or above `2^TAIL_CHUNK_MIN_OUT_LOG` elements (8 KiB of
+/// F128) so the fixed 512-chunk fan-out never shrinks to sub-kilobyte chunks
+/// whose dispatch overhead exceeds their work — measured flat at log_n 16
+/// and inverted at log_n 15 under thread scaling. Regrouping across chunk
+/// boundaries is exact: the lo/hi split is an exact tensor factorisation and
+/// deferred reduction is F2-linear (see the n_hi 9-vs-11 regression test).
+const TAIL_CHUNK_MIN_OUT_LOG: usize = 9;
+
+/// Kill switch: `FLOCK_NO_ZC_TAIL_ADAPT=1` (exact '1') restores the fixed
+/// `MAX_N_HI` fan-out for these rounds.
+fn zc_tail_adapt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_TAIL_ADAPT").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Size-adaptive hi-split for the generic tail rounds: cap the chunk count
+/// so each chunk keeps at least `2^TAIL_CHUNK_MIN_OUT_LOG` outputs.
+fn tail_n_hi_for(half: usize) -> usize {
+    let log_half = half.trailing_zeros() as usize;
+    SplitEqGhash::MAX_N_HI
+        .min(log_half.saturating_sub(TAIL_CHUNK_MIN_OUT_LOG))
+        .max(1)
+}
+
 pub fn fold_and_compute_round_pair_into(
     a: &[F128],
     b: &[F128],
@@ -1421,6 +4336,34 @@ pub fn fold_and_compute_round_pair_into(
     b_out: &mut [F128],
     r_fold: F128,
     r_next: &[F128],
+) -> (F128, F128) {
+    let default_n_hi = if zc_tail_adapt_enabled() {
+        tail_n_hi_for(a.len() / 2)
+    } else {
+        SplitEqGhash::MAX_N_HI
+    };
+    #[cfg(target_arch = "aarch64")]
+    let n_hi = if a.len() / 2 >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
+        LARGE_TAIL_EQ_N_HI
+    } else {
+        default_n_hi
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let n_hi = default_n_hi;
+
+    fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
+}
+
+/// Split-explicit implementation used by the public policy wrapper and by the
+/// exact n_hi=9 versus n_hi=11 regression test.
+fn fold_and_compute_round_pair_into_with_n_hi(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    n_hi: usize,
 ) -> (F128, F128) {
     use rayon::prelude::*;
 
@@ -1433,10 +4376,23 @@ pub fn fold_and_compute_round_pair_into(
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 1);
 
-    let eq = SplitEqGhash::new(&r_next[1..]);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
+    // Rounds whose outputs are past LLC size write ping-pong buffers that are
+    // not read until the next round's barrier and cannot stay cache-resident;
+    // ordinary stores only add write-allocate (RFO) read traffic. Route those
+    // rounds through the kernel's `stnp` arm (the same best-effort hint the
+    // round-2 producer uses); LLC-resident later rounds keep normal stores so
+    // their outputs stay hot for the next round. 2^22 F128 = 64 MiB per array.
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        half >= (1usize << 19)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
     assert_eq!(lo_size * hi_size * 2, half);
 
@@ -1445,142 +4401,139 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    // Non-temporal tail path gate: only when the folded output per array is
-    // ≥ 32 MB (64 MB for the a/b pair) — beyond L2+SLC reach, so the next
-    // round's reads are DRAM-cold regardless and the regular stores'
-    // write-allocate is one pure hidden DRAM read per output line. Below the
-    // threshold the outputs may still be cache-resident when the next round
-    // reads them, and regular stores win (NT on cache-reachable data inverts).
-    // `FLOCK_NO_NT_TAIL` is a local-diagnostics kill switch for A/B runs;
-    // the ranked worker's cleared environment never sets it.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt_stores =
-        half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
-    // q-form (all-NEON) kernel gate. The scalar-struct leaf keeps F128 halves
-    // in GPRs and pays a fmov per PMULL operand; the q-form leaf keeps every
-    // value in NEON registers (bit-identical output). Unlike the v1 leaf it
-    // also covers the sub-NT mid rounds (regular stores). `FLOCK_NO_TAIL_QNEON`
-    // is a local-diagnostics kill switch for one-process A/B runs (reverts to
-    // v1 leaf + generic reload path); `FLOCK_TAIL_LDNP` opts the DRAM rounds
-    // into `ldnp` no-allocate input streaming. The ranked worker's cleared
-    // environment never sets either.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_qneon = std::env::var_os("FLOCK_NO_TAIL_QNEON").is_none();
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_ldnp = std::env::var_os("FLOCK_TAIL_LDNP").is_some();
-
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: chunk geometry supplies two inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let (p1, pinf) =
-                unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
-
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let (p1, pinf) = 'msg: {
-                // Large rounds: fused fold + register-sourced message with
-                // `stnp` output stores — no write-allocate, no reload. Value-
-                // and byte-identical to the generic path below (same vec2
-                // fold, same reduced message products, same unreduced
-                // accumulation schedule).
-                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                {
-                    // SAFETY: aes is cfg-guaranteed; the chunk geometry
-                    // supplies 4·lo_size inputs and 2·lo_size outputs per
-                    // worker and lo_size eq weights, all in-bounds slices.
-                    if use_qneon {
-                        break 'msg unsafe {
-                            match (use_nt_stores, use_ldnp) {
-                                (true, true) => kernels::aarch64::tail_fold_chunk_q::<true, true>(
-                                    a_in.as_ptr(),
-                                    b_in.as_ptr(),
-                                    a_out.as_mut_ptr(),
-                                    b_out.as_mut_ptr(),
-                                    eq_lo.as_ptr(),
-                                    lo_size,
-                                    r_fold,
-                                ),
-                                (true, false) => kernels::aarch64::tail_fold_chunk_q::<true, false>(
-                                    a_in.as_ptr(),
-                                    b_in.as_ptr(),
-                                    a_out.as_mut_ptr(),
-                                    b_out.as_mut_ptr(),
-                                    eq_lo.as_ptr(),
-                                    lo_size,
-                                    r_fold,
-                                ),
-                                (false, _) => kernels::aarch64::tail_fold_chunk_q::<false, false>(
-                                    a_in.as_ptr(),
-                                    b_in.as_ptr(),
-                                    a_out.as_mut_ptr(),
-                                    b_out.as_mut_ptr(),
-                                    eq_lo.as_ptr(),
-                                    lo_size,
-                                    r_fold,
-                                ),
-                            }
-                        };
-                    }
-                    if use_nt_stores {
-                        break 'msg unsafe {
-                            kernels::aarch64::tail_fold_chunk_nt_neon(
-                                a_in.as_ptr(),
-                                b_in.as_ptr(),
-                                a_out.as_mut_ptr(),
-                                b_out.as_mut_ptr(),
-                                eq_lo.as_ptr(),
-                                lo_size,
-                                r_fold,
-                            )
-                        };
-                    }
-                }
-                // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
-                // selects the architecture kernel; this loop only consumes
-                // the resulting values to build the message.
-                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
-                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
-
-                let mut p1_acc = F256Unreduced::ZERO;
-                let mut pinf_acc = F256Unreduced::ZERO;
-                // x86: 4-wide deferred-reduction accumulators for the unrolled loop;
-                // the 2-wide tail still uses the scalar `*_acc` above, folded in
-                // before the final reduce.
+    // Per-chunk fused fold+message: reads one disjoint 4·lo_size input chunk,
+    // writes the corresponding 2·lo_size output chunk, returns the chunk's
+    // unscaled message partials. Shared by the rayon sweep and the hetero
+    // E-core drain (H2).
+    let chunk_partial =
+        |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
+            {
                 #[cfg(all(
                     target_arch = "x86_64",
                     target_feature = "avx512f",
                     target_feature = "vpclmulqdq"
                 ))]
-                // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate.
-                let (mut p1_wide, mut pinf_wide) =
-                    unsafe { (WideGhashX4::zero(), WideGhashX4::zero()) };
+                // SAFETY: chunk geometry supplies two inputs per output and two
+                // outputs per eq_lo value; features are guaranteed by the cfg.
+                let (p1, pinf) =
+                    unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
-                // Unroll 4 x_lo's per iteration when lo_size % 4 == 0 (the common
-                // case for the fused path; falls back to 2-wide for lo_size==2 at
-                // the smallest fused round). 16 independent r_fold muls and 8
-                // independent msg muls in flight gives the M4 OoO engine and
-                // 2/cy PMULL throughput maximum ILP.
-                assert!(lo_size & 1 == 0, "lo_size must be even");
-                let mut x_lo = 0;
-                if lo_size.is_multiple_of(4) {
-                    while x_lo + 4 <= lo_size {
+                #[cfg(target_arch = "aarch64")]
+                let (p1, pinf) =
+                    fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo, nt_stores);
+
+                #[cfg(not(any(
+                    target_arch = "aarch64",
+                    all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )
+                )))]
+                let (p1, pinf) = {
+                    // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
+                    // selects the architecture kernel; this loop only consumes
+                    // the resulting values to build the message.
+                    crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
+                    crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+
+                    let mut p1_acc = F256Unreduced::ZERO;
+                    let mut pinf_acc = F256Unreduced::ZERO;
+                    // x86: 4-wide deferred-reduction accumulators for the unrolled loop;
+                    // the 2-wide tail still uses the scalar `*_acc` above, folded in
+                    // before the final reduce.
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate.
+                    let (mut p1_wide, mut pinf_wide) =
+                        unsafe { (WideGhashX4::zero(), WideGhashX4::zero()) };
+
+                    // Unroll 4 x_lo's per iteration when lo_size % 4 == 0 (the common
+                    // case for the fused path; falls back to 2-wide for lo_size==2 at
+                    // the smallest fused round). 16 independent r_fold muls and 8
+                    // independent msg muls in flight gives the M4 OoO engine and
+                    // 2/cy PMULL throughput maximum ILP.
+                    assert!(lo_size & 1 == 0, "lo_size must be even");
+                    let mut x_lo = 0;
+                    if lo_size.is_multiple_of(4) {
+                        while x_lo + 4 <= lo_size {
+                            let x_lo_a = x_lo;
+                            // Read the just-folded pairs: (a0,a1) = (a_out[2·x_lo], a_out[2·x_lo+1]).
+                            let o = 2 * x_lo;
+                            let a0_a = a_out[o];
+                            let a1_a = a_out[o + 1];
+                            let b0_a = b_out[o];
+                            let b1_a = b_out[o + 1];
+                            let a0_b = a_out[o + 2];
+                            let a1_b = a_out[o + 3];
+                            let b0_b = b_out[o + 2];
+                            let b1_b = b_out[o + 3];
+                            let a0_c = a_out[o + 4];
+                            let a1_c = a_out[o + 5];
+                            let b0_c = b_out[o + 4];
+                            let b1_c = b_out[o + 5];
+                            let a0_d = a_out[o + 6];
+                            let a1_d = a_out[o + 7];
+                            let b0_d = b_out[o + 6];
+                            let b1_d = b_out[o + 7];
+
+                            // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
+                            let g1_a = a1_a * b1_a;
+                            let g1_b = a1_b * b1_b;
+                            let g1_c = a1_c * b1_c;
+                            let g1_d = a1_d * b1_d;
+                            let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
+                            let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
+                            let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
+                            let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
+                            // Deferred-reduction accumulate: on x86 widen all 8 products
+                            // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
+                            // reduced once after the loop; else scalar mul_unreduced.
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate; the
+                            // four eq values eq_lo[x_lo_a..x_lo_a+4] are in bounds (the
+                            // 4-wide loop runs only while x_lo + 4 <= lo_size == eq_lo.len()).
+                            unsafe {
+                                let eq4 = f128x4_loadu(eq_lo[x_lo_a..].as_ptr());
+                                p1_wide.mul_acc(eq4, f128x4_set(g1_a, g1_b, g1_c, g1_d));
+                                pinf_wide
+                                    .mul_acc(eq4, f128x4_set(g_inf_a, g_inf_b, g_inf_c, g_inf_d));
+                            }
+                            #[cfg(not(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "vpclmulqdq"
+                            )))]
+                            {
+                                let eq_l_a = eq_lo[x_lo_a];
+                                let eq_l_b = eq_lo[x_lo_a + 1];
+                                let eq_l_c = eq_lo[x_lo_a + 2];
+                                let eq_l_d = eq_lo[x_lo_a + 3];
+                                p1_acc ^= eq_l_a.mul_unreduced(g1_a);
+                                p1_acc ^= eq_l_b.mul_unreduced(g1_b);
+                                p1_acc ^= eq_l_c.mul_unreduced(g1_c);
+                                p1_acc ^= eq_l_d.mul_unreduced(g1_d);
+                                pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
+                                pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
+                                pinf_acc ^= eq_l_c.mul_unreduced(g_inf_c);
+                                pinf_acc ^= eq_l_d.mul_unreduced(g_inf_d);
+                            }
+
+                            x_lo += 4;
+                        }
+                    }
+                    // 2-wide tail (handles lo_size == 2 case and any remainder when
+                    // 4-wide loop is skipped or doesn't cover everything).
+                    while x_lo + 2 <= lo_size {
                         let x_lo_a = x_lo;
-                        // Read the just-folded pairs: (a0,a1) = (a_out[2·x_lo], a_out[2·x_lo+1]).
+                        let x_lo_b = x_lo + 1;
                         let o = 2 * x_lo;
                         let a0_a = a_out[o];
                         let a1_a = a_out[o + 1];
@@ -1590,425 +4543,198 @@ pub fn fold_and_compute_round_pair_into(
                         let a1_b = a_out[o + 3];
                         let b0_b = b_out[o + 2];
                         let b1_b = b_out[o + 3];
-                        let a0_c = a_out[o + 4];
-                        let a1_c = a_out[o + 5];
-                        let b0_c = b_out[o + 4];
-                        let b1_c = b_out[o + 5];
-                        let a0_d = a_out[o + 6];
-                        let a1_d = a_out[o + 7];
-                        let b0_d = b_out[o + 6];
-                        let b1_d = b_out[o + 7];
 
-                        // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
+                        let eq_l_a = eq_lo[x_lo_a];
+                        let eq_l_b = eq_lo[x_lo_b];
                         let g1_a = a1_a * b1_a;
                         let g1_b = a1_b * b1_b;
-                        let g1_c = a1_c * b1_c;
-                        let g1_d = a1_d * b1_d;
                         let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
                         let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                        let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
-                        let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
-                        // Deferred-reduction accumulate: on x86 widen all 8 products
-                        // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
-                        // reduced once after the loop; else scalar mul_unreduced.
-                        #[cfg(all(
-                            target_arch = "x86_64",
-                            target_feature = "avx512f",
-                            target_feature = "vpclmulqdq"
-                        ))]
-                        // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate; the
-                        // four eq values eq_lo[x_lo_a..x_lo_a+4] are in bounds (the
-                        // 4-wide loop runs only while x_lo + 4 <= lo_size == eq_lo.len()).
-                        unsafe {
-                            let eq4 = f128x4_loadu(eq_lo[x_lo_a..].as_ptr());
-                            p1_wide.mul_acc(eq4, f128x4_set(g1_a, g1_b, g1_c, g1_d));
-                            pinf_wide.mul_acc(eq4, f128x4_set(g_inf_a, g_inf_b, g_inf_c, g_inf_d));
-                        }
-                        #[cfg(not(all(
-                            target_arch = "x86_64",
-                            target_feature = "avx512f",
-                            target_feature = "vpclmulqdq"
-                        )))]
-                        {
-                            let eq_l_a = eq_lo[x_lo_a];
-                            let eq_l_b = eq_lo[x_lo_a + 1];
-                            let eq_l_c = eq_lo[x_lo_a + 2];
-                            let eq_l_d = eq_lo[x_lo_a + 3];
-                            p1_acc ^= eq_l_a.mul_unreduced(g1_a);
-                            p1_acc ^= eq_l_b.mul_unreduced(g1_b);
-                            p1_acc ^= eq_l_c.mul_unreduced(g1_c);
-                            p1_acc ^= eq_l_d.mul_unreduced(g1_d);
-                            pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
-                            pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
-                            pinf_acc ^= eq_l_c.mul_unreduced(g_inf_c);
-                            pinf_acc ^= eq_l_d.mul_unreduced(g_inf_d);
-                        }
+                        p1_acc ^= eq_l_a.mul_unreduced(g1_a);
+                        p1_acc ^= eq_l_b.mul_unreduced(g1_b);
+                        pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
+                        pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
 
-                        x_lo += 4;
+                        x_lo += 2;
+                    }
+
+                    // Merge the 4-wide deferred accumulators with the scalar tail, then
+                    // reduce once (reduction is F2-linear, so this equals the scalar
+                    // Σ mul_unreduced then reduce).
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    // SAFETY: vpclmulqdq+avx512f+sse4.1 guaranteed by the cfg gate.
+                    unsafe {
+                        p1_acc ^= p1_wide.fold();
+                        pinf_acc ^= pinf_wide.fold();
+                    }
+                    let p1 = p1_acc.reduce();
+                    let pinf = pinf_acc.reduce();
+                    (p1, pinf)
+                };
+                (p1, pinf)
+            }
+        };
+
+    // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
+    // E-core queue — the same contract as the T3 compact reconstruction.
+    #[cfg(target_arch = "aarch64")]
+    let hetero = half >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    let (sum1, sum_inf) = if hetero {
+        // GPU loop-round products arm (see `ENV_NO_GPU_ZC_LOOP`): a
+        // measured prefix of the hi-chunks gets its message products
+        // computed on the GPU (which folds its chunks' pairs redundantly
+        // via ρ-nibble tables) while the CPU writes those chunks' folded
+        // outputs through the exact field-layer `fold_pairs` kernel,
+        // skipping just the products. Only engaged on the LARGEST loop
+        // round (half ≥ 2^24): the share is calibrated at that round's
+        // chunk size, and a measured local A/B showed the same share
+        // makes the GPU the straggler on the next (half-size) round
+        // (12.6 → 33.7 ms) — per-size recalibration is not worth a
+        // second sync for an LLC-adjacent round. `None` = the exact
+        // incumbent path.
+        // PARKED alongside the T3 arm for the v10a bisect: the v9 archive
+        // carrying only this arm also died scoreless, so BOTH new arms sit
+        // behind compile-time consts while the shared-scratch cache fix
+        // ships alone. Re-enable by flipping the const once the freed job
+        // wall is confirmed on the runner.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        const ZC_LOOP_INTEGRATION_PARKED: bool = true;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_job = if !ZC_LOOP_INTEGRATION_PARKED && half >= (1usize << 24) {
+            crate::gpu_commit::launch_zc_loop_products(a, b, r_fold, eq_lo, eq_hi, lo_size, hi_size)
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let t_cpu_sweep = std::time::Instant::now();
+
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_out, b_out) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+
+            // GPU-covered prefix chunk: write the identical folded
+            // outputs via the field-layer fold, skip the products (the
+            // GPU partial replaces this chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+                let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
+                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+                return;
+            }
+
+            let (p1, pinf) = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_out,
+                b_out,
+            );
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+
+        // Drain the GPU products arm: merge prefix partials (timed
+        // proves), finish calibration (untimed warmup), or CPU-redo the
+        // skipped prefix products on any post-admission Metal failure.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = gpu_job {
+            let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+            let calib = job.is_calibration();
+            let prefix = job.cpu_split();
+            let res = crate::gpu_commit::zc_loop_wait(
+                job,
+                if calib {
+                    Some(partials.as_slice())
+                } else {
+                    None
+                },
+                cpu_wall_ms,
+                hi_size,
+            );
+            match res {
+                crate::gpu_commit::ZcLoopResult::Calibrated => {}
+                crate::gpu_commit::ZcLoopResult::Prefix(vals) => {
+                    partials[..prefix].copy_from_slice(&vals);
+                }
+                crate::gpu_commit::ZcLoopResult::Failed => {
+                    // Redo exactly the skipped prefix products — slower,
+                    // still exact. The fused chunk rewrites the same
+                    // folded values (byte-identical stores).
+                    for x_hi in 0..prefix {
+                        let (a_out, b_out) = unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(
+                                    a_base.ptr().add(x_hi * chunk_out),
+                                    chunk_out,
+                                ),
+                                std::slice::from_raw_parts_mut(
+                                    b_base.ptr().add(x_hi * chunk_out),
+                                    chunk_out,
+                                ),
+                            )
+                        };
+                        let (p1, pinf) = chunk_partial(
+                            &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                            &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                            a_out,
+                            b_out,
+                        );
+                        let eq_h = eq_hi[x_hi];
+                        partials[x_hi] = (eq_h * p1, eq_h * pinf);
                     }
                 }
-                // 2-wide tail (handles lo_size == 2 case and any remainder when
-                // 4-wide loop is skipped or doesn't cover everything).
-                while x_lo + 2 <= lo_size {
-                    let x_lo_a = x_lo;
-                    let x_lo_b = x_lo + 1;
-                    let o = 2 * x_lo;
-                    let a0_a = a_out[o];
-                    let a1_a = a_out[o + 1];
-                    let b0_a = b_out[o];
-                    let b1_a = b_out[o + 1];
-                    let a0_b = a_out[o + 2];
-                    let a1_b = a_out[o + 3];
-                    let b0_b = b_out[o + 2];
-                    let b1_b = b_out[o + 3];
+            }
+        }
 
-                    let eq_l_a = eq_lo[x_lo_a];
-                    let eq_l_b = eq_lo[x_lo_b];
-                    let g1_a = a1_a * b1_a;
-                    let g1_b = a1_b * b1_b;
-                    let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                    let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                    p1_acc ^= eq_l_a.mul_unreduced(g1_a);
-                    p1_acc ^= eq_l_b.mul_unreduced(g1_b);
-                    pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
-                    pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
-
-                    x_lo += 2;
-                }
-
-                // Merge the 4-wide deferred accumulators with the scalar tail, then
-                // reduce once (reduction is F2-linear, so this equals the scalar
-                // Σ mul_unreduced then reduce).
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                ))]
-                // SAFETY: vpclmulqdq+avx512f+sse4.1 guaranteed by the cfg gate.
-                unsafe {
-                    p1_acc ^= p1_wide.fold();
-                    pinf_acc ^= pinf_wide.fold();
-                }
-                let p1 = p1_acc.reduce();
-                let pinf = pinf_acc.reduce();
-                (p1, pinf)
-            };
-            let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            })
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| {
+                let (p1, pinf) = chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_out,
+                    b_out,
+                );
+                let eq_h = eq_hi[x_hi];
+                (eq_h * p1, eq_h * pinf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    };
 
     (r_next[0] * sum1, sum_inf)
-}
-
-/// Bind ρ₁ **and** ρ₂ in one pass over the round-two tables and emit the
-/// round-four message — replacing tail iterations `i = 0` and `i = 1`.
-///
-/// `a`/`b` have length `n = 2^k`; `a_out`/`b_out` have length `n/4`. Per
-/// composed output `x`, the four inputs `v[4x..4x+4]` fold exactly as two
-/// sequential pair folds would:
-///
-/// ```text
-/// t0 = v[4x]   + ρ₁(v[4x]   + v[4x+1])
-/// t1 = v[4x+2] + ρ₁(v[4x+2] + v[4x+3])
-/// out[x] = t0 + ρ₂(t0 + t1)
-/// ```
-///
-/// so the tables are bit-identical to `fold(ρ₁)` then `fold(ρ₂)`, and the
-/// message `(r_next4[0]·G₄(1), G₄(∞))` over `r_next4[1..]` is the same sum
-/// the incumbent's second tail iteration computes. Multiply count is the same
-/// as two sequential folds; the win is one deleted 1.5×-size DRAM pass.
-///
-/// Requires `n ≥ 16` and `r_next4.len() = log₂(n) − 2`.
-pub fn fold2_plain_and_round4_into(
-    a: &[F128],
-    b: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-) -> (F128, F128) {
-    use rayon::prelude::*;
-    let n = a.len();
-    assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 16);
-    let quarter = n / 4;
-    assert_eq!(a_out.len(), quarter);
-    assert_eq!(b_out.len(), quarter);
-    let log_n = n.trailing_zeros() as usize;
-    assert_eq!(r_next4.len(), log_n - 2);
-
-    let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], lookahead_n_hi(n_vars));
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
-    assert_eq!(lo_size * hi_size * 2, quarter);
-
-    let chunk_in = 8 * lo_size; // four inputs per composed output
-    let chunk_out = 2 * lo_size;
-    let eq_lo = &eq.lo;
-    let eq_hi = &eq.hi;
-
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: chunk geometry supplies four inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let (p1, pinf) = unsafe {
-                kernels::x86_64::fold2_and_message_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho1, rho2, eq_lo,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let (p1, pinf) =
-                fold2_and_message_scalar(a_in, b_in, a_out, b_out, rho1, rho2, eq_lo);
-
-            let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
-
-    (r_next4[0] * sum1, sum_inf)
-}
-
-/// Composed double fold (ρ_a then ρ_b) **plus** the round message **plus**
-/// the deferred quadratic for the round after it — the cascade step.
-///
-/// Tables and message are bit-identical to [`fold2_plain_and_round4_into`];
-/// additionally the six aggregates over next-round groups `y` (composed
-/// outputs `out[4y..4y+4]`) are accumulated with the same parity trick as the
-/// round-two sweep, against `r = r_next[1]` (the eq weight of the variable
-/// the emitted message binds): `eq_R(2y+1) = r·eq_{R+1}(y)`. Requires
-/// `r ≠ 0`; the caller falls back to the plain composed pass otherwise.
-///
-/// Returns `(r_next[0]·G_R(1), G_R(∞), lookahead for round R+1)`.
-pub fn fold2_plain_and_round_pair_lookahead_into(
-    a: &[F128],
-    b: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    r_next: &[F128],
-) -> (F128, F128, Round3Lookahead) {
-    use rayon::prelude::*;
-    let n = a.len();
-    assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 16);
-    let quarter = n / 4;
-    assert_eq!(a_out.len(), quarter);
-    assert_eq!(b_out.len(), quarter);
-    let log_n = n.trailing_zeros() as usize;
-    assert_eq!(r_next.len(), log_n - 2);
-    let r = r_next[1];
-    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
-
-    let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], lookahead_n_hi(n_vars));
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
-    assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
-    let r_inv = r.inv();
-
-    let chunk_in = 8 * lo_size;
-    let chunk_out = 2 * lo_size;
-    let eq_lo = &eq.lo;
-    let eq_hi = &eq.hi;
-
-    let (sum1, sum_inf, agg) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: chunk geometry supplies four inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let out = unsafe {
-                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out =
-                fold2_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo);
-
-            let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
-            (
-                eq_h * p1,
-                eq_h * pinf,
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
-
-    let la = lookahead_from_odd_weighted(&agg, r_inv);
-    (r_next[0] * sum1, sum_inf, la)
-}
-
-/// Portable leaf of [`fold2_plain_and_round_pair_lookahead_into`] for one
-/// worker chunk. Returns the eight per-chunk sums
-/// `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']` on the odd
-/// lane's weight, each reduced. Also the oracle for the AVX-512 kernel.
-#[cfg_attr(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ),
-    allow(dead_code)
-)]
-pub(crate) fn fold2_and_message_lookahead_scalar(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    eq_lo: &[F128],
-) -> [F128; 8] {
-    debug_assert_eq!(a_in.len(), 4 * a_out.len());
-    debug_assert_eq!(b_in.len(), 4 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-    debug_assert!(eq_lo.len().is_multiple_of(2));
-    let fold4 = |v: &[F128], i: usize| {
-        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
-        t0 + rho_b * (t0 + t1)
-    };
-    let mut acc = [F256Unreduced::ZERO; 8];
-    for u in 0..eq_lo.len() / 2 {
-        // Group u: pairs 2u (even) and 2u+1 (odd) = outputs 4u..4u+4.
-        let o = 4 * u;
-        let i = 16 * u;
-        let a0 = fold4(a_in, i);
-        let a1 = fold4(a_in, i + 4);
-        let a2 = fold4(a_in, i + 8);
-        let a3 = fold4(a_in, i + 12);
-        let b0 = fold4(b_in, i);
-        let b1 = fold4(b_in, i + 4);
-        let b2 = fold4(b_in, i + 8);
-        let b3 = fold4(b_in, i + 12);
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        a_out[o + 2] = a2;
-        a_out[o + 3] = a3;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
-        b_out[o + 2] = b2;
-        b_out[o + 3] = b3;
-        let wt = eq_lo[2 * u + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
-    acc.map(|x| x.reduce())
-}
-
-/// Portable leaf of [`fold2_plain_and_round4_into`] for one worker chunk.
-/// Also the oracle for the AVX-512 kernel.
-#[cfg_attr(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ),
-    allow(dead_code)
-)]
-pub(crate) fn fold2_and_message_scalar(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho1: F128,
-    rho2: F128,
-    eq_lo: &[F128],
-) -> (F128, F128) {
-    debug_assert_eq!(a_in.len(), 4 * a_out.len());
-    debug_assert_eq!(b_in.len(), 4 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-    let fold4 = |v: &[F128], i: usize| {
-        let t0 = v[i] + rho1 * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho1 * (v[i + 2] + v[i + 3]);
-        t0 + rho2 * (t0 + t1)
-    };
-    let mut p1_acc = F256Unreduced::ZERO;
-    let mut pinf_acc = F256Unreduced::ZERO;
-    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-        let i = 8 * x_lo;
-        let o = 2 * x_lo;
-        let a0 = fold4(a_in, i);
-        let a1 = fold4(a_in, i + 4);
-        let b0 = fold4(b_in, i);
-        let b1 = fold4(b_in, i + 4);
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
-    }
-    (p1_acc.reduce(), pinf_acc.reduce())
 }
 
 /// Serial reference — identical I/O contract to
@@ -2098,6 +4824,198 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 mod tests {
     use super::*;
 
+    /// The GFNI batched row fold must reproduce `fold_one_row` exactly for
+    /// every row: same table, random rows, byte-for-byte equality after the
+    /// full transpose→GFNI→inverse-transpose pipeline.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_fold64_rows_matches_fold_one_row() {
+        let z = F128::new(0x0123_4567_89ab_cdef, 0x0fed_cba9_8765_4321);
+        let table = UniSkipFoldTable::new(6, z);
+        let mats = build_uni_skip_fold_mats(&table);
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut rows = [0u8; 64 * 8];
+        for byte in rows.iter_mut() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *byte = (state >> 33) as u8;
+        }
+
+        let mut out = [F128::ZERO; 64];
+        // SAFETY: 512 readable bytes, 64 writable F128s, features cfg-gated.
+        unsafe { gfni_fold64_rows(rows.as_ptr(), &mats, out.as_mut_ptr()) };
+        for r in 0..64 {
+            let expected = table.fold_one_row(&rows[r * 8..(r + 1) * 8]);
+            assert_eq!(out[r], expected, "row {r}");
+        }
+    }
+
+    /// The K-pass GFNI batch arm (L1/L3 split permutation + two 64-row
+    /// batches) must reproduce the gather arm byte-for-byte: same compact
+    /// state, both arms of `fold2_round45_chunk_x86_avx512`, identical
+    /// outputs and message slots. Exercises a shape (out_chunk = 64) big
+    /// enough to engage the batch, which the small end-to-end shapes miss.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fold2_round45_gfni_batch_matches_gather_arm() {
+        let z = F128::new(0x1357_9bdf_2468_ace0, 0x0ace_2468_bdf1_3579);
+        let table = UniSkipFoldTable::new(6, z);
+        let lambda1 = F128::new(0x1111_2222_3333_4444, 0x5555_6666_7777_8888);
+        let lambda3 = F128::new(0x9999_aaaa_bbbb_cccc, 0xdddd_eeee_ffff_0001);
+        let table_l1 = table.scaled_linear(lambda1);
+        let table_l3 = table.scaled_linear(lambda3);
+        let mats_l1 = build_row_fold_mats(&table_l1);
+        let mats_l3 = build_row_fold_mats(&table_l3);
+
+        let out_chunk = 64usize;
+        let lo_size = out_chunk / 2;
+        let n_pairs = 2 * out_chunk;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let anchors: Vec<F128> = (0..2 * n_pairs).map(|_| F128::new(next(), next())).collect();
+        let mut deltas = crate::scratch::ScratchBytes::take(2 * n_pairs * 8);
+        for byte in deltas.iter_mut() {
+            *byte = (next() >> 33) as u8;
+        }
+        let compact = UniSkipCompactFold { anchors, deltas };
+        let rho2 = F128::new(0x0f0f_1e1e_2d2d_3c3c, 0x4b4b_5a5a_6969_7878);
+        let eq_lo: Vec<F128> = (0..lo_size).map(|_| F128::new(next(), next())).collect();
+
+        let mut a_ref = vec![F128::ZERO; out_chunk];
+        let mut b_ref = vec![F128::ZERO; out_chunk];
+        let out_ref = fold2_round45_chunk_x86_avx512(
+            &compact, &table, &table_l1, &table_l3, None, None, rho2, &mut a_ref, &mut b_ref,
+            &eq_lo, lo_size, 0,
+        );
+        let mut a_gfni = vec![F128::ZERO; out_chunk];
+        let mut b_gfni = vec![F128::ZERO; out_chunk];
+        let out_gfni = fold2_round45_chunk_x86_avx512(
+            &compact,
+            &table,
+            &table_l1,
+            &table_l3,
+            Some((&mats_l1, &mats_l3)),
+            None,
+            rho2,
+            &mut a_gfni,
+            &mut b_gfni,
+            &eq_lo,
+            lo_size,
+            0,
+        );
+        assert_eq!(a_ref, a_gfni);
+        assert_eq!(b_ref, b_gfni);
+        assert_eq!(out_ref, out_gfni);
+    }
+
+    /// The raw-input K pass must reproduce the compact route bit-for-bit at
+    /// a shape that engages the 64-group batch (m = 25 → out_chunk = 64),
+    /// including ranked-style padded blocks: the compact route consumes
+    /// pre-zeroed anchors/deltas for padded pairs while the raw route folds
+    /// the (genuinely zero) padded rows — both must land on the same field
+    /// elements, messages, and deferred round-five quadratic.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn raw_k_pass_matches_compact_route() {
+        const K_SKIP: usize = 6;
+        for (seed, ranked_padding) in [(0xC0FF_EE01u64, true), (0xC0FF_EE02, false)] {
+            let f = la_fixture(25, seed, ranked_padding);
+            let (compact, _m1, _mi, _la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                K_SKIP,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                None,
+                true,
+            );
+            let n_pairs = compact.len();
+            let n_groups = n_pairs / 2;
+            assert!(
+                zc_raw_k_supported(n_groups),
+                "test shape must engage the raw K batch"
+            );
+            let rho1 = f.rho_grid[3];
+            let rho2 = f.mlv[2];
+            let mut r_next4 = vec![F128::ONE; n_groups.trailing_zeros() as usize];
+            let tail_len = r_next4.len() - 1;
+            r_next4[1..].copy_from_slice(&f.mlv[3..3 + tail_len]);
+            assert_ne!(r_next4[1], F128::ZERO);
+
+            let mut a_c = vec![F128::ZERO; n_groups];
+            let mut b_c = vec![F128::ZERO; n_groups];
+            let (c1, ci, cla) = fold2_compact_and_round45_into(
+                &compact, &f.table, rho1, rho2, &r_next4, &mut a_c, &mut b_c,
+            );
+            let mut a_r = vec![F128::ZERO; n_groups];
+            let mut b_r = vec![F128::ZERO; n_groups];
+            let (r1m, rim, rla) = fold2_raw_and_round45_into(
+                &compact,
+                &f.a_packed,
+                &f.b_packed,
+                &f.table,
+                rho1,
+                rho2,
+                &r_next4,
+                &mut a_r,
+                &mut b_r,
+            );
+            assert_eq!(a_c, a_r, "composed a, ranked_padding={ranked_padding}");
+            assert_eq!(b_c, b_r, "composed b, ranked_padding={ranked_padding}");
+            assert_eq!((c1, ci), (r1m, rim), "round-four message");
+            assert_eq!(cla.c, rla.c, "deferred round-five quadratic");
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_normal_fold4_pair_output_selector_is_exact() {
+        assert!(ranked_normal_fold4_pair_output(1 << 20));
+        assert!(ranked_normal_fold4_pair_output(1 << 18));
+        assert!(!ranked_normal_fold4_pair_output(1 << 22));
+        assert!(!ranked_normal_fold4_pair_output(1 << 21));
+        assert!(!ranked_normal_fold4_pair_output(1 << 19));
+        assert!(!ranked_normal_fold4_pair_output(1 << 17));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_direct_fold4_pair_output_selector_is_exact() {
+        assert!(ranked_direct_fold4_pair_output(1 << 16));
+        assert!(!ranked_direct_fold4_pair_output(1 << 18));
+        assert!(!ranked_direct_fold4_pair_output(1 << 17));
+        assert!(!ranked_direct_fold4_pair_output((1 << 16) - 1));
+        assert!(!ranked_direct_fold4_pair_output((1 << 16) + 1));
+        assert!(!ranked_direct_fold4_pair_output(1 << 15));
+    }
+
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -2144,6 +5062,59 @@ mod tests {
                 assert_eq!(sum, F128::ONE, "Σ L_i ≠ 1 at k_skip={k_skip}");
             }
         }
+    }
+
+    /// The O(ell) fast path (cached denominator inverses + prefix/suffix
+    /// numerators) is bit-identical to the reference quadratic loop on both
+    /// node domains, for random and node-coincident fold points.
+    #[test]
+    fn lagrange_fast_matches_reference() {
+        let mut rng = Rng::new(42);
+        for &k_skip in &[1usize, 2, 3, 4, 5, 6, 7] {
+            let ell = 1usize << k_skip;
+            for t in 0..6 {
+                let z = if t < 4 {
+                    rng.f128()
+                } else {
+                    PHI_8_TABLE[t - 4]
+                };
+                assert_eq!(
+                    lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip)),
+                    lagrange_weights_naive_reference(k_skip, z),
+                    "S-domain mismatch at k_skip={k_skip}, t={t}"
+                );
+                if 2 * ell <= 256 {
+                    assert_eq!(
+                        lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip)),
+                        lagrange_weights_lambda_naive_reference(k_skip, z),
+                        "Λ-domain mismatch at k_skip={k_skip}, t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The staged round-two eq stash is adopted only on an exact
+    /// (challenges, n_hi) match and produces the identical table either way.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn staged_r2_eq_adoption_matches_fresh_build() {
+        let mut rng = Rng::new(7);
+        let ch = rng.f128_vec(25);
+        let fresh = SplitEqGhash::with_n_hi(&ch, 11);
+        stash_staged_r2_eq(&ch, fresh.clone());
+        // Non-matching challenges must not consume the stash.
+        let other = rng.f128_vec(25);
+        let built = take_or_build_r2_eq(&other, 11);
+        assert_eq!(built.lo, SplitEqGhash::with_n_hi(&other, 11).lo);
+        // Matching take returns the identical table.
+        let adopted = take_or_build_r2_eq(&ch, 11);
+        assert_eq!(adopted.lo, fresh.lo);
+        assert_eq!(adopted.hi, fresh.hi);
+        assert_eq!((adopted.n_lo, adopted.n_hi), (fresh.n_lo, fresh.n_hi));
+        // Stash is now empty; a fresh build still works.
+        let rebuilt = take_or_build_r2_eq(&ch, 11);
+        assert_eq!(rebuilt.lo, fresh.lo);
     }
 
     /// `L_i(s_j) = δ_{ij}` — Kronecker delta. At a node, exactly one weight is 1.
@@ -2284,249 +5255,17 @@ mod tests {
         let z = rng.f128();
         let table = UniSkipFoldTable::new(k_skip, z);
 
-        let mut cases = vec![[0u8; 8], [0xffu8; 8]];
         for _ in 0..256 {
             let mut bytes = [0u8; 8];
             for byte in bytes.iter_mut() {
                 *byte = (rng.next_u64() & 0xff) as u8;
             }
-            cases.push(bytes);
-        }
-        for bytes in cases {
             let scalar = table.fold_one_row(&bytes);
             // SAFETY: on aarch64; bytes has 8 entries; table has 8 chunks.
             let neon = unsafe {
                 fold_one_row_neon_unchecked_8(table.data.as_ptr() as *const u8, bytes.as_ptr())
             };
             assert_eq!(scalar, neon, "fold mismatch bytes={bytes:02x?}");
-        }
-    }
-
-    /// The NT tail leaf (fused fold + register-sourced message + `stnp`)
-    /// produces bit-identical folded outputs AND message partial sums to the
-    /// generic path (`fold_pairs` + reload loop) it replaces on large rounds.
-    /// The NT hint changes cache allocation only, so the equality must hold at
-    /// any size — tested here across several lo_size shapes including the
-    /// odd/2-wide tails the generic path special-cases.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn tail_fold_nt_leaf_matches_generic() {
-        let mut rng = Rng::new(72);
-        for lo_size in [2usize, 4, 6, 8, 64, 256] {
-            let n_in = 4 * lo_size;
-            let a_in = rng.f128_vec(n_in);
-            let b_in = rng.f128_vec(n_in);
-            let eq_lo = rng.f128_vec(lo_size);
-            let r_fold = rng.f128();
-
-            // Generic reference: fold_pairs then the reload message loop.
-            let mut a_ref = vec![F128::ZERO; 2 * lo_size];
-            let mut b_ref = vec![F128::ZERO; 2 * lo_size];
-            crate::field::f128_slice::fold_pairs(&a_in, 0, &mut a_ref, r_fold);
-            crate::field::f128_slice::fold_pairs(&b_in, 0, &mut b_ref, r_fold);
-            let mut p1_acc = F256Unreduced::ZERO;
-            let mut pinf_acc = F256Unreduced::ZERO;
-            for x_lo in 0..lo_size {
-                let o = 2 * x_lo;
-                let (a0, a1, b0, b1) = (a_ref[o], a_ref[o + 1], b_ref[o], b_ref[o + 1]);
-                p1_acc ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                pinf_acc ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
-            }
-            let (p1_ref, pinf_ref) = (p1_acc.reduce(), pinf_acc.reduce());
-
-            let mut a_nt = vec![F128::ZERO; 2 * lo_size];
-            let mut b_nt = vec![F128::ZERO; 2 * lo_size];
-            // SAFETY: aes is cfg-guaranteed; buffers sized 4·lo_size in /
-            // 2·lo_size out / lo_size eq exactly as the contract requires.
-            let (p1_nt, pinf_nt) = unsafe {
-                kernels::aarch64::tail_fold_chunk_nt_neon(
-                    a_in.as_ptr(),
-                    b_in.as_ptr(),
-                    a_nt.as_mut_ptr(),
-                    b_nt.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    r_fold,
-                )
-            };
-
-            assert_eq!(a_ref, a_nt, "folded a mismatch at lo_size={lo_size}");
-            assert_eq!(b_ref, b_nt, "folded b mismatch at lo_size={lo_size}");
-            assert_eq!(p1_ref, p1_nt, "p1 mismatch at lo_size={lo_size}");
-            assert_eq!(pinf_ref, pinf_nt, "pinf mismatch at lo_size={lo_size}");
-        }
-    }
-    /// The q-form tail leaf (all-NEON registers, no GPR round trips) is
-    /// bit-identical to the scalar-struct NT leaf AND the generic path across
-    /// shapes, including a ranked-adjacent lo_size (the ranked worker's first
-    /// tail round runs lo_size = 4096).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn tail_fold_qneon_leaf_matches_v1_and_generic() {
-        let mut rng = Rng::new(73);
-        for lo_size in [2usize, 4, 6, 8, 64, 256, 4096] {
-            let n_in = 4 * lo_size;
-            let a_in = rng.f128_vec(n_in);
-            let b_in = rng.f128_vec(n_in);
-            let eq_lo = rng.f128_vec(lo_size);
-            let r_fold = rng.f128();
-
-            // Generic reference: fold_pairs then the reload message loop.
-            let mut a_ref = vec![F128::ZERO; 2 * lo_size];
-            let mut b_ref = vec![F128::ZERO; 2 * lo_size];
-            crate::field::f128_slice::fold_pairs(&a_in, 0, &mut a_ref, r_fold);
-            crate::field::f128_slice::fold_pairs(&b_in, 0, &mut b_ref, r_fold);
-            let mut p1_acc = F256Unreduced::ZERO;
-            let mut pinf_acc = F256Unreduced::ZERO;
-            for x_lo in 0..lo_size {
-                let o = 2 * x_lo;
-                let (a0, a1, b0, b1) = (a_ref[o], a_ref[o + 1], b_ref[o], b_ref[o + 1]);
-                p1_acc ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                pinf_acc ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
-            }
-            let (p1_ref, pinf_ref) = (p1_acc.reduce(), pinf_acc.reduce());
-
-            let mut a_v1 = vec![F128::ZERO; 2 * lo_size];
-            let mut b_v1 = vec![F128::ZERO; 2 * lo_size];
-            let mut a_q = vec![F128::ZERO; 2 * lo_size];
-            let mut b_q = vec![F128::ZERO; 2 * lo_size];
-            // SAFETY: aes is cfg-guaranteed; buffers sized 4·lo_size in /
-            // 2·lo_size out / lo_size eq exactly as the contract requires.
-            let ((p1_v1, pinf_v1), (p1_q, pinf_q)) = unsafe {
-                (
-                    kernels::aarch64::tail_fold_chunk_nt_neon(
-                        a_in.as_ptr(),
-                        b_in.as_ptr(),
-                        a_v1.as_mut_ptr(),
-                        b_v1.as_mut_ptr(),
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        r_fold,
-                    ),
-                    kernels::aarch64::tail_fold_chunk_q::<true, false>(
-                        a_in.as_ptr(),
-                        b_in.as_ptr(),
-                        a_q.as_mut_ptr(),
-                        b_q.as_mut_ptr(),
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        r_fold,
-                    ),
-                )
-            };
-
-            assert_eq!(a_ref, a_q, "folded a mismatch at lo_size={lo_size}");
-            assert_eq!(b_ref, b_q, "folded b mismatch at lo_size={lo_size}");
-            assert_eq!(p1_ref, p1_q, "p1 mismatch at lo_size={lo_size}");
-            assert_eq!(pinf_ref, pinf_q, "pinf mismatch at lo_size={lo_size}");
-            assert_eq!((a_v1, b_v1), (a_q, b_q), "v1/q fold divergence at lo_size={lo_size}");
-            assert_eq!(
-                (p1_v1, pinf_v1),
-                (p1_q, pinf_q),
-                "v1/q message divergence at lo_size={lo_size}"
-            );
-
-            // Store/load-hint variants change cache behavior only, never bits.
-            let mut a_v = vec![F128::ZERO; 2 * lo_size];
-            let mut b_v = vec![F128::ZERO; 2 * lo_size];
-            // SAFETY: same contract as above.
-            let m_nt_ldnp = unsafe {
-                kernels::aarch64::tail_fold_chunk_q::<true, true>(
-                    a_in.as_ptr(),
-                    b_in.as_ptr(),
-                    a_v.as_mut_ptr(),
-                    b_v.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    r_fold,
-                )
-            };
-            assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "ldnp variant fold mismatch");
-            assert_eq!(m_nt_ldnp, (p1_ref, pinf_ref), "ldnp variant message mismatch");
-            // SAFETY: same contract as above.
-            let m_reg = unsafe {
-                kernels::aarch64::tail_fold_chunk_q::<false, false>(
-                    a_in.as_ptr(),
-                    b_in.as_ptr(),
-                    a_v.as_mut_ptr(),
-                    b_v.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    r_fold,
-                )
-            };
-            assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "regular-store variant fold mismatch");
-            assert_eq!(m_reg, (p1_ref, pinf_ref), "regular-store variant message mismatch");
-        }
-    }
-    /// The q-form round-2 message leaf is bit-identical to the scalar-struct
-    /// leaf across shapes, exercising the `b ≡ 1` constant-fiber shortcut
-    /// (forced all-ones b rows), all-zero rows, and padding-skip pairs.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn round2_qmsg_leaf_matches_v1() {
-        let mut rng = Rng::new(74);
-        let table = UniSkipFoldTable::new(6, rng.f128());
-        for lo_size in [2usize, 8, 64, 512] {
-            // 2·lo_size packed rows of 8 bytes each per array.
-            let mut a_packed: Vec<u8> = (0..2 * lo_size * 8)
-                .map(|_| (rng.next_u64() & 0xff) as u8)
-                .collect();
-            let mut b_packed = a_packed.clone();
-            for byte in &mut b_packed {
-                *byte ^= (rng.next_u64() & 0xff) as u8;
-            }
-            // Force constant fibers: some all-ones b rows (shortcut), some
-            // all-zero a rows (row-fold early exit).
-            for row in 0..2 * lo_size {
-                match row % 7 {
-                    0 | 1 => b_packed[row * 8..(row + 1) * 8].fill(0xff),
-                    2 => a_packed[row * 8..(row + 1) * 8].fill(0),
-                    _ => {}
-                }
-            }
-            let eq_lo = rng.f128_vec(lo_size);
-            // Padding skip: mark the top quarter of pairs as padding.
-            let pair_in_block_mask = lo_size - 1;
-            let useful_pairs_inclusive = lo_size - lo_size / 4;
-
-            let mut a_v1 = vec![F128::ZERO; 2 * lo_size];
-            let mut b_v1 = vec![F128::ZERO; 2 * lo_size];
-            let mut a_q = vec![F128::ZERO; 2 * lo_size];
-            let mut b_q = vec![F128::ZERO; 2 * lo_size];
-            // SAFETY: aes is cfg-guaranteed; 2·lo_size packed rows / output
-            // elements and lo_size eq weights as the contract requires.
-            let (m_v1, m_q) = unsafe {
-                (
-                    kernels::aarch64::round2_chunk_raw_neon(
-                        table.data.as_ptr() as *const u8,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        a_v1.as_mut_ptr(),
-                        b_v1.as_mut_ptr(),
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        0,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    ),
-                    kernels::aarch64::round2_chunk_raw_neon_q(
-                        table.data.as_ptr() as *const u8,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        a_q.as_mut_ptr(),
-                        b_q.as_mut_ptr(),
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        0,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    ),
-                )
-            };
-            assert_eq!(a_v1, a_q, "folded a mismatch at lo_size={lo_size}");
-            assert_eq!(b_v1, b_q, "folded b mismatch at lo_size={lo_size}");
-            assert_eq!(m_v1, m_q, "message mismatch at lo_size={lo_size}");
         }
     }
 
@@ -2668,9 +5407,9 @@ mod tests {
     fn fused_round_matches_unfused() {
         let mut rng = Rng::new(310);
         // fold_and_compute requires lo_size ≥ 2 in SplitEqGhash. eq is over
-        // r_next[1..] (size log_n − 2); with MAX_N_HI = 7, n_lo ≥ 1 needs
-        // eq size ≥ 8 ⇒ log_n ≥ 10. Smaller cases use the unfused path.
-        for &log_n in &[10usize, 11, 12] {
+        // r_next[1..] (size log_n − 2); with MAX_N_HI = 9, n_lo ≥ 1 needs
+        // eq size ≥ 10 ⇒ log_n ≥ 12. Smaller cases use the unfused path.
+        for &log_n in &[12usize, 13, 14] {
             let n = 1usize << log_n;
             let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
@@ -2692,6 +5431,859 @@ mod tests {
             assert_eq!(m1_fused, m1_unf, "msg_1 mismatch at log_n={log_n}");
             assert_eq!(minf_fused, minf_unf, "msg_inf mismatch at log_n={log_n}");
         }
+    }
+
+    /// Moving two equality variables from eq_lo to eq_hi only regroups an
+    /// exact tensor factorization.  It must leave both folded buffers and both
+    /// wire-message field elements bit-identical.
+    #[test]
+    fn large_tail_split11_matches_default_split9() {
+        let mut rng = Rng::new(0x5A11_7A11);
+        let log_n = 14usize;
+        let n = 1usize << log_n;
+        let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let r_fold = rng.f128();
+        let r_next = rng.f128_vec(log_n - 1);
+
+        let mut a9 = vec![F128::ZERO; n / 2];
+        let mut b9 = vec![F128::ZERO; n / 2];
+        let msg9 = fold_and_compute_round_pair_into_with_n_hi(
+            &a,
+            &b,
+            &mut a9,
+            &mut b9,
+            r_fold,
+            &r_next,
+            SplitEqGhash::MAX_N_HI,
+        );
+
+        let mut a11 = vec![F128::ZERO; n / 2];
+        let mut b11 = vec![F128::ZERO; n / 2];
+        let msg11 = fold_and_compute_round_pair_into_with_n_hi(
+            &a,
+            &b,
+            &mut a11,
+            &mut b11,
+            r_fold,
+            &r_next,
+            LARGE_TAIL_EQ_N_HI,
+        );
+
+        assert_eq!(a11, a9, "folded a differs across equality splits");
+        assert_eq!(b11, b9, "folded b differs across equality splits");
+        assert_eq!(msg11, msg9, "round message differs across equality splits");
+    }
+
+    /// Full compact-path oracle against the legacy materialized round two.
+    ///
+    /// Covers both byte-pool and donated-F128 delta backing, forces all large
+    /// destinations to come from poisoned recycled storage, compares the
+    /// round-two wire message, then compares reconstructed A/B and the next
+    /// message after folding at rho=0, rho=1, an all-ones value, and a random
+    /// challenge.
+    #[test]
+    fn compact_round2_and_reconstruction_match_legacy_with_poisoned_scratch() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+        const POISON: F128 = F128 {
+            lo: 0xa5a5_a5a5_a5a5_a5a5,
+            hi: 0x5a5a_5a5a_5a5a_5a5a,
+        };
+
+        let mut rng = Rng::new(0xC0A0_AC7);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let random_rho = rng.f128();
+        let rhos = [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            random_rho,
+        ];
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+        let n_out = 1usize << (M - K_SKIP);
+        let n_pairs = n_out / 2;
+        let deltas_len = n_out * table.n_chunks;
+
+        for donate_f128 in [false, true] {
+            crate::scratch::clear();
+
+            let (legacy_a, legacy_b, legacy_m1, legacy_mi) =
+                uni_skip_fold_and_round_pair_optimized_packed_padded(
+                    &a_packed,
+                    &b_packed,
+                    M,
+                    K_SKIP,
+                    &table,
+                    &mlv_challenges,
+                    &padding,
+                );
+
+            // Hold all poison allocations until they are initialized so
+            // smallest-fit cannot substitute the larger anchor allocation for
+            // either reconstruction output.
+            let mut poison_a_out = crate::scratch::take_f128(n_pairs);
+            let mut poison_b_out = crate::scratch::take_f128(n_pairs);
+            let mut poison_anchors = crate::scratch::take_f128(n_out);
+            poison_a_out.fill(POISON);
+            poison_b_out.fill(POISON);
+            poison_anchors.fill(POISON);
+            crate::scratch::give_f128(poison_a_out);
+            crate::scratch::give_f128(poison_b_out);
+            crate::scratch::give_f128(poison_anchors);
+
+            let deltas_backing = if donate_f128 {
+                let donor = vec![POISON; deltas_len / core::mem::size_of::<F128>()];
+                Some(ScratchBytes::from_initialized_f128(donor))
+            } else {
+                let mut poison_deltas = crate::scratch::take_u8(deltas_len);
+                poison_deltas.fill(0xa5);
+                crate::scratch::give_u8(poison_deltas);
+                None
+            };
+
+            let (compact, compact_m1, compact_mi) =
+                uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                    &a_packed,
+                    &b_packed,
+                    M,
+                    K_SKIP,
+                    &table,
+                    &mlv_challenges,
+                    &padding,
+                    deltas_backing,
+                );
+            assert_eq!(
+                (compact_m1, compact_mi),
+                (legacy_m1, legacy_mi),
+                "round-two message mismatch; donate_f128={donate_f128}"
+            );
+
+            for &rho in &rhos {
+                let mut expected_a = legacy_a.clone();
+                let mut expected_b = legacy_b.clone();
+                fold_in_place_pair(&mut expected_a, &mut expected_b, rho);
+                let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
+
+                let (actual_a, actual_b, actual_m1, actual_mi) =
+                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+                assert_eq!(
+                    actual_a, expected_a,
+                    "reconstructed A mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+                assert_eq!(
+                    actual_b, expected_b,
+                    "reconstructed B mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+                assert_eq!(
+                    (actual_m1, actual_mi),
+                    expected_msg,
+                    "post-reconstruction message mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+
+                crate::scratch::give_f128(actual_a);
+                crate::scratch::give_f128(actual_b);
+            }
+
+            compact.recycle();
+            crate::scratch::give_f128(legacy_a);
+            crate::scratch::give_f128(legacy_b);
+            crate::scratch::clear();
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Two-challenge symbolic lookahead (variant K).
+    // ----------------------------------------------------------------------
+
+    const LA_POISON: F128 = F128 {
+        lo: 0xa5a5_a5a5_a5a5_a5a5,
+        hi: 0x5a5a_5a5a_5a5a_5a5a,
+    };
+
+    struct LaFixture {
+        m: usize,
+        table: UniSkipFoldTable,
+        a_packed: Vec<u8>,
+        b_packed: Vec<u8>,
+        mlv: Vec<F128>,
+        padding: PaddingSpec,
+        rho_grid: Vec<F128>,
+    }
+
+    /// Random witness in the ranked padded shape (or dense), plus the
+    /// convention-A round-two challenge vector with a non-zero `r₁`.
+    fn la_fixture(m: usize, seed: u64, ranked_padding: bool) -> LaFixture {
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(seed);
+        let mut a = rng.bits(1 << m);
+        let mut b = rng.bits(1 << m);
+        let padding = if ranked_padding {
+            let k_log = 14usize.min(m);
+            let useful = (15_409usize).min((1usize << k_log) - 3);
+            let block = 1usize << k_log;
+            for blk in 0..(1usize << (m - k_log)) {
+                a[blk * block + useful..(blk + 1) * block].fill(false);
+                b[blk * block + useful..(blk + 1) * block].fill(false);
+            }
+            PaddingSpec {
+                k_log,
+                useful_bits_per_block: useful,
+            }
+        } else {
+            PaddingSpec::dense(m)
+        };
+        // A slab of statically all-ones b rows exercises the b≡1 degeneration.
+        let ones_rows = 1usize << (K_SKIP + 2);
+        for i in 0..ones_rows.min(1 << m) {
+            b[i] = true;
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mut mlv = vec![F128::ONE; m - K_SKIP];
+        for slot in mlv[1..].iter_mut() {
+            *slot = rng.f128();
+        }
+        assert_ne!(mlv[1], F128::ZERO);
+        let rho_grid = vec![
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            rng.f128(),
+        ];
+        LaFixture {
+            m,
+            table: UniSkipFoldTable::new(K_SKIP, z),
+            a_packed,
+            b_packed,
+            mlv,
+            padding,
+            rho_grid,
+        }
+    }
+
+    /// `first_r_next` for the incumbent round-three route.
+    fn la_r_next3(f: &LaFixture) -> Vec<F128> {
+        let mut v = vec![F128::ONE; f.mlv.len() - 1];
+        v[1..].copy_from_slice(&f.mlv[2..]);
+        v
+    }
+
+    /// `r_next4` for the round-four message (post double fold).
+    fn la_r_next4(f: &LaFixture) -> Vec<F128> {
+        let mut v = vec![F128::ONE; f.mlv.len() - 2];
+        v[1..].copy_from_slice(&f.mlv[3..]);
+        v
+    }
+
+    fn with_round2_settings(mut body: impl FnMut()) {
+        // Both gates are phase-local reads, so exercise every combination.
+        for degen_off in [false, true] {
+            for periodic_off in [false, true] {
+                unsafe {
+                    if degen_off {
+                        std::env::set_var("FLOCK_NO_R2_DEGEN", "1");
+                    } else {
+                        std::env::remove_var("FLOCK_NO_R2_DEGEN");
+                    }
+                    if periodic_off {
+                        std::env::set_var("FLOCK_NO_ZC_R2_PERIODIC", "1");
+                    } else {
+                        std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
+                    }
+                }
+                body();
+            }
+        }
+        unsafe {
+            std::env::remove_var("FLOCK_NO_R2_DEGEN");
+            std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
+        }
+    }
+
+    /// T1 — the core oracle. Round-two message identical, and the deferred
+    /// quadratic evaluates to the incumbent round-three message at every ρ₁.
+    /// Four distinct ρ₁ over-determine a quadratic, so agreement at all of
+    /// them *is* coefficient equality.
+    #[test]
+    fn round3_lookahead_matches_compact_route() {
+        for (m, ranked) in [(20usize, true), (20, false), (13, false), (16, true)] {
+            let f = la_fixture(m, 0x1EA0_0001 ^ (m as u64), ranked);
+            let r_next3 = la_r_next3(&f);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                let (compact, m1_l, mi_l) = uni_skip_fold_and_round_pair_compact_padded(
+                    &f.a_packed,
+                    &f.b_packed,
+                    f.m,
+                    6,
+                    &f.table,
+                    &f.mlv,
+                    &f.padding,
+                );
+                let (compact_n, m1_n, mi_n, la) =
+                    uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                        &f.a_packed,
+                        &f.b_packed,
+                        f.m,
+                        6,
+                        &f.table,
+                        &f.mlv,
+                        &f.padding,
+                        None,
+                        true,
+                    );
+                assert_eq!((m1_n, mi_n), (m1_l, mi_l), "round-two message, m={m}");
+                assert_eq!(compact_n.anchors, compact.anchors, "anchors, m={m}");
+                assert_eq!(&compact_n.deltas[..], &compact.deltas[..], "deltas, m={m}");
+
+                for &rho1 in &f.rho_grid {
+                    let (a3, b3, e1, ei) =
+                        fold_compact_and_compute_round_pair(&compact, &f.table, rho1, &r_next3);
+                    assert_eq!(
+                        eval_round3_lookahead(&la, rho1),
+                        (e1, ei),
+                        "round-three message, m={m}, rho1={rho1:?}"
+                    );
+                    crate::scratch::give_f128(a3);
+                    crate::scratch::give_f128(b3);
+                }
+                compact.recycle();
+                compact_n.recycle();
+                crate::scratch::clear();
+            });
+        }
+    }
+
+    /// T2 — independent derivation: Lagrange-interpolate both quadratics from
+    /// three legacy evaluations and compare the six coefficients elementwise.
+    #[test]
+    fn lookahead_coefficients_match_interpolation() {
+        let f = la_fixture(16, 0x1EA0_0002, true);
+        let r_next3 = la_r_next3(&f);
+        crate::scratch::clear();
+        let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+        );
+        let (compact_n, _, _, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+            None,
+            true,
+        );
+        let g = f.rho_grid[3];
+        assert!(g != F128::ZERO && g != F128::ONE);
+        let mut evals = Vec::new();
+        for &rho in &[F128::ZERO, F128::ONE, g] {
+            let (a3, b3, e1, ei) =
+                fold_compact_and_compute_round_pair(&compact, &f.table, rho, &r_next3);
+            evals.push((e1, ei));
+            crate::scratch::give_f128(a3);
+            crate::scratch::give_f128(b3);
+        }
+        // f(0) = c0; f(1) = c0+c1+c2; f(g) = c0 + c1·g + c2·g².
+        // ⇒ c2 = [(f(g)+c0)·g⁻¹ + f(1)+c0] · (g+1)⁻¹, c1 = f(1)+c0+c2.
+        let g_inv = g.inv();
+        let gp1_inv = (g + F128::ONE).inv();
+        for base in [0usize, 3] {
+            let pick = |e: &(F128, F128)| if base == 0 { e.0 } else { e.1 };
+            let c0 = pick(&evals[0]);
+            let f1 = pick(&evals[1]);
+            let fg = pick(&evals[2]);
+            let c2 = ((fg + c0) * g_inv + f1 + c0) * gp1_inv;
+            let c1 = f1 + c0 + c2;
+            assert_eq!(la.c[base], c0, "c{base}");
+            assert_eq!(la.c[base + 1], c1, "c{}", base + 1);
+            assert_eq!(la.c[base + 2], c2, "c{}", base + 2);
+        }
+        compact.recycle();
+        compact_n.recycle();
+        crate::scratch::clear();
+    }
+
+    /// T3 — the double-fold oracle. For a 4×4 (ρ₁, ρ₂) grid the K pass must
+    /// reproduce the legacy T3-then-fold tables **elementwise** (outputs
+    /// pre-filled with poison, so a never-written fully-padding group slot is
+    /// caught) and the round-four message.
+    #[test]
+    fn fold2_from_compact_matches_t3_then_loop_fold() {
+        for (m, ranked) in [(20usize, true), (20, false), (14, true)] {
+            let f = la_fixture(m, 0x1EA0_0003 ^ (m as u64), ranked);
+            let r_next3 = la_r_next3(&f);
+            let r_next4 = la_r_next4(&f);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
+                    &f.a_packed,
+                    &f.b_packed,
+                    f.m,
+                    6,
+                    &f.table,
+                    &f.mlv,
+                    &f.padding,
+                );
+                let n_groups = compact.len() / 2;
+                for &rho1 in &f.rho_grid {
+                    for &rho2 in &f.rho_grid {
+                        let (mut a_l, mut b_l, _, _) =
+                            fold_compact_and_compute_round_pair(&compact, &f.table, rho1, &r_next3);
+                        fold_in_place_pair(&mut a_l, &mut b_l, rho2);
+                        let msg_l = round_pair_naive(&a_l, &b_l, &r_next4);
+
+                        let mut a_n = crate::scratch::take_f128(n_groups);
+                        let mut b_n = crate::scratch::take_f128(n_groups);
+                        a_n.fill(LA_POISON);
+                        b_n.fill(LA_POISON);
+                        let msg_n = fold2_compact_and_round4_into(
+                            &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                        );
+                        assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
+                        assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
+                        assert_eq!(msg_n, msg_l, "round-four message m={m}");
+
+                        crate::scratch::give_f128(a_l);
+                        crate::scratch::give_f128(b_l);
+                        crate::scratch::give_f128(a_n);
+                        crate::scratch::give_f128(b_n);
+                    }
+                }
+                compact.recycle();
+                crate::scratch::clear();
+            });
+        }
+    }
+
+    /// T4 — textbook scalar reference: materialize A/B with `fold_at_z_naive`,
+    /// fold at ρ₁ and read the round-three message directly. Deliberately slow
+    /// and obviously correct; runs at tiny `m` only.
+    #[test]
+    fn round3_lookahead_matches_scalar_reference() {
+        const K_SKIP: usize = 6;
+        for m in [9usize, 10] {
+            let f = la_fixture(m, 0x1EA0_0004 ^ (m as u64), false);
+            let r_next3 = la_r_next3(&f);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                let (compact, _, _, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                    &f.a_packed,
+                    &f.b_packed,
+                    f.m,
+                    K_SKIP,
+                    &f.table,
+                    &f.mlv,
+                    &f.padding,
+                    None,
+                    true,
+                );
+                // Reference A/B: one row fold per output through the table.
+                let n_out = 1usize << (f.m - K_SKIP);
+                let ref_a: Vec<F128> = (0..n_out)
+                    .map(|x| f.table.fold_one_row(&f.a_packed[x * 8..x * 8 + 8]))
+                    .collect();
+                let ref_b: Vec<F128> = (0..n_out)
+                    .map(|x| f.table.fold_one_row(&f.b_packed[x * 8..x * 8 + 8]))
+                    .collect();
+                for &rho1 in &f.rho_grid {
+                    let mut a = ref_a.clone();
+                    let mut b = ref_b.clone();
+                    fold_in_place_pair(&mut a, &mut b, rho1);
+                    let expect = round_pair_naive(&a, &b, &r_next3);
+                    assert_eq!(
+                        eval_round3_lookahead(&la, rho1),
+                        expect,
+                        "scalar reference m={m} rho1={rho1:?}"
+                    );
+                }
+                compact.recycle();
+                crate::scratch::clear();
+            });
+        }
+    }
+
+    /// T6 — the degenerate-challenge guard: `r₁ = 0` makes W1/W2
+    /// unrecoverable from the parity split, so the lookahead producer must
+    /// refuse rather than emit a wrong coefficient. (`prove` takes the
+    /// incumbent route in that case.)
+    #[test]
+    #[should_panic(expected = "lookahead requires a non-zero")]
+    fn lookahead_rejects_zero_r1() {
+        let mut f = la_fixture(13, 0x1EA0_0006, false);
+        f.mlv[1] = F128::ZERO;
+        let _ = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+            None,
+            true,
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Cascaded lookahead (variant K, one level deeper): rounds 5+6.
+    // ----------------------------------------------------------------------
+
+    /// C1 — the cascade K-pass oracle. Outputs and the round-four message
+    /// must match the incumbent K pass **elementwise** (poison-filled
+    /// destinations), and the deferred round-five quadratic must evaluate to
+    /// the incumbent tail-i=2 message at every ρ₃ of a 4-point grid — four
+    /// distinct points over-determine a quadratic, so agreement at all of
+    /// them *is* coefficient equality.
+    #[test]
+    fn cascade_round5_lookahead_matches_incumbent_k_pass() {
+        for (m, ranked) in [(20usize, true), (20, false), (14, true), (13, false)] {
+            let f = la_fixture(m, 0x0CA5_0001 ^ (m as u64), ranked);
+            assert_ne!(f.mlv[3], F128::ZERO);
+            let r_next4 = la_r_next4(&f);
+            // r_next for the incumbent round-five message (tail i = 2).
+            let mut r_next5 = vec![F128::ONE; f.mlv.len() - 3];
+            r_next5[1..].copy_from_slice(&f.mlv[4..]);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
+                    &f.a_packed,
+                    &f.b_packed,
+                    f.m,
+                    6,
+                    &f.table,
+                    &f.mlv,
+                    &f.padding,
+                );
+                let n_groups = compact.len() / 2;
+                let rho_pairs = [
+                    (F128::ZERO, f.rho_grid[2]),
+                    (F128::ONE, f.rho_grid[3]),
+                    (f.rho_grid[3], f.rho_grid[3] + F128::ONE),
+                ];
+                for &(rho1, rho2) in &rho_pairs {
+                    let mut a_l = crate::scratch::take_f128(n_groups);
+                    let mut b_l = crate::scratch::take_f128(n_groups);
+                    a_l.fill(LA_POISON);
+                    b_l.fill(LA_POISON);
+                    let msg_l = fold2_compact_and_round4_into(
+                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_l, &mut b_l,
+                    );
+
+                    let mut a_n = crate::scratch::take_f128(n_groups);
+                    let mut b_n = crate::scratch::take_f128(n_groups);
+                    a_n.fill(LA_POISON);
+                    b_n.fill(LA_POISON);
+                    let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
+                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                    );
+                    assert_eq!(
+                        (m4_1, m4_inf),
+                        msg_l,
+                        "round-four message m={m} rho1={rho1:?} rho2={rho2:?}"
+                    );
+                    assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
+                    assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
+
+                    for &rho3 in &f.rho_grid {
+                        let mut a5 = a_l.clone();
+                        let mut b5 = b_l.clone();
+                        fold_in_place_pair(&mut a5, &mut b5, rho3);
+                        let expect = round_pair_naive(&a5, &b5, &r_next5);
+                        assert_eq!(
+                            eval_round3_lookahead(&la5, rho3),
+                            expect,
+                            "round-five message m={m} rho1={rho1:?} rho2={rho2:?} rho3={rho3:?}"
+                        );
+                    }
+
+                    crate::scratch::give_f128(a_l);
+                    crate::scratch::give_f128(b_l);
+                    crate::scratch::give_f128(a_n);
+                    crate::scratch::give_f128(b_n);
+                }
+                compact.recycle();
+                crate::scratch::clear();
+            });
+        }
+    }
+
+    /// C2 — the composed rounds-5/6 double-fold oracle. For a 4×4 (ρ₃, ρ₄)
+    /// grid the composed pass must reproduce two sequential incumbent folds
+    /// **elementwise** (outputs pre-filled with poison, so a never-written
+    /// slot is caught) and the round-six message.
+    #[test]
+    fn composed_rounds56_fold_matches_two_sequential_folds() {
+        let mut rng = Rng::new(0x0CA5_0002);
+        for log_n in [4usize, 5, 9, 12] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            let grid = [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                rng.f128(),
+            ];
+            for &rho3 in &grid {
+                for &rho4 in &grid {
+                    let mut a_l = a.clone();
+                    let mut b_l = b.clone();
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho3);
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho4);
+                    let msg_l = round_pair_naive(&a_l, &b_l, &r_next6);
+
+                    let mut a_n = vec![LA_POISON; n / 4];
+                    let mut b_n = vec![LA_POISON; n / 4];
+                    let msg_n = fold2_plain_and_round6_into(
+                        &a, &b, &mut a_n, &mut b_n, rho3, rho4, &r_next6,
+                    );
+                    assert_eq!(a_n, a_l, "A log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+                    assert_eq!(b_n, b_l, "B log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+                    assert_eq!(
+                        msg_n, msg_l,
+                        "round-six message log_n={log_n} rho3={rho3:?} rho4={rho4:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// C3 — the degenerate-challenge guard, one level deeper: `r_next4[1] = 0`
+    /// makes W1'/W2' unrecoverable from the parity split, so the cascade K
+    /// pass must refuse rather than emit a wrong coefficient. (`prove` takes
+    /// the incumbent K route in that case.)
+    #[test]
+    #[should_panic(expected = "cascade requires a non-zero")]
+    fn cascade_rejects_zero_r_next4_1() {
+        let f = la_fixture(13, 0x0CA5_0003, false);
+        let mut r_next4 = la_r_next4(&f);
+        r_next4[1] = F128::ZERO;
+        let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+        );
+        let n_groups = compact.len() / 2;
+        let mut a_out = vec![F128::ZERO; n_groups];
+        let mut b_out = vec![F128::ZERO; n_groups];
+        let _ = fold2_compact_and_round45_into(
+            &compact,
+            &f.table,
+            f.rho_grid[3],
+            f.rho_grid[2],
+            &r_next4,
+            &mut a_out,
+            &mut b_out,
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Cascaded lookahead, level three: rounds 7+8.
+    // ----------------------------------------------------------------------
+
+    /// D1 — the cascade3 composed-5/6 oracle (C1 one level down). Outputs and
+    /// the round-six message must match the plain composed pass
+    /// **elementwise** (poison-filled destinations), and the deferred
+    /// round-seven quadratic must evaluate to the incumbent tail-i=4 message
+    /// at every ρ₅ of a 4-point grid — four distinct points over-determine a
+    /// quadratic, so agreement at all of them *is* coefficient equality.
+    #[test]
+    fn cascade3_round7_lookahead_matches_composed_pass() {
+        let mut rng = Rng::new(0x0CA5_3001);
+        for log_n in [4usize, 5, 9, 12] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            assert_ne!(r_next6[1], F128::ZERO);
+            // r_next for the incumbent round-seven message (tail i = 4).
+            let mut r_next7 = vec![F128::ONE; log_n - 3];
+            r_next7[1..].copy_from_slice(&r_next6[2..]);
+            let rho_grid = [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                rng.f128(),
+            ];
+            let rho_pairs = [
+                (F128::ZERO, rho_grid[2]),
+                (F128::ONE, rho_grid[3]),
+                (rho_grid[3], rho_grid[3] + F128::ONE),
+            ];
+            for &(rho3, rho4) in &rho_pairs {
+                let mut a_l = vec![LA_POISON; n / 4];
+                let mut b_l = vec![LA_POISON; n / 4];
+                let msg_l =
+                    fold2_plain_and_round6_into(&a, &b, &mut a_l, &mut b_l, rho3, rho4, &r_next6);
+
+                let mut a_n = vec![LA_POISON; n / 4];
+                let mut b_n = vec![LA_POISON; n / 4];
+                let (m6_1, m6_inf, la7) =
+                    fold2_plain_and_round67_into(&a, &b, &mut a_n, &mut b_n, rho3, rho4, &r_next6);
+                assert_eq!(
+                    (m6_1, m6_inf),
+                    msg_l,
+                    "round-six message log_n={log_n} rho3={rho3:?} rho4={rho4:?}"
+                );
+                assert_eq!(a_n, a_l, "A''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+                assert_eq!(b_n, b_l, "B''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+
+                for &rho5 in &rho_grid {
+                    let mut a7 = a_l.clone();
+                    let mut b7 = b_l.clone();
+                    fold_in_place_pair(&mut a7, &mut b7, rho5);
+                    let expect = round_pair_naive(&a7, &b7, &r_next7);
+                    assert_eq!(
+                        eval_round3_lookahead(&la7, rho5),
+                        expect,
+                        "round-seven message log_n={log_n} rho3={rho3:?} rho4={rho4:?} rho5={rho5:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D2 — the composed rounds-7/8 double-fold at cascade3's call shape:
+    /// starting from a composed-5/6 output, one composed pass at (ρ₅, ρ₆)
+    /// must reproduce two sequential incumbent folds **elementwise**
+    /// (poison-filled outputs) and the round-eight message, for a 4×4 grid.
+    #[test]
+    fn cascade3_composed_rounds78_matches_two_sequential_folds() {
+        let mut rng = Rng::new(0x0CA5_3002);
+        for log_n in [6usize, 9, 12] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            // Chain through the lookahead composed-5/6 pass exactly as the
+            // driver does, then compose rounds 7+8 from its outputs.
+            let mut a2 = vec![LA_POISON; n / 4];
+            let mut b2 = vec![LA_POISON; n / 4];
+            let (_, _, _la7) = fold2_plain_and_round67_into(
+                &a,
+                &b,
+                &mut a2,
+                &mut b2,
+                rng.f128(),
+                rng.f128(),
+                &r_next6,
+            );
+            let mut r_next8 = vec![F128::ONE; log_n - 4];
+            r_next8[1..].copy_from_slice(&r_next6[3..]);
+            let grid = [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                rng.f128(),
+            ];
+            for &rho5 in &grid {
+                for &rho6 in &grid {
+                    let mut a_l = a2.clone();
+                    let mut b_l = b2.clone();
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho5);
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho6);
+                    let msg_l = round_pair_naive(&a_l, &b_l, &r_next8);
+
+                    let mut a_n = vec![LA_POISON; n / 16];
+                    let mut b_n = vec![LA_POISON; n / 16];
+                    let msg_n = fold2_plain_and_round6_into(
+                        &a2, &b2, &mut a_n, &mut b_n, rho5, rho6, &r_next8,
+                    );
+                    assert_eq!(a_n, a_l, "A log_n={log_n} rho5={rho5:?} rho6={rho6:?}");
+                    assert_eq!(b_n, b_l, "B log_n={log_n} rho5={rho5:?} rho6={rho6:?}");
+                    assert_eq!(
+                        msg_n, msg_l,
+                        "round-eight message log_n={log_n} rho5={rho5:?} rho6={rho6:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D3 — the degenerate-challenge guard, one level deeper still:
+    /// `r_next6[1] = 0` makes W1''/W2'' unrecoverable from the parity split,
+    /// so the composed-5/6 lookahead pass must refuse rather than emit a
+    /// wrong coefficient. (`prove` takes the cascade2 route in that case.)
+    #[test]
+    #[should_panic(expected = "cascade requires a non-zero r_next6")]
+    fn cascade3_rejects_zero_r_next6_1() {
+        let mut rng = Rng::new(0x0CA5_3003);
+        let log_n = 6usize;
+        let n = 1usize << log_n;
+        let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let mut r_next6 = vec![F128::ONE; log_n - 2];
+        for slot in r_next6[1..].iter_mut() {
+            *slot = rng.f128();
+        }
+        r_next6[1] = F128::ZERO;
+        let mut a_out = vec![F128::ZERO; n / 4];
+        let mut b_out = vec![F128::ZERO; n / 4];
+        let _ = fold2_plain_and_round67_into(
+            &a,
+            &b,
+            &mut a_out,
+            &mut b_out,
+            rng.f128(),
+            rng.f128(),
+            &r_next6,
+        );
     }
 
     /// Parallel `uni_skip_fold_and_round_pair_optimized_packed` produces
@@ -2936,419 +6528,12 @@ mod tests {
         }
         assert_eq!(g_via_poly, g_via_sum);
     }
-
-    // ----------------------------------------------------------------------
-    // Two-challenge lookahead (rounds 2–4).
-    // ----------------------------------------------------------------------
-
-    /// Honestly padded packed witness pair for `m` (BLAKE3-shaped padding when
-    /// `padded`), plus a padding spec.
-    fn lookahead_witness(rng: &mut Rng, m: usize, padded: bool) -> (Vec<u8>, Vec<u8>, PaddingSpec) {
-        let total_bits = 1usize << m;
-        let mut a = rng.bits(total_bits);
-        let mut b = rng.bits(total_bits);
-        let padding = if padded {
-            let k_log = 14.min(m);
-            let useful_bits = if k_log == 14 { 15_409 } else { (1usize << k_log) - 37 };
-            let block_size = 1usize << k_log;
-            for blk in 0..(total_bits / block_size) {
-                for j in useful_bits..block_size {
-                    a[blk * block_size + j] = false;
-                    b[blk * block_size + j] = false;
-                }
-            }
-            PaddingSpec {
-                k_log,
-                useful_bits_per_block: useful_bits,
-            }
-        } else {
-            PaddingSpec::dense(m)
-        };
-        (pack_bits(&a), pack_bits(&b), padding)
-    }
-
-    /// The lookahead sweep emits bit-identical folded tables and round-two
-    /// message, and its six coefficients reproduce the incumbent round-three
-    /// message (`fold_and_compute_round_pair_optimized` on the same tables)
-    /// at several ρ₁ — dense and padded, small and mid shapes.
-    #[test]
-    fn lookahead_round3_matches_incumbent() {
-        const K_SKIP: usize = 6;
-        for &(m, padded) in &[(13usize, false), (14, false), (15, true), (16, false), (17, true), (18, true)] {
-            let mut rng = Rng::new(0x1A00 + m as u64 + padded as u64 * 100);
-            let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, padded);
-            let z = rng.f128();
-            let table = UniSkipFoldTable::new(K_SKIP, z);
-            let mut mlv = rng.f128_vec(m - K_SKIP);
-            mlv[0] = F128::ONE; // Convention A, as the prover passes it.
-            assert_ne!(mlv[1], F128::ZERO);
-
-            let (a_ref, b_ref, m1_ref, mi_ref) = uni_skip_fold_and_round_pair_optimized_packed_padded(
-                &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-            );
-            let (a_la, b_la, m1_la, mi_la, la) =
-                uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
-                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-                );
-            assert_eq!(a_ref, a_la, "a tables m={m} padded={padded}");
-            assert_eq!(b_ref, b_la, "b tables m={m} padded={padded}");
-            assert_eq!((m1_ref, mi_ref), (m1_la, mi_la), "round-2 msg m={m} padded={padded}");
-
-            // Incumbent round three at three challenges (incl. 0 and 1).
-            let mut r_next3 = vec![F128::ONE; m - K_SKIP - 1];
-            r_next3[1..].copy_from_slice(&mlv[2..]);
-            for &rho1 in &[F128::ZERO, F128::ONE, rng.f128(), rng.f128()] {
-                let (mut a3, mut b3) = (a_ref.clone(), b_ref.clone());
-                fold_in_place_pair(&mut a3, &mut b3, rho1);
-                let (m1, mi) = round_pair_naive(&a3, &b3, &r_next3);
-                assert_eq!(
-                    eval_round3_lookahead(&la, rho1),
-                    (m1, mi),
-                    "round-3 msg m={m} padded={padded} rho1={rho1:?}"
-                );
-            }
-        }
-    }
-
-    /// The composed pass equals fold(ρ₁) then fold(ρ₂) elementwise (outputs
-    /// poison-prefilled so an unwritten slot is caught) and reproduces the
-    /// incumbent round-four message.
-    #[test]
-    fn fold2_plain_matches_fold_then_fold() {
-        for &log_n in &[4usize, 5, 6, 7, 9, 10, 12, 13] {
-            let mut rng = Rng::new(0x2B00 + log_n as u64);
-            let n = 1usize << log_n;
-            let a = rng.f128_vec(n);
-            let b = rng.f128_vec(n);
-            let rho1 = rng.f128();
-            let rho2 = rng.f128();
-            let mut r_next4 = vec![F128::ONE; log_n - 2];
-            for v in r_next4[1..].iter_mut() {
-                *v = rng.f128();
-            }
-            let (mut a4, mut b4) = (a.clone(), b.clone());
-            fold_in_place_pair(&mut a4, &mut b4, rho1);
-            fold_in_place_pair(&mut a4, &mut b4, rho2);
-            let (m4_1, m4_i) = round_pair_naive(&a4, &b4, &r_next4);
-
-            let poison = F128 {
-                lo: 0xDEAD_BEEF_DEAD_BEEF,
-                hi: 0xFEED_FACE_FEED_FACE,
-            };
-            let mut a_out = vec![poison; n / 4];
-            let mut b_out = vec![poison; n / 4];
-            let (c4_1, c4_i) =
-                fold2_plain_and_round4_into(&a, &b, &mut a_out, &mut b_out, rho1, rho2, &r_next4);
-            assert_eq!(a_out, a4, "a tables log_n={log_n}");
-            assert_eq!(b_out, b4, "b tables log_n={log_n}");
-            assert_eq!((c4_1, c4_i), (m4_1, m4_i), "round-4 msg log_n={log_n}");
-        }
-    }
-
-    /// AVX-512 lookahead sweep kernel vs the portable reference on one chunk,
-    /// with and without padded pairs, at several `lo_size` (incl. the scalar
-    /// tail sizes 2 and 4).
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn round2_lookahead_chunk_x86_matches_scalar() {
-        const K_SKIP: usize = 6;
-        for &(lo_size, mask, useful) in &[
-            (2usize, 0usize, usize::MAX),
-            (4, 0, usize::MAX),
-            (8, 0, usize::MAX),
-            (16, 0, usize::MAX),
-            (64, 0, usize::MAX),
-            (64, 7, 5),   // every block of 8 pairs keeps 5 (mixed group + zero groups)
-            (128, 15, 12),
-            (128, 127, 121),
-        ] {
-            let mut rng = Rng::new(0x3C00 + lo_size as u64 + mask as u64);
-            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
-            let n_rows = 4 * lo_size + 16; // slack so row_base can be non-zero
-            let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let eq_lo = rng.f128_vec(lo_size);
-            let row_base = 8;
-            let pair_idx_base = 3 * lo_size;
-
-            let mut a_s = vec![F128::ZERO; 2 * lo_size];
-            let mut b_s = vec![F128::ZERO; 2 * lo_size];
-            let out_s = round2_lookahead_chunk_scalar::<true>(
-                &a_packed, &b_packed, &table, &mut a_s, &mut b_s, &eq_lo, row_base,
-                pair_idx_base, mask, useful,
-            );
-            let mut a_v = vec![F128::ONE; 2 * lo_size];
-            let mut b_v = vec![F128::ONE; 2 * lo_size];
-            // SAFETY: rows/table/chunk lengths satisfy the kernel's contract.
-            let out_v = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut a_v,
-                    &mut b_v,
-                    &eq_lo,
-                    pair_idx_base,
-                    mask,
-                    useful,
-                )
-            };
-            assert_eq!(a_s, a_v, "a chunk lo_size={lo_size} mask={mask}");
-            assert_eq!(b_s, b_v, "b chunk lo_size={lo_size} mask={mask}");
-            assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask}");
-            // No-store variant: same sums, nothing written.
-            let mut a_e: Vec<F128> = Vec::new();
-            let mut b_e: Vec<F128> = Vec::new();
-            // SAFETY: as above; WRITE=false ignores the (empty) chunks.
-            let out_n = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut a_e,
-                    &mut b_e,
-                    &eq_lo,
-                    pair_idx_base,
-                    mask,
-                    useful,
-                )
-            };
-            assert_eq!(out_s, out_n, "no-store sums lo_size={lo_size} mask={mask}");
-            let out_ns = round2_lookahead_chunk_scalar::<false>(
-                &a_packed, &b_packed, &table, &mut a_e, &mut b_e, &eq_lo, row_base,
-                pair_idx_base, mask, useful,
-            );
-            assert_eq!(out_s, out_ns, "scalar no-store sums lo_size={lo_size} mask={mask}");
-        }
-    }
-
-    /// AVX-512 composed-fold kernel vs the portable reference on one chunk.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn fold2_and_message_x86_matches_scalar() {
-        for &lo_size in &[2usize, 4, 6, 8, 16, 64] {
-            let mut rng = Rng::new(0x4D00 + lo_size as u64);
-            let a_in = rng.f128_vec(8 * lo_size);
-            let b_in = rng.f128_vec(8 * lo_size);
-            let rho1 = rng.f128();
-            let rho2 = rng.f128();
-            let eq_lo = rng.f128_vec(lo_size);
-            let mut a_s = vec![F128::ZERO; 2 * lo_size];
-            let mut b_s = vec![F128::ZERO; 2 * lo_size];
-            let (p1_s, pi_s) = fold2_and_message_scalar(&a_in, &b_in, &mut a_s, &mut b_s, rho1, rho2, &eq_lo);
-            let mut a_v = vec![F128::ONE; 2 * lo_size];
-            let mut b_v = vec![F128::ONE; 2 * lo_size];
-            // SAFETY: lengths satisfy the kernel's contract.
-            let (p1_v, pi_v) = unsafe {
-                kernels::x86_64::fold2_and_message_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho1, rho2, &eq_lo,
-                )
-            };
-            assert_eq!(a_s, a_v, "a lo_size={lo_size}");
-            assert_eq!(b_s, b_v, "b lo_size={lo_size}");
-            assert_eq!((p1_s, pi_s), (p1_v, pi_v), "msg lo_size={lo_size}");
-        }
-    }
-
-    /// The cascade step (composed fold + message + next-round quadratic)
-    /// emits tables and message identical to the plain composed pass, and its
-    /// six coefficients reproduce the incumbent next-round message
-    /// (fold then `round_pair_naive`) at several challenges.
-    #[test]
-    fn cascade_lookahead_matches_incumbent() {
-        for &log_n in &[4usize, 5, 6, 8, 10, 13] {
-            let mut rng = Rng::new(0x5E00 + log_n as u64);
-            let n = 1usize << log_n;
-            let a = rng.f128_vec(n);
-            let b = rng.f128_vec(n);
-            let rho_a = rng.f128();
-            let rho_b = rng.f128();
-            let mut r_next = vec![F128::ONE; log_n - 2];
-            for v in r_next[1..].iter_mut() {
-                *v = rng.f128();
-            }
-            assert_ne!(r_next[1], F128::ZERO);
-            let mut a_ref = vec![F128::ZERO; n / 4];
-            let mut b_ref = vec![F128::ZERO; n / 4];
-            let (m1_ref, mi_ref) =
-                fold2_plain_and_round4_into(&a, &b, &mut a_ref, &mut b_ref, rho_a, rho_b, &r_next);
-            let poison = F128 {
-                lo: 0xDEAD_BEEF_DEAD_BEEF,
-                hi: 0xFEED_FACE_FEED_FACE,
-            };
-            let mut a_la = vec![poison; n / 4];
-            let mut b_la = vec![poison; n / 4];
-            let (m1_la, mi_la, la) = fold2_plain_and_round_pair_lookahead_into(
-                &a, &b, &mut a_la, &mut b_la, rho_a, rho_b, &r_next,
-            );
-            assert_eq!(a_ref, a_la, "a tables log_n={log_n}");
-            assert_eq!(b_ref, b_la, "b tables log_n={log_n}");
-            assert_eq!((m1_ref, mi_ref), (m1_la, mi_la), "msg log_n={log_n}");
-
-            let mut r_nn = vec![F128::ONE; log_n - 3];
-            r_nn[1..].copy_from_slice(&r_next[2..]);
-            for &rho in &[F128::ZERO, F128::ONE, rng.f128(), rng.f128()] {
-                let (mut a5, mut b5) = (a_ref.clone(), b_ref.clone());
-                fold_in_place_pair(&mut a5, &mut b5, rho);
-                let (m1, mi) = round_pair_naive(&a5, &b5, &r_nn);
-                assert_eq!(eval_round3_lookahead(&la, rho), (m1, mi), "next msg log_n={log_n} rho={rho:?}");
-            }
-        }
-    }
-
-    /// AVX-512 cascade kernel vs the portable reference on one chunk.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn fold2_and_message_lookahead_x86_matches_scalar() {
-        for &lo_size in &[2usize, 4, 6, 8, 10, 16, 24, 64] {
-            let mut rng = Rng::new(0x6F00 + lo_size as u64);
-            let a_in = rng.f128_vec(8 * lo_size);
-            let b_in = rng.f128_vec(8 * lo_size);
-            let rho_a = rng.f128();
-            let rho_b = rng.f128();
-            let eq_lo = rng.f128_vec(lo_size);
-            let mut a_s = vec![F128::ZERO; 2 * lo_size];
-            let mut b_s = vec![F128::ZERO; 2 * lo_size];
-            let out_s = fold2_and_message_lookahead_scalar(
-                &a_in, &b_in, &mut a_s, &mut b_s, rho_a, rho_b, &eq_lo,
-            );
-            let mut a_v = vec![F128::ONE; 2 * lo_size];
-            let mut b_v = vec![F128::ONE; 2 * lo_size];
-            // SAFETY: lengths satisfy the kernel's contract.
-            let out_v = unsafe {
-                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo,
-                )
-            };
-            assert_eq!(a_s, a_v, "a lo_size={lo_size}");
-            assert_eq!(b_s, b_v, "b lo_size={lo_size}");
-            assert_eq!(out_s, out_v, "sums lo_size={lo_size}");
-        }
-    }
-
-    /// The no-materialize route equals the materializing lookahead route:
-    /// same round-2 message and coefficients from the store-free sweep, and
-    /// the packed→composed pass reproduces the materialized composed tables
-    /// (POISON-prefilled outputs), round-4 message and round-5 coefficients
-    /// — dense and padded.
-    #[test]
-    fn nomat_route_matches_materialized() {
-        const K_SKIP: usize = 6;
-        for &(m, padded) in &[(13usize, false), (14, true), (15, true), (16, false), (17, true), (18, true)] {
-            let mut rng = Rng::new(0x7A00 + m as u64 + padded as u64 * 100);
-            let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, padded);
-            let z = rng.f128();
-            let table = UniSkipFoldTable::new(K_SKIP, z);
-            let mut mlv = rng.f128_vec(m - K_SKIP);
-            mlv[0] = F128::ONE;
-            let (a2, b2, m1_ref, mi_ref, la_ref) =
-                uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
-                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-                );
-            let (m1_nm, mi_nm, la_nm) = uni_skip_round_pair_lookahead_nomat_packed_padded(
-                &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-            );
-            assert_eq!((m1_ref, mi_ref), (m1_nm, mi_nm), "round-2 msg m={m} padded={padded}");
-            assert_eq!(la_ref, la_nm, "round-3 coeffs m={m} padded={padded}");
-
-            let rho1 = rng.f128();
-            let rho2 = rng.f128();
-            let mut r_next4 = vec![F128::ONE; m - K_SKIP - 2];
-            r_next4[1..].copy_from_slice(&mlv[3..]);
-            let n = 1usize << (m - K_SKIP);
-            let mut a4 = vec![F128::ZERO; n / 4];
-            let mut b4 = vec![F128::ZERO; n / 4];
-            let (m4_ref, mi4_ref, la5_ref) = fold2_plain_and_round_pair_lookahead_into(
-                &a2, &b2, &mut a4, &mut b4, rho1, rho2, &r_next4,
-            );
-            let poison = F128 {
-                lo: 0xDEAD_BEEF_DEAD_BEEF,
-                hi: 0xFEED_FACE_FEED_FACE,
-            };
-            let mut a4n = vec![poison; n / 4];
-            let mut b4n = vec![poison; n / 4];
-            let (m4_nm, mi4_nm, la5_nm) = fold2_from_packed_and_round_pair_lookahead_into(
-                &a_packed, &b_packed, m, K_SKIP, &table, &padding, &mut a4n, &mut b4n, rho1, rho2,
-                &r_next4,
-            );
-            assert_eq!(a4, a4n, "a4 m={m} padded={padded}");
-            assert_eq!(b4, b4n, "b4 m={m} padded={padded}");
-            assert_eq!((m4_ref, mi4_ref), (m4_nm, mi4_nm), "round-4 msg m={m} padded={padded}");
-            assert_eq!(la5_ref, la5_nm, "round-5 coeffs m={m} padded={padded}");
-        }
-    }
-
-    /// AVX-512 packed→composed kernel vs the portable reference on one chunk,
-    /// with and without padded pairs, at several `lo_size`.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn fold2_from_packed_lookahead_x86_matches_scalar() {
-        const K_SKIP: usize = 6;
-        for &(lo_size, mask, useful) in &[
-            (2usize, 0usize, usize::MAX),
-            (4, 0, usize::MAX),
-            (6, 0, usize::MAX),
-            (8, 0, usize::MAX),
-            (16, 0, usize::MAX),
-            (64, 0, usize::MAX),
-            (16, 7, 5),
-            (32, 15, 12),
-            (64, 127, 121),
-        ] {
-            let mut rng = Rng::new(0x8B00 + lo_size as u64 + mask as u64);
-            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
-            let out_base = 4 * lo_size; // exercise a non-zero chunk offset
-            let n_rows = 8 * (out_base + 2 * lo_size);
-            let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let rho1 = rng.f128();
-            let rho2 = rng.f128();
-            let eq_lo = rng.f128_vec(lo_size);
-            let mut a_s = vec![F128::ZERO; 2 * lo_size];
-            let mut b_s = vec![F128::ZERO; 2 * lo_size];
-            let out_s = fold2_from_packed_lookahead_scalar(
-                &a_packed, &b_packed, &table, out_base, &mut a_s, &mut b_s, rho1, rho2, &eq_lo,
-                mask, useful,
-            );
-            let mut a_v = vec![F128::ONE; 2 * lo_size];
-            let mut b_v = vec![F128::ONE; 2 * lo_size];
-            // SAFETY: rows/table/output lengths satisfy the kernel's contract.
-            let out_v = unsafe {
-                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                    table.data.as_ptr(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
-                    &mut a_v,
-                    &mut b_v,
-                    rho1,
-                    rho2,
-                    &eq_lo,
-                    mask,
-                    useful,
-                )
-            };
-            assert_eq!(a_s, a_v, "a lo_size={lo_size} mask={mask}");
-            assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask}");
-            assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask}");
-        }
-    }
 }
+
+// r567 archive marker: submission cadence variant.
+
+// r577 cadence marker: candidate identity only; no runtime effect.
+
+// r581: source-distinct cadence marker; no semantic effect.
+
+// r584: source-distinct cadence marker

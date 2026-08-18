@@ -75,7 +75,9 @@ pub(super) fn accumulate_convert(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// AB half of the eight-bank C variant. The C side no longer touches the
+/// convert table at all (see [`super::accumulate_c_banks`]), so this is just
+/// [`accumulate_convert`] with the C accumulator removed.
 #[cfg(not(any(
     target_arch = "aarch64",
     all(
@@ -84,29 +86,45 @@ pub(super) fn accumulate_convert(
         target_feature = "vpclmulqdq"
     )
 )))]
-pub(super) fn accumulate_convert_with_s_hat_v(
+pub(super) fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
-    chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
-    partial_c_0: &mut [F128; 64],
-    partial_c_1: &mut [F128; 64],
 ) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;
-        let mut converted_c_0 = F128::ZERO;
-        let mut converted_c_1 = F128::ZERO;
         for b_med in 0..n_b_med {
-            let table_base = b_med * 256;
-            let c = chunk_c_bytes[b_med][lane] as usize;
-            converted_ab += convert[table_base + chunk_ab_bytes[b_med][lane] as usize];
-            converted_c_0 += convert[table_base + (c & 0x55)];
-            converted_c_1 += convert[table_base + (c & 0xaa)];
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
-        partial_c_0[lane] += converted_c_0 * eq_lo_val;
-        partial_c_1[lane] += converted_c_1 * eq_lo_val;
+    }
+}
+
+/// Multiply-free twin of [`accumulate_convert_ab`] for the banked `eq_lo`
+/// tensor fold: the `eq_lo` scale rides on the caller-selected table
+/// (`T_w[i] = convert[i] * eq_top[w]`) and on the once-per-band `eq_bot[u]`
+/// fold of the bank, so the gathered lane is XORed in unscaled.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+)))]
+pub(super) fn accumulate_convert_ab_nomul(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        bank[lane] += converted_ab;
     }
 }
