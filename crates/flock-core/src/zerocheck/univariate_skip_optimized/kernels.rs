@@ -19,6 +19,59 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
 
+/// Static-B round-1 kernel (x86 AVX-512/GFNI only). See `x86_64_bstatic.rs`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(super) mod x86_64_bstatic;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+mod x86_64_bstatic_plan;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(super) use x86_64_bstatic::{BstaticPartials, prepare_bstatic};
+
+/// Static-B partial images: an empty placeholder where the kernel does not
+/// exist, so callers can thread the hint unconditionally.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+)))]
+pub(super) struct BstaticPartials;
+
+/// Static-B is only available on the x86 AVX-512/GFNI kernel; elsewhere the
+/// hint is always absent and the incumbent kernels run unchanged.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+)))]
+#[inline]
+pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&'static BstaticPartials> {
+    None
+}
+
+/// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
+/// the 8192-bit window being transformed plus the resolved partial images.
+/// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
+/// verifies every planned row against the actual b word.
+pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
+
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     #[cfg(target_arch = "aarch64")]
@@ -60,7 +113,16 @@ pub(super) fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    bstatic: BstaticHint,
 ) {
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    let _ = bstatic;
+
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
@@ -84,6 +146,20 @@ pub(super) fn shift_reduce_inner_ab(
         let _ = (a_col, b_col);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
+            if let Some((w, partials)) = bstatic {
+                if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    w,
+                    partials,
+                    out,
+                ) {
+                    return;
+                }
+            }
             x86_64::shift_reduce_inner_ab_x86_avx512(
                 a_packed,
                 b_packed,
@@ -146,10 +222,11 @@ pub(super) fn shift_reduce_inner_ab_x2(
     out1: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    bstatic: BstaticHint,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (a_col, b_col);
+        let _ = (a_col, b_col, bstatic);
         aarch64::shift_reduce_inner_ab_fused_neon_x2(
             a_packed,
             b_packed,
@@ -172,6 +249,7 @@ pub(super) fn shift_reduce_inner_ab_x2(
             out0,
             a_col,
             b_col,
+            bstatic,
         );
         shift_reduce_inner_ab(
             a_packed,
@@ -182,6 +260,7 @@ pub(super) fn shift_reduce_inner_ab_x2(
             out1,
             a_col,
             b_col,
+            bstatic,
         );
     }
 }

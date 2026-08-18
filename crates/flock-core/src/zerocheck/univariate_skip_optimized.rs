@@ -339,6 +339,7 @@ impl Round1AbInner {
                     out_outer,
                     a_col,
                     b_col,
+                    None,
                 );
             },
         );
@@ -380,6 +381,35 @@ pub fn precompute_round1_ab_inner_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_impl(a_packed, b_packed, m, k_skip, inv_table, padding, true)
+}
+
+/// Test oracle: [`precompute_round1_ab_inner_packed_padded`] with the static-B
+/// round-1 kernel hint forced off, i.e. the incumbent kernel on every window.
+/// Bit-identical to the production entry by construction; exists so
+/// downstream tests can compare the two on a real witness.
+#[doc(hidden)]
+pub fn precompute_round1_ab_inner_packed_padded_reference(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_impl(a_packed, b_packed, m, k_skip, inv_table, padding, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_impl(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    allow_bstatic: bool,
+) -> Round1AbInner {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -397,6 +427,13 @@ pub fn precompute_round1_ab_inner_packed_padded(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
+    // Static-B plan is censused for the ranked BLAKE3 layout only; anything
+    // else keeps the incumbent kernel (the plan would just miss anyway).
+    let bstatic_ctx = if allow_bstatic && blake3_static_layout(padding) {
+        kernels::prepare_bstatic(inv_table)
+    } else {
+        None
+    };
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
     // Treating it as bytes is valid because every byte is written below before
@@ -424,6 +461,7 @@ pub fn precompute_round1_ab_inner_packed_padded(
                     out_outer,
                     a_col,
                     b_col,
+                    bstatic_ctx.map(|p| (within_hash_outer, p)),
                 );
                 out_outer[n_b_med * 64..].fill(0);
             },
@@ -447,6 +485,7 @@ pub fn precompute_round1_ab_inner_packed_padded(
 // Output `out[lane]` is the F_8 representative of Σ_K x^K · y_K[lane] mod p.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -456,6 +495,7 @@ fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    bstatic: kernels::BstaticHint,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -466,7 +506,15 @@ fn shift_reduce_inner_ab(
         out,
         a_col,
         b_col,
+        bstatic,
     );
+}
+
+/// True for the ranked BLAKE3 witness layout the static-B plan was censused
+/// on (`k_log = 14`, `useful_bits = 15409`).
+#[inline]
+fn blake3_static_layout(padding: &PaddingSpec) -> bool {
+    padding.k_log == 14 && padding.useful_bits_per_block == 15_409
 }
 
 /// Run `shift_reduce_inner_ab` + C-side `bit_transpose_64bytes` for the
@@ -490,6 +538,7 @@ fn shift_reduce_transpose_windows(
     chunk_c_bytes: &mut [[u8; 64]; 1 << N_MEDIUM],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    bstatic: kernels::BstaticHint,
 ) {
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
@@ -504,6 +553,7 @@ fn shift_reduce_transpose_windows(
             &mut hi[0],
             a_col,
             b_col,
+            bstatic,
         );
         for w in b_med..b_med + 2 {
             let byte_base_b = chunk_byte_base + w * N_CHUNKS * 8;
@@ -524,6 +574,7 @@ fn shift_reduce_transpose_windows(
             &mut chunk_ab_bytes[b_med],
             a_col,
             b_col,
+            bstatic,
         );
         let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
         let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -550,6 +601,7 @@ fn shift_reduce_windows_into_blocks(
     out_outer: &mut [u8],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    bstatic: kernels::BstaticHint,
 ) {
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
@@ -568,6 +620,7 @@ fn shift_reduce_windows_into_blocks(
             out1,
             a_col,
             b_col,
+            bstatic,
         );
         b_med += 2;
     }
@@ -584,6 +637,7 @@ fn shift_reduce_windows_into_blocks(
             dst,
             a_col,
             b_col,
+            bstatic,
         );
     }
 }
@@ -605,6 +659,11 @@ pub fn precompute_round1_ab_inner_windows(
 
     let mut a_col = [F8::ZERO; ELL];
     let mut b_col = [F8::ZERO; ELL];
+    // This seam is fed one BLAKE3 block (two 8192-bit windows) at a time by
+    // the witness generator, so the window's parity is its BLAKE3 outer-window
+    // index `w`. That is only a static-B plan hint — a different layout just
+    // misses the plan's byte checks and runs the generic rows.
+    let bstatic_ctx = kernels::prepare_bstatic(inv_table);
     for outer in 0..a_packed.len() / OUTER_BYTES {
         let base = outer * OUTER_BYTES;
         shift_reduce_windows_into_blocks(
@@ -616,6 +675,7 @@ pub fn precompute_round1_ab_inner_windows(
             &mut out[base..base + OUTER_BYTES],
             &mut a_col,
             &mut b_col,
+            bstatic_ctx.map(|p| (outer & 1, p)),
         );
     }
 }
@@ -771,6 +831,7 @@ fn process_one_x_hi(
                 &mut state.chunk_c_bytes,
                 &mut state.a_col,
                 &mut state.b_col,
+                None,
             );
 
             kernels::accumulate_convert(
@@ -798,6 +859,7 @@ fn process_one_x_hi(
                 &mut state.chunk_c_bytes,
                 &mut state.a_col,
                 &mut state.b_col,
+                None,
             );
 
             kernels::accumulate_convert(
@@ -898,6 +960,7 @@ pub(crate) fn process_one_x_hi_with_s_hat_v(
             &mut state.chunk_c_bytes,
             &mut state.a_col,
             &mut state.b_col,
+            None,
         );
         kernels::accumulate_convert_ab(
             &state.chunk_ab_bytes,

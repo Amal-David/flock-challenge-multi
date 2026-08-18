@@ -2478,6 +2478,67 @@ mod tests {
         );
     }
 
+    /// Static-B round-1 kernel oracle on the REAL ranked-distribution witness
+    /// (block_len = 64, flags = 11, u32 counter) at m = 22 (256 blocks) and on
+    /// a random-metadata witness (which misses most of the static plan): the
+    /// production precompute (static-B hint on where the kernel exists) must
+    /// be byte-identical to the hint-off reference, and the streamed
+    /// per-block seam must agree with both.
+    #[test]
+    fn round1_ab_precompute_bstatic_matches_reference() {
+        for (seed, ranked_meta) in [(0x5B57_A71Cu64, true), (0x5B57_A71Du64, false)] {
+            let mut rng = Rng::new(seed);
+            let n_blocks = 256usize;
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    if ranked_meta {
+                        (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+                    } else {
+                        let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                        (cv, m, counter, rng.next_u32() & 0xFF, rng.next_u32() & 0xFF)
+                    }
+                })
+                .collect();
+            let n_log = min_n_blocks_log(n_blocks);
+            let m = K_LOG + n_log;
+            let (_z, a, b, mut streamed) =
+                generate_witness_with_ab_packed_and_round1_inner(&blocks, n_log);
+            let total_bytes = (1usize << m) / 8;
+            let a_bytes =
+                unsafe { std::slice::from_raw_parts(a.as_ptr().cast::<u8>(), total_bytes) };
+            let b_bytes =
+                unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), total_bytes) };
+            let padding = flock_core::zerocheck::PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: USEFUL_BITS,
+            };
+            let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+            let ntt_l =
+                flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+            let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            let mut production =
+                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                    a_bytes, b_bytes, m, K_SKIP, &inv_table, &padding,
+                );
+            let mut reference =
+                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_reference(
+                    a_bytes, b_bytes, m, K_SKIP, &inv_table, &padding,
+                );
+            assert_eq!(
+                production.as_bytes_mut(),
+                reference.as_bytes_mut(),
+                "static-B precompute differs from the incumbent reference (ranked_meta={ranked_meta})"
+            );
+            assert_eq!(
+                streamed.as_bytes_mut(),
+                reference.as_bytes_mut(),
+                "streamed ab_inner differs from the incumbent reference (ranked_meta={ranked_meta})"
+            );
+        }
+    }
+
     /// The fused generator produces (z, a, b) byte-identical to
     /// `generate_witness_with_ab_packed` AND a lincheck stripe byte-identical
     /// `Blake3LincheckCircuit` walker matches the sparse fold byte-for-byte
@@ -2819,6 +2880,91 @@ mod tests {
             ),
             7,
         );
+    }
+
+    /// Static-structure census of the round-1 AB operands at the ranked
+    /// BLAKE3 layout (k_log = 14, useful_bits = 15409, block_len = 64,
+    /// flags = 11, u32 counter — the harness's exact input distribution).
+    /// For every (window w, b_med, K, byte j) it reports whether the byte of
+    /// the packed A / B row is constant across all sampled blocks and what
+    /// that constant is. The static-B kernel uses this ONLY as a performance
+    /// hint (mask miss ⇒ generic row), so this probe never gates correctness;
+    /// it exists so the shipped plan is checked against the real generator.
+    /// Run: `cargo test --release -p flock-prover bstatic_census -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bstatic_census() {
+        let n_log = std::env::var("CENSUS_LOG2").ok().and_then(|v| v.parse().ok()).unwrap_or(12usize);
+        let ranked_dist = std::env::var_os("CENSUS_RANDOM_META").is_none();
+        let n_blocks = 1usize << n_log;
+        let mut rng = Rng::new(0xCE75_0000 ^ n_log as u64);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                if ranked_dist {
+                    (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+                } else {
+                    let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                    (cv, m, t, rng.next_u32() & 0xFF, rng.next_u32() & 0xFF)
+                }
+            })
+            .collect();
+        let (_z, a, b) = generate_witness_with_ab_packed(&blocks, n_log);
+        const BYTES_PER_BLOCK: usize = K / 8;
+        let a_bytes = unsafe { std::slice::from_raw_parts(a.as_ptr().cast::<u8>(), a.len() * 16) };
+        let b_bytes = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), b.len() * 16) };
+        assert_eq!(a_bytes.len(), n_blocks * BYTES_PER_BLOCK);
+        // per (w, b_med, K): (const_byte_mask, first_word) for a and b.
+        let mut census = |src: &[u8], name: &str| {
+            let mut first = vec![0u64; 2 * 16 * 8];
+            let mut varies = vec![0u8; 2 * 16 * 8]; // bit j set ⇒ byte j varies
+            for blk in 0..n_blocks {
+                let base = blk * BYTES_PER_BLOCK;
+                for w in 0..2 {
+                    for b_med in 0..16 {
+                        for k in 0..8 {
+                            let off = base + w * 1024 + b_med * 64 + k * 8;
+                            let word = u64::from_le_bytes(src[off..off + 8].try_into().unwrap());
+                            let idx = (w * 16 + b_med) * 8 + k;
+                            if blk == 0 {
+                                first[idx] = word;
+                            } else {
+                                let diff = word ^ first[idx];
+                                for j in 0..8 {
+                                    if (diff >> (8 * j)) & 0xff != 0 {
+                                        varies[idx] |= 1 << j;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!("// {name}: [[(mask, expected); 8]; 32] — blk = w*16 + b_med");
+            println!("pub(crate) static CENSUS_{}: [[(u64, u64); 8]; 32] = [", name.to_uppercase());
+            let mut n_static_bytes = 0usize;
+            for blk in 0..32 {
+                println!("    [");
+                for k in 0..8 {
+                    let idx = blk * 8 + k;
+                    let mut mask = 0u64;
+                    for j in 0..8 {
+                        if varies[idx] & (1 << j) == 0 {
+                            mask |= 0xffu64 << (8 * j);
+                        }
+                    }
+                    let exp = first[idx] & mask;
+                    n_static_bytes += mask.count_ones() as usize / 8;
+                    println!("        (0x{mask:016x}, 0x{exp:016x}), // blk {blk} K{k}: {} static bytes", mask.count_ones() / 8);
+                }
+                println!("    ],");
+            }
+            println!("];");
+            println!("// {name}: {n_static_bytes} static bytes of {} ({:.1}%)", 32 * 8 * 8, 100.0 * n_static_bytes as f64 / 2048.0);
+        };
+        census(b_bytes, "b");
+        census(a_bytes, "a");
     }
 }
 
