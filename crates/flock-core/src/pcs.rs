@@ -503,15 +503,6 @@ fn direct_fold4_all_claim_mix_supported(
     )
 }
 
-/// Deferred reduction in the direct-fold4 sixteen-bank materializer's
-/// witness fold (`FLOCK_NO_FOLD_DEFERRED_REDUCE=1` restores the two nested
-/// pair-fold passes; same field values either way). Latched once per process.
-#[inline]
-pub(crate) fn fold_deferred_reduce_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FOLD_DEFERRED_REDUCE").is_none())
-}
-
 /// Direct-fold4 enable, latched once per process.
 ///
 /// Default **enabled** for the ranked worker. `FLOCK_NO_OPEN_DIRECT_FOLD4=1`
