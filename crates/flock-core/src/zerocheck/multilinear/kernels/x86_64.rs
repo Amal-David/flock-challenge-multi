@@ -1,5 +1,5 @@
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
-use crate::field::{F128, F256Unreduced};
+use crate::field::gf2_128::x86_64::{f128x4_loadu, WideGhashX4};
+use crate::field::{F256Unreduced, F128};
 
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.
@@ -41,6 +41,102 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
         }
         // F128 is exactly two u64 words and accepts every bit pattern.
         acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+    }
+}
+
+fn r2_nibble_lut_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_NIBBLE").is_none())
+}
+
+/// Dispatch: nibble LUT by default. `FLOCK_NO_R2_NIBBLE=1` restores the
+/// scalar 256-entry XMM loads. Ranked env is cleared so the nibble path
+/// always runs there.
+#[inline(always)]
+pub(crate) unsafe fn fold_round2_pair_x86(
+    table_data: *const F128,
+    nibble: &super::super::FoldNibbleLut,
+    a0_bytes: *const u8,
+    a1_bytes: *const u8,
+    b0_bytes: *const u8,
+    b1_bytes: *const u8,
+) -> [F128; 4] {
+    // SAFETY: caller matches fold_round2_pair_x86_unchecked_8; both callees
+    // are cfg-gated avx512f+vpclmulqdq.
+    unsafe {
+        if r2_nibble_lut_enabled() {
+            fold_round2_pair_x86_nibble(nibble, a0_bytes, a1_bytes, b0_bytes, b1_bytes)
+        } else {
+            fold_round2_pair_x86_unchecked_8(table_data, a0_bytes, a1_bytes, b0_bytes, b1_bytes)
+        }
+    }
+}
+
+/// F₂-linear nibble-LUT fold. `UniSkipFoldTable` is XOR-doubling subset
+/// sums, so `T[byte] = T[n0] ⊕ T[n1 << 4]`. Four rows × one chunk are
+/// looked up with two `vpermi2q` (lo/hi) instead of four data-dependent
+/// 128-bit GPR-indexed loads.
+///
+/// Bit-identical to [`fold_round2_pair_x86_unchecked_8`] on linear tables.
+#[inline(always)]
+pub(crate) unsafe fn fold_round2_pair_x86_nibble(
+    nibble: &super::super::FoldNibbleLut,
+    a0_bytes: *const u8,
+    a1_bytes: *const u8,
+    b0_bytes: *const u8,
+    b1_bytes: *const u8,
+) -> [F128; 4] {
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
+        unsafe {
+            let a = _mm512_load_si512(table as *const __m512i);
+            let b = _mm512_load_si512(table.add(8) as *const __m512i);
+            _mm512_permutex2var_epi64(a, idx, b)
+        }
+    }
+
+    // SAFETY: each row has 8 readable bytes; nibble indices are 0..=15
+    // after AND-0xf so every vpermi2q stays in a 16-entry half. The LUT
+    // is 64-byte aligned by FoldNibbleLut's repr.
+    unsafe {
+        let nibble_mask = _mm512_set1_epi32(0xf);
+        let mut acc_lo = _mm256_setzero_si256();
+        let mut acc_hi = _mm256_setzero_si256();
+        for chunk in 0..8 {
+            let packed = _mm_set_epi32(
+                *b1_bytes.add(chunk) as i32,
+                *b0_bytes.add(chunk) as i32,
+                *a1_bytes.add(chunk) as i32,
+                *a0_bytes.add(chunk) as i32,
+            );
+            let row = _mm512_castsi128_si512(packed);
+            let n0 = _mm512_and_si512(row, nibble_mask);
+            let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(row), nibble_mask);
+            let n0_8 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0));
+            let n1_8 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1));
+            let los = _mm512_xor_si512(
+                lookup8(n0_8, nibble.n0_lo[chunk].as_ptr()),
+                lookup8(n1_8, nibble.n1_lo[chunk].as_ptr()),
+            );
+            let his = _mm512_xor_si512(
+                lookup8(n0_8, nibble.n0_hi[chunk].as_ptr()),
+                lookup8(n1_8, nibble.n1_hi[chunk].as_ptr()),
+            );
+            acc_lo = _mm256_xor_si256(acc_lo, _mm512_castsi512_si256(los));
+            acc_hi = _mm256_xor_si256(acc_hi, _mm512_castsi512_si256(his));
+        }
+        let lo: [u64; 4] = core::mem::transmute(acc_lo);
+        let hi: [u64; 4] = core::mem::transmute(acc_hi);
+        // _mm_set_epi32 packed b1,b0,a1,a0 into lanes 3..0, then cvtepu32_epi64
+        // puts them in qword lanes 0..3 as a0,a1,b0,b1.
+        [
+            F128::new(lo[0], hi[0]),
+            F128::new(lo[1], hi[1]),
+            F128::new(lo[2], hi[2]),
+            F128::new(lo[3], hi[3]),
+        ]
     }
 }
 

@@ -38,10 +38,10 @@
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
-use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
+use crate::field::gf2_128::x86_64::{f128x4_loadu, f128x4_set, ghash_mul_x4, WideGhashX4};
+use crate::field::{F256Unreduced, F128, PHI_8_TABLE};
+use crate::zerocheck::univariate_skip::{build_eq, pack_bits, SplitEqGhash};
 use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
@@ -54,7 +54,10 @@ use kernels::aarch64::{round2_chunk_raw_neon, round2_chunk_raw_neon_q};
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+use kernels::x86_64::{
+    fold_and_message_x86_avx512, fold_round2_pair_x86, fold_round2_pair_x86_nibble,
+    fold_round2_pair_x86_unchecked_8,
+};
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
@@ -357,10 +360,50 @@ pub fn uni_skip_fold_and_round_pair_naive(
 ///
 /// Per-row fold then becomes one table lookup + XOR per byte (n_chunks lookups
 /// total instead of `ell` Lagrange multiplications).
+///
+/// Production tables are F₂-linear XOR-doubling subset sums, so
+/// `data[j*256 + byte] = data[j*256 + n0] ⊕ data[j*256 + (n1 << 4)]`. The
+/// SoA nibble halves live in [`FoldNibbleLut`] for the AVX-512 `vpermi2q`
+/// kernel; the 256-entry `data` vector remains the scalar / kill-switch oracle.
 #[derive(Clone, Debug)]
 pub struct UniSkipFoldTable {
     pub n_chunks: usize,
     pub data: Vec<F128>,
+    #[allow(dead_code)] // consumed by AVX-512 nibble kernel; unused on AVX2 hosts
+    pub(crate) nibble: FoldNibbleLut,
+}
+
+/// 16-entry SoA nibble tables for each of the 8 byte-chunks. Layout is
+/// 64-byte aligned so `vpermi2q` can `_mm512_load_si512` each half.
+#[derive(Clone, Debug)]
+#[repr(C, align(64))]
+pub(crate) struct FoldNibbleLut {
+    pub n0_lo: [[u64; 16]; 8],
+    pub n0_hi: [[u64; 16]; 8],
+    pub n1_lo: [[u64; 16]; 8],
+    pub n1_hi: [[u64; 16]; 8],
+}
+
+impl FoldNibbleLut {
+    fn from_byte_tables(data: &[F128], n_chunks: usize) -> Self {
+        let mut lut = Self {
+            n0_lo: [[0; 16]; 8],
+            n0_hi: [[0; 16]; 8],
+            n1_lo: [[0; 16]; 8],
+            n1_hi: [[0; 16]; 8],
+        };
+        let n = n_chunks.min(8);
+        for j in 0..n {
+            let base = j * 256;
+            for i in 0..16 {
+                lut.n0_lo[j][i] = data[base + i].lo;
+                lut.n0_hi[j][i] = data[base + i].hi;
+                lut.n1_lo[j][i] = data[base + (i << 4)].lo;
+                lut.n1_hi[j][i] = data[base + (i << 4)].hi;
+            }
+        }
+        lut
+    }
 }
 
 impl UniSkipFoldTable {
@@ -387,7 +430,12 @@ impl UniSkipFoldTable {
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
         }
-        Self { n_chunks, data }
+        let nibble = FoldNibbleLut::from_byte_tables(&data, n_chunks);
+        Self {
+            n_chunks,
+            data,
+            nibble,
+        }
     }
 
     /// Scalar one-row fold: `Σ_j table[j][bytes[j]]`. Ports the NEON
@@ -560,8 +608,9 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
                         let x0g = base + x0l;
                         let x1g = x0g + 1;
-                        let folded = fold_round2_pair_x86_unchecked_8(
+                        let folded = fold_round2_pair_x86(
                             table_ptr,
+                            &table.nibble,
                             a_pkt_ptr.add(x0g * 8),
                             a_pkt_ptr.add(x1g * 8),
                             b_pkt_ptr.add(x0g * 8),
@@ -603,8 +652,9 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
                     let x0g = base + x0l;
                     let x1g = x0g + 1;
-                    let [a0, a1, b0, b1] = fold_round2_pair_x86_unchecked_8(
+                    let [a0, a1, b0, b1] = fold_round2_pair_x86(
                         table_ptr,
+                        &table.nibble,
                         a_pkt_ptr.add(x0g * 8),
                         a_pkt_ptr.add(x1g * 8),
                         b_pkt_ptr.add(x0g * 8),
@@ -816,8 +866,7 @@ pub fn fold_and_compute_round_pair_into(
     // `FLOCK_NO_NT_TAIL` is a local-diagnostics kill switch for A/B runs;
     // the ranked worker's cleared environment never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt_stores =
-        half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
+    let use_nt_stores = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
     // q-form (all-NEON) kernel gate. The scalar-struct leaf keeps F128 halves
     // in GPRs and pays a fmov per PMULL operand; the q-form leaf keeps every
     // value in NEON registers (bit-identical output). Unlike the v1 leaf it
@@ -877,15 +926,17 @@ pub fn fold_and_compute_round_pair_into(
                                     lo_size,
                                     r_fold,
                                 ),
-                                (true, false) => kernels::aarch64::tail_fold_chunk_q::<true, false>(
-                                    a_in.as_ptr(),
-                                    b_in.as_ptr(),
-                                    a_out.as_mut_ptr(),
-                                    b_out.as_mut_ptr(),
-                                    eq_lo.as_ptr(),
-                                    lo_size,
-                                    r_fold,
-                                ),
+                                (true, false) => {
+                                    kernels::aarch64::tail_fold_chunk_q::<true, false>(
+                                        a_in.as_ptr(),
+                                        b_in.as_ptr(),
+                                        a_out.as_mut_ptr(),
+                                        b_out.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        lo_size,
+                                        r_fold,
+                                    )
+                                }
                                 (false, _) => kernels::aarch64::tail_fold_chunk_q::<false, false>(
                                     a_in.as_ptr(),
                                     b_in.as_ptr(),
@@ -1474,7 +1525,11 @@ mod tests {
             assert_eq!(b_ref, b_q, "folded b mismatch at lo_size={lo_size}");
             assert_eq!(p1_ref, p1_q, "p1 mismatch at lo_size={lo_size}");
             assert_eq!(pinf_ref, pinf_q, "pinf mismatch at lo_size={lo_size}");
-            assert_eq!((a_v1, b_v1), (a_q, b_q), "v1/q fold divergence at lo_size={lo_size}");
+            assert_eq!(
+                (a_v1, b_v1),
+                (a_q, b_q),
+                "v1/q fold divergence at lo_size={lo_size}"
+            );
             assert_eq!(
                 (p1_v1, pinf_v1),
                 (p1_q, pinf_q),
@@ -1497,7 +1552,11 @@ mod tests {
                 )
             };
             assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "ldnp variant fold mismatch");
-            assert_eq!(m_nt_ldnp, (p1_ref, pinf_ref), "ldnp variant message mismatch");
+            assert_eq!(
+                m_nt_ldnp,
+                (p1_ref, pinf_ref),
+                "ldnp variant message mismatch"
+            );
             // SAFETY: same contract as above.
             let m_reg = unsafe {
                 kernels::aarch64::tail_fold_chunk_q::<false, false>(
@@ -1510,8 +1569,16 @@ mod tests {
                     r_fold,
                 )
             };
-            assert_eq!((&a_ref, &b_ref), (&a_v, &b_v), "regular-store variant fold mismatch");
-            assert_eq!(m_reg, (p1_ref, pinf_ref), "regular-store variant message mismatch");
+            assert_eq!(
+                (&a_ref, &b_ref),
+                (&a_v, &b_v),
+                "regular-store variant fold mismatch"
+            );
+            assert_eq!(
+                m_reg,
+                (p1_ref, pinf_ref),
+                "regular-store variant message mismatch"
+            );
         }
     }
     /// The q-form round-2 message leaf is bit-identical to the scalar-struct
@@ -1585,6 +1652,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fold_table_byte_equals_nibble_xor() {
+        let mut rng = Rng::new(71);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        assert_eq!(table.n_chunks, 8);
+        for j in 0..8 {
+            let base = j * 256;
+            for byte in 0usize..256 {
+                let n0 = byte & 0xf;
+                let n1 = (byte >> 4) << 4;
+                assert_eq!(
+                    table.data[base + byte],
+                    table.data[base + n0] + table.data[base + n1],
+                    "chunk={j} byte={byte:#04x}"
+                );
+            }
+        }
+    }
+
     /// Four-row x86 lookup fold matches four independent scalar folds.
     #[cfg(all(
         target_arch = "x86_64",
@@ -1614,7 +1700,17 @@ mod tests {
                     rows[3].as_ptr(),
                 )
             };
-            assert_eq!(actual, expected);
+            let nibble = unsafe {
+                fold_round2_pair_x86_nibble(
+                    &table.nibble,
+                    rows[0].as_ptr(),
+                    rows[1].as_ptr(),
+                    rows[2].as_ptr(),
+                    rows[3].as_ptr(),
+                )
+            };
+            assert_eq!(actual, expected, "gpr vs scalar");
+            assert_eq!(nibble, expected, "nibble vs scalar");
         }
     }
 
