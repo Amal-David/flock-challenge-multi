@@ -1400,6 +1400,366 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
 }
 
+// ---------------------------------------------------------------------------
+// DirectFold4: 32-bank (q-retained) C capture for the sixteen-bank PCS open.
+//
+// The incumbent DirectC capture folds all four medium coordinates into the
+// mask (`X^{b_med}`, γ = X, times `D⁻¹`). The direct-fold4 opening wants the
+// low two medium coordinates `q = b_med & 3` RETAINED, so the producer emits
+// 32 α-free banks `bank[q][K][lane] = Σ_x eq_lo(x)·D_hi⁻¹·Σ_j X^{4j}·bit_K(c[x][4j+q][lane])`
+// (only the high-medium factor `X^{4j}` and its normalisation `D_hi⁻¹ =
+// ((1+γ⁴)(1+γ⁸))⁻¹` are absorbed). Collapsing under `eq_med_lo(q) = X^q·D_lo⁻¹`
+// gives back the incumbent eight banks EXACTLY (field distributivity, `D =
+// D_lo·D_hi`), so the round-1 message / `s_hat_v_c` / `quad_c` are bit-identical.
+//
+// Four-block fusion: four consecutive `x_outer_lo` windows share one drain
+// call. The synthetic 16-row block for retained `q` has row `4w + j` =
+// transpose(c[x_lo+w][b_med = 4j+q]) and the synthetic 512-entry mask table
+// has `t_lo[byte] = T4[x_lo][byte&15] + T4[x_lo+1][byte>>4]`,
+// `t_hi[byte] = T4[x_lo+2][byte&15] + T4[x_lo+3][byte>>4]` with
+// `T4[x][m] = (Σ_{j∈m} X^{4j})·eq_lo[x]·D_hi⁻¹` — so the UNCHANGED eight-bank
+// drain kernels (`accumulate_c_banks*`) compute the 32-bank capture at exactly
+// the incumbent's per-window cost (same lookups, same RMWs, same mask ops).
+// ---------------------------------------------------------------------------
+
+/// Number of retained low-medium values (`q = b_med & 3`).
+pub(crate) const N_C_Q: usize = 4;
+
+/// `D_hi⁻¹ = ((1+γ⁴)(1+γ⁸))⁻¹` — the high-medium half of [`d_inv`].
+fn compute_d_hi_inv() -> F128 {
+    let g4 = F128 { lo: 1u64 << 4, hi: 0 };
+    let g8 = F128 { lo: 1u64 << 8, hi: 0 };
+    ((F128::ONE + g4) * (F128::ONE + g8)).inv()
+}
+
+static D_HI_INV_CACHE: OnceLock<F128> = OnceLock::new();
+pub(crate) fn d_hi_inv() -> F128 {
+    *D_HI_INV_CACHE.get_or_init(compute_d_hi_inv)
+}
+
+/// `eq_med_lo(q) = eq(β₀, q₀)·eq(β₁, q₁) = X^q · D_lo⁻¹` for `q ∈ 0..4`, in the
+/// little-endian order of `build_eq(&[β₀, β₁])` — the weights that collapse
+/// the four retained-q bank groups back to the incumbent eight banks.
+pub(crate) fn c_fold4_q_weights() -> [F128; N_C_Q] {
+    let beta = medium_challenges_ghash();
+    super::univariate_skip::build_eq(&beta[..2])
+        .try_into()
+        .expect("two-coordinate eq has four entries")
+}
+
+/// Whether the four-window fold4 producer can run for this `eq` split.
+#[inline]
+pub(crate) fn c_fold4_capture_shape_ok(big_lo_size: usize) -> bool {
+    big_lo_size.is_multiple_of(4)
+}
+
+/// Shape predicate the zerocheck driver uses to pick the fold4 producer:
+/// the outer eq split (`SplitEqGhash::new(&r[k_skip + N_INNER..])`) must
+/// leave a multiple-of-four low half (true for every `m >= 22`, in
+/// particular the ranked `m = 32`).
+pub fn c_fold4_capture_available(m: usize, k_skip: usize) -> bool {
+    if k_skip != K_SKIP || m < k_skip + N_INNER {
+        return false;
+    }
+    let n = m - k_skip - N_INNER;
+    let n_lo = n - n.min(SplitEqGhash::MAX_N_HI);
+    c_fold4_capture_shape_ok(1usize << n_lo)
+}
+
+/// Synthetic 512-entry mask tables, one per group of four consecutive
+/// `x_outer_lo` windows (see the module comment above). Layout per group:
+/// `[t_lo[256], t_hi[256]]`, exactly the shape `accumulate_c_banks*` expect.
+fn build_c_fold4_tables(eq_lo: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+    assert!(eq_lo.len().is_multiple_of(4));
+    let d_hi_inv_val = d_hi_inv();
+    let mut tables = crate::scratch::take_f128((eq_lo.len() / 4) * C_MASK_TABLE_STRIDE);
+    tables
+        .par_chunks_mut(C_MASK_TABLE_STRIDE)
+        .zip(eq_lo.par_chunks_exact(4))
+        .for_each(|(slot, eqs)| {
+            // T4[w][m] for the four windows: subset sums of X^{4j}·(eq_lo·D_hi⁻¹).
+            let mut t4 = [[F128::ZERO; 16]; 4];
+            for (w, &eq) in eqs.iter().enumerate() {
+                let mut gens = [F128::ZERO; 4];
+                gens[0] = eq * d_hi_inv_val;
+                for j in 1..4 {
+                    let mut v = gens[j - 1];
+                    for _ in 0..4 {
+                        v = mul_by_x(v);
+                    }
+                    gens[j] = v;
+                }
+                let t = &mut t4[w];
+                t[0] = F128::ZERO;
+                for j in 0..4 {
+                    let (done, rest) = t.split_at_mut(1 << j);
+                    for (out, seen) in rest[..1 << j].iter_mut().zip(done.iter()) {
+                        *out = *seen + gens[j];
+                    }
+                }
+            }
+            let (t_lo, t_hi) = slot.split_at_mut(256);
+            for byte in 0..256usize {
+                t_lo[byte] = t4[0][byte & 15] + t4[1][byte >> 4];
+                t_hi[byte] = t4[2][byte & 15] + t4[3][byte >> 4];
+            }
+        });
+    tables
+}
+
+/// Per-worker state for the four-window fold4 producer.
+pub(crate) struct WorkerStateFold4 {
+    partial_ab: [F128; ELL],
+    partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
+    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    /// Synthetic C blocks, one per retained q: row `4w + j` holds window w's
+    /// transposed row `b_med = 4j + q`.
+    chunk_c4: Box<[[[u8; 64]; 16]; N_C_Q]>,
+    a_col: [F8; ELL],
+    b_col: [F8; ELL],
+    pub(crate) local_res_ab: [F128; ELL],
+    pub(crate) local_res_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
+}
+
+impl WorkerStateFold4 {
+    pub(crate) fn new() -> Self {
+        Self {
+            partial_ab: [F128::ZERO; ELL],
+            partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_c4: Box::new([[[0u8; 64]; 16]; N_C_Q]),
+            a_col: [F8::ZERO; ELL],
+            b_col: [F8::ZERO; ELL],
+            local_res_ab: [F128::ZERO; ELL],
+            local_res_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+        }
+    }
+}
+
+/// Fold4 twin of [`process_one_x_hi_with_precomputed_ab`]: identical AB
+/// completion per window; C drained four windows at a time into 32 banks.
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab_fold4(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    c_packed: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    fold4_tables: &[F128],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    c_nibble_luts: &[kernels::CBankNibbleLut],
+    state: &mut WorkerStateFold4,
+) {
+    debug_assert!(big_lo_size.is_multiple_of(4));
+    let _ = (&mut state.a_col, &mut state.b_col);
+    state.partial_ab.fill(F128::ZERO);
+    for group in state.partial_c4.iter_mut() {
+        for bank in group.iter_mut() {
+            bank.fill(F128::ZERO);
+        }
+    }
+    let n_lo = n_lo_and_inner - N_INNER;
+    for group in 0..big_lo_size / 4 {
+        let mut any_live = false;
+        for w in 0..4 {
+            let x_outer_lo = 4 * group + w;
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            let chunk_byte_base =
+                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            // C rows: live rows transposed into their (q, 4w+j) slot, dead rows zeroed.
+            for b_med in 0..(1 << N_MEDIUM) {
+                let q = b_med & 3;
+                let j = b_med >> 2;
+                let dst = &mut state.chunk_c4[q][4 * w + j];
+                if b_med < n_b_med {
+                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                    let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                        .try_into()
+                        .expect("64 c-bytes per medium position");
+                    bit_transpose_64bytes(c_in, dst);
+                } else {
+                    dst.fill(0);
+                }
+            }
+            if n_b_med == 0 {
+                continue;
+            }
+            any_live = true;
+            // AB completion: identical to the incumbent per-window path.
+            for b_med in 0..n_b_med {
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
+            kernels::accumulate_convert_ab(
+                &state.chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut state.partial_ab,
+            );
+        }
+        if !any_live {
+            continue;
+        }
+        let c_tables =
+            &fold4_tables[group * C_MASK_TABLE_STRIDE..(group + 1) * C_MASK_TABLE_STRIDE];
+        for q in 0..N_C_Q {
+            // SAFETY: `[[u8; 64]; 16]` is contiguous and has exactly 1024 bytes.
+            let c_block: &[u8; 16 * 64] =
+                unsafe { &*state.chunk_c4[q].as_ptr().cast::<[u8; 16 * 64]>() };
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            kernels::accumulate_c_banks_prebuilt(
+                c_block,
+                1 << N_MEDIUM,
+                c_tables,
+                &c_nibble_luts[group],
+                &mut state.partial_c4[q],
+            );
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            kernels::accumulate_c_banks(c_block, 1 << N_MEDIUM, c_tables, &mut state.partial_c4[q]);
+        }
+    }
+    for lane in 0..ELL {
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        for q in 0..N_C_Q {
+            for bank in 0..N_C_BANKS {
+                state.local_res_c4[q][bank][lane] += eq_hi_val * state.partial_c4[q][bank][lane];
+            }
+        }
+    }
+}
+
+/// Collapse the 32 q-retained banks to the incumbent eight (exact), then run
+/// the incumbent finish; additionally emit the sixteen-bank direct-fold4
+/// tensor `fold4_c[(e + 4q)·128 + b₀·64 + lane] = banks[q][b₀ + 2e][lane]`
+/// (bank index `e_small + 4·q`, matching `build_eq(suffix[..4])`).
+fn finish_c_banks_fold4(
+    banks32: &[[[F128; ELL]; N_C_BANKS]; N_C_Q],
+) -> ([F128; ELL], Vec<F128>, Vec<F128>, Vec<F128>) {
+    let w = c_fold4_q_weights();
+    let mut banks8 = [[F128::ZERO; ELL]; N_C_BANKS];
+    for q in 0..N_C_Q {
+        for k in 0..N_C_BANKS {
+            for lane in 0..ELL {
+                banks8[k][lane] += w[q] * banks32[q][k][lane];
+            }
+        }
+    }
+    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks8);
+    let mut fold4_c = vec![F128::ZERO; 16 * 2 * ELL];
+    for q in 0..N_C_Q {
+        for e in 0..4 {
+            for b_0 in 0..2 {
+                let base = (e + 4 * q) * 2 * ELL + b_0 * ELL;
+                fold4_c[base..base + ELL].copy_from_slice(&banks32[q][b_0 + 2 * e]);
+            }
+        }
+    }
+    (res_c_s, s_hat_v_c, quad_c, fold4_c)
+}
+
+/// Fold4 twin of [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad`]:
+/// same `(ab, c_lifted, s_hat_v_c, quad_c)` bit-for-bit, plus the sixteen-bank
+/// C tensor. Requires `c_fold4_capture_shape_ok(1 << eq.n_lo)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+    ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    assert!(
+        c_fold4_capture_shape_ok(big_lo_size),
+        "fold4 C capture needs a multiple-of-four low split"
+    );
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let convert = convert_table();
+    let fold4_tables = build_c_fold4_tables(&eq.lo);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let c_nibble_luts = kernels::build_c_bank_nibble_luts(&fold4_tables);
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+    let (res_ab, banks32) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateFold4::new, |mut state, x_hi| {
+            process_one_x_hi_with_precomputed_ab_fold4(
+                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
+                ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
+                &fold4_tables,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                &c_nibble_luts,
+                &mut state,
+            );
+            state
+        })
+        .map(|s| (s.local_res_ab, s.local_res_c4))
+        .reduce(
+            || ([F128::ZERO; ELL], Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q])),
+            |(mut ab1, mut c1), (ab2, c2)| {
+                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for (lq, rq) in c1.iter_mut().zip(c2.iter()) {
+                    for (left, right) in lq.iter_mut().zip(rq.iter()) {
+                        for i in 0..ELL { left[i] += right[i]; }
+                    }
+                }
+                (ab1, c1)
+            },
+        );
+    crate::scratch::give_f128(fold4_tables);
+    let (res_c_s, s_hat_v_c, quad_c, fold4_c) = finish_c_banks_fold4(&banks32);
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c, fold4_c)
+}
+
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
 /// no rayon. Kept under `#[cfg(test)]` as the cross-check oracle for the
 /// parallel version: future "optimizations" to the parallel path must still
@@ -2414,6 +2774,101 @@ mod tests {
                 &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
             );
             assert_eq!(pre, fused, "precomputed DirectC mismatch at m={m}");
+        }
+    }
+
+    /// The four-window 32-bank fold4 producer must reproduce the incumbent
+    /// `(ab, c_lifted, s_hat_v_c, quad_c)` BYTE-FOR-BYTE (its 32→8 collapse is
+    /// exact field algebra), and its sixteen-bank tensor must collapse under
+    /// `suffix[..4] = [small₁, small₂, β₀, β₁]` to the wire `s_hat_v_c`.
+    /// m=22 is the smallest shape where the outer split leaves a
+    /// multiple-of-four low half (`c_fold4_capture_available`); m=24 adds a
+    /// non-trivial `n_hi`.
+    #[test]
+    fn fold4_c_capture_matches_quad_and_collapses() {
+        use crate::pcs::ring_switch::{collapse_s_hat_v_fold4, collapse_s_hat_v_quad};
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        let small = small_challenges_ghash();
+        let beta = medium_challenges_ghash();
+        let low_point4 = [small[1], small[2], beta[0], beta[1]];
+        let low_point2 = [small[1], small[2]];
+        assert!(!c_fold4_capture_available(21, K_SKIP));
+        assert!(c_fold4_capture_available(22, K_SKIP));
+        assert!(c_fold4_capture_available(32, K_SKIP));
+        // Collapse weights are exactly eq(β₀,β₁; q) = X^q·D_lo⁻¹.
+        let w = c_fold4_q_weights();
+        let d_lo_inv = ((F128::ONE + F128 { lo: 2, hi: 0 }) * (F128::ONE + F128 { lo: 4, hi: 0 })).inv();
+        for q in 0..4usize {
+            assert_eq!(w[q], F128 { lo: 1u64 << q, hi: 0 } * d_lo_inv, "q weight {q}");
+        }
+        assert_eq!(d_hi_inv() * d_lo_inv, d_inv(), "D⁻¹ = D_lo⁻¹·D_hi⁻¹");
+
+        let cases = [
+            (22usize, None),
+            (22, Some((14usize, 15_409usize))),
+            (24, Some((14usize, 15_409usize))),
+        ];
+        for (m, padded) in cases {
+            let mut rng = Rng::new(0xF01D_4C0D_u64.wrapping_add(m as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let mut c = rng.bits(total_bits);
+            let padding = match padded {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for block in 0..(total_bits / block_size) {
+                        for offset in useful_bits..block_size {
+                            let index = block * block_size + offset;
+                            a[index] = false;
+                            b[index] = false;
+                            c[index] = false;
+                        }
+                    }
+                    PaddingSpec { k_log, useful_bits_per_block: useful_bits }
+                }
+            };
+            let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+            let mut precomputed = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let quad_route = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+                &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+            );
+            let mut precomputed4 = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let (ab, c_l, s_hat_v_c, quad_c, fold4_c) =
+                round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
+                    &mut precomputed4, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                );
+            assert_eq!(ab, quad_route.0, "fold4 route AB mismatch at m={m}");
+            assert_eq!(c_l, quad_route.1, "fold4 route C-lifted mismatch at m={m}");
+            assert_eq!(s_hat_v_c, quad_route.2, "fold4 route s_hat_v_c mismatch at m={m}");
+            assert_eq!(quad_c, quad_route.3, "fold4 route quad_c mismatch at m={m}");
+            assert_eq!(fold4_c.len(), 16 * 2 * ELL);
+            assert_eq!(
+                collapse_s_hat_v_fold4(&fold4_c, &low_point4),
+                s_hat_v_c,
+                "fold4 tensor must collapse to the wire s_hat_v_c at m={m}"
+            );
+            assert_eq!(collapse_s_hat_v_quad(&quad_c, &low_point2), s_hat_v_c);
+            // The 16 fold4 banks collapse under (β₀,β₁) to the 4 quad banks.
+            let n_packed = 2 * ELL;
+            for e in 0..4 {
+                for packed in 0..n_packed {
+                    let mut acc = F128::ZERO;
+                    for q in 0..4 {
+                        acc += w[q] * fold4_c[(e + 4 * q) * n_packed + packed];
+                    }
+                    assert_eq!(acc, quad_c[e * n_packed + packed], "bank collapse e={e} p={packed}");
+                }
+            }
         }
     }
 

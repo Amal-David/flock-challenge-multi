@@ -185,6 +185,25 @@ fn zero_lane_skip_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_LANE_SKIP").is_some())
 }
 
+/// `FLOCK_NO_NTT_TOP_FUSION=1` restores the incumbent two-pass top-layer
+/// schedule (fused-four sweep, then fused-two sweep) in the same binary; the
+/// default fuses six top layers into one cache-blocked DRAM pass. See
+/// [`AdditiveNttF128::top_fused6_pass`].
+fn ntt_top_fusion_disabled() -> bool {
+    #[cfg(test)]
+    if TOP_FUSION_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_TOP_FUSION").is_some())
+}
+
+/// Test-only latch: forces the incumbent top schedule without touching the
+/// process environment, so one process can compare both schedules.
+#[cfg(test)]
+static TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
 ///
 /// The ambient publication is honored ONLY at the exact ranked production
@@ -694,6 +713,136 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// One cache-blocked DRAM pass applying six consecutive top layers
+    /// `layer..layer+6` (whole-buffer strided layers) of the interleaved
+    /// transform.
+    ///
+    /// Geometry: at `layer` a block holds `B = 2^(log_d − layer)` positions
+    /// and there are `2^layer` blocks. Let `S = B / 64`. A task is one
+    /// `(block, r)` with `r ∈ 0..S`; it owns the 64 rows at positions
+    /// `block·B + r + k·S` for `k ∈ 0..64` (row = `num_ntts` F128). Those 64
+    /// rows are exactly the closure of that row set under the butterflies of
+    /// layers `layer..layer+6`:
+    /// - layers `layer..layer+4` (fused-four, sixteenth = `B/16 = 4S`):
+    ///   the four row groups `{k ≡ j (mod 4)}`, `j ∈ 0..4`, each 16 rows
+    ///   spaced `4S` apart, i.e. the incumbent fused-four row group with
+    ///   `r' = r + j·S`;
+    /// - layers `layer+4, layer+5` (fused-two, quarter = `S`): the sixteen
+    ///   quads `k ∈ {4m..4m+4}`, i.e. the incumbent fused-two task
+    ///   `(block·16 + m, r)`.
+    ///
+    /// The 64 rows sit `S·num_ntts·16` bytes apart in memory (2 MiB at the
+    /// ranked shape — a power-of-two stride that maps every row onto the same
+    /// L1/L2 sets), so the task copies them into a contiguous per-worker
+    /// staging block, runs the two kernels there (fused-four with
+    /// `sixteenth = 4`, fused-two on adjacent quads), and copies back. The
+    /// two copies are L2-local; the DRAM traffic is one read and one write of
+    /// each row for all six layers, instead of the incumbent's two full-buffer
+    /// read+write sweeps.
+    ///
+    /// Zero-lane skip: every row of a task has the parity of `r` and every
+    /// stride is a multiple of `S`, so the lane bound is `row_lanes(r, …)`
+    /// under the same even-stride guards the incumbent sweeps use
+    /// (`4S` even for the fused-four rows, `S` even for the fused-two quads).
+    /// Rows are copied whole, so the (zero) tail lanes round-trip unchanged.
+    fn top_fused6_pass(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        layer: usize,
+        log_d: usize,
+        odd_tail: usize,
+    ) {
+        use rayon::prelude::*;
+        debug_assert!(layer + 6 <= log_d);
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6; // S
+        debug_assert!(sub_stride >= 1);
+        let sixteenth = block_size >> 4; // 4S, the incumbent fused-four stride
+        let quarter = sub_stride; // the incumbent fused-two quarter at layer+4
+        let lanes4_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        let lanes2_tail = if quarter.is_multiple_of(2) { odd_tail } else { 0 };
+
+        // Per-block twiddles for the fused-four levels (layer..layer+4).
+        let tw4: Vec<[F128; 15]> = (0..num_blocks)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(layer + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+
+        let base_addr = data.as_mut_ptr() as usize;
+        let n_tasks = num_blocks * sub_stride;
+        let row_len = num_ntts;
+        let task = |buf: &mut Vec<F128>, idx: usize| {
+            let block = idx / sub_stride;
+            let r = idx % sub_stride;
+            let block_start = block * block_bytes;
+            let lanes4 = row_lanes(r, num_ntts, lanes4_tail);
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            // SAFETY: rows `block_start + (r + k·S)·num_ntts`, k ∈ 0..64, lie
+            // inside block `block` of `data`; distinct (block, r) select
+            // pairwise-disjoint row sets, so no two concurrent tasks touch
+            // the same element. `buf` is this worker's private staging block.
+            unsafe {
+                let base = base_addr as *mut F128;
+                let row_ptr = |k: usize| base.add(block_start + (r + k * sub_stride) * row_len);
+                // Gather: 64 rows → contiguous staging rows k·num_ntts.
+                for k in 0..64 {
+                    core::ptr::copy_nonoverlapping(row_ptr(k), buf.as_mut_ptr().add(k * row_len), row_len);
+                }
+                // Layers layer..layer+4: fused-four on rows {4i + j}, i.e.
+                // sixteenth = 4 in staging-row units, r' = j.
+                let tw = &tw4[block];
+                for j in 0..4 {
+                    kernels::butterfly_fused_4layer_row(buf.as_mut_ptr(), 4, row_len, lanes4, j, tw);
+                }
+                // Layers layer+4, layer+5: fused-two on quads {4m..4m+4};
+                // block index at layer+4 is block·16 + m.
+                for m in 0..16 {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.twiddle(layer + 4, outer_block);
+                    let t_inner_a = self.twiddle(layer + 5, 2 * outer_block);
+                    let t_inner_b = self.twiddle(layer + 5, 2 * outer_block + 1);
+                    let p = buf.as_mut_ptr().add(4 * m * row_len);
+                    let a = std::slice::from_raw_parts_mut(p, lanes2);
+                    let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
+                    let c = std::slice::from_raw_parts_mut(p.add(2 * row_len), lanes2);
+                    let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
+                    kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+                }
+                // Scatter back.
+                for k in 0..64 {
+                    core::ptr::copy_nonoverlapping(buf.as_ptr().add(k * row_len), row_ptr(k), row_len);
+                }
+            }
+        };
+
+        const PARALLEL_TASK_THRESHOLD: usize = 32;
+        if n_tasks < PARALLEL_TASK_THRESHOLD {
+            let mut buf = vec![F128::ZERO; 64 * row_len];
+            for idx in 0..n_tasks {
+                task(&mut buf, idx);
+            }
+        } else {
+            (0..n_tasks)
+                .into_par_iter()
+                .for_each_init(|| vec![F128::ZERO; 64 * row_len], |buf, idx| task(buf, idx));
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -867,13 +1016,24 @@ impl AdditiveNttF128 {
         // portable kernel without changing the production dispatch on CPUs
         // that do not provide AVX-512 VPCLMULQDQ.
         let deep_fused4_ok = fused4_ok || cfg!(test);
+        // Six top layers per DRAM pass (default on AVX-512; portable in
+        // tests): a fused-four sweep followed by a fused-two sweep would read
+        // and write the whole buffer twice; the cache-blocked task below does
+        // both on a 64-row working set that stays in L2, so each top row is
+        // read once and written once for all six layers. Same butterflies,
+        // same order per row, same lane bounds and twiddles → bit-identical.
+        // Not applied on the (dead-on-x86) ordered-streaming arm.
+        let top_fusion_ok = (fused4_ok || cfg!(test)) && stream.is_none() && !ntt_top_fusion_disabled();
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
             let block_bytes = block_size * num_ntts;
 
-            if fused4_ok && layer + 3 < n_top && block_size >= 16 {
+            if top_fusion_ok && layer + 5 < n_top {
+                self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
+                layer += 6;
+            } else if fused4_ok && layer + 3 < n_top && block_size >= 16 {
                 // Fuse four layers (layer..layer+4): one read+write per block
                 // instead of four. Each block contributes a 16-point butterfly.
                 let sixteenth = block_size >> 4;
@@ -2466,6 +2626,58 @@ mod tests {
         });
     }
 
+    /// Six-layer top fusion vs the incumbent two-sweep schedule, same
+    /// process (test latch), at shapes whose top has ≥ 6 layers. The 512-thread
+    /// pool raises `n_top` to 9 so `start_layer = 3` reproduces the ranked top
+    /// structure (fused layers 3..8, then deep 9..) at 1/8 of the size.
+    #[test]
+    fn top_fusion_matches_incumbent_schedule() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0x70F6);
+        // (log_d, num_ntts, start_layer, pool threads)
+        for &(log_d, num_ntts, start_layer, threads) in &[
+            (17usize, 64usize, 0usize, 4usize), // n_top = 6: fused 0..5, no tail top layer
+            (17, 8, 3, 512),                     // n_top = 9: fused 3..8 (ranked shape structure)
+            (17, 8, 0, 512),                     // n_top = 9: fused 0..5, then f2 6-7, single 8
+            (16, 8, 1, 512),                     // n_top = 8: fused 1..6, single 7
+            (15, 4, 0, 512),                     // n_top = 7: fused 0..5, single 6
+        ] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+            let (control, candidate) = pool.install(|| {
+                TOP_FUSION_TEST_OFF.store(true, Ordering::Relaxed);
+                let mut control = original.clone();
+                ntt.forward_transform_interleaved_parallel_from_layer(
+                    &mut control,
+                    num_ntts,
+                    start_layer,
+                );
+                TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+                let mut candidate = original.clone();
+                ntt.forward_transform_interleaved_parallel_from_layer(
+                    &mut candidate,
+                    num_ntts,
+                    start_layer,
+                );
+                (control, candidate)
+            });
+            let mut expected = original.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, num_ntts, start_layer);
+            assert!(
+                control == expected,
+                "incumbent schedule mismatch at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
+            );
+            assert!(
+                candidate == expected,
+                "top fusion mismatch at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
+            );
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
     fn batched_matches_scalar() {
@@ -2683,6 +2895,53 @@ mod zero_lane_ranked_ab_probe {
         data.extend_from_slice(&msg);
         data.extend_from_slice(&msg);
         data
+    }
+
+    /// Ranked commit geometry: six-layer top fusion vs the incumbent schedule
+    /// with the odd-row zero-lane tail armed (7 lanes), byte-equality of the
+    /// whole 1 GiB transform plus interleaved min-of-N timing.
+    #[test]
+    #[ignore = "ranked shape: ~3 GiB resident"]
+    fn top_fusion_ranked_ab() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        const NUM_NTTS: usize = 64;
+        let ntt = AdditiveNttF128::standard(20);
+        let pristine = ranked_buffer(0x70F6_0BEE_D00D_5678);
+        let _g = ZeroOddTailLanes::scope(NUM_NTTS, 7);
+
+        TOP_FUSION_TEST_OFF.store(true, Ordering::Relaxed);
+        let mut control = pristine.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut control, NUM_NTTS, 3);
+        TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+        let mut candidate = pristine.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut candidate, NUM_NTTS, 3);
+        assert!(control == candidate, "top fusion changed the ranked transform output");
+        drop(candidate);
+        drop(control);
+
+        let mut best = [f64::MAX; 2];
+        for rep in 0..6 {
+            for arm in 0..2 {
+                TOP_FUSION_TEST_OFF.store(arm == 0, Ordering::Relaxed);
+                let mut data = pristine.clone();
+                let t = Instant::now();
+                ntt.forward_transform_interleaved_from_layer(&mut data, NUM_NTTS, 3);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(&data);
+                if ms < best[arm] {
+                    best[arm] = ms;
+                }
+                let name = if arm == 0 { "incumbent" } else { "fused6" };
+                println!("rep={rep} arm={name} ms={ms:.2}");
+            }
+        }
+        TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
+        let delta = (best[0] - best[1]) / best[0] * 100.0;
+        println!(
+            "MIN incumbent={:.2} ms  fused6={:.2} ms  delta={delta:+.2}%",
+            best[0], best[1]
+        );
     }
 
     #[test]
