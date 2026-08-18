@@ -494,6 +494,28 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
 
+/// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
+/// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
+/// its leaves are still cache-hot, from inside the NTT rayon job (where a
+/// nested `par_chunks_mut` would oversubscribe the pool).
+pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    debug_assert_eq!(read.len(), 2 * write.len());
+    // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
+    // initialized bytes with no padding.
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    match kind {
+        HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 => {
+            for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
+                *o = Sha256::digest(children).into();
+            }
+        }
+    }
+}
+
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
 /// Children are contiguous 64-byte spans of the level below, so both hashes

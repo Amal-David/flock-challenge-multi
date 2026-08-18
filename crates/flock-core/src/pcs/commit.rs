@@ -299,6 +299,24 @@ fn finalize_commit(
     let mut merkle_tree: Vec<Hash> = take_tree(2 * n_leaves - 1);
     let tree_addr = merkle_tree.as_mut_ptr() as usize;
 
+    // Subtree parents while hot: after a deep-pass sub-group's leaves are
+    // hashed (still on this worker, still L2-resident), fold that sub-group's
+    // own Merkle subtree — every level whose nodes depend only on this
+    // sub-group's leaves — into the same flat tree. Sub-groups are disjoint,
+    // power-of-two sized and aligned at the ranked shape (512 × 2048 leaves),
+    // so each subtree is self-contained through `log2(len)` levels and its
+    // node ranges at every level are pairwise disjoint across workers. The
+    // post-join `build_upper_levels` then starts from the sub-group roots
+    // instead of re-reading the whole 32 MiB leaf level (and 16+8+… MiB of
+    // parents) cold, level by level, with a rayon barrier per level.
+    // `local_levels` records the fold depth every sub-group achieved
+    // (usize::MAX = unset); any sub-group that cannot fold (unaligned, not a
+    // power of two, mismatched depth) sets it to 0 and the incumbent full
+    // upper-level build runs — those levels are simply rewritten, so a partial
+    // local fold is never wrong, only wasted.
+    let subtree_parents = subtree_parents_enabled();
+    let local_levels = AtomicUsize::new(usize::MAX);
+
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
         z_packed,
@@ -324,6 +342,66 @@ fn finalize_commit(
                 )
             };
             merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+
+            if !subtree_parents {
+                return;
+            }
+            let len = range.len();
+            let depth = if len.is_power_of_two()
+                && len >= 2
+                && range.start % len == 0
+                && n_leaves % len == 0
+            {
+                len.trailing_zeros() as usize
+            } else {
+                0
+            };
+            // Publish this sub-group's depth; every sub-group must agree.
+            let seen = match local_levels.compare_exchange(
+                usize::MAX,
+                depth,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => depth,
+                Err(prev) => prev,
+            };
+            if seen != depth {
+                local_levels.store(0, Ordering::Release);
+            }
+            if depth == 0 || seen == 0 {
+                return;
+            }
+            // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
+            // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
+            // nodes [start >> j, (start + len) >> j) of it.
+            let mut lvl_read_off = range.start; // level 0 = leaves
+            let mut lvl_read_len = len;
+            for j in 1..=depth {
+                let nodes_j = n_leaves >> j;
+                let base_j = 2 * n_leaves - 2 * nodes_j;
+                let write_off = base_j + (range.start >> j);
+                let write_len = len >> j;
+                // SAFETY: the read range is this worker's own just-written
+                // nodes of level j−1 (leaves for j = 1); the write range is
+                // this worker's own disjoint slice of level j. Both are inside
+                // the 2·n_leaves−1 tree and never alias each other.
+                let (read, write) = unsafe {
+                    (
+                        core::slice::from_raw_parts(
+                            (tree_addr as *const Hash).add(lvl_read_off),
+                            lvl_read_len,
+                        ),
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(write_off),
+                            write_len,
+                        ),
+                    )
+                };
+                merkle::hash_pairs_level_serial(read, write, kind);
+                lvl_read_off = write_off;
+                lvl_read_len = write_len;
+            }
         },
     );
     if timing {
@@ -333,12 +411,17 @@ fn finalize_commit(
         );
     }
     let t_merkle = std::time::Instant::now();
-    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves, kind);
+    let folded = match local_levels.load(Ordering::Acquire) {
+        usize::MAX | 0 => 0,
+        d => d,
+    };
+    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves >> folded, kind);
     let root = merkle_tree[2 * n_leaves - 2];
     if timing {
         eprintln!(
-            "[commit-timing] merkle: {:.2} ms",
-            t_merkle.elapsed().as_secs_f64() * 1e3
+            "[commit-timing] merkle: {:.2} ms (subtree levels folded in-callback: {})",
+            t_merkle.elapsed().as_secs_f64() * 1e3,
+            folded
         );
     }
 
@@ -549,6 +632,16 @@ fn cpu_join_hash_leaves(
             );
         }
     });
+}
+
+/// `FLOCK_NO_MERKLE_SUBTREE_PARENTS=1` disables the in-callback subtree fold
+/// (exact A/B control: the full upper-level build then runs as before).
+/// Resolved once per process.
+pub(crate) fn subtree_parents_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none()
+    });
+    *ON
 }
 
 /// Build tree levels from the level with `from_nodes` nodes up to the root,
