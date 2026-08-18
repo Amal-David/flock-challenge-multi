@@ -27,9 +27,10 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_optimized_packed_padded,
+    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    fold2_plain_and_round4_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
+    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -40,6 +41,28 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+/// Test-only forced-off latch for the two-challenge lookahead. Production
+/// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
+/// instead so it never has to mutate the process environment. Flipping it
+/// cannot make a concurrently running test wrong — both routes emit the same
+/// transcript, which is exactly what that test asserts.
+#[cfg(test)]
+pub(crate) static ZC_LOOKAHEAD_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_LOOKAHEAD=1` restores the incumbent rounds-2..4 route
+/// (round-2 sweep, then two fused tail passes). Same-binary A/B control and
+/// emergency fallback; the ranked worker's cleared environment never sets it,
+/// so the shipped behavior is lookahead-ON at the ranked shape.
+#[inline]
+fn lookahead_off() -> bool {
+    #[cfg(test)]
+    if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+}
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
@@ -388,8 +411,37 @@ fn prove_packed_padded_inner<C: Challenger>(
     crate::gaptime::mark("zc: fold_table built");
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
-        uni_skip_fold_and_round_pair_optimized_packed_padded(
+    // Diagnostics kill switch: FLOCK_NO_TAIL_FUSION=1 routes every tail round
+    // through the unfused two-pass path (fold_in_place_pair, then a separate
+    // round_pair_naive read of the folded arrays) for one-process A/B runs —
+    // and, being the "no fusion at all" oracle, also disables the lookahead.
+    // Transcript bytes are identical either way; the ranked worker's cleared
+    // environment never sets it.
+    let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
+
+    // Two-challenge symbolic lookahead: round three's message is a quadratic
+    // in ρ₁, so its six coefficients ride along inside round two's sweep and
+    // rounds 3+4 collapse into a single composed double-fold pass out of the
+    // round-two tables — deleting the first (largest) tail pass. Value-
+    // identical by construction — F128 is exact and the transcript order
+    // below is untouched — so the kill switch exists purely for same-binary
+    // A/B screening.
+    //
+    // `r[k_skip+1] = 0` (probability 2⁻¹²⁸ for a sampled slot; at the ranked
+    // shape it is the protocol constant φ₈(0x53) ≠ 0) makes W1/W2
+    // unrecoverable from the parity split; that case falls back to the
+    // incumbent route, which stays in the tree as the oracle anyway.
+    // `n_mlv ≥ 6` keeps the composed pass's input ≥ 16 and every eq split at
+    // lo_size ≥ 2. `m ≥ 20` covers the ranked shape (m = 32) and the local
+    // smoke geometry; tiny shapes stay on the incumbent outside tests.
+    let use_lookahead = (m >= 20 || cfg!(test))
+        && n_mlv >= 6
+        && r[k_skip + 1] != F128::ZERO
+        && !no_tail_fusion
+        && !lookahead_off();
+
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
+        let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             a_packed,
             b_packed,
             m,
@@ -398,6 +450,19 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
         );
+        (a, b, m1, mi, Some(la))
+    } else {
+        let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (a, b, m1, mi, None)
+    };
     crate::gaptime::mark("zc: round2 fused fold done");
 
     if zc_timing {
@@ -427,25 +492,69 @@ fn prove_packed_padded_inner<C: Challenger>(
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
     // two persistent buffers. Scratch capacity = N/2 (the largest fused
     // output); only needed when the first round is actually fused.
+    //
+    // With the lookahead, the first output of the tail is the composed pass's
+    // quarter-size table, so the scratch pair is taken at N/4 (the pool's
+    // best-fit hands back the same 2^(m-7)-class buffer either way).
     let n_in = a_mlv.len();
-    let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
+    let first_out = if lookahead.is_some() { n_in / 4 } else { n_in / 2 };
+    let (mut a_nxt, mut b_nxt) = if n_in >= 1024 || lookahead.is_some() {
         (
-            crate::scratch::take_f128(n_in / 2),
-            crate::scratch::take_f128(n_in / 2),
+            crate::scratch::take_f128(first_out),
+            crate::scratch::take_f128(first_out),
         )
     } else {
         (Vec::new(), Vec::new())
     };
     crate::gaptime::mark("zc: tail ping-pong buffers taken");
-    // Diagnostics kill switch: FLOCK_NO_TAIL_FUSION=1 routes every tail round
-    // through the unfused two-pass path (fold_in_place_pair, then a separate
-    // round_pair_naive read of the folded arrays) for one-process A/B runs.
-    // Transcript bytes are identical either way; the ranked worker's cleared
-    // environment never sets it.
-    let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
     let mut tail_round_ms: Vec<(usize, f64)> = Vec::new();
 
-    for i in 0..(n_mlv - 1) {
+    // `loop_start` is the first tail iteration this route has not already
+    // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
+    // indexed by `i`, so starting at 2 needs no other change.
+    let loop_start = if let Some(la) = lookahead {
+        // Round three: evaluate the deferred quadratic. No pass at all.
+        let (m3_1, m3_inf) = eval_round3_lookahead(&la, mlv_rhos[0]);
+        multilinear_msgs.push((m3_1, m3_inf));
+        challenger.observe_f128(m3_1);
+        challenger.observe_f128(m3_inf);
+        mlv_rhos.push(challenger.sample_f128());
+
+        // Rounds three and four fold together in one pass over the round-two
+        // tables (ρ₁ and ρ₂ at once), replacing tail iterations i = 0 and
+        // i = 1: 2 GiB + 1 GiB of reads and 1 GiB + 512 MiB of writes become
+        // one 2 GiB read + 512 MiB write at the ranked shape.
+        let t_round = std::time::Instant::now();
+        let quarter = n_in / 4;
+        let mut r_next4 = vec![F128::ONE; n_mlv - 2];
+        r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
+        let (m4_1, m4_inf) = fold2_plain_and_round4_into(
+            &a_mlv,
+            &b_mlv,
+            &mut a_nxt[..quarter],
+            &mut b_nxt[..quarter],
+            mlv_rhos[0],
+            mlv_rhos[1],
+            &r_next4,
+        );
+        std::mem::swap(&mut a_mlv, &mut a_nxt);
+        std::mem::swap(&mut b_mlv, &mut b_nxt);
+        a_mlv.truncate(quarter);
+        b_mlv.truncate(quarter);
+        crate::gaptime::mark("zc: rounds 3+4 composed fold done");
+        if zc_timing {
+            tail_round_ms.push((n_mlv, t_round.elapsed().as_secs_f64() * 1e3));
+        }
+        multilinear_msgs.push((m4_1, m4_inf));
+        challenger.observe_f128(m4_1);
+        challenger.observe_f128(m4_inf);
+        mlv_rhos.push(challenger.sample_f128());
+        2
+    } else {
+        0
+    };
+
+    for i in loop_start..(n_mlv - 1) {
         let t_round = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
@@ -822,6 +931,57 @@ mod tests {
 
             assert_eq!(proof_fused, proof_unfused, "proof bytes diverge at m={m}");
             assert_eq!(claim_fused, claim_unfused, "claim diverges at m={m}");
+        }
+    }
+
+    /// **Lookahead transcript identity**: the two-challenge lookahead route
+    /// (deferred round-3 quadratic + composed rounds-3/4 double fold) emits a
+    /// proof and claim byte-identical to the incumbent route — dense and
+    /// BLAKE3-padded (k_log=14, useful=15409), m ∈ {13, 17, 18} — and the
+    /// lookahead proof verifies. Toggles the test latch, not the process env.
+    #[test]
+    fn prove_transcript_identical_with_and_without_lookahead() {
+        use std::sync::atomic::Ordering;
+        for &(m, padded) in &[(13usize, false), (17, false), (18, false), (17, true), (18, true)] {
+            let mut rng = Rng::new(7700 + m as u64 + padded as u64 * 1000);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            let padding = if padded {
+                let (k_log, useful) = (14usize, 15_409usize);
+                let block = 1usize << k_log;
+                for blk in 0..((1usize << m) / block) {
+                    for j in useful..block {
+                        a[blk * block + j] = false;
+                        b[blk * block + j] = false;
+                    }
+                }
+                PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful,
+                }
+            } else {
+                PaddingSpec::dense(m)
+            };
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            assert!(!ZC_LOOKAHEAD_FORCED_OFF.load(Ordering::Relaxed));
+            let mut ch_on = FsChallenger::new(b"flock-test-v0");
+            let (proof_on, claim_on) = prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_on);
+
+            ZC_LOOKAHEAD_FORCED_OFF.store(true, Ordering::Relaxed);
+            let mut ch_off = FsChallenger::new(b"flock-test-v0");
+            let (proof_off, claim_off) =
+                prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch_off);
+            ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
+
+            assert_eq!(proof_on, proof_off, "proof diverges at m={m} padded={padded}");
+            assert_eq!(claim_on, claim_off, "claim diverges at m={m} padded={padded}");
+
+            let mut ch_v = FsChallenger::new(b"flock-test-v0");
+            let claim_v = verify(m, &proof_on, &mut ch_v)
+                .unwrap_or_else(|e| panic!("verify rejected lookahead proof at m={m}: {e:?}"));
+            assert_eq!(claim_v, claim_on, "verify claim mismatch at m={m}");
         }
     }
 
