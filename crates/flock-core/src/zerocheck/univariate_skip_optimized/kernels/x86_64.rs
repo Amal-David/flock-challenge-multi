@@ -298,6 +298,181 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
     }
 }
 
+/// F₂-linear nibble-LUT drain. Production `mask_tables` are XOR-doubling
+/// subset sums, so `T[byte] = T[n0] ⊕ T[n1 << 4]`. Each 16-entry nibble table
+/// is 16 u64 halves = two ZMM, looked up with `vpermi2q` (AVX-512F, 3c/1c on
+/// Sapphire Rapids) instead of `vpgatherqq` plus a SIMD→GPR index spill.
+///
+/// Bit-identical to the gather kernel on linear tables; GF(2) XOR reordering
+/// of independent nibble contributions is the only algebraic change.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
+    c_block: &[u8; 16 * ELL],
+    n_b_med: usize,
+    mask_tables: &[F128],
+    partial_c: &mut [[F128; ELL]; 8],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(ELL, 64);
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    debug_assert_eq!(mask_tables.len(), 512);
+
+    #[repr(C, align(64))]
+    struct NibbleLut {
+        lo_n0_lo: [u64; 16],
+        lo_n0_hi: [u64; 16],
+        lo_n1_lo: [u64; 16],
+        lo_n1_hi: [u64; 16],
+        hi_n0_lo: [u64; 16],
+        hi_n0_hi: [u64; 16],
+        hi_n1_lo: [u64; 16],
+        hi_n1_hi: [u64; 16],
+    }
+
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+    let mut lut = NibbleLut {
+        lo_n0_lo: [0; 16],
+        lo_n0_hi: [0; 16],
+        lo_n1_lo: [0; 16],
+        lo_n1_hi: [0; 16],
+        hi_n0_lo: [0; 16],
+        hi_n0_hi: [0; 16],
+        hi_n1_lo: [0; 16],
+        hi_n1_hi: [0; 16],
+    };
+    for i in 0..16 {
+        lut.lo_n0_lo[i] = t_lo[i].lo;
+        lut.lo_n0_hi[i] = t_lo[i].hi;
+        lut.lo_n1_lo[i] = t_lo[i << 4].lo;
+        lut.lo_n1_hi[i] = t_lo[i << 4].hi;
+        lut.hi_n0_lo[i] = t_hi[i].lo;
+        lut.hi_n0_hi[i] = t_hi[i].hi;
+        lut.hi_n1_lo[i] = t_hi[i << 4].lo;
+        lut.hi_n1_hi[i] = t_hi[i << 4].hi;
+    }
+
+    #[inline(always)]
+    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
+        unsafe {
+            let a = _mm512_load_si512(table as *const __m512i);
+            let b = _mm512_load_si512(table.add(8) as *const __m512i);
+            _mm512_permutex2var_epi64(a, idx, b)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn interleave_aos(los: __m512i, his: __m512i) -> (__m512i, __m512i) {
+        unsafe {
+            let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+            let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+            (
+                _mm512_permutex2var_epi64(los, idx0, his),
+                _mm512_permutex2var_epi64(los, idx1, his),
+            )
+        }
+    }
+
+    // SAFETY: each row load reads 16 bytes from a 64-byte row of `c_block`;
+    // n_b_med <= 16 bounds the row index. Nibble indices are 0..=15 by the
+    // AND-0xf, so every vpermi2q stays inside a 16-entry table half. Each
+    // partial load/store covers eight lanes in a 64-lane bank.
+    unsafe {
+        let nibble_mask = _mm512_set1_epi32(0xf);
+        for lane_base in (0..ELL).step_by(16) {
+            let mut masks = [_mm512_setzero_si512(); 8];
+            let bank_bits = [
+                _mm512_set1_epi32(1),
+                _mm512_set1_epi32(2),
+                _mm512_set1_epi32(4),
+                _mm512_set1_epi32(8),
+                _mm512_set1_epi32(16),
+                _mm512_set1_epi32(32),
+                _mm512_set1_epi32(64),
+                _mm512_set1_epi32(128),
+            ];
+
+            for b_med in 0..n_b_med {
+                let row_ptr = c_block.as_ptr().add(b_med * ELL + lane_base);
+                let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
+                let row = _mm512_cvtepu8_epi32(row_bytes);
+                let weight = _mm512_set1_epi32((1u32 << b_med) as i32);
+
+                for (mask, bank_bit) in masks.iter_mut().zip(bank_bits) {
+                    let selected = _mm512_test_epi32_mask(row, bank_bit);
+                    *mask = _mm512_mask_or_epi32(*mask, selected, *mask, weight);
+                }
+            }
+
+            for (bank, mask) in partial_c.iter_mut().zip(masks) {
+                let n0 = _mm512_and_si512(mask, nibble_mask);
+                let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(mask), nibble_mask);
+                let n2 = _mm512_and_si512(_mm512_srli_epi32::<8>(mask), nibble_mask);
+                let n3 = _mm512_and_si512(_mm512_srli_epi32::<12>(mask), nibble_mask);
+
+                for group in 0..2 {
+                    let n0_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
+                    };
+                    let n1_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
+                    };
+                    let n2_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n2))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n2))
+                    };
+                    let n3_8 = if group == 0 {
+                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n3))
+                    } else {
+                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3))
+                    };
+
+                    let los = _mm512_xor_si512(
+                        _mm512_xor_si512(
+                            lookup8(n0_8, lut.lo_n0_lo.as_ptr()),
+                            lookup8(n1_8, lut.lo_n1_lo.as_ptr()),
+                        ),
+                        _mm512_xor_si512(
+                            lookup8(n2_8, lut.hi_n0_lo.as_ptr()),
+                            lookup8(n3_8, lut.hi_n1_lo.as_ptr()),
+                        ),
+                    );
+                    let his = _mm512_xor_si512(
+                        _mm512_xor_si512(
+                            lookup8(n0_8, lut.lo_n0_hi.as_ptr()),
+                            lookup8(n1_8, lut.lo_n1_hi.as_ptr()),
+                        ),
+                        _mm512_xor_si512(
+                            lookup8(n2_8, lut.hi_n0_hi.as_ptr()),
+                            lookup8(n3_8, lut.hi_n1_hi.as_ptr()),
+                        ),
+                    );
+                    let (aos0, aos1) = interleave_aos(los, his);
+                    let partial_ptr = bank.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
+                    _mm512_storeu_si512(
+                        partial_ptr,
+                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr), aos0),
+                    );
+                    _mm512_storeu_si512(
+                        partial_ptr.add(1),
+                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr.add(1)), aos1),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Legacy two-bank capture kernel retained for compatibility with the old
 /// entry point. DirectC does not call it.
 #[cfg(all(
@@ -341,7 +516,9 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
 ))]
 mod tests {
     use super::super::accumulate_c_banks_scalar;
-    use super::{accumulate_c_banks_x86_avx512, F128};
+    use super::{
+        accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble, F128,
+    };
 
     #[test]
     fn accumulate_c_banks_avx512_matches_scalar() {
@@ -387,6 +564,80 @@ mod tests {
                 );
             }
             assert_eq!(simd, scalar, "n_b_med={n_b_med}");
+        }
+    }
+
+    fn xor_doubling_tables() -> [F128; 512] {
+        let mut tables = [F128::ZERO; 512];
+        let mut basis = [F128::ZERO; 16];
+        basis[0] = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for b in 1..16 {
+            let x = basis[b - 1];
+            basis[b] = F128::new(
+                x.lo.rotate_left(1) ^ x.hi.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                x.hi.rotate_left(1) ^ x.lo.wrapping_mul(0xd6e8_feb8_6659_fd93),
+            );
+        }
+        let (t_lo, t_hi) = tables.split_at_mut(256);
+        for (half, table) in [t_lo, t_hi].into_iter().enumerate() {
+            table[0] = F128::ZERO;
+            for b in 0..8 {
+                let add = basis[half * 8 + b];
+                let (done, rest) = table.split_at_mut(1 << b);
+                for (out, seen) in rest[..1 << b].iter_mut().zip(done.iter()) {
+                    *out = F128::new(seen.lo ^ add.lo, seen.hi ^ add.hi);
+                }
+            }
+        }
+        tables
+    }
+
+    fn nontrivial_partials() -> [[F128; 64]; 8] {
+        let mut partials = [[F128::ZERO; 64]; 8];
+        for (bank_index, bank) in partials.iter_mut().enumerate() {
+            for (lane, value) in bank.iter_mut().enumerate() {
+                *value = F128::new(
+                    ((bank_index * 64 + lane) as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                    ((lane * 8 + bank_index) as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                );
+            }
+        }
+        partials
+    }
+
+    fn ranked_shape_c_block() -> [u8; 16 * 64] {
+        let mut c_block = [0u8; 16 * 64];
+        for (i, byte) in c_block.iter_mut().enumerate() {
+            *byte = (i as u8)
+                .wrapping_mul(0x9d)
+                .rotate_left((i & 7) as u32)
+                ^ (i >> 3) as u8;
+        }
+        c_block
+    }
+
+    #[test]
+    fn accumulate_c_banks_nibble_matches_scalar_linear_tables() {
+        let c_block = ranked_shape_c_block();
+        let mask_tables = xor_doubling_tables();
+
+        for n_b_med in 0..=16 {
+            let mut scalar = nontrivial_partials();
+            let mut nibble = scalar;
+            let mut gather = scalar;
+
+            accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut scalar);
+            unsafe {
+                accumulate_c_banks_x86_avx512_nibble(
+                    &c_block,
+                    n_b_med,
+                    &mask_tables,
+                    &mut nibble,
+                );
+                accumulate_c_banks_x86_avx512(&c_block, n_b_med, &mask_tables, &mut gather);
+            }
+            assert_eq!(nibble, scalar, "nibble vs scalar n_b_med={n_b_med}");
+            assert_eq!(gather, scalar, "gather vs scalar n_b_med={n_b_med}");
         }
     }
 }

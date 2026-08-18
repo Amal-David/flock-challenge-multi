@@ -262,6 +262,20 @@ pub(super) fn accumulate_convert_ab(
     }
 }
 
+/// Ranked default is the nibble-LUT drain. `FLOCK_NO_C_NIBBLE=1` restores the
+/// gather kernel for one-process A/B; the ranked worker's cleared env never
+/// sets it. Production mask tables are F₂-linear XOR-doubling subset sums, so
+/// a byte lookup equals the XOR of two nibble lookups.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn c_nibble_lut_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C_NIBBLE").is_none())
+}
+
 /// Accumulate the eight alpha-free C banks from already-transposed C rows.
 #[inline]
 pub(super) fn accumulate_c_banks(
@@ -281,12 +295,21 @@ pub(super) fn accumulate_c_banks(
     // SAFETY: the cfg gate supplies the SIMD features; the fixed-size C and
     // partial arrays and the asserted 512-entry table bound every access.
     unsafe {
-        x86_64::accumulate_c_banks_x86_avx512(
-            c_block,
-            n_b_med,
-            mask_tables,
-            partial_c,
-        );
+        if c_nibble_lut_enabled() {
+            x86_64::accumulate_c_banks_x86_avx512_nibble(
+                c_block,
+                n_b_med,
+                mask_tables,
+                partial_c,
+            );
+        } else {
+            x86_64::accumulate_c_banks_x86_avx512(
+                c_block,
+                n_b_med,
+                mask_tables,
+                partial_c,
+            );
+        }
     }
 
     #[cfg(not(all(
@@ -388,4 +411,109 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_0,
         partial_c_1,
     );
+}
+
+#[cfg(test)]
+mod nibble_algebra_tests {
+    use super::accumulate_c_banks_scalar;
+    use super::super::F128;
+
+    fn xor_doubling_tables() -> [F128; 512] {
+        let mut tables = [F128::ZERO; 512];
+        let mut basis = [F128::ZERO; 16];
+        basis[0] = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for b in 1..16 {
+            let x = basis[b - 1];
+            basis[b] = F128::new(
+                x.lo.rotate_left(1) ^ x.hi.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                x.hi.rotate_left(1) ^ x.lo.wrapping_mul(0xd6e8_feb8_6659_fd93),
+            );
+        }
+        let (t_lo, t_hi) = tables.split_at_mut(256);
+        for (half, table) in [t_lo, t_hi].into_iter().enumerate() {
+            table[0] = F128::ZERO;
+            for b in 0..8 {
+                let add = basis[half * 8 + b];
+                let (done, rest) = table.split_at_mut(1 << b);
+                for (out, seen) in rest[..1 << b].iter_mut().zip(done.iter()) {
+                    *out = F128::new(seen.lo ^ add.lo, seen.hi ^ add.hi);
+                }
+            }
+        }
+        tables
+    }
+
+    #[test]
+    fn xor_doubling_byte_equals_nibble_xor() {
+        let tables = xor_doubling_tables();
+        let (t_lo, t_hi) = tables.split_at(256);
+        for byte in 0usize..256 {
+            let n0 = byte & 0xf;
+            let n1 = (byte >> 4) << 4;
+            assert_eq!(
+                t_lo[byte],
+                F128::new(t_lo[n0].lo ^ t_lo[n1].lo, t_lo[n0].hi ^ t_lo[n1].hi),
+                "t_lo byte={byte}"
+            );
+            assert_eq!(
+                t_hi[byte],
+                F128::new(t_hi[n0].lo ^ t_hi[n1].lo, t_hi[n0].hi ^ t_hi[n1].hi),
+                "t_hi byte={byte}"
+            );
+        }
+    }
+
+    fn nibble_drain(
+        c_block: &[u8; 16 * 64],
+        n_b_med: usize,
+        mask_tables: &[F128],
+        partial_c: &mut [[F128; 64]; 8],
+    ) {
+        let (t_lo, t_hi) = mask_tables.split_at(256);
+        for lane in 0..64 {
+            let mut masks = [0u16; 8];
+            for b_med in 0..n_b_med {
+                let c = c_block[b_med * 64 + lane];
+                for (bank, mask) in masks.iter_mut().enumerate() {
+                    *mask |= u16::from((c >> bank) & 1) << b_med;
+                }
+            }
+            for (bank, mask) in partial_c.iter_mut().zip(masks) {
+                let lo = usize::from(mask & 0xff);
+                let hi = usize::from(mask >> 8);
+                bank[lane] += t_lo[lo & 0xf]
+                    + t_lo[(lo >> 4) << 4]
+                    + t_hi[hi & 0xf]
+                    + t_hi[(hi >> 4) << 4];
+            }
+        }
+    }
+
+    #[test]
+    fn nibble_drain_matches_scalar_on_linear_tables() {
+        let mut c_block = [0u8; 16 * 64];
+        for (i, byte) in c_block.iter_mut().enumerate() {
+            *byte = (i as u8)
+                .wrapping_mul(0x9d)
+                .rotate_left((i & 7) as u32)
+                ^ (i >> 3) as u8;
+        }
+        let tables = xor_doubling_tables();
+        for n_b_med in 0..=16 {
+            let mut scalar = [[F128::ZERO; 64]; 8];
+            let mut nibble = [[F128::ZERO; 64]; 8];
+            for (bank_index, bank) in scalar.iter_mut().enumerate() {
+                for (lane, value) in bank.iter_mut().enumerate() {
+                    *value = F128::new(
+                        ((bank_index * 64 + lane) as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                        ((lane * 8 + bank_index) as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                    );
+                }
+            }
+            nibble.copy_from_slice(&scalar);
+            accumulate_c_banks_scalar(&c_block, n_b_med, &tables, &mut scalar);
+            nibble_drain(&c_block, n_b_med, &tables, &mut nibble);
+            assert_eq!(nibble, scalar, "n_b_med={n_b_med}");
+        }
+    }
 }
