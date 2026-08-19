@@ -1164,6 +1164,14 @@ fn partial_fold_packed_z_best(
         }
         #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
         {
+            // GFNI plane fold (`FLOCK_NO_LC_GFNI=1` restores the table-gather
+            // tile kernel; output is bit-identical either way).
+            #[cfg(all(target_feature = "avx512f", target_feature = "gfni"))]
+            if k_log >= 6 && lincheck_gfni_enabled() {
+                return kernels::partial_fold_packed_z_x86_gfni_padded(
+                    z_packed, m, k_log, useful_bits, eq_outer,
+                );
+            }
             partial_fold_packed_z_x86_tiled_padded(z_packed, m, k_log, useful_bits, eq_outer)
         }
         #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
@@ -1173,6 +1181,20 @@ fn partial_fold_packed_z_best(
     } else {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
     }
+}
+
+/// GFNI stripe-fold kill switch: exactly `FLOCK_NO_LC_GFNI=1` restores the
+/// table-gather tile kernel as a same-binary control.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lincheck_gfni_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_LC_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
@@ -2824,6 +2846,46 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// The GFNI plane fold must match the tiled gather kernel byte-for-byte,
+    /// including a non-64-aligned `useful_bits` boundary over honest zero
+    /// padding (the ranked BLAKE3 shape).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn partial_fold_x86_gfni_matches_tiled() {
+        for &(m, k_log, useful_bits) in
+            &[(16usize, 8usize, 256usize), (18, 10, 1000), (20, 14, 15_409)]
+        {
+            if !n_log_ok_for_tile(m, k_log, 8) {
+                continue;
+            }
+            let mut rng = Rng::new(9200 + m as u64);
+            let block_size = 1usize << k_log;
+            let mut z = rng.bits(1 << m);
+            for blk in 0..(1usize << (m - k_log)) {
+                for j in useful_bits..block_size {
+                    z[blk * block_size + j] = false;
+                }
+            }
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let p = rng.f128_vec(m - k_log);
+            let eq = build_eq_table(&p);
+            let tiled =
+                partial_fold_packed_z_x86_tiled_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let gfni = kernels::partial_fold_packed_z_x86_gfni_padded(
+                &z_packed,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
+            assert_eq!(tiled, gfni, "at m={m}, k_log={k_log}, useful={useful_bits}");
         }
     }
 

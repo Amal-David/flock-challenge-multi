@@ -67,6 +67,52 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     }
 }
 
+/// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
+/// THP in `madvise` mode, so without this hint the prover's 32 MB-1 GB
+/// working buffers sit on 4 KiB pages through every strided sweep. Advising
+/// at allocation time means the setup-phase prewarm faults the pool's pages
+/// as 2 MiB pages once, before any timed proof. Raw syscall (no libc dep);
+/// errors ignored. `FLOCK_NO_HUGEPAGES` is a local-diagnostics kill switch.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn advise_hugepages(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
+    if *DISABLED {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = ptr as usize + bytes;
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_HUGEPAGE: usize = 14;
+    // SAFETY: the advised range lies within the just-allocated buffer, and
+    // MADV_HUGEPAGE never alters contents or mapping validity.
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_HUGEPAGE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
@@ -95,6 +141,7 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         v.set_len(n);
     }
+    advise_hugepages(v.as_mut_ptr().cast::<u8>(), n * core::mem::size_of::<T>());
     v
 }
 

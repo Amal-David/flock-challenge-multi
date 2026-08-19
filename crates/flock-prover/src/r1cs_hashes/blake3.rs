@@ -1490,6 +1490,958 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
 /// Parallelism granularity: 8 compressions per task; each task writes its 8
 /// commit chunks then bit-transposes the just-written z u64s into its
 /// lincheck stripe while they are still hot in L1.
+pub(crate) mod witgen_simd {
+    use super::{
+        ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, N_G,
+        OUT_HI_BASE, USEFUL_BITS, WORD_BITS,
+    };
+    use flock_core::field::F128;
+
+    // Record-relative positions (mirrors the scalar builder's layout):
+    // carries at 31*i, lin words after all carries.
+    const REC_C0: usize = 0;
+    const REC_C1: usize = CARRY_BITS_PER_ADD;
+    const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
+    const REC_C3: usize = 3 * CARRY_BITS_PER_ADD;
+    const REC_C4: usize = 4 * CARRY_BITS_PER_ADD;
+    const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
+    const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
+    const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
+    const F128_PER_BLOCK: usize = K / 128;
+
+    #[cfg(target_arch = "aarch64")]
+    use core::arch::aarch64::*;
+    #[cfg(target_arch = "x86_64")]
+    use lanes_x86::*;
+    use flock_core::bits::transpose_8_u64s_to_64_bytes;
+
+    /// x86 lane-op compatibility layer: this module's NEON vocabulary mapped
+    /// onto SSE2 intrinsics with identical per-lane semantics, so the 4-wide
+    /// lockstep builder compiles unchanged. Every mapping is a direct
+    /// per-lane equivalent (loads/stores, xor/or/and/add, immediate shifts,
+    /// shift-left-insert, 32/64-bit transposes, de-interleaving loads).
+    #[cfg(target_arch = "x86_64")]
+    mod lanes_x86 {
+        use core::arch::x86_64::*;
+
+        pub(super) type V4 = __m128i;
+
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy)]
+        pub(super) struct uint32x4x4_t(pub V4, pub V4, pub V4, pub V4);
+
+        #[inline(always)]
+        pub(super) unsafe fn vld1q_u32(p: *const u32) -> V4 {
+            unsafe { _mm_loadu_si128(p.cast::<__m128i>()) }
+        }
+        #[inline(always)]
+        pub(super) unsafe fn vst1q_u32(p: *mut u32, v: V4) {
+            unsafe { _mm_storeu_si128(p.cast::<__m128i>(), v) }
+        }
+        #[inline(always)]
+        pub(super) fn vdupq_n_u32(x: u32) -> V4 {
+            unsafe { _mm_set1_epi32(x as i32) }
+        }
+        #[inline(always)]
+        pub(super) fn veorq_u32(a: V4, b: V4) -> V4 {
+            unsafe { _mm_xor_si128(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vorrq_u32(a: V4, b: V4) -> V4 {
+            unsafe { _mm_or_si128(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vandq_u32(a: V4, b: V4) -> V4 {
+            unsafe { _mm_and_si128(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vaddq_u32(a: V4, b: V4) -> V4 {
+            unsafe { _mm_add_epi32(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vshrq_n_u32<const N: i32>(v: V4) -> V4 {
+            unsafe { _mm_srli_epi32::<N>(v) }
+        }
+        #[inline(always)]
+        pub(super) fn vshlq_n_u32<const N: i32>(v: V4) -> V4 {
+            unsafe { _mm_slli_epi32::<N>(v) }
+        }
+        /// NEON `vsli` #N: bits `N..32` of each result lane come from
+        /// `b << N`, bits `0..N` keep `a`.
+        #[inline(always)]
+        pub(super) fn vsliq_n_u32<const N: i32>(a: V4, b: V4) -> V4 {
+            unsafe {
+                let mask = _mm_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+                _mm_or_si128(_mm_slli_epi32::<N>(b), _mm_and_si128(a, mask))
+            }
+        }
+        #[inline(always)]
+        pub(super) fn vtrn1q_u32(a: V4, b: V4) -> V4 {
+            unsafe {
+                _mm_unpacklo_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
+            }
+        }
+        #[inline(always)]
+        pub(super) fn vtrn2q_u32(a: V4, b: V4) -> V4 {
+            unsafe {
+                _mm_unpackhi_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
+            }
+        }
+        #[inline(always)]
+        pub(super) fn vtrn1q_u64(a: V4, b: V4) -> V4 {
+            unsafe { _mm_unpacklo_epi64(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vtrn2q_u64(a: V4, b: V4) -> V4 {
+            unsafe { _mm_unpackhi_epi64(a, b) }
+        }
+        #[inline(always)]
+        pub(super) fn vreinterpretq_u64_u32(v: V4) -> V4 {
+            v
+        }
+        #[inline(always)]
+        pub(super) fn vreinterpretq_u32_u64(v: V4) -> V4 {
+            v
+        }
+        /// De-interleaving load of 16 u32: lane j of result vector k is
+        /// `p[4*j + k]` — the NEON `vld4q_u32` contract.
+        #[inline(always)]
+        pub(super) unsafe fn vld4q_u32(p: *const u32) -> uint32x4x4_t {
+            unsafe {
+                let a = _mm_loadu_si128(p.cast::<__m128i>());
+                let b = _mm_loadu_si128(p.add(4).cast::<__m128i>());
+                let c = _mm_loadu_si128(p.add(8).cast::<__m128i>());
+                let d = _mm_loadu_si128(p.add(12).cast::<__m128i>());
+                let t0 = _mm_unpacklo_epi32(a, b);
+                let t1 = _mm_unpackhi_epi32(a, b);
+                let t2 = _mm_unpacklo_epi32(c, d);
+                let t3 = _mm_unpackhi_epi32(c, d);
+                uint32x4x4_t(
+                    _mm_unpacklo_epi64(t0, t2),
+                    _mm_unpackhi_epi64(t0, t2),
+                    _mm_unpacklo_epi64(t1, t3),
+                    _mm_unpackhi_epi64(t1, t3),
+                )
+            }
+        }
+    }
+    use std::sync::LazyLock;
+
+
+    const U32_PER_BLOCK: usize = K / 32; // 512
+    /// [`dump`] drains a block in 64 chunks of 8 u32 words (32 bytes).
+    const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8; // 64
+
+    // -----------------------------------------------------------------------
+    // Recycled-scratch constant-region elision (witgen-stack item B).
+    //
+    // z/a/b come from the recycling scratch pool. At this fixed layout the
+    // builder rewrites the same per-block constants every prove: the zero
+    // fill (u32 words 482..512 of every block, all three buffers), b's MAX
+    // prefix (words 0..36), and b's fixed final lin/output/padding suffix.
+    // When the pool proves — via a provenance
+    // token attached at the previous release and dropped by any other
+    // custody event — that the handed-out allocation still holds exactly a
+    // previous prove's output of this same layout, those regions already
+    // contain the right bytes and their dump chunks are skipped. Skips are
+    // dump-chunk (32 B/block) granular and stay strictly INSIDE the
+    // constant regions: z/a's zero tail skips words 488..512 (chunk 60 still
+    // carries data words 480/481 and is always written), while b can skip
+    // from word 472 because its remaining lin-id/output bits are fixed ones
+    // before the zero padding. b's prefix skips words 0..32 (chunk 4 carries
+    // data words 36..39 and the residual constant words 32..35, always
+    // written).
+    //
+    // The constants are content-independent — every completed witgen of
+    // this layout writes identical bytes there (padding blocks included) —
+    // so a token hit only ever elides rewriting bytes with themselves.
+    // `FLOCK_NO_SCRATCH_CONST_ELIDE=1` (exact) restores plain takes and
+    // full incumbent writes; any token miss independently falls back to
+    // full writes for that buffer.
+    // -----------------------------------------------------------------------
+
+    /// First skippable chunk of the zero tail: words 488..512.
+    const ELIDE_ZERO_CHUNK: usize = 61;
+    /// First skippable b suffix chunk: words 472..512.
+    const ELIDE_B_TAIL_CHUNK: usize = 59;
+    /// Leading skippable chunks of b's MAX prefix: words 0..32.
+    const ELIDE_B_PREFIX_CHUNKS: usize = 4;
+    const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
+    const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
+    const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
+    const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
+    const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
+    const B_ZERO_START_BYTE: usize = USEFUL_BITS.div_ceil(8); // 1927
+    const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
+    const _ELIDE_GEOMETRY: () = {
+        // Skipped zero-tail words start at or after the zero fill's first
+        // word (USEFUL_BITS.div_ceil(32) = 482)...
+        assert!(8 * ELIDE_ZERO_CHUNK >= USEFUL_BITS.div_ceil(32));
+        assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
+        // The final G's two B-side lin-id rows and every B-side out_hi row are
+        // ones, so the chunk-aligned B suffix begins inside that fixed run.
+        let b_fixed_one_start = GS_BASE + (N_G - 1) * G_STRIDE + REC_LIN0;
+        assert!(256 * (ELIDE_B_TAIL_CHUNK - 1) < b_fixed_one_start);
+        assert!(256 * ELIDE_B_TAIL_CHUNK >= b_fixed_one_start);
+        assert!(256 * ELIDE_B_TAIL_CHUNK < USEFUL_BITS);
+        assert!(USEFUL_BITS % 8 == 1);
+        assert!(B_ZERO_START_BYTE <= ZERO_TAIL_BYTE);
+        // ...and skipped b-prefix words end at or before the MAX prefix's
+        // last word (36).
+        assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
+    };
+
+    /// Provenance-tag layout version: bump on ANY change to the witness
+    /// block layout or to the elision geometry above.
+    const WITGEN_SCRATCH_LAYOUT_V: u64 = 2;
+    pub(crate) const ROLE_Z: u64 = 1;
+    pub(crate) const ROLE_A: u64 = 2;
+    pub(crate) const ROLE_B: u64 = 3;
+
+    pub(crate) fn enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_SIMD").is_none());
+        *ON
+    }
+
+    fn nt_enabled() -> bool {
+        // NT drain stores are OPT-IN on this lineage: the ranked runner's
+        // published profiles measured NT witness publishes as a loss on
+        // Sapphire Rapids, so the default matches the scalar driver's plain
+        // stores. `FLOCK_WITGEN_SIMD_NT=1` enables the NT drains for A/B.
+        static NT: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_SIMD_NT").is_some());
+        *NT
+    }
+
+    fn z_nt_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
+        *ON
+    }
+
+    #[inline(always)]
+    pub(super) const fn select_z_nt(
+        nt_enabled: bool,
+        defer_ranked_stripe: bool,
+        z_nt_enabled: bool,
+    ) -> bool {
+        nt_enabled && defer_ranked_stripe && z_nt_enabled
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    type V4 = uint32x4_t;
+
+    pub(crate) enum QuadInput<'a> {
+        Blocks([&'a Compression; 4]),
+    }
+
+    /// Fixed 4x4 u32 transpose. Both orientations use the same network:
+    /// (word w across 4 blocks) <-> (block j's 4 consecutive words). Pure
+    /// data movement — exact.
+    #[inline(always)]
+    fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
+    }
+
+    /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
+    /// their next readers are a proof later, from DRAM).
+    #[inline(always)]
+    unsafe fn store_nt_pair(x: V4, y: V4, p: *mut u32) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "stnp {0:q}, {1:q}, [{2}]",
+                in(vreg) x,
+                in(vreg) y,
+                in(reg) p,
+                options(nostack)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: destinations are 32-byte-aligned rows of the F128-backed
+        // witness buffers; the drain's closing fence orders the WC buffers.
+        unsafe {
+            use core::arch::x86_64::*;
+            _mm_stream_si128(p.cast::<__m128i>(), x);
+            _mm_stream_si128(p.cast::<__m128i>().add(1), y);
+        }
+    }
+
+    /// Last useful word (bit 15408 → word 481, 17 bits used).
+    const LAST_WORD: usize = (USEFUL_BITS - 1) / 32; // 481
+
+    /// Order all pending non-temporal stores before the task completes
+    /// (mirrors the mac lineage's `common::nt_publish_fence`).
+    #[inline(always)]
+    fn nt_publish_fence() {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SFENCE has no operands and no safety preconditions.
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
+
+
+    /// NT 64-byte stripe chunk store (via an L1 stack bounce): the lincheck
+    /// stripe passes the failed.md §14 never-read test (read ~85 ms later,
+    /// 512 MiB ≫ SLC), so it stores non-temporally like a/b.
+    #[inline(always)]
+    unsafe fn stripe_store_nt(src: *const u8, dst: *mut u8) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "ldp {t0:q}, {t1:q}, [{s}]",
+                "stnp {t0:q}, {t1:q}, [{d}]",
+                "ldp {t0:q}, {t1:q}, [{s}, #32]",
+                "stnp {t0:q}, {t1:q}, [{d}, #32]",
+                s = in(reg) src,
+                d = in(reg) dst,
+                t0 = out(vreg) _,
+                t1 = out(vreg) _,
+                options(nostack)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: dst is a 64-byte stripe chunk at 16-byte-aligned offsets;
+        // the stripe loop's closing fence orders the WC buffers.
+        unsafe {
+            use core::arch::x86_64::*;
+            let s = src.cast::<__m128i>();
+            let d = dst.cast::<__m128i>();
+            for k in 0..4 {
+                _mm_stream_si128(d.add(k), _mm_loadu_si128(s.add(k)));
+            }
+        }
+    }
+
+    /// u32-granular lane-wise `PackedWordWriter`: `pending` plus the
+    /// absolute-word L1 stage. Every push site is monomorphized with its
+    /// stream offset (USED), the straddle back-shift (BACK), and — when it
+    /// completes a word — the ABSOLUTE word index (WORD), so completed words
+    /// go straight to the stage with immediate store offsets. There is no
+    /// runtime writer state besides `pending` — the vector analogue of the
+    /// scalar builder's fully-unrolled writer.
+    struct W32 {
+        pending: V4,
+        stage: *mut V4, // 512 block-lane words for this buffer's quad
+    }
+
+    impl W32 {
+        #[inline(always)]
+        fn at(stage: *mut V4, pending: V4) -> Self {
+            Self { pending, stage }
+        }
+
+        /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
+        /// WIDTH ∈ {31, 32}. Carry values deliberately retain an arbitrary
+        /// bit 31: `vsli` preserves only the already-final low `USED` bits and
+        /// overwrites every following bit with the new field, so the dirty bit
+        /// just above a 31-bit field is overwritten by the next push instead
+        /// of requiring an eager mask. The fixed stream ends in full-width
+        /// lin-id fields, hence no dirty carry bit can reach `finish`.
+        ///
+        /// BACK is the straddle back-shift `room = 32 − USED`; WORD is the
+        /// absolute index of the completed word (iff this push completes one).
+        /// All consts are spelled out at the call site (stable Rust cannot
+        /// derive const arguments from const parameters).
+        #[inline(always)]
+        unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
+            &mut self,
+            v: V4,
+        ) {
+            const {
+                assert!(USED >= 0 && USED < 32);
+                assert!(WIDTH == 31 || WIDTH == 32);
+                assert!(BACK >= 1 && BACK < 32);
+                assert!(WORD < U32_PER_BLOCK);
+            }
+            debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+            unsafe {
+                // The USED == 0 arm avoids instantiating `vsliq_n::<0>`
+                // (illegal immediate) — no insert is needed at word-aligned
+                // positions. A width-31 value may leave bit 31 dirty here;
+                // the next `vsli #31` overwrites it exactly.
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        vst1q_u32(self.stage.add(WORD) as *mut u32, v);
+                        self.pending = vdupq_n_u32(0);
+                    } else {
+                        self.pending = v;
+                    }
+                } else if USED + WIDTH < 32 {
+                    self.pending = vsliq_n_u32::<USED>(self.pending, v);
+                } else {
+                    let out = vsliq_n_u32::<USED>(self.pending, v);
+                    vst1q_u32(self.stage.add(WORD) as *mut u32, out);
+                    if USED + WIDTH == 32 {
+                        self.pending = vdupq_n_u32(0);
+                    } else {
+                        self.pending = vshrq_n_u32::<BACK>(v);
+                    }
+                }
+            }
+        }
+
+        /// `PackedWordWriter::finish` semantics: the partial final word 481
+        /// (upper bits zero by construction) joins the stage.
+        #[inline(always)]
+        unsafe fn finish(&mut self) {
+            unsafe {
+                vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
+            }
+        }
+    }
+
+    /// Drain a 512-word block-lane stage to the four row-major block
+    /// destinations. `ld4` deinterleaves four block-lane words into
+    /// per-block 16-B runs (the register transpose the batch-major layout
+    /// dodged), so each block's 2 KiB drains as ONE long ascending burst:
+    /// stnp pairs for the §14-passing buffers (a/b), plain stores for z
+    /// (§16 in-closure stripe re-read). Drains dump-chunk range `g0..g1`
+    /// only (a dump chunk `g` covers u32 words `8g..8g+8` of every block in
+    /// the quad — 32 bytes per block; the full block is `0..DUMP_CHUNKS`).
+    /// The recycled-scratch constant-region elision narrows the range to
+    /// skip chunks whose destination bytes are token-verified to already
+    /// hold the per-block constants the builder would rewrite.
+    #[inline(always)]
+    unsafe fn dump_range<const NT: bool>(stage: *const V4, dst: *mut u32, g0: usize, g1: usize) {
+        unsafe {
+            for g in g0..g1 {
+                let w = 8 * g;
+                let x = vld4q_u32(stage.add(w) as *const u32);
+                let y = vld4q_u32(stage.add(w + 4) as *const u32);
+                let p0 = dst.add(w);
+                let p1 = dst.add(U32_PER_BLOCK + w);
+                let p2 = dst.add(2 * U32_PER_BLOCK + w);
+                let p3 = dst.add(3 * U32_PER_BLOCK + w);
+                if NT {
+                    store_nt_pair(x.0, y.0, p0);
+                    store_nt_pair(x.1, y.1, p1);
+                    store_nt_pair(x.2, y.2, p2);
+                    store_nt_pair(x.3, y.3, p3);
+                } else {
+                    vst1q_u32(p0, x.0);
+                    vst1q_u32(p0.add(4), y.0);
+                    vst1q_u32(p1, x.1);
+                    vst1q_u32(p1.add(4), y.1);
+                    vst1q_u32(p2, x.2);
+                    vst1q_u32(p2.add(4), y.2);
+                    vst1q_u32(p3, x.3);
+                    vst1q_u32(p3.add(4), y.3);
+                }
+            }
+        }
+        if NT {
+            nt_publish_fence();
+        }
+    }
+
+    /// Stream-sequential field push at absolute bit position `$pos`: computes
+    /// all four monomorphization consts at the call site. BACK is the
+    /// straddle back-shift `room = 32 − USED` (clamped to the legal immediate
+    /// range for the dead-branch instantiation); WORD = `pos/32` is the
+    /// completed word's absolute index.
+    macro_rules! pushf {
+        ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+            $w.push::<{ ($pos % 32) as i32 }, $width, {
+                let u = ($pos % 32) as i32;
+                if u == 0 { 1 } else { 32 - u }
+            }, { $pos / 32 }>($v);
+        }};
+    }
+
+    /// Lane-wise `add_carry_parts`: `(sum, left, right, carry_aux)`.
+    /// `vaddq_u32` wraps mod 2^32 per lane — bit-identical to scalar
+    /// `wrapping_add` for each independent block; carries never cross lanes.
+    /// The three row values retain their irrelevant bit 31. [`W32::push`]
+    /// consumes only the low 31 bits and overwrites that dirty boundary bit,
+    /// removing two vector masks from every one of the 336 additions.
+    #[inline(always)]
+    fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
+    }
+
+    /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
+    /// exact bitwise. M = 32 − N is spelled out at the call site (stable
+    /// Rust cannot derive const arguments from const parameters).
+    #[inline(always)]
+    fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
+        debug_assert_eq!(N + M, 32);
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
+    }
+
+    /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
+    /// fully writing every word (stale scratch). `z`/`a`/`b` point at the
+    /// quad's first block; block j occupies `dst + j*512 .. +512` u32 words.
+    /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
+    /// z and for the a/b pair, respectively.
+    /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
+        inputs: [&Compression; 4],
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+    ) {
+        unsafe {
+            build_quad_witness_ab_stream_neon_elide(
+                QuadInput::Blocks(inputs),
+                z,
+                a,
+                b,
+                z_nt,
+                ab_nt,
+                [false; 3],
+            )
+        }
+    }
+
+    /// [`dump`] with the constant-region skips applied: `elide_tail` drops
+    /// the zero-tail chunks, `elide_prefix` drops b's MAX-prefix chunks.
+    /// Callers may only pass `true` for destinations whose skipped bytes
+    /// are token-verified to already hold those constants.
+    #[inline(always)]
+    unsafe fn dump_elide<const NT: bool>(
+        stage: *const V4,
+        dst: *mut u32,
+        elide_tail: bool,
+        elide_prefix: bool,
+        tail_chunk: usize,
+    ) {
+        let g0 = if elide_prefix {
+            ELIDE_B_PREFIX_CHUNKS
+        } else {
+            0
+        };
+        let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
+        unsafe { dump_range::<NT>(stage, dst, g0, g1) }
+    }
+
+    /// [`build_quad_witness_ab_stream_neon`] with per-buffer constant-region
+    /// elision flags `[z, a, b]` (item B). With all flags false this is the
+    /// incumbent full write; with a flag true the corresponding buffer's
+    /// token-verified constant chunks are not re-stored (b's flag covers
+    /// both its MAX prefix and its zero tail).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_quad_witness_ab_stream_neon_elide(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+        elide: [bool; 3],
+    ) {
+        unsafe {
+            let (cv_v, m, tlo, thi, blen, flags) = match inputs {
+                QuadInput::Blocks(inputs) => {
+                    // Ordinary callers retain the incumbent AoS gather and
+                    // fixed 4x4 transpose networks unchanged.
+                    let ptrs = [
+                        inputs[0].0.as_ptr(),
+                        inputs[1].0.as_ptr(),
+                        inputs[2].0.as_ptr(),
+                        inputs[3].0.as_ptr(),
+                    ];
+                    let (cv0, cv1, cv2, cv3) = tr4(
+                        vld1q_u32(ptrs[0]),
+                        vld1q_u32(ptrs[1]),
+                        vld1q_u32(ptrs[2]),
+                        vld1q_u32(ptrs[3]),
+                    );
+                    let (cv4, cv5, cv6, cv7) = tr4(
+                        vld1q_u32(ptrs[0].add(4)),
+                        vld1q_u32(ptrs[1].add(4)),
+                        vld1q_u32(ptrs[2].add(4)),
+                        vld1q_u32(ptrs[3].add(4)),
+                    );
+                    let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
+                    let mptrs = [
+                        inputs[0].1.as_ptr(),
+                        inputs[1].1.as_ptr(),
+                        inputs[2].1.as_ptr(),
+                        inputs[3].1.as_ptr(),
+                    ];
+                    let mut m: [V4; 16] = [cv0; 16];
+                    for wgrp in 0..4 {
+                        let (m0, m1, m2, m3) = tr4(
+                            vld1q_u32(mptrs[0].add(4 * wgrp)),
+                            vld1q_u32(mptrs[1].add(4 * wgrp)),
+                            vld1q_u32(mptrs[2].add(4 * wgrp)),
+                            vld1q_u32(mptrs[3].add(4 * wgrp)),
+                        );
+                        m[4 * wgrp] = m0;
+                        m[4 * wgrp + 1] = m1;
+                        m[4 * wgrp + 2] = m2;
+                        m[4 * wgrp + 3] = m3;
+                    }
+                    let mut tlo_a = [0u32; 4];
+                    let mut thi_a = [0u32; 4];
+                    let mut bl_a = [0u32; 4];
+                    let mut fl_a = [0u32; 4];
+                    for j in 0..4 {
+                        tlo_a[j] = inputs[j].2 as u32;
+                        thi_a[j] = (inputs[j].2 >> 32) as u32;
+                        bl_a[j] = inputs[j].3;
+                        fl_a[j] = inputs[j].4;
+                    }
+                    (
+                        cv_v,
+                        m,
+                        vld1q_u32(tlo_a.as_ptr()),
+                        vld1q_u32(thi_a.as_ptr()),
+                        vld1q_u32(bl_a.as_ptr()),
+                        vld1q_u32(fl_a.as_ptr()),
+                    )
+                }
+            };
+
+            let mut state: [V4; 16] = [
+                cv_v[0],
+                cv_v[1],
+                cv_v[2],
+                cv_v[3],
+                cv_v[4],
+                cv_v[5],
+                cv_v[6],
+                cv_v[7],
+                vdupq_n_u32(BLAKE3_IV[0]),
+                vdupq_n_u32(BLAKE3_IV[1]),
+                vdupq_n_u32(BLAKE3_IV[2]),
+                vdupq_n_u32(BLAKE3_IV[3]),
+                tlo,
+                thi,
+                blen,
+                flags,
+            ];
+
+            // ---- L1 stages (block-lane words; drained by `dump` at the
+            // end so each block's 2 KiB is one ascending burst) ----
+            // Every element is written before it is read: prefix/out_lo own
+            // words 0..35, W32 owns 36..481, and the explicit suffix owns
+            // 482..511. Keep the stages uninitialized so each quad avoids
+            // three redundant 8 KiB bzero calls before those full writes.
+            let zero = vdupq_n_u32(0);
+            let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let zs = zs.as_mut_ptr().cast::<V4>();
+            let ast = ast.as_mut_ptr().cast::<V4>();
+            let bs = bs.as_mut_ptr().cast::<V4>();
+
+            // ---- prefix (bits 0..1153), straight into the stages ----
+            // cv slot, words 0..8: z=a=cv, b=MAX.
+            for w in 0..8usize {
+                vst1q_u32(zs.add(w) as *mut u32, cv_v[w]);
+                vst1q_u32(ast.add(w) as *mut u32, cv_v[w]);
+            }
+            let maxv = vdupq_n_u32(u32::MAX);
+            // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
+            // scalar writes MAX over MAX, so b needs no out_lo pass).
+            for w in 0..36usize {
+                vst1q_u32(bs.add(w) as *mut u32, maxv);
+            }
+            // Message region words 16..36: word16 = 1|m0<<1, then
+            // word16+k = chain[k-1]>>31 | chain[k]<<1 over
+            // {m1..m15, t_lo, t_hi, blen, flags}. z and a share the content.
+            let one = vdupq_n_u32(1);
+            let chain: [V4; 20] = [
+                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
+                m[13], m[14], m[15], tlo, thi, blen, flags,
+            ];
+            vst1q_u32(
+                zs.add(16) as *mut u32,
+                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
+            );
+            for k in 1..20usize {
+                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                vst1q_u32(zs.add(16 + k) as *mut u32, w);
+            }
+            // a's message region equals z's.
+            for w in 16..36usize {
+                let v = vld1q_u32(zs.add(w) as *const u32);
+                vst1q_u32(ast.add(w) as *mut u32, v);
+            }
+
+            // ---- G stream (bits 1153..15409): sequential push network ----
+            // Writers start at u32 word 36 with one pending bit (flags>>31
+            // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
+            let pending_bit = vshrq_n_u32::<31>(flags);
+            let mut wz = W32::at(zs, pending_bit);
+            let mut wa = W32::at(ast, pending_bit);
+            let mut wb = W32::at(bs, one);
+
+            macro_rules! g {
+                ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+                 $mx:literal, $my:literal) => {{
+                    let (t0, l0, r0, c0) = add_carry_parts_v(state[$la], state[$lb]);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C0, 31, c0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                    let (a1, l1, r1, c1) = add_carry_parts_v(t0, m[$mx]);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                    let d1 = xor_rotr::<16, 16>(state[$ld], a1);
+                    let (c1s, l2, r2, c2) = add_carry_parts_v(state[$lc], d1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                    let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
+                    let (t1, l3, r3, c3) = add_carry_parts_v(a1, b1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                    let (a2, l4, r4, c4) = add_carry_parts_v(t1, m[$my]);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                    let d2 = xor_rotr::<8, 24>(d1, a2);
+                    let (c2s, l5, r5, c5) = add_carry_parts_v(c1s, d2);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                    let bn = xor_rotr::<7, 25>(b1, c2s);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                    state[$la] = a2;
+                    state[$lb] = bn;
+                    state[$lc] = c2s;
+                    state[$ld] = d2;
+                }};
+            }
+            macro_rules! round {
+                ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+                 $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+                 $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+                 $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                    g!($gb, 0, 4, 8, 12, $m0, $m1);
+                    g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                    g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                    g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                    g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                }};
+            }
+            round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+            round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+            round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+            round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+            round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+            round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+            // ---- out_hi (bits 15153..15409), stream-sequential ----
+            const {
+                assert!(OUT_HI_BASE % 32 == 17);
+            }
+            macro_rules! oh {
+                ($w:literal) => {{
+                    let hv = veorq_u32(state[$w + 8], cv_v[$w]);
+                    pushf!(wz, OUT_HI_BASE + 32 * $w, 32, hv);
+                    pushf!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
+                    pushf!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+                }};
+            }
+            oh!(0);
+            oh!(1);
+            oh!(2);
+            oh!(3);
+            oh!(4);
+            oh!(5);
+            oh!(6);
+            oh!(7);
+            wz.finish();
+            wa.finish();
+            wb.finish();
+
+            // ---- zero fill, words 482..512 (finish() 241..256 semantics) ----
+            const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
+            const {
+                assert!(U32_PER_BLOCK - ZF == 30);
+            }
+            for w in 0..30usize {
+                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            }
+
+            // ---- out_lo slot, words 8..16 (z/a only) ----
+            for w in 0..8usize {
+                let lo = veorq_u32(state[w], state[w + 8]);
+                vst1q_u32(zs.add(8 + w) as *mut u32, lo);
+                vst1q_u32(ast.add(8 + w) as *mut u32, lo);
+            }
+
+            // ---- drain stages: per-block 2 KiB ascending bursts ----
+            if z_nt {
+                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            } else {
+                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            }
+            if ab_nt {
+                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            } else {
+                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            }
+        }
+    }
+    /// 4-wide lockstep witness generation: eight blocks per parallel task
+    /// (two quads), the lincheck stripe bit-transposed from the just-written
+    /// z chunks while they are L1-hot. Bit-exact with the scalar driver.
+    fn generate_impl(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        let n_total = 1usize << n_blocks_log;
+        let n_blocks = blocks.len();
+        assert!(n_blocks <= n_total);
+        assert!(
+            n_total >= 8 && n_total.is_multiple_of(8),
+            "lincheck stripe layout requires n_total >= 8 and divisible by 8"
+        );
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+        let total_f128 = n_total * F128_PER_BLOCK;
+        let mut z = flock_core::scratch::take_f128(total_f128);
+        let mut a = flock_core::scratch::take_f128(total_f128);
+        let mut b = flock_core::scratch::take_f128(total_f128);
+        let mut z_lincheck = vec![0u8; (n_total / 8) * K];
+
+        #[derive(Clone, Copy)]
+        struct WritePtr<T>(*mut T);
+        unsafe impl<T> Send for WritePtr<T> {}
+        unsafe impl<T> Sync for WritePtr<T> {}
+        impl<T> WritePtr<T> {
+            fn get(self) -> *mut T {
+                self.0
+            }
+        }
+
+        let group_f128 = 8 * F128_PER_BLOCK;
+        let z_base = WritePtr(z.as_mut_ptr());
+        let a_base = WritePtr(a.as_mut_ptr());
+        let b_base = WritePtr(b.as_mut_ptr());
+        let stripe_base = WritePtr(z_lincheck.as_mut_ptr());
+        let nt = nt_enabled();
+
+        let process_group = |g: usize| {
+            // SAFETY: each group index occurs exactly once; every group owns
+            // disjoint z/a/b ranges and one disjoint stripe.
+            let (z_grp, a_grp, b_grp) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(z_base.get().add(g * group_f128), group_f128),
+                    std::slice::from_raw_parts_mut(a_base.get().add(g * group_f128), group_f128),
+                    std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
+                )
+            };
+            for half in 0..2 {
+                let first = 8 * g + 4 * half;
+                let base = half * 4 * F128_PER_BLOCK;
+                let quad: [&Compression; 4] = std::array::from_fn(|j| {
+                    let idx = first + j;
+                    if idx < n_blocks { &blocks[idx] } else { &padding }
+                });
+                // SAFETY: each quad fully owns its four block slots in every
+                // buffer; groups are disjoint across workers.
+                unsafe {
+                    build_quad_witness_ab_stream_neon_elide(
+                        QuadInput::Blocks(quad),
+                        z_grp[base..].as_mut_ptr() as *mut u32,
+                        a_grp[base..].as_mut_ptr() as *mut u32,
+                        b_grp[base..].as_mut_ptr() as *mut u32,
+                        false,
+                        nt,
+                        [false; 3],
+                    );
+                }
+            }
+            // Bit-transpose the 8 z chunks into the lincheck stripe while
+            // they are L1-hot (identical bytes to the generic driver's
+            // full-width stripe).
+            let stripe =
+                unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
+            let z_u64_all: &[u64] = unsafe {
+                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+            };
+            let u64_per_block = K / 64;
+            let mut tmp = [0u8; 64];
+            for i in 0..u64_per_block {
+                let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
+                if nt {
+                    transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
+                    // SAFETY: stripe chunk i is 64 in-bounds bytes.
+                    unsafe {
+                        stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                    }
+                } else {
+                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                }
+            }
+            if nt {
+                nt_publish_fence();
+            }
+        };
+
+        use rayon::prelude::*;
+        (0..n_total / 8).into_par_iter().for_each(process_group);
+
+        (z, a, b, z_lincheck)
+    }
+
+    /// Public entry: the SIMD quad builder, bit-exact with the scalar
+    /// driver (`FLOCK_NO_WITGEN_SIMD=1` restores it).
+    pub(crate) fn generate(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        generate_impl(blocks, n_blocks_log)
+    }
+}
+
 pub fn generate_witness_with_ab_packed_and_lincheck(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -1499,6 +2451,12 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
+    // W-H2: SIMD-lockstep quad builder. Bit-exact with the scalar driver
+    // (`FLOCK_NO_WITGEN_SIMD=1` restores it; oracle test below).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if witgen_simd::enabled() && (1usize << n_blocks_log) >= 8 {
+        return witgen_simd::generate(blocks, n_blocks_log);
+    }
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
@@ -2102,6 +3060,50 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 4-wide lockstep quad builder must reproduce the scalar driver
+    /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and
+    /// padded block counts (padding exercises the all-zero quad slots).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn witgen_simd_matches_scalar_driver() {
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        for (n_log, n_blocks) in [(3usize, 8usize), (3, 5), (5, 32), (5, 27)] {
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    (
+                        std::array::from_fn(|_| next() as u32),
+                        std::array::from_fn(|_| next() as u32),
+                        next(),
+                        next() as u32,
+                        next() as u32,
+                    )
+                })
+                .collect();
+            let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+            let (z_s, a_s, b_s, stripe_s) = super::super::common::drive_witness_packed_and_lincheck(
+                &blocks,
+                Some(&padding),
+                n_log,
+                K_LOG,
+                |block: &Compression, z_u64, a_u64, b_u64| {
+                    let (cv, m, t, bl, fl) = block;
+                    build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+                },
+            );
+            let (z_q, a_q, b_q, stripe_q) = witgen_simd::generate(&blocks, n_log);
+            assert_eq!(z_s, z_q, "z at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(a_s, a_q, "a at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(b_s, b_q, "b at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(stripe_s, stripe_q, "stripe at n_log={n_log}, n_blocks={n_blocks}");
+        }
+    }
 
     #[test]
     fn overwrite_builder_ignores_dirty_destination() {
