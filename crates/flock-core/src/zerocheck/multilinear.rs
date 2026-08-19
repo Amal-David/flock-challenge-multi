@@ -901,53 +901,6 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
     SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1))
 }
 
-/// Chunk-count cap for the plain composed tail levels: `2^TAIL_SPLIT_MAX_N_HI`
-/// rayon chunks at most.
-const TAIL_SPLIT_MAX_N_HI: usize = 11;
-
-/// Per-chunk `eq_lo` floor for the plain composed tail levels, in log2 F128
-/// entries. A chunk covers `2·lo_size` outputs and reads `8·lo_size` inputs;
-/// shrinking `eq_lo` below 2^10 stops paying — measured at the ranked shape a
-/// 2^6 `eq_lo` at `log_n = 20` took the chunk span from 0.53 ms to 0.88 ms and
-/// in-region occupancy from 12.5/16 to 7.0/16, because the leaf loop no longer
-/// amortizes the per-chunk prologue (eight `eq_hi` multiplies plus a
-/// reduce-tree node).
-const TAIL_SPLIT_MIN_LO_LOG: usize = 10;
-
-/// Fan-out for the **plain** composed tail levels (`fold2_plain_*`).
-///
-/// The incumbent `lookahead_n_hi` cap of `MAX_N_HI = 7` is a constant 128
-/// rayon chunks at *every* level. With 16 workers that is 8 chunks per worker,
-/// so the region's drain costs a whole chunk. Per-chunk start/end timestamps
-/// at the ranked shape (15 proves per arm, interleaved) put the drain
-/// (`span − busy/16`) at a median 0.33 ms on the `log_n = 24` level and
-/// 0.21 ms on `log_n = 22`. Splitting to 2^11 / 2^9 chunks while holding
-/// `lo_size ≥ 2^10` cuts those to 0.20 ms and 0.10 ms, lifting in-region
-/// occupancy from 15.36/16 to 15.61/16 and from 14.38/16 to 15.24/16, with
-/// `busy` (total core-time) unchanged — the same work, spread flatter. Levels
-/// whose `eq` cannot keep `lo_size ≥ 2^10` (at the ranked shape `log_n ≤ 20`)
-/// keep the incumbent 128-chunk split.
-///
-/// Every admissible `n_hi` is value-identical: `eq` factors exactly as
-/// `eq(x) = eq_hi[x_hi] · eq_lo[x_lo]`, the per-chunk accumulators are
-/// deferred-reduction sums whose `reduce` is F2-linear, and the cross-chunk
-/// combine is XOR — so `Σ_hi eq_hi · reduce(Σ_lo eq_lo ⊗ g)` is the same
-/// field element for every split. Nothing about the transcript, the message
-/// values, or their absorption order moves; the proof is byte-identical.
-/// `FLOCK_NO_ZC_TAIL_SPLIT=1` restores the incumbent 128-chunk fan-out
-/// (same-binary A/B control and emergency fallback); the ranked worker's
-/// cleared environment never sets it.
-#[inline]
-fn tail_split_n_hi(n_vars: usize) -> usize {
-    let base = lookahead_n_hi(n_vars);
-    static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT").is_some());
-    if *OFF {
-        return base;
-    }
-    base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
-}
-
 /// Round-two fused fold **plus** the deferred round-three coefficients.
 ///
 /// The folded tables and the round-two wire message are bit-identical to
@@ -2222,7 +2175,7 @@ pub fn fold2_plain_and_round4_into(
     assert_eq!(r_next4.len(), log_n - 2);
 
     let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], tail_split_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], lookahead_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
@@ -2305,7 +2258,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
 
     let n_vars = r_next.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], lookahead_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
