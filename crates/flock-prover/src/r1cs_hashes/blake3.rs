@@ -100,6 +100,10 @@ use flock_core::verifier;
 #[path = "blake3_witgen8.rs"]
 mod blake3_witgen8;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[path = "blake3_witgen16.rs"]
+mod blake3_witgen16;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1321,9 +1325,11 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     // local-diagnostics kill switch; the ranked worker's cleared
     // environment never sets it.
     //
-    // On x86_64+AVX2 the regular-store path is 8-wide lockstep (`blake3_witgen8`)
-    // unless `FLOCK_NO_WITGEN_LIVE_SIMD=1`. Ranked env is cleared, so SIMD is
-    // the default. NT stays aarch64-only; do not combine with the AVX2 dump.
+    // On x86_64+AVX-512F the regular-store path is 16-wide lockstep
+    // (`blake3_witgen16`) unless `FLOCK_NO_WITGEN_HEXA=1` (then dual octa
+    // AVX2, the #145 grain) or `FLOCK_NO_WITGEN_LIVE_SIMD=1` (scalar).
+    // Ranked env is cleared and SPR has avx512f, so hexa is the default.
+    // NT stays aarch64-only.
     let use_nt = cfg!(target_arch = "aarch64")
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
@@ -1343,6 +1349,15 @@ fn live_witgen_simd_enabled() -> bool {
     {
         false
     }
+}
+
+/// 16-wide AVX-512 dump. Default ON when the crate is built with `avx512f`;
+/// `FLOCK_NO_WITGEN_HEXA=1` falls back to the #145 dual-octa AVX2 path.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn live_witgen_hexa_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_HEXA").is_none());
+    *ON
 }
 
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
@@ -1409,6 +1424,20 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    if use_simd && !use_nt && n_total >= 16 && live_witgen_hexa_enabled() {
+        generate_round1_inner_hexa(
+            blocks,
+            skip_blocks,
+            &mut z,
+            &mut a,
+            &mut b,
+            &mut ab_inner,
+            &inv_table,
+            &padding,
+        );
+        return (z, a, b, ab_inner);
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
         generate_round1_inner_octa(
@@ -1590,6 +1619,105 @@ fn generate_round1_inner_octa(
                         b_out.as_mut_ptr().add(off).cast::<u32>(),
                         [false; 3],
                     );
+                }
+            }
+            for j in 0..n_here {
+                let block_idx = GROUP * g + j;
+                if block_idx >= skip_blocks {
+                    let a_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
+                        )
+                    };
+                    let b_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
+                        )
+                    };
+                    let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                        a_bytes, b_bytes, ab_blk, inv_table,
+                    );
+                }
+            }
+        });
+}
+
+/// 16-wide AVX-512 lockstep. One rayon task owns 16 contiguous padded
+/// slots: one hexa witness dump, then round-1 AB windows on each live
+/// block. Bit-identical to two octa dumps of the same 16 compressions
+/// (the #145 dual-octa grain, now a single ZMM kernel).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn generate_round1_inner_hexa(
+    blocks: &[Compression],
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+) {
+    use rayon::prelude::*;
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const GROUP: usize = 16;
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.par_chunks_mut(group_f128))
+        .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
+            let n_here = z_out.len() / F128_PER_BLOCK;
+            if n_here >= GROUP {
+                let hexa: [&Compression; 16] = std::array::from_fn(|j| {
+                    let idx = GROUP * g + j;
+                    if idx < blocks.len() {
+                        &blocks[idx]
+                    } else {
+                        padding
+                    }
+                });
+                // SAFETY: crate compiled with AVX-512F; the group owns 16
+                // contiguous 512-word blocks in z/a/b. Dump is temporal.
+                unsafe {
+                    blake3_witgen16::build_hexa_witness_ab_stream_elide(
+                        hexa,
+                        z_out.as_mut_ptr().cast::<u32>(),
+                        a_out.as_mut_ptr().cast::<u32>(),
+                        b_out.as_mut_ptr().cast::<u32>(),
+                        [false; 3],
+                    );
+                }
+            } else {
+                // Remainder < 16: fall back to the incumbent dual-octa
+                // halves so a short test chunk cannot overflow.
+                #[cfg(target_feature = "avx2")]
+                unsafe {
+                    const SIMD: usize = 8;
+                    for half in 0..(n_here / SIMD) {
+                        let octa: [&Compression; 8] = std::array::from_fn(|j| {
+                            let idx = GROUP * g + half * SIMD + j;
+                            if idx < blocks.len() {
+                                &blocks[idx]
+                            } else {
+                                padding
+                            }
+                        });
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        blake3_witgen8::build_octa_witness_ab_stream_elide(
+                            octa,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            [false; 3],
+                        );
+                    }
                 }
             }
             for j in 0..n_here {
