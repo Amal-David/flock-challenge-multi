@@ -241,9 +241,15 @@ fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>)
     target_feature = "gfni"
 ))]
 fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
+    use rayon::prelude::*;
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
     let mut mats = vec![0u64; eq_top_scaled.len() * 256];
-    for (w, scale) in eq_top_scaled.iter().enumerate() {
+    // One task per w (32 at the ranked shape): this ~524K-iteration bit
+    // extraction ran single-threaded in the round-1 prologue with every
+    // worker idle.
+    mats.par_chunks_mut(256)
+        .zip(eq_top_scaled.par_iter())
+        .for_each(|(mats_w, scale)| {
         for bm in 0..16 {
             let basis: [F128; 8] =
                 std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
@@ -262,10 +268,10 @@ fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
                     }
                     qword |= (row as u64) << (8 * (7 - i));
                 }
-                mats[w * 256 + bm * 16 + k] = qword;
+                mats_w[bm * 16 + k] = qword;
             }
         }
-    }
+    });
     mats
 }
 
@@ -2583,10 +2589,12 @@ pub fn round1_c_fold4_from_block_major_z(
     assert_eq!(inv_table.k, k_skip);
 
     // One fold at the original r_outer: the length-2^k_log inner table over
-    // witness coordinates [0, k_log).
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner = crate::lincheck::partial_fold_packed_z_block_major_padded(
-        z_packed, m, k_log, useful_bits, &eq_outer,
+    // witness coordinates [0, k_log). Through the shared one-shot dispatch,
+    // which at the ranked `n_log = 18` uses the 9+9 factorized eq — two 8 KiB
+    // L1-resident factors instead of a serially-built, streamed 4 MiB table
+    // (the lincheck fold already made and measured this exact trade).
+    let c_inner = crate::lincheck::fold_block_major_one_shot(
+        z_packed, m, k_log, useful_bits, &r[k_log..],
     );
 
     let inner_tail = &r[k_skip + 1..k_log];

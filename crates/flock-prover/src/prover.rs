@@ -639,6 +639,13 @@ fn commit_with_round1_ab_precompute(
 /// The buffers are scratch-pool-retained (never unmapped for the process
 /// lifetime), so the detached thread cannot outlive their allocations.
 fn gpu_prewire_round1_inputs(a: &[F128], b: &[F128], z: &[F128], codeword: Option<&[F128]>) {
+    // Without Metal, `gpu::prewire` is a no-op stub — the spawn would pay a
+    // stack mmap + clone on the serial critical path between witness and
+    // commit (all workers idle), plus a scheduler wake during commit, for
+    // four empty calls.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let view = |v: &[F128]| (v.as_ptr() as usize, std::mem::size_of_val(v));
     let mut bufs = [view(a), view(b), view(z), (0usize, 0usize)];
     if let Some(cw) = codeword {

@@ -948,45 +948,6 @@ fn tail_split_n_hi(n_vars: usize) -> usize {
     base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
-#[cfg(test)]
-thread_local! {
-    static PACKED_SPLIT_N_HI_OVERRIDE: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Fan-out for the **packed** round-two lookahead sweep and the packed
-/// composed n26 pass. Same occupancy identity as [`tail_split_n_hi`], applied
-/// to the two remaining `lookahead_n_hi` sites the promoted plain-tail hop
-/// left on 128 chunks:
-///
-/// * ranked r2 (`m=32`, `k_skip=6`): `n_vars = 25` → 2048 chunks of
-///   `lo_size = 2^14` instead of 128 chunks of `lo_size = 2^18`
-/// * ranked n26: `n_vars = 23` → 2048 chunks of `lo_size = 2^12` instead of
-///   128 chunks of `lo_size = 2^16`
-///
-/// The packed kernels already accept any even `lo_size ≥ 2` (and the
-/// residue-major / cfold-bake fast paths need `lo_size` a multiple of 32,
-/// which both ranked sizes keep). Per-chunk prologue (eight `eq_hi`
-/// multiplies plus a reduce-tree node) is noise against a 30 ms inner walk;
-/// the drain of one 128-way chunk is not. Every admissible `n_hi` is
-/// value-identical for the same XOR/tensor reason as the plain tail.
-/// `FLOCK_NO_ZC_PACKED_SPLIT=1` restores the incumbent 128-chunk split.
-#[inline]
-fn packed_split_n_hi(n_vars: usize) -> usize {
-    let base = lookahead_n_hi(n_vars);
-    #[cfg(test)]
-    if let Some(over) = PACKED_SPLIT_N_HI_OVERRIDE.with(|c| c.get()) {
-        // Leave at least one lo variable (and therefore even lo_size ≥ 2).
-        return over.min(n_vars.saturating_sub(1));
-    }
-    static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PACKED_SPLIT").is_some());
-    if *OFF {
-        return base;
-    }
-    base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
-}
-
 /// Round-two fused fold **plus** the deferred round-three coefficients.
 ///
 /// The folded tables and the round-two wire message are bit-identical to
@@ -1067,7 +1028,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
 
     let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -1236,7 +1197,13 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
     let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars));
+    // Finer eq split (2^11 chunks instead of 2^7): the occupancy fix the
+    // small tail levels already carry, applied to the largest region — the
+    // coarse split leaves half-millisecond steal granules (eight per worker)
+    // idling the last workers at the join, and forces a 16x bigger serial
+    // eq_lo prologue build. Same `FLOCK_NO_ZC_TAIL_SPLIT` switch, same
+    // factorization argument as `tail_split_n_hi`'s original sites.
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -1434,7 +1401,8 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
 
     let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], packed_split_n_hi(n_vars));
+    // Finer eq split — see the round-2 nomat twin.
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], tail_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
@@ -3238,93 +3206,6 @@ mod tests {
             assert!(n_hi <= SplitEqGhash::MAX_N_HI, "log_n={log_n}");
             assert!(n_hi + 1 <= log_n - 2, "log_n={log_n} n_hi={n_hi}");
         }
-    }
-
-    /// Packed occupancy split stays inside the kernel contract: `n_lo ≥ 1`
-    /// (`lo_size ≥ 2`, even) and never below the incumbent `lookahead_n_hi`.
-    #[test]
-    fn packed_split_policy_stays_in_range() {
-        // Ranked r2: n_vars = (m − k_skip) − 1 = 25. Ranked n26: 23.
-        for n_vars in 2usize..=28 {
-            let n_hi = packed_split_n_hi(n_vars);
-            let base = lookahead_n_hi(n_vars);
-            assert!(n_hi >= base, "n_vars={n_vars} n_hi={n_hi} base={base}");
-            assert!(n_hi + 1 <= n_vars, "n_vars={n_vars} n_hi={n_hi}");
-            let n_lo = n_vars - n_hi;
-            assert!(n_lo >= 1, "n_vars={n_vars} n_lo={n_lo}");
-            let lo_size = 1usize << n_lo;
-            assert!(lo_size.is_multiple_of(2), "n_vars={n_vars} lo_size={lo_size}");
-        }
-        assert_eq!(packed_split_n_hi(25), 11, "ranked r2");
-        assert_eq!(packed_split_n_hi(23), 11, "ranked n26");
-        assert_eq!(packed_split_n_hi(12), lookahead_n_hi(12), "below lo floor");
-    }
-
-    /// Packed n26 (and the r2 lookahead that feeds it) is bit-identical
-    /// across `n_hi` — the occupancy split only regroups XOR reductions.
-    #[test]
-    fn packed_fold2_identical_across_chunk_splits() {
-        const K_SKIP: usize = 6;
-        let m = 16usize;
-        let mut rng = Rng::new(0xA11C);
-        let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, true);
-        let z = rng.f128();
-        let table = UniSkipFoldTable::new(K_SKIP, z);
-        let mut mlv = rng.f128_vec(m - K_SKIP);
-        mlv[0] = F128::ONE;
-        if mlv[1] == F128::ZERO {
-            mlv[1] = F128::ONE;
-        }
-        let rho1 = rng.f128();
-        let rho2 = rng.f128();
-        let mut r_next4 = vec![F128::ONE; m - K_SKIP - 2];
-        r_next4[1..].copy_from_slice(&mlv[3..]);
-        if r_next4[1] == F128::ZERO {
-            r_next4[1] = F128::ONE;
-        }
-        let n = 1usize << (m - K_SKIP);
-        let n_vars = r_next4.len() - 1;
-        let poison = F128 {
-            lo: 0xDEAD_BEEF_DEAD_BEEF,
-            hi: 0xFEED_FACE_FEED_FACE,
-        };
-
-        let mut a_ref = vec![poison; n / 4];
-        let mut b_ref = vec![poison; n / 4];
-        // n_hi = 1 is the coarsest split that still leaves lo_size ≥ 2.
-        PACKED_SPLIT_N_HI_OVERRIDE.with(|c| c.set(Some(1)));
-        let (m1_ref, mi_ref, la_ref) = fold2_from_packed_and_round_pair_lookahead_into(
-            &a_packed, &b_packed, m, K_SKIP, &table, &padding, &mut a_ref, &mut b_ref, rho1,
-            rho2, &r_next4,
-        );
-
-        for n_hi in 2..=n_vars.saturating_sub(1) {
-            let mut a_out = vec![poison; n / 4];
-            let mut b_out = vec![poison; n / 4];
-            PACKED_SPLIT_N_HI_OVERRIDE.with(|c| c.set(Some(n_hi)));
-            let (m1, mi, la) = fold2_from_packed_and_round_pair_lookahead_into(
-                &a_packed, &b_packed, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out,
-                rho1, rho2, &r_next4,
-            );
-            assert_eq!(a_out, a_ref, "a n_hi={n_hi}");
-            assert_eq!(b_out, b_ref, "b n_hi={n_hi}");
-            assert_eq!((m1, mi), (m1_ref, mi_ref), "msg n_hi={n_hi}");
-            assert_eq!(la, la_ref, "lookahead n_hi={n_hi}");
-        }
-        PACKED_SPLIT_N_HI_OVERRIDE.with(|c| c.set(None));
-
-        // r2 materialize vs nomat, both on the packed occupancy split.
-        let (a2, b2, m1_mat, mi_mat, la_mat) =
-            uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
-                &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-            );
-        let (m1_nm, mi_nm, la_nm) = uni_skip_round_pair_lookahead_nomat_packed_padded(
-            &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
-        );
-        assert_eq!((m1_mat, mi_mat), (m1_nm, mi_nm), "r2 msg across packed split");
-        assert_eq!(la_mat, la_nm, "r2 lookahead across packed split");
-        assert_eq!(a2.len(), n);
-        assert_eq!(b2.len(), n);
     }
 
     /// **The big cross-check**: fused `fold_and_compute_round_pair_optimized`
