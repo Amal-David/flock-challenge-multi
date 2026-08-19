@@ -1650,6 +1650,64 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     (z, a, b, ab_inner)
 }
 
+/// Fill one ranked commit seed pair in the geometry expected by
+/// `rs_encode_interleaved_generated_rate_half_on_range_done`.
+///
+/// The canonical packed trace has 64 lanes and two NTT rows per compression
+/// block. For an even residue `r`, each seed task needs rows `r,r+1` at 64
+/// sub-strides in each of four message quarters. Those are exactly 256
+/// compression blocks. Build them eight at a time with the production octa
+/// kernel and publish only their z sides into the task-private message slab.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn regenerate_ranked_commit_pair(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    r_even: usize,
+    k0: usize,
+    out: &mut [F128],
+) {
+    const LANES: usize = 64;
+    const QUARTER_ROWS: usize = 1 << 17;
+    const SUB_STRIDE: usize = QUARTER_ROWS >> 6;
+    const F128_PER_BLOCK: usize = K / 128;
+    const SIMD: usize = 8;
+    assert!(r_even < SUB_STRIDE && r_even.is_multiple_of(2));
+    assert!(k0 < 64 && k0.is_multiple_of(2));
+    assert_eq!(out.len(), 2 * 4 * 2 * LANES);
+
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let mut z_local = [F128::ZERO; SIMD * F128_PER_BLOCK];
+    let mut a_local = [F128::ZERO; SIMD * F128_PER_BLOCK];
+    let mut b_local = [F128::ZERO; SIMD * F128_PER_BLOCK];
+    // Input order: four quarters for k0, then four for k0+1.
+    let staged: [Compression; SIMD] = std::array::from_fn(|j| {
+        let k = k0 + (j >> 2);
+        let quarter = j & 3;
+        let row = r_even + k * SUB_STRIDE + quarter * QUARTER_ROWS;
+        let block = row >> 1;
+        blocks.with_block(block, &padding, |input| *input)
+    });
+    let octa: [&Compression; SIMD] = std::array::from_fn(|j| &staged[j]);
+    unsafe {
+        blake3_witgen8::build_octa_witness_ab_stream_elide(
+            octa,
+            z_local.as_mut_ptr().cast::<u32>(),
+            a_local.as_mut_ptr().cast::<u32>(),
+            b_local.as_mut_ptr().cast::<u32>(),
+            None,
+            [false; 3],
+            false,
+        );
+    }
+    for j in 0..SIMD {
+        let rel = j >> 2;
+        let quarter = j & 3;
+        let dst_row = (rel * 4 + quarter) * 2;
+        let src = &z_local[j * F128_PER_BLOCK..(j + 1) * F128_PER_BLOCK];
+        let dst = &mut out[dst_row * LANES..(dst_row + 2) * LANES];
+        dst.copy_from_slice(src);
+    }
+}
+
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
 /// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
 /// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
@@ -3174,6 +3232,28 @@ impl Blake3Setup {
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                let fill_pair = move |r, k0, out: &mut [F128]| {
+                    regenerate_ranked_commit_pair(blocks, r, k0, out)
+                };
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                let commit_fill_pair: Option<
+                    &(dyn Fn(usize, usize, &mut [F128]) + Sync),
+                > = {
+                    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                        std::env::var_os("FLOCK_NO_WITNESS_COMMIT_REGEN").is_some()
+                    });
+                    (self.r1cs.m == 32
+                        && self.n_blocks_log() == 18
+                        && self.pcs_params.log_inv_rate == 1
+                        && self.pcs_params.num_ntts() == 64
+                        && !*OFF)
+                        .then_some(&fill_pair)
+                };
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                let commit_fill_pair: Option<
+                    &(dyn Fn(usize, usize, &mut [F128]) + Sync),
+                > = None;
                 crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
                     &self.r1cs,
                     &self.pcs_params,
@@ -3183,6 +3263,7 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    commit_fill_pair,
                     challenger,
                 )
             }
@@ -3564,6 +3645,60 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn regenerated_commit_pairs_match_canonical_z_rows() {
+        const LANES: usize = 64;
+        const QUARTER_ROWS: usize = 1 << 17;
+        const SUB_STRIDE: usize = QUARTER_ROWS >> 6;
+        let blocks = crate::seed_pipe::BlockSource::closed(18, 0xC011_17ED);
+        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+        for &r_even in &[0usize, 2046] {
+            for k0 in (0..64).step_by(2) {
+                let mut got = vec![F128::ZERO; 2 * 4 * 2 * LANES];
+                regenerate_ranked_commit_pair(blocks, r_even, k0, &mut got);
+                for rel in 0..2 {
+                    for q in 0..4 {
+                        let k = k0 + rel;
+                        let row = r_even + k * SUB_STRIDE + q * QUARTER_ROWS;
+                        let block = row >> 1;
+                        let mut z = [F128::ZERO; K / 128];
+                        let mut a = [F128::ZERO; K / 128];
+                        let mut b = [F128::ZERO; K / 128];
+                        let z_u64 = unsafe {
+                            std::slice::from_raw_parts_mut(z.as_mut_ptr().cast::<u64>(), K / 64)
+                        };
+                        let a_u64 = unsafe {
+                            std::slice::from_raw_parts_mut(a.as_mut_ptr().cast::<u64>(), K / 64)
+                        };
+                        let b_u64 = unsafe {
+                            std::slice::from_raw_parts_mut(b.as_mut_ptr().cast::<u64>(), K / 64)
+                        };
+                        blocks.with_block(block, &padding, |input| {
+                            let (cv, msg, counter, block_len, flags) = input;
+                            build_block_witness_ab_packed_into(
+                                cv,
+                                msg,
+                                *counter,
+                                *block_len,
+                                *flags,
+                                z_u64,
+                                a_u64,
+                                b_u64,
+                            );
+                        });
+                        let dst_row = (rel * 4 + q) * 2;
+                        assert_eq!(
+                            &got[dst_row * LANES..(dst_row + 2) * LANES],
+                            &z,
+                            "r={r_even} q={q} k={k} block={block}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The 4-wide lockstep quad builder must reproduce the scalar driver
     /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and

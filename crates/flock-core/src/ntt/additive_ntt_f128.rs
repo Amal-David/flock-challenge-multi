@@ -876,6 +876,48 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Rate-1/2 encoder whose message rows are regenerated directly into the
+    /// fused seed/top task instead of loaded from a cold materialized message.
+    ///
+    /// `fill_pair(r, k, dst)` fills the two message rows `r` and `r + 1`
+    /// for seed sub-strides `k` and `k + 1` in all four message quarters.
+    /// The destination has 16 rows in `[k_rel][quarter][parity][lane]` order.
+    /// Calls are parallel and pairwise independent. This specialized seam is
+    /// used by the ranked BLAKE3 producer, which can recompute its trace much
+    /// more cheaply than reading the 512 MiB packed witness from DRAM.
+    pub fn rs_encode_interleaved_generated_rate_half_on_range_done(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        fill_pair: &(dyn Fn(usize, usize, &mut [F128]) + Sync),
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(codeword.len() % num_ntts, 0);
+        let log_d = log2_pow2(codeword.len() / num_ntts);
+        assert!(log_d >= 9);
+        assert_eq!(Self::interleaved_n_top(log_d, num_ntts), 9);
+        // The generated task implements exactly the same fused layers 1..8
+        // as `seed_top_fused8_pass`; the ordinary cache-blocked tail resumes
+        // at layer 9.
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        self.seed_top_fused8_generated_pass(
+            codeword,
+            num_ntts,
+            log_d,
+            odd_tail,
+            fill_pair,
+        );
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            codeword,
+            num_ntts,
+            9,
+            None,
+            Some(on_range_done),
+            None,
+        );
+    }
+
     /// [`Self::rs_encode_interleaved`] with **ordered chunk streaming**: the
     /// deep (cache-resident) NTT pass runs as ONE fully-parallel rayon pass
     /// (same schedule as the unstreamed path) whose sub-groups are claimed in
@@ -1466,6 +1508,201 @@ impl AdditiveNttF128 {
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
         }
+    }
+
+    /// Regenerated-message twin of [`Self::seed_top_fused8_pass`]. The
+    /// producer fills two neighboring message rows for two seed sub-strides
+    /// at a time. The even row is seeded immediately; the odd row is retained
+    /// in a 256-row slab while the same witness computation is still hot.
+    /// Layers 1..8 are applied in the same order and scattered to the same
+    /// codeword positions as the materialized-message path.
+    fn seed_top_fused8_generated_pass(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        odd_tail: usize,
+        fill_pair: &(dyn Fn(usize, usize, &mut [F128]) + Sync),
+    ) {
+        use rayon::prelude::*;
+        const LAYER: usize = 3;
+        assert!(log_d >= 9);
+        let block_size = 1usize << (log_d - LAYER);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6;
+        assert!(sub_stride >= 2 && sub_stride.is_multiple_of(2));
+        let sixteenth = block_size >> 4;
+        let quarter = sub_stride;
+        let lanes4_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        let lanes2_tail = if quarter.is_multiple_of(2) { odd_tail } else { 0 };
+        let row_len = num_ntts;
+
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let seed_right = seed_tw[0][2];
+        let seed_dense = seed_tw[1];
+
+        let tw4: Vec<[F128; 15]> = (0..8)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(LAYER, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+
+        let base_addr = data.as_mut_ptr() as usize;
+        #[cfg(target_arch = "x86_64")]
+        let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
+        let finish = |buf: &mut Vec<F128>, r: usize| unsafe {
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            let base = base_addr as *mut F128;
+            let bufp = buf.as_mut_ptr();
+            for block in 0..8 {
+                let region = bufp.add(block * 64 * row_len);
+                let tw = &tw4[block];
+                for j in 0..4 {
+                    let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                    kernels::butterfly_fused_4layer_row(region, 4, row_len, lanes4, j, tw);
+                }
+                for m in 0..16 {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.twiddle(LAYER + 4, outer_block);
+                    let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
+                    let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                    let p = region.add(4 * m * row_len);
+                    let a = std::slice::from_raw_parts_mut(p, lanes2);
+                    let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
+                    let c = std::slice::from_raw_parts_mut(p.add(2 * row_len), lanes2);
+                    let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
+                    kernels::butterfly_fused_2layer(
+                        a, b, c, d, t_outer, t_inner_a, t_inner_b,
+                    );
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            if publish_nt {
+                for block in 0..8 {
+                    for k in 0..64 {
+                        Self::publish_row_nt(
+                            bufp.add((block * 64 + k) * row_len),
+                            base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                            row_len,
+                        );
+                    }
+                }
+                core::arch::x86_64::_mm_sfence();
+                return;
+            }
+            for block in 0..8 {
+                for k in 0..64 {
+                    core::ptr::copy_nonoverlapping(
+                        bufp.add((block * 64 + k) * row_len),
+                        base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                        row_len,
+                    );
+                }
+            }
+        };
+        let task = |scratch: &mut (Vec<F128>, Vec<F128>, Vec<F128>), pair: usize| {
+            let r0 = 2 * pair;
+            let (odd, buf, rows) = scratch;
+            // Regenerate eight blocks (two k values × four quarters) once.
+            // Seed the even row immediately and retain only the odd raw rows.
+            for k0 in (0..64).step_by(2) {
+                fill_pair(r0, k0, rows);
+                for rel in 0..2 {
+                    let k = k0 + rel;
+                    unsafe {
+                        let src = rows.as_ptr().add(rel * 8 * row_len);
+                        let bufp = buf.as_mut_ptr();
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            src,
+                            2,
+                            0,
+                            bufp.add(k * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            2,
+                            0,
+                            bufp.add((256 + k) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                        for q in 0..4 {
+                            core::ptr::copy_nonoverlapping(
+                                src.add((2 * q + 1) * row_len),
+                                odd.as_mut_ptr().add((q * 64 + k) * row_len),
+                                row_len,
+                            );
+                        }
+                    }
+                }
+            }
+            finish(buf, r0);
+
+            // Reuse the 512-row output staging for the neighboring odd row.
+            unsafe {
+                let src = odd.as_ptr();
+                let bufp = buf.as_mut_ptr();
+                for k in 0..64 {
+                    kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                        src,
+                        64,
+                        k,
+                        bufp.add(k * row_len),
+                        64,
+                        0,
+                        row_len,
+                        seed_right,
+                    );
+                    kernels::butterfly_fused_2layer_row_from_geo(
+                        src,
+                        64,
+                        k,
+                        bufp.add((256 + k) * row_len),
+                        64,
+                        0,
+                        row_len,
+                        &seed_dense,
+                    );
+                }
+            }
+            finish(buf, r0 + 1);
+        };
+
+        (0..sub_stride / 2).into_par_iter().for_each_init(
+            || {
+                (
+                    staging_block(256, row_len),
+                    staging_block(512, row_len),
+                    staging_block(16, row_len),
+                )
+            },
+            |scratch, pair| task(scratch, pair),
+        );
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -3625,6 +3862,72 @@ mod tests {
             assert!(control == oracle, "separate seed pass mismatch at log_d={log_d} num_ntts={num_ntts}");
             assert!(candidate == oracle, "seed fusion mismatch at log_d={log_d} num_ntts={num_ntts}");
         }
+    }
+
+    /// The regenerated-row entry must produce the exact codeword and callback
+    /// coverage of the materialized-message entry. The callback below merely
+    /// remaps an ordinary message into the producer contract; the BLAKE3 path
+    /// replaces that copy with trace regeneration.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn generated_seed_top_matches_materialized_message() {
+        let log_d = 17usize;
+        let num_ntts = 8usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(512)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert_eq!(AdditiveNttF128::interleaved_n_top(log_d, num_ntts), 9);
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut rng = Rng::new(0x6E6E_5EED);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg = rand_vec(&mut rng, codeword_len >> 1);
+
+            let mut expected = junk_vec(codeword_len);
+            ntt.rs_encode_interleaved_on_range_done(
+                &msg,
+                &mut expected,
+                num_ntts,
+                &|_, _| {},
+            );
+
+            let msg_positions = msg.len() / num_ntts;
+            let quarter = msg_positions >> 2;
+            let sub_stride = quarter >> 6;
+            let fill_pair = |r_even: usize, k0: usize, dst: &mut [F128]| {
+                assert_eq!(dst.len(), 16 * num_ntts);
+                for rel in 0..2 {
+                    for q in 0..4 {
+                        for parity in 0..2 {
+                            let k = k0 + rel;
+                            let src_row = r_even + k * sub_stride + q * quarter + parity;
+                            let dst_row = (rel * 4 + q) * 2 + parity;
+                            dst[dst_row * num_ntts..(dst_row + 1) * num_ntts]
+                                .copy_from_slice(
+                                    &msg[src_row * num_ntts..(src_row + 1) * num_ntts],
+                                );
+                        }
+                    }
+                }
+            };
+            let covered = std::sync::atomic::AtomicUsize::new(0);
+            let mut actual = junk_vec(codeword_len);
+            ntt.rs_encode_interleaved_generated_rate_half_on_range_done(
+                &mut actual,
+                num_ntts,
+                &fill_pair,
+                &|range, sub| {
+                    assert_eq!(sub.len(), range.len() * num_ntts);
+                    covered.fetch_add(range.len(), std::sync::atomic::Ordering::Relaxed);
+                },
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(covered.load(std::sync::atomic::Ordering::Relaxed), 1 << log_d);
+        });
     }
 
     /// **Lead-4(d) hoist oracle.** The cached subspace-eval table must be
