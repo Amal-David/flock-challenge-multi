@@ -3486,17 +3486,18 @@ fn materialize_direct_fold4(
     assert!(packed_witness.len().is_multiple_of(16));
     let [r0, r1, r2, r3] = challenges;
 
-    let fold_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
+    // In-place char-2 eq doubling (same tensor as the multiplicative form,
+    // same schedule as build_eq, no heap allocation).
+    let mut fold_weight = [F128::ZERO; 16];
+    fold_weight[0] = F128::ONE;
+    for (bit, &r) in challenges.iter().enumerate() {
+        let half = 1usize << bit;
+        for x in (0..half).rev() {
+            let hi = fold_weight[x] * r;
+            fold_weight[x | half] = hi;
+            fold_weight[x] += hi;
         }
-        weight
-    });
+    }
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
@@ -3553,38 +3554,47 @@ fn materialize_direct_fold4(
                 // ---- b: ordinary basis (if any) folded 16:1 with the same weights.
                 if has_ordinary {
                     let b_in = &ordinary_basis[start..start + 16 * block_len];
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut b_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
+                    if deferred_reduce {
+                        crate::field::f128_slice::fold16_banked(b_in, b_out, &fold_weight);
+                    } else {
+                        let mut slot = 0usize;
+                        while slot < block_len {
+                            let n = SUB.min(block_len - slot);
+                            let mid = &mut mid[..4 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[16 * slot..16 * (slot + n)],
+                                mid,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                mid,
+                                &mut b_out[slot..slot + n],
+                                r2,
+                                r3,
+                            );
+                            slot += n;
+                        }
                     }
                 } else {
                     b_out.fill(F128::ZERO);
                 }
                 // ---- b: direct claims, one 64 KiB composed table live at a time.
+                // 8-wide fold_one_slot unroll (same algebra as prior 4-wide).
                 let table = &mut scratch[..table_len];
                 for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
                     super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 7 < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         b_out[s + 1] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
                         b_out[s + 2] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
                         b_out[s + 3] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
-                        s += 4;
+                        b_out[s + 4] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 4], table);
+                        b_out[s + 5] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 5], table);
+                        b_out[s + 6] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 6], table);
+                        b_out[s + 7] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 7], table);
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
