@@ -345,34 +345,6 @@ pub fn uni_skip_fold_and_round_pair_naive(
 // Optimized fused fold + round-2 message.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn zc_gfni_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_ZC_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
-}
-
-/// GFNI bit-matrix form of the fold table for the batched row folds
-/// (`FLOCK_NO_ZC_GFNI=1` keeps the gather kernels; bit-identical output).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn r2_gfni_mats(table: &UniSkipFoldTable) -> Option<[u64; 128]> {
-    (table.n_chunks == 8 && zc_gfni_enabled())
-        .then(|| kernels::x86_64::build_row_fold_mats(&table.data))
-}
-
 /// Precomputed fold table for the univariate-skip fold at a fixed `z`.
 ///
 /// Storage: `n_chunks × 256` F128 entries (32 KB at `k_skip=6`). For each
@@ -785,29 +757,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, F128, F128, Round3Lookahead) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let r2_mats = {
-        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        {
-            r2_gfni_mats(table)
-        }
-        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-        {
-            None::<[u64; 128]>
-        }
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[allow(unused_variables)]
-    let r2_mats_arg = r2_mats.as_ref();
-
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -860,7 +809,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             let out = unsafe {
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     row_base,
@@ -958,29 +906,6 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (F128, F128, Round3Lookahead) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let r2_mats = {
-        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        {
-            r2_gfni_mats(table)
-        }
-        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-        {
-            None::<[u64; 128]>
-        }
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[allow(unused_variables)]
-    let r2_mats_arg = r2_mats.as_ref();
-
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1025,7 +950,6 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
             let out = unsafe {
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     row_base,
@@ -1113,29 +1037,6 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     rho2: F128,
     r_next4: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let r2_mats = {
-        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        {
-            r2_gfni_mats(table)
-        }
-        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-        {
-            None::<[u64; 128]>
-        }
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[allow(unused_variables)]
-    let r2_mats_arg = r2_mats.as_ref();
-
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
     assert_eq!(table.n_chunks, 8);
@@ -1183,7 +1084,6 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
             let out = unsafe {
                 kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     out_base,
@@ -3168,12 +3068,6 @@ mod tests {
         ] {
             let mut rng = Rng::new(0x3C00 + lo_size as u64 + mask as u64);
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            let r2_mats = r2_gfni_mats(&table);
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            let r2_mats_arg = r2_mats.as_ref();
-            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-            let r2_mats_arg: Option<&[u64; 128]> = None;
             let n_rows = 4 * lo_size + 16; // slack so row_base can be non-zero
             let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
             let b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
@@ -3193,7 +3087,6 @@ mod tests {
             let out_v = unsafe {
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     row_base,
@@ -3215,7 +3108,6 @@ mod tests {
             let out_n = unsafe {
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     row_base,
@@ -3423,12 +3315,6 @@ mod tests {
         ] {
             let mut rng = Rng::new(0x8B00 + lo_size as u64 + mask as u64);
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            let r2_mats = r2_gfni_mats(&table);
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            let r2_mats_arg = r2_mats.as_ref();
-            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-            let r2_mats_arg: Option<&[u64; 128]> = None;
             let out_base = 4 * lo_size; // exercise a non-zero chunk offset
             let n_rows = 8 * (out_base + 2 * lo_size);
             let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
@@ -3448,7 +3334,6 @@ mod tests {
             let out_v = unsafe {
                 kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                     table.data.as_ptr(),
-                    r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     out_base,

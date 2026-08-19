@@ -695,6 +695,49 @@ fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
     crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
 }
 
+/// Fill `useful_chunks × 8 × 128` index bytes for one full 8-stripe tile.
+///
+/// Output layout matches the per-chunk `transposed` buffer the accumulate
+/// kernels already consume: chunk `q` occupies
+/// `out[q·1024 .. (q+1)·1024]` as `[stripe0 128B | … | stripe7 128B]`.
+/// Byte `b` of stripe `t` is bit `b` of `z[(8·(stripe_base+t)+r)·cpb + q]`
+/// for `r = 0..8` — identical to the interleaved gather in the sweep.
+///
+/// `stripe_major` only changes the walk order: `true` walks stripe then
+/// chunk so each of the 8 lanes is a unit-stride stream of `useful_chunks`
+/// F128s; `false` walks chunk then stripe (64 concurrent 2 KiB-stride
+/// streams). XOR association in the later accumulate is unchanged.
+fn fill_tile_index_bytes(
+    z_packed: &[F128],
+    stripe_base: usize,
+    chunks_per_block: usize,
+    useful_chunks: usize,
+    out: &mut [u8],
+    stripe_major: bool,
+) {
+    debug_assert_eq!(out.len(), useful_chunks * DIRECT_FOLD_TILE_STRIPES * 128);
+    let write = |t: usize, q: usize, out: &mut [u8]| {
+        let outer_base = 8 * (stripe_base + t);
+        let lanes: [F128; 8] =
+            std::array::from_fn(|r| z_packed[(outer_base + r) * chunks_per_block + q]);
+        let dst = q * DIRECT_FOLD_TILE_STRIPES * 128 + t * 128;
+        transpose_8_f128s_to_128_bytes(&lanes, &mut out[dst..dst + 128]);
+    };
+    if stripe_major {
+        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+            for q in 0..useful_chunks {
+                write(t, q, out);
+            }
+        }
+    } else {
+        for q in 0..useful_chunks {
+            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                write(t, q, out);
+            }
+        }
+    }
+}
+
 /// Direct partial fold from the canonical block-major F128 witness packing.
 /// This avoids materializing the equally-sized byte-stripe copy used by
 /// [`partial_fold_packed_z_fast`].
@@ -804,29 +847,41 @@ fn fold_block_major_one_shot(
 /// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
 /// of the block-major sweep (exact A/B control: the scalar 256-entry
 /// byte-table loop runs instead). Resolved once per process.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 fn lincheck_nibble_fold_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none());
     *ON
 }
 
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none());
     *ON
 }
 
 /// `FLOCK_NO_LC_REDUCE_SINGLE_PASS=1` restores the per-worker sequence of
 /// rayon reductions of the block-major partials (exact A/B control).
 fn reduce_single_pass_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_TILE_PRETRANSPOSE=1` restores the interleaved gather+transpose
+/// / accumulate schedule (one 1 KiB `transposed` buffer reused per chunk,
+/// 64 concurrent 2 KiB-stride streams). Default: transpose every useful
+/// chunk of a full 8-stripe tile into an L2-resident buffer first (8
+/// sequential streams), then accumulate. Same bytes, different schedule.
+fn tile_pretranspose_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_TILE_PRETRANSPOSE").is_none());
     *ON
 }
 
@@ -894,6 +949,11 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             }
             let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
             let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            // L2-resident index buffer for the default stripe-major pre-transpose
+            // (121 chunks × 8 × 128 B ≈ 121 KiB at the ranked shape). Unused
+            // when the kill switch is set or the last tile is partial.
+            let mut tile_idx = vec![0u8; useful_chunks * DIRECT_FOLD_TILE_STRIPES * 128];
+            let pre_ok = tile_pretranspose_enabled();
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -956,56 +1016,89 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                 }
 
                 t_tables += tt0.elapsed();
+                // Default on a full tile: transpose every useful chunk into
+                // `tile_idx` first (stripe-major walk = 8 sequential streams),
+                // then accumulate. Kill switch / partial last tile keep the
+                // interleaved gather (64 concurrent 2 KiB-stride streams).
+                // Ranked host is SPR x86. Leave the aarch64 NEON gather-per-chunk
+                // path untouched — that ISA is not the scored runner.
+                #[cfg(not(target_arch = "aarch64"))]
+                let do_pre = pre_ok && tile_stripes == DIRECT_FOLD_TILE_STRIPES;
+                #[cfg(target_arch = "aarch64")]
+                let do_pre = {
+                    let _ = pre_ok;
+                    false
+                };
+                if do_pre {
+                    let tq0 = std::time::Instant::now();
+                    fill_tile_index_bytes(
+                        z_packed,
+                        stripe_base,
+                        chunks_per_block,
+                        useful_chunks,
+                        &mut tile_idx,
+                        true,
+                    );
+                    t_tr += tq0.elapsed();
+                }
                 // Keep one 128-column (2 KiB) output group hot while applying
                 // all tables in this outer tile.
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
-                    let tq0 = std::time::Instant::now();
-                    // Full tiles take the all-NEON gather + bit-transpose
-                    // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
-                    // swap rounds, no bounds checks) — byte-identical output
-                    // to the scalar-formed gather below, which remains as the
-                    // partial-tile fallback and `FLOCK_NO_LINCHECK_QFORM`
-                    // kill-switch path.
-                    #[cfg(target_arch = "aarch64")]
-                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
-                        && kernels::lincheck_qform_enabled()
-                    {
-                        // SAFETY: lane (t, r) is read at index
-                        // `(8·(stripe_base + t) + r) · chunks_per_block + q`
-                        // — exactly the indices the scalar path reads; the
-                        // full-tile guard plus `q < useful_chunks ≤
-                        // chunks_per_block` keep all 64 in bounds. The output
-                        // is the whole 8×128 `transposed` buffer.
-                        unsafe {
-                            kernels::gather_transpose_tile_neon(
-                                z_packed
-                                    .as_ptr()
-                                    .add(8 * stripe_base * chunks_per_block + q),
-                                chunks_per_block,
-                                transposed.as_mut_ptr(),
-                            );
+                    if !do_pre {
+                        let tq0 = std::time::Instant::now();
+                        // Full tiles take the all-NEON gather + bit-transpose
+                        // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
+                        // swap rounds, no bounds checks) — byte-identical output
+                        // to the scalar-formed gather below, which remains as the
+                        // partial-tile fallback and `FLOCK_NO_LINCHECK_QFORM`
+                        // kill-switch path.
+                        #[cfg(target_arch = "aarch64")]
+                        let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                            && kernels::lincheck_qform_enabled()
+                        {
+                            // SAFETY: lane (t, r) is read at index
+                            // `(8·(stripe_base + t) + r) · chunks_per_block + q`
+                            // — exactly the indices the scalar path reads; the
+                            // full-tile guard plus `q < useful_chunks ≤
+                            // chunks_per_block` keep all 64 in bounds. The output
+                            // is the whole 8×128 `transposed` buffer.
+                            unsafe {
+                                kernels::gather_transpose_tile_neon(
+                                    z_packed
+                                        .as_ptr()
+                                        .add(8 * stripe_base * chunks_per_block + q),
+                                    chunks_per_block,
+                                    transposed.as_mut_ptr(),
+                                );
+                            }
+                            true
+                        } else {
+                            false
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let transposed_done = false;
+                        if !transposed_done {
+                            for t in 0..tile_stripes {
+                                let outer_base = 8 * (stripe_base + t);
+                                let lanes: [F128; 8] = std::array::from_fn(|r| {
+                                    z_packed[(outer_base + r) * chunks_per_block + q]
+                                });
+                                transpose_8_f128s_to_128_bytes(
+                                    &lanes,
+                                    &mut transposed[t * 128..(t + 1) * 128],
+                                );
+                            }
                         }
-                        true
-                    } else {
-                        false
-                    };
-                    #[cfg(not(target_arch = "aarch64"))]
-                    let transposed_done = false;
-                    if !transposed_done {
-                        for t in 0..tile_stripes {
-                            let outer_base = 8 * (stripe_base + t);
-                            let lanes: [F128; 8] = std::array::from_fn(|r| {
-                                z_packed[(outer_base + r) * chunks_per_block + q]
-                            });
-                            transpose_8_f128s_to_128_bytes(
-                                &lanes,
-                                &mut transposed[t * 128..(t + 1) * 128],
-                            );
-                        }
+                        t_tr += tq0.elapsed();
                     }
-                    t_tr += tq0.elapsed();
+                    let transposed: &[u8] = if do_pre {
+                        let w = DIRECT_FOLD_TILE_STRIPES * 128;
+                        &tile_idx[q * w..(q + 1) * w]
+                    } else {
+                        &transposed
+                    };
                     let ta0 = std::time::Instant::now();
                     let group = &mut partial[inner_base..inner_base + chunk_bits];
                     // Full tiles take the two-stream NEON wavefront leaf
@@ -1016,7 +1109,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     #[cfg(target_arch = "aarch64")]
                     let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
                         kernels::fold_block_major_chunk_neon_x2(
-                            &transposed,
+                            transposed,
                             &tables,
                             group,
                             chunk_bits,
@@ -1035,7 +1128,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                         // exactly `chunk_bits` F128.
                         unsafe {
                             kernels::fold_block_major_chunk_x86_avx512(
-                                &transposed,
+                                transposed,
                                 &nib_tables,
                                 group,
                                 chunk_bits,
@@ -1164,14 +1257,6 @@ fn partial_fold_packed_z_best(
         }
         #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
         {
-            // GFNI plane fold (`FLOCK_NO_LC_GFNI=1` restores the table-gather
-            // tile kernel; output is bit-identical either way).
-            #[cfg(all(target_feature = "avx512f", target_feature = "gfni"))]
-            if k_log >= 6 && lincheck_gfni_enabled() {
-                return kernels::partial_fold_packed_z_x86_gfni_padded(
-                    z_packed, m, k_log, useful_bits, eq_outer,
-                );
-            }
             partial_fold_packed_z_x86_tiled_padded(z_packed, m, k_log, useful_bits, eq_outer)
         }
         #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
@@ -1181,20 +1266,6 @@ fn partial_fold_packed_z_best(
     } else {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
     }
-}
-
-/// GFNI stripe-fold kill switch: exactly `FLOCK_NO_LC_GFNI=1` restores the
-/// table-gather tile kernel as a same-binary control.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "gfni"
-))]
-fn lincheck_gfni_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_LC_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
 }
 
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
@@ -1684,11 +1755,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let prepared = LAST_RHO.with(|slot| {
         let mut slot = slot.borrow_mut();
         match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
-            LastRhoSlot::Prepared(p)
-                if mlv.len() == p.inner_rest_len + (p.m - p.k_log) =>
-            {
-                Some(p)
-            }
+            LastRhoSlot::Prepared(p) if mlv.len() == p.inner_rest_len + (p.m - p.k_log) => Some(p),
             LastRhoSlot::Prepared(p) => {
                 *slot = LastRhoSlot::Prepared(p);
                 None
@@ -2515,7 +2582,11 @@ mod tests {
     /// 256-entry byte-table loop bit-for-bit for every column count
     /// 1..=128 (exercises the masked tail store) on random weights, random
     /// index bytes and a random pre-filled `partial`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
     #[test]
     fn block_major_nibble_kernel_matches_scalar_tables() {
         let mut rng = Rng::new(0x51B_B1E5);
@@ -2544,7 +2615,10 @@ mod tests {
             }
             // kernel, with a poison guard word past the end
             let mut got = base.clone();
-            got.push(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE });
+            got.push(F128 {
+                lo: 0xDEAD_BEEF,
+                hi: 0xFEED_FACE,
+            });
             unsafe {
                 kernels::fold_block_major_chunk_x86_avx512(
                     &transposed,
@@ -2553,9 +2627,50 @@ mod tests {
                     chunk_bits,
                 );
             }
-            assert_eq!(got.pop(), Some(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE }));
+            assert_eq!(
+                got.pop(),
+                Some(F128 {
+                    lo: 0xDEAD_BEEF,
+                    hi: 0xFEED_FACE
+                })
+            );
             assert_eq!(got, want, "chunk_bits={chunk_bits}");
         }
+    }
+
+    /// Stripe-major vs chunk-major fills of one tile must be byte-identical:
+    /// each index byte is a function of the same 8 F128 lanes.
+    #[test]
+    fn tile_index_fill_schedules_match() {
+        let mut rng = Rng::new(0x7113_7A11);
+        let stripe_base = 3;
+        let chunks_per_block = 16;
+        let useful_chunks = 11;
+        let n_outer = 8 * (stripe_base + DIRECT_FOLD_TILE_STRIPES);
+        let mut z = vec![F128::ZERO; n_outer * chunks_per_block];
+        for slot in z.iter_mut() {
+            *slot = rng.f128();
+        }
+        let n = useful_chunks * DIRECT_FOLD_TILE_STRIPES * 128;
+        let mut a = vec![0u8; n];
+        let mut b = vec![0u8; n];
+        fill_tile_index_bytes(
+            &z,
+            stripe_base,
+            chunks_per_block,
+            useful_chunks,
+            &mut a,
+            true,
+        );
+        fill_tile_index_bytes(
+            &z,
+            stripe_base,
+            chunks_per_block,
+            useful_chunks,
+            &mut b,
+            false,
+        );
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -2680,8 +2795,7 @@ mod tests {
             (25, 7, 121), // n_log=18 factorized dispatch
         ];
         for &(m, k_log, useful_bits) in cases {
-            let mut rng =
-                Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
+            let mut rng = Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
             let n_log = m - k_log;
             let n_outer = 1usize << n_log;
             let chunks_per_block = (1usize << k_log) / 128;
@@ -2713,13 +2827,8 @@ mod tests {
                 )
             };
 
-            let _guard = prepare_last_rho_z_fold(
-                &z_block_major,
-                m,
-                k_log,
-                useful_bits,
-                inner_rest_len,
-            );
+            let _guard =
+                prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
             kick_last_rho_z_fold(&mlv);
             let got = wait_last_rho_z_fold().expect("kick at complete mlv must run");
             assert_eq!(
@@ -2755,13 +2864,7 @@ mod tests {
         let inner_rest_len = k_log - 6;
         let short_mlv = rng.f128_vec(inner_rest_len + n_log - 1);
 
-        let _guard = prepare_last_rho_z_fold(
-            &z_block_major,
-            m,
-            k_log,
-            useful_bits,
-            inner_rest_len,
-        );
+        let _guard = prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
         kick_last_rho_z_fold(&short_mlv);
         assert!(
             wait_last_rho_z_fold().is_none(),
@@ -2846,46 +2949,6 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
-        }
-    }
-
-    /// The GFNI plane fold must match the tiled gather kernel byte-for-byte,
-    /// including a non-64-aligned `useful_bits` boundary over honest zero
-    /// padding (the ranked BLAKE3 shape).
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn partial_fold_x86_gfni_matches_tiled() {
-        for &(m, k_log, useful_bits) in
-            &[(16usize, 8usize, 256usize), (18, 10, 1000), (20, 14, 15_409)]
-        {
-            if !n_log_ok_for_tile(m, k_log, 8) {
-                continue;
-            }
-            let mut rng = Rng::new(9200 + m as u64);
-            let block_size = 1usize << k_log;
-            let mut z = rng.bits(1 << m);
-            for blk in 0..(1usize << (m - k_log)) {
-                for j in useful_bits..block_size {
-                    z[blk * block_size + j] = false;
-                }
-            }
-            let z_packed = pack_z_lincheck(&z, m, k_log);
-            let p = rng.f128_vec(m - k_log);
-            let eq = build_eq_table(&p);
-            let tiled =
-                partial_fold_packed_z_x86_tiled_padded(&z_packed, m, k_log, useful_bits, &eq);
-            let gfni = kernels::partial_fold_packed_z_x86_gfni_padded(
-                &z_packed,
-                m,
-                k_log,
-                useful_bits,
-                &eq,
-            );
-            assert_eq!(tiled, gfni, "at m={m}, k_log={k_log}, useful={useful_bits}");
         }
     }
 

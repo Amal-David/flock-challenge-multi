@@ -188,7 +188,6 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     table_data: *const F128,
-    mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
     b_pkt: *const u8,
     row_base: usize,
@@ -215,27 +214,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let mut acc = [WideGhashX4::zero(); 8];
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
-        // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
-        // side prefolded in one bit-matrix batch (padded pairs fold zero
-        // rows; the consume path below skips them exactly as before).
-        let use_batch = cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni"))
-            && mats.is_some()
-            && lo_size >= 32
-            && lo_size.is_multiple_of(32);
-        let mut fa = [F128::ZERO; 64];
-        let mut fb = [F128::ZERO; 64];
 
         while x_lo + 8 <= lo_size {
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            if use_batch && x_lo.is_multiple_of(32) {
-                // Refill both caches for pairs x_lo..x_lo+32 (rows
-                // row_base+2*x_lo .. +64 per side) — the same bytes the
-                // gather path reads.
-                let m = mats.unwrap();
-                let g0 = row_base + 2 * x_lo;
-                gfni_fold64_rows(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
-                gfni_fold64_rows(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
-            }
             // a[k][lane]: row k (0..4) of group `lane` (0..4).
             let mut a = [[F128::ZERO; 4]; 4];
             let mut b = [[F128::ZERO; 4]; 4];
@@ -255,18 +235,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     }
                     let x0g = row_base + x0l;
                     let x1g = x0g + 1;
-                    let folded = if use_batch {
-                        let r = 2 * (pair % 32);
-                        [fa[r], fa[r + 1], fb[r], fb[r + 1]]
-                    } else {
-                        fold_round2_pair_x86_unchecked_8(
-                            table_data,
-                            a_pkt.add(x0g * 8),
-                            a_pkt.add(x1g * 8),
-                            b_pkt.add(x0g * 8),
-                            b_pkt.add(x1g * 8),
-                        )
-                    };
+                    let folded = fold_round2_pair_x86_unchecked_8(
+                        table_data,
+                        a_pkt.add(x0g * 8),
+                        a_pkt.add(x1g * 8),
+                        b_pkt.add(x0g * 8),
+                        b_pkt.add(x1g * 8),
+                    );
                     a[2 * half][lane] = folded[0];
                     a[2 * half + 1][lane] = folded[1];
                     b[2 * half][lane] = folded[2];
@@ -742,7 +717,6 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     table_data: *const F128,
-    mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
     b_pkt: *const u8,
     out_base: usize,
@@ -814,7 +788,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         odd_idx: __m512i,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
-        cache: Option<(&[F128; 64], &[F128; 64], usize)>,
     ) -> (__m512i, __m512i) {
         use core::arch::x86_64::*;
         // SAFETY: caller bounds rows 4·x0 .. 4·x0 + 16.
@@ -829,18 +802,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     continue;
                 }
                 let r0 = 2 * pair;
-                let folded = if let Some((fa, fb, cache_base)) = cache {
-                    let i = r0 - cache_base;
-                    [fa[i], fa[i + 1], fb[i], fb[i + 1]]
-                } else {
-                    fold_round2_pair_x86_unchecked_8(
-                        table_data,
-                        a_pkt.add(r0 * 8),
-                        a_pkt.add((r0 + 1) * 8),
-                        b_pkt.add(r0 * 8),
-                        b_pkt.add((r0 + 1) * 8),
-                    )
-                };
+                let folded = fold_round2_pair_x86_unchecked_8(
+                    table_data,
+                    a_pkt.add(r0 * 8),
+                    a_pkt.add((r0 + 1) * 8),
+                    b_pkt.add(r0 * 8),
+                    b_pkt.add((r0 + 1) * 8),
+                );
                 ae[p] = folded[0];
                 ao[p] = folded[1];
                 be[p] = folded[2];
@@ -878,32 +846,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
-        // GFNI batch fold: each iteration's four groups consume exactly 64
-        // consecutive rows per side (rows 4·xg .. 4·xg+64) — one bit-matrix
-        // batch per side per iteration.
-        let use_batch =
-            cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni")) && mats.is_some();
-        let mut fa = [F128::ZERO; 64];
-        let mut fb = [F128::ZERO; 64];
         while x_lo + 8 <= lo_size {
             let ol = 2 * x_lo; // local output index of group 0
             let xg = out_base + ol;
-            let cache = if use_batch {
-                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-                {
-                    let m = mats.unwrap();
-                    gfni_fold64_rows(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr());
-                    gfni_fold64_rows(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr());
-                }
-                Some((&fa, &fb, 4 * xg))
-            } else {
-                None
-            };
-            let cache = cache.map(|(a, b, base)| (&*a, &*b, base));
-            let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive);
             let ap = a_out.as_mut_ptr().add(ol);
             let bp = b_out.as_mut_ptr().add(ol);
             _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
@@ -942,7 +891,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Small instances leave whole groups: one group at a time, scalar finish.
         while x_lo + 2 <= lo_size {
             let ol = 2 * x_lo;
-            let (oa, ob) = group_from_packed(table_data, a_pkt, b_pkt, out_base + ol, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, None);
+            let (oa, ob) = group_from_packed(table_data, a_pkt, b_pkt, out_base + ol, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(ol).cast::<__m512i>(), oa);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(ol).cast::<__m512i>(), ob);
             let (a0, a1, a2, a3) = (a_out[ol], a_out[ol + 1], a_out[ol + 2], a_out[ol + 3]);
@@ -968,181 +917,5 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             out[i] = tail[i].reduce();
         }
         out
-    }
-}
-
-/// [`build_uni_skip_fold_mats`] over any 8×256-entry XOR-composed byte-table
-/// block (the cascade K pass feeds its λ-scaled tables through this too —
-/// scaling the basis scales every composed entry exactly, so the matrices
-/// of a scaled table are just the scaled-basis matrices).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-pub(crate) fn build_row_fold_mats(data: &[F128]) -> [u64; 128] {
-    debug_assert_eq!(data.len(), 8 * 256);
-    let mut mats = [0u64; 128];
-    for j in 0..8 {
-        let basis: [F128; 8] = std::array::from_fn(|bit| data[j * 256 + (1 << bit)]);
-        for k in 0..16 {
-            let mut qword = 0u64;
-            for i in 0..8 {
-                let bit_index = 8 * k + i;
-                let mut row = 0u8;
-                for (b, basis_val) in basis.iter().enumerate() {
-                    let bit = if bit_index < 64 {
-                        (basis_val.lo >> bit_index) & 1
-                    } else {
-                        (basis_val.hi >> (bit_index - 64)) & 1
-                    };
-                    row |= (bit as u8) << b;
-                }
-                qword |= (row as u64) << (8 * (7 - i));
-            }
-            mats[j * 16 + k] = qword;
-        }
-    }
-    mats
-}
-
-/// Fold 64 consecutive packed 8-byte rows through the univariate-skip byte
-/// tables in one GFNI batch: `out[r] = Σ_j T_j[rows[8r + j]]`, bit-identical
-/// to eight gathers per row (same XOR terms, reassociated).
-///
-/// Pipeline: per-ZMM 8×8 byte transpose (`vpermb`), 8×8 qword transpose
-/// (`vpunpck` + two `vpermt2q` stages) to chunk-byte planes, 8 GFNI products
-/// per output-byte plane folded with `vpternlogq`, then the inverse
-/// transposes to reassemble row-major F128s. Zero table loads; the working
-/// set is the 1 KiB matrix block.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
-    use core::arch::x86_64::*;
-    // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
-    // F128s at `out`.
-    unsafe {
-        let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-        }
-        gfni_fold64_regs(z, mats, out);
-    }
-}
-
-/// [`gfni_fold64_rows`] with the 64 rows already in registers (qword q of
-/// `z[i]` = row 8i+q), for callers that assemble row batches with their own
-/// permutations (the cascade K pass splits interleaved L1/L3 delta rows).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_regs(
-    z: [core::arch::x86_64::__m512i; 8],
-    mats: &[u64; 128],
-    out: *mut F128,
-) {
-    use core::arch::x86_64::*;
-    // SAFETY (whole body): caller guarantees 64 writable F128s at `out`;
-    // all shuffle indices are in range.
-    unsafe {
-        // 8×8 byte transpose inside each ZMM: result qword j = byte j of the
-        // ZMM's eight rows (idx[8j + i] = 8i + j).
-        #[rustfmt::skip]
-        const BT: [i8; 64] = [
-            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
-            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
-            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
-            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
-        ];
-        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
-        // vpermt2q index vectors for the two combining stages of the 8×8
-        // qword transpose (and its inverse — the network is an involution).
-        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
-        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
-        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
-        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
-
-        // qword_transpose(t0..t7) -> p0..p7 with p_j.qword[i] = t_i.qword[j].
-        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
-            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
-            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
-            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
-            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
-            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
-            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
-            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
-            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
-            // Halves for planes {0,2}, {4,6}, {1,3}, {5,7} over t0..t3 / t4..t7.
-            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
-            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
-            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
-            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
-            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
-            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
-            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
-            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
-            [
-                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b), // plane 0
-                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b), // plane 1
-                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b), // plane 2
-                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b), // plane 3
-                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b), // plane 4
-                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b), // plane 5
-                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b), // plane 6
-                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b), // plane 7
-            ]
-        };
-
-        // Input: 8 ZMMs of 8 rows each -> byte-transposed -> chunk planes.
-        let mut t = [_mm512_setzero_si512(); 8];
-        for (i, slot) in t.iter_mut().enumerate() {
-            *slot = _mm512_permutexvar_epi8(bt, z[i]);
-        }
-        let p = qword_transpose(t);
-
-        // Sixteen output-byte planes: eight GFNI products folded per plane.
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
-            let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    p[j],
-                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
-                )
-            };
-            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
-            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
-            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
-
-        // Reassemble: inverse qword transpose + inverse byte transpose per
-        // half, then interleave lo/hi qwords into row-major F128s.
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
-        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        for i in 0..8 {
-            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
-            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
-            let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
-            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
-            _mm512_storeu_si512(
-                out_ptr.add(1),
-                _mm512_permutex2var_epi64(lo, il_hi, hi),
-            );
-        }
     }
 }
