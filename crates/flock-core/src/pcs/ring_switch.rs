@@ -1864,9 +1864,20 @@ pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
     // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
     let mut cols = [F128::ZERO; 128];
     let mut w = e_hi; // X^0 · e_hi
-    for c in cols.iter_mut() {
-        *c = fold_one_slot(w, base);
-        w = crate::field::mul_by_x(w);
+    let mut c = 0usize;
+    while c < cols.len() {
+        // Advance the cheap doubling chain first, then expose four independent
+        // 16-load table folds to the out-of-order core at once.
+        let w0 = w;
+        let w1 = crate::field::mul_by_x(w0);
+        let w2 = crate::field::mul_by_x(w1);
+        let w3 = crate::field::mul_by_x(w2);
+        w = crate::field::mul_by_x(w3);
+        cols[c] = fold_one_slot(w0, base);
+        cols[c + 1] = fold_one_slot(w1, base);
+        cols[c + 2] = fold_one_slot(w2, base);
+        cols[c + 3] = fold_one_slot(w3, base);
+        c += 4;
     }
     // Expand each 8-column group into its 256-entry subset-sum table. Every
     // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
