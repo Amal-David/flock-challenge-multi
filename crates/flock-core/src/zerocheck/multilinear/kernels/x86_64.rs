@@ -864,17 +864,20 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     }
 }
 
-/// `FLOCK_NO_ZC_FOLD_NT=1` restores plain write-allocate stores for the
-/// cascade fold outputs (exact same-binary A/B); the ranked worker's cleared
-/// env never sets it.
+/// The ranked default uses plain write-allocate stores for the cascade fold
+/// outputs. `FLOCK_ZC_FOLD_NT=1` opts back into the historical streaming-store
+/// path, while `FLOCK_NO_ZC_FOLD_NT=1` remains a final override for existing
+/// A/B scripts.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 pub(crate) fn zc_fold_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_NT").is_none());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_ZC_FOLD_NT").is_some()
+            && std::env::var_os("FLOCK_NO_ZC_FOLD_NT").is_none()
+    });
     *ON
 }
 
