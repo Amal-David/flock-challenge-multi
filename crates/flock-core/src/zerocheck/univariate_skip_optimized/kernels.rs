@@ -223,6 +223,30 @@ pub(super) fn accumulate_convert(
         partial_c,
     );
 }
+/// GFNI bit-matrix twin of [`accumulate_convert_ab`] for the eq-folded
+/// drain: `mats` is the 16x16 qword matrix block for the current `w` slice
+/// (convert basis pre-scaled by `eq_top[w]`), `bank_planes` the byte-plane
+/// bank for the current `u`. Bit-identical sums; see the kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_gfni(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
+    // cover every 64-byte load/store.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
+    }
+}
+
 
 #[inline]
 pub(super) fn accumulate_convert_ab(

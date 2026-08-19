@@ -193,6 +193,82 @@ pub(crate) fn d_inv() -> F128 {
     *D_INV_CACHE.get_or_init(compute_d_inv)
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn ab_eq_fold_gfni_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_EQ_FOLD").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Tensor factors of the scaled lo-eq weight for a `bank_bits = s` split:
+/// `eq_lo_scaled[(w << s) | u] == eq_top_scaled[w] * eq_bot[u]` — `build_eq`
+/// gives index bit `i` to `r_lo[i]`, so the low `s` index bits are exactly
+/// the `r_lo[..s]` sub-product and the rest the `r_lo[s..]` one; the `D^-1`
+/// prover scale rides on the top factor.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>) {
+    let eq_bot = super::univariate_skip::build_eq(&r_lo[..bank_bits]);
+    let eq_top_scaled = super::univariate_skip::build_eq(&r_lo[bank_bits..])
+        .into_iter()
+        .map(|v| v * d_inv())
+        .collect();
+    (eq_bot, eq_top_scaled)
+}
+
+/// GFNI bit-matrix form of the per-`w` pre-scaled convert tables: the
+/// convert banks are F2-linear (`gamma^b * phi_8(v)`, an additive embedding
+/// times a constant), so scaling their eight basis entries by
+/// `eq_top_scaled[w]` scales every composed entry exactly, and each scaled
+/// bank IS sixteen 8x8 bit matrices. 2 KiB per `w` instead of a 64 KiB
+/// table, and no table expansion at all. Matrix encoding matches
+/// `VGF2P8AFFINEQB`: `out.bit[i] = parity(byte[7-i] & in)`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
+    debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    let mut mats = vec![0u64; eq_top_scaled.len() * 256];
+    for (w, scale) in eq_top_scaled.iter().enumerate() {
+        for bm in 0..16 {
+            let basis: [F128; 8] =
+                std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
+            for k in 0..16 {
+                let mut qword = 0u64;
+                for i in 0..8 {
+                    let bit_index = 8 * k + i;
+                    let mut row = 0u8;
+                    for (j, b) in basis.iter().enumerate() {
+                        let bit = if bit_index < 64 {
+                            (b.lo >> bit_index) & 1
+                        } else {
+                            (b.hi >> (bit_index - 64)) & 1
+                        };
+                        row |= (bit as u8) << j;
+                    }
+                    qword |= (row as u64) << (8 * (7 - i));
+                }
+                mats[w * 256 + bm * 16 + k] = qword;
+            }
+        }
+    }
+    mats
+}
+
 // ---------------------------------------------------------------------------
 // Convert table: γ^b · φ_8(v) for b ∈ [0, 16), v ∈ [0, 256).
 // 16 × 256 × 16 bytes = 64 KB. Computed once, cached via OnceLock.
@@ -1511,6 +1587,9 @@ fn build_c_fold4_tables(eq_lo: &[F128]) -> Vec<F128> {
 /// Per-worker state for the four-window fold4 producer.
 pub(crate) struct WorkerStateFold4 {
     partial_ab: [F128; ELL],
+    /// Byte-plane banks for the eq-folded GFNI AB drain (`2^s x 1 KiB`);
+    /// empty until the folded arm first sizes it.
+    plane_banks: Vec<u8>,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     /// Synthetic C blocks, one per retained q: row `4w + j` holds window w's
@@ -1526,6 +1605,7 @@ impl WorkerStateFold4 {
     pub(crate) fn new() -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
+            plane_banks: Vec::new(),
             partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c4: Box::new([[[0u8; 64]; 16]; N_C_Q]),
@@ -1558,11 +1638,24 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
         target_feature = "vpclmulqdq"
     ))]
     c_nibble_luts: &[kernels::CBankNibbleLut],
+    eq_fold: Option<(&[F128], &[u64], usize)>,
     state: &mut WorkerStateFold4,
 ) {
     debug_assert!(big_lo_size.is_multiple_of(4));
     let _ = (&mut state.a_col, &mut state.b_col);
     state.partial_ab.fill(F128::ZERO);
+    // Eq-folded GFNI AB drain: size and zero the byte-plane banks for this
+    // band (`(eq_bot, mats, bank_bits)`; `FLOCK_NO_ZC_AB_EQ_FOLD=1` keeps
+    // the incumbent per-chunk multiply).
+    if let Some((eq_bot, _, _)) = eq_fold {
+        let plane_len = eq_bot.len() * 16 * ELL;
+        if state.plane_banks.len() != plane_len {
+            state.plane_banks.clear();
+            state.plane_banks.resize(plane_len, 0);
+        } else {
+            state.plane_banks.fill(0);
+        }
+    }
     for group in state.partial_c4.iter_mut() {
         for bank in group.iter_mut() {
             bank.fill(F128::ZERO);
@@ -1602,13 +1695,53 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 state.chunk_ab_bytes[b_med]
                     .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             }
-            kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            if let Some((_, mats, bank_bits)) = eq_fold {
+                let w_idx = x_outer_lo >> bank_bits;
+                let u = x_outer_lo & ((1usize << bank_bits) - 1);
+                let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                    .try_into()
+                    .expect("one 16x16 qword matrix block per w");
+                let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                    [u * 16 * ELL..(u + 1) * 16 * ELL])
+                    .try_into()
+                    .expect("one plane bank per low index");
+                kernels::accumulate_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            } else {
+                kernels::accumulate_convert_ab(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_scaled[x_outer_lo],
+                    &mut state.partial_ab,
+                );
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            {
+                debug_assert!(eq_fold.is_none());
+                kernels::accumulate_convert_ab(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_scaled[x_outer_lo],
+                    &mut state.partial_ab,
+                );
+            }
         }
         if !any_live {
             continue;
@@ -1637,6 +1770,25 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 target_feature = "vpclmulqdq"
             )))]
             kernels::accumulate_c_banks(c_block, 1 << N_MEDIUM, c_tables, &mut state.partial_c4[q]);
+        }
+    }
+    // Band-end plane fold for the eq-folded arm: reassemble each bank's
+    // F128 lanes and apply `eq_bot[u]` once per bank — the same sums the
+    // per-chunk multiply produced, reassociated.
+    if let Some((eq_bot, _, _)) = eq_fold {
+        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+            let bank = &state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
+            for lane in 0..ELL {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for k in 0..8 {
+                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
+                }
+                for k in 8..16 {
+                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
+                }
+                state.partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
+            }
         }
     }
     for lane in 0..ELL {
@@ -1724,9 +1876,41 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     let c_nibble_luts = kernels::build_c_bank_nibble_luts(&fold4_tables);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
+    // Eq-folded GFNI AB drain: factor `eq_lo_scaled` into `eq_top * eq_bot`
+    // and carry `eq_top[w]` inside per-`w` GFNI matrices, deleting the
+    // per-chunk eq multiply and every convert-table access.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let eq_fold_state = (ab_eq_fold_gfni_enabled() && eq.n_lo >= 2).then(|| {
+        let bank_bits = eq.n_lo.saturating_sub(5).max(1);
+        let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
+        let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
+        let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
+        (eq_bot, mats, bank_bits)
+    });
     let (res_ab, banks32) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateFold4::new, |mut state, x_hi| {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let eq_fold_arg = eq_fold_state
+                .as_ref()
+                .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
             process_one_x_hi_with_precomputed_ab_fold4(
                 x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
                 ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
@@ -1737,6 +1921,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                     target_feature = "vpclmulqdq"
                 ))]
                 &c_nibble_luts,
+                eq_fold_arg,
                 &mut state,
             );
             state

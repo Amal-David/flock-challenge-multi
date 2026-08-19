@@ -807,3 +807,67 @@ mod tests {
         }
     }
 }
+
+/// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
+/// byte sub-tables are F2-linear (XOR-composed from eight basis entries with
+/// `T[0] = 0`), so each sub-table IS sixteen 8×8 bit matrices — one per
+/// output byte of the F128 — and one `VGF2P8AFFINEQB` evaluates a matrix on
+/// all 64 lanes' bytes at once with no table loads at all. The bank lives in
+/// byte-plane-major form (`bank_planes[k*64 + lane]` = byte `k` of lane's
+/// F128 accumulator); the caller transposes once per band. Encoding
+/// (hardware-verified): `out.bit[i] = parity(mat.byte[7-i] & in)`. The
+/// accumulated planes are the table path's sums with the XOR terms
+/// reassociated — bit-identical.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    // SAFETY: the fixed-size input/plane arrays contain every 64-byte load
+    // and store below; `mats` is exactly the 16×16 qword matrix block for
+    // this table slice. The cfg gate supplies the required target features.
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for (bm, row) in rows.iter_mut().enumerate().take(n_b_med) {
+            *row = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut bm = 0;
+            // Two GFNI products fold into the accumulator per VPTERNLOGQ
+            // (imm 0x96 = a ^ b ^ c); sixteen independent plane chains keep
+            // the accumulation latency off the critical path.
+            while bm + 1 < n_b_med {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < n_b_med {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
