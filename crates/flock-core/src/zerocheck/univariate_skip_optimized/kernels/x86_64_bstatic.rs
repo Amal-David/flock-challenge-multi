@@ -175,10 +175,10 @@ unsafe fn perm_row(v: __m512i, j: usize) -> __m512i {
     }
 }
 
-/// Full inverse-NTT apply of one 8-byte packed row (bit-identical to
-/// `InvNttTableByteSingleGf8::apply_x86_avx512_register_unchecked`).
+/// One-image inverse-NTT apply (ten port-5 shuffles). Bit-identical to
+/// `InvNttTableByteSingleGf8::apply_x86_avx512_register_unchecked`.
 #[inline(always)]
-unsafe fn apply_full(table: *const u8, bytes: *const u8) -> __m512i {
+unsafe fn apply_full_1img(table: *const u8, bytes: *const u8) -> __m512i {
     // SAFETY: caller guarantees eight readable bytes at `bytes` and a table of
     // 256 rows × 64 readable bytes.
     unsafe {
@@ -188,6 +188,51 @@ unsafe fn apply_full(table: *const u8, bytes: *const u8) -> __m512i {
             acc = _mm512_xor_si512(acc, perm_row(row, j));
         }
         acc
+    }
+}
+
+/// Two-image inverse-NTT apply: same field element as [`apply_full_1img`],
+/// with the first butterfly level folded into loads from the σ₈ image
+/// (3 port-5 shuffles vs 10). Inlined copy of
+/// `InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_unchecked` so
+/// the static-B kernel keeps `#[inline(always)]` without `#[target_feature]`
+/// (rust#145574).
+#[inline(always)]
+unsafe fn apply_full_2img(base: *const u8, base8: *const u8, bytes: *const u8) -> __m512i {
+    // SAFETY: eight readable input bytes; both images hold 256×64 bytes.
+    unsafe {
+        let row = |img: *const u8, b: usize| {
+            _mm512_loadu_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
+        };
+        let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
+        let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
+        let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
+        let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
+        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
+/// Full inverse-NTT apply of one 8-byte packed row. Dispatches to the
+/// two-image form when `img2` (same latch as the generic kernel).
+#[inline(always)]
+unsafe fn apply_full(
+    inv_table: &InvNttTableByteSingleGf8,
+    bytes: *const u8,
+    img2: bool,
+) -> __m512i {
+    // SAFETY: same contract as the two apply forms; forwarded from the caller.
+    unsafe {
+        if img2 {
+            apply_full_2img(
+                inv_table.data_ptr(),
+                inv_table.half_swapped_data_ptr(),
+                bytes,
+            )
+        } else {
+            apply_full_1img(inv_table.data_ptr(), bytes)
+        }
     }
 }
 
@@ -221,6 +266,11 @@ unsafe fn kernel<const BLK: usize>(
     nt: u8,
 ) -> bool {
     let table = inv_table.data_ptr();
+    // Same 2-image latch as the generic kernel: 3 port-5 shuffles per leftover
+    // full apply instead of 10. Vary-bit reconstruction still loads from the
+    // original image (`table`) because those are individual T₀ rows, not a
+    // full 8-byte apply.
+    let img2 = super::x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
     // SAFETY: see the function contract; every load below is either an
     // 8-byte packed-row read the caller vouches for, a table-row read (u8
     // index into 256 rows of 64 bytes), or an aligned read of static/partial
@@ -279,7 +329,7 @@ unsafe fn kernel<const BLK: usize>(
             let mut acc = _mm512_setzero_si512();
             let parts = partials.rows[BLK].as_ptr() as *const u8;
             for k in 0..8usize {
-                let av = apply_full(table, a_base.add(k * N_CHUNKS));
+                let av = apply_full(inv_table, a_base.add(k * N_CHUNKS), img2);
                 let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
                 acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
             }
@@ -295,7 +345,7 @@ unsafe fn kernel<const BLK: usize>(
                 if p.kind == ROW_ZERO {
                     // b row is structurally zero ⇒ contributes nothing.
                 } else if p.kind == ROW_STATIC {
-                    let av = apply_full(table, a_ptr);
+                    let av = apply_full(inv_table, a_ptr, img2);
                     let part = _mm512_load_si512(partials.rows[BLK][$k].as_ptr() as *const __m512i);
                     if p.vary == 0 {
                         // `part` is already `T(expected) · x^K`.
@@ -320,8 +370,8 @@ unsafe fn kernel<const BLK: usize>(
                         acc = _mm512_xor_si512(acc, scaled);
                     }
                 } else {
-                    let av = apply_full(table, a_ptr);
-                    let bv = apply_full(table, b_base.add($k * N_CHUNKS));
+                    let av = apply_full(inv_table, a_ptr, img2);
+                    let bv = apply_full(inv_table, b_base.add($k * N_CHUNKS), img2);
                     let prod = _mm512_gf2p8mul_epi8(av, bv);
                     let scaled = if $k == 0 {
                         prod
@@ -549,24 +599,28 @@ mod tests {
     }
 
     /// The `q ↦ q ^ j` qword permutation reproduces the incumbent apply's
-    /// lane shuffle + half swap for every byte position.
+    /// lane shuffle + half swap for every byte position. Both apply forms
+    /// (one-image and two-image) must match the scalar table apply.
     #[test]
     fn perm_row_matches_incumbent_apply() {
         let inv_table = standard_table();
+        assert!(inv_table.has_second_image());
         let mut rng = Rng(0x9E4D);
         for _ in 0..256 {
             let word = rng.next_u64().to_le_bytes();
             let mut want = [F8::ZERO; 64];
             inv_table.apply(&word, &mut want);
-            // SAFETY: cfg-gated module ⇒ avx512f baseline.
-            let got = unsafe {
-                let v = apply_full(inv_table.data_ptr(), word.as_ptr());
-                let mut o = [0u8; 64];
-                _mm512_storeu_si512(o.as_mut_ptr() as *mut __m512i, v);
-                o
-            };
             let want: [u8; 64] = core::array::from_fn(|i| want[i].0);
-            assert_eq!(got, want);
+            for img2 in [false, true] {
+                // SAFETY: cfg-gated module ⇒ avx512f baseline.
+                let got = unsafe {
+                    let v = apply_full(&inv_table, word.as_ptr(), img2);
+                    let mut o = [0u8; 64];
+                    _mm512_storeu_si512(o.as_mut_ptr() as *mut __m512i, v);
+                    o
+                };
+                assert_eq!(got, want, "img2={img2}");
+            }
         }
     }
 }
@@ -618,6 +672,7 @@ mod microbench {
         out: &mut [u8; 64],
     ) -> bool {
         let table = inv_table.data_ptr();
+        let img2 = super::super::x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
         // SAFETY: see [`kernel`].
         unsafe {
             let a_base = a_packed.as_ptr().add(byte_base_b);
@@ -642,7 +697,7 @@ mod microbench {
                 if p.kind == ROW_ZERO {
                     continue;
                 }
-                let av = apply_full(table, a_base.add(k * N_CHUNKS));
+                let av = apply_full(inv_table, a_base.add(k * N_CHUNKS), img2);
                 if p.kind == ROW_STATIC {
                     let mut bv = _mm512_load_si512(parts[k].as_ptr() as *const __m512i);
                     if p.vary == 0 {
@@ -666,7 +721,7 @@ mod microbench {
                     };
                     acc = _mm512_xor_si512(acc, scaled);
                 } else {
-                    let bv = apply_full(table, b_base.add(k * N_CHUNKS));
+                    let bv = apply_full(inv_table, b_base.add(k * N_CHUNKS), img2);
                     let prod = _mm512_gf2p8mul_epi8(av, bv);
                     let scaled = if k == 0 {
                         prod
