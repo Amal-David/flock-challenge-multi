@@ -22,3 +22,9 @@ pub(crate) use x86_64::{NibbleTables, build_nibble_tables as build_nibble_tables
     target_feature = "gfni"
 ))]
 pub use x86_64::partial_fold_packed_z_x86_gfni_padded;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+pub(crate) use x86_64::{fold_mats_from_basis, gfni_fold_tile};

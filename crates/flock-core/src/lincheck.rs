@@ -892,6 +892,32 @@ fn lincheck_nibble_fold_enabled() -> bool {
     *ON
 }
 
+/// Test-only latch forcing the block-major GFNI arm OFF (it ships on), so
+/// both arms can be compared in one process (the env switches resolve once).
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+pub(crate) static BM_GFNI_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_LC_BM_GFNI=1` restores the nibble-table accumulate in the
+/// block-major sweep (exact same-binary A/B). Distinct from
+/// `FLOCK_NO_LC_GFNI`, which guards only the byte-stripe dispatcher — the
+/// block-major path never reaches it. Resolved once per process.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+fn block_major_gfni_enabled() -> bool {
+    #[cfg(test)]
+    if BM_GFNI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_BM_GFNI").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -924,6 +950,128 @@ fn fold_untimed_enabled() -> bool {
         std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none()
     });
     *ON
+}
+
+/// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
+/// chunk) the eight gathered+transposed stripe rows drain through
+/// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
+/// (16 planes x 64 columns per 64-column block); one transpose back to F128
+/// happens inside the cross-worker reduce. Bit-identical to the
+/// scalar/nibble arms: F128 addition IS bitwise XOR, so plane-domain
+/// accumulation commutes with the transpose, and the whole-block writes
+/// past `useful_bits` land on index bytes that are ZERO in memory (r1cs
+/// zero padding) through a linear map with no constant — contributing
+/// nothing, exactly like the masked stores they replace.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_gfni(
+    z_packed: &[F128],
+    k: usize,
+    chunks_per_block: usize,
+    useful_bits: usize,
+    useful_chunks: usize,
+    n_workers: usize,
+    tiles_per_worker: usize,
+    n_tiles: usize,
+    dynamic: bool,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    const TILE_GRAB: usize = 4;
+    let next_tile = std::sync::atomic::AtomicUsize::new(0);
+    // Same total footprint as the F128 partials (k*16 bytes per worker).
+    let mut planes = vec![0u8; n_workers * k * 16];
+    planes
+        .par_chunks_mut(k * 16)
+        .enumerate()
+        .for_each(|(worker, wplanes)| {
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            let (mut claim_lo, mut claim_hi) = if dynamic {
+                (0usize, 0usize)
+            } else {
+                (tile_lo, tile_hi)
+            };
+            let mut mats = [0u64; 128];
+            debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
+            let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            loop {
+                let tile = if claim_lo < claim_hi {
+                    claim_lo += 1;
+                    claim_lo - 1
+                } else if dynamic {
+                    let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
+                    if lo >= n_tiles {
+                        break;
+                    }
+                    claim_lo = lo + 1;
+                    claim_hi = (lo + TILE_GRAB).min(n_tiles);
+                    lo
+                } else {
+                    break;
+                };
+                let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    let eq8 = eq8_at(8 * (stripe_base + t));
+                    kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                }
+                for q in 0..useful_chunks {
+                    let inner_base = q * 128;
+                    let chunk_bits = (useful_bits - inner_base).min(128);
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let outer_base = 8 * (stripe_base + t);
+                        let lanes: [F128; 8] = std::array::from_fn(|r| {
+                            z_packed[(outer_base + r) * chunks_per_block + q]
+                        });
+                        transpose_8_f128s_to_128_bytes(
+                            &lanes,
+                            &mut transposed[t * 128..(t + 1) * 128],
+                        );
+                    }
+                    // SAFETY: `transposed` holds 8 stripes x 128 bytes at
+                    // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
+                    // the worker planes cover (2q + chunk blocks) * 1024
+                    // bytes for every q < useful_chunks <= k/128.
+                    unsafe {
+                        kernels::gfni_fold_tile(
+                            transposed.as_ptr(),
+                            128,
+                            chunk_bits.div_ceil(64),
+                            &mats,
+                            wplanes.as_mut_ptr().add(2 * q * 1024),
+                        );
+                    }
+                }
+            }
+        });
+
+    // Cross-worker reduce + transpose-back in ONE parallel pass over
+    // 64-column blocks (a standalone transpose would be a full-buffer
+    // read+write pass — the class this arm deletes).
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
+        let base = blk * 1024;
+        let mut acc = [0u8; 1024];
+        acc.copy_from_slice(&planes[base..base + 1024]);
+        for w in 1..n_workers {
+            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+            for (a, b) in acc.iter_mut().zip(src) {
+                *a ^= *b;
+            }
+        }
+        for (col, slot) in o.iter_mut().enumerate() {
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for byte in 0..8 {
+                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+            }
+            for byte in 8..16 {
+                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+            }
+            *slot = F128 { lo, hi };
+        }
+    });
+    out
 }
 
 /// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
@@ -973,6 +1121,29 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
     // tables / transpose+read / accumulate split back (it costs ~1 ms/worker).
     let timing = !fold_untimed_enabled();
+
+    // GFNI plane-major arm: exact-tile shapes only (no ragged last tile),
+    // 64-column blocks available. Everything else falls through to the
+    // incumbent nibble/scalar sweep unchanged.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+    if block_major_gfni_enabled()
+        && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0
+        && k_log >= 6
+    {
+        let _ = (trace_fold, timing);
+        return fold_block_major_gfni(
+            z_packed,
+            k,
+            chunks_per_block,
+            useful_bits,
+            useful_chunks,
+            n_workers,
+            tiles_per_worker,
+            n_tiles,
+            dynamic,
+            &eq8_at,
+        );
+    }
 
     // Outer-tile partitioning reads every useful z chunk exactly once and
     // builds every sum table once. Each worker owns a private length-k partial;
@@ -2713,6 +2884,9 @@ mod tests {
             (16, 10, 997),
             (16, 8, 241),
             (18, 12, 3_801),
+            // The ranked k_log and useful_bits at a small n_log: 121 full
+            // 128-column chunks plus the 49-bit tail block, exact tiles.
+            (20, 14, 15_409),
         ];
         for &(m, k_log, useful_bits) in cases {
             let mut rng = Rng::new(0xD1EC_7F01 + (m * 31 + k_log) as u64);
@@ -2751,6 +2925,74 @@ mod tests {
                 &eq_outer,
             );
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+
+            // Same call with the GFNI plane arm forced off: the nibble/scalar
+            // sweep must produce the identical vector (arm-vs-arm identity in
+            // one process; the env switches resolve once so a latch is the
+            // only way to cover both).
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "gfni"
+            ))]
+            {
+                BM_GFNI_FORCED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                let got_off = partial_fold_packed_z_block_major_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq_outer,
+                );
+                BM_GFNI_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    want, got_off,
+                    "forced-off arm m={m} k_log={k_log} useful={useful_bits}"
+                );
+            }
+        }
+    }
+
+    /// The GFNI matrix builder must agree with `build_sum_table` on every
+    /// byte value: affine-applying the sixteen per-stripe matrices to `v`
+    /// equals `table[v]` — isolating the `8·(7−i)` byte order and the
+    /// `bit j ↔ basis j` mapping from any layout question.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fold_mats_from_basis_matches_sum_table() {
+        let mut rng = Rng::new(0xFA57_3AB1);
+        for _ in 0..8 {
+            let eq8: [F128; 8] = std::array::from_fn(|_| rng.f128());
+            let mut mats = [0u64; 16];
+            kernels::fold_mats_from_basis(&eq8, &mut mats);
+            let mut table = vec![F128::ZERO; 256];
+            build_sum_table(&eq8, &mut table);
+            for v in 0..256usize {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for (byte_k, &m) in mats.iter().enumerate() {
+                    let mut out_byte = 0u8;
+                    for i in 0..8 {
+                        let row = ((m >> (8 * (7 - i))) & 0xff) as u8;
+                        let parity = ((row & v as u8).count_ones() & 1) as u8;
+                        out_byte |= parity << i;
+                    }
+                    if byte_k < 8 {
+                        lo |= (out_byte as u64) << (8 * byte_k);
+                    } else {
+                        hi |= (out_byte as u64) << (8 * (byte_k - 8));
+                    }
+                }
+                assert_eq!(
+                    F128 { lo, hi },
+                    table[v],
+                    "affine(mats, {v}) must equal table[{v}]"
+                );
+            }
         }
     }
 
