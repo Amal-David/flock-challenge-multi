@@ -918,6 +918,20 @@ fn block_major_gfni_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GATHER_TR=1` restores the scalar stripe gather + staging
+/// transpose in the GFNI block-major arm (exact same-binary A/B).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lc_gather_tr_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -995,6 +1009,10 @@ fn fold_block_major_gfni(
             let mut mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            // Fused register gather+transpose (no staging arrays); the
+            // scalar path stays as the kill-switch arm.
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather_tr_fused = lc_gather_tr_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1020,6 +1038,20 @@ fn fold_block_major_gfni(
                     let chunk_bits = (useful_bits - inner_base).min(128);
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
                         let outer_base = 8 * (stripe_base + t);
+                        #[cfg(target_feature = "avx512vbmi")]
+                        if gather_tr_fused {
+                            // SAFETY: rows (outer_base + r) * chunks_per_block
+                            // + q are the exact indices the scalar gather
+                            // reads; output is 128 bytes of `transposed`.
+                            unsafe {
+                                kernels::gather_transpose_stripe_x86(
+                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                    chunks_per_block,
+                                    transposed.as_mut_ptr().add(t * 128),
+                                );
+                            }
+                            continue;
+                        }
                         let lanes: [F128; 8] = std::array::from_fn(|r| {
                             z_packed[(outer_base + r) * chunks_per_block + q]
                         });
@@ -2950,6 +2982,32 @@ mod tests {
                     "forced-off arm m={m} k_log={k_log} useful={useful_bits}"
                 );
             }
+        }
+    }
+
+    /// The fused register gather+transpose must equal the scalar
+    /// gather + `transpose_8_f128s_to_128_bytes` byte-for-byte, at several
+    /// strides.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gather_transpose_stripe_matches_scalar() {
+        let mut rng = Rng::new(0x6A77_37B1);
+        for stride in [1usize, 2, 17, 128] {
+            let z: Vec<F128> = (0..8 * stride).map(|_| rng.f128()).collect();
+            let mut want = [0u8; 128];
+            let lanes: [F128; 8] = std::array::from_fn(|r| z[r * stride]);
+            transpose_8_f128s_to_128_bytes(&lanes, &mut want);
+            let mut got = [0xA5u8; 128];
+            // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
+            unsafe {
+                kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
+            }
+            assert_eq!(want, got, "stride {stride}");
         }
     }
 
