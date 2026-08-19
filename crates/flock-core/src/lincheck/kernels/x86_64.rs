@@ -181,6 +181,88 @@ pub(crate) unsafe fn gather_transpose_stripe_x86(z_ptr: *const F128, stride: usi
     }
 }
 
+/// Four-column twin of [`gather_transpose_stripe_x86`]: gathers columns
+/// `q..q+4` of the eight rows in ONE pass — eight 64-byte row loads plus two
+/// 4×4 lane transposes replace thirty-two 16-byte strided loads and
+/// twenty-four inserts. The row stride is 2048 bytes at the ranked shape, so
+/// a tile's 64 live rows land in only two L1 sets; batching four columns per
+/// visit quarters the number of times each row line must survive in those
+/// sets. Column `c`'s 128 transposed bytes land at `out + c*out_stride +
+/// (the caller's stripe offset)` — identical bytes to four single calls.
+///
+/// # Safety
+/// 4 readable F128 at `z_ptr + r*stride + c` for r in 0..8, c in 0..4; `out
+/// + c*out_stride` covers 128 writable bytes for c in 0..4; features per the
+/// cfg gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather_transpose_stripe4_x86(
+    z_ptr: *const F128,
+    stride: usize,
+    out: *mut u8,
+    out_stride: usize,
+) {
+    use core::arch::x86_64::*;
+    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
+    // SAFETY: bounds per the contract; features per the cfg gate.
+    unsafe {
+        // Row r's columns q..q+3 in one wide load (64-aligned in production —
+        // the pool's recyclable class — but loadu tolerates test vectors).
+        let ld = |r: usize| _mm512_loadu_si512(z_ptr.add(r * stride) as *const __m512i);
+        let r = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6), ld(7)];
+        // 4×4 transpose of 128-bit lanes: cols[c] = lanes {row0..row3 at c}.
+        #[inline(always)]
+        unsafe fn tr4(a: __m512i, b: __m512i, c: __m512i, d: __m512i) -> [__m512i; 4] {
+            // SAFETY: caller carries avx512f.
+            unsafe {
+                let ab_lo = _mm512_shuffle_i64x2::<0x44>(a, b); // a0 a1 b0 b1
+                let ab_hi = _mm512_shuffle_i64x2::<0xEE>(a, b); // a2 a3 b2 b3
+                let cd_lo = _mm512_shuffle_i64x2::<0x44>(c, d);
+                let cd_hi = _mm512_shuffle_i64x2::<0xEE>(c, d);
+                [
+                    _mm512_shuffle_i64x2::<0x88>(ab_lo, cd_lo), // a0 b0 c0 d0
+                    _mm512_shuffle_i64x2::<0xDD>(ab_lo, cd_lo), // a1 b1 c1 d1
+                    _mm512_shuffle_i64x2::<0x88>(ab_hi, cd_hi), // a2 b2 c2 d2
+                    _mm512_shuffle_i64x2::<0xDD>(ab_hi, cd_hi), // a3 b3 c3 d3
+                ]
+            }
+        }
+        let z0s = tr4(r[0], r[1], r[2], r[3]); // per column: rows 0..3
+        let z1s = tr4(r[4], r[5], r[6], r[7]); // per column: rows 4..7
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        #[repr(C, align(64))]
+        struct BIdx4([u8; 64]);
+        static BIDX4: BIdx4 = {
+            let mut t = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                i += 1;
+            }
+            BIdx4(t)
+        };
+        let bidx = _mm512_load_si512(BIDX4.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
+        for c in 0..4 {
+            let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
+            let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
+            let t_lo =
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
+            let t_hi =
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
+            let dst = out.add(c * out_stride);
+            _mm512_storeu_si512(dst as *mut __m512i, t_lo);
+            _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
+        }
+    }
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching

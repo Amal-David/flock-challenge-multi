@@ -931,6 +931,16 @@ fn block_major_gfni_enabled() -> bool {
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
+/// `FLOCK_NO_LC_GATHER4=1` restores single-column gather+transpose visits in
+/// the block-major GFNI fold (exact A/B control; the fused single-column arm
+/// then serves every chunk). Resolved once per process.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_gather4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER4").is_none());
+    *ON
+}
+
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -1014,7 +1024,9 @@ fn fold_block_major_gfni(
             };
             let mut mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
-            let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            // Four column-slabs of 8×128 bytes: the grouped gather writes
+            // column c at slab c; the single-column arms use slab 0 only.
+            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
             // First tile this worker writes into a freshly zeroed plane
             // buffer: seed the GFNI acc from a register zero idiom.
             let mut first_tile = true;
@@ -1042,7 +1054,65 @@ fn fold_block_major_gfni(
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                 }
-                for q in 0..useful_chunks {
+                let mut q = 0usize;
+                // Grouped arm: four full 128-bit chunks per gather visit.
+                // The row stride is 2048 bytes, so a tile's 64 live rows
+                // land in two L1 sets; one wide load per row per FOUR
+                // columns quarters the residency each row line needs there.
+                // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
+                // the ragged final chunk takes the single-column arm below.
+                #[cfg(target_feature = "avx512vbmi")]
+                if gather_tr_fused && lc_gather4_enabled() {
+                    let full_chunks = useful_bits / 128;
+                    while q + 4 <= full_chunks {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let outer_base = 8 * (stripe_base + t);
+                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                                let next_base = 8 * (stripe_base + t + 1);
+                                // One line per row covers all four columns.
+                                unsafe {
+                                    for r in 0..8 {
+                                        core::arch::x86_64::_mm_prefetch(
+                                            z_packed
+                                                .as_ptr()
+                                                .add((next_base + r) * chunks_per_block + q)
+                                                .cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                    }
+                                }
+                            }
+                            // SAFETY: rows (outer_base + r) * chunks_per_block
+                            // + q + c for c in 0..4 are the indices four
+                            // single gathers would read; each column slab is
+                            // 1024 writable bytes of `transposed`.
+                            unsafe {
+                                kernels::gather_transpose_stripe4_x86(
+                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                    chunks_per_block,
+                                    transposed.as_mut_ptr().add(t * 128),
+                                    1024,
+                                );
+                            }
+                        }
+                        for c in 0..4 {
+                            // SAFETY: as for the single-column call below;
+                            // every grouped chunk is full (2 blocks of 64).
+                            unsafe {
+                                kernels::gfni_fold_tile(
+                                    transposed.as_ptr().add(c * 1024),
+                                    128,
+                                    2,
+                                    &mats,
+                                    wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
+                                    first_tile,
+                                );
+                            }
+                        }
+                        q += 4;
+                    }
+                }
+                while q < useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
@@ -1104,6 +1174,7 @@ fn fold_block_major_gfni(
                             first_tile,
                         );
                     }
+                    q += 1;
                 }
                 first_tile = false;
             }
@@ -3056,6 +3127,42 @@ mod tests {
                 kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
             }
             assert_eq!(want, got, "stride {stride}");
+        }
+        // Four-column twin: identical bytes to four single calls at q..q+4,
+        // each landing in its own out-stride slab.
+        for stride in [4usize, 17, 128] {
+            let z: Vec<F128> = (0..8 * stride + 4).map(|_| rng.f128()).collect();
+            for q in [0usize, stride.saturating_sub(4).min(3)] {
+                let mut want = [0u8; 4 * 1024];
+                for c in 0..4 {
+                    // SAFETY: rows r*stride + q + c are in bounds by the
+                    // vector's +4 slack; each destination is 128 bytes.
+                    unsafe {
+                        kernels::gather_transpose_stripe_x86(
+                            z.as_ptr().add(q + c),
+                            stride,
+                            want.as_mut_ptr().add(c * 1024),
+                        );
+                    }
+                }
+                let mut got = [0x5Au8; 4 * 1024];
+                // SAFETY: as above; out_stride 1024 covers four 128-byte slabs.
+                unsafe {
+                    kernels::gather_transpose_stripe4_x86(
+                        z.as_ptr().add(q),
+                        stride,
+                        got.as_mut_ptr(),
+                        1024,
+                    );
+                }
+                for c in 0..4 {
+                    assert_eq!(
+                        want[c * 1024..c * 1024 + 128],
+                        got[c * 1024..c * 1024 + 128],
+                        "stride {stride} q {q} col {c}"
+                    );
+                }
+            }
         }
     }
 

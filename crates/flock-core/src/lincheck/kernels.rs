@@ -15,7 +15,7 @@ mod x86_64;
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-pub(crate) use x86_64::gather_transpose_stripe_x86;
+pub(crate) use x86_64::{gather_transpose_stripe4_x86, gather_transpose_stripe_x86};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
