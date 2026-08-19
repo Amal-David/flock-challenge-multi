@@ -147,6 +147,187 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
 }
 
+/// `FLOCK_NO_LC_PLANE_PACK=1` restores the byte-at-a-time worker XOR +
+/// scalar plane→F128 pack (same-binary A/B). Ranked env is cleared.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn plane_pack_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_PACK").is_none());
+    *ON
+}
+
+/// 8×8 byte-transpose permute for `vpermb`: output qword `j` byte `p` =
+/// input qword `p` byte `j`. Used to turn 8 plane-rows of 8 columns into
+/// 8 little-endian `u64` limbs (one F128 half per column).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+const PLANE_PACK_IDX: [i8; 64] = {
+    let mut idx = [0i8; 64];
+    let mut j = 0;
+    while j < 8 {
+        let mut p = 0;
+        while p < 8 {
+            idx[j * 8 + p] = (p * 8 + j) as i8;
+            p += 1;
+        }
+        j += 1;
+    }
+    idx
+};
+
+/// XOR-reduce one 64-column plane block across workers and pack it to 64
+/// F128s. Bit-identical to the scalar `acc[p*64+c]` → `F128.{lo,hi}` loop:
+/// `out[c].lo` byte `p` = XOR of worker plane `p` at column `c` (same for
+/// `hi` with planes 8..16).
+///
+/// # Safety
+/// `planes` is `n_workers * k * 16` bytes. `blk * 1024 + 1024` is in-bounds
+/// for every worker. `out.len() == 64`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi")]
+pub(crate) unsafe fn reduce_plane_block_to_f128(
+    planes: &[u8],
+    k: usize,
+    n_workers: usize,
+    blk: usize,
+    out: &mut [F128],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(out.len(), 64);
+    debug_assert_eq!(planes.len(), n_workers * k * 16);
+    let base = blk * 1024;
+    // SAFETY: caller bounds; avx512f+vbmi cfg-guaranteed.
+    unsafe {
+        let mut acc = [_mm512_setzero_si512(); 16];
+        for w in 0..n_workers {
+            let src = planes.as_ptr().add(w * k * 16 + base);
+            for p in 0..16 {
+                acc[p] = _mm512_xor_si512(
+                    acc[p],
+                    _mm512_loadu_si512(src.add(p * 64) as *const __m512i),
+                );
+            }
+        }
+        let mut bytes = [0u8; 1024];
+        for p in 0..16 {
+            _mm512_storeu_si512(bytes.as_mut_ptr().add(p * 64) as *mut __m512i, acc[p]);
+        }
+        if !plane_pack_enabled() {
+            for (col, slot) in out.iter_mut().enumerate() {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (bytes[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (bytes[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                *slot = F128 { lo, hi };
+            }
+            return;
+        }
+        let idx = _mm512_loadu_si512(PLANE_PACK_IDX.as_ptr() as *const __m512i);
+        for group in 0..8 {
+            let off = group * 8;
+            let mut lo_in = [0u64; 8];
+            let mut hi_in = [0u64; 8];
+            for p in 0..8 {
+                lo_in[p] = u64::from_le_bytes(
+                    bytes[p * 64 + off..p * 64 + off + 8].try_into().unwrap(),
+                );
+                hi_in[p] = u64::from_le_bytes(
+                    bytes[(p + 8) * 64 + off..(p + 8) * 64 + off + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+            let lo_t = _mm512_permutexvar_epi8(
+                idx,
+                _mm512_loadu_si512(lo_in.as_ptr() as *const __m512i),
+            );
+            let hi_t = _mm512_permutexvar_epi8(
+                idx,
+                _mm512_loadu_si512(hi_in.as_ptr() as *const __m512i),
+            );
+            let mut lo_out = [0u64; 8];
+            let mut hi_out = [0u64; 8];
+            _mm512_storeu_si512(lo_out.as_mut_ptr() as *mut __m512i, lo_t);
+            _mm512_storeu_si512(hi_out.as_mut_ptr() as *mut __m512i, hi_t);
+            for j in 0..8 {
+                out[off + j] = F128 {
+                    lo: lo_out[j],
+                    hi: hi_out[j],
+                };
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+mod plane_pack_tests {
+    use super::{reduce_plane_block_to_f128, F128};
+
+    #[test]
+    fn reduce_plane_block_matches_scalar() {
+        let k = 64usize;
+        let n_workers = 4usize;
+        let mut planes = vec![0u8; n_workers * k * 16];
+        let mut state = 0xA5A5_C3C3_1234_5678u64;
+        for b in planes.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 33) as u8;
+        }
+        let mut want = vec![F128::ZERO; 64];
+        {
+            let mut acc = [0u8; 1024];
+            acc.copy_from_slice(&planes[..1024]);
+            for w in 1..n_workers {
+                let src = &planes[w * k * 16..w * k * 16 + 1024];
+                for (a, b) in acc.iter_mut().zip(src) {
+                    *a ^= *b;
+                }
+            }
+            for (col, slot) in want.iter_mut().enumerate() {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                *slot = F128 { lo, hi };
+            }
+        }
+        let mut got = vec![F128::ZERO; 64];
+        unsafe {
+            reduce_plane_block_to_f128(&planes, k, n_workers, 0, &mut got);
+        }
+        assert_eq!(got, want);
+    }
+}
+
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///

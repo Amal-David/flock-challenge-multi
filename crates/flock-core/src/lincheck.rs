@@ -1050,25 +1050,47 @@ fn fold_block_major_gfni(
     // read+write pass — the class this arm deletes).
     let mut out = vec![F128::ZERO; k];
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
-        let base = blk * 1024;
-        let mut acc = [0u8; 1024];
-        acc.copy_from_slice(&planes[base..base + 1024]);
-        for w in 1..n_workers {
-            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
-            for (a, b) in acc.iter_mut().zip(src) {
-                *a ^= *b;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        {
+            // SAFETY: `planes` is n_workers·k·16; each 64-col block is 1024
+            // bytes; `o` is 64 F128s. Features cfg-guaranteed.
+            unsafe {
+                kernels::reduce_plane_block_to_f128(&planes, k, n_workers, blk, o);
             }
+            return;
         }
-        for (col, slot) in o.iter_mut().enumerate() {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        {
+            let base = blk * 1024;
+            let mut acc = [0u8; 1024];
+            acc.copy_from_slice(&planes[base..base + 1024]);
+            for w in 1..n_workers {
+                let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+                for (a, b) in acc.iter_mut().zip(src) {
+                    *a ^= *b;
+                }
             }
-            for byte in 8..16 {
-                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+            for (col, slot) in o.iter_mut().enumerate() {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                *slot = F128 { lo, hi };
             }
-            *slot = F128 { lo, hi };
         }
     });
     out
