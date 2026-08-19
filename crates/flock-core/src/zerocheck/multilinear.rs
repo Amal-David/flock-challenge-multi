@@ -1506,6 +1506,79 @@ pub fn fold_and_compute_round_pair_optimized(
     (a_new, b_new, m1, mi)
 }
 
+/// Per-chunk output floor for the generic tail rounds, in log2 F128 elements.
+///
+/// The tail's rayon fan-out is `hi_size = 2^n_hi` chunks; with the fixed
+/// `SplitEqGhash::MAX_N_HI = 7` split that is 128 chunks at *every* round, so
+/// once the table is small each chunk carries a handful of outputs and the
+/// fork/join tree costs more than the arithmetic. Measured on a 16-thread
+/// Zen 5 the generic tail rounds sat at a flat ~1.4 ms each from log_n 20 all
+/// the way down to log_n 10 even though the work halves every round — that
+/// floor is pure dispatch. Capping the chunk count so each chunk keeps at
+/// least `2^ZC_TAIL_CHUNK_MIN_OUT_LOG` outputs collapses it.
+///
+/// Regrouping across chunk boundaries is exact, so the wire bytes do not
+/// move: `eq` splits as an exact tensor product (`eq(x) = eq_hi[x_hi] ·
+/// eq_lo[x_lo]`), F128 multiplication is associative, and the deferred
+/// reduction is F2-linear, so `Σ_hi eq_hi · reduce(Σ_lo eq_lo ⊗ g)` is the
+/// same field element for every choice of `n_hi`.
+const ZC_TAIL_CHUNK_MIN_OUT_LOG: usize = 9;
+
+/// `FLOCK_NO_ZC_TAIL_FANOUT=1` restores the fixed `MAX_N_HI` fan-out for the
+/// generic tail rounds (same-binary A/B control and emergency fallback);
+/// `FLOCK_ZC_TAIL_CHUNK_LOG=<n>` overrides the floor for threshold sweeps.
+/// The ranked worker's cleared environment never sets either, so the shipped
+/// behavior is the tuned default.
+fn zc_tail_chunk_min_out_log() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_ZC_TAIL_FANOUT").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_ZC_TAIL_CHUNK_LOG")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(ZC_TAIL_CHUNK_MIN_OUT_LOG)
+    });
+    *V
+}
+
+/// Size-adaptive hi-split for the generic tail rounds. `half` is the folded
+/// output length. `n_hi = 0` (a single chunk) is deliberately reachable — the
+/// caller then skips the rayon region entirely.
+fn tail_n_hi_for(half: usize) -> usize {
+    let floor = zc_tail_chunk_min_out_log();
+    if floor == 0 {
+        return SplitEqGhash::MAX_N_HI;
+    }
+    let log_half = half.trailing_zeros() as usize;
+    SplitEqGhash::MAX_N_HI.min(log_half.saturating_sub(floor))
+}
+
+/// Output-length ceiling (in F128 elements) below which a generic tail round
+/// runs entirely on the calling thread — one chunk, the same AVX-512/portable
+/// kernel, and no rayon region at all. Entering a rayon region from the prove
+/// thread costs a job injection plus a latch wait on every worker; for the
+/// smallest tail rounds that is the whole round.
+const ZC_SERIAL_TAIL_MAX_OUT_LOG: usize = 17;
+
+/// `FLOCK_NO_ZC_SERIAL_TAIL=1` keeps every generic tail round on rayon;
+/// `FLOCK_ZC_SERIAL_TAIL_LOG=<n>` moves the crossover (`n = 0` also disables).
+/// The ranked worker's cleared environment never sets either.
+fn zc_serial_tail_max_out() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_ZC_SERIAL_TAIL").is_some() {
+            return 0;
+        }
+        let log = std::env::var("FLOCK_ZC_SERIAL_TAIL_LOG")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(ZC_SERIAL_TAIL_MAX_OUT_LOG)
+            .min(usize::BITS as usize - 1);
+        if log == 0 { 0 } else { 1usize << log }
+    });
+    *V
+}
+
 /// Buffer-reusing variant of [`fold_and_compute_round_pair_optimized`]: writes
 /// the folded `a`/`b` into the caller-provided `a_out`/`b_out` (each length
 /// `a.len() / 2`) instead of allocating. Returns `(r_next[0] · G(1), G(∞))`.
@@ -1522,6 +1595,34 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
+    // Chunk-count policy: cap the fan-out so each rayon chunk keeps a useful
+    // amount of work (see `tail_n_hi_for`), and drop to a single chunk on the
+    // calling thread once the round is smaller than the region entry cost
+    // (see `zc_serial_tail_max_out`). Both only change how the identical
+    // per-element products are grouped for the deferred reduction, which is
+    // exact — the wire bytes are unchanged.
+    let half = a.len() / 2;
+    let n_hi = if half <= zc_serial_tail_max_out() {
+        0
+    } else {
+        tail_n_hi_for(half)
+    };
+    fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
+}
+
+/// Split-explicit implementation behind [`fold_and_compute_round_pair_into`]'s
+/// policy wrapper. `n_hi = 0` means one chunk, executed on the calling thread
+/// with no rayon region. Every `n_hi` produces bit-identical output (see
+/// [`ZC_TAIL_CHUNK_MIN_OUT_LOG`]); the regrouping-identity test pins that.
+pub(crate) fn fold_and_compute_round_pair_into_with_n_hi(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    n_hi: usize,
+) -> (F128, F128) {
     use rayon::prelude::*;
 
     let n = a.len();
@@ -1533,7 +1634,7 @@ pub fn fold_and_compute_round_pair_into(
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 1);
 
-    let eq = SplitEqGhash::new(&r_next[1..]);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
@@ -1569,11 +1670,8 @@ pub fn fold_and_compute_round_pair_into(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_ldnp = std::env::var_os("FLOCK_TAIL_LDNP").is_some();
 
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    // Per-chunk body, shared by the rayon route and the calling-thread route.
+    let chunk_body = |x_hi: usize, a_out: &mut [F128], b_out: &mut [F128]| {
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -1795,11 +1893,24 @@ pub fn fold_and_compute_round_pair_into(
             };
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+    };
+
+    let (sum1, sum_inf) = if hi_size == 1 {
+        // One chunk: run it right here. Entering a rayon region costs a job
+        // injection plus a latch round-trip on every worker, which for the
+        // small tail rounds is more than the whole round's arithmetic.
+        chunk_body(0, a_out, b_out)
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| chunk_body(x_hi, a_out, b_out))
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    };
 
     (r_next[0] * sum1, sum_inf)
 }
@@ -2758,6 +2869,67 @@ mod tests {
                 c_eval_via_interpolation, c_eval_via_fold,
                 "c-claim identity broken at m={m}"
             );
+        }
+    }
+
+    /// **Tail chunk-split regrouping identity**: the generic tail round is
+    /// bit-identical for every `n_hi`, including `n_hi = 0` (one chunk on the
+    /// calling thread, no rayon region) — which is what lets the shipped
+    /// policy pick the split by size. `eq` factors exactly as a tensor
+    /// product and the deferred reduction is F2-linear, so regrouping the
+    /// per-element products across chunk boundaries cannot move a bit. Also
+    /// cross-checks against the unfused `fold_in_place_pair` +
+    /// `round_pair_naive` oracle.
+    #[test]
+    fn tail_round_identical_across_chunk_splits() {
+        let mut rng = Rng::new(9137);
+        for &log_n in &[10usize, 11, 13, 15] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let r_fold = rng.f128();
+            let r_next = rng.f128_vec(log_n - 1);
+
+            // Oracle: unfused two-pass route.
+            let mut a_orc = a.clone();
+            let mut b_orc = b.clone();
+            fold_in_place_pair(&mut a_orc, &mut b_orc, r_fold);
+            let (m1_orc, minf_orc) = round_pair_naive(&a_orc, &b_orc, &r_next);
+
+            // `n_hi` must leave n_lo ≥ 1 (eq is over log_n − 2 vars).
+            for n_hi in 0..=(log_n - 3).min(SplitEqGhash::MAX_N_HI) {
+                // POISON-prefill: any output slot the kernel fails to write
+                // shows up as a mismatch rather than a stale zero.
+                let poison = F128 {
+                    lo: 0xDEAD_BEEF_DEAD_BEEF,
+                    hi: 0xFEED_FACE_FEED_FACE,
+                };
+                let mut a_out = vec![poison; n / 2];
+                let mut b_out = vec![poison; n / 2];
+                let (m1, minf) = fold_and_compute_round_pair_into_with_n_hi(
+                    &a, &b, &mut a_out, &mut b_out, r_fold, &r_next, n_hi,
+                );
+                assert_eq!(a_out, a_orc, "a mismatch log_n={log_n} n_hi={n_hi}");
+                assert_eq!(b_out, b_orc, "b mismatch log_n={log_n} n_hi={n_hi}");
+                assert_eq!(m1, m1_orc, "msg_1 mismatch log_n={log_n} n_hi={n_hi}");
+                assert_eq!(minf, minf_orc, "msg_inf mismatch log_n={log_n} n_hi={n_hi}");
+            }
+        }
+    }
+
+    /// The shipped size policy never asks for an out-of-range split: `n_lo`
+    /// stays ≥ 1 (the kernel needs `lo_size ≥ 2`) and `n_hi ≤ MAX_N_HI`.
+    #[test]
+    fn tail_split_policy_stays_in_range() {
+        for log_n in 10usize..=28 {
+            let half = 1usize << (log_n - 1);
+            let n_hi = if half <= zc_serial_tail_max_out() {
+                0
+            } else {
+                tail_n_hi_for(half)
+            };
+            assert!(n_hi <= SplitEqGhash::MAX_N_HI, "log_n={log_n}");
+            assert!(n_hi + 1 <= log_n - 2, "log_n={log_n} n_hi={n_hi}");
         }
     }
 
