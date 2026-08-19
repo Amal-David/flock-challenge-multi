@@ -318,11 +318,20 @@ pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     n_b_med: &[usize; 4],
     mats: &[u64; super::C_FOLD4_MATS_PER_GROUP],
     plane_banks: &mut [u8; super::C_PLANE_BANK_BYTES],
+    assign: bool,
 ) {
     // SAFETY: the cfg gate guarantees the SIMD features; the caller's slice
     // covers the group's four windows and the plane store is fixed-size.
     unsafe {
-        x86_64::accumulate_c_banks_fold4_fused_x86_gfni(c_group, n_b_med, mats, plane_banks);
+        if assign {
+            x86_64::accumulate_c_banks_fold4_fused_x86_gfni::<true>(
+                c_group, n_b_med, mats, plane_banks,
+            );
+        } else {
+            x86_64::accumulate_c_banks_fold4_fused_x86_gfni::<false>(
+                c_group, n_b_med, mats, plane_banks,
+            );
+        }
     }
 }
 

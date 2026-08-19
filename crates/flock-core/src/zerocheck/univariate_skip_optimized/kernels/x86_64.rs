@@ -1068,7 +1068,7 @@ pub(crate) unsafe fn stage_c_group_x86_avx512(src: &[u8], dst: &mut [u8; 4 * 16 
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
+pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni<const ASSIGN: bool>(
     c_group: &[u8],
     n_b_med: &[usize; 4],
     mats: &[u64; C_FOLD4_MATS_PER_GROUP],
@@ -1125,10 +1125,20 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                     let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
                     let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
                     let ptr = planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
-                    _mm512_storeu_si512(
-                        ptr,
-                        _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
-                    );
+                    // XOR of two 512-bit values is the group's contribution.
+                    // ASSIGN: first live group of a band — store, do not RMW
+                    // a just-zeroed (or stale) line. x ⊕ 0 = x, so this is
+                    // the identity of the incumbent load-xor-store against a
+                    // zero-filled plane. Later groups keep the RMW.
+                    let contrib = _mm512_xor_si512(g_lo, g_hi);
+                    if ASSIGN {
+                        _mm512_storeu_si512(ptr, contrib);
+                    } else {
+                        _mm512_storeu_si512(
+                            ptr,
+                            _mm512_xor_si512(_mm512_loadu_si512(ptr), contrib),
+                        );
+                    }
                 }
             }
         }

@@ -1795,24 +1795,28 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             state.plane_banks.fill(0);
         }
     }
-    // Fused GFNI C drain: size and zero the 32 KiB byte-plane C banks for
-    // this band; `FLOCK_NO_ZC_C_GFNI=1` keeps the incumbent transpose +
-    // nibble-LUT drain (`c_gfni_mats == None`).
-    if c_gfni_mats.is_some() {
-        if state.plane_c.is_empty() {
-            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
-            let off = state.plane_c.as_ptr().align_offset(64);
-            state.plane_c_off = if off <= 63 { off } else { 0 };
-        } else {
-            let off = state.plane_c_off;
-            state.plane_c[off..off + C_PLANE_BANK_BYTES].fill(0);
+    // Fused GFNI C drain: size the 32 KiB byte-plane C banks for this band.
+    // Do NOT zero them — the first live group's kernel call ASSIGNS every
+    // plane slot (x ⊕ 0 = x). `FLOCK_NO_ZC_C_GFNI=1` keeps the incumbent
+    // transpose + nibble-LUT drain (`c_gfni_mats == None`).
+    if c_gfni_mats.is_some() && state.plane_c.is_empty() {
+        state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
+        let off = state.plane_c.as_ptr().align_offset(64);
+        state.plane_c_off = if off <= 63 { off } else { 0 };
+    }
+    // `partial_c4` is an XOR-accumulator on the nibble-LUT arm. On the
+    // ranked GFNI arm `c_plane_bank_to_f128` *assigns* every lane, so the
+    // 32 KiB zero-fill is a dead store — skip it. All-dead bands (no live
+    // group) restore the zeros after the loop instead of painting them
+    // only to overwrite / never read them.
+    if c_gfni_mats.is_none() {
+        for group in state.partial_c4.iter_mut() {
+            for bank in group.iter_mut() {
+                bank.fill(F128::ZERO);
+            }
         }
     }
-    for group in state.partial_c4.iter_mut() {
-        for bank in group.iter_mut() {
-            bank.fill(F128::ZERO);
-        }
-    }
+    let mut c_planes_assigned = false;
     let n_lo = n_lo_and_inner - N_INNER;
     for group in 0..big_lo_size / 4 {
         let mut any_live = false;
@@ -1949,7 +1953,14 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 .split_at_mut(C_PLANE_BANK_BYTES);
             let planes: &mut [u8; C_PLANE_BANK_BYTES] =
                 planes.try_into().expect("aligned 32 KiB plane C bank window");
-            kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
+            kernels::accumulate_c_banks_fold4_fused_gfni(
+                stage,
+                &group_counts,
+                mats_g,
+                planes,
+                !c_planes_assigned,
+            );
+            c_planes_assigned = true;
             continue;
         }
         let c_tables =
@@ -1982,15 +1993,27 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // sixteen byte planes become its 64 F128 lanes. Pure XOR accumulation,
     // so these are the incumbent's `partial_c4` values byte-for-byte.
     if c_gfni_mats.is_some() {
-        let off = state.plane_c_off;
-        let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
-        for q in 0..N_C_Q {
-            for bank in 0..N_C_BANKS {
-                let bank_planes: &[u8; 16 * ELL] = planes
-                    [(q * N_C_BANKS + bank) * 16 * ELL..][..16 * ELL]
-                    .try_into()
-                    .expect("one 16-plane bank");
-                kernels::c_plane_bank_to_f128(bank_planes, &mut state.partial_c4[q][bank]);
+        if c_planes_assigned {
+            let off = state.plane_c_off;
+            let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
+            for q in 0..N_C_Q {
+                for bank in 0..N_C_BANKS {
+                    let bank_planes: &[u8; 16 * ELL] = planes
+                        [(q * N_C_BANKS + bank) * 16 * ELL..][..16 * ELL]
+                        .try_into()
+                        .expect("one 16-plane bank");
+                    kernels::c_plane_bank_to_f128(bank_planes, &mut state.partial_c4[q][bank]);
+                }
+            }
+        } else {
+            // No live group this band: planes were never written. The
+            // incumbent's two memsets produced zeros here; do that once
+            // on the F128 banks the finish reads, not on the 32 KiB
+            // plane image that nobody will reassemble.
+            for group in state.partial_c4.iter_mut() {
+                for bank in group.iter_mut() {
+                    bank.fill(F128::ZERO);
+                }
             }
         }
     }
@@ -3377,7 +3400,17 @@ mod tests {
                     .expect("32 matrix qwords per group");
                 let planes_arr: &mut [u8; C_PLANE_BANK_BYTES] =
                     planes.as_mut_slice().try_into().expect("32 KiB plane store");
-                kernels::accumulate_c_banks_fold4_fused_gfni(group, &counts[g], mats_g, planes_arr);
+                // Oracle starts planes at 0xA5 and XOR-accumulates, matching
+                // the scalar `accumulate_c_banks` into poison F128s. Keep
+                // ASSIGN=false here; production first-live-group assign is
+                // the x⊕0 identity against a zero (or uninit) plane.
+                kernels::accumulate_c_banks_fold4_fused_gfni(
+                    group,
+                    &counts[g],
+                    mats_g,
+                    planes_arr,
+                    false,
+                );
             }
 
             for q in 0..N_C_Q {
