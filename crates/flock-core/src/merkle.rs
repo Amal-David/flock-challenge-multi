@@ -494,6 +494,48 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
 
+/// Smallest BLAKE3 parent-level rayon task worth dispatching, in nodes.
+/// `blake3_hash_many` batches 16 compressions per vector step, so 64 nodes is
+/// four full-width steps (~1.8k cycles) — comfortably above rayon's per-task
+/// dispatch cost, and the point below which a split is pure overhead.
+const MIN_LEVEL_CHUNK: usize = 64;
+
+/// `FLOCK_NO_MERKLE_LEVEL_SPLIT=1` restores the incumbent fixed split
+/// (`BLAKE3_GROUP` nodes per task, serial at or below 1024 nodes) in the same
+/// binary, so a candidate/control pair differs only in this dispatch. The
+/// ranked worker's cleared environment never sets it.
+fn level_split_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_MERKLE_LEVEL_SPLIT").is_some())
+}
+
+/// Split policy for ONE BLAKE3 parent level: `(run_serially, nodes_per_task)`.
+///
+/// The incumbent used the fixed `BLAKE3_GROUP = 1024`-node task with a
+/// serial fallback at ≤ 1024 nodes. Both constants are independent of the
+/// pool, so the task COUNT — not the pool — decided how many cores ran. At
+/// the ranked commit shape `build_upper_levels` starts from the level with
+/// `n_leaves >> 7 = 8192` nodes, so the incumbent produced
+/// `4096/1024 = 4` tasks, then `2048/1024 = 2`, then eleven fully serial
+/// levels: 13 sequential levels of which at most 4 of 16 workers ever ran.
+///
+/// Here the task size is derived from the level width and the pool instead:
+/// aim for ~4 tasks per worker so rayon can balance, never smaller than
+/// [`MIN_LEVEL_CHUNK`] and never larger than the incumbent's
+/// [`BLAKE3_GROUP`] (so wide levels keep their cache-resident task size).
+/// Purely a regrouping of independent per-node compressions — every parent
+/// digest is a function of its own 64 child bytes alone — so the tree is
+/// byte-for-byte unchanged.
+#[inline]
+fn blake3_level_split(nodes: usize) -> (bool, usize) {
+    let threads = rayon::current_num_threads();
+    if threads <= 1 || nodes <= MIN_LEVEL_CHUNK {
+        return (true, BLAKE3_GROUP);
+    }
+    let target = nodes.div_ceil(threads.saturating_mul(4).max(1));
+    (false, target.clamp(MIN_LEVEL_CHUNK, BLAKE3_GROUP))
+}
+
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
 /// its leaves are still cache-hot, from inside the NTT rayon job (where a
@@ -531,16 +573,23 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
     let read_bytes: &[u8] =
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     const SERIAL_LEVEL_NODES: usize = 1024;
+    // SHA-256 keeps the incumbent decision verbatim (never on the ranked
+    // path; not re-measured).
     let serial = write.len() <= SERIAL_LEVEL_NODES;
+    let (b3_serial, b3_chunk) = if level_split_disabled() {
+        (serial, BLAKE3_GROUP)
+    } else {
+        blake3_level_split(write.len())
+    };
 
     match kind {
         HashKind::Blake3 => {
-            if serial {
+            if b3_serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
                 write
-                    .par_chunks_mut(BLAKE3_GROUP)
-                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .par_chunks_mut(b3_chunk)
+                    .zip(read_bytes.par_chunks(b3_chunk * 64))
                     .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }

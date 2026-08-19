@@ -529,35 +529,57 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     r: usize,
     twiddles: &[F128; 15],
 ) {
-    // SAFETY: forwarded caller contract.
+    // Block 0 of every layer carries the twiddle 0 (the subspace polynomial
+    // evaluated at the subspace's own origin — an exact property of the fixed
+    // standard basis, pinned by `zero_spine_invariant`). A fused-four group on
+    // that spine therefore has zero twiddles in exactly the tree slots
+    // {0, 1, 3, 7}, and each of their butterflies degenerates to
+    // `v ^= u` (`new_u = u ^ 0·v = u`): 15 of the network's 32 multiplies are
+    // by the constant zero. The predicate is checked on the values themselves,
+    // so any non-spine group (and any other twiddle pattern) keeps the general
+    // form; the rate-1/2 seed already exploits the same spine at layers 1–2
+    // through its `_sparse` kernel.
+    let zero_spine = !zero_spine_fused4_disabled()
+        && twiddles[0] == F128::ZERO
+        && twiddles[1] == F128::ZERO
+        && twiddles[3] == F128::ZERO
+        && twiddles[7] == F128::ZERO;
+    // SAFETY: forwarded caller contract; `zero_spine` proves the zero-slot
+    // precondition by inspection of the values.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-            )
-        } else {
-            butterfly_fused_4layer_row_impl::<true>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-            )
+        match (mul_diet_disabled(), zero_spine) {
+            (true, false) => butterfly_fused_4layer_row_impl::<false, false>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (true, true) => butterfly_fused_4layer_row_impl::<false, true>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (false, false) => butterfly_fused_4layer_row_impl::<true, false>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (false, true) => butterfly_fused_4layer_row_impl::<true, true>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
         }
     }
 }
 
+/// `FLOCK_NO_NTT_ZERO_SPINE=1` restores the general twiddle product for the
+/// block-0 spine of the fused-four sweeps inside the same binary, so a
+/// candidate/control pair differs only in the product form. Read once per
+/// row-group call, outside every lane loop.
+#[inline]
+fn zero_spine_fused4_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_ZERO_SPINE").is_some())
+}
+
 /// # Safety
-/// Same contract as [`butterfly_fused_4layer_row`].
+/// Same contract as [`butterfly_fused_4layer_row`]; when `SPINE`, twiddle
+/// slots 0, 1, 3 and 7 must be zero.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
+unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const SPINE: bool>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
@@ -571,10 +593,15 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
     unsafe {
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
+        // steps of savings. On the spine the four zero slots are never read,
+        // so their broadcast (and companion CLMUL) is skipped outright.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+        for (i, (slot, value)) in tw.iter_mut().zip(twiddles.iter()).enumerate() {
+            if SPINE && (i == 0 || i == 1 || i == 3 || i == 7) {
+                debug_assert_eq!(*value, F128::ZERO);
+                continue;
+            }
             *slot = tw_x4::<false, DIET>(*value);
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
@@ -595,25 +622,51 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
                 }};
             }
 
+            // A zero twiddle makes `new_u = u ^ 0·v = u`, so the butterfly
+            // collapses to `v ^= u`. `SPINE && s == 0` is const-foldable in
+            // every unrolled iteration, so the general arm keeps its exact
+            // incumbent schedule.
+            macro_rules! butterfly_z {
+                ($u:expr, $v:expr) => {{
+                    values[$v] = _mm512_xor_si512(values[$v], values[$u]);
+                }};
+            }
+
             let outer = tw[0];
             for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+                if SPINE {
+                    butterfly_z!(i, i + 8);
+                } else {
+                    butterfly!(i, i + 8, outer);
+                }
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    if SPINE && s == 0 {
+                        butterfly_z!(8 * s + i, 8 * s + i + 4);
+                    } else {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    }
                 }
             }
             for s in 0..4 {
                 let twiddle = tw[3 + s];
                 for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    if SPINE && s == 0 {
+                        butterfly_z!(4 * s + i, 4 * s + i + 2);
+                    } else {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
                 }
             }
             for s in 0..8 {
                 let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                if SPINE && s == 0 {
+                    butterfly_z!(2 * s, 2 * s + 1);
+                } else {
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -867,6 +920,74 @@ mod diet_tests {
                 st
             };
             F128 { lo: n(), hi: n() }
+        }
+    }
+
+    /// The fused-four zero-spine specialization must be bit-identical to the
+    /// general product form and to the portable reference, for both lane
+    /// paths (4-wide, scalar tail), both `DIET` arms, and every row-group
+    /// geometry parameter it is called with.
+    #[test]
+    fn fused4_zero_spine_matches_general() {
+        let mut next = rng(0x5B1E_2026);
+        for (num_ntts, active_lanes, sixteenth, r) in
+            [(64usize, 64usize, 1usize, 0usize), (67, 67, 1, 0), (64, 50, 2, 1), (7, 5, 3, 2)]
+        {
+            let mut base = vec![F128::ZERO; 16 * sixteenth * num_ntts];
+            for v in base.iter_mut() {
+                *v = next();
+            }
+            // The spine pattern: tree slots {0, 1, 3, 7} are zero (block 0 of
+            // each fused layer), the rest are arbitrary full-width twiddles.
+            let mut twiddles = [F128::ZERO; 15];
+            for (i, t) in twiddles.iter_mut().enumerate() {
+                if !(i == 0 || i == 1 || i == 3 || i == 7) {
+                    *t = next();
+                }
+            }
+
+            let mut want = base.clone();
+            for lane in 0..active_lanes {
+                let mut values = [F128::ZERO; 16];
+                for (i, value) in values.iter_mut().enumerate() {
+                    *value = want[(i * sixteenth + r) * num_ntts + lane];
+                }
+                crate::ntt::additive_ntt_f128::kernels::portable::butterfly_fused_4layer(
+                    &mut values,
+                    &twiddles,
+                );
+                for (i, value) in values.iter().enumerate() {
+                    want[(i * sixteenth + r) * num_ntts + lane] = *value;
+                }
+            }
+
+            for (diet, spine) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut got = base.clone();
+                // SAFETY: this module compiles only with avx512f+vpclmulqdq;
+                // the buffer is 16·sixteenth rows of `num_ntts` lanes, and
+                // twiddle slots {0, 1, 3, 7} are zero as the SPINE arm
+                // requires.
+                unsafe {
+                    match (diet, spine) {
+                        (false, false) => butterfly_fused_4layer_row_impl::<false, false>(
+                            got.as_mut_ptr(), sixteenth, num_ntts, active_lanes, r, &twiddles,
+                        ),
+                        (false, true) => butterfly_fused_4layer_row_impl::<false, true>(
+                            got.as_mut_ptr(), sixteenth, num_ntts, active_lanes, r, &twiddles,
+                        ),
+                        (true, false) => butterfly_fused_4layer_row_impl::<true, false>(
+                            got.as_mut_ptr(), sixteenth, num_ntts, active_lanes, r, &twiddles,
+                        ),
+                        (true, true) => butterfly_fused_4layer_row_impl::<true, true>(
+                            got.as_mut_ptr(), sixteenth, num_ntts, active_lanes, r, &twiddles,
+                        ),
+                    }
+                }
+                assert_eq!(
+                    got, want,
+                    "num_ntts={num_ntts} lanes={active_lanes} sixteenth={sixteenth} r={r} diet={diet} spine={spine}"
+                );
+            }
         }
     }
 
@@ -1201,7 +1322,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true>(
+                        butterfly_fused_4layer_row_impl::<true, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1210,7 +1331,7 @@ mod diet_tests {
                             &tw15,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false>(
+                        butterfly_fused_4layer_row_impl::<false, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,

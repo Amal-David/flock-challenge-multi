@@ -533,12 +533,23 @@ pub enum VerifyError {
 // Core kernels
 // ---------------------------------------------------------------------------
 
-/// Build the eq-MLE table at `point ∈ F^d`. Returns a length-`2^d` vector
-/// where `output[i] = Π_j (1 + point[j] + bit_j(i)) = Π_j eq(point[j], bit_j(i))`.
-///
-/// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
-/// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
-pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+/// Half-length at or above which one doubling level of [`build_eq_table`]
+/// runs on the rayon pool; below it the sequential loop beats the dispatch.
+/// Same value the twin builder `pcs::ring_switch::build_eq_parallel` uses.
+const EQ_TABLE_PAR_THRESHOLD: usize = 1usize << 12;
+
+/// `FLOCK_NO_EQ_TABLE_PAR=1` restores the fully sequential doubling in
+/// [`build_eq_table`] (exact A/B control: same multiplies, same values, one
+/// core instead of the pool). Resolved once per process, outside the levels.
+fn eq_table_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_TABLE_PAR").is_none());
+    *ON
+}
+
+/// Byte-for-byte the pre-existing sequential builder, kept as the exact
+/// kill-switch arm for [`build_eq_table`] (`FLOCK_NO_EQ_TABLE_PAR=1`).
+fn build_eq_table_incumbent(point: &[F128]) -> Vec<F128> {
     let d = point.len();
     let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
     out.push(F128::ONE);
@@ -546,15 +557,71 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         let r_j = point[j];
         let len = 1usize << j;
         out.resize(2 * len, F128::ZERO);
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
-        //   out[i]       = v + v*r_j      ← new bit_j = 0
-        //   out[i + len] = v * r_j        ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
         for i in 0..len {
             let v = out[i];
             let hi = v * r_j;
             out[i + len] = hi;
             out[i] = v + hi;
+        }
+    }
+    out
+}
+
+/// Build the eq-MLE table at `point ∈ F^d`. Returns a length-`2^d` vector
+/// where `output[i] = Π_j (1 + point[j] + bit_j(i)) = Π_j eq(point[j], bit_j(i))`.
+///
+/// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
+/// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
+pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+    if !eq_table_par_enabled() {
+        return build_eq_table_incumbent(point);
+    }
+    let d = point.len();
+    // Uninit alloc — level `j` reads `out[..2^j]` (seeded at `out[0]`, or
+    // written by an earlier level) and *purely writes* `out[2^j..2^(j+1)]`.
+    // Every slot is therefore written before it is ever read, so the
+    // `Vec::resize(.., ZERO)` the incumbent ran at every level was writing
+    // 2^d F128 of zeros that the very next statement overwrote — 4 MiB of
+    // dead single-core stores at the ranked 18-variable shape. Same argument
+    // (and same allocation) the twin builder
+    // `pcs::ring_switch::build_eq_parallel` already relies on.
+    let mut out: Vec<F128> = crate::alloc_uninit_f128_vec(1usize << d);
+    out[0] = F128::ONE;
+    for j in 0..d {
+        let r_j = point[j];
+        let len = 1usize << j;
+        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+        //   out[i]       = v + v*r_j      ← new bit_j = 0
+        //   out[i + len] = v * r_j        ← new bit_j = 1
+        // The [i] and [i+len] slots are disjoint.
+        let (lo, hi_rest) = out.split_at_mut(len);
+        let hi = &mut hi_rest[..len];
+        // The recurrence is sequential ACROSS levels but every entry WITHIN a
+        // level is independent — `out[i]` and `out[i+len]` depend only on the
+        // pre-level `out[i]`. So a level is a pure map, and running it on the
+        // pool computes exactly the same products in exactly the same
+        // per-element form: bit-identical, with the multiplication COUNT
+        // unchanged — only the schedule moves. `build_eq_parallel` already
+        // splits this way at the same threshold; `build_eq_table` is the
+        // sibling that was left sequential, and at the ranked identity-C fold
+        // it builds an 18-variable table on ONE core while fifteen idle.
+        if len >= EQ_TABLE_PAR_THRESHOLD {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_x, hi_x)| {
+                    let v = *lo_x;
+                    let prod = v * r_j;
+                    *hi_x = prod;
+                    *lo_x = v + prod;
+                });
+        } else {
+            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
+                let v = *lo_x;
+                let prod = v * r_j;
+                *hi_x = prod;
+                *lo_x = v + prod;
+            }
         }
     }
     out
