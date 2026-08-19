@@ -1791,15 +1791,27 @@ pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
         *c = fold_one_slot(w, base);
         w = crate::field::mul_by_x(w);
     }
-    // Expand each 8-column group into its 256-entry subset-sum table. Every
-    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
-    // may be uninitialized on entry.
+    // Expand each 8-column group into its 256-entry subset-sum table.
+    //
+    // The incumbent `v & (v-1)` walk is a length-255 XOR *chain* (each slot
+    // waits on a strictly smaller index). The doubling expansion used by
+    // [`build_direct_fold_table`] writes the same subset sums — by induction
+    // on the bit, after step `b` the first `2^(b+1)` slots are
+    // `Σ_{j: bit j of v set} col8[j]` — but the inner loop iterations are
+    // independent (each `table[v+half] = table[v] ⊕ g` reads a slot written
+    // in a *previous* bit step). Same F2 algebra, same 255 XORs, no
+    // `e_hi == ONE` special-case (that compare is dead on ranked DirectFold4).
+    // Every slot of `out` is written before any read, so `out` may be
+    // uninitialized on entry.
     for k in 0..FOLD_N_BYTES {
         let col8 = &cols[k * 8..k * 8 + 8];
         let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
         block[0] = F128::ZERO;
-        for v in 1..FOLD_TABLE_SIZE {
-            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+        for (bit, &generator) in col8.iter().enumerate() {
+            let half = 1usize << bit;
+            for value in 0..half {
+                block[value + half] = block[value] + generator;
+            }
         }
     }
 }
