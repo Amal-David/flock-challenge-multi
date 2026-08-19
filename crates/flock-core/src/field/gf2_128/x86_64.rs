@@ -323,6 +323,80 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
 }
 
 // -----------------------------------------------------------------------
+// Split-twiddle ("x^64-companion") product: 5 CLMUL instead of 6.
+//
+// The additive-NTT butterflies all multiply a *variable* value `v` by a
+// twiddle `t` that is CONSTANT for the whole row set, so any per-twiddle
+// preprocessing is free. Write `v = v_lo + x^64·v_hi` (its two 64-bit limbs).
+// Because reduction mod p is a ring homomorphism,
+//
+//     t·v  ≡  t·v_lo  +  (t·x^64 mod p)·v_hi   (mod p),
+//
+// i.e. with the companion constant `u = t·x^64 mod p` precomputed the product
+// is a sum of two 128×64 products — degree ≤ 190, so it occupies only THREE
+// 64-bit limbs instead of four. Schoolbook cost is unchanged (4 CLMUL), but
+// the tail is one limb shorter, so folding it down needs a single `0x87`
+// CLMUL rather than the incumbent's two-stage recursive reduction:
+//
+//     incumbent `ghash_mul_x4`: 4 product + 2 reduction CLMUL, 5 XOR, 2 VPSLLDQ
+//     split form              : 4 product + 1 reduction CLMUL, 4 XOR, 1 VPSLLDQ
+//
+// On Sapphire Rapids VPCLMULQDQ-zmm and VPSLLDQ-zmm both issue only on port 5,
+// so this drops the port-5 op count per 4-lane multiply from 8 to 6 (-25%);
+// total zmm uops go 13 → 10. The result is the same field element, so proof
+// bytes are unchanged.
+// -----------------------------------------------------------------------
+
+/// `t · x^64 mod p`, independently in each 128-bit lane — the companion
+/// constant consumed by [`ghash_mul_x4_split`].
+///
+/// This is exactly one stage of the recursive reduction with a zero low half:
+/// `0 + x^64·t mod p`.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
+/// cfg gate and target-feature attribute).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_shift64_x4(t: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe { gf2_128_reduce_x4(_mm512_setzero_si512(), t) }
+}
+
+/// 4 independent GF(2^128) products `v[i]·t` for a twiddle supplied in split
+/// form: `t` and `t_x64 = t·x^64 mod p` (see [`ghash_shift64_x4`]). Both
+/// twiddle operands are normally lane-broadcast loop constants.
+///
+/// Field-identical to [`ghash_mul_x4`]`(t, v)` — 5 CLMUL instead of 6.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
+/// cfg gate and target-feature attribute) and that `t_x64` really is
+/// `t·x^64 mod p` in every lane.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the companion contract.
+    unsafe {
+        // Limb 0..1 of the 192-bit product: v.lo·t.lo ⊕ v.hi·t_x64.lo.
+        let lo = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(v, t),
+            _mm512_clmulepi64_epi128::<0x01>(v, t_x64),
+        );
+        // Limb 1..2, weighted x^64: v.lo·t.hi ⊕ v.hi·t_x64.hi.
+        let hi = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(v, t),
+            _mm512_clmulepi64_epi128::<0x11>(v, t_x64),
+        );
+        // One fold: lo + x^64·hi (mod p). The top limb is 64 bits wide, so the
+        // single `0x87` CLMUL finishes it (degree ≤ 70 < 128).
+        gf2_128_reduce_x4(lo, hi)
+    }
+}
+
+// -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many
 // into the accumulator; reduce once at the end. Per 128-bit lane the
