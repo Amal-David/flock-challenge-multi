@@ -1,11 +1,18 @@
 //! 8-wide AVX2 lockstep BLAKE3 witness builder (`__m256i`, 8×u32).
 //!
 //! Same G-function / carry-bit / packed-row stream as the 4-wide SSE kernel,
-//! widened to one rayon group (8 compressions) per call. The a/b drains are
-//! temporal (`storeu`) — both are re-read L1-hot by the fused round-1 window
-//! precompute in the same task. The z drain optionally publishes through XMM
-//! streaming stores (`z_nt`): z's next reader is the commit encode, a later
-//! phase, so its write-allocate RFO is pure waste (see the caller's gate).
+//! widened to one rayon group (8 compressions) per call. The z drain
+//! optionally publishes through streaming stores (`z_nt`): z's next reader is
+//! the commit encode, a later phase, so its write-allocate RFO is pure waste
+//! (see the caller's gate).
+//!
+//! The a/b drains have two shapes, selected by `win_ab`:
+//!  * `None` — the incumbent: temporal (`storeu`), because the caller re-reads
+//!    a/b L1-hot for the round-1 window precompute in the same task.
+//!  * `Some(..)` — FUSED: the very same `tr8` registers feed the main a/b
+//!    buffers non-temporally AND a compact per-octa window buffer that the
+//!    caller projects from instead. The main buffers are then never re-read,
+//!    so their write-allocate RFO (1 GiB at the ranked shape) is deleted too.
 //!
 //! Ranked live path: `generate_witness_with_ab_packed_and_round1_inner_impl`
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
@@ -26,7 +33,12 @@ const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 const U32_PER_BLOCK: usize = K / 32;
 const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
-const ELIDE_ZERO_CHUNK: usize = 61;
+// 62, not 61: an odd boundary leaves the z drain's paired NT loop with a
+// lone 32-byte tail chunk — one masked, partially-written NT line per block
+// (an ECC read-modify-write at the memory controller, 2^18 times per
+// proof). Chunk 61 is entirely inside the zero tail (LAST_WORD = 481), so
+// storing it is redundant-but-correct and the ragged tail branch vanishes.
+const ELIDE_ZERO_CHUNK: usize = 62;
 const ELIDE_B_TAIL_CHUNK: usize = 59;
 const ELIDE_B_PREFIX_CHUNKS: usize = 4;
 const LAST_WORD: usize = (USEFUL_BITS - 1) / 32;
@@ -35,6 +47,13 @@ const _ELIDE_GEOMETRY: () = {
     assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
     assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
     assert!(LAST_WORD == 481);
+    // The fused drain walks chunk PAIRS from 0 while `dump_range_nt` walks
+    // pairs from `g0`; the two agree on which chunks share a 64-byte line
+    // only while every elided PREFIX is pair-aligned. (Elided tails need no
+    // such property: a half-covered trailing pair degrades to the same
+    // single-chunk stream in both.)
+    assert!(DUMP_CHUNKS % 2 == 0);
+    assert!(ELIDE_B_PREFIX_CHUNKS % 2 == 0);
 };
 
 type V8 = __m256i;
@@ -271,74 +290,146 @@ fn wide_nt_enabled() -> bool {
 /// task; same-thread reads are self-consistent regardless).
 #[inline(always)]
 unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
-    #[inline(always)]
-    unsafe fn stream_v8(p: *mut u32, v: V8) {
-        // SAFETY: caller guarantees 16-byte alignment of `p`; the YMM arm
-        // additionally requires 32-byte alignment (true for every in-loop
-        // pointer when `dst` is 32-aligned and `w` is a multiple of 8).
-        unsafe {
-            if wide_nt_enabled() && p as usize % 32 == 0 {
-                _mm256_stream_si256(p.cast::<__m256i>(), v);
-                return;
-            }
-            _mm_stream_si128(p.cast::<__m128i>(), _mm256_castsi256_si128(v));
-            _mm_stream_si128(p.add(4).cast::<__m128i>(), _mm256_extracti128_si256::<1>(v));
-        }
-    }
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
         let mut g = g0;
         while g + 2 <= g1 {
             let w = 8 * g;
-            let ta = tr8(
-                load_v8(stage.add(w) as *const u32),
-                load_v8(stage.add(w + 1) as *const u32),
-                load_v8(stage.add(w + 2) as *const u32),
-                load_v8(stage.add(w + 3) as *const u32),
-                load_v8(stage.add(w + 4) as *const u32),
-                load_v8(stage.add(w + 5) as *const u32),
-                load_v8(stage.add(w + 6) as *const u32),
-                load_v8(stage.add(w + 7) as *const u32),
-            );
-            let tb = tr8(
-                load_v8(stage.add(w + 8) as *const u32),
-                load_v8(stage.add(w + 9) as *const u32),
-                load_v8(stage.add(w + 10) as *const u32),
-                load_v8(stage.add(w + 11) as *const u32),
-                load_v8(stage.add(w + 12) as *const u32),
-                load_v8(stage.add(w + 13) as *const u32),
-                load_v8(stage.add(w + 14) as *const u32),
-                load_v8(stage.add(w + 15) as *const u32),
-            );
+            let ta = tr8_chunk(stage, w);
+            let tb = tr8_chunk(stage, w + 8);
             for r in 0..8 {
-                let p = dst.add(r * U32_PER_BLOCK + w);
-                #[cfg(target_feature = "avx512f")]
-                if wide_nt_enabled() && p as usize % 64 == 0 {
-                    let z = _mm512_castsi256_si512(ta[r]);
-                    let z = _mm512_inserti64x4::<1>(z, tb[r]);
-                    _mm512_stream_si512(p.cast::<__m512i>(), z);
-                    continue;
-                }
-                stream_v8(p, ta[r]);
-                stream_v8(p.add(8), tb[r]);
+                stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r]);
             }
             g += 2;
         }
         if g < g1 {
             let w = 8 * g;
-            let t = tr8(
-                load_v8(stage.add(w) as *const u32),
-                load_v8(stage.add(w + 1) as *const u32),
-                load_v8(stage.add(w + 2) as *const u32),
-                load_v8(stage.add(w + 3) as *const u32),
-                load_v8(stage.add(w + 4) as *const u32),
-                load_v8(stage.add(w + 5) as *const u32),
-                load_v8(stage.add(w + 6) as *const u32),
-                load_v8(stage.add(w + 7) as *const u32),
-            );
+            let t = tr8_chunk(stage, w);
             for r in 0..8 {
                 stream_v8(dst.add(r * U32_PER_BLOCK + w), t[r]);
             }
+        }
+    }
+}
+
+/// Transpose the eight stage words at `w` (one `dump` chunk) into eight
+/// row-major 32-byte runs.
+#[inline(always)]
+unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
+    unsafe {
+        tr8(
+            load_v8(stage.add(w) as *const u32),
+            load_v8(stage.add(w + 1) as *const u32),
+            load_v8(stage.add(w + 2) as *const u32),
+            load_v8(stage.add(w + 3) as *const u32),
+            load_v8(stage.add(w + 4) as *const u32),
+            load_v8(stage.add(w + 5) as *const u32),
+            load_v8(stage.add(w + 6) as *const u32),
+            load_v8(stage.add(w + 7) as *const u32),
+        )
+    }
+}
+
+/// Publish one 32-byte transposed run non-temporally.
+///
+/// # Safety
+/// Caller guarantees 16-byte alignment of `p`; the YMM arm additionally
+/// requires 32-byte alignment (true for every in-loop pointer when `dst` is
+/// 32-aligned and `w` is a multiple of 8).
+#[inline(always)]
+unsafe fn stream_v8(p: *mut u32, v: V8) {
+    unsafe {
+        if wide_nt_enabled() && p as usize % 32 == 0 {
+            _mm256_stream_si256(p.cast::<__m256i>(), v);
+            return;
+        }
+        _mm_stream_si128(p.cast::<__m128i>(), _mm256_castsi256_si128(v));
+        _mm_stream_si128(p.add(4).cast::<__m128i>(), _mm256_extracti128_si256::<1>(v));
+    }
+}
+
+/// Publish a chunk PAIR — two consecutive 32-byte runs, i.e. one 64-byte
+/// cache line when `p` is line-aligned — non-temporally, closing the line's
+/// write-combining buffer in one shot where the ISA allows it.
+///
+/// # Safety
+/// Same alignment contract as [`stream_v8`], for both `p` and `p.add(8)`.
+#[inline(always)]
+unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
+    unsafe {
+        #[cfg(target_feature = "avx512f")]
+        if wide_nt_enabled() && p as usize % 64 == 0 {
+            let z = _mm512_castsi256_si512(va);
+            let z = _mm512_inserti64x4::<1>(z, vb);
+            _mm512_stream_si512(p.cast::<__m512i>(), z);
+            return;
+        }
+        stream_v8(p, va);
+        stream_v8(p.add(8), vb);
+    }
+}
+
+/// Dual-destination twin of [`dump_range_nt`] for the a/b sides: one
+/// transpose feeds BOTH
+///  * `dst` — the main witness buffer, published NON-TEMPORALLY over the
+///    un-elided chunk range `[g0, g1)`, in the same paired-chunk order (and
+///    with the same bytes) `dump_range_nt(stage, dst, g0, g1)` would use; and
+///  * `win` — a compact 8-block window buffer with the same row-major
+///    geometry (`U32_PER_BLOCK` row stride), written TEMPORALLY over ALL of
+///    `0..DUMP_CHUNKS`.
+///
+/// `win` deliberately ignores the elide range, so it always carries the FULL
+/// `U32_PER_BLOCK` words per block. The round-1 window projection reads a
+/// whole block; eliding a `dst` chunk is only legal because `dst` already
+/// holds those exact constant bytes from a previous witgen (pool provenance
+/// token), and those constants are *not* uniformly zero — b's elided prefix
+/// is all-ones. Rebuilding every chunk into `win` rather than zero-filling
+/// (or reading `dst` back) keeps the projection's input byte-identical to the
+/// incumbent's for every elide setting, by construction.
+///
+/// # Safety
+/// AVX2 required. `dst` owns 8 contiguous `U32_PER_BLOCK`-word blocks and is
+/// 16-byte aligned; `win` owns 8 contiguous `U32_PER_BLOCK`-word blocks and
+/// is disjoint from `dst` and from `stage`.
+#[inline(always)]
+unsafe fn dump_range_nt_win(
+    stage: *const V8,
+    dst: *mut u32,
+    win: *mut u32,
+    g0: usize,
+    g1: usize,
+) {
+    unsafe {
+        debug_assert_eq!(dst as usize % 16, 0);
+        let mut g = 0usize;
+        while g < DUMP_CHUNKS {
+            let w = 8 * g;
+            let ta = tr8_chunk(stage, w);
+            let tb = tr8_chunk(stage, w + 8);
+            // Window first: plain stores to a 16 KiB L1-resident buffer, and
+            // grouping them ahead of the streams keeps each row's write-
+            // combining buffer open across consecutive NT stores.
+            for r in 0..8 {
+                let p = win.add(r * U32_PER_BLOCK + w);
+                store_v8(p, ta[r]);
+                store_v8(p.add(8), tb[r]);
+            }
+            let lo = g >= g0 && g < g1;
+            let hi = g + 1 >= g0 && g + 1 < g1;
+            if lo && hi {
+                for r in 0..8 {
+                    stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r]);
+                }
+            } else if lo {
+                for r in 0..8 {
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w), ta[r]);
+                }
+            } else if hi {
+                for r in 0..8 {
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w + 8), tb[r]);
+                }
+            }
+            g += 2;
         }
     }
 }
@@ -367,16 +458,46 @@ unsafe fn dump_elide(
     }
 }
 
+/// [`dump_elide`]'s dual-destination form: same elide range selection, always
+/// non-temporal into `dst`, always FULL into `win`. See [`dump_range_nt_win`].
+#[inline(always)]
+unsafe fn dump_elide_win(
+    stage: *const V8,
+    dst: *mut u32,
+    win: *mut u32,
+    elide_tail: bool,
+    elide_prefix: bool,
+    tail_chunk: usize,
+) {
+    let g0 = if elide_prefix {
+        ELIDE_B_PREFIX_CHUNKS
+    } else {
+        0
+    };
+    let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
+    unsafe { dump_range_nt_win(stage, dst, win, g0, g1) }
+}
+
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
+/// `win_ab = Some((win_a, win_b))` selects the FUSED a/b drain: the main a/b
+/// buffers are published non-temporally and a full copy of this octa's 8
+/// blocks lands in the two window buffers, which the caller projects from
+/// instead of re-reading a/b. `None` is the incumbent temporal drain.
+///
 /// # Safety
 /// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
+/// When `win_ab` is `Some`, both window pointers own 8 contiguous 512-word
+/// blocks too, disjoint from each other and from `z`/`a`/`b`; and the caller
+/// must `_mm_sfence()` on this thread after its last octa, before releasing
+/// a/b to another thread (same-thread reads are self-consistent regardless).
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: [&Compression; 8],
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    win_ab: Option<(*mut u32, *mut u32)>,
     elide: [bool; 3],
     z_nt: bool,
 ) {
@@ -619,10 +740,20 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         }
 
         dump_elide(zs, z, elide[0], false, ELIDE_ZERO_CHUNK, z_nt);
-        // a/b stay temporal unconditionally: both are re-read L1-hot by the
-        // fused round-1 window precompute in this very task.
-        dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK, false);
-        dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK, false);
+        match win_ab {
+            // FUSED: the projection reads the windows, so a/b are write-only
+            // here — stream them and delete their write-allocate RFO.
+            Some((win_a, win_b)) => {
+                dump_elide_win(ast, a, win_a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide_win(bs, b, win_b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            }
+            // Incumbent: a/b stay temporal because the caller re-reads them
+            // L1-hot for the round-1 window precompute in this very task.
+            None => {
+                dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK, false);
+                dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK, false);
+            }
+        }
     }
 }
 

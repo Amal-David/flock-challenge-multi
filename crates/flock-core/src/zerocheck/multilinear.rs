@@ -976,6 +976,32 @@ const PACKED_SPLIT_MAX_N_HI: usize = 13;
 /// value-identical for the same XOR/tensor reason as the plain tail.
 /// `FLOCK_NO_ZC_PACKED_SPLIT=1` restores the incumbent 128-chunk split.
 #[inline]
+/// Per-pass table of the message block's `(w, w·x⁶⁴)` ZMM pairs: entry
+/// group `g` holds `[eq_lo[8g+1], eq_lo[8g+3], eq_lo[8g+5], eq_lo[8g+7]]`
+/// followed by the same four values multiplied by `x⁶⁴` (mod p) — the split
+/// multiplier companion. Both are pure functions of `eq_lo`, so the sweep
+/// loads two ZMMs instead of deriving them (a lane permute plus a CLMUL of
+/// pure latency on the head of the accumulate chain) every iteration.
+/// `eq_lo.len()` must be a multiple of 8.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
+    debug_assert!(eq_lo.len().is_multiple_of(8));
+    let x64 = F128::new(0, 1);
+    let mut t = crate::alloc_uninit_f128_vec(eq_lo.len());
+    for g in 0..eq_lo.len() / 8 {
+        for k in 0..4 {
+            let w = eq_lo[8 * g + 2 * k + 1];
+            t[8 * g + k] = w;
+            t[8 * g + 4 + k] = w * x64;
+        }
+    }
+    t
+}
+
 fn packed_split_n_hi(n_vars: usize) -> usize {
     let base = lookahead_n_hi(n_vars);
     #[cfg(test)]
@@ -1084,6 +1110,26 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
+    // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
+    // functions of the odd eq_lo lanes, hoisted out of the sweep (the
+    // companion CLMUL sat on the head of the chain feeding all eight
+    // accumulates). Interleaved per 8-lo group: [w×4, w·x⁶⁴×4].
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     // Per-chunk: (round-2 partial pair, six lookahead partials), both already
@@ -1117,6 +1163,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
                     pair_idx_base,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
+                    wtab_arg,
                 )
             };
             #[cfg(not(all(
@@ -1250,6 +1297,26 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
+    // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
+    // functions of the odd eq_lo lanes, hoisted out of the sweep (the
+    // companion CLMUL sat on the head of the chain feeding all eight
+    // accumulates). Interleaved per 8-lo group: [w×4, w·x⁶⁴×4].
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     let (sum1, sum_inf, agg) = (0..hi_size)
@@ -1282,6 +1349,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
                     pair_idx_base,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
+                    wtab_arg,
                 )
             };
             #[cfg(not(all(
@@ -1447,6 +1515,26 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     let r_inv = r.inv();
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
+    // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
+    // functions of the odd eq_lo lanes, hoisted out of the sweep (the
+    // companion CLMUL sat on the head of the chain feeding all eight
+    // accumulates). Interleaved per 8-lo group: [w×4, w·x⁶⁴×4].
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
     let eq_hi = &eq.hi;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
@@ -1497,6 +1585,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
                     useful_pairs_inclusive,
                     nt_out,
                     cfold_arg,
+                    wtab_arg,
                 )
             };
             #[cfg(not(all(
@@ -2378,7 +2467,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, None,
                 )
             };
             #[cfg(not(all(
@@ -3785,12 +3874,20 @@ mod tests {
                     pair_idx_base,
                     mask,
                     useful,
+                    None,
                 )
             };
             assert_eq!(a_s, a_v, "a chunk lo_size={lo_size} mask={mask}");
             assert_eq!(b_s, b_v, "b chunk lo_size={lo_size} mask={mask}");
             assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask}");
-            // No-store variant: same sums, nothing written.
+            // No-store variant: same sums, nothing written — and it
+            // exercises the hoisted (w, w·x⁶⁴) table against the scalar
+            // oracle whenever the shape allows one.
+            let wtab_test = if lo_size % 8 == 0 {
+                Some(build_w_pair_table(&eq_lo))
+            } else {
+                None
+            };
             let mut a_e: Vec<F128> = Vec::new();
             let mut b_e: Vec<F128> = Vec::new();
             // SAFETY: as above; WRITE=false ignores the (empty) chunks.
@@ -3807,6 +3904,7 @@ mod tests {
                     pair_idx_base,
                     mask,
                     useful,
+                    wtab_test.as_deref(),
                 )
             };
             assert_eq!(out_s, out_n, "no-store sums lo_size={lo_size} mask={mask}");
@@ -3921,7 +4019,7 @@ mod tests {
             // SAFETY: lengths satisfy the kernel's contract.
             let out_v = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo,
+                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None,
                 )
             };
             assert_eq!(a_s, a_v, "a lo_size={lo_size}");
@@ -4034,6 +4132,11 @@ mod tests {
             let rho1 = rng.f128();
             let rho2 = rng.f128();
             let eq_lo = rng.f128_vec(lo_size);
+            let wtab_test = if lo_size % 8 == 0 {
+                Some(build_w_pair_table(&eq_lo))
+            } else {
+                None
+            };
             let mut a_s = vec![F128::ZERO; 2 * lo_size];
             let mut b_s = vec![F128::ZERO; 2 * lo_size];
             let out_s = fold2_from_packed_lookahead_scalar(
@@ -4081,6 +4184,7 @@ mod tests {
                         useful,
                         nt_out,
                         cfold_arg,
+                        wtab_test.as_deref(),
                     )
                 };
                 let baked = cfold_arg.is_some();

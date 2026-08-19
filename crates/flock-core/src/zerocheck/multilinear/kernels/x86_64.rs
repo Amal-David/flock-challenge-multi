@@ -198,6 +198,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     pair_idx_base: usize,
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -391,11 +392,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
-            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let (a0w, a1w, a2w, a3w) = if wsplit {
-                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+                // (w, w·x⁶⁴) precomputed once per pass: both are pure
+                // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
+                // companions), yet the incumbent recomputed the companion —
+                // a permute plus a CLMUL of pure latency — at the head of
+                // the chain feeding all eight accumulates, every iteration.
+                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
                 (
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
@@ -403,12 +408,25 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                 )
             } else {
-                (
-                    ghash_mul_x4(w, a0),
-                    ghash_mul_x4(w, a1),
-                    ghash_mul_x4(w, a2),
-                    ghash_mul_x4(w, a3),
-                )
+                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                if wsplit {
+                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                    (
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                    )
+                } else {
+                    (
+                        ghash_mul_x4(w, a0),
+                        ghash_mul_x4(w, a1),
+                        ghash_mul_x4(w, a2),
+                        ghash_mul_x4(w, a3),
+                    )
+                }
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -668,6 +686,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     rho_a: F128,
     rho_b: F128,
     eq_lo: &[F128],
+    wtab: Option<&[F128]>,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -795,11 +814,15 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
 
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
-            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let (a0w, a1w, a2w, a3w) = if wsplit {
-                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+                // (w, w·x⁶⁴) precomputed once per pass: both are pure
+                // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
+                // companions), yet the incumbent recomputed the companion —
+                // a permute plus a CLMUL of pure latency — at the head of
+                // the chain feeding all eight accumulates, every iteration.
+                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
                 (
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
@@ -807,12 +830,25 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                 )
             } else {
-                (
-                    ghash_mul_x4(w, a0),
-                    ghash_mul_x4(w, a1),
-                    ghash_mul_x4(w, a2),
-                    ghash_mul_x4(w, a3),
-                )
+                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                if wsplit {
+                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                    (
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                    )
+                } else {
+                    (
+                        ghash_mul_x4(w, a0),
+                        ghash_mul_x4(w, a1),
+                        ghash_mul_x4(w, a2),
+                        ghash_mul_x4(w, a3),
+                    )
+                }
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -928,6 +964,15 @@ pub(crate) fn zc_r2_tr_enabled() -> bool {
 pub(crate) fn zc_pkt_pf_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_ZC_WTAB=1` disables the hoisted per-pass `(w, w·x⁶⁴)` pair
+/// table in the zerocheck message sweeps (exact same-binary A/B; the table
+/// holds the identical values the sweep otherwise derives per iteration).
+pub(crate) fn zc_wtab_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WTAB").is_none());
     *ON
 }
 
@@ -1075,6 +1120,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     useful_pairs_inclusive: usize,
     nt_out: bool,
     cfold: Option<&CFoldMats>,
+    wtab: Option<&[F128]>,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -1394,11 +1440,15 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
 
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
-            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let (a0w, a1w, a2w, a3w) = if wsplit {
-                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+                // (w, w·x⁶⁴) precomputed once per pass: both are pure
+                // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
+                // companions), yet the incumbent recomputed the companion —
+                // a permute plus a CLMUL of pure latency — at the head of
+                // the chain feeding all eight accumulates, every iteration.
+                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
                 (
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
@@ -1406,12 +1456,25 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                 )
             } else {
-                (
-                    ghash_mul_x4(w, a0),
-                    ghash_mul_x4(w, a1),
-                    ghash_mul_x4(w, a2),
-                    ghash_mul_x4(w, a3),
-                )
+                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                if wsplit {
+                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                    (
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                    )
+                } else {
+                    (
+                        ghash_mul_x4(w, a0),
+                        ghash_mul_x4(w, a1),
+                        ghash_mul_x4(w, a2),
+                        ghash_mul_x4(w, a3),
+                    )
+                }
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));

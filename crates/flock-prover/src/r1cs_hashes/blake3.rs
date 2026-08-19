@@ -1406,6 +1406,31 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     Vec<F128>,
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
+    generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        use_simd,
+        witgen_simd::witgen_ab_nt_enabled(),
+    )
+}
+
+/// Same as [`generate_witness_with_ab_packed_and_round1_inner_impl_ex`] with
+/// the fused a/b-NT drain (`ab_nt`) also spelled out, so tests can A/B the
+/// fused octa path against its `FLOCK_NO_WITGEN_AB_NT=1` restore in one
+/// process. Only the octa arm reads `ab_nt`.
+fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    use_nt: bool,
+    use_simd: bool,
+    ab_nt: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
     use rayon::prelude::*;
 
     const F128_PER_BLOCK: usize = K / 128;
@@ -1448,12 +1473,12 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
-        // z-ONLY elision: a/b's constant lines are re-read L1-hot by the
-        // fused round-1 window precompute immediately after the dump, so
-        // eliding their stores converts warm reads into cold misses (measured
-        // +1 ms). z has no immediate re-reader — its next consumer is the
-        // commit encode, whose reads are DRAM-class either way — so only z's
-        // zero-tail store is worth skipping.
+        // z-ONLY elision: a/b's constant lines were re-read L1-hot by the
+        // round-1 window precompute right after the dump, so eliding their
+        // stores converted warm reads into cold misses (measured +1 ms). The
+        // fused drain moves that re-read to the per-octa window buffers, so
+        // a/b elision is no longer self-defeating — but it stays off here,
+        // unchanged, because enabling it is a separate measurement.
         let elide_on = witgen_simd::const_elide_enabled();
         generate_round1_inner_octa(
             blocks,
@@ -1465,6 +1490,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
             &inv_table,
             &padding,
             [z_tok && elide_on, false, false],
+            ab_nt,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -1488,9 +1514,9 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    let _ = (use_simd, a_tok, b_tok, z_tok);
+    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    let _ = (a_tok, b_tok, z_tok);
+    let _ = (ab_nt, a_tok, b_tok, z_tok);
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -1624,13 +1650,34 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     (z, a, b, ab_inner)
 }
 
+/// One 64-byte line of a rayon task's fused a/b projection windows. A task
+/// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
+/// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
+/// total — allocated once per `for_each_init` bout and rewritten by every octa
+/// in the task, so it stays L1-resident. The `align(64)` is what the whole
+/// allocation inherits; nothing ever reads the field.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[repr(C, align(64))]
+struct AbWinLine([u64; 8]);
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
-/// task owns 16 contiguous padded slots (two octa dumps) so a/b lines for
-/// two SIMD groups stay hot across the subsequent round-1 AB windows.
-/// Temporal stores; NT publishes stay off. `elide` forwards the per-buffer
-/// constant-region skips (z, a, b) — pass `true` ONLY for a buffer whose
-/// pool provenance token verified it still holds a previous completed
-/// witgen of this exact layout.
+/// task owns 16 contiguous padded slots (two octa dumps).
+///
+/// With `ab_nt` (the default; `FLOCK_NO_WITGEN_AB_NT=1` restores the other
+/// arm) the octa dump publishes a/b NON-TEMPORALLY and simultaneously fills a
+/// 32 KiB per-task window buffer from the same transpose registers; the
+/// round-1 AB window projection for those eight blocks then runs immediately,
+/// reading the L1-hot windows. a/b are never re-read, deleting their
+/// write-allocate RFO (1 GiB at the ranked shape).
+///
+/// Without `ab_nt` this is the incumbent: temporal a/b dumps followed by one
+/// projection loop over the task's 16 blocks reading a/b back.
+///
+/// `elide` forwards the per-buffer constant-region skips (z, a, b) — pass
+/// `true` ONLY for a buffer whose pool provenance token verified it still
+/// holds a previous completed witgen of this exact layout. Elided chunks are
+/// skipped in a/b but still materialized in the windows, so the projection
+/// sees the same bytes either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa(
@@ -1643,12 +1690,16 @@ fn generate_round1_inner_octa(
     inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
     padding: &Compression,
     elide: [bool; 3],
+    ab_nt: bool,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
+    // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
+    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
 
@@ -1656,8 +1707,9 @@ fn generate_round1_inner_octa(
     // phase, DRAM-cold at the ranked shape — so the streamed transform
     // publishes it non-temporally (deletes the 512 MiB write-allocate RFO).
     // z's next reader is the commit encode — the next phase, DRAM-class
-    // either way at 512 MiB — so its dump streams too (a/b stay temporal:
-    // the fused window precompute re-reads them L1-hot in the same task).
+    // either way at 512 MiB — so its dump streams too. Under `ab_nt` a/b
+    // stream as well: their only in-task reader, the window projection, now
+    // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
@@ -1667,74 +1719,141 @@ fn generate_round1_inner_octa(
         .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
         .enumerate()
-        .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
-            let n_here = z_out.len() / F128_PER_BLOCK;
-            // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
-            // 512-word blocks in z/a/b. Last rayon chunk may be 8-wide.
-            // Dump is temporal; `elide` skips only token-verified constant
-            // chunks.
-            unsafe {
-                for half in 0..(n_here / SIMD) {
-                    let base = GROUP * g + half * SIMD;
-                    // Lead 2: the closed-form arm evaluates the eight blocks
-                    // into 896 B of L1-resident stack staging on the very
-                    // worker that is about to hash them, instead of loading
-                    // them from a 28 MiB materialized vector. The `Slice` arm
-                    // is byte-for-byte the incumbent — it still borrows in
-                    // place, no copy introduced.
-                    let staged: [Compression; SIMD];
-                    let octa: [&Compression; SIMD] = match blocks {
-                        crate::seed_pipe::BlockSource::Slice(s) => {
-                            std::array::from_fn(|j| s.get(base + j).unwrap_or(padding))
-                        }
-                        crate::seed_pipe::BlockSource::Closed { init, len } => {
-                            staged = std::array::from_fn(|j| {
-                                let idx = base + j;
-                                if idx < len {
-                                    crate::seed_pipe::gen_block(init, idx)
-                                } else {
-                                    *padding
+        .for_each_init(
+            || {
+                // Rayon splits this down to one bout per GROUP under stealing
+                // pressure, so the init runs about as often as the dump does —
+                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
+                // allocation (64-aligned via `AbWinLine`) and skips the fill;
+                // the dump writes every window byte before the projection
+                // reads any.
+                let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                if ab_nt {
+                    v.reserve_exact(WIN_LINES);
+                    // SAFETY: `MaybeUninit<T>` needs no initialization, and
+                    // `reserve_exact` guaranteed the capacity.
+                    unsafe { v.set_len(WIN_LINES) };
+                }
+                v
+            },
+            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                // The two window sides live back-to-back in one 64-aligned
+                // allocation: `[a windows | b windows]`, each 8 blocks of
+                // U32_PER_BLOCK words in the same row-major geometry as a/b.
+                let win_ab = if ab_nt {
+                    debug_assert_eq!(win.len(), WIN_LINES);
+                    let wa = win.as_mut_ptr().cast::<u32>();
+                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+                    Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+                } else {
+                    None
+                };
+                // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
+                // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
+                // contiguous 512-word blocks disjoint from every witness buffer.
+                // Last rayon chunk may be 8-wide. `elide` skips only
+                // token-verified constant chunks of a/b/z; the windows are
+                // always written in full.
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        // Lead 2: the closed-form arm evaluates the eight blocks
+                        // into 896 B of L1-resident stack staging on the very
+                        // worker that is about to hash them, instead of loading
+                        // them from a 28 MiB materialized vector. The `Slice` arm
+                        // is byte-for-byte the incumbent — it still borrows in
+                        // place, no copy introduced.
+                        let staged: [Compression; SIMD];
+                        let octa: [&Compression; SIMD] = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                std::array::from_fn(|j| s.get(base + j).unwrap_or(padding))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged = std::array::from_fn(|j| {
+                                    let idx = base + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                std::array::from_fn(|j| &staged[j])
+                            }
+                        };
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        blake3_witgen8::build_octa_witness_ab_stream_elide(
+                            octa,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            win_ab,
+                            elide,
+                            z_nt,
+                        );
+                        // Fused arm: project THIS octa's eight blocks now, off
+                        // the just-written windows, while they are L1-hot. Same
+                        // ascending block order as the incumbent loop below, so
+                        // ab_inner's NT stream stays sequential per thread.
+                        if let Some((win_a, win_b)) = win_ab {
+                            for j in 0..SIMD {
+                                if base + j < skip_blocks {
+                                    continue;
                                 }
-                            });
-                            std::array::from_fn(|j| &staged[j])
+                                let a_bytes = std::slice::from_raw_parts(
+                                    win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                );
+                                let b_bytes = std::slice::from_raw_parts(
+                                    win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                );
+                                let blk = half * SIMD + j;
+                                let ab_blk =
+                                    &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
+                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                );
+                            }
                         }
-                    };
-                    let off = half * SIMD * F128_PER_BLOCK;
-                    blake3_witgen8::build_octa_witness_ab_stream_elide(
-                        octa,
-                        z_out.as_mut_ptr().add(off).cast::<u32>(),
-                        a_out.as_mut_ptr().add(off).cast::<u32>(),
-                        b_out.as_mut_ptr().add(off).cast::<u32>(),
-                        elide,
-                        z_nt,
-                    );
+                    }
                 }
-            }
-            for j in 0..n_here {
-                let block_idx = GROUP * g + j;
-                if block_idx >= skip_blocks {
-                    let a_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                            BYTES_PER_BLOCK,
-                        )
-                    };
-                    let b_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                            BYTES_PER_BLOCK,
-                        )
-                    };
-                    let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
-                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                    );
+                // Incumbent arm — and, under `ab_nt`, only a ragged sub-octa tail
+                // the dump loop above could not cover (unreachable at every
+                // power-of-two shape ≥ 8; kept so the two arms stay observably
+                // identical). Reads a/b back.
+                let j0 = if win_ab.is_some() {
+                    (n_here / SIMD) * SIMD
+                } else {
+                    0
+                };
+                for j in j0..n_here {
+                    let block_idx = GROUP * g + j;
+                    if block_idx >= skip_blocks {
+                        let a_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            )
+                        };
+                        let b_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            )
+                        };
+                        let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                        );
+                    }
                 }
-            }
-            if abinner_nt || z_nt {
-                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
-            }
-        });
+                // Last NT store of the task in every arm — a/b's streams included.
+                if abinner_nt || z_nt || ab_nt {
+                    flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                }
+            },
+        );
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -1981,6 +2100,19 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_z_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
+        *ON
+    }
+
+    /// `FLOCK_NO_WITGEN_AB_NT=1` restores the pre-fusion octa task structure
+    /// in full: temporal a/b dumps, then a separate round-1 projection loop
+    /// that re-reads a/b. With the switch off (the default) the dump writes
+    /// a/b non-temporally while filling a per-task window buffer from the
+    /// same transpose registers, and the projection runs per octa off those
+    /// windows — deleting a/b's write-allocate RFO traffic. Orthogonal to the
+    /// z, ab_inner and elide switches.
+    pub(crate) fn witgen_ab_nt_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_NT").is_none());
         *ON
     }
 
@@ -3845,6 +3977,167 @@ mod tests {
             ab_si.as_bytes_mut(),
             "ab_inner mismatch between scalar and live SIMD"
         );
+    }
+
+    /// **Fused a/b-NT oracle, end to end.** The default octa path publishes
+    /// a/b non-temporally and projects round-1 AB windows out of the per-task
+    /// window buffers filled by the same transpose; `FLOCK_NO_WITGEN_AB_NT=1`
+    /// restores temporal a/b dumps plus a separate projection loop that
+    /// re-reads a/b. The two must agree byte-for-byte on z, a, b AND ab_inner.
+    ///
+    /// Shapes: 8 blocks (a single sub-GROUP rayon chunk — the `n_here == 8`
+    /// case), 16 (one full GROUP), 27-in-32 (ragged padding tail), and 64
+    /// (several GROUPs, so the per-task window buffer is reused across octas).
+    #[test]
+    fn round1_inner_ab_nt_fused_matches_kill_switch() {
+        for &n_blocks in &[8usize, 16, 27, 64] {
+            let mut rng = Rng::new(0xABF0_5ED0 ^ n_blocks as u64);
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                    (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+                })
+                .collect();
+            let n_log = min_n_blocks_log(n_blocks);
+
+            let (z_f, a_f, b_f, mut ab_f) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    crate::seed_pipe::BlockSource::Slice(&blocks),
+                    n_log,
+                    false,
+                    true,
+                    true,
+                );
+            let (z_t, a_t, b_t, mut ab_t) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    crate::seed_pipe::BlockSource::Slice(&blocks),
+                    n_log,
+                    false,
+                    true,
+                    false,
+                );
+
+            assert_eq!(z_f, z_t, "z mismatch, n_blocks={n_blocks}");
+            assert_eq!(a_f, a_t, "a mismatch, n_blocks={n_blocks}");
+            assert_eq!(b_f, b_t, "b mismatch, n_blocks={n_blocks}");
+            let skip = ab_f.invalid_prefix_bytes();
+            assert_eq!(skip, ab_t.invalid_prefix_bytes());
+            assert_eq!(
+                &ab_f.as_bytes_mut()[skip..],
+                &ab_t.as_bytes_mut()[skip..],
+                "ab_inner mismatch, n_blocks={n_blocks}"
+            );
+        }
+    }
+
+    /// **Fused a/b-NT oracle, at the octa generator's own seams.** Drives
+    /// [`generate_round1_inner_octa`] directly so the two knobs the end-to-end
+    /// caller never varies get exercised:
+    ///
+    /// * `elide` — the a/b dumps skip their constant chunks when the pool
+    ///   provenance token says the destination already holds them. The
+    ///   projection reads the FULL block, and those constants are NOT all
+    ///   zero (b's elided prefix is all-ones), so the fused window buffer has
+    ///   to materialize every chunk regardless of the elide range. A
+    ///   zero-filled (or dst-read-back) window would fail this test.
+    /// * `skip_blocks` — blocks below it get no projection at all; the fused
+    ///   arm must skip exactly the same ones.
+    ///
+    /// All four (elide, ab_nt) combinations must reproduce the plain
+    /// full-write temporal reference bit-for-bit.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn round1_inner_octa_ab_nt_matches_across_elide_and_skip() {
+        const F128_PER_BLOCK: usize = K / 128;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        for &(n_total, skip_blocks) in &[(8usize, 0usize), (16, 0), (32, 4), (48, 17)] {
+            let mut rng = Rng::new(0x0C7A_E11D ^ n_total as u64);
+            let mut mk = |n: usize| -> Vec<Compression> {
+                (0..n)
+                    .map(|_| {
+                        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                        let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                        (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+                    })
+                    .collect()
+            };
+            // `other` seeds the elided runs' destinations. Deliberately a
+            // DIFFERENT witness of the same layout: only the elided regions
+            // are content-independent, so any content-carrying chunk the dump
+            // wrongly skips leaves `other`'s bytes behind and is caught.
+            let other = mk(n_total);
+            let blocks = mk(n_total);
+            let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+            let ntt_s =
+                flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+            let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+                K_SKIP,
+                flock_core::field::F8(1u8 << K_SKIP),
+            );
+            let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            let n_f128 = n_total * F128_PER_BLOCK;
+            let skip_bytes = skip_blocks * BYTES_PER_BLOCK;
+
+            // `seed` = the (z, a, b) the dumps start from. Full-write runs
+            // overwrite all of it; elided runs rely on it already holding the
+            // constants, which is exactly the pool provenance contract.
+            let run = |src: &[Compression],
+                       elide: [bool; 3],
+                       ab_nt: bool,
+                       seed: Option<&(Vec<F128>, Vec<F128>, Vec<F128>)>|
+             -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+                let (mut z, mut a, mut b) = match seed {
+                    Some((zs, as_, bs)) => (zs.clone(), as_.clone(), bs.clone()),
+                    None => (
+                        vec![F128::ZERO; n_f128],
+                        vec![F128::ZERO; n_f128],
+                        vec![F128::ZERO; n_f128],
+                    ),
+                };
+                let mut ab_inner =
+                    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+                        n_total * BYTES_PER_BLOCK,
+                    );
+                ab_inner.set_invalid_prefix_bytes(skip_bytes);
+                generate_round1_inner_octa(
+                    crate::seed_pipe::BlockSource::Slice(src),
+                    skip_blocks,
+                    &mut z,
+                    &mut a,
+                    &mut b,
+                    &mut ab_inner,
+                    &inv_table,
+                    &padding,
+                    elide,
+                    ab_nt,
+                );
+                let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
+                (z, a, b, ab)
+            };
+
+            let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], false, None);
+            let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, None);
+            let seed = (z_o, a_o, b_o);
+            for &elide_on in &[false, true] {
+                for &ab_nt in &[false, true] {
+                    if !elide_on && !ab_nt {
+                        continue; // that IS the reference
+                    }
+                    let elide = [elide_on; 3];
+                    let (z, a, b, ab) =
+                        run(&blocks, elide, ab_nt, if elide_on { Some(&seed) } else { None });
+                    let tag =
+                        format!("n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}");
+                    assert_eq!(z, z_r, "z mismatch, {tag}");
+                    assert_eq!(a, a_r, "a mismatch, {tag}");
+                    assert_eq!(b, b_r, "b mismatch, {tag}");
+                    assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
+                }
+            }
+        }
     }
 
     /// Recycled-scratch constant-elision oracle (witgen-stack item B, x86

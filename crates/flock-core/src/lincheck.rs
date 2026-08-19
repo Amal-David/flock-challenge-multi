@@ -941,6 +941,15 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
+/// kicked z-fold before `fold_alpha_batched` instead of after (exact
+/// same-binary A/B; the overlap changes scheduling only).
+fn lc_alpha_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ALPHA_OVERLAP").is_none());
+    *ON
+}
+
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -2358,22 +2367,33 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // Wait-not-join: if the last-ρ kick is still running, join the OS
-    // handle here — after serial FS (label, α, eq_inner) and BEFORE
-    // fold_alpha. Do not rayon::join / rayon::scope with CSC (that pulls
-    // this thread into the fold and splits the pool). Residual join HOLD.
-    let t_wait = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let kicked_z_vec = wait_last_rho_z_fold();
-    if let Some(t) = t_wait {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "wait kicked z-fold",
-            t.elapsed().as_secs_f64() * 1e3
-        );
+    // Overlap-not-park: the kicked z-fold is a pure DRAM stream running on
+    // its own OS thread against the global pool, while `fold_alpha_batched`
+    // is a load-latency-bound sparse gather into an L2-resident eq table —
+    // complementary profiles that want each other's stall slots. Run the
+    // gather NOW and join the fold only where its output is first consumed
+    // (the z_vec match below). fold_alpha never touches z, and α/β keep
+    // their transcript positions, so the proof bytes are identical. This is
+    // NOT the rayon::join-with-CSC pattern the earlier HOLD comment warns
+    // about (that pulled this thread into the fold and split the pool); the
+    // caller merely queues a second pool-wide job instead of parking.
+    // `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order.
+    let overlap = lc_alpha_overlap_enabled();
+    let mut kicked_z_vec = None;
+    if !overlap {
+        let t_wait = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        kicked_z_vec = wait_last_rho_z_fold();
+        if let Some(t) = t_wait {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "wait kicked z-fold",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
     let t = if trace {
         Some(std::time::Instant::now())
@@ -2387,6 +2407,21 @@ fn prove_padded_inner<Ch: Challenger>(
             "fold_alpha_batched",
             t.elapsed().as_secs_f64() * 1e3
         );
+    }
+    if overlap {
+        let t_wait = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        kicked_z_vec = wait_last_rho_z_fold();
+        if let Some(t) = t_wait {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "wait kicked z-fold (overlapped)",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
