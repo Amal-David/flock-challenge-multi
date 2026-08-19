@@ -125,7 +125,61 @@ fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
     Some(((global + 2).min(available), available))
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+/// x86 Linux: SMT-aware zerocheck width. The zerocheck phase (round-1 URM
+/// shift-reduce + the round-2/3+4 lookahead sweeps) saturates the CLMUL/GFNI
+/// ports; two hyperthread siblings sharing those ports add contention, not
+/// throughput. When the host exposes SMT pairs (the ranked c7i.4xlarge is 8
+/// cores × 2 threads), run zerocheck one thread per PHYSICAL core; the
+/// store-bound witness phase and the commit keep the global width. Hosts
+/// without SMT (and every non-Linux x86) see `None` — behavior unchanged.
+/// Kill switch: `FLOCK_NO_PHASE_POOLS=1` (also covers the mac pools above).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
+    if m < 29 || std::env::var_os(PHASE_POOLS_DISABLE_ENV).is_some() {
+        return None;
+    }
+    let global = rayon::current_num_threads().max(1);
+    let physical = smt_physical_cores()?;
+    if physical == 0 || physical >= global {
+        return None;
+    }
+    // Commit width == global ⇒ `commit_phase_pool` below declines to build a
+    // redundant pool and the commit stays on the global pool.
+    Some((global, physical))
+}
+
+/// Number of physical cores, or `None` when the host has no SMT (every
+/// online CPU is its own core). Parsed from sysfs core/package ids; any read
+/// failure returns `None` (feature stays off).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn smt_physical_cores() -> Option<usize> {
+    use std::collections::HashSet;
+    let mut cores: HashSet<(u32, u32)> = HashSet::new();
+    let mut online = 0usize;
+    for cpu in 0..1024usize {
+        let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+        let core = match std::fs::read_to_string(format!("{base}/core_id")) {
+            Ok(s) => s.trim().parse::<u32>().ok()?,
+            Err(_) => break,
+        };
+        let pkg = std::fs::read_to_string(format!("{base}/physical_package_id"))
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        cores.insert((pkg, core));
+        online += 1;
+    }
+    if online == 0 || cores.len() >= online {
+        return None; // no SMT (or nothing readable): stay off
+    }
+    Some(cores.len())
+}
+
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    all(target_arch = "x86_64", target_os = "linux")
+)))]
 fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
     let _ = (m, PHASE_POOLS_DISABLE_ENV);
     None
@@ -135,6 +189,11 @@ fn commit_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     let (width, _) = phase_pool_widths(m)?;
+    if width == rayon::current_num_threads() {
+        // Same width as the global pool: installing a twin pool buys nothing
+        // and pays cross-pool scheduling — stay global (x86 SMT path).
+        return None;
+    }
     Some(POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(width)
@@ -178,6 +237,14 @@ pub(crate) fn in_witness_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + 
     if std::env::var_os(WITNESS_PHASE_POOL_DISABLE_ENV).is_some() {
         return op();
     }
+    // x86 SMT path: the zerocheck pool is NARROWER than global (one thread
+    // per physical core) — right for the port-bound sweeps, wrong for the
+    // store-bound witness dump, which keeps the full-width global pool.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        return op();
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     in_zerocheck_phase_pool(m, op)
 }
 
