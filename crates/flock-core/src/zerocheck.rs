@@ -127,16 +127,15 @@ fn cascade3_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some()
 }
 
-/// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Level 3
-/// ships on, so its latch forces it *off*; level 4 ships off (see
-/// [`cascade5_off`]), so its latch forces it *on*. Either way both routes emit
-/// the same transcript — that is what the `prove_transcript_identical_*` tests
-/// assert.
+/// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Both
+/// levels now ship on, so each latch forces the matching level *off*. Either
+/// way both routes emit the same transcript — that is what the
+/// `prove_transcript_identical_*` tests assert.
 #[cfg(test)]
 pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
-pub(crate) static ZC_CASCADE5_FORCED_ON: std::sync::atomic::AtomicBool =
+pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// `FLOCK_NO_ZC_CASCADE4=1` stops the cascade after rounds 7+8 (the incumbent
@@ -152,23 +151,21 @@ fn cascade4_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some()
 }
 
-/// Cascade level 4 (rounds 11+12) is **opt-in**: `FLOCK_ZC_CASCADE5=1` turns
-/// it on, and the ranked worker's cleared environment never does. It is
-/// implemented, transcript-identity tested and measured, but it loses once the
-/// calling-thread tail route is in: the two rounds it would replace (log_n 18
-/// and 17) already run serially for 0.54 + 0.25 ms, while the composed pass
-/// that replaces them is a rayon region costing 0.57-0.99 ms. Interleaved
-/// 32-sample medians on an idle-ish 16-thread Zen 5: 61.5 ms of zerocheck tail
-/// without it, 61.9 ms with — a 0.4 ms regression. Kept behind the flag so the
-/// next agent can re-test it on Sapphire Rapids, where rayon fan-out on 8
-/// SMT-paired cores may price differently.
+/// Cascade level 4 (rounds 11+12) ships on: `FLOCK_NO_ZC_CASCADE5=1` restores
+/// the prior opt-in-off incumbent. Zen 5 priced this as a 0.4 ms regression
+/// vs the calling-thread serial tail (0.54+0.25 ms vs a 0.57–0.99 ms rayon
+/// composed pass). Official SPR priced the earlier tail-fanout patch at
+/// −0.66% because rayon regions are cheap there — the same inversion that
+/// makes serial tail a local win can make this composed pass a runner win.
+/// One mechanism, kill-switch default ON; the ranked worker's cleared env
+/// never sets the flag.
 #[inline]
 fn cascade5_off() -> bool {
     #[cfg(test)]
-    if ZC_CASCADE5_FORCED_ON.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+    if ZC_CASCADE5_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
     }
-    std::env::var_os("FLOCK_ZC_CASCADE5").is_none()
+    std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -696,8 +693,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Level 3 ships on (kill switch FLOCK_NO_ZC_CASCADE4): at the ranked shape
     // it turns tail rounds log_n 20 and 19 — 2.0 + 1.2 ms of rayon regions —
     // into one 1.7 ms composed pass and deletes an FS round boundary.
-    // Level 4 ships OFF (opt-in FLOCK_ZC_CASCADE5); see `cascade5_off` for the
-    // measurement.
+    // Level 4 ships on (kill switch FLOCK_NO_ZC_CASCADE5); see `cascade5_off`.
     let use_cascade4 =
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
@@ -1274,8 +1270,7 @@ mod tests {
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
-                // Level 4 ships opt-in, so its latch is a forced-*on*.
-                ZC_CASCADE5_FORCED_ON.store(!c5_off, Ordering::Relaxed);
+                ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1294,7 +1289,7 @@ mod tests {
             ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
-            ZC_CASCADE5_FORCED_ON.store(false, Ordering::Relaxed);
+            ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
