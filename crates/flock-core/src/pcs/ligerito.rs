@@ -1925,8 +1925,10 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     // (`queries` ≈ tens; `yr_len` ≤ 2^5 since the residual folds to ≤5 bits), so
     // a rayon dispatch per level costs more than the field work itself (measured
     // ~0.47 ms serial vs ~0.75 ms parallel for the whole residual eval at m=30).
-    // Stay serial below the crossover — mirror of merkle.rs's `SERIAL_LEVEL_NODES`.
-    const PAR_FLOOR: usize = 1024;
+    // Keep tiny levels serial, but let medium query batches use the existing
+    // parallel evaluator. 640 is still 40 queries per ranked thread and avoids
+    // paying a fork/join for the small recursive levels.
+    const PAR_FLOOR: usize = 640;
     let per_query: Vec<PerQuery> = if n_queries > PAR_FLOOR {
         queries.par_iter().map(compute_query).collect()
     } else {
