@@ -111,6 +111,14 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
 /// `build_sum_table`'s `T[1 << j] = eq8[j]`).
+///
+/// Built as two 8×64 bit-transposes (lo / hi limbs) plus per-byte-group
+/// `swap_bytes`. The scalar extractor walked 16 × 8 × 8 isolated bits;
+/// `transpose_8_u64s_to_64_bytes` is the already-proven ISA kernel for
+/// that exact 8-lane → 8-byte-group map, and the GFNI affine qword stores
+/// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
+/// group. Bit-identical to the bit-extract loop: see
+/// `fold_mats_from_basis_matches_sum_table`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -119,22 +127,23 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
-    for (byte_k, slot) in mats.iter_mut().enumerate() {
-        let mut qword = 0u64;
-        for i in 0..8 {
-            let bit_index = 8 * byte_k + i;
-            let mut row = 0u8;
-            for (j, basis_val) in eq8.iter().enumerate() {
-                let bit = if bit_index < 64 {
-                    (basis_val.lo >> bit_index) & 1
-                } else {
-                    (basis_val.hi >> (bit_index - 64)) & 1
-                };
-                row |= (bit as u8) << j;
-            }
-            qword |= (row as u64) << (8 * (7 - i));
-        }
-        *slot = qword;
+
+    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
+    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
+    let mut lo_bytes = [0u8; 64];
+    let mut hi_bytes = [0u8; 64];
+    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+
+    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
+    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
+    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
+    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
+    for c in 0..8 {
+        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+        mats[c] = u64::from_le_bytes(lo).swap_bytes();
+        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
     }
 }
 
