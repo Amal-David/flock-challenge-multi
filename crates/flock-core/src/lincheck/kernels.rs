@@ -10,7 +10,7 @@ pub use aarch64::{
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::partial_fold_packed_z_x86_tiled_padded;
+pub use x86_64::{gather_transpose_tile_x86, partial_fold_packed_z_x86_tiled_padded};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
 pub(crate) use x86_64::{build_nibble_tables, fold_block_major_chunk_x86_avx512};
 #[cfg(target_arch = "x86_64")]
@@ -22,9 +22,3 @@ pub(crate) use x86_64::{NibbleTables, build_nibble_tables as build_nibble_tables
     target_feature = "gfni"
 ))]
 pub use x86_64::partial_fold_packed_z_x86_gfni_padded;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "gfni"
-))]
-pub(crate) use x86_64::{fold_mats_from_basis, gfni_fold_tile};

@@ -111,39 +111,30 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
 /// `build_sum_table`'s `T[1 << j] = eq8[j]`).
-///
-/// Built as two 8×64 bit-transposes (lo / hi limbs) plus per-byte-group
-/// `swap_bytes`. The scalar extractor walked 16 × 8 × 8 isolated bits;
-/// `transpose_8_u64s_to_64_bytes` is the already-proven ISA kernel for
-/// that exact 8-lane → 8-byte-group map, and the GFNI affine qword stores
-/// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
-/// group. Bit-identical to the bit-extract loop: see
-/// `fold_mats_from_basis_matches_sum_table`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
-pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
+fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
-
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
-    let mut lo_bytes = [0u8; 64];
-    let mut hi_bytes = [0u8; 64];
-    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
-
-    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
-    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
-    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    for (byte_k, slot) in mats.iter_mut().enumerate() {
+        let mut qword = 0u64;
+        for i in 0..8 {
+            let bit_index = 8 * byte_k + i;
+            let mut row = 0u8;
+            for (j, basis_val) in eq8.iter().enumerate() {
+                let bit = if bit_index < 64 {
+                    (basis_val.lo >> bit_index) & 1
+                } else {
+                    (basis_val.hi >> (bit_index - 64)) & 1
+                };
+                row |= (bit as u8) << j;
+            }
+            qword |= (row as u64) << (8 * (7 - i));
+        }
+        *slot = qword;
     }
 }
 
@@ -151,7 +142,7 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
 /// # Safety
-/// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
+/// - `tile_bytes_ptr` must point to at least `8 * k` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
 /// - `out_planes_ptr` must point to at least `n_blocks64 * 1024` bytes.
 #[cfg(all(
@@ -160,9 +151,9 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
-pub(crate) unsafe fn gfni_fold_tile(
+unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
-    stripe_stride: usize,
+    k: usize,
     n_blocks64: usize,
     mats: &[u64; 128],
     out_planes_ptr: *mut u8,
@@ -174,7 +165,7 @@ pub(crate) unsafe fn gfni_fold_tile(
             let bs = block * 64;
             let mut rows = [_mm512_setzero_si512(); 8];
             for (t, row) in rows.iter_mut().enumerate() {
-                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i);
+                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * k + bs) as *const __m512i);
             }
             let planes = out_planes_ptr.add(block * 1024);
             for byte_k in 0..16 {
@@ -483,6 +474,145 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
                 if m1 != 0 {
                     let v1 = _mm512_maskz_loadu_epi64(m1, pi.add(8));
                     _mm512_mask_storeu_epi64(pi.add(8), m1, _mm512_xor_si512(v1, aos1));
+                }
+            }
+        }
+    }
+}
+
+/// Gather 8×8 F128 lanes at `src + (8·t + r)·stride` and bit-transpose each
+/// 8-lane group into 128 output bytes. Ranked lincheck uses
+/// `chunks_per_block = 128`, so adjacent lanes sit 2 KiB apart — a scalar
+/// pointer-chase is L2-hostile on SPR. AVX-512 `vpgatherqq` issues the 8
+/// lo (then 8 hi) u64s as one gather, which the L2 miss pipeline can
+/// overlap. Kill with `FLOCK_NO_I64GATHER` (scalar loads, same transpose).
+///
+/// # Safety
+///
+/// - Lane `(t, r)` must be in-bounds at `src + (8·t + r)·stride`.
+/// - `out` must point to `8 × 128` writable bytes.
+pub unsafe fn gather_transpose_tile_x86(src: *const F128, stride: usize, out: *mut u8) {
+    if i64gather_off() {
+        unsafe { gather_transpose_tile_x86_scalar(src, stride, out) }
+        return;
+    }
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        gather_transpose_tile_x86_i64gather(src, stride, out);
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    unsafe {
+        gather_transpose_tile_x86_scalar(src, stride, out);
+    }
+}
+
+fn i64gather_off() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static OFF: AtomicU8 = AtomicU8::new(0);
+    match OFF.load(Ordering::Relaxed) {
+        0 => {
+            let v = std::env::var_os("FLOCK_NO_I64GATHER").is_some();
+            OFF.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+            v
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[target_feature(enable = "avx512f")]
+unsafe fn gather_transpose_tile_x86_i64gather(
+    src: *const F128,
+    stride: usize,
+    out: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    const TILE_T: usize = 8;
+    // F128 is `#[repr(C, align(16))] { lo: u64, hi: u64 }`. Qword index of
+    // lane r's `lo` relative to `row0` is `r * stride * 2`; `hi` is +1 qword.
+    let mut idx = [0i64; 8];
+    let qstride = (stride as i64).wrapping_mul(2);
+    for r in 0..8 {
+        idx[r] = (r as i64).wrapping_mul(qstride);
+    }
+    let vindex = _mm512_loadu_si512(idx.as_ptr().cast());
+    for t in 0..TILE_T {
+        let row0 = src.add(8 * t * stride) as *const i64;
+        let vlo = _mm512_i64gather_epi64::<8>(row0, vindex);
+        let vhi = _mm512_i64gather_epi64::<8>(row0.add(1), vindex);
+        let mut lo = [0u64; 8];
+        let mut hi = [0u64; 8];
+        _mm512_storeu_si512(lo.as_mut_ptr().cast(), vlo);
+        _mm512_storeu_si512(hi.as_mut_ptr().cast(), vhi);
+        let out_row = core::slice::from_raw_parts_mut(out.add(t * 128), 128);
+        let (out_lo, out_hi) = out_row.split_at_mut(64);
+        crate::bits::transpose_8_u64s_to_64_bytes(&lo, out_lo);
+        crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
+    }
+}
+
+unsafe fn gather_transpose_tile_x86_scalar(src: *const F128, stride: usize, out: *mut u8) {
+    const TILE_T: usize = 8;
+    for t in 0..TILE_T {
+        let mut lo = [0u64; 8];
+        let mut hi = [0u64; 8];
+        let row0 = src.add(8 * t * stride);
+        for r in 0..8 {
+            let lane = core::ptr::read(row0.add(r * stride));
+            lo[r] = lane.lo;
+            hi[r] = lane.hi;
+        }
+        let out_row = core::slice::from_raw_parts_mut(out.add(t * 128), 128);
+        let (out_lo, out_hi) = out_row.split_at_mut(64);
+        crate::bits::transpose_8_u64s_to_64_bytes(&lo, out_lo);
+        crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
+    }
+}
+
+#[cfg(test)]
+mod gather_transpose_tests {
+    use super::{gather_transpose_tile_x86, F128};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            self.0
+        }
+        fn f128(&mut self) -> F128 {
+            F128::new(self.next_u64(), self.next_u64())
+        }
+    }
+
+    /// Output row t, byte b, bit r = bit b of lane (t, r). Matches the
+    /// aarch64 `gather_transpose_tile_matches_scalar` contract.
+    #[test]
+    fn gather_transpose_tile_x86_matches_scalar() {
+        let mut rng = Rng(0x72A5_0002);
+        for &stride in &[1usize, 2, 7, 128] {
+            let src: Vec<F128> = (0..64 * stride).map(|_| rng.f128()).collect();
+            let mut got = [0u8; 8 * 128];
+            unsafe {
+                gather_transpose_tile_x86(src.as_ptr(), stride, got.as_mut_ptr());
+            }
+            for t in 0..8 {
+                for b in 0..128 {
+                    let mut want = 0u8;
+                    for r in 0..8 {
+                        let lane = src[(8 * t + r) * stride];
+                        let bit = if b < 64 {
+                            (lane.lo >> b) & 1
+                        } else {
+                            (lane.hi >> (b - 64)) & 1
+                        };
+                        want |= (bit as u8) << r;
+                    }
+                    assert_eq!(
+                        got[t * 128 + b],
+                        want,
+                        "t={t} b={b} stride={stride}"
+                    );
                 }
             }
         }
