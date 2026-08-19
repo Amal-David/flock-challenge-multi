@@ -100,6 +100,10 @@ use flock_core::verifier;
 #[path = "blake3_witgen8.rs"]
 mod blake3_witgen8;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[path = "blake3_witgen16.rs"]
+mod blake3_witgen16;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1321,17 +1325,20 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     // local-diagnostics kill switch; the ranked worker's cleared
     // environment never sets it.
     //
-    // On x86_64+AVX2 the regular-store path is 8-wide lockstep (`blake3_witgen8`)
-    // unless `FLOCK_NO_WITGEN_LIVE_SIMD=1`. Ranked env is cleared, so SIMD is
-    // the default. NT stays aarch64-only; do not combine with the AVX2 dump.
+    // On x86_64+AVX-512 the regular-store path is 16-wide lockstep
+    // (`blake3_witgen16`) unless `FLOCK_NO_WITGEN_AVX512=1` (then 8-wide
+    // `blake3_witgen8`). `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar
+    // 1-block loop. Ranked env is cleared, so the widest compiled SIMD is
+    // the default. NT stays aarch64-only; do not combine with the AVX dump.
     let use_nt = cfg!(target_arch = "aarch64")
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
-/// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
-/// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
+/// Ranked 8-wide AVX2 / 16-wide AVX-512 witness builder. Default ON
+/// (`env is none`); `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar
+/// 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
@@ -1340,6 +1347,24 @@ fn live_witgen_simd_enabled() -> bool {
         *ON
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        false
+    }
+}
+
+/// Ranked 16-wide AVX-512 witness builder. Default ON (`env is none`);
+/// `FLOCK_NO_WITGEN_AVX512=1` (or `FLOCK_NO_WITGEN_WIDE16=1`) restores the
+/// 8-wide AVX2 octa path.
+fn live_witgen_avx512_enabled() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_AVX512").is_none()
+                && std::env::var_os("FLOCK_NO_WITGEN_WIDE16").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
     {
         false
     }
@@ -1369,11 +1394,36 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
 /// Same as [`generate_witness_with_ab_packed_and_round1_inner_impl`] with an
 /// explicit SIMD toggle so tests can A/B the octa kernel vs the scalar
 /// 1-block loop without fighting the process-wide env LazyLock.
+/// 16-wide AVX-512 follows [`live_witgen_avx512_enabled`].
 fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     blocks: &[Compression],
     n_blocks_log: usize,
     use_nt: bool,
     use_simd: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    generate_witness_with_ab_packed_and_round1_inner_impl_ex_wide(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        use_simd,
+        live_witgen_avx512_enabled(),
+    )
+}
+
+/// Same as [`generate_witness_with_ab_packed_and_round1_inner_impl_ex`] with
+/// an explicit 16-wide toggle so tests can A/B AVX-512 vs AVX2 vs scalar
+/// without fighting the process-wide env LazyLock.
+fn generate_witness_with_ab_packed_and_round1_inner_impl_ex_wide(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    use_nt: bool,
+    use_simd: bool,
+    use_wide16: bool,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -1408,6 +1458,23 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    if use_simd && use_wide16 && !use_nt && n_total >= 16 {
+        generate_round1_inner_wide16(
+            blocks,
+            skip_blocks,
+            &mut z,
+            &mut a,
+            &mut b,
+            &mut ab_inner,
+            &inv_table,
+            &padding,
+        );
+        return (z, a, b, ab_inner);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    let _ = use_wide16;
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
@@ -1593,6 +1660,78 @@ fn generate_round1_inner_octa(
                 }
             }
             for j in 0..n_here {
+                let block_idx = GROUP * g + j;
+                if block_idx >= skip_blocks {
+                    let a_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
+                        )
+                    };
+                    let b_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
+                        )
+                    };
+                    let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                        a_bytes, b_bytes, ab_blk, inv_table,
+                    );
+                }
+            }
+        });
+}
+
+/// 16-wide AVX-512 lockstep for the ranked round1_inner generator. One rayon
+/// task owns 16 contiguous padded slots: wide16 witness dump, then round-1
+/// AB windows on each live block while those a/b lines are still hot.
+/// Temporal stores only (`elide = [false; 3]`); NT publishes stay off.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn generate_round1_inner_wide16(
+    blocks: &[Compression],
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+) {
+    use rayon::prelude::*;
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const GROUP: usize = 16;
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.par_chunks_mut(group_f128))
+        .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
+            let hexa: [&Compression; 16] = std::array::from_fn(|j| {
+                let idx = GROUP * g + j;
+                if idx < blocks.len() {
+                    &blocks[idx]
+                } else {
+                    padding
+                }
+            });
+            // SAFETY: crate compiled with AVX-512F; each group owns 16
+            // contiguous 512-word blocks in z/a/b. Dump is temporal
+            // (`elide` all false).
+            unsafe {
+                blake3_witgen16::build_wide16_witness_ab_stream_elide(
+                    hexa,
+                    z_out.as_mut_ptr().cast::<u32>(),
+                    a_out.as_mut_ptr().cast::<u32>(),
+                    b_out.as_mut_ptr().cast::<u32>(),
+                    [false; 3],
+                );
+            }
+            for j in 0..GROUP {
                 let block_idx = GROUP * g + j;
                 if block_idx >= skip_blocks {
                     let a_bytes = unsafe {
@@ -3662,6 +3801,64 @@ mod tests {
             ab_sc.as_bytes_mut(),
             ab_si.as_bytes_mut(),
             "ab_inner mismatch between scalar and live SIMD"
+        );
+    }
+
+    /// 16-wide AVX-512 (`use_wide16 = true`) vs 8-wide AVX2 (`use_simd = true`,
+    /// `use_wide16 = false`) vs the scalar 1-block loop must agree
+    /// byte-for-byte on z/a/b/ab_inner, including padding slots
+    /// (non-power-of-two block count: 21 compressions in 32 slots).
+    #[test]
+    fn round1_inner_wide16_matches_octa_and_scalar_padded() {
+        let mut rng = Rng::new(0x16_E1_DE08);
+        let n_blocks = 21usize;
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let n_log = min_n_blocks_log(n_blocks);
+        assert_eq!(1usize << n_log, 32);
+
+        let (z_sc, a_sc, b_sc, mut ab_sc) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex_wide(
+                &blocks, n_log, false, false, false,
+            );
+        let (z_oct, a_oct, b_oct, mut ab_oct) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex_wide(
+                &blocks, n_log, false, true, false,
+            );
+        assert_eq!(z_sc, z_oct, "z mismatch between scalar and 8-wide octa");
+        assert_eq!(a_sc, a_oct, "a mismatch between scalar and 8-wide octa");
+        assert_eq!(b_sc, b_oct, "b mismatch between scalar and 8-wide octa");
+        assert_eq!(
+            ab_sc.as_bytes_mut(),
+            ab_oct.as_bytes_mut(),
+            "ab_inner mismatch between scalar and 8-wide octa"
+        );
+
+        let (z_w, a_w, b_w, mut ab_w) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex_wide(
+                &blocks, n_log, false, true, true,
+            );
+        assert_eq!(z_sc, z_w, "z mismatch between scalar and 16-wide");
+        assert_eq!(a_sc, a_w, "a mismatch between scalar and 16-wide");
+        assert_eq!(b_sc, b_w, "b mismatch between scalar and 16-wide");
+        assert_eq!(
+            ab_sc.as_bytes_mut(),
+            ab_w.as_bytes_mut(),
+            "ab_inner mismatch between scalar and 16-wide"
+        );
+        assert_eq!(z_oct, z_w, "z mismatch between 8-wide and 16-wide");
+        assert_eq!(a_oct, a_w, "a mismatch between 8-wide and 16-wide");
+        assert_eq!(b_oct, b_w, "b mismatch between 8-wide and 16-wide");
+        assert_eq!(
+            ab_oct.as_bytes_mut(),
+            ab_w.as_bytes_mut(),
+            "ab_inner mismatch between 8-wide and 16-wide"
         );
     }
 
