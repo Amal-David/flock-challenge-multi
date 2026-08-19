@@ -1049,20 +1049,27 @@ fn fold_block_major_gfni(
                         let outer_base = 8 * (stripe_base + t);
                         #[cfg(target_feature = "avx512vbmi")]
                         if gather_tr_fused {
-                            // The next stripe is eight row-strided F128 loads,
-                            // a pattern the sequential hardware prefetchers do
-                            // not discover. Pull it into L1 while VBMI/GFNI
-                            // consumes this stripe. Do not cross a tile: with
-                            // dynamic scheduling its successor may belong to a
-                            // different worker.
-                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
-                                let next_base = 8 * (stripe_base + t + 1);
+                            // Keep the gather stream two stripes ahead. One
+                            // stripe of lead was a +0.64% official win; the
+                            // extra VBMI/GFNI body gives the hints time to
+                            // reach L1. At the tile edge continue into q+1,
+                            // never into another dynamically-owned tile.
+                            let future = t + 2;
+                            let (future_q, future_t) = if future < DIRECT_FOLD_TILE_STRIPES {
+                                (q, future)
+                            } else {
+                                (q + 1, future - DIRECT_FOLD_TILE_STRIPES)
+                            };
+                            if future_q < useful_chunks {
+                                let next_base = 8 * (stripe_base + future_t);
                                 unsafe {
                                     for r in 0..8 {
                                         core::arch::x86_64::_mm_prefetch(
                                             z_packed
                                                 .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
+                                                .add(
+                                                    (next_base + r) * chunks_per_block + future_q,
+                                                )
                                                 .cast::<i8>(),
                                             core::arch::x86_64::_MM_HINT_T0,
                                         );
