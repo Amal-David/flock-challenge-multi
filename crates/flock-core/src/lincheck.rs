@@ -932,6 +932,16 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_PLANE_XOR=1` restores the byte-at-a-time cross-worker
+/// plane XOR (exact same-binary A/B). Ranked env is cleared. This is
+/// NOT `FLOCK_NO_LC_PLANE_PACK` — the vpermb pack stays killed.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+fn lc_plane_xor_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_XOR").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -1084,11 +1094,19 @@ fn fold_block_major_gfni(
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
-        acc.copy_from_slice(&planes[base..base + 1024]);
-        for w in 1..n_workers {
-            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
-            for (a, b) in acc.iter_mut().zip(src) {
-                *a ^= *b;
+        if lc_plane_xor_enabled() {
+            // SAFETY: `planes` is n_workers·k·16; each 64-col block is
+            // 1024 bytes. Features cfg-guaranteed on this arm.
+            unsafe {
+                kernels::xor_reduce_plane_block(&planes, k, n_workers, blk, &mut acc);
+            }
+        } else {
+            acc.copy_from_slice(&planes[base..base + 1024]);
+            for w in 1..n_workers {
+                let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+                for (a, b) in acc.iter_mut().zip(src) {
+                    *a ^= *b;
+                }
             }
         }
         for (col, slot) in o.iter_mut().enumerate() {

@@ -269,6 +269,144 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// XOR-reduce one 64-column plane block (1024 bytes) across workers into
+/// `acc`. Bit-identical to:
+/// ```text
+/// acc.copy_from_slice(&planes[base..base+1024]);
+/// for w in 1..n_workers {
+///     for (a, b) in acc.iter_mut().zip(&planes[w*k*16+base..][..1024]) {
+///         *a ^= *b;
+///     }
+/// }
+/// ```
+/// F128 addition IS bitwise XOR, so this is the same char-2 sum, just
+/// kept in 16 ZMMs across the worker loop instead of store→reload of
+/// `acc` between workers. Does **not** pack to F128 — that `vpermb` path
+/// is the killed #178 `FLOCK_NO_LC_PLANE_PACK` increment.
+///
+/// # Safety
+/// `planes` is `n_workers * k * 16` bytes. `blk * 1024 + 1024` is
+/// in-bounds for every worker. `acc` is 1024 bytes. avx512f cfg-gated.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn xor_reduce_plane_block(
+    planes: &[u8],
+    k: usize,
+    n_workers: usize,
+    blk: usize,
+    acc: &mut [u8; 1024],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(planes.len(), n_workers * k * 16);
+    let base = blk * 1024;
+    // SAFETY: caller bounds; avx512f cfg-guaranteed.
+    unsafe {
+        // Worker 0 is the initial acc (same as copy_from_slice). Sixteen
+        // ZMMs cover the 1024-byte block and stay register-resident
+        // across the remaining workers.
+        let src0 = planes.as_ptr().add(base);
+        let mut v0 = _mm512_loadu_si512(src0 as *const __m512i);
+        let mut v1 = _mm512_loadu_si512(src0.add(64) as *const __m512i);
+        let mut v2 = _mm512_loadu_si512(src0.add(128) as *const __m512i);
+        let mut v3 = _mm512_loadu_si512(src0.add(192) as *const __m512i);
+        let mut v4 = _mm512_loadu_si512(src0.add(256) as *const __m512i);
+        let mut v5 = _mm512_loadu_si512(src0.add(320) as *const __m512i);
+        let mut v6 = _mm512_loadu_si512(src0.add(384) as *const __m512i);
+        let mut v7 = _mm512_loadu_si512(src0.add(448) as *const __m512i);
+        let mut v8 = _mm512_loadu_si512(src0.add(512) as *const __m512i);
+        let mut v9 = _mm512_loadu_si512(src0.add(576) as *const __m512i);
+        let mut v10 = _mm512_loadu_si512(src0.add(640) as *const __m512i);
+        let mut v11 = _mm512_loadu_si512(src0.add(704) as *const __m512i);
+        let mut v12 = _mm512_loadu_si512(src0.add(768) as *const __m512i);
+        let mut v13 = _mm512_loadu_si512(src0.add(832) as *const __m512i);
+        let mut v14 = _mm512_loadu_si512(src0.add(896) as *const __m512i);
+        let mut v15 = _mm512_loadu_si512(src0.add(960) as *const __m512i);
+        for w in 1..n_workers {
+            let src = planes.as_ptr().add(w * k * 16 + base);
+            v0 = _mm512_xor_si512(v0, _mm512_loadu_si512(src as *const __m512i));
+            v1 = _mm512_xor_si512(v1, _mm512_loadu_si512(src.add(64) as *const __m512i));
+            v2 = _mm512_xor_si512(v2, _mm512_loadu_si512(src.add(128) as *const __m512i));
+            v3 = _mm512_xor_si512(v3, _mm512_loadu_si512(src.add(192) as *const __m512i));
+            v4 = _mm512_xor_si512(v4, _mm512_loadu_si512(src.add(256) as *const __m512i));
+            v5 = _mm512_xor_si512(v5, _mm512_loadu_si512(src.add(320) as *const __m512i));
+            v6 = _mm512_xor_si512(v6, _mm512_loadu_si512(src.add(384) as *const __m512i));
+            v7 = _mm512_xor_si512(v7, _mm512_loadu_si512(src.add(448) as *const __m512i));
+            v8 = _mm512_xor_si512(v8, _mm512_loadu_si512(src.add(512) as *const __m512i));
+            v9 = _mm512_xor_si512(v9, _mm512_loadu_si512(src.add(576) as *const __m512i));
+            v10 = _mm512_xor_si512(v10, _mm512_loadu_si512(src.add(640) as *const __m512i));
+            v11 = _mm512_xor_si512(v11, _mm512_loadu_si512(src.add(704) as *const __m512i));
+            v12 = _mm512_xor_si512(v12, _mm512_loadu_si512(src.add(768) as *const __m512i));
+            v13 = _mm512_xor_si512(v13, _mm512_loadu_si512(src.add(832) as *const __m512i));
+            v14 = _mm512_xor_si512(v14, _mm512_loadu_si512(src.add(896) as *const __m512i));
+            v15 = _mm512_xor_si512(v15, _mm512_loadu_si512(src.add(960) as *const __m512i));
+        }
+        let dst = acc.as_mut_ptr();
+        _mm512_storeu_si512(dst as *mut __m512i, v0);
+        _mm512_storeu_si512(dst.add(64) as *mut __m512i, v1);
+        _mm512_storeu_si512(dst.add(128) as *mut __m512i, v2);
+        _mm512_storeu_si512(dst.add(192) as *mut __m512i, v3);
+        _mm512_storeu_si512(dst.add(256) as *mut __m512i, v4);
+        _mm512_storeu_si512(dst.add(320) as *mut __m512i, v5);
+        _mm512_storeu_si512(dst.add(384) as *mut __m512i, v6);
+        _mm512_storeu_si512(dst.add(448) as *mut __m512i, v7);
+        _mm512_storeu_si512(dst.add(512) as *mut __m512i, v8);
+        _mm512_storeu_si512(dst.add(576) as *mut __m512i, v9);
+        _mm512_storeu_si512(dst.add(640) as *mut __m512i, v10);
+        _mm512_storeu_si512(dst.add(704) as *mut __m512i, v11);
+        _mm512_storeu_si512(dst.add(768) as *mut __m512i, v12);
+        _mm512_storeu_si512(dst.add(832) as *mut __m512i, v13);
+        _mm512_storeu_si512(dst.add(896) as *mut __m512i, v14);
+        _mm512_storeu_si512(dst.add(960) as *mut __m512i, v15);
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+mod plane_xor_tests {
+    use super::xor_reduce_plane_block;
+
+    #[test]
+    fn xor_reduce_plane_block_matches_scalar() {
+        for &(k, n_workers, blk) in &[
+            (64usize, 1usize, 0usize),
+            (64, 4, 0),
+            (128, 16, 1),
+            (256, 15, 2),
+        ] {
+            let mut planes = vec![0u8; n_workers * k * 16];
+            let mut state = 0xA5A5_C3C3_1234_5678u64;
+            for b in planes.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            let base = blk * 1024;
+            let mut want = [0u8; 1024];
+            want.copy_from_slice(&planes[base..base + 1024]);
+            for w in 1..n_workers {
+                let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+                for (a, b) in want.iter_mut().zip(src) {
+                    *a ^= *b;
+                }
+            }
+            let mut got = [0u8; 1024];
+            unsafe {
+                xor_reduce_plane_block(&planes, k, n_workers, blk, &mut got);
+            }
+            assert_eq!(got, want, "k={k} n_workers={n_workers} blk={blk}");
+        }
+    }
+}
+
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
 /// `BLOCK_K = 8` block of i_inner positions, keeping all 8 F128 accumulators in
