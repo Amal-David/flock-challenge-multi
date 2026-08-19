@@ -392,6 +392,146 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     }
 }
 
+/// Two-window static-B wavefront for the only live even pairs:
+/// `(b_med, b_med+1) = (0,1)` at `w=0` (blocks 0+1, identical all-ones
+/// plan) and `(14,15)` at `w=1` (blocks 30+31: one static row + seven
+/// zeros, then eight zeros). Returns `false` (having written nothing)
+/// when the pair is not one of those two, or either window misses its
+/// plan; the caller then runs two sequential singles.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_bstatic`], for two adjacent
+/// medium windows. Each `out*` is one writable ZMM.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w: usize,
+    partials: &BstaticPartials,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) -> bool {
+    if w == 0 && b_med == 0 {
+        kernel_x2_all_ones(a_packed, b_packed, inv_table, chunk_byte_base, partials, out0, out1)
+    } else if w == 1 && b_med == 14 {
+        kernel_x2_tail(a_packed, b_packed, inv_table, chunk_byte_base, partials, out0, out1)
+    } else {
+        false
+    }
+}
+
+/// Shared sniff: every planned row of `BLK` at `byte_base_b` must match.
+/// Writes the eight b-words (generic rows stay 0). Returns false on miss.
+#[inline(always)]
+unsafe fn sniff_plan<const BLK: usize>(
+    b_packed: &[u8],
+    byte_base_b: usize,
+    b_words: &mut [u64; 8],
+) -> bool {
+    let b_base = b_packed.as_ptr().add(byte_base_b);
+    let mut hit = true;
+    macro_rules! sniff {
+        ($k:literal) => {{
+            let p: BstaticRow = BSTATIC_PLAN[BLK][$k];
+            if p.kind != ROW_GENERIC {
+                let w = u64::from_le(core::ptr::read_unaligned(
+                    b_base.add($k * N_CHUNKS) as *const u64,
+                ));
+                b_words[$k] = w;
+                hit &= (w & p.mask) == p.expected;
+            }
+        }};
+    }
+    sniff!(0);
+    sniff!(1);
+    sniff!(2);
+    sniff!(3);
+    sniff!(4);
+    sniff!(5);
+    sniff!(6);
+    sniff!(7);
+    hit
+}
+
+/// Fused blocks 0+1: both windows are ALL_FULLY_STATIC all-ones, share
+/// `partials.rows[0]`, and issue two independent apply+GFNI chains per K.
+#[inline(always)]
+unsafe fn kernel_x2_all_ones(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &BstaticPartials,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) -> bool {
+    let byte0 = chunk_byte_base;
+    let byte1 = chunk_byte_base + N_CHUNKS * 8;
+    let mut words0 = [0u64; 8];
+    let mut words1 = [0u64; 8];
+    if !sniff_plan::<0>(b_packed, byte0, &mut words0) {
+        return false;
+    }
+    if !sniff_plan::<0>(b_packed, byte1, &mut words1) {
+        return false;
+    }
+    let _ = (words0, words1);
+    let table = inv_table.data_ptr();
+    let a0 = a_packed.as_ptr().add(byte0);
+    let a1 = a_packed.as_ptr().add(byte1);
+    let parts = partials.rows[0].as_ptr() as *const u8;
+    let mut acc0 = _mm512_setzero_si512();
+    let mut acc1 = _mm512_setzero_si512();
+    for k in 0..8usize {
+        let av0 = apply_full(table, a0.add(k * N_CHUNKS));
+        let av1 = apply_full(table, a1.add(k * N_CHUNKS));
+        let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
+        acc0 = _mm512_xor_si512(acc0, _mm512_gf2p8mul_epi8(av0, part));
+        acc1 = _mm512_xor_si512(acc1, _mm512_gf2p8mul_epi8(av1, part));
+    }
+    _mm512_storeu_si512(out0.as_mut_ptr() as *mut __m512i, acc0);
+    _mm512_storeu_si512(out1.as_mut_ptr() as *mut __m512i, acc1);
+    true
+}
+
+/// Fused blocks 30+31: window 14 is one fully-static row + seven zeros;
+/// window 15 is eight structural zeros (store a zero ZMM).
+#[inline(always)]
+unsafe fn kernel_x2_tail(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &BstaticPartials,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) -> bool {
+    let byte0 = chunk_byte_base + 14 * N_CHUNKS * 8;
+    let byte1 = chunk_byte_base + 15 * N_CHUNKS * 8;
+    let mut words0 = [0u64; 8];
+    let mut words1 = [0u64; 8];
+    if !sniff_plan::<30>(b_packed, byte0, &mut words0) {
+        return false;
+    }
+    if !sniff_plan::<31>(b_packed, byte1, &mut words1) {
+        return false;
+    }
+    let _ = (words0, words1);
+    let table = inv_table.data_ptr();
+    // blk 30 k=0 is ROW_STATIC vary=0: part is already T(expected)·x^0.
+    // k=1..7 are ROW_ZERO. blk 31 is all ROW_ZERO.
+    let av = apply_full(table, a_packed.as_ptr().add(byte0));
+    let part = _mm512_load_si512(partials.rows[30][0].as_ptr() as *const __m512i);
+    let acc0 = _mm512_gf2p8mul_epi8(av, part);
+    _mm512_storeu_si512(out0.as_mut_ptr() as *mut __m512i, acc0);
+    _mm512_storeu_si512(out1.as_mut_ptr() as *mut __m512i, _mm512_setzero_si512());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::x86_64::shift_reduce_inner_ab_x86_avx512;
