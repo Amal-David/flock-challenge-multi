@@ -1526,14 +1526,27 @@ impl AdditiveNttF128 {
     /// transform; the remaining `log_d − n_top` layers run cache-resident per
     /// sub-group. Depends on the rayon pool width at call time.
     fn interleaved_n_top(log_d: usize, num_ntts: usize) -> usize {
-        // Target sub-group size = 2 MB total bytes. Each position is
+        // Target sub-group size in total bytes. Each position is
         // `num_ntts × 16` bytes, so positions per sub-group =
-        // 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
-        // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
-        // num_ntts=32 would be 64 MB and overflow L2 cache.)
-        const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
+        // 2^target / (num_ntts · 16). The historical 2 MiB (2^21) target was
+        // sized for a shared multi-megabyte cluster L2; on SPR each core has
+        // 2 MiB of PRIVATE L2 shared by TWO pinned SMT workers, so two live
+        // 2 MiB sub-groups compete for one cache. `FLOCK_NTT_SUBGROUP_LOG=N`
+        // overrides for same-binary A/B (the ranked worker's cleared env
+        // always takes the default).
+        let target_subgroup_log_bytes: usize = {
+            static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                std::env::var("FLOCK_NTT_SUBGROUP_LOG")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|v| (14..=24).contains(v))
+                    .unwrap_or(21)
+            });
+            *V
+        };
         let log_bytes_per_position = 4 + log2_pow2(num_ntts);
-        let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
+        let target_log_positions =
+            target_subgroup_log_bytes.saturating_sub(log_bytes_per_position);
         let cache_n_top = log_d.saturating_sub(target_log_positions);
 
         // Parallelism floor. The cache heuristic keeps each sub-NTT ~2 MB, but

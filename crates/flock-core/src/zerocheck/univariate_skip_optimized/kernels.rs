@@ -114,6 +114,7 @@ pub(super) fn shift_reduce_inner_ab(
     a_col: &mut [F8],
     b_col: &mut [F8],
     bstatic: BstaticHint,
+    nt: u8,
 ) {
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -121,7 +122,7 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512f",
         target_feature = "avx512bw"
     )))]
-    let _ = bstatic;
+    let _ = (bstatic, nt);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -156,6 +157,7 @@ pub(super) fn shift_reduce_inner_ab(
                     w,
                     partials,
                     out,
+                    nt,
                 ) {
                     return;
                 }
@@ -167,6 +169,7 @@ pub(super) fn shift_reduce_inner_ab(
                 chunk_byte_base,
                 b_med,
                 out,
+                nt,
             );
         }
     }
@@ -223,10 +226,11 @@ pub(super) fn shift_reduce_inner_ab_x2(
     a_col: &mut [F8],
     b_col: &mut [F8],
     bstatic: BstaticHint,
+    nt: u8,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (a_col, b_col, bstatic);
+        let _ = (a_col, b_col, bstatic, nt);
         aarch64::shift_reduce_inner_ab_fused_neon_x2(
             a_packed,
             b_packed,
@@ -250,6 +254,7 @@ pub(super) fn shift_reduce_inner_ab_x2(
             a_col,
             b_col,
             bstatic,
+            nt,
         );
         shift_reduce_inner_ab(
             a_packed,
@@ -261,6 +266,7 @@ pub(super) fn shift_reduce_inner_ab_x2(
             a_col,
             b_col,
             bstatic,
+            nt,
         );
     }
 }

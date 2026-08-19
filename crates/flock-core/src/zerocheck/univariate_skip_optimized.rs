@@ -416,6 +416,7 @@ impl Round1AbInner {
                     a_col,
                     b_col,
                     None,
+                    0,
                 );
             },
         );
@@ -538,6 +539,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
                     a_col,
                     b_col,
                     bstatic_ctx.map(|p| (within_hash_outer, p)),
+                    0,
                 );
                 out_outer[n_b_med * 64..].fill(0);
             },
@@ -572,6 +574,7 @@ fn shift_reduce_inner_ab(
     a_col: &mut [F8],
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
+    nt: u8,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -583,6 +586,7 @@ fn shift_reduce_inner_ab(
         a_col,
         b_col,
         bstatic,
+        nt,
     );
 }
 
@@ -630,6 +634,9 @@ fn shift_reduce_transpose_windows(
             a_col,
             b_col,
             bstatic,
+            // Fold-time staging arrays are re-read L1-hot immediately:
+            // always temporal.
+            0,
         );
         for w in b_med..b_med + 2 {
             let byte_base_b = chunk_byte_base + w * N_CHUNKS * 8;
@@ -651,6 +658,7 @@ fn shift_reduce_transpose_windows(
             a_col,
             b_col,
             bstatic,
+            0,
         );
         let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
         let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -678,6 +686,7 @@ fn shift_reduce_windows_into_blocks(
     a_col: &mut [F8],
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
+    nt: u8,
 ) {
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
@@ -697,6 +706,7 @@ fn shift_reduce_windows_into_blocks(
             a_col,
             b_col,
             bstatic,
+            nt,
         );
         b_med += 2;
     }
@@ -714,24 +724,72 @@ fn shift_reduce_windows_into_blocks(
             a_col,
             b_col,
             bstatic,
+            nt,
         );
+    }
+}
+
+/// `FLOCK_NO_ABINNER_NT=1` restores temporal stores for the streaming
+/// ab_inner publish (exact same-binary A/B control). Resolved once per
+/// process.
+pub fn abinner_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ABINNER_NT").is_none());
+    *ON
+}
+
+/// Drain the producing thread's write-combining buffers so non-temporally
+/// published ab_inner bytes are ordered before the rayon task's release
+/// store. Callers that passed `nt_out = true` to
+/// [`precompute_round1_ab_inner_windows`] MUST call this once per parallel
+/// task, after its last window. No-op off x86.
+#[inline]
+pub fn abinner_publish_fence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: sfence is always available on x86_64.
+    unsafe {
+        core::arch::x86_64::_mm_sfence();
     }
 }
 
 /// Transform complete 8192-bit outer windows from packed A/B into the
 /// challenge-independent round-one representation. This streaming seam lets
 /// witness generation consume each just-written block while it is still hot.
+///
+/// `nt_out = true` publishes the transformed blocks with non-temporal stores:
+/// `out` is a slice of the 512 MiB (ranked shape) ab_inner buffer whose next
+/// reader is zerocheck round 1 — after the entire commit phase, DRAM-cold —
+/// so the write-allocate RFO on every published line is pure waste. The
+/// blocks are emitted strictly sequentially per producer thread (one open
+/// write-combining stream). Callers passing `true` MUST issue
+/// [`abinner_publish_fence`] on the producing thread before the task ends
+/// (see there). Pass `false` for any destination that is re-read while hot.
 pub fn precompute_round1_ab_inner_windows(
     a_packed: &[u8],
     b_packed: &[u8],
     out: &mut [u8],
     inv_table: &InvNttTableByteSingleGf8,
+    nt_out: bool,
 ) {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     assert_eq!(a_packed.len(), b_packed.len());
     assert_eq!(a_packed.len(), out.len());
     assert_eq!(a_packed.len() % OUTER_BYTES, 0);
     assert_eq!(inv_table.k, K_SKIP);
+
+    // Every 64-byte block shares the base pointer's residue (offsets are
+    // multiples of 64), so one classification covers the whole call: ZMM
+    // streams at 64-alignment, four XMM streams at the pool's usual
+    // 16-mod-64, temporal otherwise.
+    let nt: u8 = if nt_out {
+        match out.as_ptr() as usize % 64 {
+            0 => 2,
+            r if r % 16 == 0 => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
 
     let mut a_col = [F8::ZERO; ELL];
     let mut b_col = [F8::ZERO; ELL];
@@ -752,6 +810,7 @@ pub fn precompute_round1_ab_inner_windows(
             &mut a_col,
             &mut b_col,
             bstatic_ctx.map(|p| (outer & 1, p)),
+            nt,
         );
     }
 }
@@ -2061,18 +2120,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // F128 lanes and apply `eq_bot[u]` once per bank — the same sums the
     // per-chunk multiply produced, reassociated.
     if let Some((eq_bot, _, _)) = eq_fold {
+        // Plane-major → F128 through the same vectorized kernel the C drain
+        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
+        // of 16 scalar byte loads per lane. The eq_bot multiply stays scalar
+        // here — this level compiles for every arch and the loads were the
+        // bulk of the band tail.
+        let mut bank_f128 = [F128::ZERO; ELL];
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank = &state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
+            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                .try_into()
+                .expect("one 16-plane bank");
+            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
             for lane in 0..ELL {
-                let mut lo = 0u64;
-                let mut hi = 0u64;
-                for k in 0..8 {
-                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
-                }
-                for k in 8..16 {
-                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
-                }
-                state.partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
             }
         }
     }
@@ -2383,18 +2443,19 @@ fn process_one_x_hi_ab_only(
         }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
+        // Plane-major → F128 through the same vectorized kernel the C drain
+        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
+        // of 16 scalar byte loads per lane. The eq_bot multiply stays scalar
+        // here — this level compiles for every arch and the loads were the
+        // bulk of the band tail.
+        let mut bank_f128 = [F128::ZERO; ELL];
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank = &state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
+            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                .try_into()
+                .expect("one 16-plane bank");
+            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
             for lane in 0..ELL {
-                let mut lo = 0u64;
-                let mut hi = 0u64;
-                for k in 0..8 {
-                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
-                }
-                for k in 8..16 {
-                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
-                }
-                state.partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
             }
         }
     }
@@ -3155,7 +3216,6 @@ mod tests {
                 continue;
             }
             let mut out_scalar = [0u8; 64];
-            let mut out_avx512 = [0u8; 64];
             shift_reduce_inner_ab_scalar(
                 &a_packed,
                 &b_packed,
@@ -3166,21 +3226,32 @@ mod tests {
                 &mut a_col,
                 &mut b_col,
             );
-            // SAFETY: test is compiled only when all kernel features are active.
-            unsafe {
-                shift_reduce_inner_ab_x86_avx512(
-                    &a_packed,
-                    &b_packed,
-                    &table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut out_avx512,
+            // All three terminal-store classes must produce identical bytes;
+            // the NT classes need the alignment their contract demands, which
+            // a 64-aligned repr(align) wrapper provides.
+            #[repr(align(64))]
+            struct Aligned64([u8; 64]);
+            for nt in [0u8, 1, 2] {
+                let mut out_avx512 = Aligned64([0u8; 64]);
+                // SAFETY: test compiles only when all kernel features are
+                // active; the wrapper satisfies the nt=1/2 alignment contract.
+                unsafe {
+                    shift_reduce_inner_ab_x86_avx512(
+                        &a_packed,
+                        &b_packed,
+                        &table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut out_avx512.0,
+                        nt,
+                    );
+                    core::arch::x86_64::_mm_sfence();
+                }
+                assert_eq!(
+                    out_scalar, out_avx512.0,
+                    "avx512/gfni (nt={nt}) disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
                 );
             }
-            assert_eq!(
-                out_scalar, out_avx512,
-                "avx512/gfni disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
-            );
         }
     }
 

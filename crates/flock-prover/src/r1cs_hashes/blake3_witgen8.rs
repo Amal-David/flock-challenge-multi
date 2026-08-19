@@ -1,8 +1,11 @@
 //! 8-wide AVX2 lockstep BLAKE3 witness builder (`__m256i`, 8×u32).
 //!
 //! Same G-function / carry-bit / packed-row stream as the 4-wide SSE kernel,
-//! widened to one rayon group (8 compressions) per call. Drain stores are
-//! temporal (`storeu`); NT / `_mm256_stream` publishes stay disabled.
+//! widened to one rayon group (8 compressions) per call. The a/b drains are
+//! temporal (`storeu`) — both are re-read L1-hot by the fused round-1 window
+//! precompute in the same task. The z drain optionally publishes through XMM
+//! streaming stores (`z_nt`): z's next reader is the commit encode, a later
+//! phase, so its write-allocate RFO is pure waste (see the caller's gate).
 //!
 //! Ranked live path: `generate_witness_with_ab_packed_and_round1_inner_impl`
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
@@ -233,6 +236,79 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
+/// Non-temporal twin of [`dump_range`]: identical bytes, published through
+/// `_mm_stream_si128` (the F128-backed destinations guarantee 16-byte
+/// alignment; 32/64-byte alignment is NOT guaranteed — large pool
+/// allocations land 16 mod 64 on this lineage, so YMM/ZMM streams would
+/// fault). Chunks drain in PAIRS so every destination run receives 64
+/// contiguous bytes back-to-back and each line's write-combining buffer
+/// closes as soon as it fills — one open WC stream per run instead of a
+/// line held half-written across a whole `g` step.
+///
+/// Caller contract: destinations are not read again until after an
+/// `_mm_sfence()` on this thread (the witness task issues one per rayon
+/// task; same-thread reads are self-consistent regardless).
+#[inline(always)]
+unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
+    #[inline(always)]
+    unsafe fn stream_v8(p: *mut u32, v: V8) {
+        // SAFETY: caller guarantees 16-byte alignment of `p`.
+        unsafe {
+            _mm_stream_si128(p.cast::<__m128i>(), _mm256_castsi256_si128(v));
+            _mm_stream_si128(p.add(4).cast::<__m128i>(), _mm256_extracti128_si256::<1>(v));
+        }
+    }
+    unsafe {
+        debug_assert_eq!(dst as usize % 16, 0);
+        let mut g = g0;
+        while g + 2 <= g1 {
+            let w = 8 * g;
+            let ta = tr8(
+                load_v8(stage.add(w) as *const u32),
+                load_v8(stage.add(w + 1) as *const u32),
+                load_v8(stage.add(w + 2) as *const u32),
+                load_v8(stage.add(w + 3) as *const u32),
+                load_v8(stage.add(w + 4) as *const u32),
+                load_v8(stage.add(w + 5) as *const u32),
+                load_v8(stage.add(w + 6) as *const u32),
+                load_v8(stage.add(w + 7) as *const u32),
+            );
+            let tb = tr8(
+                load_v8(stage.add(w + 8) as *const u32),
+                load_v8(stage.add(w + 9) as *const u32),
+                load_v8(stage.add(w + 10) as *const u32),
+                load_v8(stage.add(w + 11) as *const u32),
+                load_v8(stage.add(w + 12) as *const u32),
+                load_v8(stage.add(w + 13) as *const u32),
+                load_v8(stage.add(w + 14) as *const u32),
+                load_v8(stage.add(w + 15) as *const u32),
+            );
+            for r in 0..8 {
+                let p = dst.add(r * U32_PER_BLOCK + w);
+                stream_v8(p, ta[r]);
+                stream_v8(p.add(8), tb[r]);
+            }
+            g += 2;
+        }
+        if g < g1 {
+            let w = 8 * g;
+            let t = tr8(
+                load_v8(stage.add(w) as *const u32),
+                load_v8(stage.add(w + 1) as *const u32),
+                load_v8(stage.add(w + 2) as *const u32),
+                load_v8(stage.add(w + 3) as *const u32),
+                load_v8(stage.add(w + 4) as *const u32),
+                load_v8(stage.add(w + 5) as *const u32),
+                load_v8(stage.add(w + 6) as *const u32),
+                load_v8(stage.add(w + 7) as *const u32),
+            );
+            for r in 0..8 {
+                stream_v8(dst.add(r * U32_PER_BLOCK + w), t[r]);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn dump_elide(
     stage: *const V8,
@@ -240,6 +316,7 @@ unsafe fn dump_elide(
     elide_tail: bool,
     elide_prefix: bool,
     tail_chunk: usize,
+    nt: bool,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -247,7 +324,13 @@ unsafe fn dump_elide(
         0
     };
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
-    unsafe { dump_range(stage, dst, g0, g1) }
+    unsafe {
+        if nt {
+            dump_range_nt(stage, dst, g0, g1)
+        } else {
+            dump_range(stage, dst, g0, g1)
+        }
+    }
 }
 
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
@@ -261,6 +344,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     a: *mut u32,
     b: *mut u32,
     elide: [bool; 3],
+    z_nt: bool,
 ) {
     unsafe {
         let ptrs = [
@@ -500,9 +584,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(ast.add(8 + w) as *mut u32, lo);
         }
 
-        dump_elide(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-        dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-        dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+        dump_elide(zs, z, elide[0], false, ELIDE_ZERO_CHUNK, z_nt);
+        // a/b stay temporal unconditionally: both are re-read L1-hot by the
+        // fused round-1 window precompute in this very task.
+        dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK, false);
+        dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK, false);
     }
 }
 

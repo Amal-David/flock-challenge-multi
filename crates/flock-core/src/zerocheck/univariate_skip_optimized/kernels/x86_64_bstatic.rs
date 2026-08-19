@@ -218,6 +218,7 @@ unsafe fn kernel<const BLK: usize>(
     byte_base_b: usize,
     partials: &BstaticPartials,
     out: &mut [u8; 64],
+    nt: u8,
 ) -> bool {
     let table = inv_table.data_ptr();
     // SAFETY: see the function contract; every load below is either an
@@ -282,7 +283,7 @@ unsafe fn kernel<const BLK: usize>(
                 let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
                 acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
             }
-            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
+            super::x86_64::store_out64(out, acc, nt);
             return true;
         }
         // 2b. Straight-line specialised body.
@@ -339,7 +340,7 @@ unsafe fn kernel<const BLK: usize>(
         row!(5);
         row!(6);
         row!(7);
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
+        super::x86_64::store_out64(out, acc, nt);
         true
     }
 }
@@ -370,6 +371,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     w: usize,
     partials: &BstaticPartials,
     out: &mut [u8; 64],
+    nt: u8,
 ) -> bool {
     if w > 1 || b_med >= 16 {
         return false;
@@ -379,13 +381,13 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         if blk == 31 {
-            kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out)
+            kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
         } else if blk == 30 {
-            kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out)
+            kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
         } else if blk <= 1 {
             // Blocks 0 and 1 carry the identical plan (all-ones b on every
             // row), so they share one body and one set of partial images.
-            kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out)
+            kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
         } else {
             false
         }
@@ -464,7 +466,7 @@ mod tests {
                         macro_rules! run {
                             ($($i:literal),*) => {
                                 match plan {
-                                    $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, &partials, &mut got),)*
+                                    $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, &partials, &mut got, 0),)*
                                     _ => unreachable!(),
                                 }
                             };
@@ -474,7 +476,7 @@ mod tests {
                             20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
                         );
                         shift_reduce_inner_ab_x86_avx512(
-                            &a, &b, &inv_table, x * OUTER, b_med, &mut want,
+                            &a, &b, &inv_table, x * OUTER, b_med, &mut want, 0,
                         );
                         // mode 0 (plan-shaped hits) must take the specialised
                         // path; the generic control plan always runs.
@@ -488,7 +490,7 @@ mod tests {
                         if plan != BSTATIC_GENERIC_PLAN {
                             let mut got2 = [0u8; 64];
                             let ran2 = shift_reduce_inner_ab_x86_avx512_bstatic(
-                                &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut got2,
+                                &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut got2, 0,
                             );
                             let live = BSTATIC_LIVE[plan];
                             assert_eq!(ran2, ran && live, "dispatcher/kernel disagree on plan {plan} mode {mode}");
@@ -741,7 +743,7 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, None);
+                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, None, 0);
                         sink ^= out[0] as u64;
                     }
                 }
@@ -752,7 +754,7 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, Some((w, partials)));
+                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
                         sink ^= out[0] as u64;
                     }
                 }
@@ -799,7 +801,7 @@ mod microbench {
                     let mut want = [0u8; 64];
                     let mut got = [0u8; 64];
                     unsafe {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, base + w * 1024, bm, &mut want);
+                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, base + w * 1024, bm, &mut want, 0);
                         assert!(kernel_dyn(&a, &b, &inv_table, base + w * 1024 + bm * 64, &BSTATIC_PLAN[plan_i], &partials.rows[plan_i], &mut got));
                     }
                     assert_eq!(got, want, "kernel_dyn mismatch blk {blk} w {w} bm {bm}");
@@ -861,14 +863,14 @@ mod microbench {
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, None);
+                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, None, 0);
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_off = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, Some((w, partials)));
+                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_on = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
@@ -878,7 +880,7 @@ mod microbench {
             for i in 0..iters {
                 let x = i % n_windows;
                 unsafe {
-                    shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out);
+                    shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
@@ -889,10 +891,10 @@ mod microbench {
                 let x = i % n_windows;
                 unsafe {
                     let ok = shift_reduce_inner_ab_x86_avx512_bstatic(
-                        &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut out,
+                        &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut out, 0,
                     );
                     if !ok {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out);
+                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
                     }
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
@@ -904,7 +906,7 @@ mod microbench {
                 let x = i % n_windows;
                 unsafe {
                     let byte_base_b = x * OUTER + b_med * N_CHUNKS * 8;
-                    let ok = kernel::<32>(&a, &b, &inv_table, byte_base_b, &partials, &mut out);
+                    let ok = kernel::<32>(&a, &b, &inv_table, byte_base_b, &partials, &mut out, 0);
                     assert!(ok);
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
@@ -917,14 +919,14 @@ mod microbench {
                 unsafe {
                     let byte_base_b = x * OUTER + b_med * N_CHUNKS * 8;
                     macro_rules! run {
-                        ($($i:literal),*) => { match plan { $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, &partials, &mut out),)* _ => unreachable!() } };
+                        ($($i:literal),*) => { match plan { $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, &partials, &mut out, 0),)* _ => unreachable!() } };
                     }
                     let ok = run!(
                         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
                     );
                     if !ok {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out);
+                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
                     }
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;

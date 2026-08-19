@@ -1543,6 +1543,9 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
                             b_bytes,
                             ab_stage_bytes,
                             &inv_table,
+                            // Staging vec, re-read L1-hot by nt_copy_u64s
+                            // below: temporal.
+                            false,
                         );
                     }
                     // SAFETY: staging and destinations are disjoint;
@@ -1597,7 +1600,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
                         std::slice::from_raw_parts(b_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK)
                     };
                     flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                        a_bytes, b_bytes, ab_out, &inv_table,
+                        a_bytes, b_bytes, ab_out, &inv_table, false,
                     );
                 }
               });
@@ -1649,6 +1652,16 @@ fn generate_round1_inner_octa(
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
 
+    // ab_inner's next reader is zerocheck round 1 — after the whole commit
+    // phase, DRAM-cold at the ranked shape — so the streamed transform
+    // publishes it non-temporally (deletes the 512 MiB write-allocate RFO).
+    // z's next reader is the commit encode — the next phase, DRAM-class
+    // either way at 512 MiB — so its dump streams too (a/b stay temporal:
+    // the fused window precompute re-reads them L1-hot in the same task).
+    // Contract: one sfence per rayon task, below, before the task's release.
+    let abinner_nt =
+        flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -1693,6 +1706,7 @@ fn generate_round1_inner_octa(
                         a_out.as_mut_ptr().add(off).cast::<u32>(),
                         b_out.as_mut_ptr().add(off).cast::<u32>(),
                         elide,
+                        z_nt,
                     );
                 }
             }
@@ -1713,9 +1727,12 @@ fn generate_round1_inner_octa(
                     };
                     let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
                     flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                        a_bytes, b_bytes, ab_blk, inv_table,
+                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
                     );
                 }
+            }
+            if abinner_nt || z_nt {
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
             }
         });
 }
@@ -1955,6 +1972,15 @@ pub(crate) mod witgen_simd {
     pub(crate) fn const_elide_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_SCRATCH_CONST_ELIDE").is_none());
+        *ON
+    }
+
+    /// `FLOCK_NO_WITGEN_Z_NT=1` restores temporal stores for the octa
+    /// builder's z dump (exact same-binary A/B). Orthogonal to the elide and
+    /// ab_inner switches.
+    pub(crate) fn witgen_z_nt_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
         *ON
     }
 

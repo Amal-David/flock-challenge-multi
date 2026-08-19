@@ -102,6 +102,38 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     }
 }
 
+/// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
+/// store class, decided once per precompute call by the producer:
+/// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
+/// - `1`: four XMM non-temporal streams (16-aligned destination).
+/// - `2`: one ZMM non-temporal stream (64-aligned destination).
+/// NT callers own the visibility contract: writes cross a thread boundary
+/// only after an `_mm_sfence()` on the producing thread (see
+/// [`super::super::abinner_publish_fence`]).
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(crate) unsafe fn store_out64(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i, nt: u8) {
+    use core::arch::x86_64::*;
+    // SAFETY: `out` is 64 writable bytes; alignment per the `nt` contract.
+    unsafe {
+        match nt {
+            2 => _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc),
+            1 => {
+                let p = out.as_mut_ptr();
+                _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
+                _mm_stream_si128(p.add(16) as *mut __m128i, _mm512_extracti32x4_epi32::<1>(acc));
+                _mm_stream_si128(p.add(32) as *mut __m128i, _mm512_extracti32x4_epi32::<2>(acc));
+                _mm_stream_si128(p.add(48) as *mut __m128i, _mm512_extracti32x4_epi32::<3>(acc));
+            }
+            _ => _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc),
+        }
+    }
+}
+
 /// Fused AVX-512/GFNI x86 kernel. Each inverse-NTT apply returns all 64 F_8
 /// evaluations in one ZMM register; the product and x^k scaling stay 64-wide
 /// and register-resident through the final XOR accumulation.
@@ -120,6 +152,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     chunk_byte_base: usize,
     b_med: usize,
     out: &mut [u8; 64],
+    nt: u8,
 ) {
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -143,7 +176,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
             };
             acc = _mm512_xor_si512(acc, scaled);
         }
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
+        store_out64(out, acc, nt);
     }
 }
 

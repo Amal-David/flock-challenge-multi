@@ -213,6 +213,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Select the odd F128 lanes of eight consecutive eq_lo values.
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
+        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
@@ -338,10 +339,22 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let a0w = ghash_mul_x4(w, a0);
-            let a1w = ghash_mul_x4(w, a1);
-            let a2w = ghash_mul_x4(w, a2);
-            let a3w = ghash_mul_x4(w, a3);
+            let (a0w, a1w, a2w, a3w) = if wsplit {
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
+            } else {
+                (
+                    ghash_mul_x4(w, a0),
+                    ghash_mul_x4(w, a1),
+                    ghash_mul_x4(w, a2),
+                    ghash_mul_x4(w, a3),
+                )
+            };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
             acc[2].mul_acc(a3w, b3);
@@ -682,6 +695,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
+        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
@@ -729,10 +743,22 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let a0w = ghash_mul_x4(w, a0);
-            let a1w = ghash_mul_x4(w, a1);
-            let a2w = ghash_mul_x4(w, a2);
-            let a3w = ghash_mul_x4(w, a3);
+            let (a0w, a1w, a2w, a3w) = if wsplit {
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
+            } else {
+                (
+                    ghash_mul_x4(w, a0),
+                    ghash_mul_x4(w, a1),
+                    ghash_mul_x4(w, a2),
+                    ghash_mul_x4(w, a3),
+                )
+            };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
             acc[2].mul_acc(a3w, b3);
@@ -822,6 +848,19 @@ pub(crate) fn zc_regfold_enabled() -> bool {
 pub(crate) fn zc_fold_defer_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_DEFER").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_ZC_WSPLIT=1` restores the fully-reduced `w·a_k` prescale
+/// multiplies in the round-2 / rounds-3+4 message blocks (exact same-binary
+/// A/B). The split form (`ghash_mul_x4_split` with `w·x^64` hoisted once per
+/// iteration) is field-identical — reduction mod p is a ring homomorphism,
+/// so `a·w = a.lo·w + a.hi·(w·x^64 mod p)` — and replaces the two-stage
+/// recursive reduce on the chain feeding all eight accumulators with one:
+/// 22 CLMUL + 1 shift per iteration instead of 24 + 8.
+pub(crate) fn zc_wsplit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
     *ON
 }
 
@@ -1105,6 +1144,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
+        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
@@ -1212,10 +1252,22 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-            let a0w = ghash_mul_x4(w, a0);
-            let a1w = ghash_mul_x4(w, a1);
-            let a2w = ghash_mul_x4(w, a2);
-            let a3w = ghash_mul_x4(w, a3);
+            let (a0w, a1w, a2w, a3w) = if wsplit {
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
+            } else {
+                (
+                    ghash_mul_x4(w, a0),
+                    ghash_mul_x4(w, a1),
+                    ghash_mul_x4(w, a2),
+                    ghash_mul_x4(w, a3),
+                )
+            };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
             acc[2].mul_acc(a3w, b3);
