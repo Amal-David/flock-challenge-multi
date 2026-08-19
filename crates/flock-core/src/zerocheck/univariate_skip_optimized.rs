@@ -78,6 +78,41 @@ const N_CHUNKS: usize = 8;
 pub(crate) const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
 
+/// `FLOCK_NO_ZC_DIRECT_AB_ROWS=1` restores the per-window copy of the 16
+/// precomputed AB rows from `ab_inner` into the `chunk_ab_bytes` scratch
+/// before the AB convert kernel. The round-1 precompute stores every window
+/// as 16 contiguous 64-byte rows (`byte_base_b = chunk_byte_base + b_med *
+/// N_CHUNKS * 8 = chunk_byte_base + b_med * 64`), which is byte-identical to
+/// `[[u8; 64]; 1 << N_MEDIUM]`, so the kernel can read the window straight out
+/// of `ab_inner` — deleting a full store+reload of the AB rows per window with
+/// no arithmetic or ordering change (bit-identical). Resolved once per process.
+#[inline]
+fn zc_direct_ab_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none());
+    *ON
+}
+
+/// Reinterpret `ab_inner[chunk_byte_base .. +1024]` as a `&[[u8; 64]; 16]` AB
+/// window, valid only when the full 1024-byte window is in bounds. Returns
+/// `None` (caller falls back to the `chunk_ab_bytes` copy) when the switch is
+/// off or the tail window would overrun `ab_inner` (the precompute may not
+/// materialize all 16 rows of the final window).
+#[inline]
+fn direct_ab_window(ab_inner: &[u8], chunk_byte_base: usize) -> Option<&[[u8; 64]; 1 << N_MEDIUM]> {
+    const WIN: usize = (1 << N_MEDIUM) * 64;
+    if zc_direct_ab_rows_enabled() && chunk_byte_base + WIN <= ab_inner.len() {
+        // SAFETY: `ab_inner[chunk_byte_base .. chunk_byte_base + WIN]` is WIN =
+        // 1024 in-bounds bytes; `[[u8; 64]; 16]` is `align(1)` with no padding
+        // (size 1024), so the pointer is a valid reference to that region. The
+        // AB convert kernels read only `n_b_med <= 16` of the rows, each of
+        // which is exactly the precompute's contiguous 64-byte output row.
+        Some(unsafe { &*(ab_inner.as_ptr().add(chunk_byte_base) as *const [[u8; 64]; 1 << N_MEDIUM]) })
+    } else {
+        None
+    }
+}
+
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
 ///
@@ -1156,15 +1191,27 @@ fn process_one_x_hi_with_precomputed_ab(
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med]
-                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
             bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
+        // Read the AB rows straight from `ab_inner` when the window is in
+        // bounds, else copy them into the `chunk_ab_bytes` scratch.
+        let ab_win: &[[u8; 64]; 1 << N_MEDIUM] =
+            match direct_ab_window(ab_inner, chunk_byte_base) {
+                Some(w) => w,
+                None => {
+                    for b_med in 0..n_b_med {
+                        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                        state.chunk_ab_bytes[b_med]
+                            .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+                    }
+                    &state.chunk_ab_bytes
+                }
+            };
         kernels::accumulate_convert_ab(
-            &state.chunk_ab_bytes,
+            ab_win,
             n_b_med,
             convert,
             eq_lo_scaled[x_outer_lo],
@@ -1992,12 +2039,21 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             if n_b_med == 0 {
                 continue;
             }
-            // AB completion: identical to the incumbent per-window path.
-            for b_med in 0..n_b_med {
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                state.chunk_ab_bytes[b_med]
-                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-            }
+            // AB completion: read the 16 precomputed rows straight from
+            // `ab_inner` when the whole window is in bounds, else copy them
+            // into the `chunk_ab_bytes` scratch (kill switch / tail window).
+            let ab_win: &[[u8; 64]; 1 << N_MEDIUM] =
+                match direct_ab_window(ab_inner, chunk_byte_base) {
+                    Some(w) => w,
+                    None => {
+                        for b_med in 0..n_b_med {
+                            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                            state.chunk_ab_bytes[b_med]
+                                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+                        }
+                        &state.chunk_ab_bytes
+                    }
+                };
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -2014,15 +2070,10 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                     [u * 16 * ELL..(u + 1) * 16 * ELL])
                     .try_into()
                     .expect("one plane bank per low index");
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                kernels::accumulate_convert_ab_nomul_gfni(ab_win, n_b_med, mats_w, bank);
             } else {
                 kernels::accumulate_convert_ab(
-                    &state.chunk_ab_bytes,
+                    ab_win,
                     n_b_med,
                     convert,
                     eq_lo_scaled[x_outer_lo],
@@ -2038,7 +2089,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             {
                 debug_assert!(eq_fold.is_none());
                 kernels::accumulate_convert_ab(
-                    &state.chunk_ab_bytes,
+                    ab_win,
                     n_b_med,
                     convert,
                     eq_lo_scaled[x_outer_lo],
@@ -2390,10 +2441,18 @@ fn process_one_x_hi_ab_only(
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        for b_med in 0..n_b_med {
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
+        let ab_win: &[[u8; 64]; 1 << N_MEDIUM] =
+            match direct_ab_window(ab_inner, chunk_byte_base) {
+                Some(w) => w,
+                None => {
+                    for b_med in 0..n_b_med {
+                        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                        state.chunk_ab_bytes[b_med]
+                            .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+                    }
+                    &state.chunk_ab_bytes
+                }
+            };
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2410,15 +2469,10 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            kernels::accumulate_convert_ab_nomul_gfni(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                mats_w,
-                bank,
-            );
+            kernels::accumulate_convert_ab_nomul_gfni(ab_win, n_b_med, mats_w, bank);
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                ab_win,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -2434,7 +2488,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                ab_win,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
