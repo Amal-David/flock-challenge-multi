@@ -3249,6 +3249,137 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     (u0, u2)
 }
 
+/// `FLOCK_NO_OPEN_FUSED_MSG=1` restores the two-pass x86 chunk body
+/// (`fold_pairs` into `fc`/`bc`, then [`msg_reduce_avx512`] reloading them).
+/// Default ON: one pass folds from the source and accumulates the message
+/// terms from the folded ZMMs, so the just-written destination is not
+/// re-read. Ranked env is cleared. Independent of `FLOCK_NO_OPEN_NT`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_fused_msg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FUSED_MSG").is_none());
+    *ON
+}
+
+/// One [`fold_and_msg_lsb`] chunk: pair-fold `f`/`b` into `fc`/`bc` and
+/// accumulate `(u_0, u_2)` from the folded ZMMs — no reload of `fc`/`bc`.
+/// Bit-identical to `fold_pairs` + [`msg_reduce_avx512`].
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length.
+/// `f`/`b` contain `2 * (base + fc.len())` elements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_fused_x86(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    debug_assert!(base + len <= f.len() / 2);
+    debug_assert!(base + len <= b.len() / 2);
+
+    // SAFETY: cfg + target_feature; source pair bounds per the contract;
+    // destination stores cover `len` F128s.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+        #[inline(always)]
+        unsafe fn fold4(
+            src: *const F128,
+            r_bcast: __m512i,
+            idx_even: __m512i,
+            idx_odd: __m512i,
+        ) -> __m512i {
+            unsafe {
+                let lo = _mm512_loadu_si512(src as *const __m512i);
+                let hi = _mm512_loadu_si512(src.add(4) as *const __m512i);
+                let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+                let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+                _mm512_xor_si512(
+                    even,
+                    crate::field::gf2_128::x86_64::ghash_mul_x4(
+                        r_bcast,
+                        _mm512_xor_si512(even, odd),
+                    ),
+                )
+            }
+        }
+
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let lanes = len & !7;
+        let mut t = 0usize;
+        while t < lanes {
+            let s = 2 * (base + t);
+            let f0 = fold4(f.as_ptr().add(s), r_bcast, idx_even, idx_odd);
+            let f1 = fold4(f.as_ptr().add(s + 8), r_bcast, idx_even, idx_odd);
+            let b0 = fold4(b.as_ptr().add(s), r_bcast, idx_even, idx_odd);
+            let b1 = fold4(b.as_ptr().add(s + 8), r_bcast, idx_even, idx_odd);
+            _mm512_storeu_si512(fc.as_mut_ptr().add(t) as *mut __m512i, f0);
+            _mm512_storeu_si512(fc.as_mut_ptr().add(t + 4) as *mut __m512i, f1);
+            _mm512_storeu_si512(bc.as_mut_ptr().add(t) as *mut __m512i, b0);
+            _mm512_storeu_si512(bc.as_mut_ptr().add(t + 4) as *mut __m512i, b1);
+
+            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            t += 8;
+        }
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        while t < len {
+            let s = 2 * (base + t);
+            let fe = f[s];
+            let fo = f[s + 1];
+            let be = b[s];
+            let bo = b[s + 1];
+            let nf = fe + r * (fe + fo);
+            let nb = be + r * (be + bo);
+            fc[t] = nf;
+            bc[t] = nb;
+            t += 1;
+        }
+        let mut k = lanes;
+        while k + 1 < len {
+            let (f0, f1, b0, b1) = (fc[k], fc[k + 1], bc[k], bc[k + 1]);
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+        (u0, u2)
+    }
+}
+
 /// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
 /// `MOVNTDQ`). Same helper shape as the promoted seed-fused publish
 /// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM, because large pool /
@@ -3486,6 +3617,20 @@ fn fold_and_msg_lsb(
                         fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
                     }
                 });
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if open_fused_msg_enabled() {
+                // Cache-hot rounds: fold into `fc`/`bc` with regular stores
+                // and take the message terms from the folded ZMMs. Deletes
+                // the destination reload `msg_reduce_avx512` paid after
+                // `fold_pairs`. Kill `FLOCK_NO_OPEN_FUSED_MSG=1`.
+                // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk geometry
+                // is the same even-length split as the two-pass body.
+                return unsafe { fold_and_msg_chunk_fused_x86(f, b, base, fc, bc, r) };
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
@@ -7699,6 +7844,55 @@ mod tests {
             assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
             assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
             assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+        }
+    }
+
+    /// Fused regular-store fold+message (no dest reload) must match
+    /// `fold_pairs` + the scalar message loop, including a 2-element tail.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold_and_msg_fused_x86_matches_generic() {
+        let mut state = 0x1111_2222_3333_4444_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for (n_pairs, base) in [(2usize, 0usize), (8, 0), (10, 3), (32, 4), (64, 16), (2048, 0)] {
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            let mut fc_ref = vec![F128::ZERO; n_pairs];
+            let mut bc_ref = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
+            let mut u0_ref = F128::ZERO;
+            let mut u2_ref = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < n_pairs {
+                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
+                u0_ref += f0 * b0;
+                u2_ref += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+
+            let mut fc = vec![F128::ZERO; n_pairs];
+            let mut bc = vec![F128::ZERO; n_pairs];
+            let (u0, u2) = unsafe {
+                super::fold_and_msg_chunk_fused_x86(&f, &b, base, &mut fc, &mut bc, r)
+            };
+            assert_eq!(fc_ref, fc, "folded f mismatch n_pairs={n_pairs} base={base}");
+            assert_eq!(bc_ref, bc, "folded b mismatch n_pairs={n_pairs} base={base}");
+            assert_eq!(u0_ref, u0, "u0 mismatch n_pairs={n_pairs} base={base}");
+            assert_eq!(u2_ref, u2, "u2 mismatch n_pairs={n_pairs} base={base}");
         }
     }
 
