@@ -19,4 +19,11 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
+pub mod recycle_alloc;
 pub mod seed_pipe;
+
+/// Park ≥32 KiB blocks on exact-size freelists. Ranked runner does 20
+/// verified warm-ups then 100 measured runs, so timed proofs reuse resident
+/// pages for large allocs the typed scratch pools do not already cover.
+#[global_allocator]
+static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
