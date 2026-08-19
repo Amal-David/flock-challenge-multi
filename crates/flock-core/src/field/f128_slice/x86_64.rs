@@ -6,12 +6,15 @@ use crate::field::F128;
 /// Requires `avx512f` and `vpclmulqdq`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        // Constant fold challenge: hoist the x^64 companion, multiply in
+        // split-twiddle form (5 CLMUL instead of 6; same field elements).
+        let r_x64 = ghash_shift64_x4(r_bcast);
         // u64-element selectors: even 128-bit lanes -> {0,1,4,5,8,9,12,13},
         // odd -> {2,3,6,7,10,11,14,15} over concat(lo, hi).
         let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
@@ -24,7 +27,8 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
             let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
             let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
             let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
-            let new = _mm512_xor_si512(even, ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)));
+            let new =
+                _mm512_xor_si512(even, ghash_mul_x4_split(_mm512_xor_si512(even, odd), r_bcast, r_x64));
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
             t += 4;
         }
@@ -58,13 +62,15 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r0_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r0.hi as i64, r0.lo as i64));
         let r1_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r1.hi as i64, r1.lo as i64));
+        let r0_x64 = ghash_shift64_x4(r0_bcast);
+        let r1_x64 = ghash_shift64_x4(r1_bcast);
         // Same even/odd 128-bit-lane selectors as `fold_pairs`.
         let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
@@ -82,19 +88,20 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             let odd01 = _mm512_permutex2var_epi64(v0, idx_odd, v1);
             let mid01 = _mm512_xor_si512(
                 even01,
-                ghash_mul_x4(r0_bcast, _mm512_xor_si512(even01, odd01)),
+                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
             );
             let even23 = _mm512_permutex2var_epi64(v2, idx_even, v3);
             let odd23 = _mm512_permutex2var_epi64(v2, idx_odd, v3);
             let mid23 = _mm512_xor_si512(
                 even23,
-                ghash_mul_x4(r0_bcast, _mm512_xor_si512(even23, odd23)),
+                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
             );
 
             // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
             let low = _mm512_permutex2var_epi64(mid01, idx_even, mid23);
             let high = _mm512_permutex2var_epi64(mid01, idx_odd, mid23);
-            let out = _mm512_xor_si512(low, ghash_mul_x4(r1_bcast, _mm512_xor_si512(low, high)));
+            let out =
+                _mm512_xor_si512(low, ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64));
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
             t += 4;
         }

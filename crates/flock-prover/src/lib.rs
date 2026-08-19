@@ -20,3 +20,5 @@ pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
 pub mod seed_pipe;
+
+// resample r1 20260819-1120
