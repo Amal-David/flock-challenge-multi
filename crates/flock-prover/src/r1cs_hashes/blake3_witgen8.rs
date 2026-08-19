@@ -46,6 +46,31 @@ unsafe fn store_v8(p: *mut u32, v: V8) {
     unsafe { _mm256_storeu_si256(p.cast::<__m256i>(), v) }
 }
 
+/// Non-temporal 32-byte store as two 16-byte `movntdq`s. The witness
+/// buffers come out of the scratch pool at 16 mod 64, so a 64-byte
+/// `_mm512_stream_si512` gate would never fire; 16-byte streams keep every
+/// row offset legal (`p` must be 16-byte aligned — checked once per dump by
+/// the caller). Eight rows stream in lockstep, each row's 64-byte line
+/// completing over two consecutive chunks, so at most eight WC buffers are
+/// open at a time.
+#[inline(always)]
+unsafe fn store_v8_nt(p: *mut u32, v: V8) {
+    unsafe {
+        let q = p.cast::<__m128i>();
+        _mm_stream_si128(q, _mm256_castsi256_si128(v));
+        _mm_stream_si128(q.add(1), _mm256_extracti128_si256::<1>(v));
+    }
+}
+
+/// `FLOCK_NO_WITNESS_Z_NT=1` keeps z's publish on ordinary write-back stores
+/// (kill switch for the non-temporal z dump; resolved once per process).
+/// The ranked worker's cleared environment never sets it.
+pub(crate) fn z_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITNESS_Z_NT").is_none());
+    *ON
+}
+
 #[inline(always)]
 fn dup_u32(x: u32) -> V8 {
     unsafe { _mm256_set1_epi32(x as i32) }
@@ -208,7 +233,7 @@ fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
 /// 32-byte block runs. Temporal stores only.
 #[inline(always)]
-unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
+unsafe fn dump_range<const NT: bool>(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     unsafe {
         for g in g0..g1 {
             let w = 8 * g;
@@ -221,20 +246,31 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
             let r6 = load_v8(stage.add(w + 6) as *const u32);
             let r7 = load_v8(stage.add(w + 7) as *const u32);
             let t = tr8(r0, r1, r2, r3, r4, r5, r6, r7);
-            store_v8(dst.add(w), t[0]);
-            store_v8(dst.add(U32_PER_BLOCK + w), t[1]);
-            store_v8(dst.add(2 * U32_PER_BLOCK + w), t[2]);
-            store_v8(dst.add(3 * U32_PER_BLOCK + w), t[3]);
-            store_v8(dst.add(4 * U32_PER_BLOCK + w), t[4]);
-            store_v8(dst.add(5 * U32_PER_BLOCK + w), t[5]);
-            store_v8(dst.add(6 * U32_PER_BLOCK + w), t[6]);
-            store_v8(dst.add(7 * U32_PER_BLOCK + w), t[7]);
+            if NT {
+                store_v8_nt(dst.add(w), t[0]);
+                store_v8_nt(dst.add(U32_PER_BLOCK + w), t[1]);
+                store_v8_nt(dst.add(2 * U32_PER_BLOCK + w), t[2]);
+                store_v8_nt(dst.add(3 * U32_PER_BLOCK + w), t[3]);
+                store_v8_nt(dst.add(4 * U32_PER_BLOCK + w), t[4]);
+                store_v8_nt(dst.add(5 * U32_PER_BLOCK + w), t[5]);
+                store_v8_nt(dst.add(6 * U32_PER_BLOCK + w), t[6]);
+                store_v8_nt(dst.add(7 * U32_PER_BLOCK + w), t[7]);
+            } else {
+                store_v8(dst.add(w), t[0]);
+                store_v8(dst.add(U32_PER_BLOCK + w), t[1]);
+                store_v8(dst.add(2 * U32_PER_BLOCK + w), t[2]);
+                store_v8(dst.add(3 * U32_PER_BLOCK + w), t[3]);
+                store_v8(dst.add(4 * U32_PER_BLOCK + w), t[4]);
+                store_v8(dst.add(5 * U32_PER_BLOCK + w), t[5]);
+                store_v8(dst.add(6 * U32_PER_BLOCK + w), t[6]);
+                store_v8(dst.add(7 * U32_PER_BLOCK + w), t[7]);
+            }
         }
     }
 }
 
 #[inline(always)]
-unsafe fn dump_elide(
+unsafe fn dump_elide<const NT: bool>(
     stage: *const V8,
     dst: *mut u32,
     elide_tail: bool,
@@ -247,7 +283,7 @@ unsafe fn dump_elide(
         0
     };
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
-    unsafe { dump_range(stage, dst, g0, g1) }
+    unsafe { dump_range::<NT>(stage, dst, g0, g1) }
 }
 
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
@@ -261,6 +297,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     a: *mut u32,
     b: *mut u32,
     elide: [bool; 3],
+    z_nt: bool,
 ) {
     unsafe {
         let ptrs = [
@@ -500,9 +537,18 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(ast.add(8 + w) as *mut u32, lo);
         }
 
-        dump_elide(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-        dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-        dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+        // z is write-only here and DRAM-cold at its next reader (the commit
+        // encode, after the whole phase); streaming it past the caches
+        // deletes the write-allocate RFO of its 512 MiB. a/b stay temporal:
+        // the fused round-1 inner projection re-reads them L1-hot right
+        // after this dump.
+        if z_nt && (z as usize) % 16 == 0 {
+            dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+        } else {
+            dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+        }
+        dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+        dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
     }
 }
 

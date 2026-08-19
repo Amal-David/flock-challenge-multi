@@ -1621,6 +1621,7 @@ fn generate_round1_inner_octa(
     const GROUP: usize = 16;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let z_nt = blake3_witgen8::z_nt_enabled();
 
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
@@ -1650,7 +1651,14 @@ fn generate_round1_inner_octa(
                         a_out.as_mut_ptr().add(off).cast::<u32>(),
                         b_out.as_mut_ptr().add(off).cast::<u32>(),
                         elide,
+                        z_nt,
                     );
+                }
+                // Order this task's streaming z stores before it returns;
+                // the witness pool's join is the commit encode's
+                // happens-before edge.
+                if z_nt {
+                    core::arch::x86_64::_mm_sfence();
                 }
             }
             for j in 0..n_here {
