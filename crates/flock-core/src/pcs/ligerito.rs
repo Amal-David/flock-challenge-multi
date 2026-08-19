@@ -2077,12 +2077,15 @@ pub(crate) fn induce_sumcheck_poly(
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        // `t` is constant for the whole sweep: hoist its x^64 companion and
+        // run the multiply in split-twiddle form (5 CLMUL instead of 6).
+        let tb_x64 = ghash_shift64_x4(tb);
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2090,7 +2093,7 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let nb = _mm512_xor_si512(vb, ghash_mul_x4_split(vs, tb, tb_x64));
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
