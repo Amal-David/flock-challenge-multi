@@ -326,14 +326,14 @@ struct LadderShape {
     yr_log_n: usize,
 }
 
-/// Shared shape derivation behind [`default_config`] and
-/// [`LigeritoSecurityConfig::derive_profile`]: 3-bit recursive folds with the
-/// rate index increasing by ≥ 1 per level, bumped further whenever the block
-/// length couldn't accommodate `queries_at_rate(rate)` distinct queries.
+/// Profile shape derivation: `recursive_k`-bit folds with the rate index
+/// increasing by at least one per level, bumped further whenever the block
+/// length cannot accommodate `queries_at_rate(rate)` distinct queries.
 fn derive_ladder_shape(
     log_n: usize,
     initial_k: usize,
     log_inv_rate: usize,
+    recursive_k: usize,
     queries_at_rate: &dyn Fn(usize) -> usize,
 ) -> Result<LadderShape, String> {
     if log_n <= initial_k {
@@ -352,7 +352,7 @@ fn derive_ladder_shape(
         return Err("L0 block_len < queries — log_n too small for chosen rate".into());
     }
     while n_running > 5 {
-        let k = 3.min(n_running);
+        let k = recursive_k.min(n_running);
         let log_msg_cols_next = n_running - k;
         let mut next_rate = rate_running + 1;
         loop {
@@ -1297,7 +1297,8 @@ impl LigeritoSecurityConfig {
     /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
     /// union bound over terms. The three shipped profiles:
     ///
-    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.04, 100 bits per round.
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.04, 8-bit recursive folds,
+    ///             100 bits per round.
     /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
     ///             every level, 100 bits per round.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
@@ -1341,7 +1342,17 @@ impl LigeritoSecurityConfig {
         let queries_feas = |rate: usize| -> usize {
             ((t_feas - query_grind as f64).max(1.0) / per_query_bits_feas(rate)).ceil() as usize
         };
-        let shape = derive_ladder_shape(log_n, initial_k, log_inv_rate, &queries_feas)?;
+        let recursive_k = match profile {
+            LigeritoProfile::Fast => 8,
+            LigeritoProfile::Slim | LigeritoProfile::Secure => 3,
+        };
+        let shape = derive_ladder_shape(
+            log_n,
+            initial_k,
+            log_inv_rate,
+            recursive_k,
+            &queries_feas,
+        )?;
         let n_levels = shape.log_inv_rates.len();
 
         // Round-by-round target: every error term (pg, query, ood) at every
@@ -8093,8 +8104,8 @@ mod tests {
     }
 
     /// Both embedded TOMLs (m29_fast at rate 1/2 and m29_slim at rate 1/4)
-    /// parse, validate, and produce ProverConfig/VerifierConfig agreeing
-    /// with the corresponding `default_config(22, 6, rate)` shape.
+    /// parse and validate. Fast uses its tuned 8-bit ladder; Slim retains the
+    /// corresponding `default_config(22, 6, rate)` 3-bit ladder.
     #[test]
     fn ligerito_security_config_m29_toml_loads() {
         let toml_str = include_str!("../../configs/ligerito/m29_fast.toml");
@@ -8104,7 +8115,7 @@ mod tests {
         assert_eq!(cfg.log_n, 22);
         assert_eq!(cfg.initial_k, 6);
         assert_eq!(cfg.hash, "sha256");
-        assert_eq!(cfg.levels.len(), 5);
+        assert_eq!(cfg.levels.len(), 3);
         // Fast = JohnsonOod profile: 238 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
         // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
@@ -8115,9 +8126,8 @@ mod tests {
         assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
         assert!(cfg.levels[1].ood_samples >= 1);
         let (pv, _vc) = cfg.to_prover_verifier_configs().unwrap();
-        let default = default_config(22, 6, 1).unwrap();
-        assert_eq!(pv.log_inv_rates, default.log_inv_rates);
-        assert_eq!(pv.recursive_ks, default.recursive_ks);
+        assert_eq!(pv.log_inv_rates, vec![1, 2, 6]);
+        assert_eq!(pv.recursive_ks, vec![8, 8]);
         assert_eq!(pv.queries[0], 238);
 
         // Slim mode: rates start at 1/4.
@@ -8237,6 +8247,7 @@ mod tests {
         let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
         assert_eq!(pv.queries[0], 238);
         assert_eq!(pv.fold_grinding_bits[0], 12);
+        assert_eq!(pv.recursive_ks, vec![8, 8]);
 
         // m=29 slim: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");
