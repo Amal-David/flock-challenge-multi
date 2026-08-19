@@ -226,18 +226,6 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
 
-        // Residue-major refill (WRITE=false only — the chunk-store arm needs
-        // row order): the prefold emits directly in the a_k/b_k register
-        // grouping, deleting both consumer lane transposes per iteration.
-        // Gated to shapes the 8-pair batch loop consumes exhaustively: the
-        // scalar tail (and the regfold-off arm) index the cache BY ROW and
-        // must never see the residue-major layout.
-        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        let tr_emit = !WRITE
-            && use_batch
-            && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
-            && zc_r2_tr_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -253,13 +241,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                 );
-                if tr_emit {
-                    gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
-                } else {
-                    gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
-                }
+                gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 // The next refill's 512-byte packed bursts sit one tile
                 // ahead — ~4 iterations (>1000 uops) of pure compute away,
                 // a gap the hardware prefetcher does not bridge across the
@@ -290,51 +273,31 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // zero stores of the scalar arm.
             let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
                 let r0 = 2 * (x_lo % 32);
-                if tr_emit {
-                    // Residue-major cache: a_k for this window is the
-                    // contiguous ZMM at F128 index 16k + r0/4 — the exact
-                    // registers transpose4_lanes used to produce.
-                    let g = r0 / 4;
-                    let ld = |base: *const F128, k: usize| {
-                        _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
-                    };
-                    (
-                        ld(fa.as_ptr(), 0),
-                        ld(fa.as_ptr(), 1),
-                        ld(fa.as_ptr(), 2),
-                        ld(fa.as_ptr(), 3),
-                        ld(fb.as_ptr(), 0),
-                        ld(fb.as_ptr(), 1),
-                        ld(fb.as_ptr(), 2),
-                        ld(fb.as_ptr(), 3),
-                    )
-                } else {
-                    let fap = fa.as_ptr().add(r0).cast::<__m512i>();
-                    let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
-                    let za = [
-                        _mm512_loadu_si512(fap),
-                        _mm512_loadu_si512(fap.add(1)),
-                        _mm512_loadu_si512(fap.add(2)),
-                        _mm512_loadu_si512(fap.add(3)),
-                    ];
-                    let zb = [
-                        _mm512_loadu_si512(fbp),
-                        _mm512_loadu_si512(fbp.add(1)),
-                        _mm512_loadu_si512(fbp.add(2)),
-                        _mm512_loadu_si512(fbp.add(3)),
-                    ];
-                    if WRITE {
-                        let ac = a_chunk.as_mut_ptr().add(2 * x_lo).cast::<__m512i>();
-                        let bc = b_chunk.as_mut_ptr().add(2 * x_lo).cast::<__m512i>();
-                        for i in 0..4 {
-                            _mm512_storeu_si512(ac.add(i), za[i]);
-                            _mm512_storeu_si512(bc.add(i), zb[i]);
-                        }
+                let fap = fa.as_ptr().add(r0).cast::<__m512i>();
+                let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
+                let za = [
+                    _mm512_loadu_si512(fap),
+                    _mm512_loadu_si512(fap.add(1)),
+                    _mm512_loadu_si512(fap.add(2)),
+                    _mm512_loadu_si512(fap.add(3)),
+                ];
+                let zb = [
+                    _mm512_loadu_si512(fbp),
+                    _mm512_loadu_si512(fbp.add(1)),
+                    _mm512_loadu_si512(fbp.add(2)),
+                    _mm512_loadu_si512(fbp.add(3)),
+                ];
+                if WRITE {
+                    let ac = a_chunk.as_mut_ptr().add(2 * x_lo).cast::<__m512i>();
+                    let bc = b_chunk.as_mut_ptr().add(2 * x_lo).cast::<__m512i>();
+                    for i in 0..4 {
+                        _mm512_storeu_si512(ac.add(i), za[i]);
+                        _mm512_storeu_si512(bc.add(i), zb[i]);
                     }
-                    let [a0, a1, a2, a3] = transpose4_lanes(za[0], za[1], za[2], za[3]);
-                    let [b0, b1, b2, b3] = transpose4_lanes(zb[0], zb[1], zb[2], zb[3]);
-                    (a0, a1, a2, a3, b0, b1, b2, b3)
                 }
+                let [a0, a1, a2, a3] = transpose4_lanes(za[0], za[1], za[2], za[3]);
+                let [b0, b1, b2, b3] = transpose4_lanes(zb[0], zb[1], zb[2], zb[3]);
+                (a0, a1, a2, a3, b0, b1, b2, b3)
             } else {
                 // a[k][lane]: row k (0..4) of group `lane` (0..4).
                 let mut a = [[F128::ZERO; 4]; 4];
@@ -913,15 +876,6 @@ pub(crate) fn zc_fold_defer_enabled() -> bool {
 /// so `a·w = a.lo·w + a.hi·(w·x^64 mod p)` — and replaces the two-stage
 /// recursive reduce on the chain feeding all eight accumulators with one:
 /// 22 CLMUL + 1 shift per iteration instead of 24 + 8.
-/// `FLOCK_NO_ZC_R2_TR_EMIT=1` restores the row-major prefold cache and the
-/// consumer lane transposes in the round-2 message sweep (exact same-binary
-/// A/B; the residue-major emit is a pure reordering of identical values).
-pub(crate) fn zc_r2_tr_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_TR_EMIT").is_none());
-    *ON
-}
-
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
 /// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
 /// same-binary A/B; prefetch is architecturally invisible).
@@ -1589,39 +1543,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
     }
 }
 
-/// [`gfni_fold64_rows_masked`] emitting in **residue-major** order:
-/// `out[16·k + t] = fold(row 4·t + k)` — the exact layout the round-2
-/// message block consumes as its `a_k`/`b_k` register groups, so the
-/// consumer's two 4×4 lane transposes (sixteen port-5 shuffles per
-/// iteration, four iterations per refill) collapse into plain contiguous
-/// loads. Achieved with the [`SIGMA_C4`] plane regroup the constant-baked
-/// rounds-3+4 kernel already ships — eight `vpermb` per refill; the row
-/// relabeling commutes with the per-row affine products, so the values are
-/// identical, only the emit order changes.
-///
-/// # Safety
-/// As [`gfni_fold64_rows_masked`].
-#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
-    rows: *const u8,
-    mats: &[u64; 128],
-    out: *mut F128,
-    dead_lines: u8,
-) {
-    use core::arch::x86_64::*;
-    // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
-    unsafe {
-        let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        }
-        gfni_fold64_regs_sigma(z, mats, out);
-    }
-}
-
 /// Per-residue matrix set for [`gfni_fold64_rows_masked_c4`].
 ///
 /// Entry `j * 16 + k` is the ZMM of eight 8×8 GF(2) matrices the batch feeds
@@ -1857,44 +1778,6 @@ pub(crate) unsafe fn gfni_fold64_regs(
     mats: &[u64; 128],
     out: *mut F128,
 ) {
-    // SAFETY: forwarded contract.
-    unsafe { gfni_fold64_regs_impl::<false>(z, mats, out) }
-}
-
-/// [`gfni_fold64_regs`] with the [`SIGMA_C4`] residue-major relabeling —
-/// see [`gfni_fold64_rows_masked_tr`].
-///
-/// # Safety
-/// As [`gfni_fold64_regs`], plus `avx512vbmi`.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-unsafe fn gfni_fold64_regs_sigma(
-    z: [core::arch::x86_64::__m512i; 8],
-    mats: &[u64; 128],
-    out: *mut F128,
-) {
-    // SAFETY: forwarded contract.
-    unsafe { gfni_fold64_regs_impl::<true>(z, mats, out) }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "gfni"
-))]
-#[target_feature(enable = "avx512f,gfni")]
-#[inline]
-unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
-    z: [core::arch::x86_64::__m512i; 8],
-    mats: &[u64; 128],
-    out: *mut F128,
-) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 writable F128s at `out`;
     // all shuffle indices are in range.
@@ -1952,18 +1835,7 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
         for (i, slot) in t.iter_mut().enumerate() {
             *slot = _mm512_permutexvar_epi8(bt, z[i]);
         }
-        let mut p = qword_transpose(t);
-        // Residue-major relabeling: plane byte = row, and the affine products
-        // treat every byte position uniformly, so permuting the plane bytes
-        // relabels the rows for everything downstream — the row-major
-        // reassembly then emits `out[16k + t] = fold(row 4t + k)`.
-        #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
-        if SIGMA {
-            let sigma = _mm512_loadu_si512(SIGMA_C4.as_ptr() as *const __m512i);
-            for slot in p.iter_mut() {
-                *slot = _mm512_permutexvar_epi8(sigma, *slot);
-            }
-        }
+        let p = qword_transpose(t);
 
         // Sixteen output-byte planes: eight GFNI products folded per plane.
         let mut acc = [_mm512_setzero_si512(); 16];
