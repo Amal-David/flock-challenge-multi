@@ -1049,6 +1049,26 @@ fn fold_block_major_gfni(
                         let outer_base = 8 * (stripe_base + t);
                         #[cfg(target_feature = "avx512vbmi")]
                         if gather_tr_fused {
+                            // The next stripe is eight row-strided F128 loads,
+                            // a pattern the sequential hardware prefetchers do
+                            // not discover. Pull it into L1 while VBMI/GFNI
+                            // consumes this stripe. Do not cross a tile: with
+                            // dynamic scheduling its successor may belong to a
+                            // different worker.
+                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                                let next_base = 8 * (stripe_base + t + 1);
+                                unsafe {
+                                    for r in 0..8 {
+                                        core::arch::x86_64::_mm_prefetch(
+                                            z_packed
+                                                .as_ptr()
+                                                .add((next_base + r) * chunks_per_block + q)
+                                                .cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                    }
+                                }
+                            }
                             // SAFETY: rows (outer_base + r) * chunks_per_block
                             // + q are the exact indices the scalar gather
                             // reads; output is 128 bytes of `transposed`.
