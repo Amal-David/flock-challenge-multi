@@ -40,6 +40,16 @@ const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
 // storing it is redundant-but-correct and the ragged tail branch vanishes.
 const ELIDE_ZERO_CHUNK: usize = 62;
 const ELIDE_B_TAIL_CHUNK: usize = 59;
+// 60, not 59, for the FUSED (`dump_range_nt_win`) drain, for exactly the reason
+// `ELIDE_ZERO_CHUNK` is 62: an odd first-elided chunk leaves chunk 58 as a lone
+// 32-byte NT store inside the 64-byte line (58, 59) — a partially-filled
+// write-combining buffer, i.e. a read-modify-write at the memory controller,
+// once per block per prove. Chunks 60..64 are entirely inside b's fixed
+// lin-id/out_hi ones + zero padding run (which starts at bit 15,089 < 256*60),
+// so storing chunk 59 is redundant-but-correct and the ragged line vanishes.
+// The temporal (`dump_range`) arm has no write-combining buffer to leave open,
+// so it keeps the tighter 59.
+const ELIDE_B_TAIL_CHUNK_WIN: usize = 60;
 const ELIDE_B_PREFIX_CHUNKS: usize = 4;
 const LAST_WORD: usize = (USEFUL_BITS - 1) / 32;
 const _ELIDE_GEOMETRY: () = {
@@ -54,6 +64,11 @@ const _ELIDE_GEOMETRY: () = {
     // single-chunk stream in both.)
     assert!(DUMP_CHUNKS % 2 == 0);
     assert!(ELIDE_B_PREFIX_CHUNKS % 2 == 0);
+    // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
+    // stays strictly inside the same content-independent constant run.
+    assert!(ELIDE_B_TAIL_CHUNK_WIN >= ELIDE_B_TAIL_CHUNK);
+    assert!(ELIDE_B_TAIL_CHUNK_WIN % 2 == 0);
+    assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
 
 type V8 = __m256i;
@@ -745,7 +760,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             // here — stream them and delete their write-allocate RFO.
             Some((win_a, win_b)) => {
                 dump_elide_win(ast, a, win_a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide_win(bs, b, win_b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+                dump_elide_win(bs, b, win_b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK_WIN);
             }
             // Incumbent: a/b stay temporal because the caller re-reads them
             // L1-hot for the round-1 window precompute in this very task.
