@@ -152,6 +152,37 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+/// `FLOCK_NO_NTT_EVALS_CACHE=1` forces `AdditiveNttF128::standard` to rebuild
+/// its subspace-eval table on every call; the default reuses a per-dim cached
+/// build. The table is a pure deterministic function of `dim`, so the cached
+/// value is bit-identical to a fresh `generate_evals_from_subspace` build.
+#[inline]
+fn ntt_evals_cache_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_EVALS_CACHE").is_some())
+}
+
+/// Return the standard-basis eval table for `dim`, memoized per dim across NTT
+/// instances. `standard(dim)` is called ~8-10 times per prove at various dims;
+/// each call otherwise reran `generate_evals_from_subspace` (subspace-poly
+/// recurrence plus a field inversion per row). The cached build is a clone of
+/// one process-lifetime `Arc<Vec<Vec<F128>>>` keyed by `dim`; since the table
+/// is a pure deterministic function of `dim`, the clone is bit-identical to a
+/// fresh build.
+fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
+    let build = || {
+        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+        generate_evals_from_subspace(&basis)
+    };
+    if ntt_evals_cache_disabled() {
+        return build();
+    }
+    // `standard` requires dim ≤ 64; the array covers 0..=64.
+    static TABLES: OnceLock<[OnceLock<Arc<Vec<Vec<F128>>>>; 65]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    tables[dim].get_or_init(|| Arc::new(build())).as_ref().clone()
+}
+
 /// Interleaved lane count of the ranked production commitment.
 const ZERO_TAIL_NUM_NTTS: usize = 64;
 
@@ -279,6 +310,22 @@ fn ntt_fused3_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
     ntt_kernel_diet_disabled()
         || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3").is_some())
+}
+
+/// Allocate a fused-pass staging block. The default path leaves it
+/// uninitialized: every seed/gather kernel writes all `n` rows and lanes of
+/// the block before any layer loop reads them, so the zero-fill is dead work
+/// (rayon runs the `for_each_init` initializer once per job). This reuses the
+/// same `alloc_uninit_vec` helper the 512-row seed staging site already uses.
+/// `FLOCK_NO_UNINIT_STAGING=1` restores the zero-fill.
+#[inline]
+fn alloc_fused_staging(n: usize) -> Vec<F128> {
+    static ZERO_FILL: OnceLock<bool> = OnceLock::new();
+    if *ZERO_FILL.get_or_init(|| std::env::var_os("FLOCK_NO_UNINIT_STAGING").is_some()) {
+        vec![F128::ZERO; n]
+    } else {
+        crate::alloc_uninit_vec::<F128>(n)
+    }
 }
 
 /// Test-only latch for the kernel diet (see [`TOP_FUSION_TEST_OFF`]).
@@ -410,8 +457,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        let evals = generate_evals_from_subspace(&basis);
+        let evals = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -1077,14 +1123,14 @@ impl AdditiveNttF128 {
 
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         if n_tasks < PARALLEL_TASK_THRESHOLD {
-            let mut buf = vec![F128::ZERO; 64 * row_len];
+            let mut buf = alloc_fused_staging(64 * row_len);
             for idx in 0..n_tasks {
                 task(&mut buf, idx);
             }
         } else {
             (0..n_tasks)
                 .into_par_iter()
-                .for_each_init(|| vec![F128::ZERO; 64 * row_len], |buf, idx| task(buf, idx));
+                .for_each_init(|| alloc_fused_staging(64 * row_len), |buf, idx| task(buf, idx));
         }
     }
 

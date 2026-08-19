@@ -481,7 +481,18 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // ~20 ms open instead of inside the measured publish tail. Tens of µs of
     // work; the fingerprint gate in `proof_io` makes a stale or missing
     // stash fall back to the incumbent full encode, byte-identically.
-    let stash = if crate::proof_io::pre_encode_enabled() {
+    // Inline (default): the stash body is only tens of µs of alloc + encode,
+    // so run it synchronously on the prove thread before the open — no helper
+    // thread, no 3 clones, no join. Pre-encoding before `open_claims` keeps it
+    // strictly before `to_bytes`, and the fingerprint gate still guards the
+    // stash, so proof bytes are unchanged. `FLOCK_NO_INLINE_STASH=1` restores
+    // the incumbent spawn+clone+join helper-thread path.
+    let stash = if crate::proof_io::inline_stash_enabled() {
+        if crate::proof_io::pre_encode_enabled() {
+            crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof);
+        }
+        None
+    } else if crate::proof_io::pre_encode_enabled() {
         let commitment_c = commitment.clone();
         let zc_c = zc_proof.clone();
         let lc_c = lc_proof.clone();
@@ -616,6 +627,15 @@ fn commit_with_round1_ab_precompute(
 /// The buffers are scratch-pool-retained (never unmapped for the process
 /// lifetime), so the detached thread cannot outlive their allocations.
 fn gpu_prewire_round1_inputs(a: &[F128], b: &[F128], z: &[F128], codeword: Option<&[F128]>) {
+    // On non-Apple targets `flock_core::gpu::prewire` is an empty stub (see
+    // crates/flock-core/src/gpu.rs), so the spawned thread does no useful work —
+    // skip the thread create+join entirely. Setting FLOCK_NO_PREWIRE_DELETE=1
+    // restores the old unconditional spawn (still a no-op body on x86).
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    if std::env::var_os("FLOCK_NO_PREWIRE_DELETE").is_none() {
+        return;
+    }
+
     let view = |v: &[F128]| (v.as_ptr() as usize, std::mem::size_of_val(v));
     let mut bufs = [view(a), view(b), view(z), (0usize, 0usize)];
     if let Some(cw) = codeword {

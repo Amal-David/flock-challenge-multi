@@ -206,10 +206,31 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// `FLOCK_NO_USK_X2=1` restores two sequential single-window shift-reduce
+/// calls on the x86 AVX-512/GFNI arm (same-binary A/B). The ranked worker
+/// env is cleared, so the two-window wavefront is the default there.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[inline]
+fn usk_x2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_USK_X2").is_none());
+    *ON
+}
+
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
-/// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
-/// sequential single-window calls. Bit-identical to two calls of
+/// (`shift_reduce_inner_ab_fused_neon_x2`). On x86 AVX-512/GFNI, both
+/// windows first try the bstatic specialised bodies exactly as two single
+/// calls would; a both-miss pair then takes the two-window register
+/// wavefront ([`x86_64::shift_reduce_inner_ab_x86_avx512_x2`]) instead of
+/// two sequential single-window loops, and mixed pairs finish the missing
+/// window with the incumbent single kernel. Everywhere else it decays to
+/// two sequential single-window calls. Bit-identical to two calls of
 /// [`shift_reduce_inner_ab`] on every path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab_x2(
@@ -238,7 +259,109 @@ pub(super) fn shift_reduce_inner_ab_x2(
         );
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        if usk_x2_enabled() {
+            // SAFETY: the required target features are enabled at compile
+            // time; the packed-input bounds are the same contract as two
+            // single-window calls.
+            unsafe {
+                // Try the bstatic specialised bodies first, exactly as two
+                // sequential singles would.
+                let (hit0, hit1) = match bstatic {
+                    Some((w, partials)) => (
+                        x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            chunk_byte_base,
+                            b_med,
+                            w,
+                            partials,
+                            out0,
+                        ),
+                        x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            chunk_byte_base,
+                            b_med + 1,
+                            w,
+                            partials,
+                            out1,
+                        ),
+                    ),
+                    None => (false, false),
+                };
+                match (hit0, hit1) {
+                    (true, true) => {}
+                    (false, false) => x86_64::shift_reduce_inner_ab_x86_avx512_x2(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        out0,
+                        out1,
+                    ),
+                    (true, false) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med + 1,
+                        out1,
+                    ),
+                    (false, true) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        out0,
+                    ),
+                }
+            }
+            return;
+        }
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            a_col,
+            b_col,
+            bstatic,
+        );
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med + 1,
+            out1,
+            a_col,
+            b_col,
+            bstatic,
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )
+    )))]
     {
         shift_reduce_inner_ab(
             a_packed,

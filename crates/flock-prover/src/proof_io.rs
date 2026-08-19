@@ -239,6 +239,18 @@ pub(crate) fn pre_encode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
 }
 
+/// `FLOCK_NO_INLINE_STASH=1` restores the incumbent helper-thread stash: the
+/// prefix pre-encode is spawned on a detached thread (with 3 clones + join)
+/// concurrently with the PCS open. The default inlines the stash directly on
+/// the prove thread before the open — strictly less work (no thread, no
+/// clones) and byte-identical, since the stash only pre-encodes bytes the
+/// fingerprint gate re-checks at publish. The ranked harness `env_clear()`s,
+/// so the inline path is the default on the runner.
+pub(crate) fn inline_stash_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_INLINE_STASH").map_or(true, |v| v != "1"))
+}
+
 /// Encode and stash the publish prefix for a prove whose commitment /
 /// zerocheck / lincheck are final. Called by the prover on a detached helper
 /// thread concurrently with the PCS open (tens of µs of alloc + encode

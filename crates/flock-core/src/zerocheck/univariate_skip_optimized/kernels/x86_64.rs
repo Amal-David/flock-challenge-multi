@@ -147,6 +147,157 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     }
 }
 
+/// Two-window wavefront of [`shift_reduce_inner_ab_x86_avx512`]: windows
+/// `b_med` and `b_med + 1` in one K-loop with two independent ZMM
+/// accumulator chains. The single-window body is an 8-step serial
+/// mul→mul→xor dependence chain, so running two windows sequentially leaves
+/// the GFNI pipe half-idle; interleaving them keeps two independent
+/// products in flight per step while sharing the per-`k` `x^k` broadcast.
+/// Instruction-for-instruction the same applies, the same GF(2^8) muls in
+/// the same order, and the same XOR accumulation order per window as two
+/// single calls — bit-identical by construction.
+///
+/// # Safety
+/// Same contract as [`shift_reduce_inner_ab_x86_avx512`] for both windows:
+/// the packed inputs must cover every K-row of windows `b_med` and
+/// `b_med + 1` from `chunk_byte_base`.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) {
+    use core::arch::x86_64::*;
+    let byte_base_0 = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let byte_base_1 = byte_base_0 + N_CHUNKS * 8;
+
+    // SAFETY: caller bounds cover 8 readable bytes at every K-row offset of
+    // both windows; each `out*` is exactly one writable ZMM.
+    unsafe {
+        let a_ptr = a_packed.as_ptr();
+        let b_ptr = b_packed.as_ptr();
+        let mut acc0 = _mm512_setzero_si512();
+        let mut acc1 = _mm512_setzero_si512();
+        for k in 0..8usize {
+            let off0 = byte_base_0 + k * N_CHUNKS;
+            let off1 = byte_base_1 + k * N_CHUNKS;
+            let av0 = inv_table.apply_x86_avx512_register_unchecked(a_ptr.add(off0));
+            let bv0 = inv_table.apply_x86_avx512_register_unchecked(b_ptr.add(off0));
+            let av1 = inv_table.apply_x86_avx512_register_unchecked(a_ptr.add(off1));
+            let bv1 = inv_table.apply_x86_avx512_register_unchecked(b_ptr.add(off1));
+            let p0 = _mm512_gf2p8mul_epi8(av0, bv0);
+            let p1 = _mm512_gf2p8mul_epi8(av1, bv1);
+            // x^0 is the multiplicative identity: skip the scale on row 0,
+            // exactly as the single-window kernel does.
+            let (s0, s1) = if k == 0 {
+                (p0, p1)
+            } else {
+                let xk = _mm512_set1_epi8((1u8 << k) as i8);
+                (_mm512_gf2p8mul_epi8(p0, xk), _mm512_gf2p8mul_epi8(p1, xk))
+            };
+            acc0 = _mm512_xor_si512(acc0, s0);
+            acc1 = _mm512_xor_si512(acc1, s1);
+        }
+        _mm512_storeu_si512(out0.as_mut_ptr() as *mut __m512i, acc0);
+        _mm512_storeu_si512(out1.as_mut_ptr() as *mut __m512i, acc1);
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+mod shift_reduce_x2_tests {
+    use super::{
+        InvNttTableByteSingleGf8, shift_reduce_inner_ab_x86_avx512,
+        shift_reduce_inner_ab_x86_avx512_x2,
+    };
+    use crate::ntt::AdditiveNttGf8;
+    use crate::zerocheck::univariate_skip_optimized::{F8, K_SKIP};
+
+    /// Oracle: the two-window wavefront must reproduce two single-window
+    /// calls byte-for-byte on nonuniform random inputs, across window bases
+    /// and chunk offsets.
+    #[test]
+    fn x2_wavefront_matches_two_singles() {
+        let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+        let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const OUTER: usize = 1024;
+        let mut a = vec![0u8; OUTER * 2];
+        let mut b = vec![0u8; OUTER * 2];
+        for slot in a.chunks_exact_mut(8) {
+            slot.copy_from_slice(&next().to_le_bytes());
+        }
+        for slot in b.chunks_exact_mut(8) {
+            slot.copy_from_slice(&next().to_le_bytes());
+        }
+        for base in 0..2usize {
+            for b_med in [0usize, 2, 4, 6, 8, 10, 12, 14] {
+                if (b_med + 2) * 64 > OUTER {
+                    continue;
+                }
+                let mut want0 = [0u8; 64];
+                let mut want1 = [0u8; 64];
+                let mut got0 = [0u8; 64];
+                let mut got1 = [0u8; 64];
+                // SAFETY: features cfg-guaranteed for this test module; the
+                // buffers cover both windows at `base * OUTER`.
+                unsafe {
+                    shift_reduce_inner_ab_x86_avx512(
+                        &a,
+                        &b,
+                        &inv_table,
+                        base * OUTER,
+                        b_med,
+                        &mut want0,
+                    );
+                    shift_reduce_inner_ab_x86_avx512(
+                        &a,
+                        &b,
+                        &inv_table,
+                        base * OUTER,
+                        b_med + 1,
+                        &mut want1,
+                    );
+                    shift_reduce_inner_ab_x86_avx512_x2(
+                        &a,
+                        &b,
+                        &inv_table,
+                        base * OUTER,
+                        b_med,
+                        &mut got0,
+                        &mut got1,
+                    );
+                }
+                assert_eq!(got0, want0, "out0 base={base} b_med={b_med}");
+                assert_eq!(got1, want1, "out1 base={base} b_med={b_med}");
+            }
+        }
+    }
+}
+
 /// Scalar 256-entry GPR convert. Kill-switch / oracle for the nibble kernel.
 /// The C side is table-free (see `kernels::accumulate_c_banks`).
 #[cfg(all(
