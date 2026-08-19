@@ -54,6 +54,9 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    if let Some(n) = topology_pool::try_build_global() {
+        return Some(n);
+    }
     if std::env::var("RAYON_NUM_THREADS").is_ok() {
         return None;
     }
@@ -66,6 +69,126 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Err(_) => None, // pool already built
     }
 }
+
+/// Topology-aware global rayon pool for the ranked x86 worker (Linux only).
+///
+/// The ranked runner exposes 16 vCPUs = 8 physical cores × 2 SMT threads and
+/// the harness sets `RAYON_NUM_THREADS=16`, so rayon spins 16 workers that the
+/// guest scheduler is free to migrate and to double up on one core while a
+/// sibling core idles. This builds the global pool explicitly and pins worker
+/// `i` to one logical CPU chosen from `/sys/devices/system/cpu/cpu*/topology/
+/// thread_siblings_list`: mode `pin16` (default here) keeps the harness's
+/// thread count but gives every worker a fixed logical CPU, alternating
+/// physical cores first (worker 0 → core 0 sibling 0, worker 1 → core 1
+/// sibling 0, … worker 8 → core 0 sibling 1, …), so a partially-idle pool
+/// still spreads across cores; mode `phys8` uses one worker per physical
+/// core. Selected at build time by `POOL_MODE`; `FLOCK_NO_TOPOLOGY_POOL=1`
+/// disables it (rayon then builds its default pool from `RAYON_NUM_THREADS`).
+/// Engages only when the machine has exactly 2 SMT threads per core and
+/// `RAYON_NUM_THREADS` equals the logical CPU count (i.e. the ranked shape);
+/// anything else falls through to the incumbent behaviour. Pure scheduling:
+/// no arithmetic changes, proof bytes identical.
+pub(crate) mod topology_pool {
+    /// "pin16" | "phys8"
+    pub(crate) const POOL_MODE: &str = "pin16";
+
+    #[cfg(target_os = "linux")]
+    fn sibling_groups() -> Option<Vec<Vec<usize>>> {
+        let n = std::thread::available_parallelism().ok()?.get();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut seen = vec![false; n];
+        for cpu in 0..n {
+            if seen[cpu] {
+                continue;
+            }
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+            let list = std::fs::read_to_string(path).ok()?;
+            let mut g = Vec::new();
+            for part in list.trim().split(',') {
+                if let Some((a, b)) = part.split_once('-') {
+                    let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                    g.extend(a..=b);
+                } else {
+                    g.push(part.parse().ok()?);
+                }
+            }
+            g.retain(|&c| c < n);
+            g.sort_unstable();
+            g.dedup();
+            for &c in &g {
+                seen[c] = true;
+            }
+            groups.push(g);
+        }
+        Some(groups)
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pin_to(cpu: usize) {
+        let mut mask = [0u64; 16]; // 1024 CPUs
+        if cpu >= 1024 {
+            return;
+        }
+        mask[cpu / 64] |= 1u64 << (cpu % 64);
+        // SAFETY: plain syscall on the calling thread with a valid mask buffer;
+        // failure is ignored (pure hint).
+        unsafe {
+            let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+        }
+    }
+
+    pub(crate) fn try_build_global() -> Option<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("FLOCK_NO_TOPOLOGY_POOL").is_some() {
+                return None;
+            }
+            let want: usize = std::env::var("RAYON_NUM_THREADS").ok()?.parse().ok()?;
+            let logical = std::thread::available_parallelism().ok()?.get();
+            if want != logical {
+                return None;
+            }
+            let groups = sibling_groups()?;
+            let cores = groups.len();
+            if cores == 0 || logical != 2 * cores || groups.iter().any(|g| g.len() != 2) {
+                return None;
+            }
+            // Worker → CPU map: cores first (sibling 0 of each core), then the
+            // second siblings; phys8 uses only the first half.
+            let mut order: Vec<usize> = Vec::with_capacity(logical);
+            for s in 0..2 {
+                for g in &groups {
+                    order.push(g[s]);
+                }
+            }
+            let n = if POOL_MODE == "phys8" { cores } else { logical };
+            let order = std::sync::Arc::new(order);
+            let o2 = order.clone();
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .start_handler(move |i| {
+                    if let Some(&cpu) = o2.get(i) {
+                        pin_to(cpu);
+                    }
+                })
+                .build_global()
+            {
+                Ok(()) => Some(n),
+                Err(_) => None,
+            }
+        }
+    }
+}
+
 
 /// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
 /// THP in `madvise` mode, so without this hint the prover's 32 MB-1 GB
