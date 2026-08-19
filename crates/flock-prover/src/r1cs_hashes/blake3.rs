@@ -1567,13 +1567,47 @@ pub(crate) mod witgen_simd {
             unsafe { _mm_slli_epi32::<N>(v) }
         }
         /// NEON `vsli` #N: bits `N..32` of each result lane come from
-        /// `b << N`, bits `0..N` keep `a`.
+        /// `b << N`, bits `0..N` keep `a`. With AVX-512VL the select
+        /// collapses into one `vpternlogd` (`f(s,a,m) = s | (a & m)`,
+        /// imm 0xF8) after the shift — same bits, one fewer op and a
+        /// shorter chain than the shift/and/or emulation.
         #[inline(always)]
         pub(super) fn vsliq_n_u32<const N: i32>(a: V4, b: V4) -> V4 {
             unsafe {
                 let mask = _mm_set1_epi32(((1u64 << N) - 1) as u32 as i32);
-                _mm_or_si128(_mm_slli_epi32::<N>(b), _mm_and_si128(a, mask))
+                #[cfg(target_feature = "avx512vl")]
+                {
+                    _mm_ternarylogic_epi32::<0xF8>(_mm_slli_epi32::<N>(b), a, mask)
+                }
+                #[cfg(not(target_feature = "avx512vl"))]
+                {
+                    _mm_or_si128(_mm_slli_epi32::<N>(b), _mm_and_si128(a, mask))
+                }
             }
+        }
+        /// 32-bit lane rotate right by N. AVX-512VL has it natively
+        /// (`vprord`); the fallback is the exact shr/shl/or pair.
+        #[inline(always)]
+        pub(super) fn vrorq_n_u32<const N: i32, const M: i32>(v: V4) -> V4 {
+            debug_assert_eq!(N + M, 32);
+            unsafe {
+                #[cfg(target_feature = "avx512vl")]
+                {
+                    _mm_ror_epi32::<N>(v)
+                }
+                #[cfg(not(target_feature = "avx512vl"))]
+                {
+                    _mm_or_si128(_mm_srli_epi32::<N>(v), _mm_slli_epi32::<M>(v))
+                }
+            }
+        }
+        /// Carry-recurrence booleans for one 32-bit add, given
+        /// `sum = x + y`: `carry_aux = (sum ^ y) & (sum ^ x)` as a single
+        /// `vpternlogd` (imm 0x18: true at (s,x,y) ∈ {011, 100}).
+        #[cfg(target_feature = "avx512vl")]
+        #[inline(always)]
+        pub(super) fn vcarry_aux_u32(sum: V4, x: V4, y: V4) -> V4 {
+            unsafe { _mm_ternarylogic_epi32::<0x18>(sum, x, y) }
         }
         #[inline(always)]
         pub(super) fn vtrn1q_u32(a: V4, b: V4) -> V4 {
@@ -1982,6 +2016,19 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
+        // `cin = sum^x^y`, so `left = x^cin = sum^y` and `right = y^cin =
+        // sum^x` — bit-identical on every bit (including the deliberately
+        // dirty bit 31) with two fewer ops and no serial cin stage. The
+        // carry conjunction folds into one `vpternlogd` where available.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+        {
+            let sum = vaddq_u32(x, y);
+            let left = veorq_u32(sum, y);
+            let right = veorq_u32(sum, x);
+            let carry = vcarry_aux_u32(sum, x, y);
+            (sum, left, right, carry)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
         unsafe {
             let sum = vaddq_u32(x, y);
             let cin = veorq_u32(veorq_u32(sum, x), y);
@@ -1998,6 +2045,11 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
+        #[cfg(target_arch = "x86_64")]
+        {
+            vrorq_n_u32::<N, M>(veorq_u32(x, y))
+        }
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             let v = veorq_u32(x, y);
             vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
