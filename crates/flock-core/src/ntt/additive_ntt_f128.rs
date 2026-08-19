@@ -239,18 +239,86 @@ static TOP_FUSION_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `FLOCK_NO_NTT_KERNEL_DIET=1` restores the incumbent butterfly kernel
+/// schedule inside the same binary. Two value-identical instruction-stream
+/// diets ride this one switch:
+///
+///  * the odd-row lane bound is snapped down to whole 4-lane SIMD groups
+///    ([`ranked_zero_odd_tail_lanes`]), so the AVX-512 kernels stop dropping
+///    into their per-lane scalar tail;
+///  * the deep tail runs one fused-**three** sweep instead of a fused-two
+///    sweep followed by a single-layer sweep (see `deep_sub`), so the tail
+///    layers cost one row load + one row store instead of two of each.
+fn ntt_kernel_diet_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_KERNEL_DIET").is_some())
+}
+
+/// Kernel-diet part 1: snap the odd-row lane bound to whole SIMD groups.
+/// `FLOCK_NO_NTT_LANE_ROUND=1` disables just this half (diagnostics; the
+/// shipped switch is `FLOCK_NO_NTT_KERNEL_DIET`, which disables both).
+#[inline]
+fn ntt_lane_round_disabled() -> bool {
+    #[cfg(test)]
+    if KERNEL_DIET_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0 {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    ntt_kernel_diet_disabled()
+        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LANE_ROUND").is_some())
+}
+
+/// Kernel-diet part 2: fuse the three-layer deep tail into one sweep.
+/// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
+#[inline]
+fn ntt_fused3_disabled() -> bool {
+    #[cfg(test)]
+    if KERNEL_DIET_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0 {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    ntt_kernel_diet_disabled()
+        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3").is_some())
+}
+
+/// Test-only latch for the kernel diet (see [`TOP_FUSION_TEST_OFF`]).
+/// Bit 0 disables the lane rounding, bit 1 the fused-three deep tail, so one
+/// process can time each half of the diet on its own.
+#[cfg(test)]
+static KERNEL_DIET_TEST_OFF: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only counter: fused-three deep sweeps actually executed.
+#[cfg(test)]
+static FUSED3_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
 ///
 /// The ambient publication is honored ONLY at the exact ranked production
 /// geometry. Every other transform — recursive commits, Ligerito folds,
 /// tests — sees 0 here, so no unrelated buffer can pick up the publication.
+///
+/// The published tail is then rounded DOWN to a whole 4-lane SIMD group
+/// (`tail & !3`). Every AVX-512 leaf steps four `F128` per `zmm` and finishes
+/// the remainder in a per-lane scalar loop that costs ~2 whole vector steps
+/// (32 scalar `F128` multiplies with GPR round-trips vs 32 four-lane ones);
+/// at the ranked shape the raw tail of 7 leaves `64 − 7 = 57` active lanes =
+/// 14 vector steps + 1 scalar lane, whereas 60 active lanes is 15 vector
+/// steps and no scalar lane at all. The three re-enabled lanes are inside the
+/// published zero tail, so both butterfly inputs there are zero on every row
+/// of a (single-parity) group and the extra work writes back the same zeros —
+/// the transform output is unchanged, only the instruction stream shrinks.
 #[inline]
 pub(crate) fn ranked_zero_odd_tail_lanes(log_d: usize, num_ntts: usize) -> usize {
     if log_d != ZERO_TAIL_LOG_D || num_ntts != ZERO_TAIL_NUM_NTTS || zero_lane_skip_disabled() {
         return 0;
     }
     let tail = ZERO_ODD_TAIL_LANES.load(std::sync::atomic::Ordering::Relaxed);
-    if tail < num_ntts { tail } else { 0 }
+    if tail >= num_ntts {
+        return 0;
+    }
+    // `num_ntts` is 64 here, so `num_ntts - (tail & !3)` is a multiple of 4.
+    if ntt_lane_round_disabled() { tail } else { tail & !3 }
 }
 
 /// Scoped publication of the zero-odd-tail-lane count, restoring the previous
@@ -1538,8 +1606,9 @@ impl AdditiveNttF128 {
             // remaining layer. On AVX-512, reuse the fused-four kernel from
             // the top layers so a row group remains in registers across four
             // butterflies. At the ranked geometry this turns deep layers
-            // 9..19 from eleven subgroup sweeps into two fused-four sweeps,
-            // one fused-two sweep, and one scalar tail.
+            // 9..19 from eleven subgroup sweeps into two fused-four sweeps
+            // plus — with the kernel diet on — a single fused-three sweep
+            // (a fused-two sweep and a single-layer sweep without it).
             //
             // Keep the existing schedule verbatim on other targets: the
             // portable fused-four kernel is scalar and loses to the ordinary
@@ -1577,6 +1646,56 @@ impl AdditiveNttF128 {
                             );
                         }
                         layer += 4;
+                    } else if layer + 3 == log_d && !ntt_fused3_disabled() {
+                        // Exactly three layers left (the ranked deep region is
+                        // 11 layers = 4 + 4 + 3): run them as ONE fused-three
+                        // sweep over eight-row groups instead of a fused-two
+                        // sweep plus a single-layer sweep. `block_size` is 8
+                        // here, so a block IS the eight-row group and every
+                        // row is loaded once and stored once for all twelve of
+                        // its butterflies — one read+write pass over the
+                        // sub-group instead of two. Same butterflies, same
+                        // twiddles, same order per row, so the output bytes
+                        // are unchanged.
+                        debug_assert_eq!(block_size, 8);
+                        // One counter bump per sweep, never per block: the
+                        // shared atomic would otherwise sit in the hot loop.
+                        #[cfg(test)]
+                        FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The published zero tail lives on ODD rows. Blocks
+                        // start at row `8·block_in_sub` of a sub-group whose
+                        // own base row is even, so row `i` of the group has
+                        // the parity of `i` and the tail is zero on rows
+                        // 1/3/5/7 — exactly the fused-three kernel's
+                        // zero-odd-row contract. The two even-stride layers
+                        // it fuses have preserved that tail up to here.
+                        let dense_lanes = num_ntts - odd_tail;
+                        for block_in_sub in 0..num_blocks_in_sub {
+                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                            tw[0] = self.twiddle(layer, global_block);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                            }
+                            let block_start = block_in_sub * block_bytes;
+                            let block = &mut sub_data[block_start..block_start + block_bytes];
+                            debug_assert_eq!(block.len(), 8 * num_ntts);
+                            // SAFETY: `block` is eight consecutive rows of
+                            // `num_ntts` lanes, owned exclusively by this
+                            // sub-group task.
+                            unsafe {
+                                kernels::butterfly_fused_3layer_rows(
+                                    block.as_mut_ptr(),
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw,
+                                );
+                            }
+                        }
+                        layer += 3;
                     } else if layer + 1 < log_d {
                         // Greedy fused-four scheduling leaves at most three
                         // layers. The existing fused-two row helper therefore
@@ -3215,6 +3334,171 @@ mod tests {
         }
     }
 
+    /// The fused-three leaf must equal the schedule it replaces — a fused-two
+    /// sweep over the two same-parity quads followed by a single-layer sweep
+    /// over the four adjacent row pairs — for every lane count that exercises
+    /// its vector body and its scalar tail. And with a published zero tail on
+    /// the odd rows, the reduced tail network must equal the dense one.
+    #[test]
+    fn fused3_leaf_matches_incumbent_sweeps() {
+        let mut rng = Rng::new(0xF3F3_0BEE);
+        for &num_ntts in &[1usize, 3, 4, 5, 7, 8, 13, 16, 64] {
+            let mut tw = [F128::ZERO; 7];
+            for t in tw.iter_mut() {
+                *t = rng.f128();
+            }
+            let base = rand_vec(&mut rng, 8 * num_ntts);
+
+            // Oracle: the incumbent two-sweep schedule on the same 8 rows.
+            let mut expected = base.clone();
+            for parity in 0..2usize {
+                // fused-two group r = parity, quarter = 2 (rows r, r+2, r+4, r+6)
+                let mut rows: [Vec<F128>; 4] = [
+                    expected[(parity) * num_ntts..(parity + 1) * num_ntts].to_vec(),
+                    expected[(parity + 2) * num_ntts..(parity + 3) * num_ntts].to_vec(),
+                    expected[(parity + 4) * num_ntts..(parity + 5) * num_ntts].to_vec(),
+                    expected[(parity + 6) * num_ntts..(parity + 7) * num_ntts].to_vec(),
+                ];
+                let (a, rest) = rows.split_at_mut(1);
+                let (b, rest) = rest.split_at_mut(1);
+                let (c, d) = rest.split_at_mut(1);
+                kernels::butterfly_fused_2layer(
+                    &mut a[0], &mut b[0], &mut c[0], &mut d[0], tw[0], tw[1], tw[2],
+                );
+                for (k, row) in rows.iter().enumerate() {
+                    let base_row = parity + 2 * k;
+                    expected[base_row * num_ntts..(base_row + 1) * num_ntts]
+                        .copy_from_slice(row);
+                }
+            }
+            for s in 0..4usize {
+                let (top, bot) = expected.split_at_mut((2 * s + 1) * num_ntts);
+                kernels::butterfly_row_pair(
+                    &mut top[2 * s * num_ntts..],
+                    &mut bot[..num_ntts],
+                    tw[3 + s],
+                );
+            }
+
+            let mut dense = base.clone();
+            // SAFETY: eight consecutive rows of `num_ntts` lanes.
+            unsafe {
+                kernels::butterfly_fused_3layer_rows(
+                    dense.as_mut_ptr(),
+                    num_ntts,
+                    num_ntts,
+                    &tw,
+                );
+            }
+            assert!(dense == expected, "fused3 leaf mismatch at num_ntts={num_ntts}");
+
+            // Zero-odd-row tail: zero rows 1/3/5/7 on the last `tail` lanes
+            // and check the reduced network reproduces the dense one.
+            for tail in 1..num_ntts.min(9) {
+                let dense_lanes = num_ntts - tail;
+                let mut armed = base.clone();
+                for i in [1usize, 3, 5, 7] {
+                    for lane in dense_lanes..num_ntts {
+                        armed[i * num_ntts + lane] = F128::ZERO;
+                    }
+                }
+                let mut want = armed.clone();
+                // SAFETY: eight consecutive rows of `num_ntts` lanes.
+                unsafe {
+                    kernels::butterfly_fused_3layer_rows(
+                        want.as_mut_ptr(),
+                        num_ntts,
+                        num_ntts,
+                        &tw,
+                    );
+                }
+                let mut got = armed;
+                // SAFETY: same geometry; rows 1/3/5/7 are zero past
+                // `dense_lanes`, which is the kernel's tail contract.
+                unsafe {
+                    kernels::butterfly_fused_3layer_rows(
+                        got.as_mut_ptr(),
+                        num_ntts,
+                        dense_lanes,
+                        &tw,
+                    );
+                }
+                assert!(
+                    got == want,
+                    "fused3 zero-odd tail mismatch at num_ntts={num_ntts} tail={tail}"
+                );
+            }
+        }
+    }
+
+    /// Deep fused-three tail vs the incumbent fused-two + single-layer tail,
+    /// same process (test latch), at shapes whose deep region is 11 layers
+    /// (4 + 4 + 3 — the ranked structure). Both must equal the scalar oracle.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn deep_fused3_matches_incumbent_schedule() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0xDEE9_F3);
+        // (log_d, num_ntts, start_layer, threads) with log_d − n_top = 11.
+        for &(log_d, num_ntts, start_layer, threads) in &[
+            (13usize, 4usize, 0usize, 4usize),
+            (13, 8, 0, 4),
+            (13, 8, 2, 4),
+            (15, 64, 0, 4),
+        ] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+            let (control, candidate) = pool.install(|| {
+                assert_eq!(
+                    log_d - AdditiveNttF128::interleaved_n_top(log_d, num_ntts),
+                    11,
+                    "shape ({log_d}, {num_ntts}) is not an 11-layer deep region"
+                );
+                KERNEL_DIET_TEST_OFF.store(3, Ordering::Relaxed);
+                let mut control = original.clone();
+                ntt.forward_transform_interleaved_parallel_from_layer(
+                    &mut control,
+                    num_ntts,
+                    start_layer,
+                );
+                KERNEL_DIET_TEST_OFF.store(0, Ordering::Relaxed);
+                let hits_before = FUSED3_HITS.load(Ordering::Relaxed);
+                let mut candidate = original.clone();
+                ntt.forward_transform_interleaved_parallel_from_layer(
+                    &mut candidate,
+                    num_ntts,
+                    start_layer,
+                );
+                assert!(
+                    FUSED3_HITS.load(Ordering::Relaxed) > hits_before,
+                    "fused-three deep tail did not run at log_d={log_d} num_ntts={num_ntts}"
+                );
+                (control, candidate)
+            });
+            let mut expected = original.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(
+                &mut expected,
+                num_ntts,
+                start_layer,
+            );
+            assert!(
+                control == expected,
+                "incumbent deep tail mismatch at log_d={log_d} num_ntts={num_ntts}"
+            );
+            assert!(
+                candidate == expected,
+                "fused-three deep tail mismatch at log_d={log_d} num_ntts={num_ntts}"
+            );
+        }
+    }
+
     /// Portable replica of `butterfly_fused_2layer_row_from` (dense).
     fn portable_row_from_replica(
         src: &[F128],
@@ -3480,6 +3764,211 @@ mod zero_lane_ranked_ab_probe {
             "MIN incumbent={:.2} ms  fused6={:.2} ms  delta={delta:+.2}%",
             best[0], best[1]
         );
+    }
+
+    /// Isolated leaf A/B for the three-layer deep tail: the fused-three
+    /// kernel against the schedule it replaces (a fused-two sweep over the
+    /// two same-parity quads, then a single-layer sweep over the four
+    /// adjacent row pairs), on the SAME eight-row blocks, at several working
+    /// set sizes so the L1/L2/DRAM regime is visible.
+    ///
+    /// `cargo test --release -p flock-core fused3_leaf_ab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing probe"]
+    fn fused3_leaf_ab() {
+        use std::time::Instant;
+        const NUM_NTTS: usize = 64;
+        const ROWS: usize = 8;
+        let block = ROWS * NUM_NTTS;
+        let odd_tail: usize = std::env::var("FLOCK_PROBE_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let dense_lanes = NUM_NTTS - odd_tail;
+        let reps: usize = std::env::var("FLOCK_PROBE_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9);
+
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut tw = [F128::ZERO; 7];
+        for t in tw.iter_mut() {
+            *t = F128 { lo: next(), hi: next() };
+        }
+
+        // 8 KiB (L1), 256 KiB, 2 MiB (one ranked sub-group), 32 MiB, and
+        // 512 MiB (swept once per timing: the DRAM-cold regime the real deep
+        // tail runs in).
+        for &blocks in &[1usize, 32, 256, 4096, 65536] {
+            let mut data: Vec<F128> = (0..blocks * block)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            // Odd rows carry the published zero tail.
+            for b in 0..blocks {
+                for i in [1usize, 3, 5, 7] {
+                    for lane in dense_lanes..NUM_NTTS {
+                        data[b * block + i * NUM_NTTS + lane] = F128::ZERO;
+                    }
+                }
+            }
+            let iters = ((1usize << 24) / (blocks * block).max(1)).max(1);
+            let mut best = [f64::MAX; 2];
+            for _ in 0..reps {
+                for arm in 0..2 {
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        for b in 0..blocks {
+                            let blk = &mut data[b * block..(b + 1) * block];
+                            if arm == 0 {
+                                // Incumbent: fused-two on each parity quad,
+                                // then a row-pair sweep for the last layer.
+                                for parity in 0..2usize {
+                                    let lanes = row_lanes(parity, NUM_NTTS, odd_tail);
+                                    // SAFETY: rows parity+{0,2,4,6} of `blk`,
+                                    // pairwise disjoint, inside the block.
+                                    unsafe {
+                                        let p = blk.as_mut_ptr().add(parity * NUM_NTTS);
+                                        let a = std::slice::from_raw_parts_mut(p, lanes);
+                                        let b2 = std::slice::from_raw_parts_mut(
+                                            p.add(2 * NUM_NTTS),
+                                            lanes,
+                                        );
+                                        let c = std::slice::from_raw_parts_mut(
+                                            p.add(4 * NUM_NTTS),
+                                            lanes,
+                                        );
+                                        let d = std::slice::from_raw_parts_mut(
+                                            p.add(6 * NUM_NTTS),
+                                            lanes,
+                                        );
+                                        kernels::butterfly_fused_2layer(
+                                            a, b2, c, d, tw[0], tw[1], tw[2],
+                                        );
+                                    }
+                                }
+                                for s in 0..4usize {
+                                    let (top, bot) = blk.split_at_mut((2 * s + 1) * NUM_NTTS);
+                                    kernels::butterfly_row_pair(
+                                        &mut top[2 * s * NUM_NTTS..],
+                                        &mut bot[..NUM_NTTS],
+                                        tw[3 + s],
+                                    );
+                                }
+                            } else {
+                                // SAFETY: eight consecutive rows; odd rows are
+                                // zero past `dense_lanes`.
+                                unsafe {
+                                    kernels::butterfly_fused_3layer_rows(
+                                        blk.as_mut_ptr(),
+                                        NUM_NTTS,
+                                        dense_lanes,
+                                        &tw,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let ns = t.elapsed().as_secs_f64() * 1e9 / (iters * blocks * ROWS * NUM_NTTS) as f64;
+                    std::hint::black_box(&data);
+                    if ns < best[arm] {
+                        best[arm] = ns;
+                    }
+                }
+            }
+            println!(
+                "blocks={blocks:5} ({:6} KiB)  incumbent={:.4} ns/elem  fused3={:.4} ns/elem  delta={:+.2}%",
+                blocks * block * 16 / 1024,
+                best[0],
+                best[1],
+                (best[0] - best[1]) / best[0] * 100.0
+            );
+        }
+    }
+
+    /// Ranked commit geometry, in-place layers 3..19 with the odd-row zero
+    /// tail armed (7 lanes): the kernel diet (4-lane-group lane bound + the
+    /// fused-three deep tail) vs the incumbent schedule, byte-equality of the
+    /// whole 1 GiB transform plus interleaved min-of-N timing.
+    #[test]
+    #[ignore = "ranked shape: ~3 GiB resident"]
+    fn kernel_diet_ranked_ab() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        const NUM_NTTS: usize = 64;
+        let ntt = AdditiveNttF128::standard(20);
+        let pristine = ranked_buffer(0xD1E7_0BEE_D00D_9ABC);
+        let _g = ZeroOddTailLanes::scope(NUM_NTTS, 7);
+
+        KERNEL_DIET_TEST_OFF.store(3, Ordering::Relaxed);
+        let mut control = pristine.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut control, NUM_NTTS, 3);
+        KERNEL_DIET_TEST_OFF.store(0, Ordering::Relaxed);
+        let hits_before = FUSED3_HITS.load(Ordering::Relaxed);
+        let mut candidate = pristine.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut candidate, NUM_NTTS, 3);
+        assert!(
+            FUSED3_HITS.load(Ordering::Relaxed) > hits_before,
+            "fused-three deep tail did not run at the ranked shape"
+        );
+        assert!(control == candidate, "kernel diet changed the ranked transform output");
+        drop(control);
+        drop(candidate);
+
+        // Interleaved A/B/C/D, min-of-N. Arm bits: 1 = lane rounding OFF,
+        // 2 = fused-three deep tail OFF; 3 = full incumbent, 0 = full diet.
+        // The transform is destructive but timing does not depend on the
+        // values, so one buffer is reused (a 1 GiB clone per run would
+        // dominate the measurement).
+        let mut data = pristine;
+        let arms = [3usize, 1, 2, 0];
+        let names = ["incumbent", "fused3only", "laneonly", "diet"];
+        let reps: usize = std::env::var("FLOCK_PROBE_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        // `start = 3` covers the whole in-place transform (top-fused six
+        // layers + the eleven deep ones); `start = 9` is exactly the deep
+        // region; `start = 17` is exactly the three tail layers the
+        // fused-three sweep replaces.
+        for start in [17usize, 9, 3] {
+            let mut samples = vec![Vec::with_capacity(reps); 4];
+            for rep in 0..reps {
+                // Rotate the arm order every rep so no arm keeps the same
+                // position in the sequence (removes drift bias).
+                for pos in 0..4usize {
+                    let k = (pos + rep) % 4;
+                    let arm = arms[k];
+                    KERNEL_DIET_TEST_OFF.store(arm, Ordering::Relaxed);
+                    let t = Instant::now();
+                    ntt.forward_transform_interleaved_from_layer(&mut data, NUM_NTTS, start);
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    std::hint::black_box(&data);
+                    samples[k].push(ms);
+                }
+            }
+            KERNEL_DIET_TEST_OFF.store(0, Ordering::Relaxed);
+            let mut stat = [(0f64, 0f64); 4];
+            for k in 0..4 {
+                samples[k].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                stat[k] = (samples[k][0], samples[k][reps / 2]);
+            }
+            for k in 0..4 {
+                println!(
+                    "start={start} arm={:>10} min={:.2} med={:.2} ms  dmin={:+.2}% dmed={:+.2}%",
+                    names[k],
+                    stat[k].0,
+                    stat[k].1,
+                    (stat[0].0 - stat[k].0) / stat[0].0 * 100.0,
+                    (stat[0].1 - stat[k].1) / stat[0].1 * 100.0,
+                );
+            }
+        }
     }
 
     #[test]

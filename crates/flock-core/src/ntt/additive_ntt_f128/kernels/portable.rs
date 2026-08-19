@@ -279,3 +279,99 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         }
     }
 }
+
+/// Fused three-layer butterfly network on EIGHT rows, in registers.
+///
+/// `values[i]` is row `i` of the group; layer `L` pairs `(i, i+4)` with
+/// `twiddles[0]`, layer `L+1` pairs `(4s+i, 4s+i+2)` with `twiddles[1+s]`,
+/// and layer `L+2` pairs `(2s, 2s+1)` with `twiddles[3+s]` — the same
+/// (block, twiddle) convention [`butterfly_fused_4layer`] uses, one level
+/// shallower.
+#[inline]
+pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    for i in 0..4 {
+        butterfly(values, i, i + 4, twiddles[0]);
+    }
+    for s in 0..2 {
+        for i in 0..2 {
+            butterfly(values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
+        }
+    }
+    for s in 0..4 {
+        butterfly(values, 2 * s, 2 * s + 1, twiddles[3 + s]);
+    }
+}
+
+/// [`butterfly_fused_3layer`] specialized for the published zero tail: every
+/// ODD row of the group is zero in this lane, so both layer-`L` and
+/// layer-`L+1` butterflies that pair two odd rows are 0⊕0 and vanish, and
+/// every layer-`L+2` butterfly degenerates to `v[2s+1] ← v[2s]` (its
+/// multiply reads a zero operand). Four multiplies instead of twelve, and
+/// only the four even rows have to be read.
+#[inline]
+pub(super) fn butterfly_fused_3layer_zero_odd(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    butterfly(values, 0, 4, twiddles[0]);
+    butterfly(values, 2, 6, twiddles[0]);
+    butterfly(values, 0, 2, twiddles[1]);
+    butterfly(values, 4, 6, twiddles[2]);
+    for s in 0..4 {
+        values[2 * s + 1] = values[2 * s];
+    }
+}
+
+/// Process one fused-three-layer group of eight CONSECUTIVE rows.
+///
+/// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
+/// `0..dense_lanes` run the full network; lanes `dense_lanes..num_ntts` run
+/// [`butterfly_fused_3layer_zero_odd`].
+///
+/// # Safety
+/// The caller must ensure the eight rows are valid and disjoint from any
+/// group processed concurrently, `dense_lanes <= num_ntts`, and that rows
+/// 1, 3, 5 and 7 are zero on lanes `dense_lanes..num_ntts`.
+#[cfg(any(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )),
+    test
+))]
+pub(super) unsafe fn butterfly_fused_3layer_rows(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(i * num_ntts + lane);
+            }
+            if lane < dense_lanes {
+                butterfly_fused_3layer(&mut values, twiddles);
+            } else {
+                butterfly_fused_3layer_zero_odd(&mut values, twiddles);
+            }
+            for (i, value) in values.iter().enumerate() {
+                *ptr.add(i * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
