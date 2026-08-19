@@ -1397,9 +1397,20 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
         planned_round1_gpu_prefix_bytes(K_LOG + n_blocks_log);
     assert_eq!(skip_bytes % BYTES_PER_BLOCK, 0);
     let skip_blocks = skip_bytes / BYTES_PER_BLOCK;
-    let mut z = flock_core::scratch::take_f128(n_total * F128_PER_BLOCK);
-    let mut a = flock_core::scratch::take_f128(n_total * F128_PER_BLOCK);
-    let mut b = flock_core::scratch::take_f128(n_total * F128_PER_BLOCK);
+    let n_f128 = n_total * F128_PER_BLOCK;
+    // a/b come back from the pool with witgen provenance when the previous
+    // prove released them untouched (zerocheck reads them through shared
+    // slices only); a token hit lets the octa dump skip re-storing the
+    // content-independent constant regions (see the elision block in
+    // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
+    // the incumbent full writes. Tagged takes go FIRST so z's untagged take
+    // cannot consume a provenance-carrying buffer of the same size class.
+    let (mut a, a_tok) =
+        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128));
+    let (mut b, b_tok) =
+        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128));
+    let (mut z, z_tok) =
+        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128));
     let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
         n_total * BYTES_PER_BLOCK,
     );
@@ -1411,6 +1422,13 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
+        // z-ONLY elision: a/b's constant lines are re-read L1-hot by the
+        // fused round-1 window precompute immediately after the dump, so
+        // eliding their stores converts warm reads into cold misses (measured
+        // +1 ms). z has no immediate re-reader — its next consumer is the
+        // commit encode, whose reads are DRAM-class either way — so only z's
+        // zero-tail store is worth skipping.
+        let elide_on = witgen_simd::const_elide_enabled();
         generate_round1_inner_octa(
             blocks,
             skip_blocks,
@@ -1420,11 +1438,33 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
             &mut ab_inner,
             &inv_table,
             &padding,
+            [z_tok && elide_on, false, false],
+        );
+        // a/b now hold a completed witgen of this layout (elided chunks are
+        // token-verified to already match). Zerocheck reads them through
+        // shared `&[u8]` views only, so the buffers reach their release
+        // untouched — arm the provenance for the next prove's takes.
+        flock_core::scratch::register_pending_tag(
+            a.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+        );
+        flock_core::scratch::register_pending_tag(
+            b.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+        );
+        // z is read-only from here to its release inside the open's
+        // materialize (commit encode, zerocheck c-view, lincheck repack all
+        // take shared views), so its provenance survives to the next prove.
+        flock_core::scratch::register_pending_tag(
+            z.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
         );
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    let _ = use_simd;
+    let _ = (use_simd, a_tok, b_tok, z_tok);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let _ = (a_tok, b_tok, z_tok);
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -1537,14 +1577,32 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
             },
         );
 
+    // The scalar/NT arms write every word, so a/b also hold a completed
+    // witgen of this layout here — arm the provenance for the next prove.
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        b.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
     (z, a, b, ab_inner)
 }
 
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps) so a/b lines for
 /// two SIMD groups stay hot across the subsequent round-1 AB windows.
-/// Temporal stores only (`elide = [false; 3]`); NT publishes stay off.
+/// Temporal stores; NT publishes stay off. `elide` forwards the per-buffer
+/// constant-region skips (z, a, b) — pass `true` ONLY for a buffer whose
+/// pool provenance token verified it still holds a previous completed
+/// witgen of this exact layout.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa(
     blocks: &[Compression],
     skip_blocks: usize,
@@ -1554,6 +1612,7 @@ fn generate_round1_inner_octa(
     ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
     inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
     padding: &Compression,
+    elide: [bool; 3],
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -1572,6 +1631,8 @@ fn generate_round1_inner_octa(
             let n_here = z_out.len() / F128_PER_BLOCK;
             // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
             // 512-word blocks in z/a/b. Last rayon chunk may be 8-wide.
+            // Dump is temporal; `elide` skips only token-verified constant
+            // chunks.
             unsafe {
                 for half in 0..(n_here / SIMD) {
                     let octa: [&Compression; 8] = std::array::from_fn(|j| {
@@ -1588,7 +1649,7 @@ fn generate_round1_inner_octa(
                         z_out.as_mut_ptr().add(off).cast::<u32>(),
                         a_out.as_mut_ptr().add(off).cast::<u32>(),
                         b_out.as_mut_ptr().add(off).cast::<u32>(),
-                        [false; 3],
+                        elide,
                     );
                 }
             }
@@ -1836,6 +1897,23 @@ pub(crate) mod witgen_simd {
     pub(crate) const ROLE_Z: u64 = 1;
     pub(crate) const ROLE_A: u64 = 2;
     pub(crate) const ROLE_B: u64 = 3;
+
+    /// Provenance tag for a witness-role scratch buffer of `n` `F128`s.
+    /// Encodes the layout version, the role, and the exact buffer length, so
+    /// a pool hit implies the identical block layout AND geometry — the only
+    /// conditions under which the constant regions above are already right.
+    pub(crate) fn scratch_tag(role: u64, n: usize) -> u64 {
+        (WITGEN_SCRATCH_LAYOUT_V << 60) | (role << 56) | (n as u64 & ((1u64 << 56) - 1))
+    }
+
+    /// `FLOCK_NO_SCRATCH_CONST_ELIDE=1` restores full dump writes on every
+    /// buffer (exact same-binary A/B); the ranked worker's cleared env never
+    /// sets it. A token miss independently falls back to full writes.
+    pub(crate) fn const_elide_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_SCRATCH_CONST_ELIDE").is_none());
+        *ON
+    }
 
     pub(crate) fn enabled() -> bool {
         static ON: LazyLock<bool> =
@@ -3663,6 +3741,67 @@ mod tests {
             ab_si.as_bytes_mut(),
             "ab_inner mismatch between scalar and live SIMD"
         );
+    }
+
+    /// Recycled-scratch constant-elision oracle (witgen-stack item B, x86
+    /// octa path): prove 1 (full writes) arms pool provenance through the
+    /// prover's plain `give_f128` release (pending-tag registry); prove 2
+    /// re-takes the same a/b allocations on token hits, skips the
+    /// constant-region dump chunks, and must still produce
+    /// `(z, a, b, ab_inner)` byte-identical to a scalar full-write generate
+    /// of its own (different) blocks. Run single-threaded — the pool is
+    /// process-global and a concurrent test's take could steal the tagged
+    /// buffers.
+    #[test]
+    fn octa_scratch_const_elide_matches_full() {
+        let mut rng = Rng::new(0xE11D_E007);
+        let mut mk = |n: usize| -> Vec<Compression> {
+            (0..n)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                    (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+                })
+                .collect()
+        };
+        let blocks1 = mk(27);
+        let blocks2 = mk(29);
+        let n_log = min_n_blocks_log(29);
+        assert_eq!(1usize << n_log, 32);
+
+        // Expected outputs for blocks2: scalar full writes off a clean pool.
+        flock_core::scratch::clear();
+        let (z_e, a_e, b_e, mut ab_e) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks2, n_log, false, false);
+
+        // Prove 1 (octa, fresh buffers ⇒ full writes) arms the pending tags;
+        // release through the prover's untagged gives attaches them.
+        let (z1, a1, b1, ab1) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks1, n_log, false, true);
+        let (a1_ptr, b1_ptr, z1_ptr) = (a1.as_ptr(), b1.as_ptr(), z1.as_ptr());
+        drop(ab1);
+        flock_core::scratch::give_f128(a1);
+        flock_core::scratch::give_f128(b1);
+        flock_core::scratch::give_f128(z1);
+
+        // Prove 2 (octa): a/b re-take their tagged allocations, eliding the
+        // token-verified constant chunks (on x86; elsewhere this degenerates
+        // to a plain regenerate and the assertions still hold).
+        let (z2, a2, b2, mut ab2) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks2, n_log, false, true);
+        assert_eq!(a2.as_ptr(), a1_ptr, "a must re-take its tagged allocation");
+        assert_eq!(b2.as_ptr(), b1_ptr, "b must re-take its tagged allocation");
+        assert_eq!(z2.as_ptr(), z1_ptr, "z must re-take its tagged allocation");
+        assert_eq!(z2, z_e, "z mismatch after elided regenerate");
+        assert_eq!(a2, a_e, "a mismatch after elided regenerate");
+        assert_eq!(b2, b_e, "b mismatch after elided regenerate");
+        assert_eq!(
+            ab2.as_bytes_mut(),
+            ab_e.as_bytes_mut(),
+            "ab_inner mismatch after elided regenerate"
+        );
+        flock_core::scratch::clear();
     }
 
     /// Full-buffer oracle at m = 20 (64 blocks): the fused round1_inner
