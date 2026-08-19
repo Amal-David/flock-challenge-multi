@@ -203,7 +203,13 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
         return;
     }
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
+        std::sync::LazyLock::new(|| {
+            // Default OFF on this lineage: a lone probe of this hint on the
+            // ranked runner measured −0.78% (5dcaae6); FLOCK_HUGEPAGES=1
+            // re-enables it for local A/B, FLOCK_NO_HUGEPAGES=1 forces off.
+            std::env::var_os("FLOCK_NO_HUGEPAGES").is_some()
+                || std::env::var_os("FLOCK_HUGEPAGES").is_none()
+        });
     if *DISABLED {
         return;
     }
