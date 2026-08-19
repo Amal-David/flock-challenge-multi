@@ -127,6 +127,50 @@ fn cascade3_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some()
 }
 
+/// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Level 3
+/// ships on, so its latch forces it *off*; level 4 ships off (see
+/// [`cascade5_off`]), so its latch forces it *on*. Either way both routes emit
+/// the same transcript — that is what the `prove_transcript_identical_*` tests
+/// assert.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE5_FORCED_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_CASCADE4=1` stops the cascade after rounds 7+8 (the incumbent
+/// frontier behavior); the default runs one more composed pass over rounds
+/// 9+10. Independent same-binary control; the ranked worker's cleared
+/// environment never sets it.
+#[inline]
+fn cascade4_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some()
+}
+
+/// Cascade level 4 (rounds 11+12) is **opt-in**: `FLOCK_ZC_CASCADE5=1` turns
+/// it on, and the ranked worker's cleared environment never does. It is
+/// implemented, transcript-identity tested and measured, but it loses once the
+/// calling-thread tail route is in: the two rounds it would replace (log_n 18
+/// and 17) already run serially for 0.54 + 0.25 ms, while the composed pass
+/// that replaces them is a rayon region costing 0.57-0.99 ms. Interleaved
+/// 32-sample medians on an idle-ish 16-thread Zen 5: 61.5 ms of zerocheck tail
+/// without it, 61.9 ms with — a 0.4 ms regression. Kept behind the flag so the
+/// next agent can re-test it on Sapphire Rapids, where rayon fan-out on 8
+/// SMT-paired cores may price differently.
+#[inline]
+fn cascade5_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE5_FORCED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    std::env::var_os("FLOCK_ZC_CASCADE5").is_none()
+}
+
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
@@ -641,11 +685,36 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
     let use_cascade3 =
         use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
-    let n_levels = match (use_lookahead, use_cascade2, use_cascade3) {
-        (false, _, _) => 0,
-        (true, false, _) => 1,
-        (true, true, false) => 2,
-        (true, true, true) => 3,
+    // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain. Their
+    // parity weights r[k_skip+7] / r[k_skip+9] are sampled slots (the seven
+    // protocol constants end at k_skip+6), so they are non-zero except with
+    // probability 2⁻¹²⁸; the chain simply stops a level earlier otherwise.
+    // The n_mlv floors keep the last composed pass's input at ≥ 16 elements
+    // (level L consumes 2^(n_mlv−2L)) with a level of margin, matching the
+    // Apple track's shipped gating.
+    //
+    // Level 3 ships on (kill switch FLOCK_NO_ZC_CASCADE4): at the ranked shape
+    // it turns tail rounds log_n 20 and 19 — 2.0 + 1.2 ms of rayon regions —
+    // into one 1.7 ms composed pass and deletes an FS round boundary.
+    // Level 4 ships OFF (opt-in FLOCK_ZC_CASCADE5); see `cascade5_off` for the
+    // measurement.
+    let use_cascade4 =
+        use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
+    let use_cascade5 =
+        use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    let n_levels = match (
+        use_lookahead,
+        use_cascade2,
+        use_cascade3,
+        use_cascade4,
+        use_cascade5,
+    ) {
+        (false, ..) => 0,
+        (true, false, ..) => 1,
+        (true, true, false, ..) => 2,
+        (true, true, true, false, _) => 3,
+        (true, true, true, true, false) => 4,
+        (true, true, true, true, true) => 5,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -1123,10 +1192,12 @@ mod tests {
 
     /// **Lookahead / cascade transcript identity**: the two-challenge
     /// lookahead route (deferred round-3 quadratic + composed rounds-3/4
-    /// double fold) and its cascades (rounds 5+6, 7+8) each emit a proof and
-    /// claim byte-identical to the incumbent route — dense and BLAKE3-padded
-    /// (k_log=14, useful=15409), m ∈ {13, 14, 17, 18} (n_mlv = 7 enables
-    /// level 2 only, 8+ all three) — and the full-cascade proof verifies.
+    /// double fold) and its cascades (rounds 5+6, 7+8, 9+10, 11+12) each emit
+    /// a proof and claim byte-identical to the incumbent route — dense and
+    /// BLAKE3-padded (k_log=14, useful=15409), m ∈ {13, 14, 17, 18, 19}
+    /// (n_mlv = 7 enables level 2 only, 8 three, 10 four, 12 five) — and the
+    /// full-cascade proof verifies. Each arm caps the cascade one level lower
+    /// than the previous, so every level is its own successor’s oracle.
     /// Toggles the test latches, not the process env.
     #[test]
     fn prove_transcript_identical_with_and_without_lookahead() {
@@ -1136,6 +1207,7 @@ mod tests {
             (14, false),
             (17, false),
             (18, false),
+            (19, false),
             (17, true),
             (18, true),
         ] {
@@ -1161,24 +1233,49 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            // Arms: (lookahead off, cascade2 off, cascade3 off, nomat off).
+            // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
+            // nomat) forced-off flags.
             let arms = [
-                (false, false, false, false), // full: no-materialize sweep + all levels
-                (false, false, false, true),  // materializing sweep + all levels
-                (false, false, true, false),  // nomat + lookahead + cascade2
-                (false, true, true, false),   // nomat + lookahead only
-                (false, true, true, true),    // materializing lookahead only (5d4d2a9)
-                (true, true, true, true),     // incumbent
+                (false, false, false, false, false, false), // full: nomat sweep + every level
+                (false, false, false, false, false, true),  // materializing sweep + every level
+                (false, false, false, false, true, false),  // cascade capped at level 3
+                (false, false, false, true, true, false),   // capped at level 2 (frontier)
+                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
+                (false, true, true, true, true, false),     // nomat + lookahead only
+                (false, true, true, true, true, true),      // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true),       // incumbent
             ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 8 { 3 } else if n_mlv >= 7 { 2 } else { 1 };
-            let expect_levels = [all, all, if n_mlv >= 7 { 2 } else { 1 }, 1, 1, 0];
-            let expect_nomat = [true, false, true, true, false, false];
+            let all = if n_mlv >= 12 {
+                5
+            } else if n_mlv >= 10 {
+                4
+            } else if n_mlv >= 8 {
+                3
+            } else if n_mlv >= 7 {
+                2
+            } else {
+                1
+            };
+            let expect_levels = [
+                all,
+                all,
+                all.min(4),
+                all.min(3),
+                all.min(2),
+                1,
+                1,
+                0,
+            ];
+            let expect_nomat = [true, false, true, true, true, true, false, false];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
+                ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
+                // Level 4 ships opt-in, so its latch is a forced-*on*.
+                ZC_CASCADE5_FORCED_ON.store(!c5_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1196,6 +1293,8 @@ mod tests {
             ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE5_FORCED_ON.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
