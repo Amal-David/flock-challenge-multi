@@ -1001,6 +1001,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     nt_out: bool,
+    cfold: Option<&CFoldMats>,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -1159,6 +1160,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // batch per side per iteration.
         let use_batch =
             cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni")) && mats.is_some();
+        // Composed-fold baking: the (ρ₁, ρ₂) pair fold is `out = Σ_k c_k ·
+        // fold(row 4x+k)` with `c = (1+ρ₁)(1+ρ₂), ρ₁(1+ρ₂), (1+ρ₁)ρ₂, ρ₁ρ₂`.
+        // Every `c_k` rides inside the batch's bit matrices, so the three
+        // constant multiplies per output (14 CLMUL per sixteen rows) and the
+        // lane transpose they fed both disappear; the composed output is one
+        // XOR of four ZMM-strided reads of the residue-major fold.
+        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
         while x_lo + 8 <= lo_size {
@@ -1167,7 +1175,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             let cache = if use_batch {
                 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
                 {
-                    let m = mats.unwrap();
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
                     let dead = super::super::prefold_dead_line_mask_gated(
@@ -1175,8 +1182,25 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         pair_in_block_mask,
                         useful_pairs_inclusive,
                     );
-                    gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                    if use_c4 {
+                        let c = cfold.unwrap();
+                        gfni_fold64_rows_masked_c4(
+                            a_pkt.add(4 * xg * 8),
+                            c,
+                            fa.as_mut_ptr(),
+                            dead,
+                        );
+                        gfni_fold64_rows_masked_c4(
+                            b_pkt.add(4 * xg * 8),
+                            c,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    } else {
+                        let m = mats.unwrap();
+                        gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                    }
                 }
                 Some((&fa, &fb, 4 * xg))
             } else {
@@ -1190,8 +1214,34 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             // ZMM loads. Padded pairs need no branch: their raw rows are
             // zero in memory and every fold table maps 0 → 0, so the cached
             // row is already the zero the scalar path wrote explicitly.
-            let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) =
-                if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) = if use_c4 {
+                // `out[16·k + t] = c_k · fold(row 4·t + k)`, so group `t` is
+                // the XOR of the four residue planes at the same lane offset
+                // — output order already correct, no transpose.
+                let xor4 = |p: *const F128, g: usize| -> __m512i {
+                    let q = p.add(4 * g);
+                    let v0 = _mm512_loadu_si512(q.cast::<__m512i>());
+                    let v1 = _mm512_loadu_si512(q.add(16).cast::<__m512i>());
+                    let v2 = _mm512_loadu_si512(q.add(32).cast::<__m512i>());
+                    let v3 = _mm512_loadu_si512(q.add(48).cast::<__m512i>());
+                    _mm512_xor_si512(
+                        _mm512_ternarylogic_epi64::<0x96>(v0, v1, v2),
+                        v3,
+                    )
+                };
+                let ap = fa.as_ptr();
+                let bp2 = fb.as_ptr();
+                (
+                    xor4(ap, 0),
+                    xor4(bp2, 0),
+                    xor4(ap, 1),
+                    xor4(bp2, 1),
+                    xor4(ap, 2),
+                    xor4(bp2, 2),
+                    xor4(ap, 3),
+                    xor4(bp2, 3),
+                )
+            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
                     let ap = fa.as_ptr();
@@ -1447,6 +1497,225 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
             }
         }
         gfni_fold64_regs(z, mats, out);
+    }
+}
+
+/// Per-residue matrix set for [`gfni_fold64_rows_masked_c4`].
+///
+/// Entry `j * 16 + k` is the ZMM of eight 8×8 GF(2) matrices the batch feeds
+/// `vgf2p8affineqb` for input chunk `j`, output byte `k`; qword `i` carries
+/// the matrix of residue `i / 2` (the layout [`SIGMA_C4`] produces).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[repr(C, align(64))]
+pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128]);
+
+/// [`build_row_fold_mats`] for the table scaled by `c`.
+///
+/// The table is XOR-composed from its eight per-chunk basis entries, so
+/// scaling the basis scales every composed entry — the matrices of `c ·
+/// table` are exactly the matrices built from `c ·  basis`, and folding a row
+/// through them yields `c · fold(row)` as an exact field identity.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(dead_code)]
+fn build_row_fold_mats_scaled(data: &[F128], c: F128) -> [u64; 128] {
+    debug_assert_eq!(data.len(), 8 * 256);
+    let mut mats = [0u64; 128];
+    for j in 0..8 {
+        let basis: [F128; 8] = std::array::from_fn(|bit| c * data[j * 256 + (1 << bit)]);
+        for k in 0..16 {
+            let mut qword = 0u64;
+            for i in 0..8 {
+                let bit_index = 8 * k + i;
+                let mut row = 0u8;
+                for (b, basis_val) in basis.iter().enumerate() {
+                    let bit = if bit_index < 64 {
+                        (basis_val.lo >> bit_index) & 1
+                    } else {
+                        (basis_val.hi >> (bit_index - 64)) & 1
+                    };
+                    row |= (bit as u8) << b;
+                }
+                qword |= (row as u64) << (8 * (7 - i));
+            }
+            mats[j * 16 + k] = qword;
+        }
+    }
+    mats
+}
+
+/// Build the four-residue matrix set for coefficients `coeffs[0..4]`.
+///
+/// `coeffs[k]` is the constant the composed fold applies to row `4x + k`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(dead_code)]
+pub(crate) fn build_cfold_mats(data: &[F128], coeffs: [F128; 4]) -> CFoldMats {
+    let per: [[u64; 128]; 4] = std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]));
+    let mut out = CFoldMats([[0u64; 8]; 128]);
+    for idx in 0..128 {
+        for i in 0..8 {
+            // Qword `i` of the affine operand serves qword `i` of the plane,
+            // whose eight rows all carry residue `i / 2` after `SIGMA_C4`.
+            out.0[idx][i] = per[i / 2][idx];
+        }
+    }
+    out
+}
+
+/// Row regrouping applied to each chunk plane before the affine products:
+/// `plane'.byte[8·i + t] = plane.byte[32·(i & 1) + 4·t + (i >> 1)]`.
+///
+/// A plane's byte `r` is chunk `j` of row `r`, so this collects the sixteen
+/// rows of one residue class `i >> 1` into qwords `2·(i>>1)` and `2·(i>>1)+1`
+/// — the granularity at which `vgf2p8affineqb` can pick a matrix. It also
+/// leaves the fold outputs in residue-major order, `out[16·k + t] = c_k ·
+/// fold(row 4·t + k)`, so the composed output for group `t` is the XOR of
+/// four ZMM-strided reads and needs no lane transpose.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[rustfmt::skip]
+const SIGMA_C4: [i8; 64] = [
+     0,  4,  8, 12, 16, 20, 24, 28,
+    32, 36, 40, 44, 48, 52, 56, 60,
+     1,  5,  9, 13, 17, 21, 25, 29,
+    33, 37, 41, 45, 49, 53, 57, 61,
+     2,  6, 10, 14, 18, 22, 26, 30,
+    34, 38, 42, 46, 50, 54, 58, 62,
+     3,  7, 11, 15, 19, 23, 27, 31,
+    35, 39, 43, 47, 51, 55, 59, 63,
+];
+
+/// [`gfni_fold64_rows_masked`] that also applies the composed-fold constant
+/// `coeffs[r & 3]` to every row `r` of the batch, for free, by folding the
+/// constant into the bit matrices.
+///
+/// Writes the 64 scaled folds in **residue-major** order: `out[16·k + t]` is
+/// `coeffs[k] · fold(row 4·t + k)`. The caller's composed output for group
+/// `t` is therefore `out[t] ^ out[16 + t] ^ out[32 + t] ^ out[48 + t]`.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked`]: 64 readable bytes at `rows.add(64 * i)`
+/// for every line not marked dead, and 64 writable `F128`s at `out`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees the row and output bounds; every
+    // shuffle index is in range and the cfg gate supplies each intrinsic.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        }
+
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let sigma = _mm512_loadu_si512(SIGMA_C4.as_ptr() as *const __m512i);
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+
+        let mut t = [_mm512_setzero_si512(); 8];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = _mm512_permutexvar_epi8(bt, z[i]);
+        }
+        let p = qword_transpose(t);
+        // Regroup each plane so all eight rows of a qword share a residue.
+        let mut pc = [_mm512_setzero_si512(); 8];
+        for (j, slot) in pc.iter_mut().enumerate() {
+            *slot = _mm512_permutexvar_epi8(sigma, p[j]);
+        }
+
+        let mut acc = [_mm512_setzero_si512(); 16];
+        for (k, slot) in acc.iter_mut().enumerate() {
+            let g = |j: usize| {
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    pc[j],
+                    _mm512_loadu_si512(m.0[j * 16 + k].as_ptr() as *const __m512i),
+                )
+            };
+            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+            *slot = _mm512_xor_si512(v2, v3);
+        }
+
+        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
+        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        for i in 0..8 {
+            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
+            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
+            let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
+            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
+            _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo, il_hi, hi));
+        }
     }
 }
 

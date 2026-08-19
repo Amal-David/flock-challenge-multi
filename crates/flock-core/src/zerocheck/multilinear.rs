@@ -499,6 +499,23 @@ fn zc_gfni_enabled() -> bool {
     })
 }
 
+/// `FLOCK_NO_ZC_CFOLD_BAKE=1` restores the incumbent rounds-3+4 composed
+/// fold: three constant `(ρ₁, ρ₂)` multiplies per output on top of the plain
+/// byte-table fold, instead of carrying those constants inside the fold's own
+/// bit matrices. Exact same-binary A/B — the baked form is the same field
+/// element, so the transcript and proof bytes are unchanged. Read once per
+/// process; the ranked worker's cleared environment never sets it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn cfold_bake_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CFOLD_BAKE").is_none());
+    *ON
+}
+
 /// GFNI bit-matrix form of the fold table for the batched row folds
 /// (`FLOCK_NO_ZC_GFNI=1` keeps the gather kernels; bit-identical output).
 #[cfg(all(
@@ -1276,6 +1293,45 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     #[allow(unused_variables)]
     let r2_mats_arg = r2_mats.as_ref();
 
+    // Composed-fold coefficients: expanding the two pair-fold levels (char 2)
+    // gives `out = Σ_k c_k · fold(row 4x+k)` with
+    //   c₀=(1+ρ₁)(1+ρ₂)  c₁=ρ₁(1+ρ₂)  c₂=(1+ρ₁)ρ₂  c₃=ρ₁ρ₂,
+    // exactly the coefficients of `fold16_to_4_deferred`'s expansion. The fold
+    // is `F128`-linear in the table, so scaling the table by `c_k` and folding
+    // is the same field element as folding and then multiplying — the
+    // multiplies move into the batch's bit matrices and vanish from the sweep.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let cfold_mats = {
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        {
+            (table.n_chunks == 8 && zc_gfni_enabled() && cfold_bake_enabled()).then(|| {
+                let one = F128::ONE;
+                let coeffs = [
+                    (one + rho1) * (one + rho2),
+                    rho1 * (one + rho2),
+                    (one + rho1) * rho2,
+                    rho1 * rho2,
+                ];
+                kernels::x86_64::build_cfold_mats(&table.data, coeffs)
+            })
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        {
+            None::<kernels::x86_64::CFoldMats>
+        }
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(unused_variables)]
+    let cfold_arg = cfold_mats.as_ref();
+
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
     assert_eq!(table.n_chunks, 8);
@@ -1350,6 +1406,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     nt_out,
+                    cfold_arg,
                 )
             };
             #[cfg(not(all(
@@ -3806,6 +3863,24 @@ mod tests {
                 &a_packed, &b_packed, &table, out_base, &mut a_s, &mut b_s, rho1, rho2, &eq_lo,
                 mask, useful,
             );
+            // Both composed-fold routes: the incumbent (ρ₁, ρ₂) multiplies
+            // and the baked-coefficient batch, each against the same oracle.
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let cfold_built = {
+                let one = F128::ONE;
+                Some(kernels::x86_64::build_cfold_mats(
+                    &table.data,
+                    [
+                        (one + rho1) * (one + rho2),
+                        rho1 * (one + rho2),
+                        (one + rho1) * rho2,
+                        rho1 * rho2,
+                    ],
+                ))
+            };
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let cfold_built: Option<kernels::x86_64::CFoldMats> = None;
+            for cfold_arg in [None, cfold_built.as_ref()] {
             for nt_out in [false, true] {
                 let mut a_v = vec![F128::ONE; 2 * lo_size];
                 let mut b_v = vec![F128::ONE; 2 * lo_size];
@@ -3828,11 +3903,17 @@ mod tests {
                         mask,
                         useful,
                         nt_out,
+                        cfold_arg,
                     )
                 };
-                assert_eq!(a_s, a_v, "a lo_size={lo_size} mask={mask} nt={nt_out}");
-                assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask} nt={nt_out}");
-                assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask} nt={nt_out}");
+                let baked = cfold_arg.is_some();
+                assert_eq!(a_s, a_v, "a lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}");
+                assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}");
+                assert_eq!(
+                    out_s, out_v,
+                    "sums lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}"
+                );
+            }
             }
         }
     }
