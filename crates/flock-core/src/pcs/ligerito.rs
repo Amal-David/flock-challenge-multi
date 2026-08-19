@@ -3249,6 +3249,99 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     (u0, u2)
 }
 
+/// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
+/// `MOVNTDQ`). Same helper as the promoted seed-fused publish
+/// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM — large pool / arena
+/// slices on this lineage land 16 mod 64, so a 64-byte gate in front of
+/// `_mm512_stream_si512` would silently never fire.
+///
+/// # Safety
+/// `src`/`dst` cover `n` F128s; `dst` is 16-byte aligned. SSE2 is x86_64
+/// baseline.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
+    // `_mm_loadu_si128` accepts any src alignment.
+    unsafe {
+        let s = src as *const __m128i;
+        let d = dst as *mut __m128i;
+        for i in 0..n {
+            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+        }
+    }
+}
+
+/// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
+///
+/// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
+/// [`msg_reduce_avx512`] on the folded slices). Kernels write a reused
+/// L1-resident stage; the message reduce reads that stage (no dest reload);
+/// dest is published with XMM streaming stores so each output line skips
+/// write-allocate RFO. Next reader is the following sumcheck round, after a
+/// Fiat–Shamir grind — DRAM-cold when `half >= 2^21` (32 MiB / buffer).
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
+/// `<= stage_f.len()`. `f`/`b` contain `2 * (base + fc.len())` elements.
+/// `stage_*` are write-before-read scratch owned by this worker.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_nt_x86(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+    stage_f: &mut [F128],
+    stage_b: &mut [F128],
+) -> (F128, F128) {
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len <= stage_f.len() && len <= stage_b.len());
+    debug_assert!(len % 2 == 0);
+
+    crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
+    crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
+    // SAFETY: target features cfg-guaranteed; stage slices have equal even
+    // length (caller / debug_assert).
+    let (u0, u2) = unsafe { msg_reduce_avx512(&stage_f[..len], &stage_b[..len]) };
+
+    let dst_aligned =
+        (fc.as_mut_ptr() as usize) % 16 == 0 && (bc.as_mut_ptr() as usize) % 16 == 0;
+    if dst_aligned {
+        // SAFETY: dest slices are 16-aligned F128 buffers of length `len`;
+        // stage is the just-written source of the same length.
+        unsafe {
+            publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
+            publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
+            core::arch::x86_64::_mm_sfence();
+        }
+    } else {
+        fc.copy_from_slice(&stage_f[..len]);
+        bc.copy_from_slice(&stage_b[..len]);
+    }
+    (u0, u2)
+}
+
+/// Per-worker fold+msg NT stage (2 × CHUNK F128 ≈ 64 KiB). Reused across
+/// the 8192 L0 chunks so we do not allocate per rayon job.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+thread_local! {
+    static OPEN_NT_STAGE: std::cell::RefCell<(Vec<F128>, Vec<F128>)> =
+        std::cell::RefCell::new((Vec::new(), Vec::new()));
+}
+
 fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
@@ -3313,6 +3406,16 @@ fn fold_and_msg_lsb(
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
+    // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port;
+    // this is leftover (2): open L0-fold (~960 MiB RFO across the four
+    // rounds with half ≥ 2^21). `FLOCK_NO_OPEN_NT` is the same-binary A/B.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -3362,6 +3465,39 @@ fn fold_and_msg_lsb(
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                // Per-worker L1 stage. Split-borrow the RefCell tuple so
+                // rustc 1.97 / edition 2024 does not reject simultaneous
+                // `&mut st.0` + `&mut st.1` (E0499 — that was #161's 101).
+                return OPEN_NT_STAGE.with(|cell| {
+                    let mut st = cell.borrow_mut();
+                    if st.0.len() < CHUNK {
+                        st.0 = crate::alloc_uninit_vec(CHUNK);
+                        st.1 = crate::alloc_uninit_vec(CHUNK);
+                    }
+                    let (stage_f, stage_b) = &mut *st;
+                    // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
+                    // geometry matches fold_and_msg_lsb's even-length
+                    // power-of-two split; stage capacity is CHUNK.
+                    unsafe {
+                        fold_and_msg_chunk_nt_x86(
+                            f,
+                            b,
+                            base,
+                            fc,
+                            bc,
+                            r,
+                            stage_f,
+                            stage_b,
+                        )
+                    }
+                });
+            }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
                 // SAFETY: aes is cfg-guaranteed (sha3 checked by `use_soa`);
