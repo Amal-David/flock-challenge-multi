@@ -120,7 +120,7 @@ fn generator_init(log2_size: u32, seed: u64) -> u64 {
 /// One block of the protected generator's output, from the closed form: the
 /// state before block `i`'s first draw is `init + 25·i·GOLDEN`.
 #[inline(always)]
-fn gen_block(init: u64, block: usize) -> Compression {
+pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
     let mut s = init.wrapping_add(((DRAWS_PER_BLOCK * block) as u64).wrapping_mul(GOLDEN));
     let mut cv = [0u32; 8];
     for word in cv.iter_mut() {
@@ -134,6 +134,115 @@ fn gen_block(init: u64, block: usize) -> Compression {
     }
     s = s.wrapping_add(GOLDEN);
     (cv, message, u64::from(mix(s)), 64, 11)
+}
+
+// ---------------------------------------------------------------------------
+// Block sources: materialized slice vs. the closed form
+// ---------------------------------------------------------------------------
+
+/// Where a witness generator reads its compression blocks from.
+///
+/// The ordinary path is [`BlockSource::Slice`] — the protected wrapper hands
+/// `prove_fast` a materialized `Vec<Compression>` and nothing changes.
+///
+/// The speculative path can do better. [`gen_block`] is a *closed form*: block
+/// `i` depends only on `(init, i)`, proven bit-exact against a literal
+/// transcription of the reference generator at the ranked size
+/// (`seed_pipe_matches_reference_at_ranked_size`). The witness generator reads
+/// each block exactly once, from a Rayon worker that is about to spend
+/// thousands of cycles on that block's BLAKE3 trace. Recomputing the block
+/// there — 25 `mix` calls, ~2 multiplies each, entirely in registers — is
+/// cheaper than the round trip it replaces: at the ranked 2^18 blocks the
+/// materialized vector is 28 MiB of stores in the fill plus 28 MiB of
+/// DRAM loads in witgen, and the fill itself is an unoverlapped prologue
+/// (nothing else can start until it finishes).
+///
+/// [`BlockSource::Closed`] is therefore not an approximation of the slice: it
+/// is the same function the slice was filled from, evaluated at the point of
+/// use instead of ahead of it.
+#[derive(Clone, Copy, Debug)]
+pub enum BlockSource<'a> {
+    /// A materialized slice. Blocks past the end are the caller's padding.
+    Slice(&'a [Compression]),
+    /// The closed-form generator for `1 << log2_size` blocks.
+    Closed { init: u64, len: usize },
+}
+
+impl<'a> BlockSource<'a> {
+    /// The closed form for `(log2_size, seed)` — exactly the sequence
+    /// [`generate_compressions_par`] would materialize.
+    #[inline]
+    pub fn closed(log2_size: u32, seed: u64) -> Self {
+        BlockSource::Closed {
+            init: generator_init(log2_size, seed),
+            len: 1usize << log2_size,
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            BlockSource::Slice(s) => s.len(),
+            BlockSource::Closed { len, .. } => *len,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Run `f` on block `i`, or on `padding` when `i` is past the end.
+    ///
+    /// Written as a callback rather than returning `Compression` by value so
+    /// the `Slice` arm hands out a borrow into the caller's vector and stays
+    /// byte-for-byte the code it replaces — no 112-byte stack copy is
+    /// introduced on the incumbent path.
+    #[inline(always)]
+    pub fn with_block<R>(
+        &self,
+        i: usize,
+        padding: &Compression,
+        f: impl FnOnce(&Compression) -> R,
+    ) -> R {
+        match *self {
+            BlockSource::Slice(s) => f(s.get(i).unwrap_or(padding)),
+            BlockSource::Closed { init, len } => {
+                if i < len {
+                    f(&gen_block(init, i))
+                } else {
+                    f(padding)
+                }
+            }
+        }
+    }
+
+    /// Materialize into an owned vector. Used only by paths that genuinely
+    /// need a contiguous slice (the batch-major witness producer, tests).
+    pub fn to_vec(&self) -> Vec<Compression> {
+        match *self {
+            BlockSource::Slice(s) => s.to_vec(),
+            BlockSource::Closed { init, len } => {
+                let mut out = vec![ZERO_COMPRESSION; len];
+                out.par_chunks_mut(4096)
+                    .enumerate()
+                    .for_each(|(chunk_index, dst)| {
+                        let base = chunk_index * 4096;
+                        for (offset, slot) in dst.iter_mut().enumerate() {
+                            *slot = gen_block(init, base + offset);
+                        }
+                    });
+                out
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a [Compression]> for BlockSource<'a> {
+    #[inline(always)]
+    fn from(s: &'a [Compression]) -> Self {
+        BlockSource::Slice(s)
+    }
 }
 
 /// Fill `out` with the blocks the protected generator would produce for
@@ -221,9 +330,59 @@ fn bytes_of(v: &[Compression]) -> &[u8] {
 // Pipe state
 // ---------------------------------------------------------------------------
 
+/// What the speculative thread published about the blocks it proved from.
+///
+/// `Full` is the incumbent: the whole materialized vector, which the adoption
+/// gate can compare byte-for-byte. `Endpoints` is what the inline path
+/// publishes — the shape plus the two blocks the O(1) gate actually reads —
+/// and is produced *only* when `GENERATOR_VERIFIED` already holds, i.e. only
+/// when the gate is the O(1) one. See [`try_adopt`].
+#[derive(Clone)]
+enum SpecBlocks {
+    Full(Arc<Vec<Compression>>),
+    Endpoints {
+        len: usize,
+        first: Compression,
+        last: Compression,
+    },
+}
+
+impl SpecBlocks {
+    fn len(&self) -> usize {
+        match self {
+            SpecBlocks::Full(v) => v.len(),
+            SpecBlocks::Endpoints { len, .. } => *len,
+        }
+    }
+
+    /// The O(1) gate: shape plus both endpoint blocks.
+    fn endpoints_match(&self, blocks: &[Compression]) -> bool {
+        if self.len() != blocks.len() {
+            return false;
+        }
+        match self {
+            SpecBlocks::Full(v) => v.first() == blocks.first() && v.last() == blocks.last(),
+            SpecBlocks::Endpoints { first, last, .. } => {
+                blocks.first() == Some(first) && blocks.last() == Some(last)
+            }
+        }
+    }
+
+    /// The full byte comparison. `None` when this variant did not retain the
+    /// blocks — which cannot happen while the full gate is selected (see
+    /// [`inline_block_gen_enabled`]), and which the caller treats as "do not
+    /// adopt" if it ever did.
+    fn full_match(&self, blocks: &[Compression]) -> Option<bool> {
+        match self {
+            SpecBlocks::Full(v) => Some(blocks_eq(v, blocks)),
+            SpecBlocks::Endpoints { .. } => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
-    blocks: Option<Arc<Vec<Compression>>>,
+    blocks: Option<SpecBlocks>,
     result: Option<ProveOut>,
     dead: bool,
     /// Instant the seed line was read — trial t≈0. Only read for the
@@ -242,6 +401,42 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// Set once the untimed warm-up proved that [`generate_compressions_par`]
 /// reproduces the protected generator at the ranked size on this build.
 static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
+
+/// May the speculative run read its blocks straight from the closed form
+/// instead of materializing them?
+///
+/// Two conditions, both checked here so the decision is made in exactly one
+/// place:
+///
+/// 1. `GENERATOR_VERIFIED` — the untimed warm-up established, at the ranked
+///    size on this build, that our generator reproduces the protected one
+///    (see [`verify_generator_at_warmup`]). This is also precisely the
+///    condition under which [`try_adopt`] uses the O(1) endpoint gate, so
+///    when it holds the full materialized vector has no remaining reader.
+///    When it does *not* hold, the gate is a 28 MiB byte comparison that
+///    needs the vector, and this returns false — the fallback to full
+///    materialization is automatic, not a separate code path the caller has
+///    to remember to take.
+/// 2. `FLOCK_NO_INLINE_BLOCK_GEN=1` is unset. Ships-on: the ranked worker is
+///    spawned with a cleared environment
+///    (`benchmark-tools/harness/src/main.rs`, `Command::env_clear`), so the
+///    switch can never be set there. It exists for local A/B and for the
+///    tests below, which exercise both states.
+///
+/// The flag is read at most once per process and only from the seed-pipe
+/// thread, before the seed arrives — never on the timed path.
+fn inline_block_gen_enabled() -> bool {
+    inline_block_gen_decision(
+        GENERATOR_VERIFIED.load(Ordering::SeqCst),
+        std::env::var_os("FLOCK_NO_INLINE_BLOCK_GEN").as_deref(),
+    )
+}
+
+/// The pure decision, split out so the tests can drive all four
+/// (verified × kill-switch) states without mutating the process environment.
+fn inline_block_gen_decision(verified: bool, kill_switch: Option<&std::ffi::OsStr>) -> bool {
+    verified && kill_switch != Some(std::ffi::OsStr::new("1"))
+}
 
 fn shared() -> &'static Pipe {
     PIPE.get_or_init(|| Pipe {
@@ -358,7 +553,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
 /// `run` receives `setup_addr` back and is responsible for reconstituting the
 /// `Blake3Setup` reference; keeping that unsafety at the call site lets this
 /// module stay free of prover types.
-pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compression]) -> ProveOut) {
+pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<'_>) -> ProveOut) {
     if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
@@ -367,8 +562,18 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     }
 
     // Commit the speculative block buffer's pages now, outside every measured
-    // interval; the timed path only fills it.
-    let scratch = prefaulted_blocks(1usize << log2_size);
+    // interval; the timed path only fills it. On the inline path there is no
+    // buffer to commit — witgen evaluates the closed form per block — so skip
+    // the 28 MiB reservation entirely. `inline_block_gen_enabled` is stable
+    // from here on: `GENERATOR_VERIFIED` is set (if at all) by
+    // `verify_generator_at_warmup`, which the caller runs immediately before
+    // this, and is never cleared.
+    let inline = inline_block_gen_enabled();
+    let scratch = if inline {
+        Vec::new()
+    } else {
+        prefaulted_blocks(1usize << log2_size)
+    };
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -407,7 +612,9 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
         .spawn(move || {
-            speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch, warm_tx)
+            speculative_main(
+                real_stdin, writer, log2_size, setup_addr, run, scratch, inline, warm_tx,
+            )
         });
 
     if spawned.is_err() {
@@ -443,13 +650,15 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn speculative_main(
     real_stdin: i32,
     writer: i32,
     log2_size: u32,
     setup_addr: usize,
-    run: fn(usize, &[Compression]) -> ProveOut,
+    run: fn(usize, BlockSource<'_>) -> ProveOut,
     scratch: Vec<Compression>,
+    inline: bool,
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
@@ -462,16 +671,24 @@ fn speculative_main(
     // warm-up proves — no longer pays. Measured on a Zen 5 host: without this
     // pass the speculative prove gave back the whole head start. `arm()`
     // blocks until this finishes, so it lands before the ready file.
-    if scratch.len() == 1usize << log2_size {
+    //
+    // The warm-up prove takes the *same* block source the timed one will, so
+    // whichever of the two witgen paths ships is the one that gets warmed.
+    if inline || scratch.len() == 1usize << log2_size {
         let t0 = std::time::Instant::now();
         let warm_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
-            let _ = std::hint::black_box(run(setup_addr, &scratch));
+            let src = if inline {
+                BlockSource::closed(log2_size, WARMUP_SEED)
+            } else {
+                fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
+                BlockSource::Slice(&scratch)
+            };
+            let _ = std::hint::black_box(run(setup_addr, src));
         }))
         .is_ok();
         if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
             eprintln!(
-                "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed)",
+                "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed, inline={inline})",
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -517,6 +734,27 @@ fn speculative_main(
 
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Inline path: nothing is materialized except the two blocks the O(1)
+        // adoption gate reads. Everything else is evaluated inside witgen from
+        // the closed form, on the worker that is about to consume it.
+        if inline {
+            let n = 1usize << log2_size;
+            let init = generator_init(log2_size, seed);
+            let published = SpecBlocks::Endpoints {
+                len: n,
+                first: gen_block(init, 0),
+                last: gen_block(init, n - 1),
+            };
+            {
+                let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+                state.seed_at = Some(seed_at);
+                state.blocks_at = Some(std::time::Instant::now());
+                state.blocks = Some(published);
+                shared().signal.notify_all();
+            }
+            return run(setup_addr, BlockSource::Closed { init, len: n });
+        }
+
         let mut buf = std::mem::take(&mut scratch);
         let blocks = if buf.len() == 1usize << log2_size {
             fill_compressions_par(&mut buf, log2_size, seed);
@@ -530,10 +768,10 @@ fn speculative_main(
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.seed_at = Some(seed_at);
             state.blocks_at = Some(std::time::Instant::now());
-            state.blocks = Some(Arc::clone(&blocks));
+            state.blocks = Some(SpecBlocks::Full(Arc::clone(&blocks)));
             shared().signal.notify_all();
         }
-        run(setup_addr, &blocks)
+        run(setup_addr, BlockSource::Slice(&blocks))
     }));
 
     match outcome {
@@ -574,24 +812,35 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     if state.dead {
         return None;
     }
-    let speculative = Arc::clone(state.blocks.as_ref()?);
+    // Clone the *handle* (an `Arc` bump, or two 112-byte blocks) and release
+    // the lock before comparing, exactly as the incumbent did: the full
+    // comparison is a Rayon region and the speculative thread must be able to
+    // publish its result while it runs.
+    let speculative = state.blocks.as_ref()?.clone();
     let seed_at = state.seed_at;
     let blocks_at = state.blocks_at;
     drop(state);
 
     let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
-    let matched = if fast_gate {
-        // Agreement was established for this build during the untimed warm-up,
-        // and both vectors were expanded from the *same bytes*: the forwarding
-        // thread writes back verbatim what it read, so the wrapper parsed the
-        // seed we parsed. Shape plus the two endpoint blocks is then a complete
-        // check — a different seed changes block 0 — at O(1) instead of 59 MiB
-        // of reads dispatched onto the pool that is proving.
-        speculative.len() == blocks.len()
-            && speculative.first() == blocks.first()
-            && speculative.last() == blocks.last()
-    } else {
-        blocks_eq(&speculative, blocks)
+    let matched = {
+        if fast_gate {
+            // Agreement was established for this build during the untimed
+            // warm-up, and both sides were expanded from the *same bytes*: the
+            // forwarding thread writes back verbatim what it read, so the
+            // wrapper parsed the seed we parsed. Shape plus the two endpoint
+            // blocks is then a complete check — a different seed changes block
+            // 0 — at O(1) instead of 28 MiB of reads dispatched onto the pool
+            // that is proving.
+            speculative.endpoints_match(blocks)
+        } else {
+            // `GENERATOR_VERIFIED` is false, so `inline_block_gen_enabled`
+            // was false when `arm` ran and the speculative side materialized
+            // in full: `full_match` is `Some`. `None` would mean the two
+            // decisions disagreed, which is not reachable (the flag is only
+            // ever set once, before `arm`) — treat it as "do not adopt" rather
+            // than as a licence to skip the check.
+            speculative.full_match(blocks).unwrap_or(false)
+        }
     };
 
     // The head start is exactly what this mechanism buys; make it printable.
@@ -702,6 +951,97 @@ mod tests {
         assert!(!blocks_eq_serial(&a, &b));
         assert!(!blocks_eq(&a, &a[..a.len() - 1]));
         assert!(!blocks_eq_serial(&a, &a[..a.len() - 1]));
+    }
+
+    /// The closed-form source must agree with the reference generator element
+    /// for element, at every index including the last — the two the O(1)
+    /// adoption gate reads — and its `to_vec` must equal the materialized
+    /// vector it replaces.
+    #[test]
+    fn seed_pipe_closed_source_matches_reference() {
+        for &log2 in &[8u32, 12, 13] {
+            for &seed in &[0u64, 1, WARMUP_SEED, u64::MAX] {
+                let want = reference(log2, seed);
+                let src = BlockSource::closed(log2, seed);
+                assert_eq!(src.len(), want.len(), "log2={log2} seed={seed}");
+                assert!(!src.is_empty());
+                let pad = ZERO_COMPRESSION;
+                for (i, expect) in want.iter().enumerate() {
+                    let got = src.with_block(i, &pad, |b| *b);
+                    assert_eq!(&got, expect, "log2={log2} seed={seed} i={i}");
+                }
+                // Past the end is the caller's padding, exactly as a short
+                // slice would be.
+                assert_eq!(src.with_block(want.len(), &pad, |b| *b), pad);
+                assert_eq!(src.to_vec(), want, "to_vec log2={log2} seed={seed}");
+            }
+        }
+    }
+
+    /// The `Slice` arm must stay exactly the incumbent lookup, including the
+    /// short-slice padding behaviour witgen relies on for the tail slots.
+    #[test]
+    fn seed_pipe_slice_source_matches_direct_indexing() {
+        let blocks = generate_compressions_par(9, 0xFEED_FACE);
+        let short = &blocks[..300];
+        let pad: Compression = ([7; 8], [9; 16], 5, 64, 11);
+        let src = BlockSource::Slice(short);
+        for i in 0..blocks.len() {
+            let got = src.with_block(i, &pad, |b| *b);
+            assert_eq!(&got, short.get(i).unwrap_or(&pad), "i={i}");
+        }
+    }
+
+    /// The inline path may only engage when the O(1) gate is the one that
+    /// runs, and the kill switch must be an exact `"1"`.
+    #[test]
+    fn seed_pipe_inline_decision_covers_both_adoption_states() {
+        use std::ffi::OsStr;
+        // Not verified → the gate is the full 28 MiB comparison, which needs
+        // the materialized vector. Inline must be off in BOTH switch states.
+        assert!(!inline_block_gen_decision(false, None));
+        assert!(!inline_block_gen_decision(false, Some(OsStr::new("1"))));
+        // Verified → inline, unless the switch is exactly "1".
+        assert!(inline_block_gen_decision(true, None));
+        assert!(!inline_block_gen_decision(true, Some(OsStr::new("1"))));
+        assert!(inline_block_gen_decision(true, Some(OsStr::new("0"))));
+        assert!(inline_block_gen_decision(true, Some(OsStr::new(""))));
+        // The shipped default: cleared environment + verified generator.
+        assert!(inline_block_gen_decision(true, None));
+    }
+
+    /// Endpoint gate and full gate must accept and reject the same inputs, and
+    /// the endpoints-only variant must never claim a full comparison it cannot
+    /// perform.
+    #[test]
+    fn seed_pipe_endpoint_gate_agrees_with_full_gate() {
+        let a = generate_compressions_par(10, 7);
+        let init = generator_init(10, 7);
+        let n = a.len();
+        let full = SpecBlocks::Full(Arc::new(a.clone()));
+        let ends = SpecBlocks::Endpoints {
+            len: n,
+            first: gen_block(init, 0),
+            last: gen_block(init, n - 1),
+        };
+        assert_eq!(full.len(), n);
+        assert_eq!(ends.len(), n);
+        assert!(full.endpoints_match(&a) && ends.endpoints_match(&a));
+        assert_eq!(full.full_match(&a), Some(true));
+        assert_eq!(ends.full_match(&a), None);
+
+        // Different seed: block 0 differs, so the endpoint gate rejects.
+        let other = generate_compressions_par(10, 8);
+        assert!(!full.endpoints_match(&other));
+        assert!(!ends.endpoints_match(&other));
+        assert_eq!(full.full_match(&other), Some(false));
+
+        // Wrong shape.
+        assert!(!full.endpoints_match(&a[..n - 1]));
+        assert!(!ends.endpoints_match(&a[..n - 1]));
+
+        // Empty input against a non-empty speculative run.
+        assert!(!ends.endpoints_match(&[]));
     }
 
     #[test]

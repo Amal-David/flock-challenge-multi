@@ -233,8 +233,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 // gather path reads.
                 let m = mats.unwrap();
                 let g0 = row_base + 2 * x_lo;
-                gfni_fold64_rows(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
-                gfni_fold64_rows(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
+                // start, so its block position decides the dead lines.
+                let dead = super::super::prefold_dead_line_mask_gated(
+                    g0,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+                gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
             // in the fa/fb caches, and `a[k][lane] = row(4·lane + k)` is
@@ -1115,8 +1122,15 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
                 {
                     let m = mats.unwrap();
-                    gfni_fold64_rows(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr());
-                    gfni_fold64_rows(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr());
+                    // `4·xg` is the tile's global row start (output x ← rows
+                    // 4x..4x+4), so its block position decides the dead lines.
+                    let dead = super::super::prefold_dead_line_mask_gated(
+                        4 * xg,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
+                    gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
                 }
                 Some((&fa, &fb, 4 * xg))
             } else {
@@ -1308,6 +1322,10 @@ pub(crate) fn build_row_fold_mats(data: &[F128]) -> [u64; 128] {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+// Retained as the unpredicated reference the dead-line skip is proved
+// byte-identical to (`gfni_masked_prefold_matches_unpredicated_kernel`); the
+// hot paths call `gfni_fold64_rows_masked`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
@@ -1316,6 +1334,59 @@ pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
             *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        }
+        gfni_fold64_regs(z, mats, out);
+    }
+}
+
+/// [`gfni_fold64_rows`] with the tile's provably-all-padding 64-byte lines
+/// left unread: bit `i` of `dead_lines` replaces the load of rows
+/// `8i ..= 8i+7` with a zero register, so that cache line is never fetched.
+///
+/// **Byte-identical to [`gfni_fold64_rows`] on the plans this tree builds.**
+/// The GF(2) affine prefold is *per byte lane and per row*: after the two
+/// transposes, plane `p[j]` holds row `n`'s chunk-`j` byte at byte position
+/// `n`, and `_mm512_gf2p8affine_epi64_epi8::<0>` maps each byte independently
+/// through an 8×8 GF(2) matrix with a zero constant term. So output row `n`
+/// depends on input row `n` alone, and a zero input row yields
+/// `M·0 = 0` in every one of the 16 output-byte planes — exactly what the
+/// gather path produces for an all-zero row, since the byte tables are
+/// XOR-composed from the set bits of the index and `T_j[0] = 0`. Two
+/// consequences: substituting zeros can neither perturb any *other* row, nor
+/// differ from folding a genuinely-zero row.
+///
+/// The caller obtains `dead_lines` from
+/// `super::super::prefold_dead_line_mask_gated`, which only sets a bit when every
+/// pair owning a row of that line is already skipped by the round-2 padding
+/// predicate — so the substituted values are never read at all, and the
+/// identity holds whatever the padding bytes contain.
+///
+/// # Safety
+/// As [`gfni_fold64_rows`], except that the 64 bytes of a line whose
+/// `dead_lines` bit is set need not be readable.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees 64 readable bytes at `rows.add(64 * i)` for
+    // every line `i` not marked dead, and 64 writable F128s at `out`.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
         }
         gfni_fold64_regs(z, mats, out);
     }

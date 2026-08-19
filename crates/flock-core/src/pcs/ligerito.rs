@@ -2509,6 +2509,54 @@ pub(crate) fn induce_sumcheck_poly_auto(
     }
 }
 
+/// `FLOCK_NO_INDUCE_FUSED_DENSIFY=1` restores the two-pass densify of the
+/// sparse-prefix NTT: a serial `vec![F128::ZERO; 2^log_d]` zero-fill followed
+/// by a serial scatter of the active windows. Exact same-binary A/B; resolved
+/// once per process.
+fn induce_fused_densify_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_INDUCE_FUSED_DENSIFY").is_none());
+    *ON
+}
+
+/// Scatter the processed active windows into a dense `nwin`-slot table so the
+/// densify pass can be indexed (and therefore parallelised) by window number.
+/// `nwin` is `2^(log_d - k)`; every `w` in `processed` is `< nwin` and unique
+/// (they are the keys of the grouping `HashMap`).
+fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<Vec<F128>>> {
+    let mut slots: Vec<Option<Vec<F128>>> = (0..nwin).map(|_| None).collect();
+    for (w, buf) in processed {
+        debug_assert!(w < nwin);
+        debug_assert!(slots[w].is_none(), "window {w} densified twice");
+        slots[w] = Some(buf);
+    }
+    slots
+}
+
+/// Fused zero-fill + densify: ONE parallel pass over the `2^k`-aligned windows
+/// writes each of the `n / 2^k` windows exactly once — an active window gets
+/// its processed buffer, an inactive window gets zeros.
+///
+/// Byte-identical to the incumbent `vec![F128::ZERO; n]` + serial scatter:
+/// the windows partition `0..n`, the active arm copies exactly the bytes the
+/// scatter copied, and the inactive arm writes exactly the zeros the
+/// allocation left in place. The buffer therefore starts UNINITIALIZED
+/// ([`crate::alloc_uninit_vec`]'s write-before-read contract is discharged by
+/// the partition), which deletes the serial 16 MiB zero pass and spreads the
+/// first-touch page faults across the rayon pool instead of one thread.
+fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> Vec<F128> {
+    use rayon::prelude::*;
+    debug_assert_eq!(slots.len(), n >> k);
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(1usize << k)
+        .zip(slots.into_par_iter())
+        .for_each(|(dst, src)| match src {
+            Some(buf) => dst.copy_from_slice(&buf),
+            None => dst.fill(F128::ZERO),
+        });
+    data
+}
+
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
@@ -2594,13 +2642,23 @@ fn transpose_forward_ntt_sparse(
     let ot = open_timing();
     let _ta = std::time::Instant::now();
     let mf0 = if ot { minor_faults() } else { 0 };
-    let mut data = vec![F128::ZERO; n];
-    let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-    let _td = std::time::Instant::now();
-    for (w, buf) in processed {
-        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
-    }
-    let dens_ms = _td.elapsed().as_secs_f64() * 1e3;
+    let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
+        // FUSED: one parallel pass writes every window exactly once, from an
+        // UNINITIALIZED buffer. See `densify_windows_fused`.
+        let slots = window_slots(n >> k, processed);
+        let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
+        let _td = std::time::Instant::now();
+        let data = densify_windows_fused(n, k, slots);
+        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+    } else {
+        let mut data = vec![F128::ZERO; n];
+        let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
+        let _td = std::time::Instant::now();
+        for (w, buf) in processed {
+            data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
+        }
+        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+    };
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let _ts = std::time::Instant::now();
@@ -8687,6 +8745,45 @@ mod tests {
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
+            }
+        }
+    }
+
+    /// The fused parallel densify must be BYTE-identical to the incumbent
+    /// two-pass form (`vec![F128::ZERO; n]` + serial scatter of the active
+    /// windows) — including at the ranked L0 shape (log_d=20, k=8, ~214 of
+    /// 4096 windows active) and at the degenerate all-active / none-active
+    /// ends. Covers the arm the env switch selects, which resolves once per
+    /// process and so cannot be flipped inside one test binary.
+    #[test]
+    fn densify_windows_fused_matches_two_pass() {
+        use crate::challenger::Challenger;
+        for &(log_d, k) in &[(12usize, 8usize), (16, 8), (20, 8), (13, 8)] {
+            let n = 1usize << log_d;
+            let nwin = n >> k;
+            for &active in &[0usize, 1, 214.min(nwin), nwin] {
+                let mut ch = crate::challenger::RandomChallenger::new(
+                    0x0DE5_1F17 ^ ((log_d * 8191 + active) as u64),
+                );
+                // Distinct window ids, spread over the whole range.
+                let mut processed: Vec<(usize, Vec<F128>)> = Vec::new();
+                let mut seen = vec![false; nwin];
+                while processed.len() < active {
+                    let w = (ch.sample_f128().lo as usize) % nwin;
+                    if seen[w] {
+                        continue;
+                    }
+                    seen[w] = true;
+                    processed.push((w, (0..(1usize << k)).map(|_| ch.sample_f128()).collect()));
+                }
+                // Incumbent two-pass reference.
+                let mut want = vec![F128::ZERO; n];
+                for (w, buf) in &processed {
+                    want[(w << k)..((w + 1) << k)].copy_from_slice(buf);
+                }
+                let got = densify_windows_fused(n, k, window_slots(nwin, processed));
+                assert_eq!(got.len(), want.len(), "log_d={log_d} active={active}");
+                assert!(got == want, "log_d={log_d} k={k} active={active}");
             }
         }
     }
