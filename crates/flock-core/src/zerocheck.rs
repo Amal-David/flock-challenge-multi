@@ -44,6 +44,22 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
+/// Zero-cost stand-in for diagnostic clocks in ranked builds.
+#[derive(Clone, Copy)]
+struct RankedTimer;
+
+impl RankedTimer {
+    #[inline(always)]
+    const fn start() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    const fn elapsed(self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
+
 /// Test-only forced-off latch for the two-challenge lookahead. Production
 /// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
 /// instead so it never has to mutate the process environment. Flipping it
@@ -487,8 +503,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
-    let t_round1 = std::time::Instant::now();
+    let zc_timing = false;
+    let t_round1 = RankedTimer::start();
     let inv_table_owned;
     let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
         &URM_INV_TABLE_K_SKIP
@@ -517,17 +533,17 @@ fn prove_packed_padded_inner<C: Challenger>(
             // back to back: each alone reaches only ~35 GB/s, while the pair
             // interleaved recovers the fused kernel's stream-level
             // parallelism over the same total bytes.
-            let t_r1 = std::time::Instant::now();
+            let t_r1 = RankedTimer::start();
             let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, t_c_ms)) = rayon::join(
                 || {
-                    let t = std::time::Instant::now();
+                    let t = RankedTimer::start();
                     let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                         ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
                     );
                     (ab, t.elapsed().as_secs_f64() * 1e3)
                 },
                 || {
-                    let t = std::time::Instant::now();
+                    let t = RankedTimer::start();
                     let (c, s_hat_v_c, quad, fold4) =
                         crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
                             c_identity_z,
@@ -617,7 +633,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
-    let t_round2 = std::time::Instant::now();
+    let t_round2 = RankedTimer::start();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     crate::gaptime::mark("zc: fold_table built");
     let mut mlv_arg = vec![F128::ONE; n_mlv];
@@ -705,7 +721,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             t_round2.elapsed().as_secs_f64() * 1e3
         );
     }
-    let t_tail = std::time::Instant::now();
+    let t_tail = RankedTimer::start();
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     multilinear_msgs.push((msg_1, msg_inf));
     challenger.observe_f128(msg_1);
@@ -825,7 +841,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // At the ranked shape level 0 turns 2 GiB + 1 GiB of reads and 1 GiB
         // + 512 MiB of writes into one 2 GiB read + 512 MiB write; level 1
         // turns 512 + 256 MiB reads / 256 + 128 MiB writes into 512 / 128.
-        let t_round = std::time::Instant::now();
+        let t_round = RankedTimer::start();
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         let log_n_cur = n_cur.trailing_zeros() as usize;
         let quarter = n_cur / 4;
@@ -899,7 +915,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let loop_start = 2 * n_levels;
 
     for i in loop_start..(n_mlv - 1) {
-        let t_round = std::time::Instant::now();
+        let t_round = RankedTimer::start();
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
