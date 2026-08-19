@@ -1267,8 +1267,26 @@ impl AdditiveNttF128 {
     unsafe fn publish_row_nt(src: *const F128, dst: *mut F128, row_len: usize) {
         use core::arch::x86_64::*;
         // SAFETY: bounds per the contract; SSE2 is x86_64 baseline; the
-        // 16-byte store alignment is the caller's checked precondition.
+        // 16-byte store alignment is the caller's checked precondition. The
+        // 64-aligned arm (the allocator's recyclable class is 64-aligned on
+        // this lineage) publishes whole lines as single-uop ZMM streams —
+        // same bytes, a quarter of the store uops, no straddled lines.
         unsafe {
+            #[cfg(target_feature = "avx512f")]
+            if dst as usize % 64 == 0 {
+                let s = src as *const __m512i;
+                let d = dst as *mut __m512i;
+                for i in 0..row_len / 4 {
+                    _mm512_stream_si512(d.add(i), _mm512_loadu_si512(s.add(i)));
+                }
+                let done = (row_len / 4) * 4;
+                let s = src as *const __m128i;
+                let d = dst as *mut __m128i;
+                for i in done..row_len {
+                    _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+                }
+                return;
+            }
             let s = src as *const __m128i;
             let d = dst as *mut __m128i;
             for i in 0..row_len {

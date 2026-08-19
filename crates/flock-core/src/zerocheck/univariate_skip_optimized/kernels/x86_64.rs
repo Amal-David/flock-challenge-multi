@@ -102,6 +102,15 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     }
 }
 
+/// `FLOCK_NO_URM_APPLY_2IMG=1` restores the one-image inverse-NTT table
+/// apply (ten port-5 shuffles per apply) in the shift-reduce AB kernel.
+/// Resolved once per process.
+pub(crate) fn urm_apply_2img_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_APPLY_2IMG").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -157,15 +166,31 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
+    // Two-image apply: 3 port-5 shuffles per table apply instead of 10 (see
+    // `apply_x86_avx512_register_2img_unchecked`). Sixteen applies per
+    // window over the whole packed input make this the largest port-5-only
+    // uop stream in the prover. `FLOCK_NO_URM_APPLY_2IMG=1` restores the
+    // one-image form (exact same-binary A/B).
+    let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
     // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
     // every K-row offset. The table has the protocol-fixed ell=64/chunks=8
-    // shape, and `out` is exactly one writable ZMM register.
+    // shape (and carries the σ₈ image when `img2`), and `out` is exactly one
+    // writable ZMM register.
     unsafe {
         let mut acc = _mm512_setzero_si512();
         for k in 0..8usize {
             let off = byte_base_b + k * N_CHUNKS;
-            let av = inv_table.apply_x86_avx512_register_unchecked(a_packed.as_ptr().add(off));
-            let bv = inv_table.apply_x86_avx512_register_unchecked(b_packed.as_ptr().add(off));
+            let (av, bv) = if img2 {
+                (
+                    inv_table.apply_x86_avx512_register_2img_unchecked(a_packed.as_ptr().add(off)),
+                    inv_table.apply_x86_avx512_register_2img_unchecked(b_packed.as_ptr().add(off)),
+                )
+            } else {
+                (
+                    inv_table.apply_x86_avx512_register_unchecked(a_packed.as_ptr().add(off)),
+                    inv_table.apply_x86_avx512_register_unchecked(b_packed.as_ptr().add(off)),
+                )
+            };
             let product = _mm512_gf2p8mul_epi8(av, bv);
             // x^0 is the multiplicative identity, so avoid one GFNI operation
             // for the first row.
