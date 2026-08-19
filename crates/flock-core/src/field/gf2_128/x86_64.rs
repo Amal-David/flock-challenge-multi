@@ -241,13 +241,48 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+unsafe fn gf2_128_reduce_x4(t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        let shifted = _mm512_bslli_epi128::<8>(t1);
+        let folded = _mm512_clmulepi64_epi128::<0x01>(t1, poly);
+        xor3_x4(t0, shifted, folded)
+    }
+}
+
+/// `FLOCK_NO_GF_TERNLOG=1` restores the pair of `vpxorq`s that the three-input
+/// XORs below replace. The GF(2^128) reduction and the deferred-product
+/// accumulator each combine three independent vectors with XOR; AVX-512's
+/// `VPTERNLOGQ` computes any three-input boolean function in one uop, and
+/// immediate `0x96` is exactly `a ^ b ^ c` (from the canonical operand masks
+/// `a = 0xF0`, `b = 0xCC`, `c = 0xAA`: `0xF0 ^ 0xCC ^ 0xAA = 0x96`). XOR is
+/// associative and commutative, so the folded form is bit-identical to the
+/// two-instruction chain. Resolved once per process.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+fn gf_ternlog_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GF_TERNLOG").is_none());
+    *ON
+}
+
+/// `a ^ b ^ c` over four F128 lanes, as one `VPTERNLOGQ` on the default path.
+///
+/// # Safety
+/// Caller must ensure `avx512f` (statically satisfied by the cfg gate and the
+/// target-feature attribute).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor3_x4(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+    // SAFETY: avx512f is cfg-guaranteed here.
+    unsafe {
+        if gf_ternlog_enabled() {
+            _mm512_ternarylogic_epi64::<0x96>(a, b, c)
+        } else {
+            _mm512_xor_si512(_mm512_xor_si512(a, b), c)
+        }
     }
 }
 
@@ -490,11 +525,12 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        // mid ^= (x.hi·y.lo) ^ (x.lo·y.hi): three independent vectors, one op.
+        self.mid = xor3_x4(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
