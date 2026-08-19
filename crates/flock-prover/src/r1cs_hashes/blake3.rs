@@ -100,6 +100,10 @@ use flock_core::verifier;
 #[path = "blake3_witgen8.rs"]
 mod blake3_witgen8;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[path = "blake3_witgen16.rs"]
+mod blake3_witgen16;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1348,8 +1352,10 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     // environment never sets it.
     //
     // On x86_64+AVX2 the regular-store path is 8-wide lockstep (`blake3_witgen8`)
-    // unless `FLOCK_NO_WITGEN_LIVE_SIMD=1`. Ranked env is cleared, so SIMD is
-    // the default. NT stays aarch64-only; do not combine with the AVX2 dump.
+    // unless `FLOCK_NO_WITGEN_LIVE_SIMD=1`. With AVX-512F the live path widens
+    // to 16-wide (`blake3_witgen16`) unless `FLOCK_NO_WITGEN16=1`. Ranked env
+    // is cleared, so SIMD is the default. NT stays aarch64-only; do not
+    // combine with the AVX2 dump.
     let use_nt = cfg!(target_arch = "aarch64")
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
@@ -1674,8 +1680,43 @@ fn generate_round1_inner_octa(
             // Dump is temporal; `elide` skips only token-verified constant
             // chunks.
             unsafe {
-                for half in 0..(n_here / SIMD) {
-                    let base = GROUP * g + half * SIMD;
+                let mut done = 0usize;
+                #[cfg(target_feature = "avx512f")]
+                if blake3_witgen16::enabled() {
+                    const HEX: usize = 16;
+                    while done + HEX <= n_here {
+                        let base = GROUP * g + done;
+                        let staged: [Compression; HEX];
+                        let hexa: [&Compression; HEX] = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                std::array::from_fn(|j| s.get(base + j).unwrap_or(padding))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged = std::array::from_fn(|j| {
+                                    let idx = base + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                std::array::from_fn(|j| &staged[j])
+                            }
+                        };
+                        let off = done * F128_PER_BLOCK;
+                        blake3_witgen16::build_hexa_witness_ab_stream_elide(
+                            hexa,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            elide,
+                            z_nt,
+                        );
+                        done += HEX;
+                    }
+                }
+                while done + SIMD <= n_here {
+                    let base = GROUP * g + done;
                     // Lead 2: the closed-form arm evaluates the eight blocks
                     // into 896 B of L1-resident stack staging on the very
                     // worker that is about to hash them, instead of loading
@@ -1699,7 +1740,7 @@ fn generate_round1_inner_octa(
                             std::array::from_fn(|j| &staged[j])
                         }
                     };
-                    let off = half * SIMD * F128_PER_BLOCK;
+                    let off = done * F128_PER_BLOCK;
                     blake3_witgen8::build_octa_witness_ab_stream_elide(
                         octa,
                         z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -1708,6 +1749,7 @@ fn generate_round1_inner_octa(
                         elide,
                         z_nt,
                     );
+                    done += SIMD;
                 }
             }
             for j in 0..n_here {
@@ -3844,6 +3886,52 @@ mod tests {
             ab_sc.as_bytes_mut(),
             ab_si.as_bytes_mut(),
             "ab_inner mismatch between scalar and live SIMD"
+        );
+    }
+
+    /// 16-wide AVX-512 live path vs scalar on an exact GROUP=16 batch
+    /// (no padding). Complements the 27-in-32 padded test above.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn round1_inner_hexa16_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let mut rng = Rng::new(0x1601_DE00);
+        let n_blocks = 16usize;
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let n_log = min_n_blocks_log(n_blocks);
+        assert_eq!(1usize << n_log, 16);
+
+        let (z_sc, a_sc, b_sc, mut ab_sc) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(
+                crate::seed_pipe::BlockSource::Slice(&blocks),
+                n_log,
+                false,
+                false,
+            );
+        let (z_si, a_si, b_si, mut ab_si) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(
+                crate::seed_pipe::BlockSource::Slice(&blocks),
+                n_log,
+                false,
+                true,
+            );
+
+        assert_eq!(z_sc, z_si, "z mismatch between scalar and hexa16");
+        assert_eq!(a_sc, a_si, "a mismatch between scalar and hexa16");
+        assert_eq!(b_sc, b_si, "b mismatch between scalar and hexa16");
+        assert_eq!(
+            ab_sc.as_bytes_mut(),
+            ab_si.as_bytes_mut(),
+            "ab_inner mismatch between scalar and hexa16"
         );
     }
 
