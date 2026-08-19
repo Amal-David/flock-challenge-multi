@@ -2051,38 +2051,14 @@ pub(crate) fn induce_sumcheck_poly(
         })
         .collect();
 
-    // Reduce across threads. The cross-thread accumulation is parallelised
-    // over SLOTS (each slot still sums the partials in thread order, so the
-    // result is bit-identical): serially this is `n_threads · n` reads on ONE
-    // core — 16 MiB / 1M adds at the ranked open's level-1 shape
-    // (n = 2^16, 16 threads), measured ~3 ms of that level's ~4 ms.
+    // Reduce across threads.
     let mut basis_poly = vec![F128::ZERO; n];
     let mut enforced_sum = F128::ZERO;
-    for (_, ls) in partials.iter() {
-        enforced_sum += *ls;
-    }
-    // Below the floor a rayon dispatch costs more than the reduce itself.
-    const REDUCE_PAR_FLOOR: usize = 1 << 12;
-    if induce_sched_enabled() && n >= REDUCE_PAR_FLOOR && partials.len() > 1 {
-        let chunk = (n / rayon::current_num_threads().max(1)).max(REDUCE_PAR_FLOOR);
-        basis_poly
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(ci, out)| {
-                let base = ci * chunk;
-                let len = out.len();
-                for (lb, _) in partials.iter() {
-                    for (acc, &v) in out.iter_mut().zip(lb[base..base + len].iter()) {
-                        *acc += v;
-                    }
-                }
-            });
-    } else {
-        for (lb, _) in partials.iter() {
-            for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
-                *acc += v;
-            }
+    for (lb, ls) in partials {
+        for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
+            *acc += v;
         }
+        enforced_sum += ls;
     }
 
     (basis_poly, enforced_sum)
@@ -2128,63 +2104,10 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
     }
 }
 
-/// Scalar/vector transpose butterfly on two equal-length halves:
-/// `s = a + b; a' = s; b' = t·s + b`. Thin cfg wrapper so the schedulers
-/// below stay readable.
-#[inline(always)]
-fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
-    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    // SAFETY: target features cfg-guaranteed; halves are equal-length.
-    unsafe {
-        transpose_butterfly_avx512(top_h, bot, t)
-    }
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-    {
-        for (a_ref, b_ref) in top_h.iter_mut().zip(bot.iter_mut()) {
-            let a = *a_ref;
-            let b = *b_ref;
-            let s = a + b;
-            *a_ref = s;
-            *b_ref = t * s + b;
-        }
-    }
-}
-
-/// `FLOCK_NO_OPEN_TNTT_BLOCK=1` restores the incumbent one-rayon-region-per-
-/// layer transpose sweep ([`transpose_forward_ntt_dense_layers_per_layer`]).
-/// Read once per process; default ON (the ranked worker clears its env).
-fn tntt_block_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_TNTT_BLOCK").is_none());
-    *ON
-}
-
 /// Dense transpose sweep over forward layers `0..top` (applied in reverse
 /// layer order). Shared by [`transpose_forward_ntt`] and the sparse-prefix
 /// tail; `data.len()` must be `2^log_d` with `top <= log_d`.
-///
-/// Two schedules, byte-identical outputs (see
-/// `transpose_forward_ntt_blocked_matches_per_layer`):
-///  * [`transpose_forward_ntt_dense_layers_blocked`] (default) — two fused
-///    cache passes,
-///  * [`transpose_forward_ntt_dense_layers_per_layer`] (kill switch) — the
-///    incumbent one parallel sweep per layer.
 fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
-    if tntt_block_enabled() {
-        transpose_forward_ntt_dense_layers_blocked(ntt, data, top);
-    } else {
-        transpose_forward_ntt_dense_layers_per_layer(ntt, data, top);
-    }
-}
-
-/// Incumbent schedule: one parallel region per layer (and, for layers with
-/// fewer blocks than threads, one region PER BLOCK). Kept as the kill-switch
-/// arm and as the oracle for the blocked schedule's equality test.
-fn transpose_forward_ntt_dense_layers_per_layer(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-) {
     use rayon::prelude::*;
     let log_d = data.len().trailing_zeros() as usize;
     debug_assert!(top <= log_d);
@@ -2199,125 +2122,56 @@ fn transpose_forward_ntt_dense_layers_per_layer(
                 .for_each(|(block, chunk)| {
                     let t = ntt.twiddle(layer, block);
                     let (top_h, bot) = chunk.split_at_mut(bsh);
-                    transpose_butterfly(top_h, bot, t);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    // SAFETY: target features cfg-guaranteed; split halves
+                    // are equal-length.
+                    unsafe {
+                        transpose_butterfly_avx512(top_h, bot, t)
+                    }
+                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                    {
+                        for (a_ref, b_ref) in top_h.iter_mut().zip(bot.iter_mut()) {
+                            let a = *a_ref;
+                            let b = *b_ref;
+                            let s = a + b;
+                            *a_ref = s;
+                            *b_ref = t * s + b;
+                        }
+                    }
                 });
         } else {
             for block in 0..num_blocks {
                 let t = ntt.twiddle(layer, block);
                 let chunk = &mut data[block * block_size..(block + 1) * block_size];
                 let (top_h, bot) = chunk.split_at_mut(bsh);
-                // Few huge blocks: split each block's span into segments so
-                // the vector kernel still fills the cores.
-                const SEG: usize = 4096;
-                top_h
-                    .par_chunks_mut(SEG)
-                    .zip(bot.par_chunks_mut(SEG))
-                    .for_each(|(a, b)| transpose_butterfly(a, b, t));
-            }
-        }
-    }
-}
-
-/// Cache-blocked schedule: the `top` layers are applied in TWO fused passes
-/// instead of one pass per layer.
-///
-/// Why: the transposed sweep runs layers `top-1 … 0`, i.e. pairing distances
-/// `2^(log_d-top) … 2^(log_d-1)` — *increasing*. Layers `≥ split` mix only
-/// **inside** a `2^(log_d-split)`-element chunk; layers `< split` mix only
-/// **across** those chunks at a fixed offset. So the whole sweep is
-///   (a) `top-split` layers, chunk-local: one rayon region, one read+write
-///       pass, each chunk sized to stay in L2 for all of its layers;
-///   (b) `split` layers, cross-chunk: one rayon region over tiles of the
-///       chunk offset, each tile holding its `2^split` strided columns in L2
-///       for all of its layers.
-/// The incumbent made `top` full DRAM/L3 passes and — for layers whose block
-/// count fell below the thread count — re-entered the rayon pool once per
-/// block. At the ranked m=32 open's L0 induce (`log_d=20`, `top=12`) that was
-/// 12 passes over 16 MiB and 23 rayon regions; this is 2 and 2.
-///
-/// Arithmetic is unchanged: each butterfly sees exactly the operands, twiddle
-/// and layer order of the incumbent (layers commute only within a group, and
-/// the groups are applied in the same relative order), so the output is
-/// bit-identical.
-fn transpose_forward_ntt_dense_layers_blocked(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    top: usize,
-) {
-    use rayon::prelude::*;
-    let log_d = data.len().trailing_zeros() as usize;
-    debug_assert!(top <= log_d);
-    if top == 0 {
-        return;
-    }
-    let n_threads = rayon::current_num_threads().max(1);
-    // Chunk target: 2^CHUNK_LOG F128 (= 512 KiB at CHUNK_LOG=15) so a chunk
-    // stays in L2 across all of pass (a)'s layers; but never so few chunks that
-    // the pool starves. Swept 13..17 at the ranked L0 shape (log_d=20, top=12,
-    // 16 threads): Zen 5 wants the large end (17: 1.8 ms, 15: 2.6, 13: n/m) and
-    // Zen 3 the small end (13: 2.5 ms, 15: 2.6, 17: 3.1); 15 is within 0.5 ms
-    // of best on both and is the value shipped.
-    const CHUNK_LOG: usize = 15;
-
-    let split = log_d
-        .saturating_sub(CHUNK_LOG)
-        .max(ceil_log2(n_threads))
-        .min(top);
-
-    // ---- (a) chunk-local layers `split .. top`, applied high → low. ----
-    if top > split {
-        let chunk_len = 1usize << (log_d - split);
-        data.par_chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(c, chunk)| {
-                for layer in (split..top).rev() {
-                    let nb = 1usize << (layer - split); // blocks inside this chunk
-                    let block_size = 1usize << (log_d - layer);
-                    let bsh = block_size >> 1;
-                    for jb in 0..nb {
-                        let t = ntt.twiddle(layer, (c << (layer - split)) + jb);
-                        let (top_h, bot) =
-                            chunk[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                        transpose_butterfly(top_h, bot, t);
-                    }
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // Few huge blocks: split each block's span into 4 KiB
+                    // segments so the vector kernel still fills the cores.
+                    const SEG: usize = 4096;
+                    top_h
+                        .par_chunks_mut(SEG)
+                        .zip(bot.par_chunks_mut(SEG))
+                        .for_each(|(a, b)| {
+                            // SAFETY: target features cfg-guaranteed.
+                            unsafe { transpose_butterfly_avx512(a, b, t) }
+                        });
                 }
-            });
-    }
-
-    // ---- (b) cross-chunk layers `split-1 .. 0`, applied high → low. ----
-    // Position `p = x + j·seg` with `x < seg = 2^(log_d-split)`, `j < 2^split`.
-    // Layer `l < split` pairs `j` with `j ^ 2^(split-1-l)` at the same `x`, and
-    // its block index is `j >> (split-l)`. Fixing a tile of `x` values and
-    // holding that tile's `2^split` columns resident applies all `split`
-    // layers in one pass.
-    if split > 0 {
-        let nseg = 1usize << split;
-        let seg = 1usize << (log_d - split);
-        // Tile so the resident set is ~2^CHUNK_LOG F128 across all columns.
-        let tile = ((1usize << CHUNK_LOG) / nseg).max(1).min(seg);
-        let ntiles = seg / tile;
-        let mut tiles: Vec<Vec<&mut [F128]>> =
-            (0..ntiles).map(|_| Vec::with_capacity(nseg)).collect();
-        for part in data.chunks_mut(seg) {
-            for (ti, col) in part.chunks_mut(tile).enumerate() {
-                tiles[ti].push(col);
-            }
-        }
-        tiles.into_par_iter().for_each(|mut cols| {
-            for b in 0..split {
-                let layer = split - 1 - b;
-                let stride = 1usize << b;
-                let mut j = 0;
-                while j < nseg {
-                    for u in j..j + stride {
-                        let t = ntt.twiddle(layer, u >> (b + 1));
-                        let (lo, hi) = cols.split_at_mut(u + stride);
-                        transpose_butterfly(lo[u], hi[0], t);
-                    }
-                    j += stride << 1;
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    top_h
+                        .par_iter_mut()
+                        .zip(bot.par_iter_mut())
+                        .for_each(|(a_ref, b_ref)| {
+                            let a = *a_ref;
+                            let b = *b_ref;
+                            let s = a + b;
+                            *a_ref = s;
+                            *b_ref = t * s + b;
+                        });
                 }
             }
-        });
+        }
     }
 }
 
@@ -2396,81 +2250,6 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 ///
 /// Both paths are byte-identical (see `induce_sumcheck_poly_via_ntt_matches_dense`),
 /// so a mis-dispatch only costs time. Tuned/validated at blake m=30.
-/// `FLOCK_NO_OPEN_EQ_SPLIT=1` restores the serial [`build_eq_table`] for the
-/// open's OOD tables. Read once per process; default ON (the ranked worker
-/// clears its env).
-fn eq_split_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_EQ_SPLIT").is_none());
-    *ON
-}
-
-/// Parallel `eq(point, ·)` table for the open's OOD binding.
-///
-/// [`build_eq_table`] is a serial doubling recurrence: the L1 OOD sample at the
-/// ranked m=32 shape needs `2^19` entries, i.e. half a million dependent GHASH
-/// multiplies on ONE core. But `eq` is a pure tensor product and F128
-/// arithmetic is exact (`v·(1+r) = v + v·r` is an identity, not a rounding
-/// choice), so the table factors: with `i = i_lo + 2^h · i_hi`,
-///   `eq[i] = eq(point[..h])[i_lo] · eq(point[h..])[i_hi]`.
-/// Build the two small factors serially and expand in ONE rayon region — the
-/// products are the same field elements in the same slots, so the table is
-/// bit-identical (see `eq_split_matches_serial`).
-///
-/// `h` is chosen so the expansion has ~4 blocks per thread; below
-/// `SPLIT_MIN_LOG` the serial recurrence wins.
-fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-    const SPLIT_MIN_LOG: usize = 17;
-    let d = point.len();
-    if !eq_split_enabled() || d < SPLIT_MIN_LOG {
-        return build_eq_table(point);
-    }
-    let n_threads = rayon::current_num_threads().max(1);
-    // Number of expansion blocks = 2^(d-h); want ≥ 4 per thread but keep each
-    // block big enough to amortize the per-block loop.
-    let log_blocks = (ceil_log2(n_threads) + 2).min(d - 1);
-    let h = d - log_blocks;
-    let lo = build_eq_table(&point[..h]);
-    let hi = build_eq_table(&point[h..]);
-    debug_assert_eq!(lo.len(), 1usize << h);
-    debug_assert_eq!(hi.len(), 1usize << log_blocks);
-    let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
-    out.par_chunks_mut(1usize << h)
-        .zip(hi.par_iter())
-        .for_each(|(chunk, &e)| {
-            // Every slot of `chunk` is written here — upholds
-            // `alloc_uninit_vec`'s write-before-read contract.
-            for (o, &l) in chunk.iter_mut().zip(lo.iter()) {
-                *o = l * e;
-            }
-        });
-    out
-}
-
-/// `FLOCK_NO_OPEN_INDUCE_SCHED=1` restores the incumbent `induce_sumcheck_poly`
-/// scheduling: the dense-vs-Fᵀ-NTT crossover constant `C = 4`, the hard-wired
-/// dense arm at recursion levels ≥ 1, and the serial cross-thread reduce.
-/// Read once per process; default ON (the ranked worker clears its env).
-pub(crate) fn induce_sched_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_INDUCE_SCHED").is_none());
-    *ON
-}
-
-/// Crossover constant `C` in the [`induce_sumcheck_poly_auto`] dispatch rule
-/// `n_queries > C · 2^log_inv_rate · log_block`.
-///
-/// The incumbent `C = 4` priced the Fᵀ-NTT arm at ~2× the dense arm per op
-/// ("memory-bound, multi-pass") — true when the transposed sweep made one
-/// full DRAM pass per layer. [`transpose_forward_ntt_dense_layers_blocked`]
-/// cut that to two passes total (measured 20.2 → 2.3 ms at the ranked L0
-/// shape), so the NTT arm is now the cheaper one from roughly
-/// `n_queries > 2^log_inv_rate · log_block` upward; `C = 1` keeps a margin.
-fn induce_ntt_crossover_c() -> usize {
-    if induce_sched_enabled() { 1 } else { 4 }
-}
-
 pub(crate) fn induce_sumcheck_poly_auto(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -2481,8 +2260,8 @@ pub(crate) fn induce_sumcheck_poly_auto(
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
     let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt = log_msg_cols >= 12
-        && queries.len() > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1);
+    let use_ntt =
+        log_msg_cols >= 12 && queries.len() > 4 * (1usize << log_inv_rate) * log_block.max(1);
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -2546,8 +2325,6 @@ fn transpose_forward_ntt_sparse(
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
-    let nwins = win_vec.len();
-    let _tw = std::time::Instant::now();
     let processed: Vec<(usize, Vec<F128>)> = win_vec
         .into_par_iter()
         .map(|(w, mut buf)| {
@@ -2582,34 +2359,16 @@ fn transpose_forward_ntt_sparse(
             (w, buf)
         })
         .collect();
-    let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
 
     // Densify (active windows only; the rest stay zero, which is the correct
     // post-step-(k-1) state for an all-zero window).
-    let ot = open_timing();
-    let _ta = std::time::Instant::now();
-    let mf0 = if ot { minor_faults() } else { 0 };
     let mut data = vec![F128::ZERO; n];
-    let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-    let _td = std::time::Instant::now();
     for (w, buf) in processed {
         data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
-    let dens_ms = _td.elapsed().as_secs_f64() * 1e3;
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    let _ts = std::time::Instant::now();
     transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
-    if ot {
-        eprintln!(
-            "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
-            nwin = nwins,
-            win_ms = win_ms,
-            dl = log_d - k,
-            ds = _ts.elapsed().as_secs_f64() * 1e3,
-            mf = minor_faults() - mf0,
-        );
-    }
     data
 }
 
@@ -3486,17 +3245,12 @@ fn materialize_direct_fold4(
     assert!(packed_witness.len().is_multiple_of(16));
     let [r0, r1, r2, r3] = challenges;
 
-    let fold_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    // Same tensor as build_eq(challenges) (LSB-first bank index) — one-mul
+    // char-2 schedule instead of four independent multiplies per bank.
+    let fold_weight: [F128; 16] = {
+        let eq = crate::zerocheck::univariate_skip::build_eq(&challenges);
+        eq.try_into().expect("build_eq([r0,r1,r2,r3]) has length 16")
+    };
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
@@ -3553,38 +3307,48 @@ fn materialize_direct_fold4(
                 // ---- b: ordinary basis (if any) folded 16:1 with the same weights.
                 if has_ordinary {
                     let b_in = &ordinary_basis[start..start + 16 * block_len];
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut b_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
+                    if deferred_reduce {
+                        // Match the f-side deferred-reduction AVX-512 path.
+                        crate::field::f128_slice::fold16_banked(b_in, b_out, &fold_weight);
+                    } else {
+                        let mut slot = 0usize;
+                        while slot < block_len {
+                            let n = SUB.min(block_len - slot);
+                            let mid = &mut mid[..4 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[16 * slot..16 * (slot + n)],
+                                mid,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                mid,
+                                &mut b_out[slot..slot + n],
+                                r2,
+                                r3,
+                            );
+                            slot += n;
+                        }
                     }
                 } else {
                     b_out.fill(F128::ZERO);
                 }
                 // ---- b: direct claims, one 64 KiB composed table live at a time.
+                // 8-wide fold_one_slot unroll (same algebra as prior 4-wide).
                 let table = &mut scratch[..table_len];
                 for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
                     super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 7 < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         b_out[s + 1] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
                         b_out[s + 2] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
                         b_out[s + 3] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
-                        s += 4;
+                        b_out[s + 4] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 4], table);
+                        b_out[s + 5] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 5], table);
+                        b_out[s + 6] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 6], table);
+                        b_out[s + 7] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 7], table);
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
@@ -5130,8 +4894,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut direct_msg1 = None;
     // FLOCK_OPEN_TIMING diagnostics: per-round (grind ms, fold ms, arena?)
     let mut round_diag: Vec<(f64, f64, bool)> = Vec::new();
-    // (level, log_msg_cols, n_queries, ms, used_ntt)
-    let mut induce_diag: Vec<(usize, usize, usize, f64, bool)> = Vec::new();
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -5275,7 +5037,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
             // introduce round message (single pass over f1 + eq_z), instead of
             // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table_split(&z);
+            let eq_z = build_eq_table(&z);
             let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
             challenger.observe_f128(y);
             ood_values.push(y);
@@ -5327,16 +5089,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         &alpha_0,
     );
     if trace {
-        let d = _t.elapsed();
-        t_induce += d;
-        let lb = n1 + log_inv_rate_0;
-        induce_diag.push((
-            0,
-            n1,
-            queries_0.len(),
-            d.as_secs_f64() * 1e3,
-            n1 >= 12 && queries_0.len() > 4 * (1usize << log_inv_rate_0) * lb.max(1),
-        ));
+        t_induce += _t.elapsed();
     }
 
     // Introduce + glue basis_0.
@@ -5422,11 +5175,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     "  induce_sumcheck_poly:                          {:.2} ms",
                     t_induce.as_secs_f64() * 1e3
                 );
-                for (lvl, lmc, nq, ms, ntt) in induce_diag.iter() {
-                    eprintln!(
-                        "    induce L{lvl}: log_msg_cols={lmc} queries={nq} ntt={ntt} {ms:.2} ms",
-                    );
-                }
                 eprintln!(
                     "  sumcheck recursive folds:                      {:.2} ms",
                     t_sumcheck_folds.as_secs_f64() * 1e3
@@ -5487,7 +5235,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table_split(&z);
+                let eq_z = build_eq_table(&z);
                 let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
@@ -5524,45 +5272,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        // `n_next` is exactly wtns_prev's message-column count and
-        // `log_inv_rates[i+1]` its rate, so the same dense-vs-Fᵀ-NTT cost
-        // dispatch L0 uses applies here. (Was hard-wired to the dense arm
-        // back when the transposed NTT cost one DRAM pass per layer; the
-        // blocked sweep moved the crossover well below level 1's shape.)
-        let (basis_i_induced, enforced_sum_i) = if induce_sched_enabled() {
-            induce_sumcheck_poly_auto(
-                n_next,
-                config.log_inv_rates[i + 1],
-                &sks_vks_i,
-                &opened_rows_i,
-                &level_rs,
-                &queries_i,
-                &alpha_i,
-            )
-        } else {
-            induce_sumcheck_poly(
-                n_next,
-                &sks_vks_i,
-                &opened_rows_i,
-                &level_rs,
-                &queries_i,
-                &alpha_i,
-            )
-        };
+        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
+            n_next,
+            &sks_vks_i,
+            &opened_rows_i,
+            &level_rs,
+            &queries_i,
+            &alpha_i,
+        );
         if trace {
-            let d = _t.elapsed();
-            t_induce += d;
-            let rate = config.log_inv_rates[i + 1];
-            induce_diag.push((
-                i + 1,
-                n_next,
-                queries_i.len(),
-                d.as_secs_f64() * 1e3,
-                induce_sched_enabled()
-                    && n_next >= 12
-                    && queries_i.len()
-                        > induce_ntt_crossover_c() * (1usize << rate) * (n_next + rate).max(1),
-            ));
+            t_induce += _t.elapsed();
         }
 
         let _t = std::time::Instant::now();
@@ -8383,9 +8102,6 @@ mod tests {
             (3, 1, 2, 5),
             (6, 2, 3, 30),
             (10, 1, 6, 218),
-            // Level-1-shaped: rate 1/4 with many queries — the case the
-            // retuned crossover now sends down the Fᵀ-NTT arm.
-            (14, 2, 3, 106),
             (8, 3, 3, 71),
             (5, 5, 3, 43),
             (0, 2, 1, 3),
@@ -8459,42 +8175,6 @@ mod tests {
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
-            }
-        }
-    }
-
-    /// The split-product eq table must be BYTE-identical to the serial
-    /// doubling recurrence at every width the open can ask for.
-    #[test]
-    fn eq_split_matches_serial() {
-        use crate::challenger::Challenger;
-        for d in 0..=20usize {
-            let mut ch = crate::challenger::RandomChallenger::new(0x3EE7_u64 ^ d as u64);
-            let point: Vec<F128> = (0..d).map(|_| ch.sample_f128()).collect();
-            assert_eq!(build_eq_table_split(&point), build_eq_table(&point), "d={d}");
-        }
-    }
-
-    /// The cache-blocked transpose schedule must be BYTE-identical to the
-    /// incumbent per-layer schedule for every `(log_d, top)` shape the open
-    /// can reach — including `top < log_d` (the sparse-prefix tail),
-    /// `top == 0`, and sizes on both sides of the split heuristic.
-    #[test]
-    fn transpose_blocked_matches_per_layer() {
-        use crate::challenger::Challenger;
-        for &log_d in &[0usize, 1, 2, 5, 8, 12, 16, 18, 20] {
-            let ntt = AdditiveNttF128::standard(log_d.max(1));
-            for top in 0..=log_d {
-                let n = 1usize << log_d;
-                let mut ch = crate::challenger::RandomChallenger::new(
-                    0x7A5E ^ ((log_d * 37 + top) as u64),
-                );
-                let base: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
-                let mut a = base.clone();
-                let mut b = base;
-                transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut a, top);
-                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
-                assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
         }
     }
