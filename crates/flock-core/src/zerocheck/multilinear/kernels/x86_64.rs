@@ -239,6 +239,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && lo_size.is_multiple_of(8)
             && zc_regfold_enabled()
             && zc_r2_tr_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let pkt_pf = zc_pkt_pf_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let pkt_pf_far = zc_pkt_pf_far_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -261,13 +265,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
-                // The next refill's 512-byte packed bursts sit one tile
-                // ahead — ~4 iterations (>1000 uops) of pure compute away,
-                // a gap the hardware prefetcher does not bridge across the
-                // strided burst boundary. Pull both sides in now (prefetch
-                // is a hint: harmless past the end on the last tile).
-                if zc_pkt_pf_enabled() {
-                    let next = (g0 + 64) * 8;
+                // Packed-burst look-ahead. Incumbent: one tile (64 rows,
+                // ~4 consume iterations). Far arm: two tiles — same eight
+                // T0 hints, different address, analog of LC_ZFOLD_PF_CHUNKS
+                // on the block-major fold. Harmless past the end.
+                if pkt_pf {
+                    let ahead = if pkt_pf_far { 128 } else { 64 };
+                    let next = (g0 + ahead) * 8;
                     for l in 0..8 {
                         _mm_prefetch(
                             a_pkt.add(next + 64 * l).cast::<i8>(),
@@ -967,6 +971,18 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_PKT_PF_FAR=1` restores one-tile-ahead packed-burst prefetch
+/// (`g0+64` / `4·xg+64`). Default ON: two tiles ahead, same eight T0
+/// hints per refill, so the miss overlaps a full extra GFNI tile — the
+/// analog of `FLOCK_NO_LC_ZFOLD_PF` (promoted `e2b59a7` +1.79%) which
+/// moved the block-major fold's prefetch from "next stripe, this column"
+/// to "these rows, two grouped visits later". Prefetch is a hint.
+pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF_FAR").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_WTAB=1` disables the hoisted per-pass `(w, w·x⁶⁴)` pair
 /// table in the zerocheck message sweeps (exact same-binary A/B; the table
 /// holds the identical values the sweep otherwise derives per iteration).
@@ -1288,6 +1304,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let pkt_pf = zc_pkt_pf_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let pkt_pf_far = zc_pkt_pf_far_enabled();
         while x_lo + 8 <= lo_size {
             let ol = 2 * x_lo; // local output index of group 0
             let xg = out_base + ol;
@@ -1320,11 +1340,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
                     }
-                    // Next tile's 512-byte bursts, one refill ahead of the
-                    // consumer — see the round-2 twin for the rationale.
-                    // Same addresses on both refill arms.
-                    if zc_pkt_pf_enabled() {
-                        let next = (4 * xg + 64) * 8;
+                    // Packed-burst look-ahead. Incumbent: one tile. Far arm:
+                    // two tiles — see the round-2 twin. Same addresses on
+                    // both refill arms.
+                    if pkt_pf {
+                        let ahead = if pkt_pf_far { 128 } else { 64 };
+                        let next = (4 * xg + ahead) * 8;
                         for l in 0..8 {
                             _mm_prefetch(
                                 a_pkt.add(next + 64 * l).cast::<i8>(),
