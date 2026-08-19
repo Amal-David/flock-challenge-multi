@@ -81,6 +81,146 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
 }
 
 // ---------------------------------------------------------------------------
+// GFNI prefold dead-line plan (x86 round-2 / cascade-L1 batch folds).
+// ---------------------------------------------------------------------------
+
+/// `FLOCK_NO_PREFOLD_ROW_SKIP=1` restores the unpredicated 64-row GFNI
+/// prefold (every tile line loaded). Output is bit-identical either way —
+/// the switch exists only for same-binary A/B screening and bisection.
+#[cfg_attr(
+    not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
+    allow(dead_code)
+)]
+fn prefold_row_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_PREFOLD_ROW_SKIP").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// **Exact** provably-zero post-URM row set implied by the [`PaddingSpec`]:
+/// returns `(row_in_block_mask, first_dead_row)` such that post-URM row `r`
+/// holds an all-zero packed chunk iff `(r & row_in_block_mask) >=
+/// first_dead_row`. `None` when the shape has no dead rows.
+///
+/// A post-URM row is one `2^k_skip`-bit chunk of a padding block. Row `c`
+/// of a block covers witness bits `c·2^k_skip .. (c+1)·2^k_skip`, so it is
+/// entirely inside the block's zero tail iff `c·2^k_skip >=
+/// useful_bits_per_block`, i.e. `c >= ceil(useful_bits_per_block / 2^k_skip)`.
+///
+/// At the ranked BLAKE3 shape (`k_log = 14`, `useful_bits_per_block = 15409`,
+/// `k_skip = 6`): 256 rows per block, `first_dead_row = ceil(15409/64) = 241`,
+/// so rows 241..=255 — **15 rows of every 256** — are provably zero.
+///
+/// This is the *tightest* statement of the dead set and is the reference the
+/// line-granular plan below is proved against; the hot path derives its plan
+/// from [`round2_pair_skip`]'s already-trusted pair predicate instead, which
+/// is provably equivalent at 8-row granularity (see
+/// `prefold_line_plan_matches_exact_padding_derivation`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn round2_row_zero(padding: &PaddingSpec, k_skip: usize) -> Option<(usize, usize)> {
+    if padding.k_log <= k_skip {
+        return None;
+    }
+    let rows_per_block = 1usize << (padding.k_log - k_skip);
+    let chunk_bits = 1usize << k_skip;
+    let first_dead_row = padding.useful_bits_per_block.div_ceil(chunk_bits);
+    if first_dead_row >= rows_per_block {
+        return None;
+    }
+    Some((rows_per_block - 1, first_dead_row))
+}
+
+/// Dead-line plan for one 64-row GFNI prefold tile: bit `i` of the result is
+/// set iff the tile's `i`-th 64-byte line (packed rows `tile_base_row + 8i
+/// ..= tile_base_row + 8i + 7`) is entirely inside padding, so the kernel may
+/// substitute an all-zero register for that load.
+///
+/// **Value-derived, refusing off-shape.** The two inputs are exactly what
+/// [`round2_pair_skip`] derived from the [`PaddingSpec`] at runtime; every
+/// premise the plan needs is re-checked here and a violation returns `0`
+/// (= load every line, the incumbent behaviour):
+///
+/// 1. `useful_pairs_inclusive == usize::MAX` (or `pair_in_block_mask == 0`)
+///    is `round2_pair_skip`'s "nothing is dead" sentinel.
+/// 2. `pairs_per_block = pair_in_block_mask + 1` must be a power of two —
+///    otherwise the mask is not a block-position mask at all.
+/// 3. `rows_per_block = 2 · pairs_per_block` must be a multiple of 64, and
+///    `tile_base_row` a multiple of 64. Together these put the whole 64-row
+///    tile inside one padding block, so `tile_base_row & (rows_per_block − 1)`
+///    is the tile's block-local start and no line straddles a block edge.
+/// 4. `first_dead_row = 2 · useful_pairs_inclusive` must be `< rows_per_block`.
+///
+/// **Soundness.** `round2_pair_skip` establishes that a pair `p` with
+/// `(p & pair_in_block_mask) >= useful_pairs_inclusive` lies wholly in
+/// padding; its two rows are `2p` and `2p+1`, so every block-local row
+/// `>= 2 · useful_pairs_inclusive` is a padding row. A tile line whose
+/// block-local start `local + 8i` is `>= first_dead_row` therefore contains
+/// only padding rows, and — because rows only ever reach an accumulator
+/// through the pair they belong to — *every* pair owning a row of that line
+/// is already `continue`d by the consuming loop. The folded values the
+/// kernel would have computed there are never read, so zeroing them is
+/// unobservable regardless of what bytes the padding region actually holds.
+///
+/// At the ranked shape (`pair_in_block_mask = 127`,
+/// `useful_pairs_inclusive = 121`): `rows_per_block = 256`,
+/// `first_dead_row = 242`, and only the tile at block-local start 192 has a
+/// dead line — its last one, rows 248..=255. That is **1 of the 32 lines of
+/// every 256-row block**.
+#[cfg_attr(
+    not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
+    allow(dead_code)
+)]
+pub(crate) fn prefold_dead_line_mask(
+    tile_base_row: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> u8 {
+    if useful_pairs_inclusive == usize::MAX || pair_in_block_mask == 0 {
+        return 0;
+    }
+    let pairs_per_block = pair_in_block_mask + 1;
+    if !pairs_per_block.is_power_of_two() {
+        return 0;
+    }
+    let rows_per_block = 2 * pairs_per_block;
+    if !rows_per_block.is_multiple_of(64) || !tile_base_row.is_multiple_of(64) {
+        return 0;
+    }
+    let first_dead_row = useful_pairs_inclusive.saturating_mul(2);
+    if first_dead_row >= rows_per_block {
+        return 0;
+    }
+    let local = tile_base_row & (rows_per_block - 1);
+    let mut mask = 0u8;
+    for i in 0..8 {
+        if local + 8 * i >= first_dead_row {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+/// [`prefold_dead_line_mask`] behind the kill switch — what the kernels call.
+/// The predicate itself stays pure so its proof tests are independent of the
+/// environment they run in.
+#[cfg_attr(
+    not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
+    allow(dead_code)
+)]
+#[inline]
+pub(crate) fn prefold_dead_line_mask_gated(
+    tile_base_row: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> u8 {
+    if !prefold_row_skip_enabled() {
+        return 0;
+    }
+    prefold_dead_line_mask(tile_base_row, pair_in_block_mask, useful_pairs_inclusive)
+}
+
+// ---------------------------------------------------------------------------
 // Lagrange weights for the univariate-skip fold at z.
 // ---------------------------------------------------------------------------
 
@@ -3694,6 +3834,349 @@ mod tests {
                 assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask} nt={nt_out}");
                 assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask} nt={nt_out}");
             }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // GFNI prefold dead-line skip.
+    // ----------------------------------------------------------------------
+
+    /// The ranked BLAKE3 padding shape as `R1CS::padding_spec` (RowMajor)
+    /// hands it to the zerocheck: `2^14`-bit blocks, 15409 useful bits each.
+    fn ranked_padding() -> PaddingSpec {
+        PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        }
+    }
+
+    /// The derived dead set at the ranked shape, end to end: 15 provably-zero
+    /// post-URM rows per 256-row block (241..=255), of which exactly one
+    /// aligned 8-row group — one 64-byte line, rows 248..=255 — is fully dead.
+    #[test]
+    fn prefold_ranked_dead_set_is_one_line_of_thirty_two() {
+        let padding = ranked_padding();
+        let k_skip = 6;
+
+        // Exact derivation from the PaddingSpec.
+        let (row_in_block_mask, first_dead_row) = round2_row_zero(&padding, k_skip).unwrap();
+        assert_eq!(row_in_block_mask, 255, "2^(14-6) = 256 post-URM rows/block");
+        assert_eq!(first_dead_row, 241, "ceil(15409 / 64)");
+        assert_eq!(256 - first_dead_row, 15, "15 dead rows per block");
+        // Row 240 straddles the useful/padding boundary; row 241 is the first
+        // whose whole 64-bit chunk sits past `useful_bits_per_block`.
+        assert!(240 * 64 < padding.useful_bits_per_block);
+        assert!(241 * 64 >= padding.useful_bits_per_block);
+
+        // The pair predicate the kernels already carry.
+        let (pair_mask, useful_pairs) = round2_pair_skip(&padding, k_skip);
+        assert_eq!((pair_mask, useful_pairs), (127, 121));
+
+        // Line plan: only the block's last 64-row tile has a dead line, and
+        // only its last one. 1 of the block's 32 lines = 3.125% of the
+        // prefold's packed-row read volume.
+        let masks: Vec<u8> = (0..4)
+            .map(|t| prefold_dead_line_mask(64 * t, pair_mask, useful_pairs))
+            .collect();
+        assert_eq!(masks, vec![0, 0, 0, 0b1000_0000]);
+        let dead_lines: u32 = masks.iter().map(|m| m.count_ones()).sum();
+        assert_eq!(dead_lines, 1, "1 dead 64-byte line of the block's 32");
+
+        // It is the block position that decides, not the absolute row.
+        for block in 0..5usize {
+            for t in 0..4usize {
+                let base = 256 * block + 64 * t;
+                let want = if t == 3 { 0b1000_0000 } else { 0 };
+                assert_eq!(
+                    prefold_dead_line_mask(base, pair_mask, useful_pairs),
+                    want,
+                    "base={base}"
+                );
+            }
+        }
+    }
+
+    /// At 64-byte-line granularity the pair-conservative plan the hot path
+    /// uses is **identical** to the exact `useful_bits` derivation, for every
+    /// padding shape — so the skip needs no premise beyond the pair predicate
+    /// `round2_pair_skip` already established.
+    ///
+    /// Proof (checked exhaustively over `first_dead_row` below): with
+    /// `f = ceil(useful_bits / 2^k_skip)` the exact first dead row, the pair
+    /// form uses `2·ceil(f/2)`, which is `f` when `f` is even and `f + 1` when
+    /// `f` is odd. A line start `q` is a multiple of 8, hence even, so
+    /// `q >= f` and `q >= f + 1` are the same condition when `f` is odd.
+    #[test]
+    fn prefold_line_plan_matches_exact_padding_derivation() {
+        for k_log in 7..=16usize {
+            for k_skip in [3usize, 4, 5, 6] {
+                if k_log <= k_skip + 1 {
+                    continue;
+                }
+                let chunk_bits = 1usize << k_skip;
+                let rows_per_block = 1usize << (k_log - k_skip);
+                for f in 1..=rows_per_block {
+                    for useful in [(f - 1) * chunk_bits + 1, f * chunk_bits] {
+                        let padding = PaddingSpec {
+                            k_log,
+                            useful_bits_per_block: useful,
+                        };
+                        assert_eq!(
+                            round2_row_zero(&padding, k_skip).map(|(_, r)| r),
+                            (f < rows_per_block).then_some(f),
+                            "k_log={k_log} k_skip={k_skip} useful={useful}"
+                        );
+                        let (pair_mask, useful_pairs) = round2_pair_skip(&padding, k_skip);
+                        for t in 0..rows_per_block.div_ceil(64) {
+                            let base = 64 * t;
+                            let got = prefold_dead_line_mask(base, pair_mask, useful_pairs);
+                            let want = if !rows_per_block.is_multiple_of(64) {
+                                // Tiles do not nest inside a block: refused.
+                                0
+                            } else {
+                                let mut m = 0u8;
+                                for i in 0..8 {
+                                    if f < rows_per_block && base + 8 * i >= f {
+                                        m |= 1 << i;
+                                    }
+                                }
+                                m
+                            };
+                            assert_eq!(
+                                got, want,
+                                "k_log={k_log} k_skip={k_skip} useful={useful} tile={t}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every premise the plan needs is re-checked at runtime; a violation
+    /// returns "load every line", never a wrong skip.
+    #[test]
+    fn prefold_line_plan_refuses_off_shape() {
+        // Dense padding: `round2_pair_skip`'s "nothing is dead" sentinel.
+        let (pm, up) = round2_pair_skip(&PaddingSpec::dense(32), 6);
+        assert_eq!((pm, up), (0, usize::MAX));
+        assert_eq!(prefold_dead_line_mask(0, pm, up), 0);
+        assert_eq!(prefold_dead_line_mask(192, pm, up), 0);
+        assert_eq!(round2_row_zero(&PaddingSpec::dense(32), 6), None);
+
+        // Sentinel and degenerate inputs.
+        assert_eq!(prefold_dead_line_mask(192, 127, usize::MAX), 0);
+        assert_eq!(prefold_dead_line_mask(192, 0, 121), 0);
+        // Non-power-of-two "block": not a block-position mask.
+        assert_eq!(prefold_dead_line_mask(192, 100, 50), 0);
+        // Block shorter than one tile (8 rows): tiles cannot nest.
+        assert_eq!(prefold_dead_line_mask(0, 3, 2), 0);
+        // Tile base not 64-row aligned: the block-local start is unusable.
+        assert_eq!(prefold_dead_line_mask(200, 127, 121), 0);
+        // Nothing dead at pair granularity.
+        assert_eq!(prefold_dead_line_mask(192, 127, 128), 0);
+        // Dead rows exist but no aligned group of 8 is fully dead.
+        assert_eq!(prefold_dead_line_mask(192, 127, 126), 0);
+    }
+
+    /// The kill switch gates the plan the kernels consume, and nothing else:
+    /// the predicate itself is pure, so every proof above holds in either
+    /// switch state. Deterministic whichever way the suite is run.
+    #[test]
+    fn prefold_kill_switch_gates_the_plan() {
+        let (pair_mask, useful_pairs) = round2_pair_skip(&ranked_padding(), 6);
+        let pure = prefold_dead_line_mask(192, pair_mask, useful_pairs);
+        assert_eq!(pure, 0b1000_0000);
+        let want = if prefold_row_skip_enabled() { pure } else { 0 };
+        assert_eq!(
+            prefold_dead_line_mask_gated(192, pair_mask, useful_pairs),
+            want
+        );
+        // Off-shape stays off-shape through the gate.
+        assert_eq!(
+            prefold_dead_line_mask_gated(200, pair_mask, useful_pairs),
+            0
+        );
+    }
+
+    /// Scalar model of one 64-row GFNI prefold tile applying the same
+    /// dead-line predicate as `gfni_fold64_rows_masked`: a dead line yields
+    /// `fold_one_row(0) = 0`, every other row the true table fold.
+    fn prefold_tile_scalar(
+        packed: &[u8],
+        table: &UniSkipFoldTable,
+        tile_base_row: usize,
+        dead_lines: u8,
+    ) -> Vec<F128> {
+        let nc = table.n_chunks;
+        (0..64)
+            .map(|i| {
+                if dead_lines & (1u8 << (i / 8)) != 0 {
+                    return F128::ZERO;
+                }
+                let r = tile_base_row + i;
+                table.fold_one_row(&packed[r * nc..(r + 1) * nc])
+            })
+            .collect()
+    }
+
+    /// Zero-propagation with teeth: garbage poured into the rows the plan
+    /// declares dead is **invisible** with the skip ON (the tile is identical
+    /// to the unpredicated fold of the genuinely-zero buffer) and **visible**
+    /// with the skip OFF.
+    #[test]
+    fn prefold_dead_line_absorbs_poison() {
+        let mut rng = Rng::new(0xF01D_5EED);
+        let k_skip = 6;
+        let table = UniSkipFoldTable::new(k_skip, rng.f128());
+        let (pair_mask, useful_pairs) = round2_pair_skip(&ranked_padding(), k_skip);
+        let nc = table.n_chunks;
+
+        // One padding block: rows 0..241 carry witness bits, 241..=255 are the
+        // zero tail the padding spec guarantees.
+        let mut clean = vec![0u8; 256 * nc];
+        for byte in clean[..241 * nc].iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        let mut poisoned = clean.clone();
+        for (i, byte) in poisoned[248 * nc..].iter_mut().enumerate() {
+            *byte = 0xA5 ^ (i as u8);
+        }
+
+        let dead = prefold_dead_line_mask(192, pair_mask, useful_pairs);
+        assert_eq!(dead, 0b1000_0000);
+
+        let reference = prefold_tile_scalar(&clean, &table, 192, 0);
+        assert!(
+            reference[49..].iter().all(|v| *v == F128::ZERO),
+            "rows 241..=255 fold to zero: T_j[0] = 0 in every byte table"
+        );
+
+        let on = prefold_tile_scalar(&poisoned, &table, 192, dead);
+        assert_eq!(on, reference, "poison must be invisible with the skip ON");
+
+        let off = prefold_tile_scalar(&poisoned, &table, 192, 0);
+        assert_ne!(off, reference, "poison must be visible with the skip OFF");
+    }
+
+    /// The consumer-level claim that licenses the skip: no row of a dead line
+    /// reaches any accumulator or any written table slot. Checked on the
+    /// portable round-two chunk path (the same predicate the AVX-512 kernel
+    /// applies), so it runs on every host.
+    #[test]
+    fn round2_chunk_never_reads_a_dead_line() {
+        let mut rng = Rng::new(0xBEEF_2026);
+        let k_skip = 6;
+        let table = UniSkipFoldTable::new(k_skip, rng.f128());
+        let (pair_mask, useful_pairs) = round2_pair_skip(&ranked_padding(), k_skip);
+        let nc = table.n_chunks;
+        // lo_size = 128 pairs = exactly one padding block.
+        let lo_size = 128usize;
+        let mut a = vec![0u8; 2 * lo_size * nc];
+        let mut b = vec![0u8; 2 * lo_size * nc];
+        for byte in a[..241 * nc].iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        for byte in b[..241 * nc].iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        let eq_lo = rng.f128_vec(lo_size);
+
+        let run = |a: &[u8], b: &[u8]| {
+            let mut a_chunk = vec![F128::ZERO; 2 * lo_size];
+            let mut b_chunk = vec![F128::ZERO; 2 * lo_size];
+            let out = round2_lookahead_chunk_scalar::<true>(
+                a,
+                b,
+                &table,
+                &mut a_chunk,
+                &mut b_chunk,
+                &eq_lo,
+                0,
+                0,
+                pair_mask,
+                useful_pairs,
+            );
+            (out, a_chunk, b_chunk)
+        };
+        let base = run(&a, &b);
+
+        // Poison exactly the dead line (rows 248..=255).
+        let (mut ap, mut bp) = (a.clone(), b.clone());
+        for byte in ap[248 * nc..].iter_mut() {
+            *byte = 0x5A;
+        }
+        for byte in bp[248 * nc..].iter_mut() {
+            *byte = 0xC3;
+        }
+        assert_eq!(run(&ap, &bp), base, "dead-line rows must not be read");
+
+        // Wider: every row of a skipped pair (242..=255) is equally unread.
+        let (mut ap2, mut bp2) = (a.clone(), b.clone());
+        for byte in ap2[242 * nc..].iter_mut() {
+            *byte = 0x11;
+        }
+        for byte in bp2[242 * nc..].iter_mut() {
+            *byte = 0x22;
+        }
+        assert_eq!(run(&ap2, &bp2), base);
+
+        // Teeth: row 240 belongs to the boundary pair 120, which is inside the
+        // useful range — poisoning it MUST change the result.
+        let mut ap3 = a.clone();
+        ap3[240 * nc] ^= 0xFF;
+        assert_ne!(run(&ap3, &b), base, "row 240 is live");
+    }
+
+    /// Byte-identity of the predicated prefold against the unpredicated
+    /// kernel, on hardware. Compiles wherever the AVX-512/GFNI arms compile
+    /// (e.g. `-C target-cpu=sapphirerapids`); on hosts without those features
+    /// the portable oracles above carry the proof.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_masked_prefold_matches_unpredicated_kernel() {
+        let mut rng = Rng::new(0x9E37_79B9);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mats = kernels::x86_64::build_row_fold_mats(&table.data);
+        let nc = table.n_chunks;
+        let mut clean = vec![0u8; 64 * nc];
+        for byte in clean[..56 * nc].iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        let mut poisoned = clean.clone();
+        for byte in poisoned[56 * nc..].iter_mut() {
+            *byte = 0xA5;
+        }
+
+        let mut want = [F128::ZERO; 64];
+        let mut got = [F128::ZERO; 64];
+        let mut off = [F128::ZERO; 64];
+        // SAFETY: each call gets 512 readable input bytes and 64 writable
+        // F128 outputs; the cfg gate supplies every intrinsic feature.
+        unsafe {
+            kernels::x86_64::gfni_fold64_rows(clean.as_ptr(), &mats, want.as_mut_ptr());
+            kernels::x86_64::gfni_fold64_rows_masked(
+                poisoned.as_ptr(),
+                &mats,
+                got.as_mut_ptr(),
+                0b1000_0000,
+            );
+            kernels::x86_64::gfni_fold64_rows_masked(poisoned.as_ptr(), &mats, off.as_mut_ptr(), 0);
+        }
+        assert_eq!(got, want, "masked prefold must be byte-identical");
+        assert_ne!(off, want, "poison must be visible with the skip OFF");
+        for r in 0..64 {
+            assert_eq!(
+                want[r],
+                table.fold_one_row(&clean[r * nc..(r + 1) * nc]),
+                "unpredicated kernel vs scalar table fold, row {r}"
+            );
         }
     }
 }
