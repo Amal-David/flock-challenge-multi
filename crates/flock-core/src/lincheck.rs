@@ -258,8 +258,27 @@ pub struct CscCircuit {
     a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
     b_rows: Vec<u32>,
+    /// Narrow (`u16`) copies of `a_rows`/`b_rows`, used when every row index
+    /// fits in 16 bits (`n_rows <= 65536`). The gather in
+    /// [`LincheckCircuit::fold_alpha_batched`] streams the whole index array
+    /// once per proof — at the BLAKE3 shape that is ~84 MB of `u32` against a
+    /// 256 KiB `eq_inner` that stays in L2, so the pass is bound by the index
+    /// stream, and halving it halves the DRAM traffic. When these are
+    /// populated `a_rows`/`b_rows` are emptied (never both representations).
+    a_rows16: Vec<u16>,
+    b_rows16: Vec<u16>,
+    /// True iff `a_rows16`/`b_rows16` hold the row indices.
+    narrow: bool,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
+}
+
+/// `FLOCK_NO_LC_CSC_U16=1` restores the 32-bit CSC row-index arrays in
+/// [`CscCircuit`] (exact A/B control: same sums, twice the index bytes).
+fn csc_u16_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CSC_U16").is_none());
+    *ON
 }
 
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
@@ -290,20 +309,50 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
 // Compact Debug — the row arrays run to millions of entries.
 impl std::fmt::Debug for CscCircuit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (nnz_a, nnz_b) = if self.narrow {
+            (self.a_rows16.len(), self.b_rows16.len())
+        } else {
+            (self.a_rows.len(), self.b_rows.len())
+        };
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
-            .field("nnz_a", &self.a_rows.len())
-            .field("nnz_b", &self.b_rows.len())
+            .field("nnz_a", &nnz_a)
+            .field("nnz_b", &nnz_b)
             .finish()
     }
 }
 
 impl CscCircuit {
     pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
+        Self::from_matrices_narrow(a_0, b_0, csc_u16_rows_enabled())
+    }
+
+    /// [`Self::from_matrices`] with the u16 row-index narrowing forced on or
+    /// off — the A/B oracle hook for tests (production goes through the
+    /// `FLOCK_NO_LC_CSC_U16` switch).
+    #[doc(hidden)]
+    pub fn from_matrices_narrow(
+        a_0: &SparseBinaryMatrix,
+        b_0: &SparseBinaryMatrix,
+        want_narrow: bool,
+    ) -> Self {
         assert_eq!(a_0.num_rows, b_0.num_rows);
         assert_eq!(a_0.num_cols, b_0.num_cols);
-        let (a_col_ptr, a_rows) = csc_from_rows(a_0);
-        let (b_col_ptr, b_rows) = csc_from_rows(b_0);
+        let (a_col_ptr, mut a_rows) = csc_from_rows(a_0);
+        let (b_col_ptr, mut b_rows) = csc_from_rows(b_0);
+        // Narrow the row indices to u16 when the base matrix has at most
+        // 2^16 rows (the BLAKE3/SHA-2 shapes have 2^14). Same values, half
+        // the bytes streamed by `fold_alpha_batched`.
+        let narrow = a_0.num_rows <= (1usize << 16) && want_narrow;
+        let (a_rows16, b_rows16) = if narrow {
+            let a16: Vec<u16> = a_rows.iter().map(|&r| r as u16).collect();
+            let b16: Vec<u16> = b_rows.iter().map(|&r| r as u16).collect();
+            a_rows = Vec::new();
+            b_rows = Vec::new();
+            (a16, b16)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Self {
             n_cols: a_0.num_cols,
             n_rows: a_0.num_rows,
@@ -311,6 +360,9 @@ impl CscCircuit {
             a_rows,
             b_col_ptr,
             b_rows,
+            a_rows16,
+            b_rows16,
+            narrow,
             const_pin: None,
         }
     }
@@ -319,6 +371,22 @@ impl CscCircuit {
     pub fn with_const_pin(mut self, const_pin: Option<usize>) -> Self {
         self.const_pin = const_pin;
         self
+    }
+
+    /// Evaluate `one_col` for every column — sequential below the rayon
+    /// threshold, one `par_iter_mut` dispatch above it. Shared by the u16 and
+    /// u32 gather bodies so both keep exactly the same dispatch structure.
+    #[inline]
+    fn map_cols(&self, one_col: impl Fn(usize) -> F128 + Sync + Send) -> Vec<F128> {
+        use rayon::prelude::*;
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            return (0..self.n_cols).map(one_col).collect();
+        }
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(c, slot)| *slot = one_col(c));
+        out
     }
 }
 
@@ -330,13 +398,33 @@ impl LincheckCircuit for CscCircuit {
         self.const_pin
     }
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
         // Row indices are `< n_rows` by construction ([`csc_from_rows`]);
         // checking here (once) instead of per nonzero drops the two-branch
         // bounds check from the ~7-instruction gather loop body.
         assert!(self.n_rows <= eq_inner.len());
-        let one_col = |c: usize| {
+        if self.narrow {
+            // u16 index stream: identical row order, identical XOR order,
+            // half the bytes read per nonzero.
+            return self.map_cols(|c| {
+                let mut sa = F128::ZERO;
+                for &r in
+                    &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
+                {
+                    // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+                    sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                let mut sb = F128::ZERO;
+                for &r in
+                    &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+                {
+                    // SAFETY: as above.
+                    sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                alpha * sa + sb
+            });
+        }
+        self.map_cols(|c| {
             let mut sa = F128::ZERO;
             for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
                 // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
@@ -348,15 +436,7 @@ impl LincheckCircuit for CscCircuit {
                 sb += *unsafe { eq_inner.get_unchecked(r as usize) };
             }
             alpha * sa + sb
-        };
-        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
-            return (0..self.n_cols).map(one_col).collect();
-        }
-        let mut out = vec![F128::ZERO; self.n_cols];
-        out.par_iter_mut()
-            .enumerate()
-            .for_each(|(c, slot)| *slot = one_col(c));
-        out
+        })
     }
 }
 
@@ -830,6 +910,22 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
+/// per-chunk `Instant::now()` probes inside the block-major sweep (the
+/// incumbent behaviour, and the way to get the tables / transpose+read /
+/// accumulate split back under `LINCHECK_TRACE`). Left on (default), the
+/// probes are skipped entirely: at the ranked shape the incumbent takes
+/// 4 clock reads per (tile, 128-column chunk) — 256 tiles × 121 chunks ×
+/// 4 ≈ 124 K `clock_gettime` calls per worker — in the middle of the
+/// witness sweep. Pure instrumentation: the folded values are identical
+/// either way.
+fn fold_untimed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none()
+    });
+    *ON
+}
+
 /// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
 /// outer weights for the stripe beginning at `outer_base`; the sweep builds
 /// whichever subset tables its accumulate kernel needs from them (the
@@ -868,6 +964,15 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
     let dynamic = dynamic_tiles_enabled();
+    // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
+    // kill switch, which restores the always-on probes). Resolved once here
+    // so the worker loop reads a register, not the environment.
+    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
+    // so `LINCHECK_TRACE=1` measures the production sweep. Set
+    // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
+    // tables / transpose+read / accumulate split back (it costs ~1 ms/worker).
+    let timing = !fold_untimed_enabled();
 
     // Outer-tile partitioning reads every useful z chunk exactly once and
     // builds every sum table once. Each worker owns a private length-k partial;
@@ -939,7 +1044,11 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     target_feature = "avx512bw"
                 )))]
                 let use_nibble = false;
-                let tt0 = std::time::Instant::now();
+                let tt0 = if timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 for t in 0..tile_stripes {
                     let outer_base = 8 * (stripe_base + t);
                     let eq8 = eq8_at(outer_base);
@@ -955,13 +1064,19 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     build_sum_table(&eq8, &mut tables[t * 256..(t + 1) * 256]);
                 }
 
-                t_tables += tt0.elapsed();
+                if let Some(tt0) = tt0 {
+                    t_tables += tt0.elapsed();
+                }
                 // Keep one 128-column (2 KiB) output group hot while applying
                 // all tables in this outer tile.
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
-                    let tq0 = std::time::Instant::now();
+                    let tq0 = if timing {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     // Full tiles take the all-NEON gather + bit-transpose
                     // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
                     // swap rounds, no bounds checks) — byte-identical output
@@ -1005,8 +1120,14 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                             );
                         }
                     }
-                    t_tr += tq0.elapsed();
-                    let ta0 = std::time::Instant::now();
+                    if let Some(tq0) = tq0 {
+                        t_tr += tq0.elapsed();
+                    }
+                    let ta0 = if timing {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let group = &mut partial[inner_base..inner_base + chunk_bits];
                     // Full tiles take the two-stream NEON wavefront leaf
                     // (paired 8-column blocks, 16 register accumulators —
@@ -1063,10 +1184,12 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                         }
                         group[b] = acc;
                     }
-                    t_acc += ta0.elapsed();
+                    if let Some(ta0) = ta0 {
+                        t_acc += ta0.elapsed();
+                    }
                 }
             }
-            if std::env::var_os("LINCHECK_TRACE").is_some() {
+            if trace_fold {
                 eprintln!(
                     "[lc] fold worker {worker}: total {:.2} ms tables {:.2} transpose+read {:.2} acc {:.2}",
                     wt0.elapsed().as_secs_f64() * 1e3,
@@ -2415,6 +2538,30 @@ mod tests {
     }
 
     // ---- Unit tests for the kernels ----
+
+    /// The u16-narrowed CSC row indices produce exactly the same
+    /// `fold_alpha_batched` output as the u32 arrays (oracle A/B for
+    /// `FLOCK_NO_LC_CSC_U16`), for both the sequential and the rayon branch.
+    #[test]
+    fn csc_u16_rows_match_u32_rows() {
+        for &(k, nnz) in &[(64usize, 500usize), (1 << 12, 40_000), (1 << 13, 90_000)] {
+            let mut rng = Rng::new(0xC5C1_6000 ^ k as u64);
+            let a = random_sparse_matrix(k, nnz, &mut rng);
+            let b = random_sparse_matrix(k, nnz, &mut rng);
+            let wide = CscCircuit::from_matrices_narrow(&a, &b, false);
+            let narrow = CscCircuit::from_matrices_narrow(&a, &b, true);
+            assert!(!wide.narrow);
+            assert!(narrow.narrow);
+            let alpha = rng.f128();
+            let eq: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+            let want = wide.fold_alpha_batched(alpha, &eq);
+            let got = narrow.fold_alpha_batched(alpha, &eq);
+            assert_eq!(want, got, "k={k}");
+            // …and both agree with the row-scatter reference.
+            let reference = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
+            assert_eq!(want, reference, "k={k} reference");
+        }
+    }
 
     /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]

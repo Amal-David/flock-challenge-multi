@@ -3529,16 +3529,7 @@ fn materialize_direct_fold4(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            // `compose_block_table` writes every table slot before any read;
-            // the nested mid path writes every mid slot before any read.
-            // Ranked DirectFold4 has `mid_len == 0`. Zero-init is a dead 64 KiB
-            // store per worker.
-            || {
-                (
-                    crate::alloc_uninit_f128_vec(table_len),
-                    crate::alloc_uninit_f128_vec(mid_len),
-                )
-            },
+            || (vec![F128::ZERO; table_len], vec![F128::ZERO; mid_len]),
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
@@ -3722,11 +3713,14 @@ fn materialize_direct_ab_fold2(
         .map_init(
             // Table-hot 2-claim keeps one 64 KiB composed table live per phase.
             || {
-                crate::alloc_uninit_f128_vec(if claims.len() == 2 {
-                    table_len
-                } else {
-                    claims.len() * table_len
-                })
+                vec![
+                    F128::ZERO;
+                    if claims.len() == 2 {
+                        table_len
+                    } else {
+                        claims.len() * table_len
+                    }
+                ]
             },
             |scratch, (block, (b_out, f_out))| {
                 // Production 2-claim table-hot path composes inside each phase.
