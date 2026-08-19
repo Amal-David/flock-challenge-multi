@@ -30,7 +30,7 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
@@ -77,6 +77,53 @@ const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 pub(crate) const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
+
+/// Chunk-count cap for round 1's outer eq split: `2^R1_SPLIT_MAX_N_HI`
+/// rayon `x_hi` tasks at most.
+const R1_SPLIT_MAX_N_HI: usize = 11;
+
+/// Per-`x_hi` `eq_lo` floor, in log2 windows. Round 1's GFNI eq-fold
+/// scratch is `2^(n_lo − 5) KiB` per worker; the incumbent `n_lo = 12`
+/// is 128 KiB (L1 overflow). `n_lo = 8` is 8 KiB and still a multiple
+/// of four (fold4 capture).
+const R1_SPLIT_MIN_LO_LOG: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static ROUND1_SPLIT_N_HI_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Outer eq split for every round-1 production (and serial-oracle) entry.
+///
+/// Incumbent [`SplitEqGhash::new`] caps `n_hi` at 7 → 128 `x_hi` tasks at
+/// every `m ≥ 20`. Ranked `m = 32` has 19 outer variables, so that is 128
+/// chunks of `lo_size = 2^12` — 8 chunks/worker on the scoring 16-thread
+/// pool, and the GFNI eq-fold's per-worker `plane_banks` is 128 KiB.
+/// Raising `n_hi` to 11 at that shape (2048 chunks, `lo_size = 2^8`) is
+/// the same exact tensor regrouping the packed-tail occupancy hop already
+/// shipped: `eq(x) = eq_hi[x_hi] · eq_lo[x_lo]`, F128 addition is XOR, the
+/// deferred reduction is F2-linear. `FLOCK_NO_ZC_R1_SPLIT=1` restores the
+/// 128-chunk split.
+fn round1_eq_split(r_outer: &[F128]) -> SplitEqGhash {
+    SplitEqGhash::with_n_hi(r_outer, round1_n_hi(r_outer.len()))
+}
+
+fn round1_n_hi(n_outer: usize) -> usize {
+    let base = n_outer.min(SplitEqGhash::MAX_N_HI);
+    #[cfg(test)]
+    if let Some(over) = ROUND1_SPLIT_N_HI_OVERRIDE.with(|c| c.get()) {
+        // Keep at least two lo variables so fold4's multiple-of-four lo
+        // half (`2^n_lo` with `n_lo ≥ 2`) still holds.
+        return over.min(n_outer.saturating_sub(2));
+    }
+    static OFF: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_SPLIT").is_some());
+    if *OFF {
+        return base;
+    }
+    base.max(R1_SPLIT_MAX_N_HI.min(n_outer.saturating_sub(R1_SPLIT_MIN_LO_LOG)))
+}
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
@@ -1299,7 +1346,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1453,7 +1500,7 @@ pub(crate) fn round1_with_s_hat_v_impl(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1548,7 +1595,7 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1652,15 +1699,15 @@ pub(crate) fn c_fold4_capture_shape_ok(big_lo_size: usize) -> bool {
 }
 
 /// Shape predicate the zerocheck driver uses to pick the fold4 producer:
-/// the outer eq split (`SplitEqGhash::new(&r[k_skip + N_INNER..])`) must
-/// leave a multiple-of-four low half (true for every `m >= 22`, in
-/// particular the ranked `m = 32`).
+/// the outer eq split ([`round1_eq_split`]) must leave a multiple-of-four
+/// low half (true for every `m >= 22`, in particular the ranked `m = 32`).
 pub fn c_fold4_capture_available(m: usize, k_skip: usize) -> bool {
     if k_skip != K_SKIP || m < k_skip + N_INNER {
         return false;
     }
     let n = m - k_skip - N_INNER;
-    let n_lo = n - n.min(SplitEqGhash::MAX_N_HI);
+    let n_hi = round1_n_hi(n);
+    let n_lo = n - n_hi;
     c_fold4_capture_shape_ok(1usize << n_lo)
 }
 
@@ -2201,7 +2248,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     assert!(
         c_fold4_capture_shape_ok(big_lo_size),
@@ -2488,7 +2535,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2644,7 +2691,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2826,6 +2873,75 @@ mod tests {
         let out1 = round1_shift_reduce_extract_c(&a, &b, &c, m, K_SKIP, &r, &table);
         let out2 = round1_shift_reduce_extract_c(&a, &b, &c, m, K_SKIP, &r, &table);
         assert_eq!(out1, out2);
+    }
+
+    /// Every admissible outer `n_hi` is value-identical: the eq tensor
+    /// factors exactly, F128 addition is XOR, and the deferred reduction is
+    /// F2-linear. Covers the fused extract_c path and the ranked AB-only
+    /// identity-C consumer.
+    #[test]
+    fn round1_outer_split_n_hi_is_value_identical() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ROUND1_SPLIT_N_HI_OVERRIDE.with(|c| c.set(None));
+            }
+        }
+        let _reset = Reset;
+
+        assert_eq!(round1_n_hi(19), 11, "ranked m=32 outer");
+        assert_eq!(round1_n_hi(17), 9, "m=30 outer");
+        assert_eq!(round1_n_hi(15), 7, "below lo floor stays incumbent");
+        assert_eq!(round1_n_hi(7), 7);
+
+        let m = 20usize;
+        let n_outer = m - K_SKIP - N_INNER;
+        let mut rng = Rng::new(0x51_5b17);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c = rng.bits(1 << m);
+        let a_p = pack_bits(&a);
+        let b_p = pack_bits(&b);
+        let c_p = pack_bits(&c);
+        let outer = rng.f128_vec(n_outer);
+        let r = build_protocol_r(m, &outer);
+        let table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+
+        ROUND1_SPLIT_N_HI_OVERRIDE.with(|cell| cell.set(Some(SplitEqGhash::MAX_N_HI)));
+        let expected = round1_shift_reduce_extract_c_packed(
+            &a_p, &b_p, &c_p, m, K_SKIP, &r, &table,
+        );
+        let mut pre_expected = precompute_round1_ab_inner_packed_padded(
+            &a_p, &b_p, m, K_SKIP, &table, &padding,
+        );
+        let expected_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut pre_expected,
+            &a_p,
+            &b_p,
+            m,
+            K_SKIP,
+            &r,
+            &table,
+            &padding,
+        );
+
+        // n_hi = 0 is a single chunk; n_hi = n_outer-2 keeps n_lo ≥ 2.
+        for n_hi in 0..=n_outer.saturating_sub(2) {
+            ROUND1_SPLIT_N_HI_OVERRIDE.with(|cell| cell.set(Some(n_hi)));
+            let got = round1_shift_reduce_extract_c_packed(
+                &a_p, &b_p, &c_p, m, K_SKIP, &r, &table,
+            );
+            assert_eq!(got, expected, "extract_c mismatch at n_hi={n_hi}");
+            let mut pre = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let got_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &mut pre, &a_p, &b_p, m, K_SKIP, &r, &table, &padding,
+            );
+            assert_eq!(got_ab, expected_ab, "AB-only mismatch at n_hi={n_hi}");
+        }
     }
 
     /// **The defining cross-check**: `C_s · (opt_AB + opt_C) == naive_AB + naive_C`,
@@ -3455,7 +3571,7 @@ mod tests {
             let inv_table = make_inv_table();
             let padding = PaddingSpec::dense(m);
 
-            let hi_size = 1usize << SplitEqGhash::new(&r[K_SKIP + N_INNER..]).n_hi;
+            let hi_size = 1usize << round1_eq_split(&r[K_SKIP + N_INNER..]).n_hi;
             let g = (hi_size / 2).max(1);
 
             let pure_cpu = round1_with_s_hat_v_impl(
