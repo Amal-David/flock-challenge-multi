@@ -408,15 +408,13 @@ impl LincheckCircuit for CscCircuit {
             // half the bytes read per nonzero.
             return self.map_cols(|c| {
                 let mut sa = F128::ZERO;
-                for &r in
-                    &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
+                for &r in &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
                 {
                     // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
                     sa += *unsafe { eq_inner.get_unchecked(r as usize) };
                 }
                 let mut sb = F128::ZERO;
-                for &r in
-                    &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+                for &r in &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
                 {
                     // SAFETY: as above.
                     sb += *unsafe { eq_inner.get_unchecked(r as usize) };
@@ -884,11 +882,14 @@ fn fold_block_major_one_shot(
 /// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
 /// of the block-major sweep (exact A/B control: the scalar 256-entry
 /// byte-table loop runs instead). Resolved once per process.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 fn lincheck_nibble_fold_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none());
     *ON
 }
 
@@ -907,7 +908,11 @@ pub(crate) static BM_GFNI_FORCED_OFF: std::sync::atomic::AtomicBool =
 /// block-major sweep (exact same-binary A/B). Distinct from
 /// `FLOCK_NO_LC_GFNI`, which guards only the byte-stripe dispatcher — the
 /// block-major path never reaches it. Resolved once per process.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
 fn block_major_gfni_enabled() -> bool {
     #[cfg(test)]
     if BM_GFNI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
@@ -921,18 +926,16 @@ fn block_major_gfni_enabled() -> bool {
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none());
     *ON
 }
 
 /// `FLOCK_NO_LC_REDUCE_SINGLE_PASS=1` restores the per-worker sequence of
 /// rayon reductions of the block-major partials (exact A/B control).
 fn reduce_single_pass_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none());
     *ON
 }
 
@@ -946,9 +949,8 @@ fn reduce_single_pass_enabled() -> bool {
 /// witness sweep. Pure instrumentation: the folded values are identical
 /// either way.
 fn fold_untimed_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none());
     *ON
 }
 
@@ -962,7 +964,11 @@ fn fold_untimed_enabled() -> bool {
 /// past `useful_bits` land on index bytes that are ZERO in memory (r1cs
 /// zero padding) through a linear map with no constant — contributing
 /// nothing, exactly like the masked stores they replace.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
 #[allow(clippy::too_many_arguments)]
 fn fold_block_major_gfni(
     z_packed: &[F128],
@@ -1018,15 +1024,39 @@ fn fold_block_major_gfni(
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
-                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                        let outer_base = 8 * (stripe_base + t);
-                        let lanes: [F128; 8] = std::array::from_fn(|r| {
-                            z_packed[(outer_base + r) * chunks_per_block + q]
-                        });
-                        transpose_8_f128s_to_128_bytes(
-                            &lanes,
-                            &mut transposed[t * 128..(t + 1) * 128],
-                        );
+                    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+                    let transposed_done = if kernels::lincheck_gather_transpose_enabled() {
+                        // SAFETY: lane (t, r) is read at index
+                        // `(8·(stripe_base + t) + r) · chunks_per_block + q`
+                        // — exactly the indices the scalar path reads; q <
+                        // useful_chunks ≤ chunks_per_block keeps all 64 in
+                        // bounds. The output is the whole 8×128 `transposed`.
+                        unsafe {
+                            kernels::gather_transpose_tile_x86(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+                    let transposed_done = false;
+                    if !transposed_done {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let outer_base = 8 * (stripe_base + t);
+                            let lanes: [F128; 8] = std::array::from_fn(|r| {
+                                z_packed[(outer_base + r) * chunks_per_block + q]
+                            });
+                            transpose_8_f128s_to_128_bytes(
+                                &lanes,
+                                &mut transposed[t * 128..(t + 1) * 128],
+                            );
+                        }
                     }
                     // SAFETY: `transposed` holds 8 stripes x 128 bytes at
                     // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
@@ -1125,11 +1155,12 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     // GFNI plane-major arm: exact-tile shapes only (no ragged last tile),
     // 64-column blocks available. Everything else falls through to the
     // incumbent nibble/scalar sweep unchanged.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
-    if block_major_gfni_enabled()
-        && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0
-        && k_log >= 6
-    {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    if block_major_gfni_enabled() && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0 && k_log >= 6 {
         let _ = (trace_fold, timing);
         return fold_block_major_gfni(
             z_packed,
@@ -1277,7 +1308,40 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                     } else {
                         false
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vbmi"
+                    ))]
+                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                        && kernels::lincheck_gather_transpose_enabled()
+                    {
+                        // SAFETY: same index contract as the aarch64 arm and
+                        // the GFNI sweep gather — `q < useful_chunks` and a
+                        // full 8-stripe tile.
+                        unsafe {
+                            kernels::gather_transpose_tile_x86(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(
+                        target_arch = "aarch64",
+                        all(
+                            target_arch = "x86_64",
+                            target_feature = "avx512f",
+                            target_feature = "avx512bw",
+                            target_feature = "avx512vbmi"
+                        )
+                    )))]
                     let transposed_done = false;
                     if !transposed_done {
                         for t in 0..tile_stripes {
@@ -1463,7 +1527,11 @@ fn partial_fold_packed_z_best(
             #[cfg(all(target_feature = "avx512f", target_feature = "gfni"))]
             if k_log >= 6 && lincheck_gfni_enabled() {
                 return kernels::partial_fold_packed_z_x86_gfni_padded(
-                    z_packed, m, k_log, useful_bits, eq_outer,
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer,
                 );
             }
             partial_fold_packed_z_x86_tiled_padded(z_packed, m, k_log, useful_bits, eq_outer)
@@ -1978,11 +2046,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let prepared = LAST_RHO.with(|slot| {
         let mut slot = slot.borrow_mut();
         match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
-            LastRhoSlot::Prepared(p)
-                if mlv.len() == p.inner_rest_len + (p.m - p.k_log) =>
-            {
-                Some(p)
-            }
+            LastRhoSlot::Prepared(p) if mlv.len() == p.inner_rest_len + (p.m - p.k_log) => Some(p),
             LastRhoSlot::Prepared(p) => {
                 *slot = LastRhoSlot::Prepared(p);
                 None
@@ -2833,7 +2897,11 @@ mod tests {
     /// 256-entry byte-table loop bit-for-bit for every column count
     /// 1..=128 (exercises the masked tail store) on random weights, random
     /// index bytes and a random pre-filled `partial`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
     #[test]
     fn block_major_nibble_kernel_matches_scalar_tables() {
         let mut rng = Rng::new(0x51B_B1E5);
@@ -2862,7 +2930,10 @@ mod tests {
             }
             // kernel, with a poison guard word past the end
             let mut got = base.clone();
-            got.push(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE });
+            got.push(F128 {
+                lo: 0xDEAD_BEEF,
+                hi: 0xFEED_FACE,
+            });
             unsafe {
                 kernels::fold_block_major_chunk_x86_avx512(
                     &transposed,
@@ -2871,7 +2942,13 @@ mod tests {
                     chunk_bits,
                 );
             }
-            assert_eq!(got.pop(), Some(F128 { lo: 0xDEAD_BEEF, hi: 0xFEED_FACE }));
+            assert_eq!(
+                got.pop(),
+                Some(F128 {
+                    lo: 0xDEAD_BEEF,
+                    hi: 0xFEED_FACE
+                })
+            );
             assert_eq!(got, want, "chunk_bits={chunk_bits}");
         }
     }
@@ -3069,8 +3146,7 @@ mod tests {
             (25, 7, 121), // n_log=18 factorized dispatch
         ];
         for &(m, k_log, useful_bits) in cases {
-            let mut rng =
-                Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
+            let mut rng = Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
             let n_log = m - k_log;
             let n_outer = 1usize << n_log;
             let chunks_per_block = (1usize << k_log) / 128;
@@ -3102,13 +3178,8 @@ mod tests {
                 )
             };
 
-            let _guard = prepare_last_rho_z_fold(
-                &z_block_major,
-                m,
-                k_log,
-                useful_bits,
-                inner_rest_len,
-            );
+            let _guard =
+                prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
             kick_last_rho_z_fold(&mlv);
             let got = wait_last_rho_z_fold().expect("kick at complete mlv must run");
             assert_eq!(
@@ -3144,13 +3215,7 @@ mod tests {
         let inner_rest_len = k_log - 6;
         let short_mlv = rng.f128_vec(inner_rest_len + n_log - 1);
 
-        let _guard = prepare_last_rho_z_fold(
-            &z_block_major,
-            m,
-            k_log,
-            useful_bits,
-            inner_rest_len,
-        );
+        let _guard = prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
         kick_last_rho_z_fold(&short_mlv);
         assert!(
             wait_last_rho_z_fold().is_none(),
@@ -3248,9 +3313,11 @@ mod tests {
     ))]
     #[test]
     fn partial_fold_x86_gfni_matches_tiled() {
-        for &(m, k_log, useful_bits) in
-            &[(16usize, 8usize, 256usize), (18, 10, 1000), (20, 14, 15_409)]
-        {
+        for &(m, k_log, useful_bits) in &[
+            (16usize, 8usize, 256usize),
+            (18, 10, 1000),
+            (20, 14, 15_409),
+        ] {
             if !n_log_ok_for_tile(m, k_log, 8) {
                 continue;
             }

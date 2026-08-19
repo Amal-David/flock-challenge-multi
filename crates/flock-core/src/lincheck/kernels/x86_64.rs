@@ -165,7 +165,9 @@ pub(crate) unsafe fn gfni_fold_tile(
             let bs = block * 64;
             let mut rows = [_mm512_setzero_si512(); 8];
             for (t, row) in rows.iter_mut().enumerate() {
-                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i);
+                *row = _mm512_loadu_si512(
+                    tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i
+                );
             }
             let planes = out_planes_ptr.add(block * 1024);
             for byte_k in 0..16 {
@@ -402,7 +404,11 @@ pub(crate) fn build_nibble_tables(eq8: &[F128; 8], out: &mut NibbleTables) {
 /// # Safety
 /// Requires AVX-512F/BW at runtime (guaranteed by the cfg gate that compiles
 /// this function in). All loads/stores are bounds-checked by the asserts.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
     transposed: &[u8],
@@ -466,14 +472,194 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
                 // Tail group: 2 qwords per column; aos0 covers columns 0..4,
                 // aos1 columns 4..8 of this group.
                 let q = 2 * cols; // qwords to touch
-                let m0: __mmask8 = if q >= 8 { 0xFF } else { ((1u16 << q) - 1) as u8 };
-                let m1: __mmask8 = if q <= 8 { 0 } else { ((1u16 << (q - 8)) - 1) as u8 };
+                let m0: __mmask8 = if q >= 8 {
+                    0xFF
+                } else {
+                    ((1u16 << q) - 1) as u8
+                };
+                let m1: __mmask8 = if q <= 8 {
+                    0
+                } else {
+                    ((1u16 << (q - 8)) - 1) as u8
+                };
                 let pi = p as *mut i64;
                 let v0 = _mm512_maskz_loadu_epi64(m0, pi);
                 _mm512_mask_storeu_epi64(pi, m0, _mm512_xor_si512(v0, aos0));
                 if m1 != 0 {
                     let v1 = _mm512_maskz_loadu_epi64(m1, pi.add(8));
                     _mm512_mask_storeu_epi64(pi.add(8), m1, _mm512_xor_si512(v1, aos1));
+                }
+            }
+        }
+    }
+}
+
+/// `FLOCK_NO_LC_GT=1` restores the scalar-formed gather +
+/// [`crate::lincheck::transpose_8_f128s_to_128_bytes`] loop (exact same-binary
+/// A/B). The ranked worker's cleared env never sets it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+pub(crate) fn lincheck_gather_transpose_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GT").is_none());
+    *ON
+}
+
+/// All-AVX-512 gather + bit-transpose for one full 8-stripe tile chunk.
+///
+/// Replaces, for each stripe row `t ∈ 0..8`, the scalar-formed
+/// `lanes: [F128; 8]` gather + [`super::super::transpose_8_f128s_to_128_bytes`]
+/// pair that the block-major GFNI arm still ran on every (tile, 128-column
+/// chunk). The legacy codegen indexes `z_packed` through eight slice bounds
+/// checks, materializes `[F128; 8]` then two `[u64; 8]` extracts, and only
+/// then calls the already-proven [`bit_transpose_64bytes_avx512`] kernel.
+/// Here the eight lanes load straight into XMM, `punpcklqdq`/`punpckhqdq`
+/// split lo/hi halves, and the identical VBMI permute + Hacker's Delight
+/// swap-round transpose stays register-resident — plus a 256 B
+/// `prefetcht0` along each of the 64 strided streams (the NEON kernel's
+/// measured lead; 2 KiB stride defeats the hardware prefetcher).
+///
+/// Output layout is byte-identical to the legacy path: row `t` at
+/// `out + 128·t`, low u64 table in bytes `0..64`, high in `64..128`.
+/// Byte `b` bit `r` = bit `b` of lane `(t, r)` at `src[(8·t + r)·stride]`.
+///
+/// # Safety
+/// - Lane `(t, r)` is read at `src + (8·t + r) · stride` (F128 elements);
+///   all 64 such positions must be in bounds.
+/// - `out` must point to `8 × 128` writable bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn gather_transpose_tile_x86(src: *const F128, stride: usize, out: *mut u8) {
+    use crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes;
+    use core::arch::x86_64::*;
+
+    const TILE_T: usize = 8;
+    // 256 B = 16 F128s = 16 chunk-steps; matches the NEON kernel's probe.
+    const PREFETCH_ELEMS: usize = 16;
+
+    let stride_bytes = stride * 16;
+    let mut p = src as *const u8;
+    let mut row = out;
+    for _t in 0..TILE_T {
+        let w0 = _mm_loadu_si128(p as *const __m128i);
+        let w1 = _mm_loadu_si128(p.add(stride_bytes) as *const __m128i);
+        let w2 = _mm_loadu_si128(p.add(2 * stride_bytes) as *const __m128i);
+        let w3 = _mm_loadu_si128(p.add(3 * stride_bytes) as *const __m128i);
+        let w4 = _mm_loadu_si128(p.add(4 * stride_bytes) as *const __m128i);
+        let w5 = _mm_loadu_si128(p.add(5 * stride_bytes) as *const __m128i);
+        let w6 = _mm_loadu_si128(p.add(6 * stride_bytes) as *const __m128i);
+        let w7 = _mm_loadu_si128(p.add(7 * stride_bytes) as *const __m128i);
+
+        for r in 0..8 {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(r * stride_bytes + PREFETCH_ELEMS * 16) as *const i8);
+        }
+
+        // lo table = lo0‖lo1 … lo6‖lo7 (the byte image of the legacy
+        // `[u64; 8]` lo array); hi table likewise. `punpcklqdq` takes the
+        // low qword of each F128; `punpckhqdq` the high.
+        let lo01 = _mm_unpacklo_epi64(w0, w1);
+        let lo23 = _mm_unpacklo_epi64(w2, w3);
+        let lo45 = _mm_unpacklo_epi64(w4, w5);
+        let lo67 = _mm_unpacklo_epi64(w6, w7);
+        let hi01 = _mm_unpackhi_epi64(w0, w1);
+        let hi23 = _mm_unpackhi_epi64(w2, w3);
+        let hi45 = _mm_unpackhi_epi64(w4, w5);
+        let hi67 = _mm_unpackhi_epi64(w6, w7);
+        let lo = _mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_set_m128i(lo23, lo01)),
+            _mm256_set_m128i(lo67, lo45),
+            1,
+        );
+        let hi = _mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_set_m128i(hi23, hi01)),
+            _mm256_set_m128i(hi67, hi45),
+            1,
+        );
+
+        // The public `bit_transpose_64bytes` kernel is the same VBMI permute +
+        // three swap rounds the scalar path already called via
+        // `transpose_8_u64s_to_64_bytes`. Applying it to a register-resident
+        // ZMM (store → kernel → load) keeps the bit function identical; the
+        // store/reload is 64 B L1 and cheaper than the deleted gather form.
+        let mut lo_in = [0u8; 64];
+        let mut hi_in = [0u8; 64];
+        let mut lo_out = [0u8; 64];
+        let mut hi_out = [0u8; 64];
+        _mm512_storeu_si512(lo_in.as_mut_ptr() as *mut __m512i, lo);
+        _mm512_storeu_si512(hi_in.as_mut_ptr() as *mut __m512i, hi);
+        bit_transpose_64bytes(&lo_in, &mut lo_out);
+        bit_transpose_64bytes(&hi_in, &mut hi_out);
+        core::ptr::copy_nonoverlapping(lo_out.as_ptr(), row, 64);
+        core::ptr::copy_nonoverlapping(hi_out.as_ptr(), row.add(64), 64);
+
+        p = p.add(8 * stride_bytes);
+        row = row.add(128);
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+mod tests {
+    use super::*;
+    use crate::field::F128;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn f128(&mut self) -> F128 {
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            }
+        }
+    }
+
+    /// The AVX-512 gather+transpose must reproduce the scalar definition:
+    /// output row t, byte b, bit r = bit b of lane (t, r).
+    #[test]
+    fn gather_transpose_tile_matches_scalar() {
+        let mut rng = Rng(0x72A5_0002);
+        for &stride in &[1usize, 2, 7, 128] {
+            let src: Vec<F128> = (0..64 * stride).map(|_| rng.f128()).collect();
+            let mut got = [0u8; 8 * 128];
+            unsafe {
+                gather_transpose_tile_x86(src.as_ptr(), stride, got.as_mut_ptr());
+            }
+            for t in 0..8 {
+                for b in 0..128 {
+                    let mut want = 0u8;
+                    for r in 0..8 {
+                        let lane = src[(8 * t + r) * stride];
+                        let bit = if b < 64 {
+                            (lane.lo >> b) & 1
+                        } else {
+                            (lane.hi >> (b - 64)) & 1
+                        };
+                        want |= (bit as u8) << r;
+                    }
+                    assert_eq!(got[t * 128 + b], want, "stride={stride} t={t} b={b}");
                 }
             }
         }
