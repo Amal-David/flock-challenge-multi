@@ -162,7 +162,12 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     // prover, freed when it drops. `FLOCK_NO_FOLD_ARENA` is a
     // local-diagnostics escape hatch; the ranked worker's cleared environment
     // never sets it.
-    #[cfg(target_arch = "aarch64")]
+    // Fold arena: ranked m=32 needs 2·(l − l/2^k) = 1008 MiB of fold
+    // outputs (l=2^25, k=6). Prefault overlaps `b_combined`. aarch64
+    // already created this; x86 hardcoded None and fell back to
+    // scratch::take_f128 (64–128 MB parked; first L0 half is 256 MiB
+    // and still faulted inside the serial Fiat–Shamir chain).
+    // `FLOCK_NO_FOLD_ARENA` remains the local-diagnostics kill.
     let fold_arena = {
         let l = packed_witness.len();
         let k = lig_config.initial_k;
@@ -175,9 +180,6 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             None
         }
     };
-    // x86_64 keeps its prewarmed scratch-pool fold path unchanged.
-    #[cfg(not(target_arch = "aarch64"))]
-    let fold_arena: Option<ligerito::FoldArena> = None;
     crate::gaptime::mark("open: fold arena ready");
 
     let combined = compute_combined_basis_and_target(

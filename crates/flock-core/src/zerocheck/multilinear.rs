@@ -1164,21 +1164,6 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     let eq_hi = &eq.hi;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    // NT publish of the fold outputs: only when the outputs are too large to
-    // be LLC-resident when the next cascade level reads them (2^23 F128 =
-    // 128 MiB per array selects the rounds-3+4 level alone at the ranked
-    // shape; later levels' outputs ARE cache-resident and NT would hurt).
-    // The message terms come from registers, so the stores are write-once.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let nt_out = kernels::x86_64::zc_fold_nt_enabled()
-        && quarter >= (1 << 23)
-        && (a_out.as_ptr() as usize) % 16 == 0
-        && (b_out.as_ptr() as usize) % 16 == 0;
-
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -1209,7 +1194,6 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
                     eq_lo,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
-                    nt_out,
                 )
             };
             #[cfg(not(all(
@@ -3371,23 +3355,11 @@ mod tests {
             #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
             let r2_mats_arg: Option<&[u64; 128]> = None;
             let n_rows = 4 * lo_size + 16; // slack so row_base can be non-zero
-            let mut a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
             let eq_lo = rng.f128_vec(lo_size);
             let row_base = 8;
             let pair_idx_base = 3 * lo_size;
-            // Production shape: rows of masked (padded) pairs are ZERO in
-            // memory (r1cs zero padding). The batch register arm folds cached
-            // rows unconditionally and relies on that invariant; the scalar
-            // reference zeroes those outputs explicitly — equal only on
-            // production-shaped inputs.
-            for pair in 0..lo_size {
-                if ((pair_idx_base + pair) & mask) >= useful {
-                    let r0 = (row_base + 2 * pair) * 8;
-                    a_packed[r0..r0 + 16].fill(0);
-                    b_packed[r0..r0 + 16].fill(0);
-                }
-            }
 
             let mut a_s = vec![F128::ZERO; 2 * lo_size];
             let mut b_s = vec![F128::ZERO; 2 * lo_size];
@@ -3623,9 +3595,6 @@ mod tests {
             (4, 0, usize::MAX),
             (6, 0, usize::MAX),
             (8, 0, usize::MAX),
-            // 10: main loop AND the regular-store tail in the SAME call, so
-            // the nt arm's mixed NT/plain stores to one buffer are covered.
-            (10, 0, usize::MAX),
             (16, 0, usize::MAX),
             (64, 0, usize::MAX),
             (16, 7, 5),
@@ -3642,21 +3611,8 @@ mod tests {
             let r2_mats_arg: Option<&[u64; 128]> = None;
             let out_base = 4 * lo_size; // exercise a non-zero chunk offset
             let n_rows = 8 * (out_base + 2 * lo_size);
-            let mut a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
-            // Production shape: masked (padded) pairs' packed rows are zero
-            // in memory; the batch register arm folds cached rows
-            // unconditionally and relies on that invariant.
-            for x0 in out_base..out_base + 2 * lo_size {
-                for p in 0..2usize {
-                    let pair = 2 * x0 + p;
-                    if (pair & mask) >= useful {
-                        let r0 = 2 * pair * 8;
-                        a_packed[r0..r0 + 16].fill(0);
-                        b_packed[r0..r0 + 16].fill(0);
-                    }
-                }
-            }
+            let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
             let rho1 = rng.f128();
             let rho2 = rng.f128();
             let eq_lo = rng.f128_vec(lo_size);
@@ -3666,34 +3622,28 @@ mod tests {
                 &a_packed, &b_packed, &table, out_base, &mut a_s, &mut b_s, rho1, rho2, &eq_lo,
                 mask, useful,
             );
-            for nt_out in [false, true] {
-                let mut a_v = vec![F128::ONE; 2 * lo_size];
-                let mut b_v = vec![F128::ONE; 2 * lo_size];
-                // SAFETY: rows/table/output lengths satisfy the kernel's
-                // contract; `F128` is `repr(C, align(16))`, so every
-                // `Vec<F128>` base is 16-byte aligned by the allocation
-                // layout — the nt arm's requirement is a language guarantee.
-                let out_v = unsafe {
-                    kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                        table.data.as_ptr(),
-                        r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        out_base,
-                        &mut a_v,
-                        &mut b_v,
-                        rho1,
-                        rho2,
-                        &eq_lo,
-                        mask,
-                        useful,
-                        nt_out,
-                    )
-                };
-                assert_eq!(a_s, a_v, "a lo_size={lo_size} mask={mask} nt={nt_out}");
-                assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask} nt={nt_out}");
-                assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask} nt={nt_out}");
-            }
+            let mut a_v = vec![F128::ONE; 2 * lo_size];
+            let mut b_v = vec![F128::ONE; 2 * lo_size];
+            // SAFETY: rows/table/output lengths satisfy the kernel's contract.
+            let out_v = unsafe {
+                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    out_base,
+                    &mut a_v,
+                    &mut b_v,
+                    rho1,
+                    rho2,
+                    &eq_lo,
+                    mask,
+                    useful,
+                )
+            };
+            assert_eq!(a_s, a_v, "a lo_size={lo_size} mask={mask}");
+            assert_eq!(b_s, b_v, "b lo_size={lo_size} mask={mask}");
+            assert_eq!(out_s, out_v, "sums lo_size={lo_size} mask={mask}");
         }
     }
 }
