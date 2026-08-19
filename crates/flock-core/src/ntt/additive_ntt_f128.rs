@@ -4147,6 +4147,34 @@ mod tests {
             }
         }
     }
+
+    /// A fused-four group whose inner two layers are the two deepest
+    /// (`layer = dim-4` covers `dim-4 .. dim-1`) has `twiddles[3..]` all
+    /// high-limb zero — the predicate `butterfly_fused_4layer_row` uses.
+    #[test]
+    fn fused4_deepest_group_inner_twiddles_are_low() {
+        for dim in 16..=22usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            let layer = dim - 4;
+            for block in 0..(1usize << layer) {
+                let mut tw = [F128::ZERO; 15];
+                tw[0] = ntt.twiddle(layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = ntt.twiddle(layer + 3, 8 * block + s);
+                }
+                assert!(
+                    tw[3..].iter().all(|t| t.hi == 0),
+                    "dim={dim} layer={layer} block={block}"
+                );
+            }
+        }
+    }
 }
 
 /// Direct instrument for the zero-odd-tail-lane skip at the exact ranked

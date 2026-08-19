@@ -529,35 +529,47 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     r: usize,
     twiddles: &[F128; 15],
 ) {
-    // SAFETY: forwarded caller contract.
+    // The last fused-four group of the deep 4+4+3 schedule covers the
+    // domain's four deepest layers. Its two inner layers are then the two
+    // deepest standard-basis layers, whose every twiddle has a zero high
+    // limb — 12 of 15 twiddles, 16 of 32 butterflies, take the 3-CLMUL
+    // LOW product. Seed-top fused-four (layers 3..6) keeps the general
+    // form because the predicate inspects the values.
+    let low_inner = !low_twiddle_fused4_disabled() && twiddles[3..].iter().all(|t| t.hi == 0);
+    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
+    // precondition for `twiddles[3..]` by inspection of the values.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-            )
-        } else {
-            butterfly_fused_4layer_row_impl::<true>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-            )
+        match (mul_diet_disabled(), low_inner) {
+            (true, false) => butterfly_fused_4layer_row_impl::<false, false>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (true, true) => butterfly_fused_4layer_row_impl::<false, true>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (false, false) => butterfly_fused_4layer_row_impl::<true, false>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
+            (false, true) => butterfly_fused_4layer_row_impl::<true, true>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            ),
         }
     }
+}
+
+/// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED4=1` restores the general twiddle product
+/// for the fused-four sweep's two inner layers. Read once, outside every
+/// lane loop.
+#[inline]
+fn low_twiddle_fused4_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED4").is_some())
 }
 
 /// # Safety
 /// Same contract as [`butterfly_fused_4layer_row`].
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
+unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const LOW_INNER: bool>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
@@ -571,11 +583,15 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
     unsafe {
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
+        // steps of savings. Inner-layer slots take the LOW broadcast when
+        // the caller proved `twiddles[3..].hi == 0`.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
+        tw[0] = tw_x4::<false, DIET>(twiddles[0]);
+        tw[1] = tw_x4::<false, DIET>(twiddles[1]);
+        tw[2] = tw_x4::<false, DIET>(twiddles[2]);
+        for (slot, value) in tw[3..].iter_mut().zip(twiddles[3..].iter()) {
+            *slot = tw_x4::<LOW_INNER, DIET>(*value);
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let lanes = active_lanes & !3;
@@ -587,9 +603,9 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
             }
 
             macro_rules! butterfly {
-                ($u:expr, $v:expr, $twiddle:expr) => {{
+                ($u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
                     let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                        _mm512_xor_si512(values[$u], mul_x4::<$low, DIET>($twiddle, values[$v]));
                     values[$v] = _mm512_xor_si512(values[$v], new_u);
                     values[$u] = new_u;
                 }};
@@ -597,23 +613,23 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
 
             let outer = tw[0];
             for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+                butterfly!(i, i + 8, outer, false);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle, false);
                 }
             }
             for s in 0..4 {
                 let twiddle = tw[3 + s];
                 for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
                 }
             }
             for s in 0..8 {
                 let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                butterfly!(2 * s, 2 * s + 1, twiddle, LOW_INNER);
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -1095,7 +1111,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true>(
+                        butterfly_fused_4layer_row_impl::<true, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1104,7 +1120,7 @@ mod diet_tests {
                             &tw15,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false>(
+                        butterfly_fused_4layer_row_impl::<false, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1117,6 +1133,73 @@ mod diet_tests {
                 buf
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
+
+            // Inner-layer LOW product is the same field element when
+            // `tw[3..].hi == 0`.
+            let mut tw_low = tw15;
+            for t in tw_low[3..].iter_mut() {
+                t.hi = 0;
+            }
+            let run_fused4_low = |diet: bool| {
+                let mut buf = base.clone();
+                unsafe {
+                    if diet {
+                        butterfly_fused_4layer_row_impl::<true, true>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw_low,
+                        );
+                    } else {
+                        butterfly_fused_4layer_row_impl::<false, true>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw_low,
+                        );
+                    }
+                }
+                buf
+            };
+            let run_fused4_gen = |diet: bool| {
+                let mut buf = base.clone();
+                unsafe {
+                    if diet {
+                        butterfly_fused_4layer_row_impl::<true, false>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw_low,
+                        );
+                    } else {
+                        butterfly_fused_4layer_row_impl::<false, false>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw_low,
+                        );
+                    }
+                }
+                buf
+            };
+            assert_eq!(
+                run_fused4_low(true),
+                run_fused4_gen(true),
+                "fused4 LOW vs general diet len={len}"
+            );
+            assert_eq!(
+                run_fused4_low(false),
+                run_fused4_gen(false),
+                "fused4 LOW vs general 6-CLMUL len={len}"
+            );
         }
     }
 }
