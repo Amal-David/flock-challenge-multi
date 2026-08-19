@@ -954,14 +954,18 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Packed kernels amortize their prologue at a smaller low half than the
+/// plain tail, so keep splitting two bits beyond the plain-tail cap.
+const PACKED_SPLIT_MAX_N_HI: usize = 13;
+
 /// Fan-out for the **packed** round-two lookahead sweep and the packed
 /// composed n26 pass. Same occupancy identity as [`tail_split_n_hi`], applied
 /// to the two remaining `lookahead_n_hi` sites the promoted plain-tail hop
 /// left on 128 chunks:
 ///
-/// * ranked r2 (`m=32`, `k_skip=6`): `n_vars = 25` → 2048 chunks of
-///   `lo_size = 2^14` instead of 128 chunks of `lo_size = 2^18`
-/// * ranked n26: `n_vars = 23` → 2048 chunks of `lo_size = 2^12` instead of
+/// * ranked r2 (`m=32`, `k_skip=6`): `n_vars = 25` → 8192 chunks of
+///   `lo_size = 2^12` instead of 128 chunks of `lo_size = 2^18`
+/// * ranked n26: `n_vars = 23` → 8192 chunks of `lo_size = 2^10` instead of
 ///   128 chunks of `lo_size = 2^16`
 ///
 /// The packed kernels already accept any even `lo_size ≥ 2` (and the
@@ -984,7 +988,7 @@ fn packed_split_n_hi(n_vars: usize) -> usize {
     if *OFF {
         return base;
     }
-    base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
+    base.max(PACKED_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
 /// Round-two fused fold **plus** the deferred round-three coefficients.
@@ -3255,8 +3259,8 @@ mod tests {
             let lo_size = 1usize << n_lo;
             assert!(lo_size.is_multiple_of(2), "n_vars={n_vars} lo_size={lo_size}");
         }
-        assert_eq!(packed_split_n_hi(25), 11, "ranked r2");
-        assert_eq!(packed_split_n_hi(23), 11, "ranked n26");
+        assert_eq!(packed_split_n_hi(25), 13, "ranked r2");
+        assert_eq!(packed_split_n_hi(23), 13, "ranked n26");
         assert_eq!(packed_split_n_hi(12), lookahead_n_hi(12), "below lo floor");
     }
 
