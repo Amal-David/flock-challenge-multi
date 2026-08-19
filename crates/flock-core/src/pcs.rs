@@ -116,6 +116,77 @@ fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
     op()
 }
 
+/// Run Ligerito's recursive prover on a narrower cached pool.
+///
+/// The recursive prover is a serial Fiat-Shamir chain of *short* statically
+/// chunked parallel sections (initial sumcheck folds, induce, recursive
+/// commits, glue). Each section's useful work shrinks geometrically while its
+/// fork/join cost does not, so past a modest width the barriers cost more than
+/// the extra lanes return. Measured on atlas (Zen 5, ranked m=32, same binary,
+/// `gap-run` medians over the timed prove) the phase **anti-scales**:
+///
+/// | global pool | `open: ligerito recursive prover` |
+/// |---:|---:|
+/// | 1  | 73.3 ms |
+/// | 4  | 38.5 ms |
+/// | 16 | 68.3 ms |
+///
+/// — 4 threads beat 16 by 1.8x. Sweeping the pool width directly at a global
+/// 16 (same binary, `FLOCK_OPEN_LIG_POOL_WIDTH`) reproduces it monotonically:
+/// 63.8 ms off, 34.2 at 4, 39.1 at 6, 42.0 at 8, 46 at 10, 51 at 12.
+///
+/// The aarch64 track reached the same conclusion from the other side:
+/// running the WHOLE open phase on the wide pool cost +4.3 ms there (`induce_sumcheck_poly` +2.2, initial folds +1.0, recursive
+/// commits +0.9), which is why only the combine is widened above.
+///
+/// Width is `FLOCK_OPEN_LIG_POOL_WIDTH` (default [`OPEN_LIG_POOL_WIDTH`]),
+/// clamped to the global pool; `FLOCK_NO_OPEN_LIG_POOL=1` restores the global
+/// pool. Gated to large opens (`l >= 2^22`, the m=29 ranked floor) and to
+/// configs where the global pool is actually wider.
+///
+/// Pool width cannot change wire bytes: every parallel reduction the recursive
+/// prover performs is an XOR sum over F128 (characteristic two, so associative
+/// and commutative — any association gives the same element), and the Merkle
+/// and transcript orders are structural, not scheduling-dependent. The proof
+/// SHA is the gate.
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+const OPEN_LIG_POOL_WIDTH: usize = 4;
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn open_lig_pool(l: usize) -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    if l < (1 << 22) || std::env::var_os("FLOCK_NO_OPEN_LIG_POOL").is_some() {
+        return None;
+    }
+    let global = rayon::current_num_threads();
+    POOL.get_or_init(|| {
+        let width = std::env::var("FLOCK_OPEN_LIG_POOL_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|w| *w > 0)
+            .unwrap_or(OPEN_LIG_POOL_WIDTH)
+            .min(global);
+        (width < global).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .thread_name(|i| format!("flock-open-lig-{i}"))
+                .build()
+                .expect("build cached open-ligerito pool")
+        })
+    })
+    .as_ref()
+}
+
+fn in_open_lig_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    if let Some(pool) = open_lig_pool(l) {
+        return pool.install(op);
+    }
+    let _ = l;
+    op()
+}
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -191,8 +262,11 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
     crate::gaptime::mark("open: combined basis + target done");
 
+    let l_open = packed_witness.len();
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold4 {
+    // Narrow pool: the recursive prover's short sections anti-scale past a
+    // modest width (see `in_open_lig_pool`). Values are pool-width invariant.
+    let ligerito_proof = in_open_lig_pool(l_open, || if let Some(direct) = combined.direct_fold4 {
         ligerito::recursive_prover_with_basis_direct_fold4(
             lig_config,
             packed_witness,
@@ -242,7 +316,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             fold_arena,
             challenger,
         )
-    };
+    });
     crate::gaptime::mark("open: ligerito recursive prover done");
     if trace {
         eprintln!(
