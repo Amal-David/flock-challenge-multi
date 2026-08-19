@@ -904,47 +904,23 @@ fn lincheck_nibble_fold_enabled() -> bool {
 pub(crate) static BM_GFNI_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// `FLOCK_NO_LC_BM_GFNI=1` restores the nibble-table accumulate in the
-/// block-major sweep (exact same-binary A/B). Distinct from
-/// `FLOCK_NO_LC_GFNI`, which guards only the byte-stripe dispatcher — the
-/// block-major path never reaches it. Resolved once per process.
+/// The ranked x86 build always uses the block-major GFNI arm when its shape
+/// guards match. Tests retain an atomic off-switch for oracle comparisons.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline(always)]
 fn block_major_gfni_enabled() -> bool {
     #[cfg(test)]
-    if BM_GFNI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+    {
+        return !BM_GFNI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed);
     }
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_BM_GFNI").is_none());
-    *ON
-}
-
-/// `FLOCK_NO_LC_GATHER_TR=1` restores the scalar stripe gather + staging
-/// transpose in the GFNI block-major arm (exact same-binary A/B).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-/// `FLOCK_NO_LC_GATHER4=1` restores single-column gather+transpose visits in
-/// the block-major GFNI fold (exact A/B control; the fused single-column arm
-/// then serves every chunk). Resolved once per process.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-fn lc_gather4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER4").is_none());
-    *ON
-}
-
-fn lc_gather_tr_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
-    *ON
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
@@ -1001,9 +977,7 @@ fn fold_block_major_gfni(
     useful_bits: usize,
     useful_chunks: usize,
     n_workers: usize,
-    tiles_per_worker: usize,
     n_tiles: usize,
-    dynamic: bool,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
 ) -> Vec<F128> {
     use rayon::prelude::*;
@@ -1013,15 +987,8 @@ fn fold_block_major_gfni(
     let mut planes = vec![0u8; n_workers * k * 16];
     planes
         .par_chunks_mut(k * 16)
-        .enumerate()
-        .for_each(|(worker, wplanes)| {
-            let tile_lo = worker * tiles_per_worker;
-            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
-            let (mut claim_lo, mut claim_hi) = if dynamic {
-                (0usize, 0usize)
-            } else {
-                (tile_lo, tile_hi)
-            };
+        .for_each(|wplanes| {
+            let (mut claim_lo, mut claim_hi) = (0usize, 0usize);
             let mut mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             // Four column-slabs of 8×128 bytes: the grouped gather writes
@@ -1030,15 +997,11 @@ fn fold_block_major_gfni(
             // First tile this worker writes into a freshly zeroed plane
             // buffer: seed the GFNI acc from a register zero idiom.
             let mut first_tile = true;
-            // Fused register gather+transpose (no staging arrays); the
-            // scalar path stays as the kill-switch arm.
-            #[cfg(target_feature = "avx512vbmi")]
-            let gather_tr_fused = lc_gather_tr_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
                     claim_lo - 1
-                } else if dynamic {
+                } else {
                     let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
                     if lo >= n_tiles {
                         break;
@@ -1046,8 +1009,6 @@ fn fold_block_major_gfni(
                     claim_lo = lo + 1;
                     claim_hi = (lo + TILE_GRAB).min(n_tiles);
                     lo
-                } else {
-                    break;
                 };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
                 for t in 0..DIRECT_FOLD_TILE_STRIPES {
@@ -1062,7 +1023,7 @@ fn fold_block_major_gfni(
                 // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
                 // the ragged final chunk takes the single-column arm below.
                 #[cfg(target_feature = "avx512vbmi")]
-                if gather_tr_fused && lc_gather4_enabled() {
+                {
                     let full_chunks = useful_bits / 128;
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
@@ -1118,7 +1079,7 @@ fn fold_block_major_gfni(
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
                         let outer_base = 8 * (stripe_base + t);
                         #[cfg(target_feature = "avx512vbmi")]
-                        if gather_tr_fused {
+                        {
                             // The next stripe is eight row-strided F128 loads,
                             // a pattern the sequential hardware prefetchers do
                             // not discover. Pull it into L1 while VBMI/GFNI
@@ -1151,13 +1112,16 @@ fn fold_block_major_gfni(
                             }
                             continue;
                         }
-                        let lanes: [F128; 8] = std::array::from_fn(|r| {
-                            z_packed[(outer_base + r) * chunks_per_block + q]
-                        });
-                        transpose_8_f128s_to_128_bytes(
-                            &lanes,
-                            &mut transposed[t * 128..(t + 1) * 128],
-                        );
+                        #[cfg(not(target_feature = "avx512vbmi"))]
+                        {
+                            let lanes: [F128; 8] = std::array::from_fn(|r| {
+                                z_packed[(outer_base + r) * chunks_per_block + q]
+                            });
+                            transpose_8_f128s_to_128_bytes(
+                                &lanes,
+                                &mut transposed[t * 128..(t + 1) * 128],
+                            );
+                        }
                     }
                     // SAFETY: `transposed` holds 8 stripes x 128 bytes at
                     // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
@@ -1248,17 +1212,6 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     // per-column XOR association changes but the sum does not.
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
-    let dynamic = dynamic_tiles_enabled();
-    // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
-    // kill switch, which restores the always-on probes). Resolved once here
-    // so the worker loop reads a register, not the environment.
-    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
-    // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
-    // so `LINCHECK_TRACE=1` measures the production sweep. Set
-    // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
-    // tables / transpose+read / accumulate split back (it costs ~1 ms/worker).
-    let timing = !fold_untimed_enabled();
-
     // GFNI plane-major arm: exact-tile shapes only (no ragged last tile),
     // 64-column blocks available. Everything else falls through to the
     // incumbent nibble/scalar sweep unchanged.
@@ -1268,7 +1221,6 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
         target_feature = "gfni"
     ))]
     if block_major_gfni_enabled() && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0 && k_log >= 6 {
-        let _ = (trace_fold, timing);
         return fold_block_major_gfni(
             z_packed,
             k,
@@ -1276,12 +1228,21 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             useful_bits,
             useful_chunks,
             n_workers,
-            tiles_per_worker,
             n_tiles,
-            dynamic,
             &eq8_at,
         );
     }
+
+    let dynamic = dynamic_tiles_enabled();
+    // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
+    // kill switch, which restores the always-on probes). Ranked GFNI returns
+    // above without paying any of this fallback-only instrumentation setup.
+    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
+    // so `LINCHECK_TRACE=1` measures the production sweep. Set
+    // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
+    // tables / transpose+read / accumulate split back (it costs ~1 ms/worker).
+    let timing = !fold_untimed_enabled();
 
     // Outer-tile partitioning reads every useful z chunk exactly once and
     // builds every sum table once. Each worker owns a private length-k partial;
