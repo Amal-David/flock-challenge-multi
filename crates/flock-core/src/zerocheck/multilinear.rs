@@ -1327,6 +1327,326 @@ pub(crate) fn fold2_from_packed_lookahead_scalar(
     acc.map(|x| x.reduce())
 }
 
+/// Tri-composed rounds-3+4+5 pass **from the packed witness**: the fold3
+/// twin of [`fold2_from_packed_and_round_pair_lookahead_into`] — re-derives
+/// the round-two folded rows from packed bytes, folds them at ρ₁, ρ₂, ρ₃ in
+/// registers, writes the eighth-size state once, and emits the next round's
+/// message plus the quadratic and bivariate deferred messages. At the ranked
+/// shape this writes 256 MiB instead of 512 MiB and deletes the following
+/// composed pass's 512 MiB read outright.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn fold3_from_packed_and_round_tri_lookahead_into(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    padding: &PaddingSpec,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    rho3: F128,
+    r_next: &[F128],
+) -> (F128, F128, Round3Lookahead, Round4Lookahead2) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let r2_mats = {
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        {
+            r2_gfni_mats(table)
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        {
+            None::<[u64; 128]>
+        }
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(unused_variables)]
+    let r2_mats_arg = r2_mats.as_ref();
+
+    use rayon::prelude::*;
+    assert_eq!(k_skip, 6);
+    assert_eq!(table.n_chunks, 8);
+    let n = 1usize << (m - k_skip);
+    assert!(n >= 64);
+    let eighth = n / 8;
+    assert_eq!(a_out.len(), eighth);
+    assert_eq!(b_out.len(), eighth);
+    assert_eq!(r_next.len(), m - k_skip - 3);
+    let r1 = r_next[1];
+    let r2 = r_next[2];
+    assert_ne!(r1, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+    assert_ne!(r2, F128::ZERO, "bivariate lookahead requires a non-zero second parity weight");
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], lookahead_n_hi(n_vars).min(n_vars - 2));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 4, "tri-composed lookahead requires lo_size >= 4");
+    assert_eq!(lo_size * hi_size * 2, eighth);
+    let kappa = (F128::ONE + r1) * r1.inv();
+    let r_inv = r1.inv();
+    let inv12 = (r1 * r2).inv();
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    let (sum1, sum_inf, agg, bi1, biinf) = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
+            let out_base = x_hi * chunk_out;
+
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: the packed inputs expose 8 readable bytes for every
+            // row 8·out_base .. 8·(out_base + chunk_out); the table has the
+            // protocol-fixed shape; lo_size % 16 checked; the cfg gate
+            // supplies every feature.
+            let out = if eq_lo.len().is_multiple_of(16) {
+                unsafe {
+                    kernels::x86_64::fold3_from_packed_tri_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        rho3,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    )
+                }
+            } else {
+                fold3_from_packed_tri_scalar(
+                    a_packed,
+                    b_packed,
+                    table,
+                    out_base,
+                    a_out,
+                    b_out,
+                    rho1,
+                    rho2,
+                    rho3,
+                    eq_lo,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                )
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            let out = fold3_from_packed_tri_scalar(
+                a_packed,
+                b_packed,
+                table,
+                out_base,
+                a_out,
+                b_out,
+                rho1,
+                rho2,
+                rho3,
+                eq_lo,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            );
+
+            let eq_h = eq_hi[x_hi];
+            let p1 = kappa * out.0[0] + out.0[2];
+            let pinf = kappa * out.0[1] + out.0[3];
+            let mut agg = [F128::ZERO; 6];
+            for (dst, src) in agg.iter_mut().zip(out.0[2..8].iter()) {
+                *dst = eq_h * *src;
+            }
+            let mut b1 = [F128::ZERO; 9];
+            let mut binf = [F128::ZERO; 9];
+            for k in 0..9 {
+                b1[k] = eq_h * out.1[k];
+                binf[k] = eq_h * out.2[k];
+            }
+            (eq_h * p1, eq_h * pinf, agg, b1, binf)
+        })
+        .reduce(
+            || (
+                F128::ZERO,
+                F128::ZERO,
+                [F128::ZERO; 6],
+                [F128::ZERO; 9],
+                [F128::ZERO; 9],
+            ),
+            |(s1, sinf, sa, sb1, sbi), (c1, cinf, ca, cb1, cbi)| {
+                let mut a = sa;
+                for (x, y) in a.iter_mut().zip(ca.iter()) {
+                    *x += *y;
+                }
+                let mut b1 = sb1;
+                for (x, y) in b1.iter_mut().zip(cb1.iter()) {
+                    *x += *y;
+                }
+                let mut bi = sbi;
+                for (x, y) in bi.iter_mut().zip(cbi.iter()) {
+                    *x += *y;
+                }
+                (s1 + c1, sinf + cinf, a, b1, bi)
+            },
+        );
+
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
+    let mut la2 = Round4Lookahead2 {
+        p1: [F128::ZERO; 9],
+        pinf: [F128::ZERO; 9],
+    };
+    for k in 0..9 {
+        la2.p1[k] = inv12 * bi1[k];
+        la2.pinf[k] = inv12 * biinf[k];
+    }
+    (r_next[0] * sum1, sum_inf, la, la2)
+}
+
+/// Portable leaf of [`fold3_from_packed_and_round_tri_lookahead_into`] for
+/// one worker chunk. Also the oracle for the AVX-512 kernel.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    allow(dead_code)
+)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn fold3_from_packed_tri_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    rho3: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> ([F128; 8], [F128; 9], [F128; 9]) {
+    let n_chunks = table.n_chunks;
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
+    debug_assert!(eq_lo.len().is_multiple_of(4));
+    // Round-2-composed value at fold2-output index `x` (pairs 2x, 2x+1).
+    let out2_at = |x: usize| -> (F128, F128) {
+        let mut ta = [F128::ZERO; 2];
+        let mut tb = [F128::ZERO; 2];
+        for half in 0..2 {
+            let pair = 2 * x + half;
+            if (pair & pair_in_block_mask) >= useful_pairs_inclusive {
+                continue;
+            }
+            let r0 = 2 * pair;
+            let r1 = r0 + 1;
+            let a0 = table.fold_one_row(&a_packed[r0 * n_chunks..(r0 + 1) * n_chunks]);
+            let a1 = table.fold_one_row(&a_packed[r1 * n_chunks..(r1 + 1) * n_chunks]);
+            let b0 = table.fold_one_row(&b_packed[r0 * n_chunks..(r0 + 1) * n_chunks]);
+            let b1 = table.fold_one_row(&b_packed[r1 * n_chunks..(r1 + 1) * n_chunks]);
+            ta[half] = a0 + rho1 * (a0 + a1);
+            tb[half] = b0 + rho1 * (b0 + b1);
+        }
+        (ta[0] + rho2 * (ta[0] + ta[1]), tb[0] + rho2 * (tb[0] + tb[1]))
+    };
+    // Fold3 output `y` (global): fold2-outputs 2y, 2y+1 at ρ₃.
+    let out8_at = |y: usize| -> (F128, F128) {
+        let (a0, b0) = out2_at(2 * y);
+        let (a1, b1) = out2_at(2 * y + 1);
+        (a0 + rho3 * (a0 + a1), b0 + rho3 * (b0 + b1))
+    };
+    let grid = |v4: F128, v5: F128, v6: F128, v7: F128| -> [F128; 9] {
+        [
+            v4,
+            v6,
+            v4 + v6,
+            v5,
+            v7,
+            v5 + v7,
+            v4 + v5,
+            v6 + v7,
+            v4 + v5 + v6 + v7,
+        ]
+    };
+    let mut acc = [F256Unreduced::ZERO; 8];
+    let mut acc1 = [F256Unreduced::ZERO; 9];
+    let mut accinf = [F256Unreduced::ZERO; 9];
+    for z in 0..eq_lo.len() / 4 {
+        let o = 8 * z;
+        let mut va = [F128::ZERO; 8];
+        let mut vb = [F128::ZERO; 8];
+        for j in 0..8 {
+            let (a, b) = out8_at(out_base + o + j);
+            va[j] = a;
+            vb[j] = b;
+            a_out[o + j] = a;
+            b_out[o + j] = b;
+        }
+        for half in 0..2 {
+            let (a0, a1, a2, a3) = (
+                va[4 * half],
+                va[4 * half + 1],
+                va[4 * half + 2],
+                va[4 * half + 3],
+            );
+            let (b0, b1, b2, b3) = (
+                vb[4 * half],
+                vb[4 * half + 1],
+                vb[4 * half + 2],
+                vb[4 * half + 3],
+            );
+            let wt = eq_lo[2 * (2 * z + half) + 1];
+            let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+            acc[0] ^= a1w.mul_unreduced(b1);
+            acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+            acc[2] ^= a3w.mul_unreduced(b3);
+            acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            acc[4] ^= a2w.mul_unreduced(b2);
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc[5] ^= e_aw.mul_unreduced(e_b);
+            acc[6] ^= o_aw.mul_unreduced(o_b);
+            acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+        }
+        let wt8 = eq_lo[4 * z + 3];
+        let ga1 = grid(va[4], va[5], va[6], va[7]);
+        let gb1 = grid(vb[4], vb[5], vb[6], vb[7]);
+        let gia = grid(va[0] + va[4], va[1] + va[5], va[2] + va[6], va[3] + va[7]);
+        let gib = grid(vb[0] + vb[4], vb[1] + vb[5], vb[2] + vb[6], vb[3] + vb[7]);
+        for k in 0..9 {
+            acc1[k] ^= (wt8 * ga1[k]).mul_unreduced(gb1[k]);
+            accinf[k] ^= (wt8 * gia[k]).mul_unreduced(gib[k]);
+        }
+    }
+    (
+        acc.map(|x| x.reduce()),
+        acc1.map(|x| x.reduce()),
+        accinf.map(|x| x.reduce()),
+    )
+}
+
 /// Portable reference for one lookahead round-two chunk. Returns the eight
 /// per-chunk sums `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`
 /// (all on the odd lane's weight `r₁·eq₃`, see the driver), each reduced.
@@ -1411,6 +1731,281 @@ pub(crate) fn round2_lookahead_chunk_scalar<const WRITE: bool>(
         acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
     }
     acc.map(|x| x.reduce())
+}
+
+/// Bivariate-extended no-write round-two sweep chunk (portable): the
+/// incumbent eight sums plus the two {0,1,∞}² grids over eight-groups of the
+/// virtual round-two-folded state (four consecutive pairs, weight
+/// `eq_lo[4z+3]`). Oracle for the AVX-512 kernel and the non-x86 fallback.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn round2_lookahead_chunk_biv_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    row_base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> ([F128; 8], [F128; 9], [F128; 9]) {
+    let n_chunks = table.n_chunks;
+    let lo_size = eq_lo.len();
+    debug_assert!(lo_size.is_multiple_of(4));
+    let mut acc = [F256Unreduced::ZERO; 8];
+    let mut acc1 = [F256Unreduced::ZERO; 9];
+    let mut accinf = [F256Unreduced::ZERO; 9];
+
+    let fold_pair = |x_lo: usize| -> Option<(F128, F128, F128, F128)> {
+        if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+            return None;
+        }
+        let x0g = row_base + 2 * x_lo;
+        let x1g = x0g + 1;
+        Some((
+            table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]),
+            table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]),
+            table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]),
+            table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]),
+        ))
+    };
+    let grid = |v4: F128, v5: F128, v6: F128, v7: F128| -> [F128; 9] {
+        [
+            v4,
+            v6,
+            v4 + v6,
+            v5,
+            v7,
+            v5 + v7,
+            v4 + v5,
+            v6 + v7,
+            v4 + v5 + v6 + v7,
+        ]
+    };
+
+    for z in 0..lo_size / 4 {
+        // Eight-group z: pairs 4z..4z+4 = virtual values v0..v8.
+        let mut va = [F128::ZERO; 8];
+        let mut vb = [F128::ZERO; 8];
+        let mut any = false;
+        for p in 0..4 {
+            if let Some((a0, a1, b0, b1)) = fold_pair(4 * z + p) {
+                any = true;
+                va[2 * p] = a0;
+                va[2 * p + 1] = a1;
+                vb[2 * p] = b0;
+                vb[2 * p + 1] = b1;
+            }
+        }
+        if !any {
+            continue;
+        }
+        // Incumbent eight sums on the two four-value halves (u = 2z, 2z+1).
+        for half in 0..2 {
+            let (a0, a1, a2, a3) = (
+                va[4 * half],
+                va[4 * half + 1],
+                va[4 * half + 2],
+                va[4 * half + 3],
+            );
+            let (b0, b1, b2, b3) = (
+                vb[4 * half],
+                vb[4 * half + 1],
+                vb[4 * half + 2],
+                vb[4 * half + 3],
+            );
+            let wt = eq_lo[2 * (2 * z + half) + 1];
+            let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+            acc[0] ^= a1w.mul_unreduced(b1);
+            acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+            acc[2] ^= a3w.mul_unreduced(b3);
+            acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            acc[4] ^= a2w.mul_unreduced(b2);
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc[5] ^= e_aw.mul_unreduced(e_b);
+            acc[6] ^= o_aw.mul_unreduced(o_b);
+            acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+        }
+        // Bivariate grids on the full eight-group.
+        let wt8 = eq_lo[4 * z + 3];
+        let ga1 = grid(va[4], va[5], va[6], va[7]);
+        let gb1 = grid(vb[4], vb[5], vb[6], vb[7]);
+        let gia = grid(va[0] + va[4], va[1] + va[5], va[2] + va[6], va[3] + va[7]);
+        let gib = grid(vb[0] + vb[4], vb[1] + vb[5], vb[2] + vb[6], vb[3] + vb[7]);
+        for k in 0..9 {
+            acc1[k] ^= (wt8 * ga1[k]).mul_unreduced(gb1[k]);
+            accinf[k] ^= (wt8 * gia[k]).mul_unreduced(gib[k]);
+        }
+    }
+    (
+        acc.map(|x| x.reduce()),
+        acc1.map(|x| x.reduce()),
+        accinf.map(|x| x.reduce()),
+    )
+}
+
+/// Bivariate-extended no-materialize round-two sweep: everything
+/// [`uni_skip_round_pair_lookahead_nomat_packed_padded`] returns PLUS the
+/// deferred round-four message as its {0,1,∞}² grid, so the tri-composed
+/// level-zero pass can bind three challenges. Requires
+/// `mlv_challenges[2] ≠ 0` and a lo split of at least sixteen pairs (both
+/// guaranteed by the F3 gate).
+pub fn uni_skip_round_pair_lookahead_biv_nomat_packed_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (F128, F128, Round3Lookahead, Round4Lookahead2) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let r2_mats = {
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        {
+            r2_gfni_mats(table)
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        {
+            None::<[u64; 128]>
+        }
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(unused_variables)]
+    let r2_mats_arg = r2_mats.as_ref();
+
+    use rayon::prelude::*;
+    assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+    let r1 = mlv_challenges[1];
+    let r2 = mlv_challenges[2];
+    assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
+    assert_ne!(r2, F128::ZERO, "bivariate requires a non-zero r[k_skip+2]");
+
+    let n_vars = mlv_challenges.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_out);
+    assert!(
+        lo_size >= 16 && lo_size.is_multiple_of(16),
+        "bivariate sweep requires a sixteen-pair lo split"
+    );
+    let kappa = (F128::ONE + r1) * r1.inv();
+    let r1_inv = r1.inv();
+    let inv12 = (r1 * r2).inv();
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    let (sum1, sum_inf, agg, bi1, biinf) = (0..hi_size)
+        .into_par_iter()
+        .map(|x_hi| {
+            let row_base = x_hi * chunk_size;
+            let pair_idx_base = x_hi * lo_size;
+
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: the packed inputs expose 8 readable bytes per post-URM
+            // row of this chunk, the table has the protocol-fixed 8 × 256
+            // shape, lo_size is a multiple of 16 (asserted), and the cfg
+            // gate supplies every intrinsic feature.
+            let out = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_biv_x86_avx512(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    eq_lo,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                )
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            let out = round2_lookahead_chunk_biv_scalar(
+                a_packed,
+                b_packed,
+                table,
+                eq_lo,
+                row_base,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            );
+
+            let eq_h = eq_hi[x_hi];
+            let p1 = kappa * out.0[0] + out.0[2];
+            let pinf = kappa * out.0[1] + out.0[3];
+            let mut agg = [F128::ZERO; 6];
+            for (dst, src) in agg.iter_mut().zip(out.0[2..8].iter()) {
+                *dst = eq_h * *src;
+            }
+            let mut b1 = [F128::ZERO; 9];
+            let mut binf = [F128::ZERO; 9];
+            for k in 0..9 {
+                b1[k] = eq_h * out.1[k];
+                binf[k] = eq_h * out.2[k];
+            }
+            (eq_h * p1, eq_h * pinf, agg, b1, binf)
+        })
+        .reduce(
+            || (
+                F128::ZERO,
+                F128::ZERO,
+                [F128::ZERO; 6],
+                [F128::ZERO; 9],
+                [F128::ZERO; 9],
+            ),
+            |(s1, sinf, sa, sb1, sbi), (c1, cinf, ca, cb1, cbi)| {
+                let mut a = sa;
+                for (x, y) in a.iter_mut().zip(ca.iter()) {
+                    *x += *y;
+                }
+                let mut b1 = sb1;
+                for (x, y) in b1.iter_mut().zip(cb1.iter()) {
+                    *x += *y;
+                }
+                let mut bi = sbi;
+                for (x, y) in bi.iter_mut().zip(cbi.iter()) {
+                    *x += *y;
+                }
+                (s1 + c1, sinf + cinf, a, b1, bi)
+            },
+        );
+
+    let la = lookahead_from_odd_weighted(&agg, r1_inv);
+    let mut la2 = Round4Lookahead2 {
+        p1: [F128::ZERO; 9],
+        pinf: [F128::ZERO; 9],
+    };
+    for k in 0..9 {
+        la2.p1[k] = inv12 * bi1[k];
+        la2.pinf[k] = inv12 * biinf[k];
+    }
+    (mlv_challenges[0] * sum1, sum_inf, la, la2)
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,6 +2704,389 @@ pub(crate) fn fold2_and_message_scalar(
         pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
     }
     (p1_acc.reduce(), pinf_acc.reduce())
+}
+
+// ---------------------------------------------------------------------------
+// Three-challenge cascade: the message TWO rounds past a composed pass,
+// deferred as a bivariate quadratic in the two not-yet-sampled challenges, so
+// three rounds collapse into one 8:1 pass. Same reassociation argument as the
+// two-challenge lookahead — the six incumbent coefficients are literally the
+// {0,1,∞} evaluations of the deferred quadratic, and this stores the {0,1,∞}²
+// evaluation grid of the deferred bivariate. Every wire byte is identical.
+// ---------------------------------------------------------------------------
+
+/// Deferred bivariate message: `p1[3α+β]` / `pinf[3α+β]` are the two halves'
+/// evaluations at `(ρ, ρ') = (α, β)` for `α, β ∈ {0, 1, ∞}` (index order
+/// 0, 1, ∞).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Round4Lookahead2 {
+    pub p1: [F128; 9],
+    pub pinf: [F128; 9],
+}
+
+/// Evaluate a char-2 quadratic from its {0, 1, ∞} evaluations:
+/// `G(x) = P₀ + (P₀+P₁+P_∞)·x + P_∞·x²` (check: G(0)=P₀, G(1)=P₁ in char 2,
+/// leading coefficient P_∞ — the exact map `lookahead_from_odd_weighted`
+/// encodes).
+#[inline]
+fn quad_from_evals(p0: F128, p1: F128, pinf: F128, x: F128) -> F128 {
+    p0 + (p0 + p1 + pinf) * x + pinf * (x * x)
+}
+
+/// Evaluate the deferred bivariate message at the two sampled challenges.
+#[inline]
+pub fn eval_round4_lookahead2(la: &Round4Lookahead2, rho: F128, rho2: F128) -> (F128, F128) {
+    let collapse = |p: &[F128; 9]| -> F128 {
+        let q0 = quad_from_evals(p[0], p[1], p[2], rho2);
+        let q1 = quad_from_evals(p[3], p[4], p[5], rho2);
+        let qi = quad_from_evals(p[6], p[7], p[8], rho2);
+        quad_from_evals(q0, q1, qi, rho)
+    };
+    (collapse(&la.p1), collapse(&la.pinf))
+}
+
+/// Standalone bivariate-lookahead sweep over a materialized state: the
+/// message two rounds ahead as its {0,1,∞}² evaluation grid.
+///
+/// `r_next` is the same vector the composed pass received for THIS state
+/// (`r_next[0] = ONE`, `r_next[1..]` the remaining eq weights): the grid's
+/// group weight divides out the two low parity weights `r_next[1]`,
+/// `r_next[2]`, both of which must be non-zero (protocol constants at the
+/// ranked shape; the caller gates on it).
+///
+/// Staging form (correctness-first): a separate pass over the state. The
+/// fused kernels take over this computation once the schedule is proven.
+pub fn bivariate_lookahead_from_state(
+    a: &[F128],
+    b: &[F128],
+    r_next: &[F128],
+) -> Round4Lookahead2 {
+    use rayon::prelude::*;
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n);
+    let r1 = r_next[1];
+    let r2 = r_next[2];
+    assert_ne!(r1, F128::ZERO);
+    assert_ne!(r2, F128::ZERO);
+    // eq over the pair-index space, exactly as the composed passes build it
+    // (clamped so a group of four pairs always fits in the lo half).
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], lookahead_n_hi(n_vars).min(n_vars - 2));
+    let lo_size = 1usize << eq.n_lo;
+    assert!(lo_size >= 4, "bivariate lookahead requires lo_size >= 4");
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let inv12 = (r1 * r2).inv();
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+    let chunk_in = 2 * lo_size;
+
+    let (p1, pinf) = (0..hi_size)
+        .into_par_iter()
+        .map(|x_hi| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let mut acc1 = [F256Unreduced::ZERO; 9];
+            let mut accinf = [F256Unreduced::ZERO; 9];
+            for z in 0..lo_size / 4 {
+                // Group z: state values v0..v8 = a_in[8z .. 8z+8]; the top
+                // pair's odd weight eq_lo[4z+3] = eq₃(z)·r1·r2.
+                let i = 8 * z;
+                let wt = eq_lo[4 * z + 3];
+                // Odd-half selections (v4..v8) for the "1" evaluations and
+                // half-sums d_j = v_j + v_{j+4} for the "∞" evaluations —
+                // all XOR, no multiplies (folds at 0/1/∞ are selections).
+                let grid = |v4: F128, v5: F128, v6: F128, v7: F128| -> [F128; 9] {
+                    [
+                        v4,
+                        v6,
+                        v4 + v6,
+                        v5,
+                        v7,
+                        v5 + v7,
+                        v4 + v5,
+                        v6 + v7,
+                        v4 + v5 + v6 + v7,
+                    ]
+                };
+                let ga1 = grid(a_in[i + 4], a_in[i + 5], a_in[i + 6], a_in[i + 7]);
+                let gb1 = grid(b_in[i + 4], b_in[i + 5], b_in[i + 6], b_in[i + 7]);
+                let gai = grid(
+                    a_in[i] + a_in[i + 4],
+                    a_in[i + 1] + a_in[i + 5],
+                    a_in[i + 2] + a_in[i + 6],
+                    a_in[i + 3] + a_in[i + 7],
+                );
+                let gbi = grid(
+                    b_in[i] + b_in[i + 4],
+                    b_in[i + 1] + b_in[i + 5],
+                    b_in[i + 2] + b_in[i + 6],
+                    b_in[i + 3] + b_in[i + 7],
+                );
+                for k in 0..9 {
+                    acc1[k] ^= (wt * ga1[k]).mul_unreduced(gb1[k]);
+                    accinf[k] ^= (wt * gai[k]).mul_unreduced(gbi[k]);
+                }
+            }
+            let eq_h = eq_hi[x_hi];
+            let mut out1 = [F128::ZERO; 9];
+            let mut outinf = [F128::ZERO; 9];
+            for k in 0..9 {
+                out1[k] = eq_h * acc1[k].reduce();
+                outinf[k] = eq_h * accinf[k].reduce();
+            }
+            (out1, outinf)
+        })
+        .reduce(
+            || ([F128::ZERO; 9], [F128::ZERO; 9]),
+            |(mut s1, mut si), (c1, ci)| {
+                for k in 0..9 {
+                    s1[k] += c1[k];
+                    si[k] += ci[k];
+                }
+                (s1, si)
+            },
+        );
+
+    let mut out = Round4Lookahead2 {
+        p1: [F128::ZERO; 9],
+        pinf: [F128::ZERO; 9],
+    };
+    for k in 0..9 {
+        out.p1[k] = inv12 * p1[k];
+        out.pinf[k] = inv12 * pinf[k];
+    }
+    out
+}
+
+/// Three-challenge composed pass: fold `(a, b)` 8:1 at `(ρ_a, ρ_b, ρ_c)`,
+/// compute the next round's message, and defer the two rounds after that as
+/// a quadratic ([`Round3Lookahead`]) and a bivariate quadratic
+/// ([`Round4Lookahead2`]) in their not-yet-sampled challenges. Replaces a
+/// composed double-fold plus one ordinary tail iteration — one full
+/// read+write pass of the middle state deleted. Pure reassociation of exact
+/// F128 arithmetic; every wire byte is identical.
+#[allow(clippy::too_many_arguments)]
+pub fn fold3_plain_and_round_tri_lookahead_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    r_next: &[F128],
+) -> (F128, F128, Round3Lookahead, Round4Lookahead2) {
+    use rayon::prelude::*;
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 64);
+    let eighth = n / 8;
+    assert_eq!(a_out.len(), eighth);
+    assert_eq!(b_out.len(), eighth);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 3);
+    let r1 = r_next[1];
+    let r2 = r_next[2];
+    assert_ne!(r1, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+    assert_ne!(r2, F128::ZERO, "bivariate lookahead requires a non-zero second parity weight");
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], lookahead_n_hi(n_vars).min(n_vars - 2));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 4, "tri-composed lookahead requires lo_size >= 4");
+    assert_eq!(lo_size * hi_size * 2, eighth);
+    let kappa = (F128::ONE + r1) * r1.inv();
+    let r_inv = r1.inv();
+    let inv12 = (r1 * r2).inv();
+
+    let chunk_in = 16 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    let (sum1, sum_inf, agg, bi1, biinf) = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: chunk geometry supplies eight inputs per output and two
+            // outputs per eq_lo value; features are guaranteed by the cfg.
+            let out = unsafe {
+                kernels::x86_64::fold3_and_message_tri_lookahead_x86_avx512(
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+                )
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            let out = fold3_and_message_tri_lookahead_scalar(
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+            );
+            let eq_h = eq_hi[x_hi];
+            let p1 = kappa * out.0[0] + out.0[2];
+            let pinf = kappa * out.0[1] + out.0[3];
+            let mut agg = [F128::ZERO; 6];
+            for (dst, src) in agg.iter_mut().zip(out.0[2..8].iter()) {
+                *dst = eq_h * *src;
+            }
+            let mut b1 = [F128::ZERO; 9];
+            let mut binf = [F128::ZERO; 9];
+            for k in 0..9 {
+                b1[k] = eq_h * out.1[k];
+                binf[k] = eq_h * out.2[k];
+            }
+            (eq_h * p1, eq_h * pinf, agg, b1, binf)
+        })
+        .reduce(
+            || (
+                F128::ZERO,
+                F128::ZERO,
+                [F128::ZERO; 6],
+                [F128::ZERO; 9],
+                [F128::ZERO; 9],
+            ),
+            |(s1, sinf, sa, sb1, sbi), (c1, cinf, ca, cb1, cbi)| {
+                let mut a = sa;
+                for (x, y) in a.iter_mut().zip(ca.iter()) {
+                    *x += *y;
+                }
+                let mut b1 = sb1;
+                for (x, y) in b1.iter_mut().zip(cb1.iter()) {
+                    *x += *y;
+                }
+                let mut bi = sbi;
+                for (x, y) in bi.iter_mut().zip(cbi.iter()) {
+                    *x += *y;
+                }
+                (s1 + c1, sinf + cinf, a, b1, bi)
+            },
+        );
+
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
+    let mut la2 = Round4Lookahead2 {
+        p1: [F128::ZERO; 9],
+        pinf: [F128::ZERO; 9],
+    };
+    for k in 0..9 {
+        la2.p1[k] = inv12 * bi1[k];
+        la2.pinf[k] = inv12 * biinf[k];
+    }
+    (r_next[0] * sum1, sum_inf, la, la2)
+}
+
+/// Portable leaf of [`fold3_plain_and_round_tri_lookahead_into`] for one
+/// worker chunk. Returns the incumbent eight sums (on the odd pair weight)
+/// plus the two bivariate {0,1,∞}² grids (on the top-odd group weight
+/// `eq_lo[4z+3]`), each reduced.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fold3_and_message_tri_lookahead_scalar(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    eq_lo: &[F128],
+) -> ([F128; 8], [F128; 9], [F128; 9]) {
+    debug_assert_eq!(a_in.len(), 8 * a_out.len());
+    debug_assert_eq!(b_in.len(), 8 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert!(eq_lo.len().is_multiple_of(4));
+    let fold8 = |v: &[F128], i: usize| {
+        let l0 = v[i] + rho_a * (v[i] + v[i + 1]);
+        let l1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
+        let l2 = v[i + 4] + rho_a * (v[i + 4] + v[i + 5]);
+        let l3 = v[i + 6] + rho_a * (v[i + 6] + v[i + 7]);
+        let m0 = l0 + rho_b * (l0 + l1);
+        let m1 = l2 + rho_b * (l2 + l3);
+        m0 + rho_c * (m0 + m1)
+    };
+    let grid = |v4: F128, v5: F128, v6: F128, v7: F128| -> [F128; 9] {
+        [
+            v4,
+            v6,
+            v4 + v6,
+            v5,
+            v7,
+            v5 + v7,
+            v4 + v5,
+            v6 + v7,
+            v4 + v5 + v6 + v7,
+        ]
+    };
+    let mut acc = [F256Unreduced::ZERO; 8];
+    let mut acc1 = [F256Unreduced::ZERO; 9];
+    let mut accinf = [F256Unreduced::ZERO; 9];
+    for z in 0..eq_lo.len() / 4 {
+        // Group z: eight outputs v0..v8 = out[8z .. 8z+8] from 64 inputs.
+        let o = 8 * z;
+        let i = 64 * z;
+        let mut va = [F128::ZERO; 8];
+        let mut vb = [F128::ZERO; 8];
+        for j in 0..8 {
+            va[j] = fold8(a_in, i + 8 * j);
+            vb[j] = fold8(b_in, i + 8 * j);
+            a_out[o + j] = va[j];
+            b_out[o + j] = vb[j];
+        }
+        // Incumbent eight-sum stats on the two 4-subgroups (u = 2z, 2z+1).
+        for half in 0..2 {
+            let (a0, a1, a2, a3) = (
+                va[4 * half],
+                va[4 * half + 1],
+                va[4 * half + 2],
+                va[4 * half + 3],
+            );
+            let (b0, b1, b2, b3) = (
+                vb[4 * half],
+                vb[4 * half + 1],
+                vb[4 * half + 2],
+                vb[4 * half + 3],
+            );
+            let wt = eq_lo[2 * (2 * z + half) + 1];
+            let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+            acc[0] ^= a1w.mul_unreduced(b1);
+            acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+            acc[2] ^= a3w.mul_unreduced(b3);
+            acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+            acc[4] ^= a2w.mul_unreduced(b2);
+            let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+            let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+            acc[5] ^= e_aw.mul_unreduced(e_b);
+            acc[6] ^= o_aw.mul_unreduced(o_b);
+            acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+        }
+        // Bivariate grids on the full 8-group (top-odd weight).
+        let wt8 = eq_lo[4 * z + 3];
+        let ga1 = grid(va[4], va[5], va[6], va[7]);
+        let gb1 = grid(vb[4], vb[5], vb[6], vb[7]);
+        let gai = grid(va[0] + va[4], va[1] + va[5], va[2] + va[6], va[3] + va[7]);
+        let gbi = grid(vb[0] + vb[4], vb[1] + vb[5], vb[2] + vb[6], vb[3] + vb[7]);
+        for k in 0..9 {
+            acc1[k] ^= (wt8 * ga1[k]).mul_unreduced(gb1[k]);
+            accinf[k] ^= (wt8 * gai[k]).mul_unreduced(gbi[k]);
+        }
+    }
+    (
+        acc.map(|x| x.reduce()),
+        acc1.map(|x| x.reduce()),
+        accinf.map(|x| x.reduce()),
+    )
 }
 
 /// Serial reference — identical I/O contract to
@@ -3348,11 +4326,76 @@ mod tests {
         }
     }
 
+    /// AVX-512 tri-composed kernel vs the portable reference on one chunk —
+    /// vector body, whole-group tail, and tail-only shapes.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold3_and_message_tri_lookahead_x86_matches_scalar() {
+        for &lo_size in &[4usize, 8, 12, 16, 20, 32, 36, 64] {
+            let mut rng = Rng::new(0x3F00 + lo_size as u64);
+            let a_in = rng.f128_vec(16 * lo_size);
+            let b_in = rng.f128_vec(16 * lo_size);
+            let rho_a = rng.f128();
+            let rho_b = rng.f128();
+            let rho_c = rng.f128();
+            let eq_lo = rng.f128_vec(lo_size);
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = vec![F128::ZERO; 2 * lo_size];
+            let out_s = fold3_and_message_tri_lookahead_scalar(
+                &a_in, &b_in, &mut a_s, &mut b_s, rho_a, rho_b, rho_c, &eq_lo,
+            );
+            let mut a_v = vec![F128::ONE; 2 * lo_size];
+            let mut b_v = vec![F128::ONE; 2 * lo_size];
+            // SAFETY: lengths satisfy the kernel's contract.
+            let out_v = unsafe {
+                kernels::x86_64::fold3_and_message_tri_lookahead_x86_avx512(
+                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, rho_c, &eq_lo,
+                )
+            };
+            assert_eq!(a_s, a_v, "a lo_size={lo_size}");
+            assert_eq!(b_s, b_v, "b lo_size={lo_size}");
+            assert_eq!(out_s.0, out_v.0, "eight sums lo_size={lo_size}");
+            assert_eq!(out_s.1, out_v.1, "bivariate 1-grid lo_size={lo_size}");
+            assert_eq!(out_s.2, out_v.2, "bivariate inf-grid lo_size={lo_size}");
+        }
+    }
+
     /// The no-materialize route equals the materializing lookahead route:
     /// same round-2 message and coefficients from the store-free sweep, and
     /// the packed→composed pass reproduces the materialized composed tables
     /// (POISON-prefilled outputs), round-4 message and round-5 coefficients
     /// — dense and padded.
+    #[test]
+    fn biv_nomat_sweep_matches_incumbent_and_standalone() {
+        const K_SKIP: usize = 6;
+        // lo_size ≥ 16 needs n_vars ≥ 11 → m ≥ 18.
+        for &(m, padded) in &[(18usize, false), (18, true), (19, true)] {
+            let mut rng = Rng::new(0x8B00 + m as u64 + padded as u64 * 100);
+            let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, padded);
+            let z = rng.f128();
+            let table = UniSkipFoldTable::new(K_SKIP, z);
+            let mut mlv = rng.f128_vec(m - K_SKIP);
+            mlv[0] = F128::ONE;
+            // Materializing sweep: reference messages + the state for the
+            // standalone bivariate oracle.
+            let (a2, b2, m1_ref, mi_ref, la_ref) =
+                uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+            let (m1_b, mi_b, la_b, la2_b) = uni_skip_round_pair_lookahead_biv_nomat_packed_padded(
+                &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+            );
+            assert_eq!((m1_ref, mi_ref), (m1_b, mi_b), "round-2 msg m={m} padded={padded}");
+            assert_eq!(la_ref, la_b, "round-3 coeffs m={m} padded={padded}");
+            let la2_ref = bivariate_lookahead_from_state(&a2, &b2, &mlv);
+            assert_eq!(la2_ref, la2_b, "bivariate grid m={m} padded={padded}");
+        }
+    }
+
     #[test]
     fn nomat_route_matches_materialized() {
         const K_SKIP: usize = 6;

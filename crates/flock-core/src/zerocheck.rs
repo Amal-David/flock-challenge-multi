@@ -72,6 +72,38 @@ fn lookahead_off() -> bool {
 pub(crate) static ZC_LEVELS_LAST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+/// Test-only: whether the last prove ran the F3 tri-composed cascade.
+#[cfg(test)]
+pub(crate) static ZC_F3_LAST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only forced-on latch for the F3 tri-composed cascade.
+#[cfg(test)]
+pub(crate) static ZC_F3_FORCED_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_F3=1` restores the incumbent two-challenge cascade
+/// bit-for-bit in the same binary; the default is the tri-composed cascade
+/// (the bivariate grid rides the composed passes' registers). The harness
+/// env-clears workers, so the shipped behavior is ON.
+#[inline]
+fn f3_on() -> bool {
+    #[cfg(test)]
+    if ZC_F3_FORCED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(test)]
+    if ZC_F3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    std::env::var_os("FLOCK_NO_ZC_F3").is_none()
+}
+
+/// Test-only forced-off latch for the F3 tri-composed cascade.
+#[cfg(test)]
+pub(crate) static ZC_F3_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test-only forced-off latches for the cascade levels (rounds 5+6, 7+8).
 #[cfg(test)]
 pub(crate) static ZC_CASCADE2_FORCED_OFF: std::sync::atomic::AtomicBool =
@@ -530,7 +562,39 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
+    // F3 gate, decided before the sweep so the sweep can carry the bivariate
+    // grid. Slots k+1..k+7 are protocol constants at the ranked shape;
+    // beyond that the slots are sampled (zero w.p. 2⁻¹²⁸).
+    let use_f3 = use_nomat
+        && f3_on()
+        && n_mlv >= 12
+        && r[k_skip + 2] != F128::ZERO
+        && r[k_skip + 3] != F128::ZERO
+        && r[k_skip + 4] != F128::ZERO
+        && r[k_skip + 5] != F128::ZERO
+        && r[k_skip + 7] != F128::ZERO
+        && r[k_skip + 8] != F128::ZERO
+        && r[k_skip + 10] != F128::ZERO
+        && r[k_skip + 11] != F128::ZERO
+        && !cascade2_off()
+        && !cascade3_off();
+    #[cfg(test)]
+    ZC_F3_LAST.store(use_f3, std::sync::atomic::Ordering::Relaxed);
+
+    let mut f3_la2 = None;
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_f3 {
+        let (m1, mi, la, la2) = multilinear::uni_skip_round_pair_lookahead_biv_nomat_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        f3_la2 = Some(la2);
+        (Vec::new(), Vec::new(), m1, mi, Some(la))
+    } else if use_nomat {
         let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded(
             a_packed,
             b_packed,
@@ -650,10 +714,96 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
 
-    // `loop_start` is the first tail iteration this route has not already
-    // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
-    // indexed by `i`, so starting at 2·levels needs no other change.
+    // F3 tri-composed cascade: the sweep carried the bivariate grid, so
+    // every level — including level zero straight from the packed witness —
+    // binds THREE challenges per pass (two lookahead evaluations, then one
+    // 8:1 composed fold that emits the next message plus both deferred
+    // messages). Three messages and three folds per level keep the ordinary
+    // loop aligned. Transcript bytes identical — pure reassociation.
     let mut la = lookahead;
+    if use_f3 {
+        use multilinear::{
+            eval_round4_lookahead2, fold3_from_packed_and_round_tri_lookahead_into,
+            fold3_plain_and_round_tri_lookahead_into,
+        };
+        let mut la3 = la.take().expect("f3 without a deferred message");
+        let mut la2 = f3_la2.take().expect("f3 without a bivariate grid");
+        for t in 0..3usize {
+            let rho_base = 3 * t;
+            let (m_a1, m_ainf) = eval_round3_lookahead(&la3, mlv_rhos[rho_base]);
+            multilinear_msgs.push((m_a1, m_ainf));
+            challenger.observe_f128(m_a1);
+            challenger.observe_f128(m_ainf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let (m_b1, m_binf) =
+                eval_round4_lookahead2(&la2, mlv_rhos[rho_base], mlv_rhos[rho_base + 1]);
+            multilinear_msgs.push((m_b1, m_binf));
+            challenger.observe_f128(m_b1);
+            challenger.observe_f128(m_binf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let (m1, mi, la_n, la2_n, log_n_cur) = if t == 0 {
+                // Level 0: rounds 3+4+5 straight from the packed witness,
+                // writing the eighth-size state once.
+                let eighth = n_in / 8;
+                let mut r_next = vec![F128::ONE; n_mlv - 3];
+                r_next[1..].copy_from_slice(&r[k_skip + 4..]);
+                let mut a8 = crate::scratch::take_f128(eighth);
+                let mut b8 = crate::scratch::take_f128(eighth);
+                let (m1, mi, la_n, la2_n) = fold3_from_packed_and_round_tri_lookahead_into(
+                    a_packed,
+                    b_packed,
+                    m,
+                    k_skip,
+                    &fold_table,
+                    padding,
+                    &mut a8,
+                    &mut b8,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    mlv_rhos[2],
+                    &r_next,
+                );
+                a_mlv = a8;
+                b_mlv = b8;
+                crate::gaptime::mark("zc: rounds 3+4 composed fold done");
+                (m1, mi, la_n, la2_n, n_mlv)
+            } else {
+                let n_cur = a_mlv.len();
+                let log_n_cur = n_cur.trailing_zeros() as usize;
+                let eighth = n_cur / 8;
+                let bound_after = 3 + 3 * t;
+                let mut r_next3 = vec![F128::ONE; log_n_cur - 3];
+                r_next3[1..].copy_from_slice(&r[k_skip + bound_after + 1..]);
+                let (m1, mi, la_n, la2_n) = fold3_plain_and_round_tri_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..eighth],
+                    &mut b_nxt[..eighth],
+                    mlv_rhos[rho_base],
+                    mlv_rhos[rho_base + 1],
+                    mlv_rhos[rho_base + 2],
+                    &r_next3,
+                );
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(eighth);
+                b_mlv.truncate(eighth);
+                (m1, mi, la_n, la2_n, log_n_cur)
+            };
+            la3 = la_n;
+            la2 = la2_n;
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m1, mi));
+            challenger.observe_f128(m1);
+            challenger.observe_f128(mi);
+            mlv_rhos.push(challenger.sample_f128());
+        }
+    } else {
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
@@ -739,7 +889,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
     }
-    let loop_start = 2 * n_levels;
+    }
+    // F3 handles rounds 3..=11 (nine messages, nine folds — three per
+    // level); the incumbent cascade handles two per level.
+    let loop_start = if use_f3 { 9 } else { 2 * n_levels };
 
     for i in loop_start..(n_mlv - 1) {
         let t_round = std::time::Instant::now();
@@ -1208,6 +1361,64 @@ mod tests {
             let claim_v = verify(m, proof_full, &mut ch_v)
                 .unwrap_or_else(|e| panic!("verify rejected cascade proof at m={m}: {e:?}"));
             assert_eq!(&claim_v, claim_full, "verify claim mismatch at m={m}");
+        }
+    }
+
+    /// **F3 tri-composed cascade**: with the staging gate forced on, the
+    /// prove transcript is byte-for-byte identical to the incumbent cascade
+    /// (pure reassociation), the F3 arm genuinely engages, and the proof
+    /// verifies. Covers dense and BLAKE3-padded shapes above the `n_mlv >=
+    /// 12` gate plus one below it (which must fall back).
+    #[test]
+    fn f3_cascade_transcript_identical() {
+        use std::sync::atomic::Ordering;
+        for &(m, padded) in &[(18usize, false), (18, true), (19, false), (17, false), (23, false)] {
+            let mut rng = Rng::new(9900 + m as u64 + padded as u64 * 1000);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            let padding = if padded {
+                let (k_log, useful) = (14usize, 15_409usize);
+                let block = 1usize << k_log;
+                for blk in 0..((1usize << m) / block) {
+                    for j in useful..block {
+                        a[blk * block + j] = false;
+                        b[blk * block + j] = false;
+                    }
+                }
+                PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful,
+                }
+            } else {
+                PaddingSpec::dense(m)
+            };
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            ZC_F3_FORCED_OFF.store(true, Ordering::Relaxed);
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            let baseline = prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch);
+            ZC_F3_FORCED_OFF.store(false, Ordering::Relaxed);
+            assert!(!ZC_F3_LAST.load(Ordering::Relaxed), "baseline arm must not run f3");
+
+            ZC_F3_FORCED_ON.store(true, Ordering::Relaxed);
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            let f3 = prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch);
+            ZC_F3_FORCED_ON.store(false, Ordering::Relaxed);
+            let expect_engaged = m - K_SKIP >= 12;
+            assert_eq!(
+                ZC_F3_LAST.load(Ordering::Relaxed),
+                expect_engaged,
+                "f3 engagement wrong at m={m}"
+            );
+
+            assert_eq!(baseline.0, f3.0, "f3 proof diverges at m={m} padded={padded}");
+            assert_eq!(baseline.1, f3.1, "f3 claim diverges at m={m} padded={padded}");
+
+            let mut ch_v = FsChallenger::new(b"flock-test-v0");
+            let claim_v = verify(m, &f3.0, &mut ch_v)
+                .unwrap_or_else(|e| panic!("verify rejected f3 proof at m={m}: {e:?}"));
+            assert_eq!(&claim_v, &f3.1, "verify claim mismatch at m={m}");
         }
     }
 
