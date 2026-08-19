@@ -117,7 +117,7 @@
 //!   per byte.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
@@ -1472,13 +1472,157 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
 }
 
 /// Dot product of two equal-length F128 slices.
+///
+/// Reduction modulo the GHASH polynomial is F₂-linear, so
+/// `Σ (aᵢ·bᵢ) mod p = (Σ aᵢ·bᵢ) mod p` — the identity already documented
+/// on [`F128::mul_unreduced`] and landed in `ring_switch::inner_product`
+/// (`58d26785` / #142). This is the private lincheck leftover of that
+/// package: `λ · z_partial` (prove/verify, length `2^k_skip = 64`) plus
+/// the product-sumcheck messages `e1 = Σ χ_hi·z_hi` and
+/// `e∞ = Σ (χ_hi+χ_lo)·(z_hi+z_lo)` (first eval `half = 2^{k_log-1} =
+/// 8192` on ranked BLAKE3). Kill `FLOCK_NO_LC_WIDE=1` keeps the portable
+/// one-reduce loop. Ranked Hilbert env is cleared, so the SPR wide path
+/// fires.
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if lc_wide_enabled() {
+            // SAFETY: cfg gate supplies avx512f + vpclmulqdq; sse4.1 is
+            // part of every AVX-512 profile the crate already compiles for.
+            return unsafe { inner_product_wide(a, b) };
+        }
     }
-    acc
+    inner_product_unreduced(a, b)
+}
+
+/// Portable one-reduce inner product. Bit-identical to the historical
+/// `acc += x * y` loop because reduction commutes with XOR.
+fn inner_product_unreduced(a: &[F128], b: &[F128]) -> F128 {
+    let mut acc = F256Unreduced::ZERO;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        acc ^= x.mul_unreduced(y);
+    }
+    acc.reduce()
+}
+
+/// `FLOCK_NO_LC_WIDE=1` disables the AVX-512 4-wide path (exact A/B).
+fn lc_wide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_WIDE").is_none()
+    });
+    *ON
+}
+
+/// 4-wide unreduced CLMUL accumulate + one horizontal fold + one reduce.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` (+ `sse4.1` for `fold`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len());
+    // SAFETY: cfg + target_feature; loads are unaligned; F128 is 16-byte
+    // and four consecutive values fill one ZMM. Tail uses the same
+    // `mul_unreduced` the portable path uses.
+    unsafe {
+        let n = a.len();
+        let mut acc = WideGhashX4::zero();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let x = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let y = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            acc.mul_acc(x, y);
+            i += 4;
+        }
+        let mut tail = acc.fold();
+        while i < n {
+            tail ^= a[i].mul_unreduced(b[i]);
+            i += 1;
+        }
+        tail.reduce()
+    }
+}
+
+/// Portable one-reduce product-sumcheck message
+/// `(Σ χ_hi·z_hi, Σ (χ_hi+χ_lo)·(z_hi+z_lo))`.
+fn sumcheck_round_eval_unreduced(
+    clo: &[F128],
+    chi: &[F128],
+    zlo: &[F128],
+    zhi: &[F128],
+) -> (F128, F128) {
+    debug_assert_eq!(clo.len(), chi.len());
+    debug_assert_eq!(zlo.len(), chi.len());
+    debug_assert_eq!(zhi.len(), chi.len());
+    let mut e1 = F256Unreduced::ZERO;
+    let mut einf = F256Unreduced::ZERO;
+    for i in 0..chi.len() {
+        e1 ^= chi[i].mul_unreduced(zhi[i]);
+        einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+    }
+    (e1.reduce(), einf.reduce())
+}
+
+/// SPR 4-wide form of [`sumcheck_round_eval_unreduced`]. `χ+` / `z+` are
+/// XOR of the two ZMM loads (F128 add is XOR).
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` (+ `sse4.1` for `fold`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn sumcheck_round_eval_wide(
+    clo: &[F128],
+    chi: &[F128],
+    zlo: &[F128],
+    zhi: &[F128],
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    let n = chi.len();
+    debug_assert_eq!(clo.len(), n);
+    debug_assert_eq!(zlo.len(), n);
+    debug_assert_eq!(zhi.len(), n);
+    // SAFETY: cfg + target_feature; four consecutive F128 fill one ZMM.
+    unsafe {
+        let mut e1 = WideGhashX4::zero();
+        let mut einf = WideGhashX4::zero();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let chi4 = _mm512_loadu_si512(chi.as_ptr().add(i) as *const __m512i);
+            let zhi4 = _mm512_loadu_si512(zhi.as_ptr().add(i) as *const __m512i);
+            let clo4 = _mm512_loadu_si512(clo.as_ptr().add(i) as *const __m512i);
+            let zlo4 = _mm512_loadu_si512(zlo.as_ptr().add(i) as *const __m512i);
+            e1.mul_acc(chi4, zhi4);
+            einf.mul_acc(
+                _mm512_xor_si512(chi4, clo4),
+                _mm512_xor_si512(zhi4, zlo4),
+            );
+            i += 4;
+        }
+        let mut e1t = e1.fold();
+        let mut einft = einf.fold();
+        while i < n {
+            e1t ^= chi[i].mul_unreduced(zhi[i]);
+            einft ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+            i += 1;
+        }
+        (e1t.reduce(), einft.reduce())
+    }
 }
 
 /// Length above which the inner product / element-wise kernels split via
@@ -1576,22 +1720,33 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            if lc_wide_enabled() {
+                // SAFETY: cfg gate; slices are the four half-tables.
+                return unsafe { sumcheck_round_eval_wide(clo, chi, zlo, zhi) };
+            }
         }
-        return (e1, einf);
+        return sumcheck_round_eval_unreduced(clo, chi, zlo, zhi);
     }
-    (0..half)
+    // Parallel: per-item unreduced schoolbook, XOR-tree of F256Unreduced,
+    // one reduce. Same identity as the sequential path; grain unchanged.
+    let (e1, einf) = (0..half)
         .into_par_iter()
         .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            let e1_i = chi[i].mul_unreduced(zhi[i]);
+            let einf_i = (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
             (e1_i, einf_i)
         })
-        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        .reduce(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        );
+    (e1.reduce(), einf.reduce())
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1661,8 +1816,8 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half2 {
             let lo = cq0[i] + r * (cq2[i] + cq0[i]);
             let hi = cq1[i] + r * (cq3[i] + cq1[i]);
@@ -1672,12 +1827,13 @@ fn sumcheck_bind_both_and_eval_next(
             cq1[i] = hi;
             zq0[i] = zlo;
             zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
+            e1 ^= hi.mul_unreduced(zhi);
+            einf ^= (hi + lo).mul_unreduced(zhi + zlo);
         }
-        (e1, einf)
+        (e1.reduce(), einf.reduce())
     } else {
-        cq0.par_iter_mut()
+        let (e1, einf) = cq0
+            .par_iter_mut()
             .zip(cq1.par_iter_mut())
             .zip(cq2.par_iter())
             .zip(cq3.par_iter())
@@ -1694,9 +1850,16 @@ fn sumcheck_bind_both_and_eval_next(
                 *c1 = hi;
                 *z0 = zlo;
                 *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
+                (
+                    hi.mul_unreduced(zhi),
+                    (hi + lo).mul_unreduced(zhi + zlo),
+                )
             })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+            .reduce(
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+            );
+        (e1.reduce(), einf.reduce())
     };
 
     comb.truncate(half);
@@ -2538,6 +2701,69 @@ mod tests {
     }
 
     // ---- Unit tests for the kernels ----
+
+    /// Deferred-reduction IP / sumcheck messages are bit-identical to the
+    /// historical per-product reduce (`acc += x * y`).
+    #[test]
+    fn inner_product_deferred_matches_naive() {
+        let mut rng = Rng::new(0x_1C_D07);
+        for &n in &[0usize, 1, 3, 4, 5, 7, 8, 16, 64, 128, 243, 4095, 4096, 8192] {
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let mut naive = F128::ZERO;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                naive += x * y;
+            }
+            let got = inner_product(&a, &b);
+            assert_eq!(got, naive, "n={n} wide-or-unreduced ≠ per-product");
+            let portable = inner_product_unreduced(&a, &b);
+            assert_eq!(portable, naive, "n={n} portable unreduced ≠ per-product");
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                // SAFETY: cfg gate.
+                let wide = unsafe { inner_product_wide(&a, &b) };
+                assert_eq!(wide, naive, "n={n} WideGhashX4 ≠ per-product");
+            }
+        }
+    }
+
+    /// `sumcheck_round_eval_par` matches a naive per-product reduce at both
+    /// the sequential (`half < 4096`) and parallel (`half ≥ 4096`) grains.
+    #[test]
+    fn sumcheck_round_eval_deferred_matches_naive() {
+        let mut rng = Rng::new(0x_5C_E0F);
+        for &n in &[2usize, 4, 8, 16, 64, 128, 256, 1024, 4096, 8192, 16384] {
+            let c = rng.f128_vec(n);
+            let z = rng.f128_vec(n);
+            let half = n / 2;
+            let mut e1 = F128::ZERO;
+            let mut einf = F128::ZERO;
+            for i in 0..half {
+                e1 += c[i + half] * z[i + half];
+                einf += (c[i + half] + c[i]) * (z[i + half] + z[i]);
+            }
+            let got = sumcheck_round_eval_par(&c, &z);
+            assert_eq!(got, (e1, einf), "n={n} eval ≠ naive");
+            let (clo, chi) = c.split_at(half);
+            let (zlo, zhi) = z.split_at(half);
+            let portable = sumcheck_round_eval_unreduced(clo, chi, zlo, zhi);
+            assert_eq!(portable, (e1, einf), "n={n} portable ≠ naive");
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                // SAFETY: cfg gate.
+                let wide = unsafe { sumcheck_round_eval_wide(clo, chi, zlo, zhi) };
+                assert_eq!(wide, (e1, einf), "n={n} wide ≠ naive");
+            }
+        }
+    }
 
     /// The u16-narrowed CSC row indices produce exactly the same
     /// `fold_alpha_batched` output as the u32 arrays (oracle A/B for
