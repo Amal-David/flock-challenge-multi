@@ -63,6 +63,15 @@ use kernels::shift_reduce_inner_ab_scalar;
     target_feature = "avx512bw"
 ))]
 use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+use kernels::x86_64::shift_reduce_inner_ab_x86_avx512_gfni;
 #[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
 use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 
@@ -2878,6 +2887,134 @@ mod tests {
                 out_scalar, out_avx512,
                 "avx512/gfni disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
             );
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    #[test]
+    fn x86_gfni_avx512_matrix_kernel_matches_incumbent() {
+        // The table-free GFNI kernel is the ranked default: it must agree byte
+        // for byte with BOTH the scalar oracle and the incumbent table-apply
+        // AVX-512 kernel (the FLOCK_NO_URM_GFNI arm), on every window shape,
+        // with POISON-prefilled outputs so a missed lane cannot pass.
+        let mut rng = Rng::new(0x9A17_5A1B);
+        let m = 14;
+        let table = make_inv_table();
+        let a_bits = rng.bits(1 << m);
+        let b_bits = rng.bits(1 << m);
+        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
+        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+
+        for &(chunk_byte_base, b_med) in &[
+            (0usize, 0usize),
+            (0, 1),
+            (64, 5),
+            (1024, 7),
+            (2048, 12),
+            (4096, 15),
+        ] {
+            let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
+            if needed > a_packed.len() {
+                continue;
+            }
+            let mut out_scalar = [0u8; 64];
+            let mut out_incumbent = [0xA5u8; 64];
+            let mut out_gfni = [0x5Au8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med,
+                &mut out_scalar,
+                &mut a_col,
+                &mut b_col,
+            );
+            // SAFETY: test is compiled only when all kernel features are active.
+            unsafe {
+                shift_reduce_inner_ab_x86_avx512(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_incumbent,
+                );
+                shift_reduce_inner_ab_x86_avx512_gfni(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_gfni,
+                );
+            }
+            assert_eq!(
+                out_scalar, out_gfni,
+                "gfni kernel disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
+            );
+            assert_eq!(
+                out_incumbent, out_gfni,
+                "gfni kernel disagrees with incumbent at (base={chunk_byte_base}, b_med={b_med})"
+            );
+        }
+    }
+
+    /// All-zero and all-ones rows (the BLAKE3 circuit's structurally static
+    /// windows) go through the same matrix path — pin them down explicitly.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    #[test]
+    fn x86_gfni_avx512_matrix_kernel_extreme_rows() {
+        let table = make_inv_table();
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+        let n = 16 * N_CHUNKS * 8;
+        for &(a_fill, b_fill) in &[(0u8, 0u8), (0xff, 0xff), (0, 0xff), (0xff, 0), (0x01, 0x80)] {
+            let a_packed = vec![a_fill; n];
+            let b_packed = vec![b_fill; n];
+            for b_med in 0..16usize {
+                let mut out_scalar = [0u8; 64];
+                let mut out_gfni = [0x5Au8; 64];
+                shift_reduce_inner_ab_scalar(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    0,
+                    b_med,
+                    &mut out_scalar,
+                    &mut a_col,
+                    &mut b_col,
+                );
+                // SAFETY: test is compiled only when all features are active.
+                unsafe {
+                    shift_reduce_inner_ab_x86_avx512_gfni(
+                        &a_packed,
+                        &b_packed,
+                        &table,
+                        0,
+                        b_med,
+                        &mut out_gfni,
+                    );
+                }
+                assert_eq!(
+                    out_scalar, out_gfni,
+                    "gfni kernel disagrees on fill ({a_fill:#04x},{b_fill:#04x}) b_med={b_med}"
+                );
+            }
         }
     }
 

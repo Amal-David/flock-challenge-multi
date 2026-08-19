@@ -23,11 +23,21 @@
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
+/// The `ell = 64` §2.1 apply expressed as 64 GF(2) 8x8 matrices, laid out for
+/// `VGF2P8AFFINEQB`: operand `g` (one 64-byte vector) holds in qword `l` the
+/// matrix of output position `8g + l`. See
+/// [`InvNttTableByteSingleGf8::affine_mats_ptr`].
+#[derive(Clone, Debug)]
+#[repr(C, align(64))]
+pub struct InvNttAffineMats([[u64; 8]; 8]);
+
 #[derive(Clone, Debug)]
 pub struct InvNttTableByteSingleGf8 {
     pub k: usize,
     pub ell: usize,
     pub n_chunks: usize,
+    /// GFNI matrix image of the table; all-zero unless `ell == 64`.
+    affine_mats: InvNttAffineMats,
     /// Backing allocation for the table plus at most 63 bytes of alignment
     /// padding. The logical table starts at `data_offset`.
     data: Vec<F8>,
@@ -112,13 +122,80 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
+        // GFNI matrix image (production `ell = 64` only).
+        //
+        // The apply is F_2-linear in the packed input bits, and the table is
+        // built by XOR-doubling from the eight one-hot rows, so output byte j
+        // is the F_2-linear map whose column t is `cols[t][j] = T_0[1 << t][j]`.
+        // `VGF2P8AFFINEQB` wants that map as one qword whose byte `7 - b`
+        // holds, in bit t, bit b of `cols[t][j]` (the instruction computes
+        // `result.bit[b] = parity(A.byte[7 - b] & input)`).
+        let mut affine = InvNttAffineMats([[0u64; 8]; 8]);
+        if ell == 64 {
+            let table = &data[data_offset..data_offset + table_len];
+            for g in 0..8usize {
+                for l in 0..8usize {
+                    let j = 8 * g + l;
+                    let mut q = 0u64;
+                    for b in 0..8usize {
+                        let mut byte = 0u64;
+                        for t in 0..8usize {
+                            let c = table[(1usize << t) * ell + j].0;
+                            byte |= (u64::from(c >> b) & 1) << t;
+                        }
+                        q |= byte << (8 * (7 - b));
+                    }
+                    affine.0[g][l] = q;
+                }
+            }
+        }
+
         Self {
             k,
             ell,
             n_chunks,
+            affine_mats: affine,
             data,
             data_offset,
         }
+    }
+
+    /// Raw pointer to the eight 64-byte `VGF2P8AFFINEQB` matrix operands of
+    /// the `ell = 64` apply (see [`InvNttAffineMats`]). 64-byte aligned.
+    #[inline]
+    pub fn affine_mats_ptr(&self) -> *const u8 {
+        self.affine_mats.0.as_ptr() as *const u8
+    }
+
+    /// Scalar reference for the GFNI matrix image: `affine_apply_scalar(bytes)`
+    /// reproduces [`Self::apply_scalar`] out of the matrices alone, in the
+    /// transposed order the AVX-512 kernel produces
+    /// (`out[8h + l] = transposed[8l + h]`). Test/oracle helper — it is the
+    /// portable statement of what the affine kernel computes.
+    #[cfg(test)]
+    pub(crate) fn affine_apply_scalar(&self, bytes: &[u8]) -> Vec<F8> {
+        assert_eq!(self.ell, 64);
+        assert_eq!(bytes.len(), 8);
+        let mut out = vec![F8::ZERO; 64];
+        for (h, out_h) in bytes.iter().enumerate().map(|(h, _)| (h, h)) {
+            let _ = out_h;
+            for l in 0..8usize {
+                let mut acc = 0u8;
+                for g in 0..8usize {
+                    // Matrix of output position 8g + l applied to byte h ^ g.
+                    let a = self.affine_mats.0[g][l];
+                    let v = bytes[h ^ g];
+                    let mut byte = 0u8;
+                    for b in 0..8usize {
+                        let row = ((a >> (8 * (7 - b))) & 0xff) as u8;
+                        byte |= ((row & v).count_ones() as u8 & 1) << b;
+                    }
+                    acc ^= byte;
+                }
+                out[8 * h + l] = F8(acc);
+            }
+        }
+        out
     }
 
     /// Raw pointer to the table data (`256 × ell` bytes, row-major). Used by
@@ -590,6 +667,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn affine_matrix_image_matches_apply_scalar() {
+        // Portable statement of the GFNI kernel's algebra: evaluating the
+        // matrix image byte by byte must reproduce the scalar apply for the
+        // production ell = 64 shape. Runs on every architecture, so a bad
+        // matrix build fails without AVX-512 hardware.
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(1 << 6));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut rng = Rng::new(0xAFF1);
+        for case in 0..64 {
+            let bytes: Vec<u8> = (0..8)
+                .map(|i| {
+                    if case == 0 {
+                        0
+                    } else if case == 1 {
+                        0xff
+                    } else if case < 10 {
+                        // one-hot rows: exercise each byte position alone
+                        if i == case - 2 { 0xa7 } else { 0 }
+                    } else {
+                        (rng.next_u64() & 0xff) as u8
+                    }
+                })
+                .collect();
+            let mut expected = vec![F8::ZERO; 64];
+            table.apply_scalar(&bytes, &mut expected);
+            let got = table.affine_apply_scalar(&bytes);
+            assert_eq!(expected, got, "affine image disagrees, bytes={bytes:02x?}");
         }
     }
 
