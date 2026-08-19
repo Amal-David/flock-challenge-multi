@@ -40,10 +40,25 @@ use serde::{Deserialize, Serialize};
 /// commit shapes with their NTT-encode/Merkle split, plus the section totals
 /// the `LIG_PROVE_TRACE` breakdown already prints. Read once per process
 /// (diagnostics only; the ranked worker's cleared env never sets it).
+#[inline(always)]
 pub(crate) fn open_timing() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_TIMING").is_some());
-    *ON
+    false
+}
+
+/// Zero-cost stand-in for diagnostics clocks in ranked builds.
+#[derive(Clone, Copy)]
+struct RankedTimer;
+
+impl RankedTimer {
+    #[inline(always)]
+    const fn start() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    const fn elapsed(self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
 
 /// `FLOCK_NO_OPEN_FILL=1` restores the incumbent open-phase scheduling at every
@@ -2712,7 +2727,7 @@ fn transpose_forward_ntt_sparse(
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
-    let _tw = std::time::Instant::now();
+    let _tw = RankedTimer::start();
     let window_task = |w: usize, mut buf: Vec<F128>| -> (usize, Vec<F128>) {
         {
             for s in 0..k {
@@ -2769,20 +2784,20 @@ fn transpose_forward_ntt_sparse(
     // Densify (active windows only; the rest stay zero, which is the correct
     // post-step-(k-1) state for an all-zero window).
     let ot = open_timing();
-    let _ta = std::time::Instant::now();
+    let _ta = RankedTimer::start();
     let mf0 = if ot { minor_faults() } else { 0 };
     let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
         // FUSED: one parallel pass writes every window exactly once, from an
         // UNINITIALIZED buffer. See `densify_windows_fused`.
         let slots = window_slots(n >> k, processed);
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-        let _td = std::time::Instant::now();
+        let _td = RankedTimer::start();
         let data = densify_windows_fused(n, k, slots);
         (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
     } else {
         let mut data = vec![F128::ZERO; n];
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-        let _td = std::time::Instant::now();
+        let _td = RankedTimer::start();
         for (w, buf) in processed {
             data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
         }
@@ -2790,7 +2805,7 @@ fn transpose_forward_ntt_sparse(
     };
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    let _ts = std::time::Instant::now();
+    let _ts = RankedTimer::start();
     transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
     if ot {
         eprintln!(
@@ -2934,7 +2949,7 @@ pub(crate) fn ligero_commit(
     // fusion while overwriting every slot of the recycled matrix.
     let codeword_len = block_len * num_interleaved;
     let ot = open_timing();
-    let t_alloc = std::time::Instant::now();
+    let t_alloc = RankedTimer::start();
     let mut mat = crate::scratch::take_f128(codeword_len);
     let mat_alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
@@ -2950,7 +2965,7 @@ pub(crate) fn ligero_commit(
     if crate::pcs::commit::lig_fused_commit_enabled() && !crate::gpu::merkle::available() {
         let faults_before = if ot { minor_faults() } else { 0 };
         let mat_cap = mat.capacity();
-        let t_encode = std::time::Instant::now();
+        let t_encode = RankedTimer::start();
         let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
         let folded = crate::pcs::commit::fused_encode_leaves_subtree(
             ntt,
@@ -2963,7 +2978,7 @@ pub(crate) fn ligero_commit(
             kind,
         );
         let fused_ms = t_encode.elapsed().as_secs_f64() * 1e3;
-        let t_upper = std::time::Instant::now();
+        let t_upper = RankedTimer::start();
         crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
         if ot {
             eprintln!(
@@ -2985,7 +3000,7 @@ pub(crate) fn ligero_commit(
         };
     }
 
-    let t_encode = std::time::Instant::now();
+    let t_encode = RankedTimer::start();
     ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1e3;
     let data_bytes: &[u8] = unsafe {
@@ -2995,7 +3010,7 @@ pub(crate) fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let t_merkle = std::time::Instant::now();
+    let t_merkle = RankedTimer::start();
     let mut gpu_busy_ms = 0.0f64;
     let gpu_tree = if kind == HashKind::Blake3
         && block_len >= gpu_open_merkle_min_leaves()
@@ -3014,11 +3029,11 @@ pub(crate) fn ligero_commit(
         // so the ranked L1 16 MiB tree is already resident after untimed warmup
         // (LigeroWitness::drop parks it). Public merkle_tree() stays unpooled
         // so tests/oracles cannot steal the L0 64 MiB slot.
-        let t_ta = std::time::Instant::now();
+        let t_ta = RankedTimer::start();
         let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
         tree_alloc_ms = t_ta.elapsed().as_secs_f64() * 1e3;
         if ot {
-            let t_l = std::time::Instant::now();
+            let t_l = RankedTimer::start();
             merkle::hash_leaves(data_bytes, leaf_size_bytes, &mut tree[..block_len], kind);
             leaves_ms = t_l.elapsed().as_secs_f64() * 1e3;
             crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len, kind);
@@ -5060,11 +5075,11 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = false;
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
-    let t_total = std::time::Instant::now();
+    let t_total = RankedTimer::start();
     let mut t_commits = std::time::Duration::ZERO;
     let t_induce = std::time::Duration::ZERO;
     let t_sumcheck = std::time::Duration::ZERO;
@@ -5091,7 +5106,7 @@ pub fn recursive_prover<Ch: Challenger>(
     let log_inv_rate_0 = config.log_inv_rates[0];
     let log_msg_cols_0 = log_n - initial_k;
     let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
-    let t = std::time::Instant::now();
+    let t = RankedTimer::start();
     let wtns_0 = ligero_commit(
         poly,
         log_msg_cols_0,
@@ -5137,11 +5152,11 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = false;
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
-    let t_total = std::time::Instant::now();
+    let t_total = RankedTimer::start();
     let t_commits = std::time::Duration::ZERO;
     let t_induce = std::time::Duration::ZERO;
     let t_sumcheck = std::time::Duration::ZERO;
@@ -5393,7 +5408,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
+    let trace = false;
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -5402,7 +5417,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut t_intro_glue = std::time::Duration::ZERO;
     let mut t_ood = std::time::Duration::ZERO;
 
-    let t_total = std::time::Instant::now();
+    let t_total = RankedTimer::start();
 
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
@@ -5433,7 +5448,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
 
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     assert!(
         direct_fold2.is_none() || direct_fold4.is_none(),
         "direct-fold2 and direct-fold4 modes are mutually exclusive"
@@ -5496,14 +5511,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // `mca-commutes`), so it needs (fold_bits − j) bits — one fewer per
         // round than the worst (j=0) round `fold_grinding_bits` is sized for.
         // Derived from fold_grinding_bits + round index; not stored.
-        let _tg = std::time::Instant::now();
+        let _tg = RankedTimer::start();
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
         let r = challenger.sample_f128();
-        let _tf = std::time::Instant::now();
+        let _tf = RankedTimer::start();
         let msg = if direct_fold4_mode && j < 4 {
             let msg = match j {
                 0 => eval_lookahead(
@@ -5602,7 +5617,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert!(n1 >= log_num_interleaved_1);
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
     let wtns_1 = ligero_commit(
         sc_prover.f(),
@@ -5623,7 +5638,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // sumcheck (introduce + glue). Binds the prover to a single codeword of
     // the interleaved list before any of L0's queries are drawn.
     {
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         for _ in 0..ood_count(1) {
             let z = challenger.sample_f128_vec(n1);
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
@@ -5655,7 +5670,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
@@ -5679,7 +5694,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
     let sks_vks_n1 = eval_sk_at_vks(n1);
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
@@ -5708,7 +5723,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     });
 
     // Introduce + glue basis_0.
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let intro_msg_0 = sc_prover.introduce_new(basis_0_induced, enforced_sum_0);
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
@@ -5726,7 +5741,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     for i in 0..r {
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         for j in 0..k_i {
             // These folds fold level i+1's commitment — fold-challenge
             // grinding guards its proximity-gap term. Tapered per round:
@@ -5756,7 +5771,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let num_queries_last = config.queries[i + 1];
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             let opened_rows_last: Vec<Vec<F128>> = queries_last
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
@@ -5833,7 +5848,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         assert!(n_next >= log_num_interleaved_next);
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
         let wtns_next = ligero_commit(
             sc_prover.f(),
@@ -5852,7 +5867,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
         {
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
                 let eq_z = build_eq_table_split(&z);
@@ -5875,7 +5890,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
@@ -5896,7 +5911,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         let sks_vks_i = eval_sk_at_vks(n_next);
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         // `n_next` is exactly wtns_prev's message-column count and
         // `log_inv_rates[i+1]` its rate, so the same dense-vs-Fᵀ-NTT cost
         // dispatch L0 uses applies here. (Was hard-wired to the dense arm
@@ -5945,7 +5960,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             });
         }
 
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
@@ -5994,7 +6009,7 @@ where
     let mut t_enforced = std::time::Duration::ZERO;
     let mut t_residual = std::time::Duration::ZERO;
     let mut t_evalb = std::time::Duration::ZERO;
-    let t_start = std::time::Instant::now();
+    let t_start = RankedTimer::start();
 
     let initial_k = config.initial_k;
     let r = config.recursive_steps;
@@ -6120,13 +6135,13 @@ where
     nonce_idx += 1;
 
     let num_queries_0 = config.queries[0];
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let queries_0 = sample_distinct_queries(challenger, block_len_0, num_queries_0);
     if trace {
         t_sample_q += _t.elapsed();
     }
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     if !verify_level_opens(
         &proof.initial_root,
         block_len_0,
@@ -6146,7 +6161,7 @@ where
     // residual evaluations are deferred to the final check (succinct path —
     // see `induce_sumcheck_evaluate_at_residual`).
     let n1 = log_n - initial_k;
-    let _t = std::time::Instant::now();
+    let _t = RankedTimer::start();
     let enforced_sum_0 = induce_sumcheck_enforced_sum(
         &proof.initial_proof.opened_rows,
         &r_lane_fold,
@@ -6259,7 +6274,7 @@ where
             let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
             let prev_num_interleaved = 1usize << prev_log_num_interleaved;
             let num_queries_last = config.queries[i + 1];
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             let queries_last =
                 sample_distinct_queries(challenger, prev_block_len, num_queries_last);
             // Basis-induction challenge for the LAST commitment. Sampled here —
@@ -6270,7 +6285,7 @@ where
             if trace {
                 t_sample_q += _t.elapsed();
             }
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             if !verify_level_opens(
                 &prev_root,
                 prev_block_len,
@@ -6320,7 +6335,7 @@ where
             let yr_len = yr.len();
             let yr_log_n = n_current;
 
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             let induced_residuals: Vec<Vec<F128>> = level_ctxs
                 .iter()
                 .map(|ctx| {
@@ -6369,7 +6384,7 @@ where
 
             // Batch-evaluate b at all yr positions in one call so the
             // caller can amortize prefix work (e.g. ring_switch tensor prefix).
-            let _te = std::time::Instant::now();
+            let _te = RankedTimer::start();
             let evb_vec = eval_b_residual(&ris, yr_log_n);
             if trace {
                 t_evalb += _te.elapsed();
@@ -6378,7 +6393,7 @@ where
                 return false;
             }
             let mut inner = F128::ZERO;
-            let _t = std::time::Instant::now();
+            let _t = RankedTimer::start();
             for y in 0..yr_len {
                 let mut combined_y = evb_vec[y];
                 for (k, residual) in induced_residuals.iter().enumerate() {
@@ -6468,7 +6483,7 @@ where
         let prev_block_len = 1usize << (prev_log_msg_cols + prev_log_inv_rate);
         let prev_num_interleaved = 1usize << prev_log_num_interleaved;
         let num_queries_i = config.queries[i + 1];
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         let queries_i = sample_distinct_queries(challenger, prev_block_len, num_queries_i);
         if trace {
             t_sample_q += _t.elapsed();
@@ -6479,7 +6494,7 @@ where
         }
         let rp = &proof.recursive_proofs[recursive_proof_idx];
         recursive_proof_idx += 1;
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         if !verify_level_opens(
             &prev_root,
             prev_block_len,
@@ -6495,7 +6510,7 @@ where
             t_merkle += _t.elapsed();
         }
 
-        let _t = std::time::Instant::now();
+        let _t = RankedTimer::start();
         let enforced_sum_i =
             induce_sumcheck_enforced_sum(&rp.opened_rows, &level_rs, &queries_i, &alpha_i);
         if trace {
@@ -6972,7 +6987,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     eval_point: &[F128],
     claimed_value: F128,
     challenger: &mut Ch,
-    t_total: std::time::Instant,
+    t_total: RankedTimer,
     mut t_commits: std::time::Duration,
     mut t_induce: std::time::Duration,
     mut t_sumcheck: std::time::Duration,
@@ -7006,7 +7021,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let t = std::time::Instant::now();
+    let t = RankedTimer::start();
     let wtns_1 = ligero_commit(
         &f1,
         log_msg_cols_1,
@@ -7024,7 +7039,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let num_queries_0 = udr_queries(log_inv_rate_0);
     let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let t = std::time::Instant::now();
+    let t = RankedTimer::start();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
     let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
     t_opens += t.elapsed();
@@ -7035,7 +7050,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Induce basis from wtns_0 opens ----
     let sks_vks_n1 = eval_sk_at_vks(n1);
-    let t = std::time::Instant::now();
+    let t = RankedTimer::start();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
@@ -7049,7 +7064,7 @@ fn recursive_prover_inner<Ch: Challenger>(
 
     // ---- Start sumcheck: f¹ · eq(z[initial_k..], ·) = claimed_value ----
     let eq_z_residual = build_eq_table(&eval_point[initial_k..]);
-    let t = std::time::Instant::now();
+    let t = RankedTimer::start();
     let (mut sc_prover, start_msg) = SumcheckProver::new(f1, eq_z_residual, claimed_value);
     t_sumcheck += t.elapsed();
     challenger.observe_f128(start_msg.u_0);
@@ -7070,7 +7085,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     for i in 0..r {
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
-        let t = std::time::Instant::now();
+        let t = RankedTimer::start();
         for _ in 0..k_i {
             let ri = challenger.sample_f128();
             let msg = sc_prover.fold(ri);
@@ -7133,7 +7148,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let t = std::time::Instant::now();
+        let t = RankedTimer::start();
         let wtns_next = ligero_commit(
             sc_prover.f(),
             log_msg_cols_next,
@@ -7153,7 +7168,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         let num_queries_i = udr_queries(config.log_inv_rates[i + 1]);
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let t = std::time::Instant::now();
+        let t = RankedTimer::start();
         let opened_rows_i: Vec<Vec<F128>> = queries_i
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
