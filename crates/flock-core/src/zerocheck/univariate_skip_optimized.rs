@@ -1584,12 +1584,148 @@ fn build_c_fold4_tables(eq_lo: &[F128]) -> Vec<F128> {
     tables
 }
 
+/// Ranked default is the fused GFNI C drain. `FLOCK_NO_ZC_C_GFNI=1` restores
+/// the incumbent bit-transpose + nibble-LUT drain in the same binary (the
+/// ranked worker's env is cleared, so the shipped behaviour is ON).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn c_fold4_gfni_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_C_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Byte-plane C bank store, `[q][bank][byte-plane][lane]`.
+pub(crate) const C_PLANE_BANK_BYTES: usize = N_C_Q * N_C_BANKS * 16 * ELL;
+/// One four-window C group: four contiguous 1 KiB windows of `c_packed`.
+pub(crate) const C_GROUP_BYTES: usize = 4 * (1 << N_MEDIUM) * ELL;
+/// GFNI matrix qwords per four-window group: two mask halves × 16 output bytes.
+#[allow(dead_code)] // used only by the fused GFNI C drain
+pub(crate) const C_FOLD4_MATS_PER_GROUP: usize = 32;
+
+/// GFNI bit-matrix form of [`build_c_fold4_tables`].
+///
+/// The synthetic fold4 mask table is F2-linear in the sixteen mask bits by
+/// construction (`t_lo[byte] = t4[0][byte & 15] + t4[1][byte >> 4]`, each
+/// `t4[w]` an XOR-doubling subset sum of four generators), so it never needs
+/// expanding to 512 entries at all: each 8-bit half IS sixteen 8×8 bit
+/// matrices — one per output byte of the F128 — built straight from its eight
+/// basis entries `t4[2h + (b >> 2)][1 << (b & 3)]`. 256 bytes per group
+/// instead of 8 KiB, and `VGF2P8AFFINEQB` evaluates one matrix on 64 lanes'
+/// mask bytes per instruction with no table load at all. Matrix encoding
+/// (hardware-verified, same as the AB drain): `out.bit[i] = parity(byte[7-i] & in)`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_c_fold4_gfni_mats(eq_lo: &[F128]) -> Vec<u64> {
+    assert!(eq_lo.len().is_multiple_of(4));
+    let d_hi_inv_val = d_hi_inv();
+    let mut mats = vec![0u64; (eq_lo.len() / 4) * C_FOLD4_MATS_PER_GROUP];
+    // Deliberately serial. At the ranked shape this is 1024 groups x ~700 ops
+    // = 0.12 ms, which is well under the ~1.2 ms it costs to wake the pool's
+    // fifteen sleeping workers at this point in the prove (measured); the
+    // 8 MiB table build it replaces paid that wake-up and then some.
+    for (slot, eqs) in mats
+        .chunks_mut(C_FOLD4_MATS_PER_GROUP)
+        .zip(eq_lo.chunks_exact(4))
+    {
+        build_one_group_mats(slot, eqs, d_hi_inv_val);
+    }
+    mats
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn build_one_group_mats(slot: &mut [u64], eqs: &[F128], d_hi_inv_val: F128) {
+    // gens[w][j] = X^{4j}·(eq_lo[w]·D_hi⁻¹): window `w`'s four subset-sum
+    // generators, i.e. `t4[w][1 << j]`.
+    let mut gens = [[F128::ZERO; 4]; 4];
+    for (w, &eq) in eqs.iter().enumerate() {
+        gens[w][0] = eq * d_hi_inv_val;
+        for j in 1..4 {
+            let mut v = gens[w][j - 1];
+            for _ in 0..4 {
+                v = mul_by_x(v);
+            }
+            gens[w][j] = v;
+        }
+    }
+    for h in 0..2 {
+        // Mask bit `b` of half `h` is drain row `8h + b`, i.e. window
+        // `2h + (b >> 2)`'s medium row `4·(b & 3) + q`.
+        let basis: [F128; 8] = std::array::from_fn(|b| gens[2 * h + (b >> 2)][b & 3]);
+        for k in 0..16 {
+            // Byte-column `k` of the basis: `col.byte[b] = basis[b].byte[k]`.
+            // Its 8x8 bit transpose has `t.byte[i].bit[b] = basis[b].bit(8k+i)`,
+            // which is the matrix row VGF2P8AFFINEQB wants at byte `7-i` —
+            // one byte reversal away.
+            let mut col = 0u64;
+            for (b, value) in basis.iter().enumerate() {
+                let byte = if k < 8 {
+                    (value.lo >> (8 * k)) & 0xff
+                } else {
+                    (value.hi >> (8 * (k - 8))) & 0xff
+                };
+                col |= byte << (8 * b);
+            }
+            slot[h * 16 + k] = transpose_bits_8x8(col).swap_bytes();
+        }
+    }
+}
+
+/// 8x8 bit transpose of a qword read as eight byte-rows:
+/// `out.byte[i].bit[b] = in.byte[b].bit[i]`. The three masked swap rounds are
+/// the scalar twin of [`bit_transpose_64bytes`]'s per-qword stage.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn transpose_bits_8x8(mut x: u64) -> u64 {
+    let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^= t ^ (t << 28);
+    x
+}
+
 /// Per-worker state for the four-window fold4 producer.
 pub(crate) struct WorkerStateFold4 {
     partial_ab: [F128; ELL],
     /// Byte-plane banks for the eq-folded GFNI AB drain (`2^s x 1 KiB`);
     /// empty until the folded arm first sizes it.
     plane_banks: Vec<u8>,
+    /// Byte-plane C banks for the fused GFNI drain (`[q][bank][plane][lane]`,
+    /// 32 KiB) followed by the 4 KiB group staging buffer; over-allocated by
+    /// 63 bytes so both stay cache-line aligned. Empty until the fused arm
+    /// first sizes it.
+    plane_c: Vec<u8>,
+    plane_c_off: usize,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     /// Synthetic C blocks, one per retained q: row `4w + j` holds window w's
@@ -1606,6 +1742,8 @@ impl WorkerStateFold4 {
         Self {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
+            plane_c: Vec::new(),
+            plane_c_off: 0,
             partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c4: Box::new([[[0u8; 64]; 16]; N_C_Q]),
@@ -1639,6 +1777,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     ))]
     c_nibble_luts: &[kernels::CBankNibbleLut],
     eq_fold: Option<(&[F128], &[u64], usize)>,
+    c_gfni_mats: Option<&[u64]>,
     state: &mut WorkerStateFold4,
 ) {
     debug_assert!(big_lo_size.is_multiple_of(4));
@@ -1656,6 +1795,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             state.plane_banks.fill(0);
         }
     }
+    // Fused GFNI C drain: size and zero the 32 KiB byte-plane C banks for
+    // this band; `FLOCK_NO_ZC_C_GFNI=1` keeps the incumbent transpose +
+    // nibble-LUT drain (`c_gfni_mats == None`).
+    if c_gfni_mats.is_some() {
+        if state.plane_c.is_empty() {
+            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
+            let off = state.plane_c.as_ptr().align_offset(64);
+            state.plane_c_off = if off <= 63 { off } else { 0 };
+        } else {
+            let off = state.plane_c_off;
+            state.plane_c[off..off + C_PLANE_BANK_BYTES].fill(0);
+        }
+    }
     for group in state.partial_c4.iter_mut() {
         for bank in group.iter_mut() {
             bank.fill(F128::ZERO);
@@ -1664,31 +1816,60 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     let n_lo = n_lo_and_inner - N_INNER;
     for group in 0..big_lo_size / 4 {
         let mut any_live = false;
+        let mut group_counts = [0usize; 4];
+        for (w, count) in group_counts.iter_mut().enumerate() {
+            let x_outer = (4 * group + w) | (x_hi << n_lo);
+            *count = b_med_counts[x_outer & within_outer_mask] as usize;
+            any_live |= *count != 0;
+        }
+        // Early staged fetch: pull this group's 4 KiB of `c_packed` in strict
+        // address order BEFORE the AB completion runs, so its DRAM misses
+        // retire underneath four windows of AB work instead of stalling the
+        // drain at the end of the group.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if any_live && c_gfni_mats.is_some() {
+            let group_base = (((4 * group) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            let off = state.plane_c_off + C_PLANE_BANK_BYTES;
+            let stage: &mut [u8; C_GROUP_BYTES] = (&mut state.plane_c
+                [off..off + C_GROUP_BYTES])
+                .try_into()
+                .expect("aligned 4 KiB group staging window");
+            kernels::stage_c_group(&c_packed[group_base..group_base + C_GROUP_BYTES], stage);
+        }
         for w in 0..4 {
             let x_outer_lo = 4 * group + w;
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            let n_b_med = group_counts[w];
             let chunk_byte_base =
                 ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
             // C rows: live rows transposed into their (q, 4w+j) slot, dead rows zeroed.
-            for b_med in 0..(1 << N_MEDIUM) {
-                let q = b_med & 3;
-                let j = b_med >> 2;
-                let dst = &mut state.chunk_c4[q][4 * w + j];
-                if b_med < n_b_med {
-                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                    let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                        .try_into()
-                        .expect("64 c-bytes per medium position");
-                    bit_transpose_64bytes(c_in, dst);
-                } else {
-                    dst.fill(0);
+            // The fused GFNI drain reads `c_packed` directly and folds this
+            // transpose into its own mask build, so it needs none of this.
+            if c_gfni_mats.is_none() {
+                for b_med in 0..(1 << N_MEDIUM) {
+                    let q = b_med & 3;
+                    let j = b_med >> 2;
+                    let dst = &mut state.chunk_c4[q][4 * w + j];
+                    if b_med < n_b_med {
+                        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                        let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                            .try_into()
+                            .expect("64 c-bytes per medium position");
+                        bit_transpose_64bytes(c_in, dst);
+                    } else {
+                        dst.fill(0);
+                    }
                 }
             }
             if n_b_med == 0 {
                 continue;
             }
-            any_live = true;
             // AB completion: identical to the incumbent per-window path.
             for b_med in 0..n_b_med {
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -1746,6 +1927,31 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
         if !any_live {
             continue;
         }
+        // Fused GFNI drain: one call per four-window group, straight off the
+        // 4 KiB of `c_packed` this group owns. No row transposes, no mask
+        // tables, no LUT probes — see the kernel.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if let Some(mats) = c_gfni_mats {
+            let mats_g: &[u64; C_FOLD4_MATS_PER_GROUP] = (&mats[group
+                * C_FOLD4_MATS_PER_GROUP
+                ..(group + 1) * C_FOLD4_MATS_PER_GROUP])
+                .try_into()
+                .expect("32 matrix qwords per four-window group");
+            let off = state.plane_c_off;
+            let (planes, stage) = state.plane_c[off..off + C_PLANE_BANK_BYTES + C_GROUP_BYTES]
+                .split_at_mut(C_PLANE_BANK_BYTES);
+            let planes: &mut [u8; C_PLANE_BANK_BYTES] =
+                planes.try_into().expect("aligned 32 KiB plane C bank window");
+            kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
+            continue;
+        }
         let c_tables =
             &fold4_tables[group * C_MASK_TABLE_STRIDE..(group + 1) * C_MASK_TABLE_STRIDE];
         for q in 0..N_C_Q {
@@ -1770,6 +1976,22 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 target_feature = "vpclmulqdq"
             )))]
             kernels::accumulate_c_banks(c_block, 1 << N_MEDIUM, c_tables, &mut state.partial_c4[q]);
+        }
+    }
+    // Band-end plane reassembly for the fused GFNI C drain: each bank's
+    // sixteen byte planes become its 64 F128 lanes. Pure XOR accumulation,
+    // so these are the incumbent's `partial_c4` values byte-for-byte.
+    if c_gfni_mats.is_some() {
+        let off = state.plane_c_off;
+        let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
+        for q in 0..N_C_Q {
+            for bank in 0..N_C_BANKS {
+                let bank_planes: &[u8; 16 * ELL] = planes
+                    [(q * N_C_BANKS + bank) * 16 * ELL..][..16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_to_f128(bank_planes, &mut state.partial_c4[q][bank]);
+            }
         }
     }
     // Band-end plane fold for the eq-folded arm: reassemble each bank's
@@ -1867,7 +2089,33 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let fold4_tables = build_c_fold4_tables(&eq.lo);
+    // Fused GFNI C drain: 32 bit matrices per four-window group replace the
+    // group's 512-entry synthetic mask table and its nibble LUT outright, so
+    // neither is built at all when the fused arm is live (8 MiB + 1 MiB of
+    // per-prove table material at the ranked shape).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let c_gfni_state = c_fold4_gfni_enabled().then(|| build_c_fold4_gfni_mats(&eq.lo));
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let c_gfni_state: Option<Vec<u64>> = None;
+    let fold4_tables = if c_gfni_state.is_some() {
+        Vec::new()
+    } else {
+        build_c_fold4_tables(&eq.lo)
+    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1922,6 +2170,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                 ))]
                 &c_nibble_luts,
                 eq_fold_arg,
+                c_gfni_state.as_deref(),
                 &mut state,
             );
             state
@@ -3054,6 +3303,104 @@ mod tests {
                     assert_eq!(acc, quad_c[e * n_packed + packed], "bank collapse e={e} p={packed}");
                 }
             }
+        }
+    }
+
+
+    /// The fused GFNI DirectFold4 C drain must reproduce the incumbent
+    /// `bit_transpose_64bytes` + LUT drain byte-for-byte: same synthetic mask
+    /// weights, same padded row geometry, same multi-group accumulation. Both
+    /// accumulators are POISON-prefilled with the identical value (every byte
+    /// plane `0xA5` is exactly every F128 lane `0xA5A5..A5`), so a bank slot
+    /// the kernel failed to touch would show up as a mismatch.
+    #[test]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    fn fused_gfni_c_drain_matches_transpose_drain() {
+        const GROUP_BYTES: usize = 4 * (1 << N_MEDIUM) * ELL;
+        const N_GROUPS: usize = 3;
+        let mut rng = Rng::new(0xC0FF_EE17_4C42);
+        for trial in 0..6usize {
+            let mut c_all = vec![0u8; N_GROUPS * GROUP_BYTES];
+            for byte in c_all.iter_mut() {
+                *byte = (rng.next_u64() >> 13) as u8;
+            }
+            // trial 0 is the dense geometry; the rest exercise ragged padding
+            // (including all-dead windows, which the driver still drains).
+            let counts: Vec<[usize; 4]> = (0..N_GROUPS)
+                .map(|_| {
+                    std::array::from_fn(|_| {
+                        if trial == 0 { 16 } else { (rng.next_u64() % 17) as usize }
+                    })
+                })
+                .collect();
+            let eq_lo: Vec<F128> = (0..4 * N_GROUPS).map(|_| rng.f128()).collect();
+            let tables = build_c_fold4_tables(&eq_lo);
+            let mats = build_c_fold4_gfni_mats(&eq_lo);
+
+            let poison = F128 { lo: 0xA5A5_A5A5_A5A5_A5A5, hi: 0xA5A5_A5A5_A5A5_A5A5 };
+            let mut banks = vec![[[poison; ELL]; N_C_BANKS]; N_C_Q];
+            let mut planes = vec![0xA5u8; C_PLANE_BANK_BYTES];
+
+            for g in 0..N_GROUPS {
+                let group = &c_all[g * GROUP_BYTES..(g + 1) * GROUP_BYTES];
+                let mut chunk_c4 = vec![[[0u8; 64]; 16]; N_C_Q];
+                for w in 0..4 {
+                    for b_med in 0..(1 << N_MEDIUM) {
+                        let dst = &mut chunk_c4[b_med & 3][4 * w + (b_med >> 2)];
+                        if b_med < counts[g][w] {
+                            let base = w * (1 << N_MEDIUM) * ELL + b_med * ELL;
+                            let c_in: &[u8; 64] =
+                                group[base..base + 64].try_into().expect("64 c-bytes");
+                            bit_transpose_64bytes(c_in, dst);
+                        } else {
+                            dst.fill(0);
+                        }
+                    }
+                }
+                let c_tables = &tables[g * C_MASK_TABLE_STRIDE..(g + 1) * C_MASK_TABLE_STRIDE];
+                for q in 0..N_C_Q {
+                    // SAFETY: `[[u8; 64]; 16]` is contiguous, exactly 1024 bytes.
+                    let c_block: &[u8; 16 * 64] =
+                        unsafe { &*chunk_c4[q].as_ptr().cast::<[u8; 16 * 64]>() };
+                    kernels::accumulate_c_banks(c_block, 1 << N_MEDIUM, c_tables, &mut banks[q]);
+                }
+                let mats_g: &[u64; C_FOLD4_MATS_PER_GROUP] = mats
+                    [g * C_FOLD4_MATS_PER_GROUP..(g + 1) * C_FOLD4_MATS_PER_GROUP]
+                    .try_into()
+                    .expect("32 matrix qwords per group");
+                let planes_arr: &mut [u8; C_PLANE_BANK_BYTES] =
+                    planes.as_mut_slice().try_into().expect("32 KiB plane store");
+                kernels::accumulate_c_banks_fold4_fused_gfni(group, &counts[g], mats_g, planes_arr);
+            }
+
+            for q in 0..N_C_Q {
+                for bank in 0..N_C_BANKS {
+                    let bank_planes = &planes[(q * N_C_BANKS + bank) * 16 * ELL..][..16 * ELL];
+                    for lane in 0..ELL {
+                        let mut lo = 0u64;
+                        let mut hi = 0u64;
+                        for k in 0..8 {
+                            lo |= (bank_planes[k * ELL + lane] as u64) << (8 * k);
+                        }
+                        for k in 8..16 {
+                            hi |= (bank_planes[k * ELL + lane] as u64) << (8 * (k - 8));
+                        }
+                        assert_eq!(
+                            F128 { lo, hi },
+                            banks[q][bank][lane],
+                            "trial {trial} q {q} bank {bank} lane {lane}"
+                        );
+                    }
+                }
+            }
+            crate::scratch::give_f128(tables);
         }
     }
 
