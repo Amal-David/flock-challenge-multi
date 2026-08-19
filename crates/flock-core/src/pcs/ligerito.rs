@@ -1297,18 +1297,13 @@ impl LigeritoSecurityConfig {
     /// Fiat-Shamir security (cf. Ethereum's `soundcalc`), not a whole-protocol
     /// union bound over terms. The three shipped profiles:
     ///
-    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.04, 100 bits per round.
+    /// - `Fast`:   JohnsonOod, rate 1/2, η = 0.02, 100 bits per round.
     /// - `Slim`:   JohnsonOod, rate 1/4, η = 0.02, 16-bit query grinding at
     ///             every level, 100 bits per round.
     /// - `Secure`: Udr, rate 1/2, ε* = 1e-3, 120 bits per round.
     pub fn derive_profile(m: usize, profile: LigeritoProfile) -> Result<Self, String> {
-        // Fast trades a few more queries for much cheaper proximity-gap
-        // grinding. Slim retains its proof-size-oriented 0.02 slack.
-        let johnson_eta = match profile {
-            LigeritoProfile::Fast => 0.04,
-            LigeritoProfile::Slim => 0.02,
-            LigeritoProfile::Secure => 0.0, // unused in the UDR branch
-        };
+        /// Johnson slack below the Johnson radius, flat across levels.
+        const JOHNSON_ETA: f64 = 0.02;
         let target_bits = profile.security_bits();
         let log_inv_rate = profile.log_inv_rate();
         let query_grind: usize = match profile {
@@ -1328,7 +1323,7 @@ impl LigeritoSecurityConfig {
             match profile {
                 LigeritoProfile::Secure => udr_per_query_bits_asymptotic(rate),
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    paper_per_query_bits(rate, johnson_eta)
+                    paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             }
         };
@@ -1366,7 +1361,7 @@ impl LigeritoSecurityConfig {
             let per_q = match profile {
                 LigeritoProfile::Secure => udr_per_query_bits(rate, cols, UDR_PROXIMITY_LOSS),
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    paper_per_query_bits(rate, johnson_eta)
+                    paper_per_query_bits(rate, JOHNSON_ETA)
                 }
             };
             let queries = ((t - query_grind as f64).max(1.0) / per_q).ceil() as usize;
@@ -1395,21 +1390,21 @@ impl LigeritoSecurityConfig {
                     )
                 }
                 LigeritoProfile::Fast | LigeritoProfile::Slim => {
-                    let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, johnson_eta, cols, ilv);
+                    let eps_pg = ANALYSIS_LOG_Q - paper_johnson_log_a(rate, JOHNSON_ETA, cols, ilv);
                     let mu = cols + ilv;
                     let ood_samples = if i == 0 {
                         0 // bound by the opening's own evaluation claim
                     } else {
                         (1..=8usize)
-                            .find(|&s| paper_ood_bits(rate, johnson_eta, mu, s) >= t)
+                            .find(|&s| paper_ood_bits(rate, JOHNSON_ETA, mu, s) >= t)
                             .ok_or_else(|| {
                                 format!("L{i}: no OOD sample count reaches {t:.1} bits")
                             })?
                     };
-                    let eps_ood = paper_ood_bits(rate, johnson_eta, mu, ood_samples);
+                    let eps_ood = paper_ood_bits(rate, JOHNSON_ETA, mu, ood_samples);
                     (
                         SoundnessRegime::JohnsonOod,
-                        Some(johnson_eta),
+                        Some(JOHNSON_ETA),
                         None,
                         eps_pg,
                         ood_samples,
@@ -8105,11 +8100,11 @@ mod tests {
         assert_eq!(cfg.initial_k, 6);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
-        // Fast = JohnsonOod profile: 238 L0 queries per-round at 100 bits (no
+        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
         // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
-        assert_eq!(cfg.levels[0].queries, 238);
+        assert_eq!(cfg.levels[0].queries, 218);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
         assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
@@ -8118,7 +8113,7 @@ mod tests {
         let default = default_config(22, 6, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
-        assert_eq!(pv.queries[0], 238);
+        assert_eq!(pv.queries[0], 218);
 
         // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
@@ -8235,8 +8230,8 @@ mod tests {
     fn ligerito_prover_config_for_lookup() {
         // m=29 fast: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
-        assert_eq!(pv.queries[0], 238);
-        assert_eq!(pv.fold_grinding_bits[0], 12);
+        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.fold_grinding_bits[0], 16);
 
         // m=29 slim: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");

@@ -850,9 +850,9 @@ fn partial_fold_packed_z_block_major_factorized_padded(
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
 /// [`prove_padded_inner`]: factorized eq when `n_log == 18`, else a
-/// materialized outer table. Used by the last-ρ kick and the sequential
-/// fallback so both produce the same `ẑ`.
-fn fold_block_major_one_shot(
+/// materialized outer table. Used by the last-ρ kick, the sequential
+/// fallback, and the round-1 identity-C fold, so all produce the same `ẑ`.
+pub(crate) fn fold_block_major_one_shot(
     z: &[F128],
     m: usize,
     k_log: usize,
@@ -1010,7 +1010,20 @@ fn fold_block_major_gfni(
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
     // Same total footprint as the F128 partials (k*16 bytes per worker).
-    let mut planes = vec![0u8; n_workers * k * 16];
+    // Uninit: `vec![0u8]` through the recycling allocator is an explicit
+    // single-threaded 4 MiB memset with every worker idle. The GFNI leaf
+    // seeds its own written range from a register zero (`first_tile`), so
+    // only the bytes past the last written chunk must read as zero for the
+    // reduce — each worker zeroes its own tail inside its par task (and its
+    // whole region in the claimed-no-tiles case, which the dynamic counter
+    // can produce).
+    let written_bytes = if useful_chunks == 0 {
+        0
+    } else {
+        let last_bits = (useful_bits - (useful_chunks - 1) * 128).min(128);
+        1024 * (2 * (useful_chunks - 1) + last_bits.div_ceil(64))
+    };
+    let mut planes = crate::alloc_uninit_vec::<u8>(n_workers * k * 16);
     planes
         .par_chunks_mut(k * 16)
         .enumerate()
@@ -1178,12 +1191,22 @@ fn fold_block_major_gfni(
                 }
                 first_tile = false;
             }
+            if first_tile {
+                // Claimed no tiles: nothing seeded this region, but the
+                // reduce reads all of it.
+                wplanes.fill(0);
+            } else {
+                // Bytes past the last written chunk are never stored by the
+                // GFNI leaf; the reduce reads the full k*16.
+                wplanes[written_bytes..].fill(0);
+            }
         });
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
-    // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
+    // read+write pass — the class this arm deletes). Uninit: the pass below
+    // writes every one of the k slots.
+    let mut out = crate::alloc_uninit_f128_vec(k);
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];

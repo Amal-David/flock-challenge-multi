@@ -295,6 +295,25 @@ fn ntt_lane_round_disabled() -> bool {
 }
 
 /// Kernel-diet part 2: fuse the three-layer deep tail into one sweep.
+/// Test-only latch forcing the sub-group slack off, for tests that pin
+/// `interleaved_n_top` to a specific deep-region depth (env switches
+/// resolve once per process, so a latch is the only in-process control).
+#[cfg(test)]
+static NTT_SUBS_SLACK_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_NTT_SUBS_SLACK=1` restores the exact one-sub-NTT-per-worker
+/// parallelism floor for mid-size transforms (exact same-binary A/B).
+#[inline]
+fn ntt_subs_slack_enabled() -> bool {
+    #[cfg(test)]
+    if NTT_SUBS_SLACK_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SUBS_SLACK").is_none())
+}
+
 /// `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1` restores the sweep-per-stage deep-layer
 /// schedule (three full passes over each sub-group plus the Merkle callback
 /// read) instead of the block-fused single pass (exact same-binary A/B).
@@ -1593,7 +1612,18 @@ impl AdditiveNttF128 {
         const PARALLEL_FLOOR_LOG_D: usize = 12;
         const MIN_SUB_LOG: usize = 8;
         if log_d >= PARALLEL_FLOOR_LOG_D {
-            let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two());
+            // Slack over the "one sub-NTT per worker" floor: exactly
+            // thread-count tasks is the worst split for a region entered off
+            // a serial section (workers wake staggered; one late worker owns
+            // a full 1/16 of the level). Four tasks per worker keeps the
+            // steal granule useful while bounding the tail at ~1/64. The
+            // large ranked commit is unaffected — its cache-derived n_top
+            // already exceeds the floor either way. `FLOCK_NO_NTT_SUBS_SLACK=1`
+            // restores the exact-width floor (same butterflies, same
+            // twiddles — the split only changes task boundaries).
+            let slack = if ntt_subs_slack_enabled() { 2 } else { 0 };
+            let want_subs_log =
+                log2_pow2(rayon::current_num_threads().next_power_of_two()) + slack;
             let max_n_top = log_d.saturating_sub(MIN_SUB_LOG);
             cache_n_top.max(want_subs_log.min(max_n_top))
         } else {
@@ -3955,6 +3985,10 @@ mod tests {
     fn deep_fused3_matches_incumbent_schedule() {
         use std::sync::atomic::Ordering;
         let mut rng = Rng::new(0xDEE9_F3);
+        // These shapes pin `interleaved_n_top` to an 11-layer deep region at
+        // the exact-width parallelism floor; force the sub-group slack off so
+        // the geometry precondition holds regardless of the shipped default.
+        NTT_SUBS_SLACK_TEST_OFF.store(true, Ordering::Relaxed);
         // (log_d, num_ntts, start_layer, threads) with log_d − n_top = 11.
         for &(log_d, num_ntts, start_layer, threads) in &[
             (13usize, 4usize, 0usize, 4usize),
@@ -4010,6 +4044,7 @@ mod tests {
                 "fused-three deep tail mismatch at log_d={log_d} num_ntts={num_ntts}"
             );
         }
+        NTT_SUBS_SLACK_TEST_OFF.store(false, Ordering::Relaxed);
     }
 
     /// Portable replica of `butterfly_fused_2layer_row_from` (dense).
