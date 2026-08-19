@@ -598,6 +598,39 @@ impl AdditiveNttF128 {
             return;
         }
 
+        // Rate ≤ 1/4 (every recursive Ligerito commit): same seed idea as the
+        // rate-1/2 path above. The incumbent materialized the replicated
+        // codeword with `replicate_message_fill` and then had the transform's
+        // first pass read all of it back; seeding layers `k, k+1` from `msg`
+        // writes the codeword ONCE and starts the transform two layers in.
+        // Measured fill cost this deletes at m=32: 1.7 ms (L1, 32 MiB) + 0.57
+        // (L2) + 0.08 (L3) on Zen 5, 2.0 + 0.4 + 0.12 on Zen 3, plus the
+        // first top pass's 32 MiB read+write at L1.
+        // `FLOCK_NO_NTT_RATE_SEED=1` restores the fill.
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        if log_inv_rate >= 2
+            && log_inv_rate + 2 <= log_d
+            && msg.len() / num_ntts >= 4
+            && !rate_seed_disabled()
+        {
+            self.seed_layers_pair_from_msg(msg, codeword, num_ntts, log_inv_rate);
+            // Layers `log_inv_rate` and `log_inv_rate+1` are done; the deep
+            // pass starts at `max(n_top, start_layer)` so a start layer past
+            // `n_top` simply skips the whole-buffer sweep.
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                log_inv_rate + 2,
+                None,
+                Some(on_range_done),
+                None,
+            );
+            return;
+        }
+
         // `FLOCK_NTT_TIMING`: fill/transform split per encode (diagnostics;
         // read once per process, the ranked worker's cleared env never sets it).
         static NTT_TIMING: std::sync::LazyLock<bool> =
@@ -739,20 +772,45 @@ impl AdditiveNttF128 {
         codeword: &mut [F128],
         num_ntts: usize,
     ) {
+        self.seed_layers_pair_from_msg(msg, codeword, num_ntts, 1);
+    }
+
+    /// Apply forward layers `k` and `k+1` of a rate-1/2^k zero-padded encode
+    /// **directly from `msg`**, writing the whole `2^k·|msg|` codeword once.
+    ///
+    /// Layers `0..k` of that encode are copy-only: the padded input's upper
+    /// halves are zero, so each of those butterflies degenerates to `u = v =
+    /// x[i]` and the net effect is `msg` replicated into every layer-`k`
+    /// block. Layer `k` inside block `b` therefore pairs `msg[i]` with
+    /// `msg[i + half]`, and layer `k+1` stays inside the same block — so both
+    /// can be produced straight from `msg`. That deletes the
+    /// `replicate_message_fill` codeword write AND the first transform pass's
+    /// read of what it just wrote. `k = 1` is the long-standing rate-1/2 seed;
+    /// the ranked recursive Ligerito commits are `k = 2..6`.
+    fn seed_layers_pair_from_msg(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+        k: usize,
+    ) {
         use rayon::prelude::*;
 
-        debug_assert_eq!(codeword.len(), 2 * msg.len());
+        let blocks = codeword.len() / msg.len();
+        debug_assert_eq!(blocks, 1usize << k);
         let msg_positions = msg.len() / num_ntts;
         debug_assert!(msg_positions >= 4 && msg_positions.is_power_of_two());
         let quarter = msg_positions >> 2;
 
-        let mut twiddles = [[F128::ZERO; 3]; 2];
-        for (block, tw) in twiddles.iter_mut().enumerate() {
-            tw[0] = self.twiddle(1, block);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(2, 2 * block + s);
-            }
-        }
+        let twiddles: Vec<[F128; 3]> = (0..blocks)
+            .map(|block| {
+                [
+                    self.twiddle(k, block),
+                    self.twiddle(k + 1, 2 * block),
+                    self.twiddle(k + 1, 2 * block + 1),
+                ]
+            })
+            .collect();
         debug_assert_eq!(twiddles[0][0], F128::ZERO);
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
 
@@ -773,11 +831,13 @@ impl AdditiveNttF128 {
         let dst = codeword.as_mut_ptr() as usize;
         let msg_len = msg.len();
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        let use_nt = num_ntts % 8 == 0
+        let use_nt = blocks == 2
+            && num_ntts % 8 == 0
             && num_ntts <= kernels::SEED_NT_MAX_NTTS
             && dst % 128 == 0
             && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
             && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
+        let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             if use_nt {
@@ -793,6 +853,10 @@ impl AdditiveNttF128 {
                 );
                 return;
             }
+            // Block 0's layer-`k` and first layer-`k+1` twiddles are ZERO for
+            // every layer (each layer's twiddle row starts at 0), so it takes
+            // the sparse kernel. The remaining blocks reuse the same four
+            // source rows, which stay in L1 across the block loop.
             kernels::butterfly_fused_2layer_row_from_sparse(
                 src as *const F128,
                 dst as *mut F128,
@@ -801,14 +865,16 @@ impl AdditiveNttF128 {
                 r,
                 twiddles[0][2],
             );
-            kernels::butterfly_fused_2layer_row_from(
-                src as *const F128,
-                (dst as *mut F128).add(msg_len),
-                quarter,
-                num_ntts,
-                r,
-                &twiddles[1],
-            );
+            for (b, tw) in twiddles.iter().enumerate().skip(1) {
+                kernels::butterfly_fused_2layer_row_from(
+                    src as *const F128,
+                    (dst as *mut F128).add(b * msg_len),
+                    quarter,
+                    num_ntts,
+                    r,
+                    tw,
+                );
+            }
         };
 
         const PARALLEL_ROW_THRESHOLD: usize = 256;
@@ -2219,6 +2285,15 @@ fn rate_half_seed_disabled() -> bool {
     std::env::var_os("FLOCK_NO_RATE_HALF_SEED").is_some()
 }
 
+/// `FLOCK_NO_NTT_RATE_SEED=1` restores `replicate_message_fill` + a transform
+/// from layer `log_inv_rate` for rate ≤ 1/4 encodes. Read once per process;
+/// default ON (the ranked worker clears its env).
+fn rate_seed_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RATE_SEED").is_some());
+    *OFF
+}
+
 /// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
 /// the zero-padded transform's initial copy-only layers.
 fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
@@ -2269,6 +2344,45 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    /// The generalized rate-1/2^k encode seed must reproduce, bit for bit,
+    /// the incumbent `replicate_message_fill` + transform-from-layer-k path
+    /// (which is itself the zero-padded forward transform).
+    #[test]
+    fn rate_seed_pair_matches_replicate_fill() {
+        let shapes = [
+            (4usize, 0usize, 2usize),
+            (6, 3, 2),
+            (8, 3, 3),
+            (5, 1, 4),
+            (7, 2, 2),
+            (4, 3, 5),
+            (10, 3, 2),
+            (2, 0, 1),
+        ];
+        for (si, &(log_msg_pos, log_ntts, k)) in shapes.iter().enumerate() {
+            let num_ntts = 1usize << log_ntts;
+            let msg_pos = 1usize << log_msg_pos;
+            let log_d = log_msg_pos + k;
+            if k + 2 > log_d {
+                continue;
+            }
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut rng = Rng::new(0x5EED_0000 ^ si as u64);
+            let msg = rand_vec(&mut rng, msg_pos * num_ntts);
+            let cw_len = (msg_pos << k) * num_ntts;
+
+            let mut want = vec![F128::ZERO; cw_len];
+            replicate_message_fill(&mut want, &msg);
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, num_ntts, k);
+
+            let mut got = vec![F128::ZERO; cw_len];
+            ntt.seed_layers_pair_from_msg(&msg, &mut got, num_ntts, k);
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut got, num_ntts, k + 2);
+
+            assert_eq!(got, want, "shape {si}: log_msg_pos={log_msg_pos} ntts={num_ntts} k={k}");
+        }
     }
 
     #[test]
