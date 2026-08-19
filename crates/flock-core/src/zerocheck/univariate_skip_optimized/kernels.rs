@@ -313,7 +313,9 @@ fn ab_nibble_lut_enabled() -> bool {
 /// Ranked default is the nibble-LUT drain. `FLOCK_NO_C_NIBBLE=1` restores the
 /// gather kernel for one-process A/B; the ranked worker's cleared env never
 /// sets it. Production mask tables are F₂-linear XOR-doubling subset sums, so
-/// a byte lookup equals the XOR of two nibble lookups.
+/// a byte lookup equals the XOR of two nibble lookups. The nibble kernel's
+/// mask build is a 64-lane `vptestmb` pack (AVX-512BW); the gather kill-switch
+/// path stays AVX-512F-only.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

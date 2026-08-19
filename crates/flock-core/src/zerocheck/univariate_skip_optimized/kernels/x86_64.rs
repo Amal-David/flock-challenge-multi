@@ -473,7 +473,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
 pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
     c_block: &[u8; 16 * ELL],
     n_b_med: usize,
@@ -488,13 +488,21 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
 }
 
 /// DirectC nibble drain with the eq-dependent table already materialized.
+///
+/// Mask build is a 64-lane AVX-512BW `vptestmb` pack: one ZMM load of the
+/// full C row, eight byte-tests, eight `maskz_set1` ORs. The 16-bit subset
+/// index is split into two u8 planes (`b_med 0..7` / `8..15`) because a
+/// 16-bit weight does not fit in a byte; n0|n1 come from the lo plane and
+/// n2|n3 from the hi plane — the same four nibbles the 16-lane `vptestmd`
+/// path accumulated in i32. LUT half is unchanged (`vpermi2q` on the
+/// existing SoA tables).
 #[inline]
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
 pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
     c_block: &[u8; 16 * ELL],
     n_b_med: usize,
@@ -526,42 +534,64 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
         }
     }
 
-    // SAFETY: each row load reads 16 bytes from a 64-byte row of `c_block`;
-    // n_b_med <= 16 bounds the row index. Nibble indices are 0..=15 by the
-    // AND-0xf, so every vpermi2q stays inside a 16-entry table half. Each
-    // partial load/store covers eight lanes in a 64-lane bank.
+    #[inline(always)]
+    unsafe fn extract16(v: __m512i, chunk: usize) -> __m128i {
+        unsafe {
+            match chunk {
+                0 => _mm512_castsi512_si128(v),
+                1 => _mm512_extracti32x4_epi32::<1>(v),
+                2 => _mm512_extracti32x4_epi32::<2>(v),
+                _ => _mm512_extracti32x4_epi32::<3>(v),
+            }
+        }
+    }
+
+    // SAFETY: each `b_med` load reads a full 64-byte C row (`ELL == 64`);
+    // `n_b_med <= 16` bounds the row. Bank bits are the eight C-byte bits.
+    // Lo/hi planes reconstruct the same 16-bit subset index the i32 path
+    // built, so nibble indices stay in 0..=15 and every vpermi2q stays
+    // inside a 16-entry table half. Partial stores cover eight F128 lanes.
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
-        for lane_base in (0..ELL).step_by(16) {
-            let mut masks = [_mm512_setzero_si512(); 8];
-            let bank_bits = [
-                _mm512_set1_epi32(1),
-                _mm512_set1_epi32(2),
-                _mm512_set1_epi32(4),
-                _mm512_set1_epi32(8),
-                _mm512_set1_epi32(16),
-                _mm512_set1_epi32(32),
-                _mm512_set1_epi32(64),
-                _mm512_set1_epi32(128),
-            ];
+        let bank_bits = [
+            _mm512_set1_epi8(1),
+            _mm512_set1_epi8(2),
+            _mm512_set1_epi8(4),
+            _mm512_set1_epi8(8),
+            _mm512_set1_epi8(16),
+            _mm512_set1_epi8(32),
+            _mm512_set1_epi8(64),
+            _mm512_set1_epi8(-128), // 1 << 7 as i8
+        ];
 
-            for b_med in 0..n_b_med {
-                let row_ptr = c_block.as_ptr().add(b_med * ELL + lane_base);
-                let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
-                let row = _mm512_cvtepu8_epi32(row_bytes);
-                let weight = _mm512_set1_epi32((1u32 << b_med) as i32);
+        let mut lo_masks = [_mm512_setzero_si512(); 8];
+        let mut hi_masks = [_mm512_setzero_si512(); 8];
 
-                for (mask, bank_bit) in masks.iter_mut().zip(bank_bits) {
-                    let selected = _mm512_test_epi32_mask(row, bank_bit);
-                    *mask = _mm512_mask_or_epi32(*mask, selected, *mask, weight);
-                }
+        for b_med in 0..n_b_med {
+            let row = _mm512_loadu_si512(c_block.as_ptr().add(b_med * ELL) as *const __m512i);
+            let hi_plane = b_med >= 8;
+            let shift = if hi_plane { b_med - 8 } else { b_med };
+            let weight = (1u8 << shift) as i8;
+            let dest = if hi_plane {
+                &mut hi_masks
+            } else {
+                &mut lo_masks
+            };
+            for (mask, bank_bit) in dest.iter_mut().zip(bank_bits) {
+                let selected = _mm512_test_epi8_mask(row, bank_bit);
+                *mask = _mm512_or_si512(*mask, _mm512_maskz_set1_epi8(selected, weight));
             }
+        }
 
-            for (bank, mask) in partial_c.iter_mut().zip(masks) {
-                let n0 = _mm512_and_si512(mask, nibble_mask);
-                let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(mask), nibble_mask);
-                let n2 = _mm512_and_si512(_mm512_srli_epi32::<8>(mask), nibble_mask);
-                let n3 = _mm512_and_si512(_mm512_srli_epi32::<12>(mask), nibble_mask);
+        for (bank, (lo, hi)) in partial_c.iter_mut().zip(lo_masks.iter().zip(hi_masks.iter())) {
+            for chunk in 0..4 {
+                let lane_base = chunk * 16;
+                let lo16 = _mm512_cvtepu8_epi32(extract16(*lo, chunk));
+                let hi16 = _mm512_cvtepu8_epi32(extract16(*hi, chunk));
+                let n0 = _mm512_and_si512(lo16, nibble_mask);
+                let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(lo16), nibble_mask);
+                let n2 = _mm512_and_si512(hi16, nibble_mask);
+                let n3 = _mm512_and_si512(_mm512_srli_epi32::<4>(hi16), nibble_mask);
 
                 for group in 0..2 {
                     let n0_8 = if group == 0 {
