@@ -2251,13 +2251,18 @@ fn transpose_forward_ntt_dense_layers_blocked(
         return;
     }
     let n_threads = rayon::current_num_threads().max(1);
-    // Chunk target: 2^CHUNK_LOG F128 (= 512 KiB at CHUNK_LOG=15) so a chunk
+    // Chunk target: 2^CHUNK_LOG F128 (= 1 MiB at CHUNK_LOG=16) so a chunk
     // stays in L2 across all of pass (a)'s layers; but never so few chunks that
     // the pool starves. Swept 13..17 at the ranked L0 shape (log_d=20, top=12,
     // 16 threads): Zen 5 wants the large end (17: 1.8 ms, 15: 2.6, 13: n/m) and
-    // Zen 3 the small end (13: 2.5 ms, 15: 2.6, 17: 3.1); 15 is within 0.5 ms
-    // of best on both and is the value shipped.
-    const CHUNK_LOG: usize = 15;
+    // Zen 3 the small end (13: 2.5 ms, 15: 2.6, 17: 3.1); 15 was the AMD
+    // compromise. Official SPR rejected CHUNK_LOG=17 (−0.62% tntt17-2).
+    //
+    // Ranked L0 + 16 threads: split = max(20-CHUNK_LOG, 4).min(12), so
+    // CHUNK_LOG=16 and 17 share split=4 (pass (a) chunk = 1 MiB both). Only
+    // pass (b) tile doubles: 16 → 1 MiB resident, 17 → 2 MiB (= full SPR L2).
+    // 16 keeps the Zen-5 split without the 2 MiB tile that evicted L2 on SPR.
+    const CHUNK_LOG: usize = 16;
 
     let split = log_d
         .saturating_sub(CHUNK_LOG)
