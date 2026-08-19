@@ -147,6 +147,202 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     }
 }
 
+/// 64-byte broadcasts of `x^K` (K = 0..8) for the round-1 shift-reduce scale.
+/// The rolled loop would otherwise rebuild the multiplier every K-row with
+/// `mov`/`shl`/`vpbroadcastb` (two integer uops plus a shuffle-port
+/// broadcast); a static aligned image makes it one folded load.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[repr(C, align(64))]
+struct XkBroadcasts([[u8; 64]; 8]);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+static XK_BROADCASTS: XkBroadcasts = XkBroadcasts([
+    [1u8; 64],
+    [2u8; 64],
+    [4u8; 64],
+    [8u8; 64],
+    [16u8; 64],
+    [32u8; 64],
+    [64u8; 64],
+    [128u8; 64],
+]);
+
+/// Byte-transpose gather index: `out[8h + l] = r[8l + h]` — the same
+/// permutation as [`bit_transpose_64bytes_avx512`]'s byte gather. The GFNI
+/// apply produces its 64 outputs transposed; one `vpermb` per window undoes
+/// it (everything in between is elementwise).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[repr(C, align(64))]
+struct ByteIdx([u8; 64]);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[rustfmt::skip]
+static T_IDX: ByteIdx = ByteIdx([
+    0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+    2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+    4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+    6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+]);
+
+/// `vpshufb` index for "swap the two bytes of every 16-bit group" — the g = 1
+/// element of the input-side XOR-permutation group. (g = 2 and g = 4 are
+/// `vprold 16` / `vprolq 32`; there is no `vprolw`.)
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[rustfmt::skip]
+static SWAP_IDX: ByteIdx = ByteIdx([
+    1, 0, 3, 2, 5, 4, 7, 6,  9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6,  9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6,  9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6,  9, 8, 11, 10, 13, 12, 15, 14,
+]);
+
+/// Table-free GFNI round-1 shift-reduce — the ranked default.
+///
+/// The §2.1 apply `out[i] = XOR_b T_0[byte_b][i ^ 8b]` is F_2-linear from the
+/// 64 packed input bits to 64 F_8 output bytes, i.e. 64 GF(2) 8x8 matrices
+/// (output position j has the matrix whose column t is `T_0[1 << t][j]`), and
+/// `VGF2P8AFFINEQB` evaluates eight of them — one per qword — against eight
+/// input bytes in a single uop. Writing `i = 8h + l` and `g = h ^ b`,
+///
+///   out[8h + l] = XOR_g  M[8g + l] . x[h ^ g]
+///
+/// so with the eight matrix operands in registers and the input row broadcast
+/// as a qword, instruction `g` is one `vgf2p8affineqb` of the XOR-g byte
+/// permutation of that broadcast against operand `g`, and qword `l` byte `h`
+/// of the XOR of all eight is `out[8h + l]` — the byte transpose of the
+/// apply. `vgf2p8mulb`, the `x^K` scale and the XOR accumulation are all
+/// elementwise, so the transpose survives the whole window and one `vpermb`
+/// before the store undoes it.
+///
+/// Versus the incumbent table apply this deletes, per window, 128 table-row
+/// loads, 128 `movzx` + 128 `imul` row-address uops and 112 shuffle uops, and
+/// adds 128 `vgf2p8affineqb` + 112 permutes: 657 -> ~370 instructions and
+/// 264 -> 32 load uops per window, with the 16 KiB table out of L1 entirely.
+/// Values are bit-identical.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw,avx512vbmi")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_gfni(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+) {
+    use core::arch::x86_64::*;
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+
+    // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
+    // every K-row offset (identical to the incumbent kernel's reads). The
+    // matrix image is 8 x 64 aligned bytes, built by
+    // `InvNttTableByteSingleGf8::new` for the protocol ell = 64 / chunks = 8
+    // shape, and `out` is exactly one writable ZMM register.
+    unsafe {
+        let mats = inv_table.affine_mats_ptr() as *const __m512i;
+        let m0 = _mm512_load_si512(mats);
+        let m1 = _mm512_load_si512(mats.add(1));
+        let m2 = _mm512_load_si512(mats.add(2));
+        let m3 = _mm512_load_si512(mats.add(3));
+        let m4 = _mm512_load_si512(mats.add(4));
+        let m5 = _mm512_load_si512(mats.add(5));
+        let m6 = _mm512_load_si512(mats.add(6));
+        let m7 = _mm512_load_si512(mats.add(7));
+        let swap = _mm512_load_si512(SWAP_IDX.0.as_ptr() as *const __m512i);
+
+        // One §2.1 apply: broadcast the 8-byte row, build its eight XOR-g byte
+        // permutations, and XOR the eight matrix evaluations.
+        macro_rules! apply {
+            ($src:expr, $off:expr) => {{
+                let word = ($src.as_ptr().add($off) as *const i64).read_unaligned();
+                let p0 = _mm512_set1_epi64(word);
+                let p1 = _mm512_shuffle_epi8(p0, swap);
+                let p2 = _mm512_rol_epi32::<16>(p0);
+                let p3 = _mm512_shuffle_epi8(p2, swap);
+                let p4 = _mm512_rol_epi64::<32>(p0);
+                let p5 = _mm512_shuffle_epi8(p4, swap);
+                let p6 = _mm512_rol_epi32::<16>(p4);
+                let p7 = _mm512_shuffle_epi8(p6, swap);
+                let t0 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p0, m0),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p1, m1),
+                );
+                let t1 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p2, m2),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p3, m3),
+                );
+                let t2 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p4, m4),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p5, m5),
+                );
+                let t3 = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p6, m6),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p7, m7),
+                );
+                _mm512_xor_si512(_mm512_xor_si512(t0, t1), _mm512_xor_si512(t2, t3))
+            }};
+        }
+
+        let mut acc = _mm512_setzero_si512();
+        for k in 0..8usize {
+            let off = byte_base_b + k * N_CHUNKS;
+            let av = apply!(a_packed, off);
+            let bv = apply!(b_packed, off);
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            // x^0 is the multiplicative identity, so K = 0 skips the scale.
+            let scaled = if k == 0 {
+                product
+            } else {
+                let xk = _mm512_load_si512(XK_BROADCASTS.0[k].as_ptr() as *const __m512i);
+                _mm512_gf2p8mul_epi8(product, xk)
+            };
+            acc = _mm512_xor_si512(acc, scaled);
+        }
+        // Undo the byte transpose once for the whole window.
+        let idx = _mm512_load_si512(T_IDX.0.as_ptr() as *const __m512i);
+        _mm512_storeu_si512(
+            out.as_mut_ptr() as *mut __m512i,
+            _mm512_permutexvar_epi8(idx, acc),
+        );
+    }
+}
+
 /// Scalar 256-entry GPR convert. Kill-switch / oracle for the nibble kernel.
 /// The C side is table-free (see `kernels::accumulate_c_banks`).
 #[cfg(all(

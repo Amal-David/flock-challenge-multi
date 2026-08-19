@@ -103,6 +103,24 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+/// Ranked default is the table-free GFNI round-1 shift-reduce
+/// ([`x86_64::shift_reduce_inner_ab_x86_avx512_gfni`]). `FLOCK_NO_URM_GFNI=1`
+/// restores the incumbent table-apply kernel for one-process A/B; the ranked
+/// worker's cleared env never sets it. Both arms are bit-identical — the GFNI
+/// arm evaluates the same F_2-linear §2.1 map out of its matrix image instead
+/// of the 256-row byte table.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+fn urm_gfni_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_URM_GFNI").is_none())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],
@@ -146,6 +164,9 @@ pub(super) fn shift_reduce_inner_ab(
         let _ = (a_col, b_col);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
+            // Static-B first: for the four structurally-fixed windows it
+            // writes the window itself and returns true. Every other window
+            // (and any mask miss) falls through to the generic kernel below.
             if let Some((w, partials)) = bstatic {
                 if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
                     a_packed,
@@ -159,6 +180,18 @@ pub(super) fn shift_reduce_inner_ab(
                 ) {
                     return;
                 }
+            }
+            #[cfg(target_feature = "avx512vbmi")]
+            if urm_gfni_enabled() {
+                x86_64::shift_reduce_inner_ab_x86_avx512_gfni(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    out,
+                );
+                return;
             }
             x86_64::shift_reduce_inner_ab_x86_avx512(
                 a_packed,

@@ -96,6 +96,10 @@ use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[path = "blake3_witgen8.rs"]
+mod blake3_witgen8;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1704,6 +1708,16 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
+    /// 8-wide AVX2 path. `FLOCK_NO_WITGEN_AVX512=1` restores the 4-wide SSE
+    /// kernel. Default ON (ranked env is cleared). Compiled only when the
+    /// crate has AVX2 (`-C target-cpu=native` on SPR / this host).
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn avx8_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AVX512").is_none());
+        *ON
+    }
+
     fn nt_enabled() -> bool {
         // NT drain stores are OPT-IN on this lineage: the ranked runner's
         // published profiles measured NT witness publishes as a loss on
@@ -2330,12 +2344,14 @@ pub(crate) mod witgen_simd {
             }
         }
     }
-    /// 4-wide lockstep witness generation: eight blocks per parallel task
-    /// (two quads), the lincheck stripe bit-transposed from the just-written
-    /// z chunks while they are L1-hot. Bit-exact with the scalar driver.
-    fn generate_impl(
+    /// Shared group/stripe shell: one rayon task per 8 compressions, then
+    /// the lincheck stripe is bit-transposed from the just-written z chunks
+    /// while they are L1-hot. `build8` writes the 8-block (z, a, b) range.
+    fn generate_common(
         blocks: &[Compression],
         n_blocks_log: usize,
+        nt: bool,
+        build8: impl Fn([&Compression; 8], *mut u32, *mut u32, *mut u32) + Sync,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
@@ -2366,7 +2382,6 @@ pub(crate) mod witgen_simd {
         let a_base = WritePtr(a.as_mut_ptr());
         let b_base = WritePtr(b.as_mut_ptr());
         let stripe_base = WritePtr(z_lincheck.as_mut_ptr());
-        let nt = nt_enabled();
 
         let process_group = |g: usize| {
             // SAFETY: each group index occurs exactly once; every group owns
@@ -2378,27 +2393,16 @@ pub(crate) mod witgen_simd {
                     std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
                 )
             };
-            for half in 0..2 {
-                let first = 8 * g + 4 * half;
-                let base = half * 4 * F128_PER_BLOCK;
-                let quad: [&Compression; 4] = std::array::from_fn(|j| {
-                    let idx = first + j;
-                    if idx < n_blocks { &blocks[idx] } else { &padding }
-                });
-                // SAFETY: each quad fully owns its four block slots in every
-                // buffer; groups are disjoint across workers.
-                unsafe {
-                    build_quad_witness_ab_stream_neon_elide(
-                        QuadInput::Blocks(quad),
-                        z_grp[base..].as_mut_ptr() as *mut u32,
-                        a_grp[base..].as_mut_ptr() as *mut u32,
-                        b_grp[base..].as_mut_ptr() as *mut u32,
-                        false,
-                        nt,
-                        [false; 3],
-                    );
-                }
-            }
+            let octa: [&Compression; 8] = std::array::from_fn(|j| {
+                let idx = 8 * g + j;
+                if idx < n_blocks { &blocks[idx] } else { &padding }
+            });
+            build8(
+                octa,
+                z_grp.as_mut_ptr() as *mut u32,
+                a_grp.as_mut_ptr() as *mut u32,
+                b_grp.as_mut_ptr() as *mut u32,
+            );
             // Bit-transpose the 8 z chunks into the lincheck stripe while
             // they are L1-hot (identical bytes to the generic driver's
             // full-width stripe).
@@ -2432,13 +2436,83 @@ pub(crate) mod witgen_simd {
         (z, a, b, z_lincheck)
     }
 
-    /// Public entry: the SIMD quad builder, bit-exact with the scalar
-    /// driver (`FLOCK_NO_WITGEN_SIMD=1` restores it).
+    /// 4-wide lockstep witness generation: eight blocks per parallel task
+    /// (two quads). Bit-exact with the scalar driver.
+    fn generate_impl(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        let nt = nt_enabled();
+        generate_common(blocks, n_blocks_log, nt, |octa, z, a, b| {
+            // SAFETY: each quad fully owns its four block slots; groups
+            // are disjoint across workers.
+            unsafe {
+                build_quad_witness_ab_stream_neon_elide(
+                    QuadInput::Blocks([octa[0], octa[1], octa[2], octa[3]]),
+                    z,
+                    a,
+                    b,
+                    false,
+                    nt,
+                    [false; 3],
+                );
+                build_quad_witness_ab_stream_neon_elide(
+                    QuadInput::Blocks([octa[4], octa[5], octa[6], octa[7]]),
+                    z.add(4 * U32_PER_BLOCK),
+                    a.add(4 * U32_PER_BLOCK),
+                    b.add(4 * U32_PER_BLOCK),
+                    false,
+                    nt,
+                    [false; 3],
+                );
+            }
+        })
+    }
+
+    /// Public entry: 8-wide AVX2 lockstep on x86_64 when AVX2 is present
+    /// (`FLOCK_NO_WITGEN_AVX512=1` restores 4-wide SSE). Bit-exact with the
+    /// scalar driver (`FLOCK_NO_WITGEN_SIMD=1` restores that).
     pub(crate) fn generate(
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if avx8_enabled() {
+            return generate_octa(blocks, n_blocks_log);
+        }
         generate_impl(blocks, n_blocks_log)
+    }
+
+    /// 8-wide builder over the same group/stripe shell as [`generate_impl`].
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn generate_octa(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        // Temporal drains only: NT witness publishes are a known SPR loss.
+        generate_common(blocks, n_blocks_log, false, |octa, z, a, b| {
+            // SAFETY: caller (`avx8_enabled` or the test wrapper) proved AVX2;
+            // each group owns 8 blocks.
+            unsafe {
+                super::blake3_witgen8::build_octa_witness_ab_stream_elide(octa, z, a, b, [false; 3]);
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generate_quad(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        generate_impl(blocks, n_blocks_log)
+    }
+
+    #[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+    pub(crate) fn generate_octa_forced(
+        blocks: &[Compression],
+        n_blocks_log: usize,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+        generate_octa(blocks, n_blocks_log)
     }
 }
 
@@ -3128,9 +3202,10 @@ pub fn generate_witness_batch_major(
 mod tests {
     use super::*;
 
-    /// The 4-wide lockstep quad builder must reproduce the scalar driver
-    /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and
-    /// padded block counts (padding exercises the all-zero quad slots).
+    /// The lockstep SIMD builders (4-wide SSE and 8-wide AVX2) must reproduce
+    /// the scalar driver byte-for-byte: z, a, b, and the lincheck stripe,
+    /// across dense and padded block counts (padding exercises the all-zero
+    /// unused slots).
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn witgen_simd_matches_scalar_driver() {
@@ -3169,6 +3244,21 @@ mod tests {
             assert_eq!(a_s, a_q, "a at n_log={n_log}, n_blocks={n_blocks}");
             assert_eq!(b_s, b_q, "b at n_log={n_log}, n_blocks={n_blocks}");
             assert_eq!(stripe_s, stripe_q, "stripe at n_log={n_log}, n_blocks={n_blocks}");
+
+            let (z4, a4, b4, s4) = witgen_simd::generate_quad(&blocks, n_log);
+            assert_eq!(z_s, z4, "quad z at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(a_s, a4, "quad a at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(b_s, b4, "quad b at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(stripe_s, s4, "quad stripe at n_log={n_log}, n_blocks={n_blocks}");
+
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                let (z8, a8, b8, s8) = witgen_simd::generate_octa_forced(&blocks, n_log);
+                assert_eq!(z_s, z8, "octa z at n_log={n_log}, n_blocks={n_blocks}");
+                assert_eq!(a_s, a8, "octa a at n_log={n_log}, n_blocks={n_blocks}");
+                assert_eq!(b_s, b8, "octa b at n_log={n_log}, n_blocks={n_blocks}");
+                assert_eq!(stripe_s, s8, "octa stripe at n_log={n_log}, n_blocks={n_blocks}");
+            }
         }
     }
 
