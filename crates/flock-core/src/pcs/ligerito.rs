@@ -75,6 +75,17 @@ pub(crate) fn open_timing() -> bool {
 /// message changes — only how many tasks the same work is cut into (F128
 /// addition is XOR, and each site's per-slot summation order is preserved).
 /// Read once per process; default ON (the ranked worker clears its env).
+/// `FLOCK_NO_OPEN_ZMM_PUB=1` restores the XMM-only streaming publish in
+/// [`publish_f128_row_nt`]. The destination is checked for 64-byte alignment at
+/// run time; when it holds, one ZMM streaming store replaces four XMM stores
+/// for the same 64-byte line, so the published bytes are identical and only the
+/// store count changes. Read once per process.
+pub(crate) fn open_zmm_pub_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_ZMM_PUB").is_none());
+    *ON
+}
+
 pub(crate) fn open_fill_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FILL").is_none());
@@ -3449,6 +3460,25 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     unsafe {
         let s = src as *const __m128i;
         let d = dst as *mut __m128i;
+        // One F128 per XMM streaming store is four stores per 64-byte line.
+        // When the destination really is 64-byte aligned, a single ZMM
+        // streaming store covers the whole line, publishing the same bytes with
+        // a quarter of the store uops. The alignment is CHECKED AT RUN TIME
+        // rather than assumed: a compile-time gate would silently never fire if
+        // an allocation came back 16-mod-64, which is exactly how an earlier
+        // attempt at this class became a no-op. The tail keeps the XMM path.
+        if open_zmm_pub_enabled() && n >= 4 && (dst as usize) % 64 == 0 {
+            let blocks = n / 4;
+            let sz = src as *const __m512i;
+            let dz = dst as *mut __m512i;
+            for i in 0..blocks {
+                _mm512_stream_si512(dz.add(i), _mm512_loadu_si512(sz.add(i)));
+            }
+            for i in (blocks * 4)..n {
+                _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+            }
+            return;
+        }
         for i in 0..n {
             _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
         }
