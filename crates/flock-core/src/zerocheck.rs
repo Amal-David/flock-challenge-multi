@@ -323,6 +323,12 @@ pub struct CapturedSHatVC {
     /// gate is on and the round-1 split admits the four-window producer. It
     /// collapses under `suffix[..4]` to `s_hat_v_c` exactly.
     pub fold4: Option<Vec<F128>>,
+    /// Sixty-four-bank direct-fold8 C tensor (`bank = e_small + 4·q + 16·j`,
+    /// 128 entries each), present only when the shared
+    /// `ranked_direct_fold8_enabled()` gate is on and the round-1 split
+    /// admits the sixteen-window producer. It collapses under `suffix[..6]`
+    /// to `s_hat_v_c` exactly.
+    pub fold8: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -423,27 +429,35 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if crate::pcs::ranked_direct_fold4_enabled()
+        if crate::pcs::ranked_direct_fold8_enabled()
+            && crate::zerocheck::univariate_skip_optimized::c_fold8_capture_available(m, k_skip)
+        {
+            let (ab, c, s_hat_v_c, quad, fold8) =
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold8(
+                    ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                );
+            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None, fold8: Some(fold8) }))
+        } else if crate::pcs::ranked_direct_fold4_enabled()
             && crate::zerocheck::univariate_skip_optimized::c_fold4_capture_available(m, k_skip)
         {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                     ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
                 );
-            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: Some(fold4) }))
+            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: Some(fold4), fold8: None }))
         } else {
             let (ab, c, s_hat_v_c, quad) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
                     ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
                 );
-            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None }))
+            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None, fold8: None }))
         }
     } else if capture_s_hat_v_c {
         let (ab, c, s_hat_v_c, quad) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
                 a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
             );
-        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None }))
+        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None, fold8: None }))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
