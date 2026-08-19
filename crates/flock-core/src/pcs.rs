@@ -192,7 +192,20 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold4 {
+    let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
+        ligerito::recursive_prover_with_basis_direct_fold8(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            direct,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            fold_arena,
+            challenger,
+        )
+    } else if let Some(direct) = combined.direct_fold4 {
         ligerito::recursive_prover_with_basis_direct_fold4(
             lig_config,
             packed_witness,
@@ -281,6 +294,10 @@ struct CombinedClaim {
     /// Sixteen-bank direct factors for BOTH ranked claims: rounds 0..3 come
     /// from the 16×16 product matrices and the state materializes once at N/16.
     direct_fold4: Option<Vec<ring_switch::DirectFold4Factors>>,
+    /// Sixty-four-bank direct factors for BOTH ranked claims: round 0 comes
+    /// from the cached factor-state statistics, rounds 1..5 from online state
+    /// folds, and the state materializes once at N/64.
+    direct_fold8: Option<Vec<ring_switch::DirectFold8Factors>>,
 }
 
 /// Compute the ordinary round-zero message and the following message as two
@@ -524,6 +541,34 @@ pub fn ranked_direct_fold4_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4").is_none())
 }
 
+/// Sixty-four-bank route: both ranked claims must expose a complete
+/// direct-fold8 factor bundle.
+#[inline]
+fn direct_fold8_all_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold8.is_some()
+                && c.direct_fold8.is_some()
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
+}
+
+/// Direct-fold8 enable, latched once per process.
+///
+/// Default **enabled** for the ranked worker. `FLOCK_NO_OPEN_DIRECT_FOLD8=1`
+/// falls back to the sixteen-bank fold4 route bit-for-bit. The
+/// retained-coordinate producers and this consumer share this predicate so
+/// they cannot silently disagree.
+#[inline]
+pub fn ranked_direct_fold8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD8").is_none())
+}
+
 #[inline]
 fn direct_ab_claim_mix_supported(
     rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
@@ -645,20 +690,42 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_rs == 2
         && n_pd == 0
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
-    let use_direct_fold4 = direct_common
+    let use_direct_fold8 = direct_common
+        && ranked_direct_fold8_enabled()
+        && direct_fold8_all_claim_mix_supported(&rs_results);
+    let use_direct_fold4 = !use_direct_fold8
+        && direct_common
         && ranked_direct_fold4_enabled()
         && direct_fold4_all_claim_mix_supported(&rs_results);
-    let use_direct_all = !use_direct_fold4
+    let use_direct_all = !use_direct_fold8
+        && !use_direct_fold4
         && direct_common
         && ranked_direct_c_enabled()
         && direct_all_claim_mix_supported(&rs_results);
-    let use_direct_ab = !use_direct_fold4
+    let use_direct_ab = !use_direct_fold8
+        && !use_direct_fold4
         && direct_common
         && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
     let use_direct_c = use_direct_ab
         && !use_direct_all
         && ranked_direct_c_enabled()
         && rs_results[1].1.direct_fold2.is_some();
+    let direct_fold8 = if use_direct_fold8 {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold8
+                .take()
+                .expect("direct-fold8 gate checked claim zero"),
+            rs_results[1]
+                .1
+                .direct_fold8
+                .take()
+                .expect("direct-fold8 gate checked claim one"),
+        ])
+    } else {
+        None
+    };
     let direct_fold4 = if use_direct_fold4 {
         Some(vec![
             rs_results[0]
@@ -709,9 +776,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = direct_fold4
-        .as_ref()
-        .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len);
+    let direct_count = direct_fold8.as_ref().map_or_else(
+        || {
+            direct_fold4
+                .as_ref()
+                .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
+        },
+        Vec::len,
+    );
 
     let direct_c_stats = if use_direct_c {
         match &rs_results[1].1.rs_eq_ind {
@@ -776,11 +848,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = if use_direct_c || use_direct_all || use_direct_fold4 {
-        Vec::new()
-    } else {
-        crate::scratch::take_f128(l)
-    };
+    let mut b_combined: Vec<F128> =
+        if use_direct_c || use_direct_all || use_direct_fold4 || use_direct_fold8 {
+            Vec::new()
+        } else {
+            crate::scratch::take_f128(l)
+        };
     crate::gaptime::mark("open: b_combined taken");
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
@@ -801,7 +874,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && pd_dense.is_empty();
 
     let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
-        in_wide_combine_pool(l, || if use_direct_fold4 {
+        in_wide_combine_pool(l, || if use_direct_fold8 {
+        // Round zero comes from the claims' cached factor-state statistics
+        // below; every later initial message is derived online after its
+        // preceding challenge inside the ligerito driver.
+        ((F128::ZERO, F128::ZERO), None)
+    } else if use_direct_fold4 {
         // All four initial messages come from the two claims' 16×16 product
         // matrices below; no L-sized basis exists to sweep.
         ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
@@ -925,6 +1003,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     let mut round2_lookahead = None;
     let mut round3_lookahead = None;
+    if let Some(direct) = direct_fold8.as_ref() {
+        for claim in direct {
+            round0_u0 += claim.round0.0;
+            round0_u2 += claim.round0.1;
+        }
+    }
     if let Some(direct) = direct_fold4.as_ref() {
         let (direct_round0, direct_round1, direct_round2, direct_round3) =
             messages_from_direct_products_fold4(direct);
@@ -1008,6 +1092,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round3_lookahead,
         direct_fold2,
         direct_fold4,
+        direct_fold8,
     }
 }
 
