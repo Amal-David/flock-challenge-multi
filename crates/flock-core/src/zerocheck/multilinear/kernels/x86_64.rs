@@ -238,6 +238,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && lo_size.is_multiple_of(8)
             && zc_regfold_enabled()
             && zc_r2_tr_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let wide16 = tr_emit && zc_r2_wide16_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -278,6 +280,40 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         );
                     }
                 }
+            }
+            // Residue-major 16-pair consume: two independent 8-pair windows
+            // from one 64-row cache (g and g+4). Same eight-accumulator
+            // message as the 8-pair body; XOR-accumulation is associative
+            // so the pairing is value-exact. Two windows per iteration
+            // issue the next window's contiguous loads while the first
+            // window's CLMUL chain is in flight — the leftover named after
+            // the residue-major emit deleted the consumer transposes.
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            if wide16 && x_lo + 16 <= lo_size {
+                let r0 = 2 * (x_lo % 32);
+                let g = r0 / 4;
+                r2_tr_consume8(
+                    fa.as_ptr(),
+                    fb.as_ptr(),
+                    eq_lo.as_ptr(),
+                    x_lo,
+                    g,
+                    wsplit,
+                    odd_idx,
+                    &mut acc,
+                );
+                r2_tr_consume8(
+                    fa.as_ptr(),
+                    fb.as_ptr(),
+                    eq_lo.as_ptr(),
+                    x_lo + 8,
+                    g + 4,
+                    wsplit,
+                    odd_idx,
+                    &mut acc,
+                );
+                x_lo += 16;
+                continue;
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
             // in the fa/fb caches, and `a[k][lane] = row(4·lane + k)` is
@@ -920,6 +956,90 @@ pub(crate) fn zc_r2_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_TR_EMIT").is_none());
     *ON
+}
+
+/// `FLOCK_NO_ZC_R2_WIDE16=1` restores the 8-pair residue-major consume
+/// (four iterations per 64-row refill). Default pairs two windows per
+/// iteration (`g` then `g+4`) on the WRITE=false ranked path. Value-exact:
+/// both windows feed the same eight XOR-accumulators with the incumbent
+/// message. Ranked env is cleared, so the 16-pair form is scored.
+pub(crate) fn zc_r2_wide16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_WIDE16").is_none());
+    *ON
+}
+
+/// One residue-major 8-pair window: `a_k`/`b_k` are the contiguous ZMMs at
+/// F128 index `16·k + g`. Identical message to the 8-pair loop body.
+///
+/// # Safety
+/// `fa`/`fb` expose 64 residue-major F128; eight readable F128 at
+/// `eq_lo.add(x_lo)`; `g + 3 < 16`. AVX-512F + VPCLMULQDQ (module-gated).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn r2_tr_consume8(
+    fa: *const F128,
+    fb: *const F128,
+    eq_lo: *const F128,
+    x_lo: usize,
+    g: usize,
+    wsplit: bool,
+    odd_idx: core::arch::x86_64::__m512i,
+    acc: &mut [WideGhashX4; 8],
+) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    // SAFETY: caller supplies the cache layout, eq_lo window, and ISA.
+    unsafe {
+        let ld = |base: *const F128, k: usize| {
+            _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
+        };
+        let a0 = ld(fa, 0);
+        let a1 = ld(fa, 1);
+        let a2 = ld(fa, 2);
+        let a3 = ld(fa, 3);
+        let b0 = ld(fb, 0);
+        let b1 = ld(fb, 1);
+        let b2 = ld(fb, 2);
+        let b3 = ld(fb, 3);
+        let e_lo = f128x4_loadu(eq_lo.add(x_lo));
+        let e_hi = f128x4_loadu(eq_lo.add(x_lo + 4));
+        let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+        let (a0w, a1w, a2w, a3w) = if wsplit {
+            let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+            (
+                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+            )
+        } else {
+            (
+                ghash_mul_x4(w, a0),
+                ghash_mul_x4(w, a1),
+                ghash_mul_x4(w, a2),
+                ghash_mul_x4(w, a3),
+            )
+        };
+        acc[0].mul_acc(a1w, b1);
+        acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+        acc[2].mul_acc(a3w, b3);
+        acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+        acc[4].mul_acc(a2w, b2);
+        let e_aw = _mm512_xor_si512(a0w, a2w);
+        let e_b = _mm512_xor_si512(b0, b2);
+        let o_aw = _mm512_xor_si512(a1w, a3w);
+        let o_b = _mm512_xor_si512(b1, b3);
+        acc[5].mul_acc(e_aw, e_b);
+        acc[6].mul_acc(o_aw, o_b);
+        acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+    }
 }
 
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
