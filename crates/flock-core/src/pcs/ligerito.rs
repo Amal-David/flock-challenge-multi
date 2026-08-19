@@ -46,6 +46,41 @@ pub(crate) fn open_timing() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_OPEN_FILL=1` restores the incumbent open-phase scheduling at every
+/// site where the recursive open left cores idle for want of tasks (measured
+/// per sub-phase on a quiet 16-vCPU c7i with `CLOCK_PROCESS_CPUTIME_ID` deltas
+/// across in-process phase marks):
+///
+///   * `transpose_forward_ntt_dense_layers_blocked` pass (b): the tile count is
+///     `seg / tile` with `tile` sized purely for cache residency. At the L1
+///     induce (`log_d = 18`) that is FOUR tiles on sixteen threads; the floor
+///     added here caps the tile so at least `n_threads` tiles exist. The ranked
+///     L0 induce (`log_d = 20`) already sits exactly at the floor, so its tuned
+///     tile is untouched.
+///   * `induce_sumcheck_poly`'s cross-thread reduce: `chunk` was floored at
+///     `REDUCE_PAR_FLOOR = 2^12`, which is TWO chunks at the L2 induce's
+///     `n = 2^13`. The floor drops to `2^9` (still ≥ one 8 KiB slab per task).
+///   * `build_eq_table_split`'s `SPLIT_MIN_LOG`: the L2/L3 OOD tables
+///     (`d = 16`, `13`) fell below 17 and ran the serial doubling recurrence —
+///     65 535 dependent GHASH multiplies on ONE core inside a phase whose other
+///     two passes use all sixteen.
+///   * the sparse-prefix NTT's window grouping: a serial `HashMap` pass that
+///     allocated and ZEROED one `2^k` buffer per active window (213 × 4 KiB at
+///     the ranked L0) before any thread saw them; now the buffers are built and
+///     transposed in ONE parallel region, one task per window.
+///   * the opened-row `clone()`s feeding `RecursiveProof`: the rows are moved
+///     into the proof after the induce reads them instead of copied before it.
+///
+/// Every arm is bit-identical: no arithmetic, operand order, or transcript
+/// message changes — only how many tasks the same work is cut into (F128
+/// addition is XOR, and each site's per-slot summation order is preserved).
+/// Read once per process; default ON (the ranked worker clears its env).
+pub(crate) fn open_fill_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FILL").is_none());
+    *ON
+}
+
 // ===================================================================
 // Config
 // ===================================================================
@@ -2064,7 +2099,18 @@ pub(crate) fn induce_sumcheck_poly(
     // Below the floor a rayon dispatch costs more than the reduce itself.
     const REDUCE_PAR_FLOOR: usize = 1 << 12;
     if induce_sched_enabled() && n >= REDUCE_PAR_FLOOR && partials.len() > 1 {
-        let chunk = (n / rayon::current_num_threads().max(1)).max(REDUCE_PAR_FLOOR);
+        // `chunk` floored at REDUCE_PAR_FLOOR is TWO tasks at the ranked L2
+        // induce (n = 2^13, 16 threads) — fourteen cores idle through the whole
+        // reduce. The lower floor keeps each task at ≥ 8 KiB of output while
+        // letting `n / threads` actually reach the thread count. Per-slot
+        // summation order (partial 0, 1, … in thread order) is unchanged, so
+        // the result is bit-identical.
+        let reduce_floor = if open_fill_enabled() {
+            1usize << 9
+        } else {
+            REDUCE_PAR_FLOOR
+        };
+        let chunk = (n / rayon::current_num_threads().max(1)).max(reduce_floor);
         basis_poly
             .par_chunks_mut(chunk)
             .enumerate()
@@ -2299,7 +2345,22 @@ fn transpose_forward_ntt_dense_layers_blocked(
         let nseg = 1usize << split;
         let seg = 1usize << (log_d - split);
         // Tile so the resident set is ~2^CHUNK_LOG F128 across all columns.
-        let tile = ((1usize << CHUNK_LOG) / nseg).max(1).min(seg);
+        let mut tile = ((1usize << CHUNK_LOG) / nseg).max(1).min(seg);
+        // Starvation floor: the tile loop is pass (b)'s ONLY parallel
+        // decomposition, so a cache-sized tile that leaves fewer tiles than
+        // threads simply idles cores. Cap the tile at `seg >> log2(threads)`
+        // (a power of two, so it still divides `seg` exactly). At the ranked L0
+        // induce (log_d=20, seg=2^16, 16 threads) the cap EQUALS the tuned tile
+        // — L0's resident set is unchanged — while the L1 induce (log_d=18,
+        // seg=2^14) goes from 4 tiles to 16.
+        if open_fill_enabled() {
+            let cap = seg >> ceil_log2(n_threads);
+            // Only when the segment can actually supply thread-many tiles of a
+            // sane size; tiny domains keep the incumbent single-tile schedule.
+            if cap >= 64 {
+                tile = tile.min(cap);
+            }
+        }
         let ntiles = seg / tile;
         let mut tiles: Vec<Vec<&mut [F128]>> =
             (0..ntiles).map(|_| Vec::with_capacity(nseg)).collect();
@@ -2426,9 +2487,20 @@ fn eq_split_enabled() -> bool {
 /// `SPLIT_MIN_LOG` the serial recurrence wins.
 fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
+    // The incumbent floor (17) let the L2 and L3 OOD tables (d = 16, 13) fall
+    // back to the serial doubling recurrence: 2^d − 1 dependent GHASH
+    // multiplies on ONE core, in a phase whose other two passes (round message
+    // + glue) already spread over sixteen. 2^13 still leaves ≥ 128 entries per
+    // expansion block, well above rayon's dispatch break-even.
     const SPLIT_MIN_LOG: usize = 17;
+    const SPLIT_MIN_LOG_FILL: usize = 13;
+    let split_min = if open_fill_enabled() {
+        SPLIT_MIN_LOG_FILL
+    } else {
+        SPLIT_MIN_LOG
+    };
     let d = point.len();
-    if !eq_split_enabled() || d < SPLIT_MIN_LOG {
+    if !eq_split_enabled() || d < split_min {
         return build_eq_table(point);
     }
     let n_threads = rayon::current_num_threads().max(1);
@@ -2589,21 +2661,55 @@ fn transpose_forward_ntt_sparse(
 
     let wmask = (1usize << k) - 1;
     // Group nonzeros into 2^k windows.
-    let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-    for (&p, &v) in positions.iter().zip(values) {
-        let buf = windows
-            .entry(p >> k)
-            .or_insert_with(|| vec![F128::ZERO; 1 << k]);
-        buf[p & wmask] += v;
+    //
+    // The incumbent built the window buffers in a SERIAL `HashMap` pass:
+    // one `vec![ZERO; 2^k]` allocation + zero-fill per active window (213 ×
+    // 4 KiB at the ranked L0 induce, 103 × 4 KiB at L1) plus the hashing,
+    // all on one core before any worker started. With `FLOCK_NO_OPEN_FILL`
+    // unset we instead compute the window key per nonzero, group by a sort of
+    // the (tiny) index list, and let each window's task allocate, fill AND
+    // transpose its own buffer inside the existing parallel region — the
+    // buffer is written by the same thread that immediately reads it.
+    //
+    // Bit-identical: `sample_distinct_queries` yields DISTINCT positions, so
+    // every slot of every window buffer is written by exactly one nonzero;
+    // and the run grouping is a stable sort, so even coincident positions
+    // would accumulate in their original order. The window ORDER in the output
+    // vector is irrelevant — `window_slots` scatters by window index (the
+    // incumbent's `HashMap` iteration order was already nondeterministic).
+    let fill = open_fill_enabled();
+    let mut win_vec: Vec<(usize, Vec<F128>)> = Vec::new();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut order: Vec<u32> = Vec::new();
+    if fill {
+        order.extend(0..positions.len() as u32);
+        order.sort_by_key(|&i| positions[i as usize] >> k);
+        let mut s = 0usize;
+        while s < order.len() {
+            let w = positions[order[s] as usize] >> k;
+            let mut e = s + 1;
+            while e < order.len() && positions[order[e] as usize] >> k == w {
+                e += 1;
+            }
+            runs.push((s, e));
+            s = e;
+        }
+    } else {
+        let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
+        for (&p, &v) in positions.iter().zip(values) {
+            let buf = windows
+                .entry(p >> k)
+                .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+            buf[p & wmask] += v;
+        }
+        win_vec = windows.into_iter().collect();
     }
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
-    let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
-    let nwins = win_vec.len();
+    let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = win_vec
-        .into_par_iter()
-        .map(|(w, mut buf)| {
+    let window_task = |w: usize, mut buf: Vec<F128>| -> (usize, Vec<F128>) {
+        {
             for s in 0..k {
                 let layer = log_d - 1 - s;
                 let bsh = 1usize << s; // pairing distance
@@ -2633,8 +2739,26 @@ fn transpose_forward_ntt_sparse(
                 }
             }
             (w, buf)
-        })
-        .collect();
+        }
+    };
+    let processed: Vec<(usize, Vec<F128>)> = if fill {
+        runs.par_iter()
+            .map(|&(rs, re)| {
+                let w = positions[order[rs] as usize] >> k;
+                let mut buf = vec![F128::ZERO; 1 << k];
+                for &i in &order[rs..re] {
+                    let i = i as usize;
+                    buf[positions[i] & wmask] += values[i];
+                }
+                window_task(w, buf)
+            })
+            .collect()
+    } else {
+        win_vec
+            .into_par_iter()
+            .map(|(w, buf)| window_task(w, buf))
+            .collect()
+    };
     let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
 
     // Densify (active windows only; the rest stay zero, which is the correct
@@ -5532,9 +5656,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
+    // The proof's copy of the opened rows is the SAME data the induce below
+    // reads. The incumbent cloned all 218 rows (218 allocations, 223 KiB) here,
+    // on one core, purely to keep `opened_rows_0` alive for the induce; moving
+    // the rows in after the induce deletes the copy outright.
+    let mut merkle_proof_0 = Some(merkle_proof_0);
+    let mut initial_proof = if open_fill_enabled() {
+        None
+    } else {
+        Some(RecursiveProof {
+            opened_rows: opened_rows_0.clone(),
+            merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
+        })
     };
 
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
@@ -5563,6 +5696,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             n1 >= 12 && queries_0.len() > 4 * (1usize << log_inv_rate_0) * lb.max(1),
         ));
     }
+
+    let initial_proof = initial_proof.take().unwrap_or_else(|| RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
+    });
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -5742,10 +5880,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
+        // Same deletion as the L0 block: the rows move into the proof after the
+        // induce has read them instead of being cloned before it.
+        let mut merkle_proof_i = Some(merkle_proof_i);
+        if !open_fill_enabled() {
+            recursive_proofs.push(RecursiveProof {
+                opened_rows: opened_rows_i.clone(),
+                merkle_proof: merkle_proof_i.take().expect("merkle proof taken once"),
+            });
+        }
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
@@ -5788,6 +5931,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     && queries_i.len()
                         > induce_ntt_crossover_c() * (1usize << rate) * (n_next + rate).max(1),
             ));
+        }
+
+        if let Some(mp) = merkle_proof_i.take() {
+            recursive_proofs.push(RecursiveProof {
+                opened_rows: opened_rows_i,
+                merkle_proof: mp,
+            });
         }
 
         let _t = std::time::Instant::now();
