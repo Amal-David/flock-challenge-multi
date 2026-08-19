@@ -4624,3 +4624,28 @@ mod low_twiddle_invariant {
         }
     }
 }
+
+#[cfg(test)]
+mod zero_spine_invariant {
+    use super::*;
+
+    /// Block 0 of EVERY layer of the standard-basis twiddle table is the
+    /// zero element — the subspace polynomial evaluated at its own subspace's
+    /// origin. This is a property of the fixed basis, not of any input, and
+    /// it is what lets the fused-four sweeps take the zero-spine network
+    /// (15 of 32 butterflies collapse to `v ^= u`) on the first block of each
+    /// group; the rate-1/2 seed already exploits the same fact at layers 1–2
+    /// through its `_sparse` kernel. Checked exhaustively at each dimension
+    /// the ranked prove builds.
+    #[test]
+    fn every_layer_block0_twiddle_is_zero() {
+        for dim in 12..=22usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            for layer in 0..dim {
+                let t = ntt.twiddle(layer, 0);
+                assert_eq!(t, F128::ZERO, "dim={dim} layer={layer} t={t:?}");
+            }
+        }
+    }
+}
+
