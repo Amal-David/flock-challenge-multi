@@ -282,6 +282,117 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// 8×64 byte transpose used by [`planes_block_to_f128_x86`].
+///
+/// Eight 64-byte rows in, eight registers out with
+/// `out[k].byte[8L + b] = rows[b][8k + L]` — output register `k`, qword `L`,
+/// holds the eight rows' byte at column `8k + L`. Three `vpermt2q` stages
+/// swap register index bit `d` with qword index bit `d` (an 8×8 qword
+/// transpose), then one `vpermb` finishes the sub-qword byte transpose.
+/// Same recipe as the promoted zerocheck `byte_transpose_8x64` (REV=false).
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn byte_transpose_8x64_planes(
+    rows: [core::arch::x86_64::__m512i; 8],
+) -> [core::arch::x86_64::__m512i; 8] {
+    use core::arch::x86_64::*;
+    #[rustfmt::skip]
+    const IDX: [i8; 64] = [
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    ];
+    const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+    const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+    const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
+    const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
+    const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
+    const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
+
+    // SAFETY: register-to-register shuffles plus loads of fixed 64-byte
+    // index constants; the cfg gate supplies the target features.
+    unsafe {
+        let mut cur = rows;
+        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
+            let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+            let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+            let mut next = [_mm512_setzero_si512(); 8];
+            for r in 0..8usize {
+                if r & d == 0 {
+                    let x = cur[r];
+                    let y = cur[r | d];
+                    next[r] = _mm512_permutex2var_epi64(x, ia, y);
+                    next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
+                }
+            }
+            cur = next;
+        }
+        let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
+        let mut out = [_mm512_setzero_si512(); 8];
+        for k in 0..8usize {
+            out[k] = _mm512_permutexvar_epi8(idx, cur[k]);
+        }
+        out
+    }
+}
+
+/// Reassemble one 16×64 byte-plane block into 64 AoS F128 columns.
+///
+/// `planes[k*64 + c]` is byte `k` of column `c`. Output
+/// `out[c] = F128 { lo, hi }` with `lo = Σ_{k<8} planes[k*64+c] << 8k`
+/// and `hi` the same over `k = 8..16`. Bit-identical to the scalar
+/// strided pack that previously sat after the worker XOR in
+/// `fold_block_major_gfni`. The 2-source `xor_bytes_avx512` merge and
+/// worker-0 `copy_from_slice` are untouched.
+///
+/// # Safety
+/// `planes` covers 1024 readable bytes; `out` covers 64 writable F128
+/// (1024 bytes). Requires avx512f + avx512bw + avx512vbmi.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+pub(crate) unsafe fn planes_block_to_f128_x86(planes: *const u8, out: *mut F128) {
+    use core::arch::x86_64::*;
+    // SAFETY: sixteen 64-byte plane loads cover the 1024-byte block;
+    // sixteen 64-byte stores cover 64 F128. Features per the cfg gate.
+    unsafe {
+        let lo_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(planes.add(k * 64) as *const __m512i));
+        let hi_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(planes.add((8 + k) * 64) as *const __m512i));
+        let los = byte_transpose_8x64_planes(lo_rows);
+        let his = byte_transpose_8x64_planes(hi_rows);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let dst = out as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(
+                dst.add(2 * k),
+                _mm512_permutex2var_epi64(los[k], idx0, his[k]),
+            );
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
+        }
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`

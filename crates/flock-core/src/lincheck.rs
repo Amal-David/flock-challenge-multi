@@ -937,6 +937,21 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_PLANE_F128=1` restores the scalar 16×64→F128 pack after
+/// the worker XOR in the GFNI block-major reduce (exact same-binary A/B).
+/// The 2-source merge and worker-0 `copy_from_slice` stay either way.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -1124,6 +1139,16 @@ fn fold_block_major_gfni(
             unsafe {
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
+        }
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        if lc_plane_f128_enabled() {
+            // SAFETY: `acc` is 1024 bytes; `o` is a 64-column chunk
+            // (k is a power of two ≥ 64 on this arm). Same bytes as the
+            // scalar pack below.
+            unsafe {
+                kernels::planes_block_to_f128_x86(acc.as_ptr(), o.as_mut_ptr());
+            }
+            return;
         }
         for (col, slot) in o.iter_mut().enumerate() {
             let mut lo = 0u64;
@@ -3056,6 +3081,47 @@ mod tests {
                 kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
             }
             assert_eq!(want, got, "stride {stride}");
+        }
+    }
+
+    /// Isolated 16×64 plane→F128 pack must match the scalar strided gather
+    /// byte-for-byte. Independent of the worker XOR (which this shot does
+    /// not touch).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    #[test]
+    fn planes_block_to_f128_matches_scalar() {
+        let mut rng = Rng::new(0xF128_B10C);
+        for _ in 0..8 {
+            let mut planes = [0u8; 1024];
+            for b in planes.iter_mut() {
+                *b = rng.next_u64() as u8;
+            }
+            let mut want = [F128::ZERO; 64];
+            for (col, slot) in want.iter_mut().enumerate() {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (planes[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (planes[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                *slot = F128 { lo, hi };
+            }
+            let mut got = [F128 {
+                lo: 0xA5A5_A5A5_A5A5_A5A5,
+                hi: 0xA5A5_A5A5_A5A5_A5A5,
+            }; 64];
+            // SAFETY: 1024-byte block in, 64 F128 out.
+            unsafe {
+                kernels::planes_block_to_f128_x86(planes.as_ptr(), got.as_mut_ptr());
+            }
+            assert_eq!(want, got);
         }
     }
 
