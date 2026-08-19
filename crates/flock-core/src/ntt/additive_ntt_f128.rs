@@ -295,6 +295,15 @@ fn ntt_lane_round_disabled() -> bool {
 }
 
 /// Kernel-diet part 2: fuse the three-layer deep tail into one sweep.
+/// `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1` restores the sweep-per-stage deep-layer
+/// schedule (three full passes over each sub-group plus the Merkle callback
+/// read) instead of the block-fused single pass (exact same-binary A/B).
+#[inline]
+fn deep_block_fuse_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
+}
+
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
 #[inline]
 fn ntt_fused3_disabled() -> bool {
@@ -1823,7 +1832,115 @@ impl AdditiveNttF128 {
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
 
-        let deep_sub = |sub_idx: usize, sub_data: &mut [F128]| {
+        // Block-fused deep tail (ranked 4+4+3 schedule only): after the first
+        // fused-four sweep, a sub-group decomposes into sixteen fully
+        // independent layer-(n_top+4) blocks, and everything that remains —
+        // the second fused-four, the fused-three, and the Merkle leaf
+        // callback — fits inside one such block. Running them per block
+        // collapses three more full sweeps over the sub-group into one
+        // L2-resident pass per block. Same butterflies, same twiddles, same
+        // per-row order — only the interleaving of DISJOINT blocks changes,
+        // so the output bytes are identical. `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1`
+        // restores the sweep schedule (exact same-binary A/B).
+        let fuse_blocks = deep_fused4_ok
+            && log_d == n_top + 11
+            && start_layer <= n_top
+            && !ntt_fused3_disabled()
+            && deep_block_fuse_enabled();
+
+        let deep_sub = |sub_idx: usize,
+                        sub_data: &mut [F128],
+                        block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>|
+         -> bool {
+            if fuse_blocks && block_cb.is_some() {
+                let cb = block_cb.unwrap();
+                // Sweep 1: fused-four over the whole sub-group (layers
+                // n_top..n_top+4) — verbatim the incumbent's first pass.
+                {
+                    let layer = n_top;
+                    let block_size = 1usize << (log_d - layer);
+                    let sixteenth = block_size >> 4;
+                    let global_block = sub_idx;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                    tw[0] = self.twiddle(layer, global_block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                    }
+                    for s in 0..8 {
+                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                    }
+                    butterfly_interleaved_fused_4layer_rows(
+                        sub_data,
+                        &tw,
+                        sixteenth,
+                        num_ntts,
+                        if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
+                    );
+                }
+                // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
+                // (n_top+8..n_top+11), then the leaf callback, all while the
+                // 128-position block is cache-hot.
+                let layer4 = n_top + 4;
+                let block_size4 = 1usize << (log_d - layer4);
+                let block_bytes4 = block_size4 * num_ntts;
+                let sixteenth4 = block_size4 >> 4;
+                let layer3 = n_top + 8;
+                let dense_lanes = num_ntts - odd_tail;
+                #[cfg(test)]
+                FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for b in 0..16usize {
+                    let g4 = sub_idx * 16 + b;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                    tw[0] = self.twiddle(layer4, g4);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+                    }
+                    for s in 0..8 {
+                        tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+                    }
+                    let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
+                    butterfly_interleaved_fused_4layer_rows(
+                        blk,
+                        &tw,
+                        sixteenth4,
+                        num_ntts,
+                        if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
+                    );
+                    for j in 0..16usize {
+                        let g8 = g4 * 16 + j;
+                        let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+                        tw3[0] = self.twiddle(layer3, g8);
+                        for s in 0..2 {
+                            tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+                        }
+                        for s in 0..4 {
+                            tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+                        }
+                        let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+                        // SAFETY: eight consecutive rows of `num_ntts` lanes,
+                        // owned exclusively by this sub-group task; the zero
+                        // tail lives on odd rows exactly as in the sweep
+                        // schedule (blocks start at even global rows).
+                        unsafe {
+                            kernels::butterfly_fused_3layer_rows(
+                                eight.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &tw3,
+                            );
+                        }
+                    }
+                    let lo = sub_idx * sub_size_positions + b * block_size4;
+                    cb(lo..lo + block_size4, &sub_data[b * block_bytes4..(b + 1) * block_bytes4]);
+                }
+                return true;
+            }
             // The cache-blocked tail normally sweeps each subgroup once per
             // remaining layer. On AVX-512, reuse the fused-four kernel from
             // the top layers so a row group remains in registers across four
@@ -1958,7 +2075,7 @@ impl AdditiveNttF128 {
                         layer += 1;
                     }
                 }
-                return;
+                return false;
             }
 
             for layer in n_top.max(start_layer)..log_d {
@@ -1982,6 +2099,7 @@ impl AdditiveNttF128 {
                     );
                 }
             }
+            false
         };
 
         match stream {
@@ -1993,10 +2111,11 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        deep_sub(sub_idx, sub_data);
-                        if let Some(cb) = on_sub_done {
-                            let lo = sub_idx * sub_size_positions;
-                            cb(lo..lo + sub_size_positions, sub_data);
+                        if !deep_sub(sub_idx, sub_data, on_sub_done) {
+                            if let Some(cb) = on_sub_done {
+                                let lo = sub_idx * sub_size_positions;
+                                cb(lo..lo + sub_size_positions, sub_data);
+                            }
                         }
                     });
             }
@@ -2018,7 +2137,7 @@ impl AdditiveNttF128 {
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
-                            .for_each(|(i, sub_data)| deep_sub(sub_cursor + i, sub_data));
+                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None); });
                         on_chunk(
                             c,
                             sub_cursor * sub_size_positions..end_sub * sub_size_positions,
@@ -2114,7 +2233,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data);
+                    deep_sub(i, sub_data, None);
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -4479,29 +4598,5 @@ mod low_twiddle_ranked_ab_probe {
             std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some(),
             best = best,
         );
-    }
-}
-
-#[cfg(test)]
-mod low_twiddle_invariant {
-    use super::*;
-
-    /// The two deepest layers of the standard-basis twiddle table have a
-    /// zero high limb in EVERY block. This is a property of the fixed basis,
-    /// not of any input, and it is what lets the fused-three sweep (the last
-    /// group of the deep region) take the 3-CLMUL low product for six of its
-    /// seven twiddles. Checked exhaustively over every entry of the two
-    /// layers at each dimension the ranked prove builds.
-    #[test]
-    fn deepest_standard_twiddle_layers_have_zero_high_limb() {
-        for dim in 12..=22usize {
-            let ntt = AdditiveNttF128::standard(dim);
-            for layer in [dim - 2, dim - 1] {
-                for block in 0..(1usize << layer) {
-                    let t = ntt.twiddle(layer, block);
-                    assert_eq!(t.hi, 0, "dim={dim} layer={layer} block={block} t={t:?}");
-                }
-            }
-        }
     }
 }

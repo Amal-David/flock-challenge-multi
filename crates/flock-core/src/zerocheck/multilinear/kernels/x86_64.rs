@@ -243,6 +243,24 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 );
                 gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                 gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                // The next refill's 512-byte packed bursts sit one tile
+                // ahead — ~4 iterations (>1000 uops) of pure compute away,
+                // a gap the hardware prefetcher does not bridge across the
+                // strided burst boundary. Pull both sides in now (prefetch
+                // is a hint: harmless past the end on the last tile).
+                if zc_pkt_pf_enabled() {
+                    let next = (g0 + 64) * 8;
+                    for l in 0..8 {
+                        _mm_prefetch(
+                            a_pkt.add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
             // in the fa/fb caches, and `a[k][lane] = row(4·lane + k)` is
@@ -858,6 +876,15 @@ pub(crate) fn zc_fold_defer_enabled() -> bool {
 /// so `a·w = a.lo·w + a.hi·(w·x^64 mod p)` — and replaces the two-stage
 /// recursive reduce on the chain feeding all eight accumulators with one:
 /// 22 CLMUL + 1 shift per iteration instead of 24 + 8.
+/// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
+/// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
+/// same-binary A/B; prefetch is architecturally invisible).
+pub(crate) fn zc_pkt_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF").is_none());
+    *ON
+}
+
 pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
@@ -1200,6 +1227,22 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                    }
+                    // Next tile's 512-byte bursts, one refill ahead of the
+                    // consumer — see the round-2 twin for the rationale.
+                    // Same addresses on both refill arms.
+                    if zc_pkt_pf_enabled() {
+                        let next = (4 * xg + 64) * 8;
+                        for l in 0..8 {
+                            _mm_prefetch(
+                                a_pkt.add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                            _mm_prefetch(
+                                b_pkt.add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
                 Some((&fa, &fb, 4 * xg))
