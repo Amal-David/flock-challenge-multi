@@ -116,7 +116,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
-pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
+fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
     for (byte_k, slot) in mats.iter_mut().enumerate() {
@@ -142,7 +142,7 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
 /// # Safety
-/// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
+/// - `tile_bytes_ptr` must point to at least `8 * k` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
 /// - `out_planes_ptr` must point to at least `n_blocks64 * 1024` bytes.
 #[cfg(all(
@@ -151,9 +151,9 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
-pub(crate) unsafe fn gfni_fold_tile(
+unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
-    stripe_stride: usize,
+    k: usize,
     n_blocks64: usize,
     mats: &[u64; 128],
     out_planes_ptr: *mut u8,
@@ -165,7 +165,7 @@ pub(crate) unsafe fn gfni_fold_tile(
             let bs = block * 64;
             let mut rows = [_mm512_setzero_si512(); 8];
             for (t, row) in rows.iter_mut().enumerate() {
-                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i);
+                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * k + bs) as *const __m512i);
             }
             let planes = out_planes_ptr.add(block * 1024);
             for byte_k in 0..16 {

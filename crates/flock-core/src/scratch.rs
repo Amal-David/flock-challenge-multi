@@ -20,13 +20,7 @@
 use crate::field::F128;
 use std::sync::Mutex;
 
-/// Pool entries carry a provenance tag: `0` means "no provenance". A non-zero
-/// tag asserts the buffer's contents are EXACTLY what its previous owner
-/// released — attached only by [`give_f128_tagged`], dropped by every other
-/// custody event ([`give_f128`] pushes tag 0; any take hands the buffer to a
-/// caller whose writes void the old provenance, and re-tagging is the new
-/// owner's responsibility).
-static POOL: Mutex<Vec<(Vec<F128>, u64)>> = Mutex::new(Vec::new());
+static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -57,62 +51,22 @@ pub fn take_f128(n: usize) -> Vec<F128> {
 /// the commit prefault skips its page-touch thread when the pool can
 /// supply an already-resident buffer).
 pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
-    try_take_f128_tagged(n, 0).map(|(v, _)| v)
-}
-
-/// [`take_f128`] with provenance: prefers a pooled buffer whose tag equals
-/// `tag` (smallest such capacity ≥ `n`), falling back to plain best-fit. The
-/// returned flag is `true` only when the buffer's previous release attached
-/// exactly this tag and no other custody event touched it since — i.e. its
-/// contents are bit-identical to what the tagged releaser handed back. On a
-/// `false` return the contents are stale/uninitialized as usual.
-///
-/// `tag` must be non-zero for the hit flag to be meaningful (tag 0 always
-/// reports `false`).
-pub fn take_f128_tagged(n: usize, tag: u64) -> (Vec<F128>, bool) {
-    if let Some(r) = try_take_f128_tagged(n, tag) {
-        return r;
-    }
-    (crate::alloc_uninit_vec(n), false)
-}
-
-fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
     let mut pool = POOL.lock().unwrap();
     let mut best: Option<usize> = None;
-    let mut best_pref = false;
-    for (i, (v, t)) in pool.iter().enumerate() {
-        if v.capacity() < n {
-            continue;
-        }
-        // Tagged callers prefer their own tag; untagged callers prefer
-        // untagged entries, so foreign provenance survives unrelated takes
-        // whenever any other buffer fits (soft partition, never a refusal).
-        let pref = if tag != 0 { *t == tag } else { *t == 0 };
-        let better = match best {
-            None => true,
-            Some(b) => {
-                (pref && !best_pref) || (pref == best_pref && v.capacity() < pool[b].0.capacity())
-            }
-        };
-        if better {
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
             best = Some(i);
-            best_pref = pref;
         }
     }
-    let best_hit = best_pref && tag != 0;
     if let Some(i) = best {
-        let (mut v, _) = pool.swap_remove(i);
+        let mut v = pool.swap_remove(i);
         drop(pool);
-        // A tag hit requires the previous release to have had the same
-        // length: the tag encodes it (caller contract), and same allocation
-        // + same length means `clear` + `set_len` below exposes exactly the
-        // released bytes.
         v.clear();
         // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
         // exposing uninit/stale elements is sound to *hold* — the caller
         // upholds write-before-read per this function's contract.
         unsafe { v.set_len(n) };
-        return Some((v, best_hit));
+        return Some(v);
     }
     None
 }
@@ -121,60 +75,17 @@ fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
 /// smallest-capacity buffer is evicted (large buffers are the expensive ones
 /// to re-fault; a run that ramps problem sizes upward must not get its big
 /// buffers crowded out by stale small ones).
-/// One-shot pending tags keyed by allocation pointer: [`register_pending_tag`]
-/// arms one, and the next [`give_f128`] of that exact allocation attaches it
-/// instead of dropping provenance. Entries are consumed on match, and
-/// re-registering a pointer overwrites its pending tag.
-static PENDING_TAGS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-
-/// Arm a provenance tag for the buffer starting at `ptr`: the NEXT
-/// [`give_f128`] of that allocation behaves as [`give_f128_tagged`] with
-/// `tag`. Call at the exact moment the buffer holds a completed
-/// layout-tagged output, and only for buffers no later phase mutates before
-/// their release (read-only views are fine). This keeps provenance knowledge
-/// at the producer without threading tags through every release site.
-pub fn register_pending_tag(ptr: *const F128, tag: u64) {
-    let mut pending = PENDING_TAGS.lock().unwrap();
-    if let Some(slot) = pending.iter_mut().find(|(p, _)| *p == ptr as usize) {
-        slot.1 = tag;
-        return;
-    }
-    pending.push((ptr as usize, tag));
-    // Bounded: a prove registers a handful of buffers; anything beyond that
-    // is stale (e.g. an aborted prove) and safe to shed oldest-first.
-    if pending.len() > 8 {
-        pending.remove(0);
-    }
-}
-
 pub fn give_f128(v: Vec<F128>) {
-    let tag = {
-        let mut pending = PENDING_TAGS.lock().unwrap();
-        match pending.iter().position(|(p, _)| *p == v.as_ptr() as usize) {
-            Some(i) => pending.swap_remove(i).1,
-            None => 0,
-        }
-    };
-    give_f128_tagged(v, tag);
-}
-
-/// [`give_f128`] with a provenance tag: asserts the buffer's first `len`
-/// elements hold exactly the releasing phase's completed output, so a later
-/// [`take_f128_tagged`] with the same tag may skip rewriting
-/// content-independent regions. The tag MUST encode the layout version and
-/// the buffer length; release with plain [`give_f128`] (tag 0) whenever any
-/// doubt exists about the contents.
-pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
     if v.capacity() == 0 {
         return;
     }
     let mut pool = POOL.lock().unwrap();
-    pool.push((v, tag));
+    pool.push(v);
     if pool.len() > MAX_POOLED {
         let smallest = pool
             .iter()
             .enumerate()
-            .min_by_key(|(_, (v, _))| v.capacity())
+            .min_by_key(|(_, v)| v.capacity())
             .map(|(i, _)| i)
             .expect("pool non-empty");
         pool.swap_remove(smallest);
@@ -244,51 +155,6 @@ mod tests {
         let v2 = take_f128(512);
         assert_eq!(v2.as_ptr(), ptr);
         assert_eq!(v2.len(), 512);
-        clear();
-    }
-
-    #[test]
-    fn tagged_roundtrip_and_custody_drop() {
-        clear();
-        let mut v = take_f128(256);
-        for s in v.iter_mut() {
-            *s = F128 { lo: 3, hi: 4 };
-        }
-        let ptr = v.as_ptr();
-        give_f128_tagged(v, 77);
-        // Same tag: hit, same allocation, contents intact.
-        let (v2, hit) = take_f128_tagged(256, 77);
-        assert!(hit);
-        assert_eq!(v2.as_ptr(), ptr);
-        assert!(v2.iter().all(|s| s.lo == 3 && s.hi == 4));
-        // Untagged give drops provenance: same buffer, no hit.
-        give_f128(v2);
-        let (v3, hit) = take_f128_tagged(256, 77);
-        assert!(!hit);
-        assert_eq!(v3.as_ptr(), ptr);
-        // Wrong tag on a tagged entry: no hit.
-        give_f128_tagged(v3, 77);
-        let (v4, hit) = take_f128_tagged(256, 78);
-        assert!(!hit);
-        drop(v4);
-        clear();
-    }
-
-    #[test]
-    fn tag_hit_beats_smaller_untagged_fit() {
-        clear();
-        give_f128(take_f128(300));
-        let mut big = take_f128(1024);
-        for s in big.iter_mut() {
-            *s = F128 { lo: 1, hi: 2 };
-        }
-        let big_ptr = big.as_ptr();
-        give_f128_tagged(big, 9);
-        give_f128(take_f128(300));
-        let (got, hit) = take_f128_tagged(256, 9);
-        assert!(hit, "tagged entry must win over smaller untagged fits");
-        assert_eq!(got.as_ptr(), big_ptr);
-        drop(got);
         clear();
     }
 

@@ -208,9 +208,10 @@ pub(super) fn shift_reduce_inner_ab(
 
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
-/// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
-/// sequential single-window calls. Bit-identical to two calls of
-/// [`shift_reduce_inner_ab`] on every path.
+/// (`shift_reduce_inner_ab_fused_neon_x2`); on x86 AVX-512/GFNI it takes the
+/// matching two-accumulator GFNI wavefront unless `FLOCK_NO_USK_X2` is set.
+/// Everywhere else it decays to two sequential single-window calls.
+/// Bit-identical to two calls of [`shift_reduce_inner_ab`] on every path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab_x2(
     a_packed: &[u8],
@@ -238,7 +239,108 @@ pub(super) fn shift_reduce_inner_ab_x2(
         );
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        if usk_x2_off() {
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out0,
+                a_col,
+                b_col,
+                bstatic,
+            );
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med + 1,
+                out1,
+                a_col,
+                b_col,
+                bstatic,
+            );
+            return;
+        }
+        let _ = (a_col, b_col);
+        // SAFETY: all required target features are enabled at compile time.
+        // Preserve the specialised bstatic blocks (0/1 and 30/31) and fuse
+        // only the generic pair — the live ranked shape is 7–8 even-aligned
+        // pairs, of which 6–7 miss bstatic and take this wavefront.
+        unsafe {
+            let mut d0 = false;
+            let mut d1 = false;
+            if let Some((w, partials)) = bstatic {
+                d0 = x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    w,
+                    partials,
+                    out0,
+                );
+                d1 = x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med + 1,
+                    w,
+                    partials,
+                    out1,
+                );
+            }
+            match (d0, d1) {
+                (true, true) => {}
+                (true, false) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med + 1,
+                    out1,
+                ),
+                (false, true) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    out0,
+                ),
+                (false, false) => x86_64::shift_reduce_inner_ab_x86_avx512_x2(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    out0,
+                    out1,
+                ),
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )
+    )))]
     {
         shift_reduce_inner_ab(
             a_packed,
@@ -263,6 +365,18 @@ pub(super) fn shift_reduce_inner_ab_x2(
             bstatic,
         );
     }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+fn usk_x2_off() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_USK_X2").is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
