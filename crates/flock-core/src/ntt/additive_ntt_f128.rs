@@ -4481,3 +4481,27 @@ mod low_twiddle_ranked_ab_probe {
         );
     }
 }
+
+#[cfg(test)]
+mod low_twiddle_invariant {
+    use super::*;
+
+    /// The two deepest layers of the standard-basis twiddle table have a
+    /// zero high limb in EVERY block. This is a property of the fixed basis,
+    /// not of any input, and it is what lets the fused-three sweep (the last
+    /// group of the deep region) take the 3-CLMUL low product for six of its
+    /// seven twiddles. Checked exhaustively over every entry of the two
+    /// layers at each dimension the ranked prove builds.
+    #[test]
+    fn deepest_standard_twiddle_layers_have_zero_high_limb() {
+        for dim in 12..=22usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            for layer in [dim - 2, dim - 1] {
+                for block in 0..(1usize << layer) {
+                    let t = ntt.twiddle(layer, block);
+                    assert_eq!(t.hi, 0, "dim={dim} layer={layer} block={block} t={t:?}");
+                }
+            }
+        }
+    }
+}
