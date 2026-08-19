@@ -669,23 +669,40 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // 5-CLMUL split form, which is eight of every twelve butterflies in the
     // group. The predicate is still checked on the values themselves, so a
     // non-final fused-three group simply keeps the general form.
-    let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
-    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
-    // precondition for `twiddles[1..]` by inspection of the values.
+    // The group's outer layer is the domain's THIRD-deepest, where exactly
+    // half the blocks carry a low twiddle, so slot 0 is worth testing per
+    // call as well as slots 1..7.
+    let on = !low_twiddle_fused3_disabled();
+    let low_inner = on && twiddles[1..].iter().all(|t| t.hi == 0);
+    let low_outer = on && twiddles[0].hi == 0;
+    // SAFETY: forwarded caller contract; the two predicates prove the LOW
+    // precondition for the slots they gate by inspecting the values.
     unsafe {
-        match (mul_diet_disabled(), low_inner) {
-            (true, false) => {
-                butterfly_fused_3layer_rows_impl::<false, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (true, true) => {
-                butterfly_fused_3layer_rows_impl::<false, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, false) => {
-                butterfly_fused_3layer_rows_impl::<true, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, true) => {
-                butterfly_fused_3layer_rows_impl::<true, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
+        match (mul_diet_disabled(), low_outer, low_inner) {
+            (true, false, false) => butterfly_fused_3layer_rows_impl::<false, false, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, false, true) => butterfly_fused_3layer_rows_impl::<false, false, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, true, false) => butterfly_fused_3layer_rows_impl::<false, true, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, true, true) => butterfly_fused_3layer_rows_impl::<false, true, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, false, false) => butterfly_fused_3layer_rows_impl::<true, false, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, false, true) => butterfly_fused_3layer_rows_impl::<true, false, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, true, false) => butterfly_fused_3layer_rows_impl::<true, true, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, true, true) => butterfly_fused_3layer_rows_impl::<true, true, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
         }
     }
 }
@@ -704,7 +721,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// Same contract as [`butterfly_fused_3layer_rows`].
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bool>(
+unsafe fn butterfly_fused_3layer_rows_impl<
+    const DIET: bool,
+    const LOW_OUTER: bool,
+    const LOW_INNER: bool,
+>(
     ptr: *mut F128,
     num_ntts: usize,
     dense_lanes: usize,
@@ -721,7 +742,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
         // loads and two stores for the same 12.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 7];
-        tw[0] = tw_x4::<false, DIET>(twiddles[0]);
+        tw[0] = tw_x4::<LOW_OUTER, DIET>(twiddles[0]);
         for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
             *slot = tw_x4::<LOW_INNER, DIET>(*value);
         }
@@ -763,7 +784,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, false);
+                butterfly2!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -790,7 +811,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, false);
+                butterfly!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -827,8 +848,8 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
                 values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
             }
             let outer = tw[0];
-            butterfly!(values, 0, 4, outer, false);
-            butterfly!(values, 2, 6, outer, false);
+            butterfly!(values, 0, 4, outer, LOW_OUTER);
+            butterfly!(values, 2, 6, outer, LOW_OUTER);
             butterfly!(values, 0, 2, tw[1], LOW_INNER);
             butterfly!(values, 4, 6, tw[2], LOW_INNER);
             for i in 0..4 {
@@ -923,16 +944,16 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false>(
+                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, false>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true>(
+                        (false, true) => butterfly_fused_3layer_rows_impl::<false, false, true>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false>(
+                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, false>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true>(
+                        (true, true) => butterfly_fused_3layer_rows_impl::<true, false, true>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
                     }

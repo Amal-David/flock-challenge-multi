@@ -2098,6 +2098,15 @@ pub(crate) fn induce_sumcheck_poly(
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site). `top` and
 /// `bot` must have equal length.
+/// `FLOCK_NO_TNTT_CONST_DIET=1` restores the six-CLMUL `ghash_mul_x4` in the
+/// sparse transpose-NTT window butterfly (exact same-binary A/B). Read once.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+fn tntt_const_diet_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_TNTT_CONST_DIET").is_some())
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
@@ -2106,7 +2115,23 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
+        use crate::field::gf2_128::x86_64::{
+            ghash_mul_x4_low_lhs, ghash_mul_x4_split, ghash_shift64_x4,
+        };
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        // The twiddle is ONE broadcast constant for this whole window step,
+        // so its product form is decided once, outside the lane loop:
+        //   * `t.hi == 0` (every twiddle of the two deepest standard-basis
+        //     layers, which is where the sparse window phase starts) needs
+        //     only the short product: 3 CLMUL.
+        //   * otherwise the `t·x^64` companion is built once here and every
+        //     lane takes the split product: 5 CLMUL instead of 6.
+        // Both are exact identities in GF(2^128) — reduction mod p is a ring
+        // homomorphism — so the transform's bytes are unchanged.
+        // `FLOCK_NO_TNTT_CONST_DIET=1` restores the general product.
+        let diet = !tntt_const_diet_disabled();
+        let low = diet && t.hi == 0;
+        let tb_x64 = if diet && !low { ghash_shift64_x4(tb) } else { tb };
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2114,7 +2139,14 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let prod = if low {
+                ghash_mul_x4_low_lhs(tb, vs)
+            } else if diet {
+                ghash_mul_x4_split(vs, tb, tb_x64)
+            } else {
+                ghash_mul_x4(tb, vs)
+            };
+            let nb = _mm512_xor_si512(vb, prod);
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }

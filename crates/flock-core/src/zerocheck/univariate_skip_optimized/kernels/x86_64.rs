@@ -230,6 +230,16 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // One broadcast eq weight for the whole tile: build its `eq·x^64`
+        // companion once so every scaled store below is the five-CLMUL split
+        // product instead of the general six. Exact identity (reduction mod p
+        // is a ring homomorphism). `FLOCK_NO_R1_EQ_SPLIT=1` restores it.
+        let eq_split = !r1_eq_split_disabled();
+        let eq_x64 = if eq_split {
+            crate::field::gf2_128::x86_64::ghash_shift64_x4(eq)
+        } else {
+            eq
+        };
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -240,7 +250,14 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_ab = {
+                let v = f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]);
+                if eq_split {
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(v, eq, eq_x64)
+                } else {
+                    ghash_mul_x4(v, eq)
+                }
+            };
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -362,6 +379,16 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // One broadcast eq weight for the whole tile: build its `eq·x^64`
+        // companion once so every scaled store below is the five-CLMUL split
+        // product instead of the general six. Exact identity (reduction mod p
+        // is a ring homomorphism). `FLOCK_NO_R1_EQ_SPLIT=1` restores it.
+        let eq_split = !r1_eq_split_disabled();
+        let eq_x64 = if eq_split {
+            crate::field::gf2_128::x86_64::ghash_shift64_x4(eq)
+        } else {
+            eq
+        };
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -400,8 +427,16 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let scaled0 = if eq_split {
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(aos0, eq, eq_x64)
+                } else {
+                    ghash_mul_x4(aos0, eq)
+                };
+                let scaled1 = if eq_split {
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(aos1, eq, eq_x64)
+                } else {
+                    ghash_mul_x4(aos1, eq)
+                };
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
@@ -1236,4 +1271,12 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
             );
         }
     }
+}
+
+/// `FLOCK_NO_R1_EQ_SPLIT=1` restores the six-CLMUL `eq` prescale in the
+/// round-one AB tiles (exact same-binary A/B). Read once per process.
+#[inline]
+fn r1_eq_split_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_R1_EQ_SPLIT").is_some())
 }
