@@ -479,3 +479,203 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
         }
     }
 }
+
+/// `FLOCK_NO_LC_BIND_WIDE=1` restores the scalar lincheck product-sumcheck
+/// bind / eval loops. Ranked env is cleared. Runtime AVX-512F + VPCLMUL
+/// detect (not compile-time `target_feature`) so the path lives on SPR
+/// even when rustc `native` withholds AVX-512 from `cfg`.
+pub(crate) fn sumcheck_wide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_BIND_WIDE").is_none()
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("vpclmulqdq")
+    });
+    *ON
+}
+
+/// Local 4-wide reduced mul. Same CLMUL + two-stage `0x87` fold as
+/// `field::gf2_128::x86_64::ghash_mul_x4`, inlined so we do not depend on
+/// that helper's compile-time `target_feature` cfg (dead on rustc that
+/// does not bake AVX-512 into `native`).
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn ghash_mul_x4_rt(
+    x: core::arch::x86_64::__m512i,
+    y: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        let reduce = |mut t0: __m512i, t1: __m512i| {
+            t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
+            _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly))
+        };
+        let t1a = _mm512_clmulepi64_epi128::<0x01>(x, y);
+        let t1b = _mm512_clmulepi64_epi128::<0x10>(x, y);
+        let t2 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let t1 = reduce(_mm512_xor_si512(t1a, t1b), t2);
+        let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        reduce(t0, t1)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn xor_reduce4(v: core::arch::x86_64::__m512i) -> F128 {
+    use core::arch::x86_64::*;
+    let mut tmp = [F128::ZERO; 4];
+    // SAFETY: F128 is 16-byte plain bits; four fill one ZMM.
+    unsafe {
+        _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, v);
+    }
+    tmp[0] + tmp[1] + tmp[2] + tmp[3]
+}
+
+/// Half-split bind: `lo[i] ← lo[i] + r·(hi[i] + lo[i])`.
+///
+/// Char-2 identity `lo + r·(lo ⊕ hi)` is the same body as
+/// [`crate::field::f128_slice::x86_64::fold_pairs`], but the pair is
+/// `(lo[i], hi[i])` (split tables) rather than adjacent even/odd. Each
+/// lane is a fully-reduced `ghash_mul_x4` product — not a deferred
+/// accumulator.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `lo.len() == hi.len()`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn bind_halves_wide(lo: &mut [F128], hi: &[F128], r: F128) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(lo.len(), hi.len());
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let n = lo.len();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let l = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            let h = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);
+            let out = _mm512_xor_si512(l, ghash_mul_x4_rt(r_bcast, _mm512_xor_si512(l, h)));
+            _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, out);
+            i += 4;
+        }
+        while i < n {
+            lo[i] = lo[i] + r * (hi[i] + lo[i]);
+            i += 1;
+        }
+    }
+}
+
+/// Product-sumcheck message over a half-split: `e1 = Σ chi·zhi`,
+/// `einf = Σ (chi⊕clo)·(zhi⊕zlo)`. Per-lane `ghash_mul_x4` (reduced), then
+/// XOR-sum the four reduced products. Bit-identical to the scalar `+= x * y`
+/// loop — not a deferred-reduction accumulator.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and equal lengths.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn eval_round_wide(
+    clo: &[F128],
+    chi: &[F128],
+    zlo: &[F128],
+    zhi: &[F128],
+) -> (F128, F128) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(clo.len(), chi.len());
+    debug_assert_eq!(zlo.len(), clo.len());
+    debug_assert_eq!(zhi.len(), clo.len());
+    unsafe {
+        let n = clo.len();
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let c_lo = _mm512_loadu_si512(clo.as_ptr().add(i) as *const __m512i);
+            let c_hi = _mm512_loadu_si512(chi.as_ptr().add(i) as *const __m512i);
+            let z_lo = _mm512_loadu_si512(zlo.as_ptr().add(i) as *const __m512i);
+            let z_hi = _mm512_loadu_si512(zhi.as_ptr().add(i) as *const __m512i);
+            e1 += xor_reduce4(ghash_mul_x4_rt(c_hi, z_hi));
+            einf += xor_reduce4(ghash_mul_x4_rt(
+                _mm512_xor_si512(c_hi, c_lo),
+                _mm512_xor_si512(z_hi, z_lo),
+            ));
+            i += 4;
+        }
+        while i < n {
+            e1 += chi[i] * zhi[i];
+            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            i += 1;
+        }
+        (e1, einf)
+    }
+}
+
+/// Fused half-split bind of `comb` and `z` plus the next-round message.
+/// Same identities as [`bind_halves_wide`] + [`eval_round_wide`] on the
+/// just-bound values. Writes `c0/c1/z0/z1` in place.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and equal lengths.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn bind_both_eval_wide(
+    c0: &mut [F128],
+    c1: &mut [F128],
+    c2: &[F128],
+    c3: &[F128],
+    z0: &mut [F128],
+    z1: &mut [F128],
+    z2: &[F128],
+    z3: &[F128],
+    r: F128,
+) -> (F128, F128) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(c0.len(), c1.len());
+    debug_assert_eq!(c0.len(), c2.len());
+    debug_assert_eq!(c0.len(), c3.len());
+    debug_assert_eq!(c0.len(), z0.len());
+    debug_assert_eq!(c0.len(), z1.len());
+    debug_assert_eq!(c0.len(), z2.len());
+    debug_assert_eq!(c0.len(), z3.len());
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let n = c0.len();
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let q0 = _mm512_loadu_si512(c0.as_ptr().add(i) as *const __m512i);
+            let q1 = _mm512_loadu_si512(c1.as_ptr().add(i) as *const __m512i);
+            let q2 = _mm512_loadu_si512(c2.as_ptr().add(i) as *const __m512i);
+            let q3 = _mm512_loadu_si512(c3.as_ptr().add(i) as *const __m512i);
+            let p0 = _mm512_loadu_si512(z0.as_ptr().add(i) as *const __m512i);
+            let p1 = _mm512_loadu_si512(z1.as_ptr().add(i) as *const __m512i);
+            let p2 = _mm512_loadu_si512(z2.as_ptr().add(i) as *const __m512i);
+            let p3 = _mm512_loadu_si512(z3.as_ptr().add(i) as *const __m512i);
+            let lo = _mm512_xor_si512(q0, ghash_mul_x4_rt(r_bcast, _mm512_xor_si512(q2, q0)));
+            let hi = _mm512_xor_si512(q1, ghash_mul_x4_rt(r_bcast, _mm512_xor_si512(q3, q1)));
+            let zlo = _mm512_xor_si512(p0, ghash_mul_x4_rt(r_bcast, _mm512_xor_si512(p2, p0)));
+            let zhi = _mm512_xor_si512(p1, ghash_mul_x4_rt(r_bcast, _mm512_xor_si512(p3, p1)));
+            _mm512_storeu_si512(c0.as_mut_ptr().add(i) as *mut __m512i, lo);
+            _mm512_storeu_si512(c1.as_mut_ptr().add(i) as *mut __m512i, hi);
+            _mm512_storeu_si512(z0.as_mut_ptr().add(i) as *mut __m512i, zlo);
+            _mm512_storeu_si512(z1.as_mut_ptr().add(i) as *mut __m512i, zhi);
+            e1 += xor_reduce4(ghash_mul_x4_rt(hi, zhi));
+            einf += xor_reduce4(ghash_mul_x4_rt(
+                _mm512_xor_si512(hi, lo),
+                _mm512_xor_si512(zhi, zlo),
+            ));
+            i += 4;
+        }
+        while i < n {
+            let lo = c0[i] + r * (c2[i] + c0[i]);
+            let hi = c1[i] + r * (c3[i] + c1[i]);
+            let zlo = z0[i] + r * (z2[i] + z0[i]);
+            let zhi = z1[i] + r * (z3[i] + z1[i]);
+            c0[i] = lo;
+            c1[i] = hi;
+            z0[i] = zlo;
+            z1[i] = zhi;
+            e1 += hi * zhi;
+            einf += (hi + lo) * (zhi + zlo);
+            i += 1;
+        }
+        (e1, einf)
+    }
+}

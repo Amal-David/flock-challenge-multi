@@ -1576,21 +1576,13 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-        }
-        return (e1, einf);
+        return kernels::eval_round(clo, chi, zlo, zhi);
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
-        })
+    clo.par_chunks(kernels::SUMCHECK_WIDE_CHUNK)
+        .zip(chi.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+        .zip(zlo.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+        .zip(zhi.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+        .map(|(((clo_c, chi_c), zlo_c), zhi_c)| kernels::eval_round(clo_c, chi_c, zlo_c, zhi_c))
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
@@ -1599,18 +1591,14 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
+    let (lo, hi) = v.split_at_mut(half);
+    let hi = &hi[..half];
     if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
-        }
+        kernels::bind_halves(lo, hi, r);
     } else {
-        let (lo, hi) = v.split_at_mut(half);
-        let hi = &hi[..half];
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(lo_i, &hi_i)| {
-                *lo_i = *lo_i + r * (hi_i + *lo_i);
-            });
+        lo.par_chunks_mut(kernels::SUMCHECK_WIDE_CHUNK)
+            .zip(hi.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+            .for_each(|(lo_c, hi_c)| kernels::bind_halves(lo_c, hi_c, r));
     }
     v.truncate(half);
 }
@@ -1661,40 +1649,18 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
-        }
-        (e1, einf)
+        kernels::bind_both_eval(cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r)
     } else {
-        cq0.par_iter_mut()
-            .zip(cq1.par_iter_mut())
-            .zip(cq2.par_iter())
-            .zip(cq3.par_iter())
-            .zip(zq0.par_iter_mut())
-            .zip(zq1.par_iter_mut())
-            .zip(zq2.par_iter())
-            .zip(zq3.par_iter())
+        cq0.par_chunks_mut(kernels::SUMCHECK_WIDE_CHUNK)
+            .zip(cq1.par_chunks_mut(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(cq2.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(cq3.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(zq0.par_chunks_mut(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(zq1.par_chunks_mut(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(zq2.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
+            .zip(zq3.par_chunks(kernels::SUMCHECK_WIDE_CHUNK))
             .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
-                let lo = *c0 + r * (*c2 + *c0);
-                let hi = *c1 + r * (*c3 + *c1);
-                let zlo = *z0 + r * (*z2 + *z0);
-                let zhi = *z1 + r * (*z3 + *z1);
-                *c0 = lo;
-                *c1 = hi;
-                *z0 = zlo;
-                *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
+                kernels::bind_both_eval(c0, c1, c2, c3, z0, z1, z2, z3, r)
             })
             .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
     };
@@ -2384,6 +2350,7 @@ pub fn verify<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::kernels;
     use crate::challenger::FsChallenger;
 
     /// SplitMix64 PRNG, deterministic.
@@ -3386,5 +3353,94 @@ mod tests {
             ),
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
+    }
+
+    fn scalar_eval(clo: &[F128], chi: &[F128], zlo: &[F128], zhi: &[F128]) -> (F128, F128) {
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        for i in 0..clo.len() {
+            e1 += chi[i] * zhi[i];
+            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+        }
+        (e1, einf)
+    }
+
+    fn scalar_bind(lo: &mut [F128], hi: &[F128], r: F128) {
+        for i in 0..lo.len() {
+            lo[i] = lo[i] + r * (hi[i] + lo[i]);
+        }
+    }
+
+    /// Wide kernels must be bit-identical to the scalar product-sumcheck
+    /// identities, including the 4-lane tail (n ≢ 0 mod 4).
+    #[test]
+    fn sumcheck_wide_matches_scalar_identities() {
+        let mut rng = Rng::new(0xA11CE);
+        for n in [1usize, 2, 3, 4, 5, 7, 16, 257, 4096] {
+            let clo = rng.f128_vec(n);
+            let chi = rng.f128_vec(n);
+            let zlo = rng.f128_vec(n);
+            let zhi = rng.f128_vec(n);
+            let (e1, einf) = kernels::eval_round(&clo, &chi, &zlo, &zhi);
+            let (s1, sinf) = scalar_eval(&clo, &chi, &zlo, &zhi);
+            assert_eq!((e1, einf), (s1, sinf), "eval n={n}");
+
+            let r = rng.f128();
+            let mut lo_k = clo.clone();
+            let mut lo_s = clo.clone();
+            kernels::bind_halves(&mut lo_k, &chi, r);
+            scalar_bind(&mut lo_s, &chi, r);
+            assert_eq!(lo_k, lo_s, "bind n={n}");
+
+            if n >= 1 {
+                let mut c0 = clo.clone();
+                let mut c1 = chi.clone();
+                let mut z0 = zlo.clone();
+                let mut z1 = zhi.clone();
+                let c2 = rng.f128_vec(n);
+                let c3 = rng.f128_vec(n);
+                let z2 = rng.f128_vec(n);
+                let z3 = rng.f128_vec(n);
+                let mut sc0 = c0.clone();
+                let mut sc1 = c1.clone();
+                let mut sz0 = z0.clone();
+                let mut sz1 = z1.clone();
+                let (we1, weinf) =
+                    kernels::bind_both_eval(&mut c0, &mut c1, &c2, &c3, &mut z0, &mut z1, &z2, &z3, r);
+                let mut se1 = F128::ZERO;
+                let mut seinf = F128::ZERO;
+                for i in 0..n {
+                    let lo = sc0[i] + r * (c2[i] + sc0[i]);
+                    let hi = sc1[i] + r * (c3[i] + sc1[i]);
+                    let zl = sz0[i] + r * (z2[i] + sz0[i]);
+                    let zh = sz1[i] + r * (z3[i] + sz1[i]);
+                    sc0[i] = lo;
+                    sc1[i] = hi;
+                    sz0[i] = zl;
+                    sz1[i] = zh;
+                    se1 += hi * zh;
+                    seinf += (hi + lo) * (zh + zl);
+                }
+                assert_eq!((we1, weinf), (se1, seinf), "fused eval n={n}");
+                assert_eq!(c0, sc0, "fused c0 n={n}");
+                assert_eq!(c1, sc1, "fused c1 n={n}");
+                assert_eq!(z0, sz0, "fused z0 n={n}");
+                assert_eq!(z1, sz1, "fused z1 n={n}");
+            }
+        }
+    }
+
+    /// Parallel chunk reduce of `sumcheck_round_eval_par` must match a
+    /// single sequential pass (XOR is associative).
+    #[test]
+    fn sumcheck_round_eval_par_matches_sequential() {
+        let mut rng = Rng::new(0xB0B0);
+        for n in [8usize, 16, 1 << 12, 1 << 13] {
+            let c = rng.f128_vec(n);
+            let z = rng.f128_vec(n);
+            let half = n / 2;
+            let seq = scalar_eval(&c[..half], &c[half..], &z[..half], &z[half..]);
+            assert_eq!(sumcheck_round_eval_par(&c, &z), seq, "n={n}");
+        }
     }
 }
