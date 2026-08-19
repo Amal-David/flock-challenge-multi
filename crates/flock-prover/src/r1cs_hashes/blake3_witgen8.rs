@@ -191,6 +191,12 @@ macro_rules! pushf8 {
 #[inline(always)]
 fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     let sum = add_v8(x, y);
+    // cin = sum ^ x ^ y. On SPR (avx512vl) that's one `vpternlogd` (imm 0x96)
+    // instead of two `vpxor`. Algebra is unchanged: wrapping add still
+    // defines the R1CS carry bits via (x^cin) & (y^cin).
+    #[cfg(target_feature = "avx512vl")]
+    let cin = unsafe { _mm256_ternarylogic_epi32(sum, x, y, 0x96) };
+    #[cfg(not(target_feature = "avx512vl"))]
     let cin = xor_v8(xor_v8(sum, x), y);
     let left = xor_v8(x, cin);
     let right = xor_v8(y, cin);
