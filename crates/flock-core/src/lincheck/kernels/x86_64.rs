@@ -107,18 +107,82 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     out
 }
 
+/// Fused gather + bit-transpose of one stripe: eight strided F128 lanes go
+/// straight from memory to the 128-byte transposed form in registers — no
+/// staging arrays, no store-forwarding round trips. Byte-level transpose by
+/// `vpermb` (out byte `c*8 + r` = lane r's byte c), bit-level flip by
+/// `VGF2P8AFFINEQB` with the bit-transpose identity — the same recipe as
+/// the zerocheck fused C drain. Output byte `b` of half h, bit r = bit
+/// `8*b_local` ... semantics identical to `transpose_8_f128s_to_128_bytes`
+/// (asserted by the oracle test).
+///
+/// # Safety
+/// Eight readable F128 at `z_ptr + r*stride` for r in 0..8; `out` covers
+/// 128 writable bytes; avx512f + avx512vbmi + gfni (module/cfg-gated).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather_transpose_stripe_x86(
+    z_ptr: *const F128,
+    stride: usize,
+    out: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
+    // SAFETY: bounds per the contract; features per the cfg gate.
+    unsafe {
+        let ld = |r: usize| _mm_loadu_si128(z_ptr.add(r * stride) as *const __m128i);
+        // Build two ZMMs of four lanes each (lane r occupies 128-bit slot r%4).
+        let z0 = {
+            let a = _mm512_castsi128_si512(ld(0));
+            let a = _mm512_inserti32x4::<1>(a, ld(1));
+            let a = _mm512_inserti32x4::<2>(a, ld(2));
+            _mm512_inserti32x4::<3>(a, ld(3))
+        };
+        let z1 = {
+            let a = _mm512_castsi128_si512(ld(4));
+            let a = _mm512_inserti32x4::<1>(a, ld(5));
+            let a = _mm512_inserti32x4::<2>(a, ld(6));
+            _mm512_inserti32x4::<3>(a, ld(7))
+        };
+        // Split into lo-qwords (lane r's .lo at qword r) and hi-qwords.
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        let zlo = _mm512_permutex2var_epi64(z0, lo_idx, z1);
+        let zhi = _mm512_permutex2var_epi64(z0, hi_idx, z1);
+        // Byte transpose 8x8 (out byte c*8+r = in byte r*8+c), then per-qword
+        // 8x8 bit transpose via the affine identity.
+        #[repr(C, align(64))]
+        struct BIdx([u8; 64]);
+        static BIDX: BIdx = {
+            let mut t = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                // Lane order pre-reversed: the affine bit-transpose reads
+                // A.byte[7 - i], so out byte j bit i = A.byte[7-i].bit[j] —
+                // feeding lane (7 - r) at byte r cancels the reversal.
+                t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                i += 1;
+            }
+            BIdx(t)
+        };
+        let bidx = _mm512_load_si512(BIDX.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
+        let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
+        let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
+        _mm512_storeu_si512(out as *mut __m512i, t_lo);
+        _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+    }
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
 /// `build_sum_table`'s `T[1 << j] = eq8[j]`).
-///
-/// Built as two 8×64 bit-transposes (lo / hi limbs) plus per-byte-group
-/// `swap_bytes`. The scalar extractor walked 16 × 8 × 8 isolated bits;
-/// `transpose_8_u64s_to_64_bytes` is the already-proven ISA kernel for
-/// that exact 8-lane → 8-byte-group map, and the GFNI affine qword stores
-/// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
-/// group. Bit-identical to the bit-extract loop: see
-/// `fold_mats_from_basis_matches_sum_table`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -127,23 +191,22 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
-
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
-    let mut lo_bytes = [0u8; 64];
-    let mut hi_bytes = [0u8; 64];
-    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
-
-    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
-    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
-    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    for (byte_k, slot) in mats.iter_mut().enumerate() {
+        let mut qword = 0u64;
+        for i in 0..8 {
+            let bit_index = 8 * byte_k + i;
+            let mut row = 0u8;
+            for (j, basis_val) in eq8.iter().enumerate() {
+                let bit = if bit_index < 64 {
+                    (basis_val.lo >> bit_index) & 1
+                } else {
+                    (basis_val.hi >> (bit_index - 64)) & 1
+                };
+                row |= (bit as u8) << j;
+            }
+            qword |= (row as u64) << (8 * (7 - i));
+        }
+        *slot = qword;
     }
 }
 
