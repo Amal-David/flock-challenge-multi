@@ -59,7 +59,7 @@
 
 use crate::bits::{transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
@@ -1522,13 +1522,90 @@ pub fn claim_check(weights: &[F128], s_hat_v: &[F128]) -> F128 {
 }
 
 /// Standard inner product `Σ_i a[i] · b[i]` over F_{2^128}.
+///
+/// Reduction modulo the GHASH polynomial is F₂-linear, so
+/// `Σ (aᵢ·bᵢ) mod p = (Σ aᵢ·bᵢ) mod p` — the identity already documented
+/// on [`F128::mul_unreduced`]. The portable path XOR-accumulates unreduced
+/// 256-bit schoolbook products and reduces **once**. On the ranked host
+/// (`avx512f` + `vpclmulqdq`, c7i.4xlarge SPR) the same identity is 4-wide
+/// via [`crate::field::gf2_128::x86_64::WideGhashX4`] — the crate's existing
+/// deferred-reduction primitive (`fold16_banked`). Kill switch
+/// `FLOCK_NO_IP_WIDE=1` keeps the portable one-reduce loop (still not the
+/// old per-product reduce). Ranked env is cleared, so the wide path fires.
 pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        acc += x * y;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if inner_product_wide_enabled() {
+            // SAFETY: the cfg gate supplies avx512f + vpclmulqdq; sse4.1 is
+            // part of every AVX-512 profile the crate already compiles for.
+            return unsafe { inner_product_wide(a, b) };
+        }
     }
-    acc
+    inner_product_unreduced(a, b)
+}
+
+/// Portable one-reduce inner product. Bit-identical to the historical
+/// `acc += x * y` loop because reduction commutes with XOR.
+fn inner_product_unreduced(a: &[F128], b: &[F128]) -> F128 {
+    let mut acc = F256Unreduced::ZERO;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        acc ^= x.mul_unreduced(y);
+    }
+    acc.reduce()
+}
+
+/// `FLOCK_NO_IP_WIDE=1` disables the AVX-512 4-wide path (exact A/B).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn inner_product_wide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_IP_WIDE").is_none()
+    });
+    *ON
+}
+
+/// 4-wide unreduced CLMUL accumulate + one horizontal fold + one reduce.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` (+ `sse4.1` for `fold`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len());
+    // SAFETY: cfg + target_feature; loads are unaligned; F128 is 16-byte
+    // and four consecutive values fill one ZMM. Tail uses the same
+    // `mul_unreduced` the portable path uses.
+    unsafe {
+        let n = a.len();
+        let mut acc = WideGhashX4::zero();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let x = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let y = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            acc.mul_acc(x, y);
+            i += 4;
+        }
+        let mut tail = acc.fold();
+        while i < n {
+            tail ^= a[i].mul_unreduced(b[i]);
+            i += 1;
+        }
+        tail.reduce()
+    }
 }
 
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
@@ -3259,6 +3336,36 @@ mod tests {
     use super::*;
     use crate::pcs::pack::pack_witness;
     use crate::zerocheck::univariate_skip::build_eq;
+
+    /// Deferred-reduction IP is bit-identical to the historical per-product
+    /// reduce (`acc += x * y`), including the AVX-512 wide path on this cfg.
+    #[test]
+    fn inner_product_deferred_matches_naive() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0x_1B_D07);
+        for &n in &[0usize, 1, 3, 4, 5, 7, 8, 16, 128, 243] {
+            let a: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+            let mut naive = F128::ZERO;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                naive += x * y;
+            }
+            let got = inner_product(&a, &b);
+            assert_eq!(got, naive, "n={n} wide-or-unreduced ≠ per-product");
+            let portable = inner_product_unreduced(&a, &b);
+            assert_eq!(portable, naive, "n={n} portable unreduced ≠ per-product");
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                // SAFETY: cfg gate.
+                let wide = unsafe { inner_product_wide(&a, &b) };
+                assert_eq!(wide, naive, "n={n} WideGhashX4 ≠ per-product");
+            }
+        }
+    }
 
     /// Binary-query specialization matches the general path bit-for-bit.
     #[test]
