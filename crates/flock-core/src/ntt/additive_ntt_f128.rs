@@ -132,32 +132,6 @@ fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
 /// Cache standard-basis tables across NTT instances. The ranked worker runs
 /// an untimed proof before accepting the measured seed, so its warm-up fills
 /// these one-time cells and measured proofs only clone an `Arc`.
-/// Memoized subspace-eval table for the standard basis at `dim`.
-///
-/// `AdditiveNttF128::standard`'s basis is `{1<<i}` — a function of `dim`
-/// alone, with no dependence on the seed, the commitment or any challenge —
-/// so the table it induces is a process-lifetime constant per dim.
-/// `FLOCK_NO_EVALS_CACHE=1` rebuilds every time (the A/B control; the ranked
-/// worker's cleared environment never sets it).
-///
-/// Bounded by construction: `standard` asserts `dim ≤ 64`, so this is 65
-/// slots holding at most 65·65/2 `F128` between them.
-fn cached_standard_evals(dim: usize) -> Arc<Vec<Vec<F128>>> {
-    let build = || {
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Arc::new(generate_evals_from_subspace(&basis))
-    };
-    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
-        || matches!(std::env::var_os("FLOCK_NO_EVALS_CACHE"), Some(v) if v == "1"),
-    );
-    if *DISABLED {
-        return build();
-    }
-    static TABLES: OnceLock<[OnceLock<Arc<Vec<Vec<F128>>>>; 65]> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    Arc::clone(tables[dim].get_or_init(build))
-}
-
 fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
     if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
         return None;
@@ -317,96 +291,6 @@ static KERNEL_DIET_TEST_OFF: std::sync::atomic::AtomicUsize =
 /// Test-only counter: fused-three deep sweeps actually executed.
 #[cfg(test)]
 static FUSED3_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-// ---------------------------------------------------------------------------
-// Per-worker staging blocks for the fused top passes
-// ---------------------------------------------------------------------------
-
-/// How a fused-pass staging block is initialized.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StagingInit {
-    /// Ships-on: no initialization at all. Every element is written before it
-    /// is read — see the write census at each call site.
-    Uninit,
-    /// The incumbent: zero-filled. `FLOCK_NO_UNINIT_STAGING=1`.
-    Zero,
-    /// Test-only: filled with a sentinel that is not a plausible NTT value, so
-    /// any surviving element betrays an unwritten slot.
-    #[cfg(test)]
-    Poison,
-}
-
-/// Test override for [`staging_init_mode`]; 0 = env-derived.
-#[cfg(test)]
-static STAGING_INIT_TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(test)]
-const STAGING_POISON: F128 = F128 {
-    lo: 0xDEAD_BEEF_FEED_FACE,
-    hi: 0xBAAD_F00D_C0DE_D00D,
-};
-
-fn staging_init_mode() -> StagingInit {
-    #[cfg(test)]
-    {
-        match STAGING_INIT_TEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => return StagingInit::Zero,
-            2 => return StagingInit::Poison,
-            3 => return StagingInit::Uninit,
-            _ => {}
-        }
-    }
-    static MODE: std::sync::LazyLock<StagingInit> =
-        std::sync::LazyLock::new(|| match std::env::var_os("FLOCK_NO_UNINIT_STAGING") {
-            Some(v) if v == "1" => StagingInit::Zero,
-            _ => StagingInit::Uninit,
-        });
-    *MODE
-}
-
-/// A `rows × row_len` per-worker staging block for the fused top passes.
-///
-/// **Why the zero-init is dead.** Both callers fill the whole block before
-/// reading any of it:
-///
-/// - [`AdditiveNttF128::top_fused6_pass`] opens each task with a *gather*:
-///   `for k in 0..64 { copy_nonoverlapping(row_ptr(k), buf + k·row_len,
-///   row_len) }`. That is 64 rows × `row_len` lanes = the entire block, copied
-///   from `data`, before the first butterfly touches it.
-/// - [`AdditiveNttF128::seed_top_fused8_pass`] opens each task with the *seed*:
-///   for `k ∈ 0..64` it calls `butterfly_fused_2layer_row_from_sparse_geo` with
-///   `dst = buf + k·row_len, dst_quarter = 64, dst_r = 0`, and
-///   `butterfly_fused_2layer_row_from_geo` with `dst = buf + (256+k)·row_len`,
-///   same geometry. Each of those kernels writes destination rows
-///   `i·dst_quarter + dst_r` for `i ∈ 0..4` — i.e. rows `k, k+64, k+128, k+192`
-///   and `256+k, …, 256+k+192` — over lanes `0..num_ntts`, the full width (the
-///   AVX-512 body covers `num_ntts & !3` and the scalar tail runs to
-///   `num_ntts`). Over `k ∈ 0..64` that is exactly rows `0..512`, each once,
-///   all lanes. The later `butterfly_fused_4layer_row` / `butterfly_fused_2layer`
-///   kernels are lane-bounded and leave the tail lanes alone — which is why
-///   those lanes must be *seed-written* rather than merely zero, and they are.
-///
-/// So no read of this buffer ever observes the initializer, and
-/// `fused_staging_poison_does_not_change_output` proves it empirically by
-/// running the production shapes with a sentinel fill and asserting the
-/// codeword is byte-identical to the zero-filled incumbent's.
-///
-/// `alloc_uninit_vec` additionally `madvise(MADV_HUGEPAGE)`s blocks ≥ 2 MiB,
-/// which the `vec![F128::ZERO; …]` it replaces did not.
-fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
-    let n = rows * row_len;
-    match staging_init_mode() {
-        // SAFETY (of the write-before-read contract, not of this call): see
-        // the per-call-site census above.
-        StagingInit::Uninit => crate::alloc_uninit_vec::<F128>(n),
-        StagingInit::Zero => vec![F128::ZERO; n],
-        #[cfg(test)]
-        StagingInit::Poison => {
-            let mut v = crate::alloc_uninit_vec::<F128>(n);
-            v.fill(STAGING_POISON);
-            v
-        }
-    }
-}
 
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
 ///
@@ -504,10 +388,7 @@ fn row_lanes(r: usize, num_ntts: usize, odd_tail: usize) -> usize {
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    ///
-    /// Shared rather than owned so [`AdditiveNttF128::standard`] can hand out
-    /// a cached table (see [`cached_standard_evals`]) instead of rebuilding it.
-    evals: Arc<Vec<Vec<F128>>>,
+    evals: Vec<Vec<F128>>,
     /// Breadth-first layer table used by production-size transforms. Keeping
     /// this separate preserves the compact fallback for unusually large
     /// domains while making every hot-path twiddle lookup O(1).
@@ -517,7 +398,7 @@ pub struct AdditiveNttF128 {
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
-        let evals = Arc::new(generate_evals_from_subspace(basis));
+        let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
             evals,
@@ -527,19 +408,10 @@ impl AdditiveNttF128 {
 
     /// Standard NTT with basis `{1, x, x², …, x^(dim-1)}`. Requires `dim ≤ 64`
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
-    ///
-    /// Both tables are memoized on `dim`: the breadth-first twiddle table
-    /// already was ([`cached_standard_twiddles`]), and now the subspace evals
-    /// are too. A prove constructs this ~8–10 times (the commit plus each
-    /// Ligerito recursion level), all on the calling thread inside the timed
-    /// window, and the rebuild is dominated by `dim` F_{2^128} inversions —
-    /// measured ~14 µs at dim 12 rising to ~23 µs at dim 19 on this host
-    /// (`standard_ctor_cost_probe`). It is a pure function of `dim`: the basis
-    /// is `1 << i`, seed- and shape-independent, so the cached value is
-    /// bit-identical to the rebuilt one.
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+        let evals = generate_evals_from_subspace(&basis);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -1205,14 +1077,14 @@ impl AdditiveNttF128 {
 
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         if n_tasks < PARALLEL_TASK_THRESHOLD {
-            let mut buf = staging_block(64, row_len);
+            let mut buf = vec![F128::ZERO; 64 * row_len];
             for idx in 0..n_tasks {
                 task(&mut buf, idx);
             }
         } else {
             (0..n_tasks)
                 .into_par_iter()
-                .for_each_init(|| staging_block(64, row_len), |buf, idx| task(buf, idx));
+                .for_each_init(|| vec![F128::ZERO; 64 * row_len], |buf, idx| task(buf, idx));
         }
     }
 
@@ -1430,14 +1302,16 @@ impl AdditiveNttF128 {
         // 512 KiB zero-fill per init was dead work — rayon runs the
         // initializer once per JOB, not per worker.
         if sub_stride < PARALLEL_TASK_THRESHOLD {
-            let mut buf = staging_block(512, row_len);
+            let mut buf = crate::alloc_uninit_vec::<F128>(512 * row_len);
             for r in 0..sub_stride {
                 task(&mut buf, r);
             }
         } else {
             (0..sub_stride)
                 .into_par_iter()
-                .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+                .for_each_init(|| crate::alloc_uninit_vec::<F128>(512 * row_len), |buf, r| {
+                    task(buf, r)
+                });
         }
     }
 
@@ -3474,178 +3348,6 @@ mod tests {
             ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
             assert!(control == oracle, "separate seed pass mismatch at log_d={log_d} num_ntts={num_ntts}");
             assert!(candidate == oracle, "seed fusion mismatch at log_d={log_d} num_ntts={num_ntts}");
-        }
-    }
-
-    /// **Lead-4(d) hoist oracle.** The cached subspace-eval table must be
-    /// bit-identical to a freshly generated one at every dim, and the twiddles
-    /// derived from it must agree — including the compact fallback path above
-    /// `MAX_PRECOMPUTED_TWIDDLE_LOG`, which reads `evals` directly.
-    #[test]
-    fn cached_standard_evals_match_fresh_build() {
-        // dim ≥ 1: `generate_evals_from_subspace` indexes `row[0]`, so dim 0 is
-        // unsupported in the incumbent too and no caller constructs it (the
-        // `log_block == 0` and `log_d.max(1)` guards in `ligerito.rs`). The
-        // cache reproduces that panic identically — it calls the same builder.
-        for dim in [1usize, 2, 4, 12, 16, 19, 20, 21, 64] {
-            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-            let fresh = generate_evals_from_subspace(&basis);
-            let cached = cached_standard_evals(dim);
-            assert_eq!(*cached, fresh, "evals mismatch at dim={dim}");
-            // Second call must hand back the same table, not a rebuild —
-            // unless the kill switch is on, in which case it must still be
-            // value-identical (checked above and again here).
-            let again = cached_standard_evals(dim);
-            assert_eq!(*again, fresh, "evals mismatch on second call at dim={dim}");
-            let cache_on = !matches!(std::env::var_os("FLOCK_NO_EVALS_CACHE"), Some(v) if v == "1");
-            if cache_on {
-                assert!(Arc::ptr_eq(&cached, &again), "dim={dim} was rebuilt");
-            }
-            // The constructed NTT agrees with one built from the same basis
-            // through the uncached `new` path, twiddle for twiddle.
-            if dim > 0 && dim <= 20 {
-                let a = AdditiveNttF128::standard(dim);
-                let b = AdditiveNttF128::new(&basis);
-                assert_eq!(a.log_domain_size(), b.log_domain_size());
-                for layer in 0..dim {
-                    for block in 0..(1usize << layer).min(64) {
-                        assert_eq!(
-                            a.twiddle(layer, block),
-                            b.twiddle(layer, block),
-                            "twiddle mismatch dim={dim} layer={layer} block={block}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Timing probe (ignored): what does `AdditiveNttF128::standard(dim)`
-    /// actually cost, now that `cached_standard_twiddles` memoizes the big
-    /// table? The residue is `generate_evals_from_subspace` — O(dim²)
-    /// multiplies, `dim` inversions and `dim` small allocations. Decides
-    /// whether hoisting `evals` behind a per-dim cache is worth the ripple
-    /// through the struct. Ranked dims are 19–20 (commit) and the Ligerito
-    /// recursion levels below.
-    #[test]
-    #[ignore]
-    fn standard_ctor_cost_probe() {
-        for dim in [12usize, 16, 19, 20] {
-            // Warm the per-dim twiddle table first: its one-time build is tens
-            // of ms at dim 20 and would otherwise be amortized into the
-            // per-call number, which is exactly the cost we are NOT paying per
-            // call.
-            let t0 = std::time::Instant::now();
-            std::hint::black_box(AdditiveNttF128::standard(dim));
-            let cold = t0.elapsed().as_secs_f64() * 1e3;
-            let reps = 200;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(AdditiveNttF128::standard(dim));
-            }
-            let per = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
-            eprintln!(
-                "[probe] AdditiveNttF128::standard({dim}) = {per:.2} us/call warm (first call {cold:.2} ms, one-time twiddle build)"
-            );
-        }
-    }
-
-    /// **Lead-4(a) deletion oracle.** The fused top passes' per-worker staging
-    /// blocks are allocated uninitialized (`staging_block`). The claim is that
-    /// every element is written before it is read, so the initializer is dead.
-    ///
-    /// This asserts it empirically instead of only by census: run the same
-    /// production shapes three times — zero-filled (the incumbent), sentinel-
-    /// filled, and uninitialized — and require byte-identical codewords. If
-    /// any staging element were read before being written, the sentinel arm
-    /// would diverge from the zero arm, because `STAGING_POISON` is not
-    /// `F128::ZERO` and the passes are `+`/`*` over F_2^128 (so a stale
-    /// addend cannot silently cancel).
-    ///
-    /// Both fused passes are covered: `rs_encode_interleaved` at these shapes
-    /// takes the seeded eight-layer pass (512-row staging), and the plain
-    /// interleaved forward transform takes the six-layer top pass (64-row
-    /// staging); the hit counters assert both actually fired.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
-    #[test]
-    fn fused_staging_poison_does_not_change_output() {
-        use std::sync::atomic::Ordering;
-        // The staging mode is process-global; keep the three arms serialized
-        // against each other.
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
-
-        let mut rng = Rng::new(0x5741_6E47);
-        for &(log_d, num_ntts, threads) in &[(17usize, 8usize, 512usize), (17, 4, 512)] {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            let ntt = AdditiveNttF128::standard(log_d);
-            let codeword_len = (1usize << log_d) * num_ntts;
-            let msg_len = codeword_len >> 1;
-            let msg = rand_vec(&mut rng, msg_len);
-            let dense = rand_vec(&mut rng, codeword_len);
-
-            let run = |mode: u8| -> (Vec<F128>, Vec<F128>, bool, bool) {
-                STAGING_INIT_TEST_MODE.store(mode, Ordering::SeqCst);
-                let out = pool.install(|| {
-                    let seed_before = SEED_TOP_FUSION_HITS.load(Ordering::Relaxed);
-                    let mut encoded = junk_vec(codeword_len);
-                    ntt.rs_encode_interleaved(&msg, &mut encoded, num_ntts);
-                    let seed_fired = SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) > seed_before;
-
-                    let top_before = TOP_FUSION_HITS.load(Ordering::Relaxed);
-                    let mut forward = dense.clone();
-                    ntt.forward_transform_interleaved_parallel_from_layer(
-                        &mut forward,
-                        num_ntts,
-                        0,
-                    );
-                    let top_fired = TOP_FUSION_HITS.load(Ordering::Relaxed) > top_before;
-                    (encoded, forward, seed_fired, top_fired)
-                });
-                STAGING_INIT_TEST_MODE.store(0, Ordering::SeqCst);
-                out
-            };
-
-            let (enc_zero, fwd_zero, seed_fired, top_fired) = run(1); // Zero (incumbent)
-            assert!(
-                seed_fired,
-                "seed fusion did not run at log_d={log_d} num_ntts={num_ntts}"
-            );
-            assert!(
-                top_fired,
-                "top fusion did not run at log_d={log_d} num_ntts={num_ntts}"
-            );
-            let (enc_poison, fwd_poison, ..) = run(2); // Poison
-            let (enc_uninit, fwd_uninit, ..) = run(3); // Uninit (the shipped mode)
-
-            assert!(
-                enc_zero == enc_poison,
-                "poisoned staging changed the codeword at log_d={log_d} num_ntts={num_ntts}"
-            );
-            assert!(
-                enc_zero == enc_uninit,
-                "uninit staging changed the codeword at log_d={log_d} num_ntts={num_ntts}"
-            );
-            assert!(
-                fwd_zero == fwd_poison,
-                "poisoned staging changed the forward transform at log_d={log_d} num_ntts={num_ntts}"
-            );
-            assert!(
-                fwd_zero == fwd_uninit,
-                "uninit staging changed the forward transform at log_d={log_d} num_ntts={num_ntts}"
-            );
-            // The sentinel must never survive into the output — that would
-            // mean a staging element reached the codeword unwritten.
-            assert!(
-                !enc_poison.contains(&STAGING_POISON) && !fwd_poison.contains(&STAGING_POISON),
-                "poison sentinel leaked into the output at log_d={log_d} num_ntts={num_ntts}"
-            );
         }
     }
 

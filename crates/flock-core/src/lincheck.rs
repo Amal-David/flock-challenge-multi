@@ -1097,7 +1097,20 @@ fn fold_block_major_gfni(
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
         acc.copy_from_slice(&planes[base..base + 1024]);
-        for w in 1..n_workers {
+        // Pair workers so each pass is `acc ^= P_w ^= P_{w+1}` via
+        // VPTERNLOGQ 0x96 (one store of acc instead of two). Odd leftover
+        // falls back to the existing 2-source VPXORD helper.
+        let mut w = 1;
+        while w + 1 < n_workers {
+            let src_a = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+            let src_b = &planes[(w + 1) * k * 16 + base..(w + 1) * k * 16 + base + 1024];
+            // SAFETY: all three slices are 1024 bytes; 0x96 is A⊕B⊕C.
+            unsafe {
+                kernels::xor_bytes_avx512_3(acc.as_mut_ptr(), src_a.as_ptr(), src_b.as_ptr(), 1024);
+            }
+            w += 2;
+        }
+        if w < n_workers {
             let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
             // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
             // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.

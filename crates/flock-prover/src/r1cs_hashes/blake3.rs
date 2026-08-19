@@ -1310,32 +1310,6 @@ pub fn generate_witness_with_ab_packed_and_round1_inner(
     Vec<F128>,
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
-    generate_witness_with_ab_packed_and_round1_inner_from(
-        crate::seed_pipe::BlockSource::Slice(blocks),
-        n_blocks_log,
-    )
-}
-
-/// [`generate_witness_with_ab_packed_and_round1_inner`] over an arbitrary
-/// [`BlockSource`](crate::seed_pipe::BlockSource).
-///
-/// The speculative seed-pipe run passes the *closed form* here rather than a
-/// materialized vector: block `i` is recomputed on the Rayon worker that is
-/// about to build its BLAKE3 trace, which deletes 28 MiB of stores in the
-/// generator plus 28 MiB of loads here (ranked shape), and deletes the
-/// generator's unoverlapped prologue outright. The two paths are byte-identical
-/// by construction — same `gen_block`, same order — and
-/// `round1_inner_closed_form_source_matches_slice` asserts it on the produced
-/// witness rather than on the blocks.
-pub fn generate_witness_with_ab_packed_and_round1_inner_from(
-    blocks: crate::seed_pipe::BlockSource<'_>,
-    n_blocks_log: usize,
-) -> (
-    Vec<F128>,
-    Vec<F128>,
-    Vec<F128>,
-    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
-) {
     // z/a/b (3 · 2^m bits) plus the round-1 ab_inner wavefront (another
     // 2^m bits) are pure write-only streams here — ~2 GiB at the ranked
     // m = 32 — next read only in later phases, far beyond any cache, so
@@ -1375,7 +1349,7 @@ fn live_witgen_simd_enabled() -> bool {
 /// explicit staged-NT toggle so tests can assert byte equality of the paths.
 /// SIMD dispatch follows [`live_witgen_simd_enabled`].
 fn generate_witness_with_ab_packed_and_round1_inner_impl(
-    blocks: crate::seed_pipe::BlockSource<'_>,
+    blocks: &[Compression],
     n_blocks_log: usize,
     use_nt: bool,
 ) -> (
@@ -1396,7 +1370,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
 /// explicit SIMD toggle so tests can A/B the octa kernel vs the scalar
 /// 1-block loop without fighting the process-wide env LazyLock.
 fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-    blocks: crate::seed_pipe::BlockSource<'_>,
+    blocks: &[Compression],
     n_blocks_log: usize,
     use_nt: bool,
     use_simd: bool,
@@ -1512,8 +1486,8 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
             },
             |(z_stage, a_stage, b_stage, ab_stage),
              (block_idx, (((z_out, a_out), b_out), ab_out))| {
-              blocks.with_block(block_idx, &padding, |block| {
-                let (cv, msg, counter, block_len, flags) = block;
+                let (cv, msg, counter, block_len, flags) =
+                    blocks.get(block_idx).unwrap_or(&padding);
                 let project = block_idx >= skip_blocks;
                 if use_nt {
                     build_block_witness_ab_packed_into(
@@ -1600,7 +1574,6 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
                         a_bytes, b_bytes, ab_out, &inv_table,
                     );
                 }
-              });
             },
         );
 
@@ -1631,7 +1604,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa(
-    blocks: crate::seed_pipe::BlockSource<'_>,
+    blocks: &[Compression],
     skip_blocks: usize,
     z: &mut [F128],
     a: &mut [F128],
@@ -1662,30 +1635,14 @@ fn generate_round1_inner_octa(
             // chunks.
             unsafe {
                 for half in 0..(n_here / SIMD) {
-                    let base = GROUP * g + half * SIMD;
-                    // Lead 2: the closed-form arm evaluates the eight blocks
-                    // into 896 B of L1-resident stack staging on the very
-                    // worker that is about to hash them, instead of loading
-                    // them from a 28 MiB materialized vector. The `Slice` arm
-                    // is byte-for-byte the incumbent — it still borrows in
-                    // place, no copy introduced.
-                    let staged: [Compression; SIMD];
-                    let octa: [&Compression; SIMD] = match blocks {
-                        crate::seed_pipe::BlockSource::Slice(s) => {
-                            std::array::from_fn(|j| s.get(base + j).unwrap_or(padding))
+                    let octa: [&Compression; 8] = std::array::from_fn(|j| {
+                        let idx = GROUP * g + half * SIMD + j;
+                        if idx < blocks.len() {
+                            &blocks[idx]
+                        } else {
+                            padding
                         }
-                        crate::seed_pipe::BlockSource::Closed { init, len } => {
-                            staged = std::array::from_fn(|j| {
-                                let idx = base + j;
-                                if idx < len {
-                                    crate::seed_pipe::gen_block(init, idx)
-                                } else {
-                                    *padding
-                                }
-                            });
-                            std::array::from_fn(|j| &staged[j])
-                        }
-                    };
+                    });
                     let off = half * SIMD * F128_PER_BLOCK;
                     blake3_witgen8::build_octa_witness_ab_stream_elide(
                         octa,
@@ -2938,13 +2895,10 @@ impl Blake3Setup {
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
-                let _ = std::hint::black_box(self.prove_fast_inner(
-                    crate::seed_pipe::BlockSource::Slice(blocks),
-                    &mut warm_challenger,
-                ));
+                let _ = std::hint::black_box(self.prove_fast_inner(blocks, &mut warm_challenger));
             }
         }
-        let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
+        let out = self.prove_fast_inner(blocks, challenger);
         if call == 0 {
             // Last things the untimed warm-up does: prove that our parallel
             // generator reproduces the wrapper's warm-up blocks (enables the
@@ -2977,10 +2931,7 @@ impl Blake3Setup {
     /// Body of a speculative proof: identical to the timed call the wrapper
     /// would have made, including a challenger built from the benchmark domain
     /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(
-        setup_addr: usize,
-        blocks: crate::seed_pipe::BlockSource<'_>,
-    ) -> crate::seed_pipe::ProveOut {
+    fn run_speculative_prove(setup_addr: usize, blocks: &[Compression]) -> crate::seed_pipe::ProveOut {
         // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
         // worker builds in `main` and holds until the process exits, so it
         // outlives this thread. Only shared reads happen through it — the same
@@ -2995,7 +2946,7 @@ impl Blake3Setup {
 
     fn prove_fast_inner<Ch: Challenger>(
         &self,
-        blocks: crate::seed_pipe::BlockSource<'_>,
+        blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         flock_core::gaptime::begin("blake3 prove_fast");
@@ -3005,7 +2956,7 @@ impl Blake3Setup {
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner_from(
+                            generate_witness_with_ab_packed_and_round1_inner(
                                 blocks,
                                 self.n_blocks_log(),
                             )
@@ -3029,19 +2980,6 @@ impl Blake3Setup {
                 )
             }
             flock_core::r1cs::WitnessLayout::BatchMajor => {
-                // The batch-major producer wants a contiguous slice. It is not
-                // the ranked layout (`common.rs` builds RowMajor), so paying a
-                // materialization here keeps the closed form confined to the
-                // path that benefits from it.
-                let materialized: Option<Vec<Compression>> = match blocks {
-                    crate::seed_pipe::BlockSource::Slice(_) => None,
-                    crate::seed_pipe::BlockSource::Closed { .. } => Some(blocks.to_vec()),
-                };
-                let blocks: &[Compression] = match (&materialized, blocks) {
-                    (Some(v), _) => v,
-                    (None, crate::seed_pipe::BlockSource::Slice(s)) => s,
-                    (None, _) => unreachable!("closed source is materialized above"),
-                };
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                     flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                         self.generate_witness_ab(blocks)
@@ -3756,16 +3694,10 @@ mod tests {
             .collect();
         let n_log = min_n_blocks_log(n_blocks);
 
-        let (z_nt, a_nt, b_nt, mut ab_nt) = generate_witness_with_ab_packed_and_round1_inner_impl(
-            crate::seed_pipe::BlockSource::Slice(&blocks),
-            n_log,
-            true,
-        );
-        let (z_rg, a_rg, b_rg, mut ab_rg) = generate_witness_with_ab_packed_and_round1_inner_impl(
-            crate::seed_pipe::BlockSource::Slice(&blocks),
-            n_log,
-            false,
-        );
+        let (z_nt, a_nt, b_nt, mut ab_nt) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, true);
+        let (z_rg, a_rg, b_rg, mut ab_rg) =
+            generate_witness_with_ab_packed_and_round1_inner_impl(&blocks, n_log, false);
 
         assert_eq!(z_nt, z_rg, "z mismatch between NT and regular paths");
         assert_eq!(a_nt, a_rg, "a mismatch between NT and regular paths");
@@ -3797,19 +3729,9 @@ mod tests {
         assert_eq!(1usize << n_log, 32);
 
         let (z_sc, a_sc, b_sc, mut ab_sc) =
-            generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-                crate::seed_pipe::BlockSource::Slice(&blocks),
-                n_log,
-                false,
-                false,
-            );
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks, n_log, false, false);
         let (z_si, a_si, b_si, mut ab_si) =
-            generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-                crate::seed_pipe::BlockSource::Slice(&blocks),
-                n_log,
-                false,
-                true,
-            );
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks, n_log, false, true);
 
         assert_eq!(z_sc, z_si, "z mismatch between scalar and live SIMD");
         assert_eq!(a_sc, a_si, "a mismatch between scalar and live SIMD");
@@ -3850,21 +3772,13 @@ mod tests {
 
         // Expected outputs for blocks2: scalar full writes off a clean pool.
         flock_core::scratch::clear();
-        let (z_e, a_e, b_e, mut ab_e) = generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-            crate::seed_pipe::BlockSource::Slice(&blocks2),
-            n_log,
-            false,
-            false,
-        );
+        let (z_e, a_e, b_e, mut ab_e) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks2, n_log, false, false);
 
         // Prove 1 (octa, fresh buffers ⇒ full writes) arms the pending tags;
         // release through the prover's untagged gives attaches them.
-        let (z1, a1, b1, ab1) = generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-            crate::seed_pipe::BlockSource::Slice(&blocks1),
-            n_log,
-            false,
-            true,
-        );
+        let (z1, a1, b1, ab1) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks1, n_log, false, true);
         let (a1_ptr, b1_ptr, z1_ptr) = (a1.as_ptr(), b1.as_ptr(), z1.as_ptr());
         drop(ab1);
         flock_core::scratch::give_f128(a1);
@@ -3874,12 +3788,8 @@ mod tests {
         // Prove 2 (octa): a/b re-take their tagged allocations, eliding the
         // token-verified constant chunks (on x86; elsewhere this degenerates
         // to a plain regenerate and the assertions still hold).
-        let (z2, a2, b2, mut ab2) = generate_witness_with_ab_packed_and_round1_inner_impl_ex(
-            crate::seed_pipe::BlockSource::Slice(&blocks2),
-            n_log,
-            false,
-            true,
-        );
+        let (z2, a2, b2, mut ab2) =
+            generate_witness_with_ab_packed_and_round1_inner_impl_ex(&blocks2, n_log, false, true);
         assert_eq!(a2.as_ptr(), a1_ptr, "a must re-take its tagged allocation");
         assert_eq!(b2.as_ptr(), b1_ptr, "b must re-take its tagged allocation");
         assert_eq!(z2.as_ptr(), z1_ptr, "z must re-take its tagged allocation");
@@ -3892,81 +3802,6 @@ mod tests {
             "ab_inner mismatch after elided regenerate"
         );
         flock_core::scratch::clear();
-    }
-
-    /// **Lead-2 deletion oracle.** The speculative run no longer materializes
-    /// the 28 MiB compression vector: witgen evaluates `gen_block(init, i)`
-    /// inline on the worker that consumes block `i`. The deletion is only
-    /// legitimate if the witness it produces is byte-identical to the one the
-    /// materialized vector produces — asserted here on the *outputs* (z, a, b
-    /// and the round-1 ab_inner wavefront), not on the blocks, so a divergence
-    /// anywhere in the substitution is caught.
-    ///
-    /// Both NT toggles are exercised: `use_nt` selects a different write path
-    /// and reads the block through the same `with_block` call.
-    #[test]
-    fn round1_inner_closed_form_source_matches_slice() {
-        use crate::seed_pipe::{BlockSource, generate_compressions_par};
-        for &log2 in &[6u32, 8] {
-            for &seed in &[0u64, 0x00C0_FFEE_BEEF_D15C, u64::MAX] {
-                let blocks = generate_compressions_par(log2, seed);
-                let n_log = min_n_blocks_log(blocks.len());
-                for use_nt in [false, true] {
-                    if use_nt && !super::super::common::u64_per_block_is_nt_compatible(K / 64) {
-                        continue;
-                    }
-                    let (z_s, a_s, b_s, mut ab_s) =
-                        generate_witness_with_ab_packed_and_round1_inner_impl(
-                            BlockSource::Slice(&blocks),
-                            n_log,
-                            use_nt,
-                        );
-                    let (z_c, a_c, b_c, mut ab_c) =
-                        generate_witness_with_ab_packed_and_round1_inner_impl(
-                            BlockSource::closed(log2, seed),
-                            n_log,
-                            use_nt,
-                        );
-                    let tag = format!("log2={log2} seed={seed} use_nt={use_nt}");
-                    assert_eq!(z_s, z_c, "z mismatch, {tag}");
-                    assert_eq!(a_s, a_c, "a mismatch, {tag}");
-                    assert_eq!(b_s, b_c, "b mismatch, {tag}");
-                    assert_eq!(
-                        ab_s.as_bytes_mut(),
-                        ab_c.as_bytes_mut(),
-                        "ab_inner mismatch, {tag}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The closed form must also survive the padding regime: when the block
-    /// count is not a power of two the tail slots come from `padding`, and the
-    /// two sources must agree there too. (The closed source always covers a
-    /// full power-of-two, so this drives the slice side short and checks the
-    /// closed side reproduces the *same* prefix.)
-    #[test]
-    fn round1_inner_closed_form_matches_slice_on_padded_shape() {
-        use crate::seed_pipe::{BlockSource, generate_compressions_par};
-        let log2 = 6u32;
-        let seed = 0xABCD_1234_5678_9F01u64;
-        let blocks = generate_compressions_par(log2, seed);
-        let n_log = min_n_blocks_log(blocks.len()) + 1; // half the slots are padding
-        let (z_s, a_s, b_s, mut ab_s) = generate_witness_with_ab_packed_and_round1_inner_impl(
-            BlockSource::Slice(&blocks),
-            n_log,
-            false,
-        );
-        let (z_c, a_c, b_c, mut ab_c) = generate_witness_with_ab_packed_and_round1_inner_impl(
-            BlockSource::closed(log2, seed),
-            n_log,
-            false,
-        );
-        assert_eq!(z_s, z_c);
-        assert_eq!(a_s, a_c);
-        assert_eq!(b_s, b_c);
-        assert_eq!(ab_s.as_bytes_mut(), ab_c.as_bytes_mut());
     }
 
     /// Full-buffer oracle at m = 20 (64 blocks): the fused round1_inner
