@@ -112,13 +112,11 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
 /// `build_sum_table`'s `T[1 << j] = eq8[j]`).
 ///
-/// Built as two 8×64 bit-transposes (lo / hi limbs) plus per-byte-group
-/// `swap_bytes`. The scalar extractor walked 16 × 8 × 8 isolated bits;
-/// `transpose_8_u64s_to_64_bytes` is the already-proven ISA kernel for
-/// that exact 8-lane → 8-byte-group map, and the GFNI affine qword stores
-/// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
-/// group. Bit-identical to the bit-extract loop: see
-/// `fold_mats_from_basis_matches_sum_table`.
+/// Built as two 8×64 bit-transposes (lo / hi limbs) plus one ZMM
+/// `vpshufb` per limb that byte-reverses every qword. That shuffle *is*
+/// the sixteen `u64::from_le_bytes(group).swap_bytes()` stores: GFNI
+/// wants row `i` at qword byte `7 − i`. Bit-identical to the bit-extract
+/// loop: see `fold_mats_from_basis_matches_sum_table`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -138,12 +136,62 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
     // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
     // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`. One
+    // in-lane `vpshufb` per 64-byte limb does all eight qwords; AVX-512BW
+    // is part of official `-C target-cpu=native` on SPR.
+    #[cfg(target_feature = "avx512bw")]
+    // SAFETY: `lo_bytes`/`hi_bytes` are owned 64-byte stack arrays;
+    // `mats` is the caller's exclusive 16-u64 (128-byte) buffer. The
+    // two regions do not overlap. `vpshufb` only reads the 64-byte
+    // source and writes 64 bytes of `mats`. The shuffle mask indexes
+    // inside each 16-byte EVEX lane (see `swap_bytes_store_16`).
+    unsafe {
+        swap_bytes_store_16(lo_bytes.as_ptr(), hi_bytes.as_ptr(), mats.as_mut_ptr());
+    }
+    #[cfg(not(target_feature = "avx512bw"))]
+    {
+        for c in 0..8 {
+            let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            mats[c] = u64::from_le_bytes(lo).swap_bytes();
+            mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+        }
+    }
+}
+
+/// Byte-reverse every qword of two 64-byte transpose outputs and store
+/// them as the 16 GFNI affine matrices.
+///
+/// EVEX `VPSHUFB` is a 16-byte in-lane shuffle (Intel SDM: index is
+/// `mask[j] & 0xF` plus the lane base). The repeated 16-byte pattern
+/// `{7,6,5,4,3,2,1,0, 15,14,13,12,11,10,9,8}` therefore reverses bytes
+/// inside each of the eight qwords and never crosses a 16-byte lane.
+/// That is exactly `u64::from_le_bytes(group).swap_bytes()` on each
+/// little-endian 8-byte group.
+///
+/// # Safety
+/// - `lo` and `hi` must each address 64 readable bytes.
+/// - `mats` must address 16 writable `u64`s (128 bytes).
+/// - The three regions must not alias.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn swap_bytes_store_16(lo: *const u8, hi: *const u8, mats: *mut u64) {
+    use core::arch::x86_64::*;
+    // 16-byte pattern, high-to-low for `_mm_set_epi8`:
+    // dest[0..7] = src[7..0], dest[8..15] = src[15..8].
+    let lane = _mm_set_epi8(8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7);
+    let mask = _mm512_broadcast_i32x4(lane);
+    // SAFETY: caller contract above; unaligned load/store of owned buffers.
+    unsafe {
+        let vlo = _mm512_loadu_si512(lo.cast::<__m512i>());
+        let vhi = _mm512_loadu_si512(hi.cast::<__m512i>());
+        _mm512_storeu_si512(mats.cast::<__m512i>(), _mm512_shuffle_epi8(vlo, mask));
+        _mm512_storeu_si512(mats.add(8).cast::<__m512i>(), _mm512_shuffle_epi8(vhi, mask));
     }
 }
 
