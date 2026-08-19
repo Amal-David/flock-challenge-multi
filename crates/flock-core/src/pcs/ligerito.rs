@@ -3307,11 +3307,21 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     (u0, u2)
 }
 
-/// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
-/// `MOVNTDQ`). Same helper shape as the promoted seed-fused publish
-/// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM, because large pool /
-/// arena slices on this lineage land 16 mod 64 — a 64-byte gate in front of
-/// `_mm512_stream_si512` would silently never fire.
+/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in this helper.
+/// Latched once; the ranked worker's cleared environment never sets it.
+#[cfg(target_arch = "x86_64")]
+fn wide_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
+    *ON
+}
+
+/// Publish `n` F128s with non-temporal stores. Recyclable-class destinations
+/// are 64-aligned on this lineage (`RecycleAlloc` align64), so the helper
+/// matches [`AdditiveNttF128::publish_row_nt`]: one ZMM stream per cache line
+/// when `avx512f` is a compile-time feature, otherwise one YMM stream per
+/// 32-byte pair, with an XMM tail. `FLOCK_NO_WIDE_NT=1` keeps the historical
+/// XMM loop for same-binary A/B.
 ///
 /// # Safety
 /// `src`/`dst` cover `n` F128s; `dst` is 16-byte aligned. SSE2 is x86_64
@@ -3321,8 +3331,37 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
+    // `_mm_loadu_si128` / `_mm256_loadu_si256` / `_mm512_loadu_si512` accept
+    // any src alignment.
     unsafe {
+        #[cfg(target_feature = "avx512f")]
+        if wide_nt_enabled() && dst as usize % 64 == 0 {
+            let s = src as *const __m512i;
+            let d = dst as *mut __m512i;
+            for i in 0..n / 4 {
+                _mm512_stream_si512(d.add(i), _mm512_loadu_si512(s.add(i)));
+            }
+            let done = (n / 4) * 4;
+            let s = src as *const __m128i;
+            let d = dst as *mut __m128i;
+            for i in done..n {
+                _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+            }
+            return;
+        }
+        if wide_nt_enabled() && dst as usize % 32 == 0 {
+            let s = src as *const __m256i;
+            let d = dst as *mut __m256i;
+            for i in 0..n / 2 {
+                _mm256_stream_si256(d.add(i), _mm256_loadu_si256(s.add(i)));
+            }
+            if n % 2 == 1 {
+                let s = src as *const __m128i;
+                let d = dst as *mut __m128i;
+                _mm_stream_si128(d.add(n - 1), _mm_loadu_si128(s.add(n - 1)));
+            }
+            return;
+        }
         let s = src as *const __m128i;
         let d = dst as *mut __m128i;
         for i in 0..n {
