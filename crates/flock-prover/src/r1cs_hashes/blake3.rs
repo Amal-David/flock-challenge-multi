@@ -1975,12 +1975,21 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
-    /// `FLOCK_NO_WITGEN_Z_NT=1` restores temporal stores for the octa
-    /// builder's z dump (exact same-binary A/B). Orthogonal to the elide and
-    /// ab_inner switches.
+    /// The octa builder's z dump is temporal by default. Its eight block
+    /// rows are interleaved in 32-byte pieces, so streaming stores leave eight
+    /// partial cache lines live per producer; Sapphire Rapids evicts those WC
+    /// lines before the following pieces arrive. This exact schedule lost
+    /// badly in an isolated ranked run even though it later re-entered the
+    /// tree as a passenger in a larger winning bundle.
+    ///
+    /// `FLOCK_WITGEN_Z_NT=1` opts back into that diagnostic arm, and
+    /// `FLOCK_NO_WITGEN_Z_NT=1` remains a final kill switch for old A/B
+    /// scripts. The ranked worker clears both, so it takes ordinary stores.
     pub(crate) fn witgen_z_nt_enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("FLOCK_WITGEN_Z_NT").is_some()
+                && std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none()
+        });
         *ON
     }
 
