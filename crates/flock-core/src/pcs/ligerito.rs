@@ -3470,8 +3470,9 @@ fn eval_fold4_lookahead3(
 /// direct basis in ONE N→N/16 pass and emits the round-4 message. Both ranked
 /// claims are direct here (no ordinary basis), so the b side is two table-hot
 /// phases of `fold_one_slot` exactly like the fold2 materializer, at a quarter
-/// of the slots; the f side is two nested pair-folds (r0,r1 then r2,r3) done
-/// sub-block by sub-block so the 4:1 intermediate stays L1-resident.
+/// of the slots — first claim assigns (no memset of the uninit `take_f128`
+/// chunk), later claims add. The ranked f side is `fold16_banked` (deferred
+/// reduction); the nested pair-fold + mid buffer is only the fallback.
 fn materialize_direct_fold4(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -3512,16 +3513,23 @@ fn materialize_direct_fold4(
     }));
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
+    // Ranked path has no ordinary basis and uses fold16_banked, so the mid
+    // buffer is dead there — allocate it only when the nested b-side needs it.
     const SUB: usize = 256;
     let deferred_reduce = super::fold_deferred_reduce_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
+    let mid_len = if has_ordinary || !deferred_reduce {
+        4 * SUB
+    } else {
+        0
+    };
     let (u_0, u_2) = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || (vec![F128::ZERO; table_len], vec![F128::ZERO; 4 * SUB]),
+            || (vec![F128::ZERO; table_len], vec![F128::ZERO; mid_len]),
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
@@ -3571,12 +3579,41 @@ fn materialize_direct_fold4(
                         );
                         slot += n;
                     }
-                } else {
-                    b_out.fill(F128::ZERO);
                 }
                 // ---- b: direct claims, one 64 KiB composed table live at a time.
+                // Ranked path: no ordinary basis. `take_f128` is write-before-read
+                // (stale/uninit), so the fold2 materializer's table-hot schedule
+                // applies: first claim ASSIGNS every slot, later claims ADD.
+                // Deletes the `b_out.fill(ZERO)` memset that used to paint the
+                // whole chunk before the same += loop. Same F128 values — XOR
+                // with zero is the identity; the assign *is* that identity
+                // without the store. Existing 4-wide stride kept (not unrolled
+                // further; #120's 8-wide was cancelled with no official score).
                 let table = &mut scratch[..table_len];
-                for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                let mut claims_iter = claims.iter().zip(direct_tables.iter());
+                if !has_ordinary {
+                    let (first, first_table) = claims_iter
+                        .next()
+                        .expect("materialize_direct_fold4: claims non-empty");
+                    super::ring_switch::compose_block_table(
+                        first_table,
+                        first.eq_hi[block],
+                        table,
+                    );
+                    let mut s = 0usize;
+                    while s + 3 < block_len {
+                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
+                        b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
+                        b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
+                        b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
+                        s += 4;
+                    }
+                    while s < block_len {
+                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
+                        s += 1;
+                    }
+                }
+                for (claim, direct_table) in claims_iter {
                     super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
                     let mut s = 0usize;
                     while s + 3 < block_len {
