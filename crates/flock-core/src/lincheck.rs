@@ -1099,8 +1099,10 @@ fn fold_block_major_gfni(
         acc.copy_from_slice(&planes[base..base + 1024]);
         for w in 1..n_workers {
             let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
-            for (a, b) in acc.iter_mut().zip(src) {
-                *a ^= *b;
+            // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
+            // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
+            unsafe {
+                kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
         for (col, slot) in o.iter_mut().enumerate() {

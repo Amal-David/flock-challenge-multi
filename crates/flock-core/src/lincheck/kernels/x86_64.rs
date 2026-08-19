@@ -83,8 +83,12 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
             || vec![0u8; k * 16],
             |mut a, b| {
                 // Plane XOR merge — same sums, still plane-major.
-                for (x, y) in a.iter_mut().zip(b.iter()) {
-                    *x ^= *y;
+                // k_log ≥ 6 ⇒ k*16 is a multiple of 64.
+                debug_assert_eq!(a.len(), b.len());
+                debug_assert_eq!(a.len() % 64, 0);
+                // SAFETY: both plane buffers are k*16 bytes, 64-aligned length.
+                unsafe {
+                    xor_bytes_avx512(a.as_mut_ptr(), b.as_ptr(), a.len());
                 }
                 a
             },
@@ -274,6 +278,42 @@ pub(crate) unsafe fn gfni_fold_tile(
                 }
                 _mm512_storeu_si512(plane_ptr, acc);
             }
+        }
+    }
+}
+
+/// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
+///
+/// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`
+/// / `VPXORD` is the 512-bit encoding of the same operation (Intel SDM
+/// `PXOR`/`VPXORD`). Used for the cross-worker plane merge in
+/// `fold_block_major_gfni` (and available to the stripe GFNI `.reduce`).
+///
+/// # Safety
+/// `dst` and `src` must each cover `len` bytes; `len % 64 == 0`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(len % 64, 0);
+    // SAFETY: caller guarantees `len` bytes at both pointers and 64-byte steps.
+    unsafe {
+        let mut i = 0;
+        // Two-ZMM unroll matches the Linux `xor_avx512_2` RAID xor_gen kernel
+        // (load pair / vpxor pair / store pair). Odd 64-byte tail is one more.
+        while i + 128 <= len {
+            let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+            let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
+            let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
+            let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
+            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+            _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+            i += 128;
+        }
+        if i < len {
+            let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+            let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
+            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
         }
     }
 }
