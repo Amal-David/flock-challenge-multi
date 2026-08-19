@@ -1563,6 +1563,8 @@ pub(crate) fn round1_with_precomputed_ab_impl(
 
 /// Number of retained low-medium values (`q = b_med & 3`).
 pub(crate) const N_C_Q: usize = 4;
+/// Number of retained high-medium values (`j = b_med >> 2`) in DirectFold8.
+pub(crate) const N_C_J: usize = 4;
 
 /// `D_hi⁻¹ = ((1+γ⁴)(1+γ⁸))⁻¹` — the high-medium half of [`d_inv`].
 fn compute_d_hi_inv() -> F128 {
@@ -1582,6 +1584,15 @@ pub(crate) fn d_hi_inv() -> F128 {
 pub(crate) fn c_fold4_q_weights() -> [F128; N_C_Q] {
     let beta = medium_challenges_ghash();
     super::univariate_skip::build_eq(&beta[..2])
+        .try_into()
+        .expect("two-coordinate eq has four entries")
+}
+
+/// Weights for collapsing DirectFold8's retained high-medium selector `j`
+/// back to DirectFold4. These are `eq(β₂, j₀)·eq(β₃, j₁)`.
+pub(crate) fn c_fold8_j_weights() -> [F128; N_C_J] {
+    let beta = medium_challenges_ghash();
+    super::univariate_skip::build_eq(&beta[2..4])
         .try_into()
         .expect("two-coordinate eq has four entries")
 }
@@ -1667,11 +1678,17 @@ fn c_fold4_gfni_enabled() -> bool {
 
 /// Byte-plane C bank store, `[q][bank][byte-plane][lane]`.
 pub(crate) const C_PLANE_BANK_BYTES: usize = N_C_Q * N_C_BANKS * 16 * ELL;
+/// DirectFold8 keeps both medium-coordinate pairs instead of folding `j`.
+pub(crate) const C_FOLD8_PLANE_BANK_BYTES: usize =
+    N_C_J * N_C_Q * N_C_BANKS * 16 * ELL;
 /// One four-window C group: four contiguous 1 KiB windows of `c_packed`.
 pub(crate) const C_GROUP_BYTES: usize = 4 * (1 << N_MEDIUM) * ELL;
 /// GFNI matrix qwords per four-window group: two mask halves × 16 output bytes.
 #[allow(dead_code)] // used only by the fused GFNI C drain
 pub(crate) const C_FOLD4_MATS_PER_GROUP: usize = 32;
+/// Four retained `j` values × two window halves × sixteen output bytes.
+#[allow(dead_code)]
+pub(crate) const C_FOLD8_MATS_PER_GROUP: usize = N_C_J * 2 * 16;
 
 /// GFNI bit-matrix form of [`build_c_fold4_tables`].
 ///
@@ -1705,6 +1722,52 @@ fn build_c_fold4_gfni_mats(eq_lo: &[F128]) -> Vec<u64> {
         .zip(eq_lo.chunks_exact(4))
     {
         build_one_group_mats(slot, eqs, d_hi_inv_val);
+    }
+    mats
+}
+
+/// GFNI matrices for the 64-bank DirectFold8 C capture. Unlike fold4, the
+/// high-medium selector `j` is retained, so each matrix selects only the two
+/// rows with that `j` from a two-window mask half and weights them by their
+/// outer `eq_lo` values. The medium-coordinate eq factors are applied only
+/// when the 64 banks are collapsed back to the wire statistic.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_c_fold8_gfni_mats(eq_lo: &[F128]) -> Vec<u64> {
+    assert!(eq_lo.len().is_multiple_of(4));
+    let mut mats = vec![0u64; (eq_lo.len() / 4) * C_FOLD8_MATS_PER_GROUP];
+    for (slot, eqs) in mats
+        .chunks_mut(C_FOLD8_MATS_PER_GROUP)
+        .zip(eq_lo.chunks_exact(4))
+    {
+        for j in 0..N_C_J {
+            for half in 0..2 {
+                let mut basis = [F128::ZERO; 8];
+                for (b, value) in basis.iter_mut().enumerate() {
+                    if (b & 3) == j {
+                        *value = eqs[2 * half + (b >> 2)];
+                    }
+                }
+                for k in 0..16 {
+                    let mut col = 0u64;
+                    for (b, value) in basis.iter().enumerate() {
+                        let byte = if k < 8 {
+                            (value.lo >> (8 * k)) & 0xff
+                        } else {
+                            (value.hi >> (8 * (k - 8))) & 0xff
+                        };
+                        col |= byte << (8 * b);
+                    }
+                    slot[(2 * j + half) * 16 + k] = transpose_bits_8x8(col).swap_bytes();
+                }
+            }
+        }
     }
     mats
 }
@@ -1790,6 +1853,9 @@ pub(crate) struct WorkerStateFold4 {
     plane_c: Vec<u8>,
     plane_c_off: usize,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
+    /// Widened C statistic used only by the fused DirectFold8 arm:
+    /// `[j][q][K][lane]`.
+    partial_c8: Box<[[[[F128; ELL]; N_C_BANKS]; N_C_Q]; N_C_J]>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     /// Synthetic C blocks, one per retained q: row `4w + j` holds window w's
     /// transposed row `b_med = 4j + q`.
@@ -1798,6 +1864,7 @@ pub(crate) struct WorkerStateFold4 {
     b_col: [F8; ELL],
     pub(crate) local_res_ab: [F128; ELL],
     pub(crate) local_res_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
+    pub(crate) local_res_c8: Box<[[[[F128; ELL]; N_C_BANKS]; N_C_Q]; N_C_J]>,
 }
 
 impl WorkerStateFold4 {
@@ -1808,12 +1875,14 @@ impl WorkerStateFold4 {
             plane_c: Vec::new(),
             plane_c_off: 0,
             partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+            partial_c8: Box::new([[[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]; N_C_J]),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c4: Box::new([[[0u8; 64]; 16]; N_C_Q]),
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
             local_res_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+            local_res_c8: Box::new([[[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]; N_C_J]),
         }
     }
 }
@@ -1841,9 +1910,17 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     c_nibble_luts: &[kernels::CBankNibbleLut],
     eq_fold: Option<(&[F128], &[u64], usize)>,
     c_gfni_mats: Option<&[u64]>,
+    c_fold8_gfni_mats: Option<&[u64]>,
     state: &mut WorkerStateFold4,
 ) {
     debug_assert!(big_lo_size.is_multiple_of(4));
+    debug_assert!(!(c_gfni_mats.is_some() && c_fold8_gfni_mats.is_some()));
+    let c_gfni_live = c_gfni_mats.is_some() || c_fold8_gfni_mats.is_some();
+    let c_plane_len = if c_fold8_gfni_mats.is_some() {
+        C_FOLD8_PLANE_BANK_BYTES
+    } else {
+        C_PLANE_BANK_BYTES
+    };
     let _ = (&mut state.a_col, &mut state.b_col);
     state.partial_ab.fill(F128::ZERO);
     // Eq-folded GFNI AB drain: size and zero the byte-plane banks for this
@@ -1861,19 +1938,31 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // Fused GFNI C drain: size and zero the 32 KiB byte-plane C banks for
     // this band; `FLOCK_NO_ZC_C_GFNI=1` keeps the incumbent transpose +
     // nibble-LUT drain (`c_gfni_mats == None`).
-    if c_gfni_mats.is_some() {
+    if c_gfni_live {
         if state.plane_c.is_empty() {
-            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
+            state.plane_c = vec![0u8; c_plane_len + C_GROUP_BYTES + 63];
             let off = state.plane_c.as_ptr().align_offset(64);
             state.plane_c_off = if off <= 63 { off } else { 0 };
+        } else if state.plane_c.len() < c_plane_len + C_GROUP_BYTES + 63 {
+            state.plane_c.resize(c_plane_len + C_GROUP_BYTES + 63, 0);
         } else {
             let off = state.plane_c_off;
-            state.plane_c[off..off + C_PLANE_BANK_BYTES].fill(0);
+            state.plane_c[off..off + c_plane_len].fill(0);
         }
     }
-    for group in state.partial_c4.iter_mut() {
-        for bank in group.iter_mut() {
-            bank.fill(F128::ZERO);
+    if c_fold8_gfni_mats.is_some() {
+        for j_group in state.partial_c8.iter_mut() {
+            for q_group in j_group.iter_mut() {
+                for bank in q_group.iter_mut() {
+                    bank.fill(F128::ZERO);
+                }
+            }
+        }
+    } else {
+        for group in state.partial_c4.iter_mut() {
+            for bank in group.iter_mut() {
+                bank.fill(F128::ZERO);
+            }
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
@@ -1897,9 +1986,9 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             target_feature = "vpclmulqdq",
             target_feature = "gfni"
         ))]
-        if any_live && c_gfni_mats.is_some() {
+        if any_live && c_gfni_live {
             let group_base = (((4 * group) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let off = state.plane_c_off + C_PLANE_BANK_BYTES;
+            let off = state.plane_c_off + c_plane_len;
             let stage: &mut [u8; C_GROUP_BYTES] = (&mut state.plane_c
                 [off..off + C_GROUP_BYTES])
                 .try_into()
@@ -1914,7 +2003,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             // C rows: live rows transposed into their (q, 4w+j) slot, dead rows zeroed.
             // The fused GFNI drain reads `c_packed` directly and folds this
             // transpose into its own mask build, so it needs none of this.
-            if c_gfni_mats.is_none() {
+            if !c_gfni_live {
                 for b_med in 0..(1 << N_MEDIUM) {
                     let q = b_med & 3;
                     let j = b_med >> 2;
@@ -2001,19 +2090,49 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             target_feature = "vpclmulqdq",
             target_feature = "gfni"
         ))]
-        if let Some(mats) = c_gfni_mats {
-            let mats_g: &[u64; C_FOLD4_MATS_PER_GROUP] = (&mats[group
-                * C_FOLD4_MATS_PER_GROUP
-                ..(group + 1) * C_FOLD4_MATS_PER_GROUP])
-                .try_into()
-                .expect("32 matrix qwords per four-window group");
-            let off = state.plane_c_off;
-            let (planes, stage) = state.plane_c[off..off + C_PLANE_BANK_BYTES + C_GROUP_BYTES]
-                .split_at_mut(C_PLANE_BANK_BYTES);
-            let planes: &mut [u8; C_PLANE_BANK_BYTES] =
-                planes.try_into().expect("aligned 32 KiB plane C bank window");
-            kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
-            continue;
+        {
+            if let Some(mats) = c_fold8_gfni_mats {
+                let mats_g: &[u64; C_FOLD8_MATS_PER_GROUP] = (&mats[group
+                    * C_FOLD8_MATS_PER_GROUP
+                    ..(group + 1) * C_FOLD8_MATS_PER_GROUP])
+                    .try_into()
+                    .expect("128 matrix qwords per four-window fold8 group");
+                let off = state.plane_c_off;
+                let (planes, stage) = state.plane_c
+                    [off..off + C_FOLD8_PLANE_BANK_BYTES + C_GROUP_BYTES]
+                    .split_at_mut(C_FOLD8_PLANE_BANK_BYTES);
+                let planes: &mut [u8; C_FOLD8_PLANE_BANK_BYTES] = planes
+                    .try_into()
+                    .expect("aligned 128 KiB plane C fold8 bank window");
+                kernels::accumulate_c_banks_fold8_fused_gfni(
+                    stage,
+                    &group_counts,
+                    mats_g,
+                    planes,
+                );
+                continue;
+            }
+            if let Some(mats) = c_gfni_mats {
+                let mats_g: &[u64; C_FOLD4_MATS_PER_GROUP] = (&mats[group
+                    * C_FOLD4_MATS_PER_GROUP
+                    ..(group + 1) * C_FOLD4_MATS_PER_GROUP])
+                    .try_into()
+                    .expect("32 matrix qwords per four-window group");
+                let off = state.plane_c_off;
+                let (planes, stage) = state.plane_c
+                    [off..off + C_PLANE_BANK_BYTES + C_GROUP_BYTES]
+                    .split_at_mut(C_PLANE_BANK_BYTES);
+                let planes: &mut [u8; C_PLANE_BANK_BYTES] = planes
+                    .try_into()
+                    .expect("aligned 32 KiB plane C bank window");
+                kernels::accumulate_c_banks_fold4_fused_gfni(
+                    stage,
+                    &group_counts,
+                    mats_g,
+                    planes,
+                );
+                continue;
+            }
         }
         let c_tables =
             &fold4_tables[group * C_MASK_TABLE_STRIDE..(group + 1) * C_MASK_TABLE_STRIDE];
@@ -2044,7 +2163,25 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // Band-end plane reassembly for the fused GFNI C drain: each bank's
     // sixteen byte planes become its 64 F128 lanes. Pure XOR accumulation,
     // so these are the incumbent's `partial_c4` values byte-for-byte.
-    if c_gfni_mats.is_some() {
+    if c_fold8_gfni_mats.is_some() {
+        let off = state.plane_c_off;
+        let planes = &state.plane_c[off..off + C_FOLD8_PLANE_BANK_BYTES];
+        for j in 0..N_C_J {
+            for q in 0..N_C_Q {
+                for bank in 0..N_C_BANKS {
+                    let bank_index = (j * N_C_Q + q) * N_C_BANKS + bank;
+                    let bank_planes: &[u8; 16 * ELL] = planes
+                        [bank_index * 16 * ELL..][..16 * ELL]
+                        .try_into()
+                        .expect("one 16-plane fold8 bank");
+                    kernels::c_plane_bank_to_f128(
+                        bank_planes,
+                        &mut state.partial_c8[j][q][bank],
+                    );
+                }
+            }
+        }
+    } else if c_gfni_mats.is_some() {
         let off = state.plane_c_off;
         let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
         for q in 0..N_C_Q {
@@ -2078,9 +2215,21 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     }
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        for q in 0..N_C_Q {
-            for bank in 0..N_C_BANKS {
-                state.local_res_c4[q][bank][lane] += eq_hi_val * state.partial_c4[q][bank][lane];
+        if c_fold8_gfni_mats.is_some() {
+            for j in 0..N_C_J {
+                for q in 0..N_C_Q {
+                    for bank in 0..N_C_BANKS {
+                        state.local_res_c8[j][q][bank][lane] +=
+                            eq_hi_val * state.partial_c8[j][q][bank][lane];
+                    }
+                }
+            }
+        } else {
+            for q in 0..N_C_Q {
+                for bank in 0..N_C_BANKS {
+                    state.local_res_c4[q][bank][lane] +=
+                        eq_hi_val * state.partial_c4[q][bank][lane];
+                }
             }
         }
     }
@@ -2115,6 +2264,38 @@ fn finish_c_banks_fold4(
     (res_c_s, s_hat_v_c, quad_c, fold4_c)
 }
 
+/// Collapse the retained `j` dimension to the incumbent fold4 tensor and
+/// export all 64 DirectFold8 banks in suffix-coordinate order.
+fn finish_c_banks_fold8(
+    banks128: &[[[[F128; ELL]; N_C_BANKS]; N_C_Q]; N_C_J],
+) -> ([F128; ELL], Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    let w = c_fold8_j_weights();
+    let mut banks32 = [[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q];
+    for j in 0..N_C_J {
+        for q in 0..N_C_Q {
+            for bank in 0..N_C_BANKS {
+                for lane in 0..ELL {
+                    banks32[q][bank][lane] += w[j] * banks128[j][q][bank][lane];
+                }
+            }
+        }
+    }
+    let (res_c_s, s_hat_v_c, quad_c, fold4_c) = finish_c_banks_fold4(&banks32);
+    let mut fold8_c = vec![F128::ZERO; 64 * 2 * ELL];
+    for j in 0..N_C_J {
+        for q in 0..N_C_Q {
+            for e in 0..4 {
+                for b_0 in 0..2 {
+                    let base = (e + 4 * q + 16 * j) * 2 * ELL + b_0 * ELL;
+                    fold8_c[base..base + ELL]
+                        .copy_from_slice(&banks128[j][q][b_0 + 2 * e]);
+                }
+            }
+        }
+    }
+    (res_c_s, s_hat_v_c, quad_c, fold4_c, fold8_c)
+}
+
 /// Fold4 twin of [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad`]:
 /// same `(ab, c_lifted, s_hat_v_c, quad_c)` bit-for-bit, plus the sixteen-bank
 /// C tensor. Requires `c_fold4_capture_shape_ok(1 << eq.n_lo)`.
@@ -2129,7 +2310,14 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Option<Vec<F128>>,
+) {
     use rayon::prelude::*;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
@@ -2164,7 +2352,19 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     ))]
-    let c_gfni_state = c_fold4_gfni_enabled().then(|| build_c_fold4_gfni_mats(&eq.lo));
+    let c_fold8_gfni_state =
+        (crate::pcs::ranked_direct_fold8_enabled() && c_fold4_gfni_enabled())
+            .then(|| build_c_fold8_gfni_mats(&eq.lo));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let c_gfni_state = (c_fold8_gfni_state.is_none() && c_fold4_gfni_enabled())
+        .then(|| build_c_fold4_gfni_mats(&eq.lo));
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -2174,7 +2374,16 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         target_feature = "gfni"
     )))]
     let c_gfni_state: Option<Vec<u64>> = None;
-    let fold4_tables = if c_gfni_state.is_some() {
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let c_fold8_gfni_state: Option<Vec<u64>> = None;
+    let fold4_tables = if c_gfni_state.is_some() || c_fold8_gfni_state.is_some() {
         Vec::new()
     } else {
         build_c_fold4_tables(&eq.lo)
@@ -2203,7 +2412,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
         (eq_bot, mats, bank_bits)
     });
-    let (res_ab, banks32) = (0..hi_size)
+    let use_fold8 = c_fold8_gfni_state.is_some();
+    let (res_ab, banks32, banks128) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateFold4::new, |mut state, x_hi| {
             #[cfg(all(
@@ -2234,27 +2444,57 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                 &c_nibble_luts,
                 eq_fold_arg,
                 c_gfni_state.as_deref(),
+                c_fold8_gfni_state.as_deref(),
                 &mut state,
             );
             state
         })
-        .map(|s| (s.local_res_ab, s.local_res_c4))
+        .map(|s| (s.local_res_ab, s.local_res_c4, s.local_res_c8))
         .reduce(
-            || ([F128::ZERO; ELL], Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q])),
-            |(mut ab1, mut c1), (ab2, c2)| {
+            || {
+                (
+                    [F128::ZERO; ELL],
+                    Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+                    Box::new([[[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]; N_C_J]),
+                )
+            },
+            |(mut ab1, mut c41, mut c81), (ab2, c42, c82)| {
                 for i in 0..ELL { ab1[i] += ab2[i]; }
-                for (lq, rq) in c1.iter_mut().zip(c2.iter()) {
-                    for (left, right) in lq.iter_mut().zip(rq.iter()) {
-                        for i in 0..ELL { left[i] += right[i]; }
+                if use_fold8 {
+                    for (lj, rj) in c81.iter_mut().zip(c82.iter()) {
+                        for (lq, rq) in lj.iter_mut().zip(rj.iter()) {
+                            for (left, right) in lq.iter_mut().zip(rq.iter()) {
+                                for i in 0..ELL { left[i] += right[i]; }
+                            }
+                        }
+                    }
+                } else {
+                    for (lq, rq) in c41.iter_mut().zip(c42.iter()) {
+                        for (left, right) in lq.iter_mut().zip(rq.iter()) {
+                            for i in 0..ELL { left[i] += right[i]; }
+                        }
                     }
                 }
-                (ab1, c1)
+                (ab1, c41, c81)
             },
         );
     crate::scratch::give_f128(fold4_tables);
-    let (res_c_s, s_hat_v_c, quad_c, fold4_c) = finish_c_banks_fold4(&banks32);
+    let (res_c_s, s_hat_v_c, quad_c, fold4_c, fold8_c) = if use_fold8 {
+        let (c, s, q, f4, f8) = finish_c_banks_fold8(&banks128);
+        (c, s, q, f4, Some(f8))
+    } else {
+        let (c, s, q, f4) = finish_c_banks_fold4(&banks32);
+        (c, s, q, f4, None)
+    };
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c, fold4_c)
+    (
+        res_ab.to_vec(),
+        res_c_lifted,
+        s_hat_v_c,
+        quad_c,
+        fold4_c,
+        fold8_c,
+    )
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -3283,12 +3523,15 @@ mod tests {
     /// non-trivial `n_hi`.
     #[test]
     fn fold4_c_capture_matches_quad_and_collapses() {
-        use crate::pcs::ring_switch::{collapse_s_hat_v_fold4, collapse_s_hat_v_quad};
+        use crate::pcs::ring_switch::{
+            collapse_s_hat_v_fold4, collapse_s_hat_v_fold8, collapse_s_hat_v_quad,
+        };
         use crate::zerocheck::univariate_skip::pack_bits;
 
         let small = small_challenges_ghash();
         let beta = medium_challenges_ghash();
         let low_point4 = [small[1], small[2], beta[0], beta[1]];
+        let low_point6 = [small[1], small[2], beta[0], beta[1], beta[2], beta[3]];
         let low_point2 = [small[1], small[2]];
         assert!(!c_fold4_capture_available(21, K_SKIP));
         assert!(c_fold4_capture_available(22, K_SKIP));
@@ -3340,7 +3583,7 @@ mod tests {
             let mut precomputed4 = precompute_round1_ab_inner_packed_padded(
                 &a_p, &b_p, m, K_SKIP, &table, &padding,
             );
-            let (ab, c_l, s_hat_v_c, quad_c, fold4_c) =
+            let (ab, c_l, s_hat_v_c, quad_c, fold4_c, fold8_c) =
                 round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                     &mut precomputed4, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
                 );
@@ -3355,6 +3598,48 @@ mod tests {
                 "fold4 tensor must collapse to the wire s_hat_v_c at m={m}"
             );
             assert_eq!(collapse_s_hat_v_quad(&quad_c, &low_point2), s_hat_v_c);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            {
+                let fold8_c = fold8_c
+                    .as_ref()
+                    .expect("native GFNI fold8 capture must be live");
+                assert_eq!(fold8_c.len(), 64 * 2 * ELL);
+                assert_eq!(
+                    collapse_s_hat_v_fold8(fold8_c, &low_point6),
+                    s_hat_v_c,
+                    "fold8 tensor must collapse to the wire s_hat_v_c at m={m}"
+                );
+                let j_weights = c_fold8_j_weights();
+                for e in 0..16 {
+                    for packed in 0..2 * ELL {
+                        let mut acc = F128::ZERO;
+                        for j in 0..N_C_J {
+                            acc += j_weights[j] * fold8_c[(e + 16 * j) * 2 * ELL + packed];
+                        }
+                        assert_eq!(
+                            acc,
+                            fold4_c[e * 2 * ELL + packed],
+                            "fold8 -> fold4 collapse e={e} p={packed}"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            assert!(fold8_c.is_none());
             // The 16 fold4 banks collapse under (β₀,β₁) to the 4 quad banks.
             let n_packed = 2 * ELL;
             for e in 0..4 {

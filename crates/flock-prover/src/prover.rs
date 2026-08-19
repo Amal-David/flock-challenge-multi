@@ -61,17 +61,39 @@ fn ranked_direct_fold4_precompute_enabled(
         && r1cs.k_log >= pcs::LOG_PACKING + 4
 }
 
-/// AB claim precompute from lincheck's pre-sumcheck `z_vec`: sixteen banks
-/// when the fold4 route is live for this prove, four banks on the direct-C
-/// route, the canonical 128-vector otherwise.
+/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
+/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
+#[inline]
+fn ranked_direct_fold8_precompute_enabled(
+    r1cs: &BlockR1cs,
+    captured: &zerocheck::CapturedSHatVC,
+) -> bool {
+    ranked_direct_fold4_precompute_enabled(r1cs, captured)
+        && pcs::ranked_direct_fold8_enabled()
+        && captured.fold8.is_some()
+        && r1cs.k_log >= r1cs.k_skip + 7
+        && r1cs.k_log >= pcs::LOG_PACKING + 6
+}
+
+/// AB claim precompute from lincheck's pre-sumcheck `z_vec`: sixty-four banks
+/// when fold8 is live, sixteen banks on fold4, four banks on direct-C, and the
+/// canonical 128-vector otherwise.
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
     z_vec: &[F128],
     inner_rest_tail: &[F128],
 ) -> Option<Vec<F128>> {
-    if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
-        Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(z_vec, inner_rest_tail))
+    if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
+        Some(pcs::ring_switch::s_hat_v_fold8_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
+    } else if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
+        Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
     } else if ranked_direct_ab_precompute_enabled(r1cs) {
         Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(z_vec, inner_rest_tail))
     } else if r1cs.k_log >= pcs::LOG_PACKING {
@@ -81,21 +103,23 @@ fn precompute_ab_s_hat_v(
     }
 }
 
-/// Pick C's precomputed slot: the sixteen-bank tensor on the fold4 route,
-/// the 512-long quad on the ranked direct-C shape, otherwise the canonical
-/// 128-long `s_hat_v_c`. All describe the same claim (the collapses map one
-/// to the other), so the transcript is identical either way.
+/// Pick C's precomputed slot. The DirectFold8 route takes the sixty-four-bank
+/// tensor; the strict DirectFold4 experiment takes the sixteen-bank tensor;
+/// the incumbent ranked path takes the four-bank tensor; every other shape
+/// takes the canonical transcript-visible statistic. Falls back through
+/// narrower captures by presence, so a producer shape miss (e.g. no lincheck
+/// stripe) degrades to a still-correct route instead of panicking.
 #[inline]
 fn pre_c_slot<'a>(
     r1cs: &BlockR1cs,
     captured: &'a zerocheck::CapturedSHatVC,
 ) -> Option<&'a [F128]> {
-    Some(if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
-        captured
-            .fold4
-            .as_deref()
-            .expect("fold4 precompute gate checked the capture")
-    } else if ranked_direct_c_precompute_enabled(r1cs) {
+    Some(
+        if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
+            captured.fold8.as_deref().unwrap()
+        } else if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
+            captured.fold4.as_deref().unwrap()
+        } else if ranked_direct_c_precompute_enabled(r1cs) {
         captured.quad.as_slice()
     } else {
         captured.s_hat_v_c.as_slice()

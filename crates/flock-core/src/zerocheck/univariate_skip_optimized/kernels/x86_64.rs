@@ -9,7 +9,10 @@ use super::super::{ELL, F128, N_MEDIUM};
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q};
+use super::super::{
+    C_FOLD4_MATS_PER_GROUP, C_FOLD8_MATS_PER_GROUP, C_FOLD8_PLANE_BANK_BYTES,
+    C_PLANE_BANK_BYTES, N_C_BANKS, N_C_J, N_C_Q,
+};
 
 /// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
@@ -1129,6 +1132,85 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                         ptr,
                         _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
                     );
+                }
+            }
+        }
+    }
+}
+
+/// DirectFold8 sibling of the fused C drain. The raw masks are identical to
+/// fold4, but `j` remains a bank selector. Four small matrix pairs therefore
+/// replace the fold4 matrix that sums all four high-medium rows.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+pub(crate) unsafe fn accumulate_c_banks_fold8_fused_x86_gfni(
+    c_group: &[u8],
+    n_b_med: &[usize; 4],
+    mats: &[u64; C_FOLD8_MATS_PER_GROUP],
+    plane_banks: &mut [u8; C_FOLD8_PLANE_BANK_BYTES],
+) {
+    use core::arch::x86_64::*;
+    const ROW_BYTES: usize = ELL;
+    const WINDOW_BYTES: usize = 16 * ROW_BYTES;
+    debug_assert!(c_group.len() >= 4 * WINDOW_BYTES);
+    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
+
+    unsafe {
+        let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
+        let planes = plane_banks.as_mut_ptr();
+        let base = c_group.as_ptr();
+
+        for q in 0..N_C_Q {
+            let mut masks = [[_mm512_setzero_si512(); N_C_BANKS]; 2];
+            for (half, mask_half) in masks.iter_mut().enumerate() {
+                let mut rows = [_mm512_setzero_si512(); 8];
+                for wj in 0..2usize {
+                    let w = 2 * half + wj;
+                    let live = n_b_med[w];
+                    for j in 0..N_C_J {
+                        let b_med = 4 * j + q;
+                        if b_med < live {
+                            rows[4 * wj + j] = _mm512_loadu_si512(
+                                base.add(w * WINDOW_BYTES + b_med * ROW_BYTES)
+                                    as *const __m512i,
+                            );
+                        }
+                    }
+                }
+                let cols = byte_transpose_8x64::<true>(rows);
+                for (bank, slot) in mask_half.iter_mut().enumerate() {
+                    *slot = _mm512_gf2p8affine_epi64_epi8::<0>(ident, cols[bank]);
+                }
+            }
+            for j in 0..N_C_J {
+                for plane in 0..16usize {
+                    let m_lo = _mm512_set1_epi64(mats[(2 * j) * 16 + plane] as i64);
+                    let m_hi = _mm512_set1_epi64(mats[(2 * j + 1) * 16 + plane] as i64);
+                    for bank in 0..N_C_BANKS {
+                        let g_lo =
+                            _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
+                        let g_hi =
+                            _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
+                        let bank_index = (j * N_C_Q + q) * N_C_BANKS + bank;
+                        let ptr = planes.add((bank_index * 16 + plane) * ELL)
+                            as *mut __m512i;
+                        _mm512_storeu_si512(
+                            ptr,
+                            _mm512_ternarylogic_epi64::<0x96>(
+                                _mm512_loadu_si512(ptr),
+                                g_lo,
+                                g_hi,
+                            ),
+                        );
+                    }
                 }
             }
         }
