@@ -850,9 +850,10 @@ fn partial_fold_packed_z_block_major_factorized_padded(
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
 /// [`prove_padded_inner`]: factorized eq when `n_log == 18`, else a
-/// materialized outer table. Used by the last-ρ kick and the sequential
-/// fallback so both produce the same `ẑ`.
-fn fold_block_major_one_shot(
+/// materialized outer table. Used by the last-ρ kick, the sequential
+/// fallback, and the ranked identity-C round-1 fold so all three produce
+/// the same `ẑ`.
+pub(crate) fn fold_block_major_one_shot(
     z: &[F128],
     m: usize,
     k_log: usize,

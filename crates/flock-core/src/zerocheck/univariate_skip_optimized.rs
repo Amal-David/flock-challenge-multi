@@ -193,6 +193,15 @@ pub(crate) fn d_inv() -> F128 {
     *D_INV_CACHE.get_or_init(compute_d_inv)
 }
 
+/// Ranked default: identity-C round-1 uses lincheck's n_log=18 9+9
+/// factorized eq dispatch. `FLOCK_NO_ZC_ID_C_EQ_FACTORED=1` restores the
+/// dense 4 MiB `eq_outer` table for a same-binary A/B. Ranked workers
+/// clear their environment, so the factorized arm is the scored path.
+fn identity_c_eq_factored_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_ID_C_EQ_FACTORED").is_none())
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2583,11 +2592,23 @@ pub fn round1_c_fold4_from_block_major_z(
     assert_eq!(inv_table.k, k_skip);
 
     // One fold at the original r_outer: the length-2^k_log inner table over
-    // witness coordinates [0, k_log).
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner = crate::lincheck::partial_fold_packed_z_block_major_padded(
-        z_packed, m, k_log, useful_bits, &eq_outer,
-    );
+    // witness coordinates [0, k_log). At the ranked BLAKE3 shape that outer
+    // tensor is 2^18 values (4 MiB) and was built by a serial doubling
+    // recurrence sitting next to lincheck's already-factorized n_log=18
+    // dispatch (9+9, two 8 KiB tables). Route identity-C through that same
+    // helper: F128 multiplication is bilinear, so
+    // `eq_outer[i] = eq_lo[i & 511] * eq_hi[i >> 9]` is exact, not an
+    // approximation. `FLOCK_NO_ZC_ID_C_EQ_FACTORED=1` restores the dense table.
+    let c_inner = if identity_c_eq_factored_enabled() {
+        crate::lincheck::fold_block_major_one_shot(
+            z_packed, m, k_log, useful_bits, &r[k_log..],
+        )
+    } else {
+        let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+        crate::lincheck::partial_fold_packed_z_block_major_padded(
+            z_packed, m, k_log, useful_bits, &eq_outer,
+        )
+    };
 
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
