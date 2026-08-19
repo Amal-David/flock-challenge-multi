@@ -950,6 +950,38 @@ fn lc_alpha_overlap_enabled() -> bool {
     *ON
 }
 
+/// Chunks of look-ahead for the grouped block-major gather prefetch. One
+/// grouped visit consumes four F128 chunks = one 64-byte line per row, so
+/// `8` is two visits (two lines) ahead on the SAME eight rows.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+const LC_ZFOLD_PF_CHUNKS: usize = 8;
+
+/// `FLOCK_NO_LC_ZFOLD_PF=1` restores the incumbent one-stripe-ahead prefetch
+/// in the grouped block-major gather (exact same-binary A/B).
+///
+/// The incumbent prefetches the NEXT STRIPE's eight rows at the column the
+/// loop is on right now. That is ~56 uops of look-ahead — one
+/// `gather_transpose_stripe4_x86` call — while the lines it asks for are
+/// consumed later in the SAME grouped visit, so the demand loads reach the
+/// line before DRAM does and the visit degenerates into
+/// [stall on eight strided misses] → [GFNI burst], with no overlap. The
+/// ranked-shape decomposition of the fold measured that directly:
+/// memory-only 5.2 ms + gather/transpose 2.3 ms + GFNI 5.8 ms ≈ 13.3 ms
+/// wall, i.e. strictly additive.
+///
+/// This arm instead asks for the lines the SAME eight rows will need two
+/// grouped visits from now — one whole visit (~3.3 K uops) of look-ahead —
+/// so the miss is issued while the previous visit's GFNI fold is still
+/// draining. Same eight prefetch instructions per stripe, different address:
+/// no work is added, and prefetches have no architectural effect, so the
+/// folded values are bit-identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF").is_none());
+    *ON
+}
+
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -1043,6 +1075,10 @@ fn fold_block_major_gfni(
             // scalar path stays as the kill-switch arm.
             #[cfg(target_feature = "avx512vbmi")]
             let gather_tr_fused = lc_gather_tr_enabled();
+            // Grouped-gather prefetch distance, resolved once per worker
+            // (never inside the tile / chunk / stripe loops).
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_far = lc_zfold_pf_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1076,7 +1112,30 @@ fn fold_block_major_gfni(
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
                             let outer_base = 8 * (stripe_base + t);
-                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                            if pf_far {
+                                // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
+                                // on: the lines this stripe demand-loads two
+                                // grouped visits from now. Issued here, the
+                                // miss overlaps the current visit's GFNI fold.
+                                // `qn <= full_chunks` keeps the prefetch on
+                                // a line the sweep really demands; `qn <
+                                // chunks_per_block` keeps the address inside
+                                // the block for any (useful_bits, k) shape.
+                                let qn = q + LC_ZFOLD_PF_CHUNKS;
+                                if qn <= full_chunks && qn < chunks_per_block {
+                                    unsafe {
+                                        for r in 0..8 {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                z_packed
+                                                    .as_ptr()
+                                                    .add((outer_base + r) * chunks_per_block + qn)
+                                                    .cast::<i8>(),
+                                                core::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
                                 let next_base = 8 * (stripe_base + t + 1);
                                 // One line per row covers all four columns.
                                 unsafe {
