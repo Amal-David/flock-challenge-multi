@@ -1229,6 +1229,89 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     (res_ab.to_vec(), res_c_lifted)
 }
 
+/// Scalar `Σ_k α^k · banks[k][lane]` into the even/odd residuals.
+/// Portable / kill-switch twin of [`collapse_alpha_banks_wide`].
+fn collapse_alpha_banks_scalar(
+    alpha_pow: &[F128; N_C_BANKS],
+    banks: &[[F128; ELL]; N_C_BANKS],
+    res_c_s_0: &mut [F128; ELL],
+    res_c_s_1: &mut [F128; ELL],
+) {
+    for (k, bank) in banks.iter().enumerate() {
+        let target = if k & 1 == 0 { &mut *res_c_s_0 } else { &mut *res_c_s_1 };
+        for lane in 0..ELL {
+            target[lane] += alpha_pow[k] * bank[lane];
+        }
+    }
+}
+
+/// 4-lane deferred-reduction form of [`collapse_alpha_banks_scalar`].
+///
+/// Even banks (`k = 0,2,4,6`) feed `res_c_s_0`, odd banks `res_c_s_1`.
+/// Each residual is `Σ_{e<4} α^{2e(+1)} · banks[2e(+1)][lane]` — four
+/// products XOR-accumulated per lane. `WideGhashX4::mul_acc` keeps the
+/// Karatsuba triples unreduced across those four products and
+/// `reduce_lanes` folds once. Reduction is F₂-linear, so this equals
+/// reducing each product and XORing (the scalar loop).
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` available (cfg-gated + target_feature).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn collapse_alpha_banks_wide(
+    alpha_pow: &[F128; N_C_BANKS],
+    banks: &[[F128; ELL]; N_C_BANKS],
+    res_c_s_0: &mut [F128; ELL],
+    res_c_s_1: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    // SAFETY: cfg + target_feature; every load/store is 4 contiguous F128
+    // inside a `[F128; 64]` bank / residual.
+    unsafe {
+        let w_even: [__m512i; 4] = core::array::from_fn(|e| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(
+                alpha_pow[2 * e].hi as i64,
+                alpha_pow[2 * e].lo as i64,
+            ))
+        });
+        let w_odd: [__m512i; 4] = core::array::from_fn(|e| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(
+                alpha_pow[2 * e + 1].hi as i64,
+                alpha_pow[2 * e + 1].lo as i64,
+            ))
+        });
+        let mut lane = 0usize;
+        while lane < ELL {
+            let mut acc0 = WideGhashX4::zero();
+            let mut acc1 = WideGhashX4::zero();
+            for e in 0..4 {
+                acc0.mul_acc(
+                    w_even[e],
+                    _mm512_loadu_si512(banks[2 * e].as_ptr().add(lane) as *const __m512i),
+                );
+                acc1.mul_acc(
+                    w_odd[e],
+                    _mm512_loadu_si512(banks[2 * e + 1].as_ptr().add(lane) as *const __m512i),
+                );
+            }
+            _mm512_storeu_si512(
+                res_c_s_0.as_mut_ptr().add(lane) as *mut __m512i,
+                acc0.reduce_lanes(),
+            );
+            _mm512_storeu_si512(
+                res_c_s_1.as_mut_ptr().add(lane) as *mut __m512i,
+                acc1.reduce_lanes(),
+            );
+            lane += 4;
+        }
+    }
+}
+
 fn finish_c_banks(
     banks: &[[F128; ELL]; N_C_BANKS],
 ) -> ([F128; ELL], Vec<F128>, Vec<F128>) {
@@ -1239,12 +1322,22 @@ fn finish_c_banks(
     }
     let mut res_c_s_0 = [F128::ZERO; ELL];
     let mut res_c_s_1 = [F128::ZERO; ELL];
-    for (k, bank) in banks.iter().enumerate() {
-        let target = if k & 1 == 0 { &mut res_c_s_0 } else { &mut res_c_s_1 };
-        for lane in 0..ELL {
-            target[lane] += alpha_pow[k] * bank[lane];
-        }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate supplies the features; residuals start ZERO so a
+    // missed store would fail the existing fold4/quad oracles.
+    unsafe {
+        collapse_alpha_banks_wide(&alpha_pow, banks, &mut res_c_s_0, &mut res_c_s_1);
     }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    collapse_alpha_banks_scalar(&alpha_pow, banks, &mut res_c_s_0, &mut res_c_s_1);
     let mut res_c_s = [F128::ZERO; ELL];
     for lane in 0..ELL {
         res_c_s[lane] = res_c_s_0[lane] + res_c_s_1[lane];
@@ -2023,6 +2116,75 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     }
 }
 
+/// Scalar `banks8[k][lane] = Σ_q w[q] · banks32[q][k][lane]`.
+/// Portable twin of [`collapse_q_banks_wide`].
+fn collapse_q_banks_scalar(
+    w: &[F128; N_C_Q],
+    banks32: &[[[F128; ELL]; N_C_BANKS]; N_C_Q],
+    banks8: &mut [[F128; ELL]; N_C_BANKS],
+) {
+    for q in 0..N_C_Q {
+        for k in 0..N_C_BANKS {
+            for lane in 0..ELL {
+                banks8[k][lane] += w[q] * banks32[q][k][lane];
+            }
+        }
+    }
+}
+
+/// 4-lane deferred-reduction form of [`collapse_q_banks_scalar`].
+///
+/// Per `(k, lane)` the incumbent XORs four products `w[q] · banks32[q][k][lane]`.
+/// `N_C_Q = 4` fits one `WideGhashX4` accumulator: four `mul_acc` (4 CLMUL
+/// each, no reduce) + one `reduce_lanes` (2 CLMUL) = 18 CLMUL / 4 lanes
+/// against 4 × 6 = 24 for immediate-reduce `ghash_mul_x4`, and against
+/// 4 × ~5–6 scalar CLMUL per lane. Reduction is F₂-linear
+/// (`ghash_reduce_acc_x4` / `WideGhashX4::reduce_lanes` docs), so the
+/// stored `banks8` lanes are field-identical to the scalar loop.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` available (cfg-gated + target_feature).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn collapse_q_banks_wide(
+    w: &[F128; N_C_Q],
+    banks32: &[[[F128; ELL]; N_C_BANKS]; N_C_Q],
+    banks8: &mut [[F128; ELL]; N_C_BANKS],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    // SAFETY: cfg + target_feature; `banks32[q][k]` and `banks8[k]` are
+    // `[F128; 64]`; we walk them in 4-lane steps.
+    unsafe {
+        let wq: [__m512i; N_C_Q] = core::array::from_fn(|q| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[q].hi as i64, w[q].lo as i64))
+        });
+        for k in 0..N_C_BANKS {
+            let mut lane = 0usize;
+            while lane < ELL {
+                let mut acc = WideGhashX4::zero();
+                for q in 0..N_C_Q {
+                    acc.mul_acc(
+                        wq[q],
+                        _mm512_loadu_si512(
+                            banks32[q][k].as_ptr().add(lane) as *const __m512i,
+                        ),
+                    );
+                }
+                _mm512_storeu_si512(
+                    banks8[k].as_mut_ptr().add(lane) as *mut __m512i,
+                    acc.reduce_lanes(),
+                );
+                lane += 4;
+            }
+        }
+    }
+}
+
 /// Collapse the 32 q-retained banks to the incumbent eight (exact), then run
 /// the incumbent finish; additionally emit the sixteen-bank direct-fold4
 /// tensor `fold4_c[(e + 4q)·128 + b₀·64 + lane] = banks[q][b₀ + 2e][lane]`
@@ -2032,13 +2194,21 @@ fn finish_c_banks_fold4(
 ) -> ([F128; ELL], Vec<F128>, Vec<F128>, Vec<F128>) {
     let w = c_fold4_q_weights();
     let mut banks8 = [[F128::ZERO; ELL]; N_C_BANKS];
-    for q in 0..N_C_Q {
-        for k in 0..N_C_BANKS {
-            for lane in 0..ELL {
-                banks8[k][lane] += w[q] * banks32[q][k][lane];
-            }
-        }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate; `banks8` starts ZERO.
+    unsafe {
+        collapse_q_banks_wide(&w, banks32, &mut banks8);
     }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    collapse_q_banks_scalar(&w, banks32, &mut banks8);
     let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks8);
     let mut fold4_c = vec![F128::ZERO; 16 * 2 * ELL];
     for q in 0..N_C_Q {
@@ -3306,6 +3476,67 @@ mod tests {
         }
     }
 
+
+    /// Deferred-reduction q-collapse + α-bank finish must match the scalar
+    /// XOR-of-products loops lane-for-lane. The wide arm is the ranked
+    /// default; this test drives both bodies on the same random banks.
+    #[test]
+    fn finish_c_banks_fold4_wide_matches_scalar() {
+        let mut rng = Rng::new(0xF01D_C011_A95E);
+        for trial in 0..8usize {
+            let mut banks32 = [[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q];
+            for q in 0..N_C_Q {
+                for k in 0..N_C_BANKS {
+                    for lane in 0..ELL {
+                        banks32[q][k][lane] = rng.f128();
+                    }
+                }
+            }
+            let w = c_fold4_q_weights();
+            let mut scalar8 = [[F128::ZERO; ELL]; N_C_BANKS];
+            collapse_q_banks_scalar(&w, &banks32, &mut scalar8);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                let mut wide8 = [[F128::ZERO; ELL]; N_C_BANKS];
+                // SAFETY: cfg gate.
+                unsafe { collapse_q_banks_wide(&w, &banks32, &mut wide8) };
+                assert_eq!(wide8, scalar8, "q-collapse trial {trial}");
+            }
+            let (s_res, s_hat, s_quad) = {
+                let alpha = phi8(F8(0x02));
+                let mut alpha_pow = [F128::ONE; N_C_BANKS];
+                for k in 1..N_C_BANKS {
+                    alpha_pow[k] = alpha_pow[k - 1] * alpha;
+                }
+                let mut r0 = [F128::ZERO; ELL];
+                let mut r1 = [F128::ZERO; ELL];
+                collapse_alpha_banks_scalar(&alpha_pow, &scalar8, &mut r0, &mut r1);
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                {
+                    let mut w0 = [F128::ZERO; ELL];
+                    let mut w1 = [F128::ZERO; ELL];
+                    // SAFETY: cfg gate.
+                    unsafe { collapse_alpha_banks_wide(&alpha_pow, &scalar8, &mut w0, &mut w1) };
+                    assert_eq!(w0, r0, "alpha even trial {trial}");
+                    assert_eq!(w1, r1, "alpha odd trial {trial}");
+                }
+                finish_c_banks(&scalar8)
+            };
+            let (f_res, f_hat, f_quad, fold4) = finish_c_banks_fold4(&banks32);
+            assert_eq!(f_res, s_res, "res_c_s trial {trial}");
+            assert_eq!(f_hat, s_hat, "s_hat_v_c trial {trial}");
+            assert_eq!(f_quad, s_quad, "quad_c trial {trial}");
+            assert_eq!(fold4.len(), 16 * 2 * ELL);
+        }
+    }
 
     /// The fused GFNI DirectFold4 C drain must reproduce the incumbent
     /// `bit_transpose_64bytes` + LUT drain byte-for-byte: same synthetic mask
