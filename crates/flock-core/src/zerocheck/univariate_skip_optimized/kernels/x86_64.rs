@@ -482,9 +482,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
 ) {
     debug_assert_eq!(mask_tables.len(), 512);
     let lut = super::CBankNibbleLut::new(mask_tables);
-    unsafe {
-        accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, &lut, partial_c)
-    }
+    unsafe { accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, &lut, partial_c) }
 }
 
 /// DirectC nibble drain with the eq-dependent table already materialized.
@@ -616,6 +614,96 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
                         _mm512_xor_si512(_mm512_loadu_si512(partial_ptr.add(1)), aos1),
                     );
                 }
+            }
+        }
+    }
+}
+
+/// GFNI twin of [`accumulate_c_banks_x86_avx512_nibble_prebuilt`]. The two
+/// 256-entry XOR-doubling halves are F₂-linear (`T[byte] = Σ_j bit_j · T[1<<j]`,
+/// `T[0] = 0`), so each half IS sixteen 8×8 bit matrices — one per output byte
+/// of the F128. One `VGF2P8AFFINEQB` evaluates a matrix on all 64 lanes' mask
+/// bytes; the 16-entry `vpermi2q` nibble tables and the 8 KiB expanded table
+/// disappear. Encoding matches the AB eq-fold kernel: `out.bit[i] =
+/// parity(mat.byte[7-i] & in)`. Planes reassemble to AoS F128s and XOR into
+/// `partial_c` — the same sums as the nibble/gather path, reassociated.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_c_banks_x86_gfni(
+    c_block: &[u8; 16 * ELL],
+    n_b_med: usize,
+    mats: &super::CBankGfniMats,
+    partial_c: &mut [[F128; ELL]; 8],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(ELL, 64);
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+
+    // SAFETY: each 16-byte row load sits inside a 64-byte C row; n_b_med ≤ 16
+    // bounds the row index. Mask words are at most 0xffff. Every GFNI input
+    // is a full 64-lane mask-byte vector; plane stores cover `16 * ELL` bytes.
+    unsafe {
+        let mut mlo = [[0u8; ELL]; 8];
+        let mut mhi = [[0u8; ELL]; 8];
+        for lane_base in (0..ELL).step_by(16) {
+            let mut masks = [_mm512_setzero_si512(); 8];
+            let bank_bits = [
+                _mm512_set1_epi32(1),
+                _mm512_set1_epi32(2),
+                _mm512_set1_epi32(4),
+                _mm512_set1_epi32(8),
+                _mm512_set1_epi32(16),
+                _mm512_set1_epi32(32),
+                _mm512_set1_epi32(64),
+                _mm512_set1_epi32(128),
+            ];
+            for b_med in 0..n_b_med {
+                let row_ptr = c_block.as_ptr().add(b_med * ELL + lane_base);
+                let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
+                let row = _mm512_cvtepu8_epi32(row_bytes);
+                let weight = _mm512_set1_epi32((1u32 << b_med) as i32);
+                for (mask, bank_bit) in masks.iter_mut().zip(bank_bits) {
+                    let selected = _mm512_test_epi32_mask(row, bank_bit);
+                    *mask = _mm512_mask_or_epi32(*mask, selected, *mask, weight);
+                }
+            }
+            for (bank, mask) in masks.iter().enumerate() {
+                let mut words = [0u32; 16];
+                _mm512_storeu_si512(words.as_mut_ptr() as *mut __m512i, *mask);
+                for i in 0..16 {
+                    mlo[bank][lane_base + i] = (words[i] & 0xff) as u8;
+                    mhi[bank][lane_base + i] = ((words[i] >> 8) & 0xff) as u8;
+                }
+            }
+        }
+
+        for (bank, (lo_bytes, hi_bytes)) in mlo.iter().zip(mhi.iter()).enumerate() {
+            let mlo_v = _mm512_loadu_si512(lo_bytes.as_ptr() as *const __m512i);
+            let mhi_v = _mm512_loadu_si512(hi_bytes.as_ptr() as *const __m512i);
+            let mut planes = [0u8; 16 * ELL];
+            for k in 0..16 {
+                let g0 =
+                    _mm512_gf2p8affine_epi64_epi8::<0>(mlo_v, _mm512_set1_epi64(mats.lo[k] as i64));
+                let g1 =
+                    _mm512_gf2p8affine_epi64_epi8::<0>(mhi_v, _mm512_set1_epi64(mats.hi[k] as i64));
+                _mm512_storeu_si512(
+                    planes.as_mut_ptr().add(k * ELL) as *mut __m512i,
+                    _mm512_xor_si512(g0, g1),
+                );
+            }
+            for lane in 0..ELL {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for k in 0..8 {
+                    lo |= (planes[k * ELL + lane] as u64) << (8 * k);
+                    hi |= (planes[(k + 8) * ELL + lane] as u64) << (8 * k);
+                }
+                partial_c[bank][lane] += F128 { lo, hi };
             }
         }
     }
@@ -770,6 +858,33 @@ mod tests {
             }
             assert_eq!(nibble, scalar, "nibble vs scalar n_b_med={n_b_med}");
             assert_eq!(gather, scalar, "gather vs scalar n_b_med={n_b_med}");
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn accumulate_c_banks_gfni_matches_scalar_linear_tables() {
+        let c_block = ranked_shape_c_block();
+        let mask_tables = xor_doubling_tables();
+        let mats = super::super::CBankGfniMats::new(&mask_tables);
+
+        for n_b_med in 0..=16 {
+            let mut scalar = nontrivial_partials();
+            let mut gfni = scalar;
+            let mut nibble = scalar;
+
+            accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut scalar);
+            unsafe {
+                super::accumulate_c_banks_x86_gfni(&c_block, n_b_med, &mats, &mut gfni);
+                accumulate_c_banks_x86_avx512_nibble(&c_block, n_b_med, &mask_tables, &mut nibble);
+            }
+            assert_eq!(gfni, scalar, "gfni vs scalar n_b_med={n_b_med}");
+            assert_eq!(nibble, scalar, "nibble vs scalar n_b_med={n_b_med}");
         }
     }
 

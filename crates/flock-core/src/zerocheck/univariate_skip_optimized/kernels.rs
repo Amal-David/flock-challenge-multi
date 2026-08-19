@@ -247,7 +247,6 @@ pub(super) fn accumulate_convert_ab_nomul_gfni(
     }
 }
 
-
 #[inline]
 pub(super) fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -324,6 +323,22 @@ fn c_nibble_lut_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C_NIBBLE").is_none())
 }
 
+/// Ranked default on GFNI hosts is the bit-matrix C drain. `FLOCK_NO_C_GFNI=1`
+/// falls back to the nibble/`vpermi2q` kernel. The ranked worker's cleared
+/// env never sets it, so the shipped behavior is ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn c_gfni_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_C_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// SoA form of the four 16-entry F₂-linear nibble tables used by DirectC.
 /// One table depends only on `eq_lo`, so round one can build it once and reuse
 /// it across every `x_hi` instead of reconstructing it in the hot drain.
@@ -354,10 +369,14 @@ impl CBankNibbleLut {
         debug_assert_eq!(mask_tables.len(), 512);
         let (t_lo, t_hi) = mask_tables.split_at(256);
         let mut lut = Self {
-            lo_n0_lo: [0; 16], lo_n0_hi: [0; 16],
-            lo_n1_lo: [0; 16], lo_n1_hi: [0; 16],
-            hi_n0_lo: [0; 16], hi_n0_hi: [0; 16],
-            hi_n1_lo: [0; 16], hi_n1_hi: [0; 16],
+            lo_n0_lo: [0; 16],
+            lo_n0_hi: [0; 16],
+            lo_n1_lo: [0; 16],
+            lo_n1_hi: [0; 16],
+            hi_n0_lo: [0; 16],
+            hi_n0_hi: [0; 16],
+            hi_n1_lo: [0; 16],
+            hi_n1_hi: [0; 16],
         };
         for i in 0..16 {
             lut.lo_n0_lo[i] = t_lo[i].lo;
@@ -380,7 +399,87 @@ impl CBankNibbleLut {
 ))]
 pub(super) fn build_c_bank_nibble_luts(mask_tables: &[super::F128]) -> Vec<CBankNibbleLut> {
     debug_assert_eq!(mask_tables.len() % 512, 0);
-    mask_tables.chunks_exact(512).map(CBankNibbleLut::new).collect()
+    mask_tables
+        .chunks_exact(512)
+        .map(CBankNibbleLut::new)
+        .collect()
+}
+
+/// Sixteen 8×8 GFNI matrices for each 256-entry XOR-doubling half of a C
+/// mask table. `T[byte] = Σ_j bit_j(byte)·T[1<<j]` is F₂-linear, so each half
+/// IS sixteen bit-matrices (one per output byte of the F128). 256 bytes
+/// replaces the 8 KiB table + 512-byte nibble LUT.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[repr(C, align(64))]
+pub(super) struct CBankGfniMats {
+    pub(super) lo: [u64; 16],
+    pub(super) hi: [u64; 16],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn f2_linear_byte_mats(basis: [super::F128; 8]) -> [u64; 16] {
+    let mut mats = [0u64; 16];
+    for (k, mat) in mats.iter_mut().enumerate() {
+        let mut qword = 0u64;
+        for i in 0..8 {
+            let bit_index = 8 * k + i;
+            let mut row = 0u8;
+            for (j, b) in basis.iter().enumerate() {
+                let bit = if bit_index < 64 {
+                    (b.lo >> bit_index) & 1
+                } else {
+                    (b.hi >> (bit_index - 64)) & 1
+                };
+                row |= (bit as u8) << j;
+            }
+            qword |= (row as u64) << (8 * (7 - i));
+        }
+        *mat = qword;
+    }
+    mats
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+impl CBankGfniMats {
+    pub(super) fn new(mask_tables: &[super::F128]) -> Self {
+        debug_assert_eq!(mask_tables.len(), 512);
+        let (t_lo, t_hi) = mask_tables.split_at(256);
+        let basis_lo = std::array::from_fn(|j| t_lo[1 << j]);
+        let basis_hi = std::array::from_fn(|j| t_hi[1 << j]);
+        Self {
+            lo: f2_linear_byte_mats(basis_lo),
+            hi: f2_linear_byte_mats(basis_hi),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(super) fn build_c_bank_gfni_mats(mask_tables: &[super::F128]) -> Vec<CBankGfniMats> {
+    debug_assert_eq!(mask_tables.len() % 512, 0);
+    mask_tables
+        .chunks_exact(512)
+        .map(CBankGfniMats::new)
+        .collect()
 }
 
 #[cfg(all(
@@ -394,18 +493,31 @@ pub(super) fn accumulate_c_banks_prebuilt(
     n_b_med: usize,
     mask_tables: &[super::F128],
     lut: &CBankNibbleLut,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    gfni: &CBankGfniMats,
     partial_c: &mut [[super::F128; 64]; 8],
 ) {
     // SAFETY: cfg supplies the features and fixed arrays bound all accesses.
     unsafe {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if c_gfni_enabled() {
+            x86_64::accumulate_c_banks_x86_gfni(c_block, n_b_med, gfni, partial_c);
+            return;
+        }
         if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(
-                c_block, n_b_med, lut, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, lut, partial_c);
         } else {
-            x86_64::accumulate_c_banks_x86_avx512(
-                c_block, n_b_med, mask_tables, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512(c_block, n_b_med, mask_tables, partial_c);
         }
     }
 }
@@ -429,6 +541,17 @@ pub(super) fn accumulate_c_banks(
     // SAFETY: the cfg gate supplies the SIMD features; the fixed-size C and
     // partial arrays and the asserted 512-entry table bound every access.
     unsafe {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if c_gfni_enabled() {
+            let mats = CBankGfniMats::new(mask_tables);
+            x86_64::accumulate_c_banks_x86_gfni(c_block, n_b_med, &mats, partial_c);
+            return;
+        }
         if c_nibble_lut_enabled() {
             x86_64::accumulate_c_banks_x86_avx512_nibble(c_block, n_b_med, mask_tables, partial_c);
         } else {

@@ -32,11 +32,11 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{mul_by_x, phi8, F128, F8, PHI_8_TABLE};
 use crate::ntt::InvNttTableByteSingleGf8;
 
+use super::univariate_skip::{ntt_extend_f128_vec_ghash, pack_bits, SplitEqGhash};
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
 
@@ -202,8 +202,7 @@ pub(crate) fn d_inv() -> F128 {
 fn ab_eq_fold_gfni_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_ZC_AB_EQ_FOLD").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
+        std::env::var_os("FLOCK_NO_ZC_AB_EQ_FOLD").as_deref() != Some(std::ffi::OsStr::new("1"))
     })
 }
 
@@ -245,8 +244,7 @@ fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
     let mut mats = vec![0u64; eq_top_scaled.len() * 256];
     for (w, scale) in eq_top_scaled.iter().enumerate() {
         for bm in 0..16 {
-            let basis: [F128; 8] =
-                std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
+            let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
             for k in 0..16 {
                 let mut qword = 0u64;
                 for i in 0..8 {
@@ -297,7 +295,6 @@ fn build_convert_table() -> Vec<F128> {
 pub(crate) fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
-
 
 const C_MASK_TABLE_STRIDE: usize = 512;
 
@@ -983,11 +980,10 @@ pub(crate) fn process_one_x_hi_with_s_hat_v(
             &mut state.partial_ab,
         );
         // SAFETY: `[[u8; 64]; 16]` is contiguous and has exactly 1024 bytes.
-        let c_block: &[u8; 16 * 64] = unsafe {
-            &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>()
-        };
-        let c_tables = &mask_tables
-            [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        let c_block: &[u8; 16 * 64] =
+            unsafe { &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>() };
+        let c_tables =
+            &mask_tables[x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
         kernels::accumulate_c_banks(c_block, n_b_med, c_tables, &mut state.partial_c);
     }
     for lane in 0..ELL {
@@ -1018,6 +1014,13 @@ fn process_one_x_hi_with_precomputed_ab(
         target_feature = "vpclmulqdq"
     ))]
     c_nibble_luts: &[kernels::CBankNibbleLut],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    c_gfni_mats: &[kernels::CBankGfniMats],
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.fill(F128::ZERO);
@@ -1034,8 +1037,7 @@ fn process_one_x_hi_with_precomputed_ab(
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med]
-                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
@@ -1049,11 +1051,10 @@ fn process_one_x_hi_with_precomputed_ab(
             &mut state.partial_ab,
         );
         // SAFETY: `[[u8; 64]; 16]` is contiguous and has exactly 1024 bytes.
-        let c_block: &[u8; 16 * 64] = unsafe {
-            &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>()
-        };
-        let c_tables = &mask_tables
-            [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        let c_block: &[u8; 16 * 64] =
+            unsafe { &*state.chunk_c_bytes.as_ptr().cast::<[u8; 16 * 64]>() };
+        let c_tables =
+            &mask_tables[x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -1064,6 +1065,13 @@ fn process_one_x_hi_with_precomputed_ab(
             n_b_med,
             c_tables,
             &c_nibble_luts[x_outer_lo],
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            &c_gfni_mats[x_outer_lo],
             &mut state.partial_c,
         );
         #[cfg(not(all(
@@ -1229,9 +1237,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     (res_ab.to_vec(), res_c_lifted)
 }
 
-fn finish_c_banks(
-    banks: &[[F128; ELL]; N_C_BANKS],
-) -> ([F128; ELL], Vec<F128>, Vec<F128>) {
+fn finish_c_banks(banks: &[[F128; ELL]; N_C_BANKS]) -> ([F128; ELL], Vec<F128>, Vec<F128>) {
     let alpha = phi8(F8(0x02));
     let mut alpha_pow = [F128::ONE; N_C_BANKS];
     for k in 1..N_C_BANKS {
@@ -1240,7 +1246,11 @@ fn finish_c_banks(
     let mut res_c_s_0 = [F128::ZERO; ELL];
     let mut res_c_s_1 = [F128::ZERO; ELL];
     for (k, bank) in banks.iter().enumerate() {
-        let target = if k & 1 == 0 { &mut res_c_s_0 } else { &mut res_c_s_1 };
+        let target = if k & 1 == 0 {
+            &mut res_c_s_0
+        } else {
+            &mut res_c_s_1
+        };
         for lane in 0..ELL {
             target[lane] += alpha_pow[k] * bank[lane];
         }
@@ -1282,8 +1292,14 @@ fn finish_c_banks(
 /// are unchanged. See module-level docs for the F_2-linearity argument that
 /// makes `s_hat_v_c[(λ, 0)] + s_hat_v_c[(λ, 1)] · α == res_c_s_opt[λ]`.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], m: usize, k_skip: usize,
-    r: &[F128], inv_table: &InvNttTableByteSingleGf8, padding: &PaddingSpec,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     let (ab, c, s, _) = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
         a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
@@ -1292,8 +1308,14 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 }
 
 pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
-    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], m: usize, k_skip: usize,
-    r: &[F128], inv_table: &InvNttTableByteSingleGf8, padding: &PaddingSpec,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_s_hat_v_impl(
         a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
@@ -1344,9 +1366,20 @@ pub(crate) fn round1_with_s_hat_v_impl(
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             process_one_x_hi_with_s_hat_v(
-                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
-                a_packed, b_packed, c_packed, inv_table, &eq_lo_scaled, eq.hi[x_hi],
-                convert, &mask_tables, &mut state,
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                &mask_tables,
+                &mut state,
             );
             state
         })
@@ -1354,9 +1387,13 @@ pub(crate) fn round1_with_s_hat_v_impl(
         .reduce(
             || ([F128::ZERO; ELL], Box::new([[F128::ZERO; ELL]; N_C_BANKS])),
             |(mut ab1, mut c1), (ab2, c2)| {
-                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
                 for (left, right) in c1.iter_mut().zip(c2.iter()) {
-                    for i in 0..ELL { left[i] += right[i]; }
+                    for i in 0..ELL {
+                        left[i] += right[i];
+                    }
                 }
                 (ab1, c1)
             },
@@ -1378,20 +1415,31 @@ pub(crate) fn round1_with_s_hat_v_impl(
 /// season-1 URM kernel, which is bit-identical per x_hi to the precomputed
 /// path, so the XOR merge is exact for any split point.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-    ab_inner: &mut Round1AbInner, a_packed: &[u8], b_packed: &[u8], c_packed: &[u8],
-    m: usize, k_skip: usize, r: &[F128], inv_table: &InvNttTableByteSingleGf8,
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
-    let (ab, c, s, _) =
-        round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-            ab_inner, a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
-        );
+    let (ab, c, s, _) = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+        ab_inner, a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+    );
     (ab, c, s)
 }
 
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-    ab_inner: &mut Round1AbInner, a_packed: &[u8], b_packed: &[u8], c_packed: &[u8],
-    m: usize, k_skip: usize, r: &[F128], inv_table: &InvNttTableByteSingleGf8,
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     round1_with_precomputed_ab_impl(
@@ -1440,14 +1488,29 @@ pub(crate) fn round1_with_precomputed_ab_impl(
         target_feature = "vpclmulqdq"
     ))]
     let c_nibble_luts = kernels::build_c_bank_nibble_luts(&mask_tables);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let c_gfni_mats = kernels::build_c_bank_gfni_mats(&mask_tables);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
     let (res_ab, banks) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             process_one_x_hi_with_precomputed_ab(
-                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
-                ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
                 &mask_tables,
                 #[cfg(all(
                     target_arch = "x86_64",
@@ -1455,6 +1518,13 @@ pub(crate) fn round1_with_precomputed_ab_impl(
                     target_feature = "vpclmulqdq"
                 ))]
                 &c_nibble_luts,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                &c_gfni_mats,
                 &mut state,
             );
             state
@@ -1463,9 +1533,13 @@ pub(crate) fn round1_with_precomputed_ab_impl(
         .reduce(
             || ([F128::ZERO; ELL], Box::new([[F128::ZERO; ELL]; N_C_BANKS])),
             |(mut ab1, mut c1), (ab2, c2)| {
-                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
                 for (left, right) in c1.iter_mut().zip(c2.iter()) {
-                    for i in 0..ELL { left[i] += right[i]; }
+                    for i in 0..ELL {
+                        left[i] += right[i];
+                    }
                 }
                 (ab1, c1)
             },
@@ -1503,8 +1577,14 @@ pub(crate) const N_C_Q: usize = 4;
 
 /// `D_hi⁻¹ = ((1+γ⁴)(1+γ⁸))⁻¹` — the high-medium half of [`d_inv`].
 fn compute_d_hi_inv() -> F128 {
-    let g4 = F128 { lo: 1u64 << 4, hi: 0 };
-    let g8 = F128 { lo: 1u64 << 8, hi: 0 };
+    let g4 = F128 {
+        lo: 1u64 << 4,
+        hi: 0,
+    };
+    let g8 = F128 {
+        lo: 1u64 << 8,
+        hi: 0,
+    };
     ((F128::ONE + g4) * (F128::ONE + g8)).inv()
 }
 
@@ -1638,6 +1718,13 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
         target_feature = "vpclmulqdq"
     ))]
     c_nibble_luts: &[kernels::CBankNibbleLut],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    c_gfni_mats: &[kernels::CBankGfniMats],
     eq_fold: Option<(&[F128], &[u64], usize)>,
     state: &mut WorkerStateFold4,
 ) {
@@ -1668,8 +1755,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             let x_outer_lo = 4 * group + w;
             let x_outer = x_outer_lo | (x_hi << n_lo);
             let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-            let chunk_byte_base =
-                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
             // C rows: live rows transposed into their (q, 4w+j) slot, dead rows zeroed.
             for b_med in 0..(1 << N_MEDIUM) {
                 let q = b_med & 3;
@@ -1762,6 +1848,13 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 1 << N_MEDIUM,
                 c_tables,
                 &c_nibble_luts[group],
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                &c_gfni_mats[group],
                 &mut state.partial_c4[q],
             );
             #[cfg(not(all(
@@ -1874,6 +1967,13 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         target_feature = "vpclmulqdq"
     ))]
     let c_nibble_luts = kernels::build_c_bank_nibble_luts(&fold4_tables);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let c_gfni_mats = kernels::build_c_bank_gfni_mats(&fold4_tables);
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
     // Eq-folded GFNI AB drain: factor `eq_lo_scaled` into `eq_top * eq_bot`
@@ -1912,8 +2012,16 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
             )))]
             let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
             process_one_x_hi_with_precomputed_ab_fold4(
-                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask, &b_med_counts,
-                ab_inner_bytes, c_packed, &eq_lo_scaled, eq.hi[x_hi], convert,
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
                 &fold4_tables,
                 #[cfg(all(
                     target_arch = "x86_64",
@@ -1921,6 +2029,13 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                     target_feature = "vpclmulqdq"
                 ))]
                 &c_nibble_luts,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                &c_gfni_mats,
                 eq_fold_arg,
                 &mut state,
             );
@@ -1928,12 +2043,21 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         })
         .map(|s| (s.local_res_ab, s.local_res_c4))
         .reduce(
-            || ([F128::ZERO; ELL], Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q])),
+            || {
+                (
+                    [F128::ZERO; ELL],
+                    Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
+                )
+            },
             |(mut ab1, mut c1), (ab2, c2)| {
-                for i in 0..ELL { ab1[i] += ab2[i]; }
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
                 for (lq, rq) in c1.iter_mut().zip(c2.iter()) {
                     for (left, right) in lq.iter_mut().zip(rq.iter()) {
-                        for i in 0..ELL { left[i] += right[i]; }
+                        for i in 0..ELL {
+                            left[i] += right[i];
+                        }
                     }
                 }
                 (ab1, c1)
@@ -2267,8 +2391,8 @@ mod tests {
     ///     (this is the only shape that exercises the full-skip case.)
     #[test]
     fn padded_matches_dense_with_zero_padding() {
-        use crate::zerocheck::PaddingSpec;
         use crate::zerocheck::univariate_skip::pack_bits;
+        use crate::zerocheck::PaddingSpec;
 
         // (k_log, useful_bits, n_blocks_log) — pick n_blocks_log so
         // m = k_log + n_blocks_log is small enough to keep the test fast
@@ -2457,7 +2581,8 @@ mod tests {
                 "x2 window 0 disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
             );
             assert_eq!(
-                out_scalar_1, out_x2_1,
+                out_scalar_1,
+                out_x2_1,
                 "x2 window 1 disagrees with scalar at (base={chunk_byte_base}, b_med={})",
                 b_med + 1
             );
@@ -2772,28 +2897,10 @@ mod tests {
             let hi_size = 1usize << SplitEqGhash::new(&r[K_SKIP + N_INNER..]).n_hi;
             let g = (hi_size / 2).max(1);
 
-            let pure_cpu = round1_with_s_hat_v_impl(
-                &a,
-                &b,
-                &c,
-                m,
-                K_SKIP,
-                &r,
-                &inv_table,
-                &padding,
-                Some(0),
-            );
-            let split = round1_with_s_hat_v_impl(
-                &a,
-                &b,
-                &c,
-                m,
-                K_SKIP,
-                &r,
-                &inv_table,
-                &padding,
-                Some(g),
-            );
+            let pure_cpu =
+                round1_with_s_hat_v_impl(&a, &b, &c, m, K_SKIP, &r, &inv_table, &padding, Some(0));
+            let split =
+                round1_with_s_hat_v_impl(&a, &b, &c, m, K_SKIP, &r, &inv_table, &padding, Some(g));
             assert_eq!(split, pure_cpu, "s_hat_v split mismatch at m={m} g={g}");
 
             let mut precomputed =
@@ -2939,7 +3046,10 @@ mod tests {
                             c[index] = false;
                         }
                     }
-                    PaddingSpec { k_log, useful_bits_per_block: useful_bits }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
                 }
             };
             let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
@@ -2952,11 +3062,18 @@ mod tests {
             assert_eq!(fused.3.len(), 4 * 2 * ELL);
             assert_eq!(collapse_s_hat_v_quad(&fused.3, &low_point), fused.2);
 
-            let mut precomputed = precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, m, K_SKIP, &table, &padding,
-            );
+            let mut precomputed =
+                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding);
             let pre = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-                &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                &mut precomputed,
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
             );
             assert_eq!(pre, fused, "precomputed DirectC mismatch at m={m}");
         }
@@ -2983,9 +3100,17 @@ mod tests {
         assert!(c_fold4_capture_available(32, K_SKIP));
         // Collapse weights are exactly eq(β₀,β₁; q) = X^q·D_lo⁻¹.
         let w = c_fold4_q_weights();
-        let d_lo_inv = ((F128::ONE + F128 { lo: 2, hi: 0 }) * (F128::ONE + F128 { lo: 4, hi: 0 })).inv();
+        let d_lo_inv =
+            ((F128::ONE + F128 { lo: 2, hi: 0 }) * (F128::ONE + F128 { lo: 4, hi: 0 })).inv();
         for q in 0..4usize {
-            assert_eq!(w[q], F128 { lo: 1u64 << q, hi: 0 } * d_lo_inv, "q weight {q}");
+            assert_eq!(
+                w[q],
+                F128 {
+                    lo: 1u64 << q,
+                    hi: 0
+                } * d_lo_inv,
+                "q weight {q}"
+            );
         }
         assert_eq!(d_hi_inv() * d_lo_inv, d_inv(), "D⁻¹ = D_lo⁻¹·D_hi⁻¹");
 
@@ -3012,29 +3137,49 @@ mod tests {
                             c[index] = false;
                         }
                     }
-                    PaddingSpec { k_log, useful_bits_per_block: useful_bits }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
                 }
             };
             let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
             let outer = rng.f128_vec(m - K_SKIP - N_INNER);
             let r = build_protocol_r(m, &outer);
             let table = make_inv_table();
-            let mut precomputed = precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, m, K_SKIP, &table, &padding,
-            );
+            let mut precomputed =
+                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding);
             let quad_route = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-                &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                &mut precomputed,
+                &a_p,
+                &b_p,
+                &c_p,
+                m,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
             );
-            let mut precomputed4 = precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, m, K_SKIP, &table, &padding,
-            );
+            let mut precomputed4 =
+                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding);
             let (ab, c_l, s_hat_v_c, quad_c, fold4_c) =
                 round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                    &mut precomputed4, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                    &mut precomputed4,
+                    &a_p,
+                    &b_p,
+                    &c_p,
+                    m,
+                    K_SKIP,
+                    &r,
+                    &table,
+                    &padding,
                 );
             assert_eq!(ab, quad_route.0, "fold4 route AB mismatch at m={m}");
             assert_eq!(c_l, quad_route.1, "fold4 route C-lifted mismatch at m={m}");
-            assert_eq!(s_hat_v_c, quad_route.2, "fold4 route s_hat_v_c mismatch at m={m}");
+            assert_eq!(
+                s_hat_v_c, quad_route.2,
+                "fold4 route s_hat_v_c mismatch at m={m}"
+            );
             assert_eq!(quad_c, quad_route.3, "fold4 route quad_c mismatch at m={m}");
             assert_eq!(fold4_c.len(), 16 * 2 * ELL);
             assert_eq!(
@@ -3051,10 +3196,13 @@ mod tests {
                     for q in 0..4 {
                         acc += w[q] * fold4_c[(e + 4 * q) * n_packed + packed];
                     }
-                    assert_eq!(acc, quad_c[e * n_packed + packed], "bank collapse e={e} p={packed}");
+                    assert_eq!(
+                        acc,
+                        quad_c[e * n_packed + packed],
+                        "bank collapse e={e} p={packed}"
+                    );
                 }
             }
         }
     }
-
 }
