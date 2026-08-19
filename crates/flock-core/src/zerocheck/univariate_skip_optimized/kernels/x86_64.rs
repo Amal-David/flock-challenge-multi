@@ -901,3 +901,68 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
         }
     }
 }
+
+/// `dst[i] += eq_hi · src[i]` for every 128-bit lane, four at a time.
+///
+/// `eq_hi` is constant for the whole `x_hi` band, so the `x^64` companion
+/// (`t·x^64 mod p`) is built once and reused. Each four-lane product is
+/// [`ghash_mul_x4_split`] — field-identical to four scalar `F128` muls
+/// (the in-tree NTT test `ghash_mul_x4_split` ≡ `ghash_mul_x4`), then
+/// XOR-accumulated into `dst`. Destinations are independent: there is
+/// nothing to defer-reduce, so `WideGhashX4` would only add a reduce.
+///
+/// # Safety
+/// `dst`/`src` same length, multiple of 4, every four-lane load/store
+/// in-bounds. `avx512f` + `vpclmulqdq` from the cfg gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn fold_eq_hi_broadcast_split_x4(
+    dst: &mut [F128],
+    src: &[F128],
+    t: core::arch::x86_64::__m512i,
+    t_x64: core::arch::x86_64::__m512i,
+) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(dst.len(), src.len());
+    debug_assert_eq!(dst.len() % 4, 0);
+    // SAFETY: caller supplies the target features and equal, 4-aligned slices.
+    unsafe {
+        let mut i = 0;
+        while i < src.len() {
+            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let prod = ghash_mul_x4_split(v, t, t_x64);
+            let dptr = dst.as_mut_ptr().add(i) as *mut __m512i;
+            _mm512_storeu_si512(
+                dptr,
+                _mm512_xor_si512(_mm512_loadu_si512(dptr), prod),
+            );
+            i += 4;
+        }
+    }
+}
+
+/// Broadcast `eq_hi` and its `x^64` companion across four 128-bit lanes.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` from the cfg gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn eq_hi_split_broadcast(
+    eq_hi: F128,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_shift64_x4};
+    // SAFETY: cfg gate; `f128x4_set` / `ghash_shift64_x4` are register-only.
+    unsafe {
+        let t = f128x4_set(eq_hi, eq_hi, eq_hi, eq_hi);
+        (t, ghash_shift64_x4(t))
+    }
+}

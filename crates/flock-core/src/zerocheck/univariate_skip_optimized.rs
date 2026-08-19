@@ -1791,6 +1791,38 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             }
         }
     }
+    // Outer fold by eq_hi. The scalar is one GHASH per (lane, bank); on
+    // ranked SPR the same products are four-wide `ghash_mul_x4_split` with
+    // a single `x^64` companion for the whole band (AB + 4×8 C banks).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        let (t, t_x64) = kernels::eq_hi_split_broadcast(eq_hi_val);
+        kernels::fold_eq_hi_broadcast_split_x4(
+            &mut state.local_res_ab,
+            &state.partial_ab,
+            t,
+            t_x64,
+        );
+        for q in 0..N_C_Q {
+            for bank in 0..N_C_BANKS {
+                kernels::fold_eq_hi_broadcast_split_x4(
+                    &mut state.local_res_c4[q][bank],
+                    &state.partial_c4[q][bank],
+                    t,
+                    t_x64,
+                );
+            }
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         for q in 0..N_C_Q {

@@ -412,6 +412,41 @@ pub(super) fn accumulate_c_banks_prebuilt(
     }
 }
 
+/// `dst[i] += eq_hi · src[i]` via the SPR split-companion 4-lane product.
+/// Companion is computed once by the caller (`eq_hi_split_broadcast`) and
+/// reused across the AB vector and every C bank of one `x_hi`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn fold_eq_hi_broadcast_split_x4(
+    dst: &mut [super::F128],
+    src: &[super::F128],
+    t: core::arch::x86_64::__m512i,
+    t_x64: core::arch::x86_64::__m512i,
+) {
+    // SAFETY: cfg supplies the features; slices are ELL=64 (multiple of 4)
+    // from the fold4 worker arrays.
+    unsafe {
+        x86_64::fold_eq_hi_broadcast_split_x4(dst, src, t, t_x64);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn eq_hi_split_broadcast(
+    eq_hi: super::F128,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    // SAFETY: cfg supplies avx512f+vpclmulqdq.
+    unsafe { x86_64::eq_hi_split_broadcast(eq_hi) }
+}
+
 /// Accumulate the eight alpha-free C banks from already-transposed C rows.
 #[inline]
 pub(super) fn accumulate_c_banks(
