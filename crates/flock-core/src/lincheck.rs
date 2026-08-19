@@ -932,6 +932,21 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_FUSED_GFNI=1` restores the `transposed[8×128]` store→reload
+/// between gather+transpose and [`kernels::gfni_fold_tile`]. The gather
+/// itself stays on (`FLOCK_NO_LC_GATHER_TR` still owns that).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lc_fused_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FUSED_GFNI").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -1013,6 +1028,8 @@ fn fold_block_major_gfni(
             // scalar path stays as the kill-switch arm.
             #[cfg(target_feature = "avx512vbmi")]
             let gather_tr_fused = lc_gather_tr_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let fused_gfni = lc_fused_gfni_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1036,6 +1053,23 @@ fn fold_block_major_gfni(
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
+                    #[cfg(target_feature = "avx512vbmi")]
+                    if gather_tr_fused && fused_gfni {
+                        // SAFETY: same eight gather indices as the staged
+                        // loop below; planes cover n_blocks64 * 1024 bytes.
+                        unsafe {
+                            kernels::gather_transpose_gfni_fold_chunk(
+                                z_packed.as_ptr(),
+                                stripe_base,
+                                q,
+                                chunks_per_block,
+                                chunk_bits.div_ceil(64),
+                                &mats,
+                                wplanes.as_mut_ptr().add(2 * q * 1024),
+                            );
+                        }
+                        continue;
+                    }
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
                         let outer_base = 8 * (stripe_base + t);
                         #[cfg(target_feature = "avx512vbmi")]
@@ -3008,6 +3042,67 @@ mod tests {
                 kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
             }
             assert_eq!(want, got, "stride {stride}");
+        }
+    }
+
+    /// Register handoff of gather ZMMs into the GFNI drain equals the
+    /// staged `transposed[8×128]` store→reload used by the kill-switch arm.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gather_transpose_gfni_fold_matches_staged() {
+        let mut rng = Rng::new(0xF01D_C0DE);
+        let n_outer = 64usize;
+        let chunks_per_block = 2usize;
+        let stripe_base = 0usize;
+        let z: Vec<F128> = (0..n_outer * chunks_per_block).map(|_| rng.f128()).collect();
+        let mut mats = [0u64; 128];
+        for t in 0..8 {
+            let eq8: [F128; 8] = std::array::from_fn(|_| rng.f128());
+            kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+        }
+        for (q, n_blocks64) in [(0usize, 2usize), (1, 1)] {
+            let mut transposed = [0u8; 8 * 128];
+            for t in 0..8 {
+                let outer_base = 8 * (stripe_base + t);
+                unsafe {
+                    kernels::gather_transpose_stripe_x86(
+                        z.as_ptr().add(outer_base * chunks_per_block + q),
+                        chunks_per_block,
+                        transposed.as_mut_ptr().add(t * 128),
+                    );
+                }
+            }
+            let mut staged = [0u8; 2048];
+            let mut fused = [0u8; 2048];
+            unsafe {
+                kernels::gfni_fold_tile(
+                    transposed.as_ptr(),
+                    128,
+                    n_blocks64,
+                    &mats,
+                    staged.as_mut_ptr(),
+                );
+                kernels::gather_transpose_gfni_fold_chunk(
+                    z.as_ptr(),
+                    stripe_base,
+                    q,
+                    chunks_per_block,
+                    n_blocks64,
+                    &mats,
+                    fused.as_mut_ptr(),
+                );
+            }
+            let n = n_blocks64 * 1024;
+            assert_eq!(
+                &staged[..n],
+                &fused[..n],
+                "q={q} n_blocks64={n_blocks64}"
+            );
         }
     }
 

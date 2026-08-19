@@ -34,4 +34,4 @@ pub(crate) use x86_64::{fold_mats_from_basis, gfni_fold_tile};
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-pub(crate) use x86_64::gather_transpose_stripe_x86;
+pub(crate) use x86_64::{gather_transpose_gfni_fold_chunk, gather_transpose_stripe_x86};
