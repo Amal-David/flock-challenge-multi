@@ -207,6 +207,45 @@ fn ab_eq_fold_gfni_enabled() -> bool {
     })
 }
 
+/// Kill switch for the 4-lane deferred-reduction `eq_bot` fold. Ranked
+/// workers are `env_clear()`ed, so the shipped path is ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn ab_eq_bot_wide_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_EQ_BOT_WIDE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Incumbent band-end fold: reassemble each bank's 64 F128 lanes from the
+/// 16 byte planes and apply one *reduced* `eq_bot[u]` multiply per lane.
+fn fold_eq_bot_plane_banks_scalar(
+    eq_bot: &[F128],
+    plane_banks: &[u8],
+    partial_ab: &mut [F128; ELL],
+) {
+    for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+        let bank = &plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
+        for lane in 0..ELL {
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for k in 0..8 {
+                lo |= (bank[k * ELL + lane] as u64) << (8 * k);
+            }
+            for k in 8..16 {
+                hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
+            }
+            partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
+        }
+    }
+}
+
 /// Tensor factors of the scaled lo-eq weight for a `bank_bits = s` split:
 /// `eq_lo_scaled[(w << s) | u] == eq_top_scaled[w] * eq_bot[u]` — `build_eq`
 /// gives index bit `i` to `r_lo[i]`, so the low `s` index bits are exactly
@@ -1774,22 +1813,28 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     }
     // Band-end plane fold for the eq-folded arm: reassemble each bank's
     // F128 lanes and apply `eq_bot[u]` once per bank — the same sums the
-    // per-chunk multiply produced, reassociated.
+    // per-chunk multiply produced, reassociated. Default path defers the
+    // GHASH reduction across every bank (`WideGhashX4`); kill switch
+    // `FLOCK_NO_ZC_AB_EQ_BOT_WIDE=1` restores the per-product scalar mul.
     if let Some((eq_bot, _, _)) = eq_fold {
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank = &state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
-            for lane in 0..ELL {
-                let mut lo = 0u64;
-                let mut hi = 0u64;
-                for k in 0..8 {
-                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
-                }
-                for k in 8..16 {
-                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
-                }
-                state.partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
-            }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if ab_eq_bot_wide_enabled() {
+            kernels::fold_eq_bot_plane_banks(&state.plane_banks, eq_bot, &mut state.partial_ab);
+        } else {
+            fold_eq_bot_plane_banks_scalar(eq_bot, &state.plane_banks, &mut state.partial_ab);
         }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        fold_eq_bot_plane_banks_scalar(eq_bot, &state.plane_banks, &mut state.partial_ab);
     }
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];

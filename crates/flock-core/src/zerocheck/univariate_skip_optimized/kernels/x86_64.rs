@@ -665,8 +665,9 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
 mod tests {
     use super::super::accumulate_c_banks_scalar;
     use super::{
-        accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
-        accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble, F128,
+        ELL, F128, accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
+        accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble,
+        fold_eq_bot_plane_banks_x86,
     };
 
     #[test]
@@ -806,6 +807,43 @@ mod tests {
             assert_eq!(nibble, gpr, "n_b_med={n_b_med}");
         }
     }
+
+    #[test]
+    fn fold_eq_bot_wide_matches_scalar() {
+        const N_BANKS: usize = 8;
+        let mut planes = vec![0u8; N_BANKS * 16 * ELL];
+        for (i, b) in planes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(0x5d) ^ (i >> 5) as u8;
+        }
+        let mut eq_bot = [F128::ZERO; N_BANKS];
+        for (i, v) in eq_bot.iter_mut().enumerate() {
+            let x = i as u64 + 1;
+            *v = F128::new(
+                x.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                x.rotate_left(17).wrapping_mul(0xd6e8_feb8_6659_fd93),
+            );
+        }
+        let mut wide = [F128::ZERO; ELL];
+        let mut scalar = [F128::ZERO; ELL];
+        unsafe {
+            fold_eq_bot_plane_banks_x86(&planes, &eq_bot, &mut wide);
+        }
+        for (u, eq) in eq_bot.iter().enumerate() {
+            let bank = &planes[u * 16 * ELL..(u + 1) * 16 * ELL];
+            for lane in 0..ELL {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for k in 0..8 {
+                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
+                }
+                for k in 8..16 {
+                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
+                }
+                scalar[lane] += *eq * F128 { lo, hi };
+            }
+        }
+        assert_eq!(wide, scalar);
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -868,6 +906,65 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
                 acc = _mm512_xor_si512(acc, g);
             }
             _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+/// Band-end fold `partial_ab[lane] += Σ_u eq_bot[u] · bank_u[lane]`.
+///
+/// Each bank is byte-plane-major (`bank[k*ELL + lane]` = byte `k` of that
+/// lane's F128). The incumbent applies one *reduced* scalar GHASH per
+/// `(bank, lane)`. Reduction over `F₂[x]/(x^128+x^7+x^2+x+1)` is
+/// F₂-linear, so XOR-accumulating the unreduced 4-CLMUL products in
+/// [`crate::field::gf2_128::x86_64::WideGhashX4`] and reducing once per
+/// 4-lane group after every bank equals the XOR of the individually
+/// reduced products — bit-identical, not merely equal. At the ranked
+/// `s = 7` shape that is 128 reductions → 1 per 4-lane group, and
+/// 4-wide `VPCLMULQDQ` instead of scalar `pclmulqdq`.
+///
+/// # Safety
+/// `plane_banks.len() == eq_bot.len() * 16 * ELL`. Caller guarantees
+/// `avx512f` + `vpclmulqdq` (statically satisfied by the cfg gate).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn fold_eq_bot_plane_banks_x86(
+    plane_banks: &[u8],
+    eq_bot: &[F128],
+    partial_ab: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_set};
+    use core::arch::x86_64::*;
+    debug_assert_eq!(plane_banks.len(), eq_bot.len() * 16 * ELL);
+    // SAFETY: bounds checked by the debug_assert / caller contract; the
+    // cfg + target_feature attrs supply the SIMD ISA.
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); ELL / 4];
+        for (u, eq) in eq_bot.iter().enumerate() {
+            let bank = plane_banks.as_ptr().add(u * 16 * ELL);
+            let eqv = _mm512_broadcast_i32x4(_mm_set_epi64x(eq.hi as i64, eq.lo as i64));
+            for g in 0..(ELL / 4) {
+                let lane = g * 4;
+                let mut v = [F128::ZERO; 4];
+                for i in 0..4 {
+                    let mut lo = 0u64;
+                    let mut hi = 0u64;
+                    for k in 0..8 {
+                        lo |= (*bank.add(k * ELL + lane + i) as u64) << (8 * k);
+                        hi |= (*bank.add((k + 8) * ELL + lane + i) as u64) << (8 * k);
+                    }
+                    v[i] = F128 { lo, hi };
+                }
+                acc[g].mul_acc(eqv, f128x4_set(v[0], v[1], v[2], v[3]));
+            }
+        }
+        for g in 0..(ELL / 4) {
+            let dest = partial_ab.as_mut_ptr().add(g * 4) as *mut __m512i;
+            let old = _mm512_loadu_si512(dest as *const __m512i);
+            _mm512_storeu_si512(dest, _mm512_xor_si512(old, acc[g].reduce_lanes()));
         }
     }
 }

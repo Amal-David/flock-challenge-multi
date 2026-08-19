@@ -247,6 +247,26 @@ pub(super) fn accumulate_convert_ab_nomul_gfni(
     }
 }
 
+/// Band-end `eq_bot` fold over byte-plane banks. See the x86 kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn fold_eq_bot_plane_banks(
+    plane_banks: &[u8],
+    eq_bot: &[super::F128],
+    partial_ab: &mut [super::F128; 64],
+) {
+    // SAFETY: caller is the fold4 eq-folded arm; `plane_banks` is sized
+    // `eq_bot.len() * 16 * 64` and the cfg gate supplies AVX-512+VPCLMUL.
+    unsafe {
+        x86_64::fold_eq_bot_plane_banks_x86(plane_banks, eq_bot, partial_ab);
+    }
+}
+
 
 #[inline]
 pub(super) fn accumulate_convert_ab(
