@@ -326,7 +326,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
     );
     (proof, claim)
 }
@@ -347,7 +347,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
     );
     (
         proof,
@@ -387,6 +387,42 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         padding,
         true,
         Some(ab_inner),
+        None,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Ranked identity-C specialization of
+/// [`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab`]. The extra
+/// buffer is the packed witness itself (C = z at the ranked shape); it lets
+/// round one derive the legacy C message and every RingSwitch capture from a
+/// single block-major outer fold instead of draining the witness into 32 field
+/// banks. Proof and transcript stay byte-identical to the Fold4 path.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(c_identity_z),
         challenger,
     );
     (
@@ -405,6 +441,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
+    c_identity_z: Option<&[F128]>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -464,7 +501,62 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if crate::pcs::ranked_direct_fold4_enabled()
+        if let Some(c_identity_z) = c_identity_z {
+            // Ranked identity-C: AB completes without touching `c_packed`, and
+            // C's message plus all three capture tensors come from one
+            // block-major outer fold of the witness. Both halves are
+            // bit-identical to the fused Fold4 kernel's outputs; the caller's
+            // gate pins the shape.
+            assert_eq!(padding.k_log, 14, "identity-C reuse fixes k_log=14");
+            assert!(
+                crate::pcs::ranked_direct_fold4_enabled(),
+                "identity-C reuse requires ranked DirectFold4"
+            );
+            // The two halves are independent (round one has no Fiat-Shamir
+            // dependency inside it), so run them concurrently rather than
+            // back to back: each alone reaches only ~35 GB/s, while the pair
+            // interleaved recovers the fused kernel's stream-level
+            // parallelism over the same total bytes.
+            let t_r1 = std::time::Instant::now();
+            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, t_c_ms)) = rayon::join(
+                || {
+                    let t = std::time::Instant::now();
+                    let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                        ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
+                    );
+                    (ab, t.elapsed().as_secs_f64() * 1e3)
+                },
+                || {
+                    let t = std::time::Instant::now();
+                    let (c, s_hat_v_c, quad, fold4) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
+                            c_identity_z,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                        );
+                    (c, s_hat_v_c, quad, fold4, t.elapsed().as_secs_f64() * 1e3)
+                },
+            );
+            if zc_timing {
+                eprintln!(
+                    "[zc-timing] round1 AB {t_ab_ms:.2} ms || identity-C fold {t_c_ms:.2} ms -> {:.2} ms",
+                    t_r1.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            (
+                ab,
+                c,
+                Some(CapturedSHatVC {
+                    s_hat_v_c,
+                    quad,
+                    fold4: Some(fold4),
+                }),
+            )
+        } else if crate::pcs::ranked_direct_fold4_enabled()
             && crate::zerocheck::univariate_skip_optimized::c_fold4_capture_available(m, k_skip)
         {
             let (ab, c, s_hat_v_c, quad, fold4) =

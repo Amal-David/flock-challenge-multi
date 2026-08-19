@@ -36,7 +36,7 @@ use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
+use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
 
@@ -2257,6 +2257,309 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c, fold4_c)
 }
 
+// ---------------------------------------------------------------------------
+// Ranked identity-C via one block-major outer fold
+//
+// At the ranked BLAKE3 shape C is the identity (`Cz = z`), so C's round-one
+// message is a statistic of the committed witness itself. Folding `z` at the
+// round-one outer challenges `r[k_log..]` yields the length-2^k_log inner table
+// of that same multilinear, and retaining four of its inner coordinates is an
+// exact reassociation of the incumbent 32-bank row-major drain. Round one then
+// splits in two:
+//
+//   * `round1_shift_reduce_ab_packed_padded_with_precomputed` — the AB half of
+//     the fused kernel, with the C drain deleted;
+//   * `round1_c_fold4_from_block_major_z` — C's message and all three
+//     RingSwitch capture tensors, from one outer fold.
+//
+// The fold is the block-major kernel lincheck already runs on this exact
+// buffer, so no new representation of the witness is built: the deleted drain
+// and the added fold read the same 2^(m-3) bytes.
+// ---------------------------------------------------------------------------
+
+/// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
+pub(crate) struct WorkerStateAbOnly {
+    partial_ab: [F128; ELL],
+    plane_banks: Vec<u8>,
+    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    pub(crate) local_res_ab: [F128; ELL],
+}
+
+impl WorkerStateAbOnly {
+    pub(crate) fn new() -> Self {
+        Self {
+            partial_ab: [F128::ZERO; ELL],
+            plane_banks: Vec::new(),
+            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            local_res_ab: [F128::ZERO; ELL],
+        }
+    }
+}
+
+/// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
+/// instruction: same window order, same kernels, same band-end plane fold.
+/// Every C statement (and every `c_packed` byte) is gone.
+fn process_one_x_hi_ab_only(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    eq_fold: Option<(&[F128], &[u64], usize)>,
+    state: &mut WorkerStateAbOnly,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    if let Some((eq_bot, _, _)) = eq_fold {
+        let plane_len = eq_bot.len() * 16 * ELL;
+        if state.plane_banks.len() != plane_len {
+            state.plane_banks.clear();
+            state.plane_banks.resize(plane_len, 0);
+        } else {
+            state.plane_banks.fill(0);
+        }
+    }
+    let n_lo = n_lo_and_inner - N_INNER;
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+        }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if let Some((_, mats, bank_bits)) = eq_fold {
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & ((1usize << bank_bits) - 1);
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                [u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            kernels::accumulate_convert_ab_nomul_gfni(
+                &state.chunk_ab_bytes,
+                n_b_med,
+                mats_w,
+                bank,
+            );
+        } else {
+            kernels::accumulate_convert_ab(
+                &state.chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut state.partial_ab,
+            );
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        {
+            debug_assert!(eq_fold.is_none());
+            kernels::accumulate_convert_ab(
+                &state.chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut state.partial_ab,
+            );
+        }
+    }
+    if let Some((eq_bot, _, _)) = eq_fold {
+        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+            let bank = &state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL];
+            for lane in 0..ELL {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for k in 0..8 {
+                    lo |= (bank[k * ELL + lane] as u64) << (8 * k);
+                }
+                for k in 8..16 {
+                    hi |= (bank[k * ELL + lane] as u64) << (8 * (k - 8));
+                }
+                state.partial_ab[lane] += *eq_bot_val * F128 { lo, hi };
+            }
+        }
+    }
+    for lane in 0..ELL {
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+    }
+}
+
+/// Round-one AB message from the challenge-independent precompute, with no C
+/// drain. Bit-identical to the AB output of
+/// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4`];
+/// the caller sources C from the lincheck stripe instead.
+pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+    ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let convert = convert_table();
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let eq_fold_state = (ab_eq_fold_gfni_enabled() && eq.n_lo >= 2).then(|| {
+        let bank_bits = eq.n_lo.saturating_sub(5).max(1);
+        let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
+        let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
+        let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
+        (eq_bot, mats, bank_bits)
+    });
+    let res_ab = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let eq_fold_arg = eq_fold_state
+                .as_ref()
+                .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
+            process_one_x_hi_ab_only(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                eq_fold_arg,
+                &mut state,
+            );
+            state
+        })
+        .map(|s| s.local_res_ab)
+        .reduce(
+            || [F128::ZERO; ELL],
+            |mut ab1, ab2| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
+                ab1
+            },
+        );
+    res_ab.to_vec()
+}
+
+/// Derive the exact legacy round-one C message and its RingSwitch capture
+/// tensors from one block-major outer fold of the identity-C witness.
+///
+/// Returns `(res_c_lifted, s_hat_v_c, quad_c, fold4_c)` — the same four values
+/// [`finish_c_banks_fold4`] produces from the 32-bank row-major drain, and in
+/// the same conventions (`res_c_lifted` still omits the `C_s` factor, which the
+/// zerocheck caller restores before the message reaches the transcript).
+pub fn round1_c_fold4_from_block_major_z(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(
+        k_log >= k_skip + 5,
+        "Fold4 needs four retained tail coordinates"
+    );
+    assert_eq!(r.len(), m);
+    assert_eq!(z_packed.len(), (1usize << m) / 128);
+    assert_eq!(inv_table.k, k_skip);
+
+    // One fold at the original r_outer: the length-2^k_log inner table over
+    // witness coordinates [0, k_log).
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    let c_inner = crate::lincheck::partial_fold_packed_z_block_major_padded(
+        z_packed, m, k_log, useful_bits, &eq_outer,
+    );
+
+    let inner_tail = &r[k_skip + 1..k_log];
+    let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
+
+    // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
+    // tensor (coordinates 0 and 1 stay bank selectors).
+    let retained_hi_eq = build_eq(&inner_tail[2..4]);
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    let mut quad = vec![F128::ZERO; 4 * n_packed];
+    for q in 0..4 {
+        for e in 0..4 {
+            let src = (e + 4 * q) * n_packed;
+            let dst = e * n_packed;
+            for packed in 0..n_packed {
+                quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+            }
+        }
+    }
+    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+
+    // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
+    // bit at the original C point recovers C's 64 S-domain evaluations.
+    let prefix = r[k_skip];
+    let mut res_c_s = [F128::ZERO; ELL];
+    let c_s_inv = c_s_f128().inv();
+    for lane in 0..ELL {
+        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
+        res_c_s[lane] = c_s_inv * naive;
+    }
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    (res_c_lifted, s_hat_v_c, quad, fold4)
+}
+
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
 /// no rayon. Kept under `#[cfg(test)]` as the cross-check oracle for the
 /// parallel version: future "optimizations" to the parallel path must still
@@ -3281,6 +3584,82 @@ mod tests {
     /// m=22 is the smallest shape where the outer split leaves a
     /// multiple-of-four low half (`c_fold4_capture_available`); m=24 adds a
     /// non-trivial `n_hi`.
+    /// **Identity-C differential oracle.** At the ranked BLAKE3 shape C is the
+    /// identity, so folding the packed witness at `r[k_log..]` and retaining
+    /// four inner coordinates must reproduce the 32-bank row-major drain
+    /// exactly — all five round-one outputs, bit for bit, on dense and
+    /// honestly-padded witnesses.
+    #[test]
+    fn identity_c_fold_matches_row_major_fold4_drain() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        for (m, useful_bits) in [(22usize, 15_409usize), (24, 15_409), (22, 1usize << 14)] {
+            const K_LOG: usize = 14;
+            let mut rng = Rng::new(0x1DC_5721_u64.wrapping_add((m * 100_000 + useful_bits) as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let mut c = rng.bits(total_bits);
+            let block_size = 1usize << K_LOG;
+            for block in 0..(total_bits / block_size) {
+                for offset in useful_bits..block_size {
+                    let index = block * block_size + offset;
+                    a[index] = false;
+                    b[index] = false;
+                    c[index] = false;
+                }
+            }
+            let padding = PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: useful_bits,
+            };
+            let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
+            // The packed byte buffer and the F128 word buffer are the same
+            // bits in the same order; the fold wants the word view.
+            let c_words: Vec<F128> = c_p
+                .chunks_exact(16)
+                .map(|w| F128 {
+                    lo: u64::from_le_bytes(w[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(w[8..].try_into().unwrap()),
+                })
+                .collect();
+
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+
+            let mut precomputed = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let (ab_ref, c_ref, s_hat_ref, quad_ref, fold4_ref) =
+                round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
+                    &mut precomputed, &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
+                );
+
+            let mut precomputed_ab_only = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let ab_new = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &mut precomputed_ab_only, &a_p, &b_p, m, K_SKIP, &r, &table, &padding,
+            );
+            let (c_new, s_hat_new, quad_new, fold4_new) = round1_c_fold4_from_block_major_z(
+                &c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table,
+            );
+
+            assert_eq!(ab_new, ab_ref, "AB-only mismatch at m={m} useful={useful_bits}");
+            assert_eq!(c_new, c_ref, "stripe C message mismatch at m={m} useful={useful_bits}");
+            assert_eq!(
+                s_hat_new, s_hat_ref,
+                "stripe s_hat_v_c mismatch at m={m} useful={useful_bits}"
+            );
+            assert_eq!(quad_new, quad_ref, "stripe quad mismatch at m={m} useful={useful_bits}");
+            assert_eq!(
+                fold4_new, fold4_ref,
+                "stripe fold4 tensor mismatch at m={m} useful={useful_bits}"
+            );
+        }
+    }
+
     #[test]
     fn fold4_c_capture_matches_quad_and_collapses() {
         use crate::pcs::ring_switch::{collapse_s_hat_v_fold4, collapse_s_hat_v_quad};

@@ -61,6 +61,29 @@ fn ranked_direct_fold4_precompute_enabled(
         && r1cs.k_log >= pcs::LOG_PACKING + 4
 }
 
+/// Exact-shape gate for deriving identity C from one block-major outer fold of
+/// the witness instead of draining it into 32 field banks in zerocheck round
+/// one. Deliberately narrower than the generic DirectFold4 gate — the shortcut
+/// relies on ranked BLAKE3's block geometry and honest padding, and every miss
+/// keeps the incumbent producer.
+///
+/// The fold4 capture is checked by shape rather than by a `CapturedSHatVC`,
+/// because this gate runs *before* round one produces one; the stripe path
+/// always emits the fold4 tensor, so the downstream consumer gate still agrees.
+#[inline]
+fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold4_enabled()
+        && r1cs.k_log >= pcs::LOG_PACKING + 4
+        && r1cs.m == 32
+        && r1cs.k_log == 14
+        && r1cs.k_skip == zerocheck::K_SKIP
+        && r1cs.useful_bits == 15_409
+        && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+        && r1cs.c0_is_identity()
+        && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
+}
+
 /// AB claim precompute from lincheck's pre-sumcheck `z_vec`: sixteen banks
 /// when the fold4 route is live for this prove, four banks on the direct-C
 /// route, the canonical 128-vector otherwise.
@@ -782,6 +805,10 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         None
     };
 
+    // Ranked identity-C (`FLOCK_NO_ZC_IDENTITY_C=1` restores the 32-bank
+    // row-major drain): round one folds the packed witness directly.
+    let c_identity_z: Option<&[F128]> =
+        ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
     let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
         flock_core::gaptime::mark("zerocheck: pool entered");
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -804,9 +831,17 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             )
         };
         flock_core::gaptime::mark("zerocheck: views built");
-        let r = zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        );
+        let r = match c_identity_z {
+            Some(c_identity_z) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
+                    a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                    challenger,
+                )
+            }
+            None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            ),
+        };
         flock_core::gaptime::mark("zerocheck: work done");
         r
     });
@@ -1023,6 +1058,10 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- zerocheck ---
     let t0 = Instant::now();
+    // Ranked identity-C (`FLOCK_NO_ZC_IDENTITY_C=1` restores the 32-bank
+    // row-major drain): round one folds the packed witness directly.
+    let c_identity_z: Option<&[F128]> =
+        ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
     let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -1042,9 +1081,17 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        match c_identity_z {
+            Some(c_identity_z) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
+                    a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                    challenger,
+                )
+            }
+            None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            ),
+        }
     });
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);
