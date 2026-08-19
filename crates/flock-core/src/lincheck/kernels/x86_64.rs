@@ -1,4 +1,4 @@
-use super::super::{F128, build_sum_table};
+use super::super::{build_sum_table, F128};
 
 /// GFNI twin of [`partial_fold_packed_z_x86_tiled_padded`]: each stripe's
 /// 256-entry sum table is F2-linear (`T[0] = 0`, XOR-composed from the eight
@@ -63,7 +63,8 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                     }
                     // SAFETY: tile_rel < n_tiles_in_chunk keeps the tile in
                     // bounds; the block loop stays within k columns and the
-                    // plane buffer is k*16 bytes.
+                    // plane buffer is k*16 bytes. tile_rel == 0 seeds from
+                    // the fold's zeroed plane buffer (XOR 0 is identity).
                     unsafe {
                         gfni_fold_tile(
                             chunk_bytes.as_ptr().add(tile_rel * TILE_T * k),
@@ -71,6 +72,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                             n_blocks64,
                             &mats,
                             out_planes.as_mut_ptr(),
+                            tile_rel == 0,
                         );
                     }
                 }
@@ -126,11 +128,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gather_transpose_stripe_x86(
-    z_ptr: *const F128,
-    stride: usize,
-    out: *mut u8,
-) {
+pub(crate) unsafe fn gather_transpose_stripe_x86(z_ptr: *const F128, stride: usize, out: *mut u8) {
     use core::arch::x86_64::*;
     const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
     // SAFETY: bounds per the contract; features per the cfg gate.
@@ -222,6 +220,10 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
+/// `seed_zero` replaces the first-tile `_mm512_loadu_si512` of a known-zero
+/// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
+/// later tiles still `loadu` the running acc. Bit-identical to loadu-of-zeros.
+///
 /// # Safety
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
@@ -238,6 +240,7 @@ pub(crate) unsafe fn gfni_fold_tile(
     n_blocks64: usize,
     mats: &[u64; 128],
     out_planes_ptr: *mut u8,
+    seed_zero: bool,
 ) {
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
@@ -246,12 +249,18 @@ pub(crate) unsafe fn gfni_fold_tile(
             let bs = block * 64;
             let mut rows = [_mm512_setzero_si512(); 8];
             for (t, row) in rows.iter_mut().enumerate() {
-                *row = _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i);
+                *row = _mm512_loadu_si512(
+                    tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i
+                );
             }
             let planes = out_planes_ptr.add(block * 1024);
             for byte_k in 0..16 {
                 let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+                let mut acc = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                };
                 for t in (0..8).step_by(2) {
                     let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                         rows[t],
@@ -483,7 +492,11 @@ pub(crate) fn build_nibble_tables(eq8: &[F128; 8], out: &mut NibbleTables) {
 /// # Safety
 /// Requires AVX-512F/BW at runtime (guaranteed by the cfg gate that compiles
 /// this function in). All loads/stores are bounds-checked by the asserts.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
     transposed: &[u8],
@@ -547,8 +560,16 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
                 // Tail group: 2 qwords per column; aos0 covers columns 0..4,
                 // aos1 columns 4..8 of this group.
                 let q = 2 * cols; // qwords to touch
-                let m0: __mmask8 = if q >= 8 { 0xFF } else { ((1u16 << q) - 1) as u8 };
-                let m1: __mmask8 = if q <= 8 { 0 } else { ((1u16 << (q - 8)) - 1) as u8 };
+                let m0: __mmask8 = if q >= 8 {
+                    0xFF
+                } else {
+                    ((1u16 << q) - 1) as u8
+                };
+                let m1: __mmask8 = if q <= 8 {
+                    0
+                } else {
+                    ((1u16 << (q - 8)) - 1) as u8
+                };
                 let pi = p as *mut i64;
                 let v0 = _mm512_maskz_loadu_epi64(m0, pi);
                 _mm512_mask_storeu_epi64(pi, m0, _mm512_xor_si512(v0, aos0));
