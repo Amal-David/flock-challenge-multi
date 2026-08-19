@@ -397,7 +397,14 @@ impl Challenger for FsChallenger {
         // aarch64 NEON kernel, ~86 Mh/s/core — and a whole multiple of its
         // 16-lane batch), small enough to keep cancellation granular once an
         // earlier task has found a match.
-        const GRIND_CHUNK: u64 = 1 << 10;
+        // Keep each Rayon task large enough to amortize scheduler overhead while
+        // retaining fine-grained cancellation. The AVX-512 scanner processes 32
+        // nonces per iteration, so 8192 remains an exact batch multiple.
+        let grind_chunk: u64 = if std::env::var_os("FLOCK_NO_GRIND_CHUNK8192").is_some() {
+            1 << 10
+        } else {
+            1 << 13
+        };
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -406,10 +413,10 @@ impl Challenger for FsChallenger {
             // given, so scanning blocks in order yields the globally smallest.
             let mut start: u64 = 0;
             loop {
-                if let Some(n) = pow_scan(&state_digest, start, GRIND_CHUNK, bits, kind) {
+                if let Some(n) = pow_scan(&state_digest, start, grind_chunk, bits, kind) {
                     break n;
                 }
-                start = start.saturating_add(GRIND_CHUNK);
+                start = start.saturating_add(grind_chunk);
             }
         } else {
             // Block-parallel search. Blocks are scanned in order and each task
@@ -421,7 +428,7 @@ impl Challenger for FsChallenger {
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
             let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = block.div_ceil(GRIND_CHUNK);
+            let n_chunks = block.div_ceil(grind_chunk);
             let mut start: u64 = 0;
             loop {
                 // `find_first` takes the earliest *chunk* that yields a match
@@ -434,8 +441,8 @@ impl Challenger for FsChallenger {
                     .map(|c| {
                         pow_scan(
                             &state_digest,
-                            start.saturating_add(c * GRIND_CHUNK),
-                            GRIND_CHUNK,
+                            start.saturating_add(c * grind_chunk),
+                            grind_chunk,
                             bits,
                             kind,
                         )
