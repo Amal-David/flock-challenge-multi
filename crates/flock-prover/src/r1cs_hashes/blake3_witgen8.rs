@@ -59,6 +59,21 @@ fn xor_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_xor_si256(a, b) }
 }
 
+/// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
+/// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
+/// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
+/// `FLOCK_NO_WITGEN_TERNLOG=1` restores the two-XOR fallback.
+#[inline(always)]
+fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_TERNLOG").is_none());
+    if *ON {
+        unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
+    } else {
+        xor_v8(xor_v8(a, b), c)
+    }
+}
+
 #[inline(always)]
 fn or_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_or_si256(a, b) }
@@ -194,7 +209,7 @@ macro_rules! pushf8 {
 #[inline(always)]
 fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     let sum = add_v8(x, y);
-    let cin = xor_v8(xor_v8(sum, x), y);
+    let cin = xor3_v8(sum, x, y);
     let left = xor_v8(x, cin);
     let right = xor_v8(y, cin);
     let carry = and_v8(left, right);
