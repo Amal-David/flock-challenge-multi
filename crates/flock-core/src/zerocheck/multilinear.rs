@@ -948,6 +948,30 @@ fn tail_split_n_hi(n_vars: usize) -> usize {
     base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
+/// Fan-out for the **packed** round-two / cascade-from-packed sweeps, which
+/// still used the incumbent `lookahead_n_hi` cap of 128 rayon chunks after
+/// the plain composed tail (#226) moved to a size-adaptive split.
+///
+/// At the ranked round-two shape (`m = 32`, `k_skip = 6`) `n_vars = 25` and
+/// the 128-chunk split leaves eight chunks per worker — the same drain the
+/// plain tail measured at `log_n = 24`. The packed leaf is heavier (URM
+/// byte-table gathers), so the per-chunk prologue amortizes at the same
+/// `lo_size ≥ 2^10` floor. Splitting to `n_hi = 11` (2048 chunks, `lo =
+/// 2^14`) is value-identical: `eq` is an exact tensor product, the per-chunk
+/// accumulators reduce by F128 XOR, and the kernel already accepts any even
+/// `lo_size ≥ 2`. `FLOCK_NO_ZC_R2_SPLIT=1` restores the 128-chunk cap;
+/// the ranked worker's cleared environment never sets it.
+#[inline]
+fn r2_split_n_hi(n_vars: usize) -> usize {
+    let base = lookahead_n_hi(n_vars);
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_SPLIT").is_some());
+    if *OFF {
+        return base;
+    }
+    base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
+}
+
 /// Round-two fused fold **plus** the deferred round-three coefficients.
 ///
 /// The folded tables and the round-two wire message are bit-identical to
@@ -1028,7 +1052,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
 
     let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], r2_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -1197,7 +1221,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
     let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], r2_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -1395,7 +1419,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
 
     let n_vars = r_next4.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], lookahead_n_hi(n_vars));
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], r2_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
@@ -3201,6 +3225,28 @@ mod tests {
         }
     }
 
+    /// Packed r2/cascade split keeps `lo_size ≥ 2` and only raises `n_hi`
+    /// once `eq` can still hold the 2^10 floor that amortizes the AVX-512
+    /// prologue. Ranked round-two is `n_vars = 25` → `n_hi = 11`.
+    #[test]
+    fn r2_split_policy_stays_in_range() {
+        assert_eq!(r2_split_n_hi(8), 7);
+        assert_eq!(r2_split_n_hi(17), 7);
+        assert_eq!(r2_split_n_hi(18), 8);
+        assert_eq!(r2_split_n_hi(21), 11);
+        assert_eq!(r2_split_n_hi(25), 11);
+        for n_vars in 2usize..=30 {
+            let n_hi = r2_split_n_hi(n_vars);
+            assert!(n_hi <= n_vars.saturating_sub(1), "n_vars={n_vars} n_hi={n_hi}");
+            let n_lo = n_vars - n_hi;
+            assert!(n_lo >= 1, "n_vars={n_vars} n_hi={n_hi}");
+            if n_hi > SplitEqGhash::MAX_N_HI {
+                assert!(n_lo >= TAIL_SPLIT_MIN_LO_LOG, "n_vars={n_vars} n_lo={n_lo}");
+                assert!(n_hi <= TAIL_SPLIT_MAX_N_HI, "n_vars={n_vars} n_hi={n_hi}");
+            }
+        }
+    }
+
     /// **The big cross-check**: fused `fold_and_compute_round_pair_optimized`
     /// produces the same output as the unfused sequence
     /// `fold_in_place_pair` → `round_pair_naive`.
@@ -3514,7 +3560,7 @@ mod tests {
     #[test]
     fn lookahead_round3_matches_incumbent() {
         const K_SKIP: usize = 6;
-        for &(m, padded) in &[(13usize, false), (14, false), (15, true), (16, false), (17, true), (18, true)] {
+        for &(m, padded) in &[(13usize, false), (14, false), (15, true), (16, false), (17, true), (18, true), (25, false)] {
             let mut rng = Rng::new(0x1A00 + m as u64 + padded as u64 * 100);
             let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, padded);
             let z = rng.f128();
