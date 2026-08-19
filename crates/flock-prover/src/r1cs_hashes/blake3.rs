@@ -1541,8 +1541,8 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
 }
 
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
-/// task owns 8 contiguous padded slots: octa witness dump, then round-1
-/// AB windows on each live block while those a/b lines are still hot.
+/// task owns 16 contiguous padded slots (two octa dumps) so a/b lines for
+/// two SIMD groups stay hot across the subsequent round-1 AB windows.
 /// Temporal stores only (`elide = [false; 3]`); NT publishes stay off.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn generate_round1_inner_octa(
@@ -1558,7 +1558,8 @@ fn generate_round1_inner_octa(
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
-    const GROUP: usize = 8;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
 
@@ -1568,26 +1569,30 @@ fn generate_round1_inner_octa(
         .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
         .enumerate()
         .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
-            let octa: [&Compression; 8] = std::array::from_fn(|j| {
-                let idx = GROUP * g + j;
-                if idx < blocks.len() {
-                    &blocks[idx]
-                } else {
-                    padding
-                }
-            });
-            // SAFETY: crate compiled with AVX2; each group owns 8 contiguous
-            // 512-word blocks in z/a/b. Dump is temporal (`elide` all false).
+            let n_here = z_out.len() / F128_PER_BLOCK;
+            // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
+            // 512-word blocks in z/a/b. Last rayon chunk may be 8-wide.
             unsafe {
-                blake3_witgen8::build_octa_witness_ab_stream_elide(
-                    octa,
-                    z_out.as_mut_ptr().cast::<u32>(),
-                    a_out.as_mut_ptr().cast::<u32>(),
-                    b_out.as_mut_ptr().cast::<u32>(),
-                    [false; 3],
-                );
+                for half in 0..(n_here / SIMD) {
+                    let octa: [&Compression; 8] = std::array::from_fn(|j| {
+                        let idx = GROUP * g + half * SIMD + j;
+                        if idx < blocks.len() {
+                            &blocks[idx]
+                        } else {
+                            padding
+                        }
+                    });
+                    let off = half * SIMD * F128_PER_BLOCK;
+                    blake3_witgen8::build_octa_witness_ab_stream_elide(
+                        octa,
+                        z_out.as_mut_ptr().add(off).cast::<u32>(),
+                        a_out.as_mut_ptr().add(off).cast::<u32>(),
+                        b_out.as_mut_ptr().add(off).cast::<u32>(),
+                        [false; 3],
+                    );
+                }
             }
-            for j in 0..GROUP {
+            for j in 0..n_here {
                 let block_idx = GROUP * g + j;
                 if block_idx >= skip_blocks {
                     let a_bytes = unsafe {
