@@ -2159,6 +2159,29 @@ fn tntt_block_enabled() -> bool {
     *ON
 }
 
+/// Cache-blocked tNTT chunk log: resident set is `2^log` F128 elements.
+///
+/// 15 (512 KiB) is the shipped Zen 3/5 compromise. Official SPR (c7i.4xlarge)
+/// has 2 MiB L2/core and `avx512f`; 17 keeps a chunk in L2 across pass (a)
+/// (Zen 5 measured 1.8 ms at 17 vs 2.6 ms at 15). Zen 3 / no-AVX-512 stays
+/// at 15. `FLOCK_TNTT_CHUNK_LOG=N` overrides (clamped 12..=20) for A/B; the
+/// ranked worker's cleared env never sets it.
+fn tntt_chunk_log() -> usize {
+    static LOG: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if let Ok(s) = std::env::var("FLOCK_TNTT_CHUNK_LOG") {
+            if let Ok(n) = s.parse::<usize>() {
+                return n.clamp(12, 20);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512f") {
+            return 17;
+        }
+        15
+    });
+    *LOG
+}
+
 /// Dense transpose sweep over forward layers `0..top` (applied in reverse
 /// layer order). Shared by [`transpose_forward_ntt`] and the sparse-prefix
 /// tail; `data.len()` must be `2^log_d` with `top <= log_d`.
@@ -2251,16 +2274,12 @@ fn transpose_forward_ntt_dense_layers_blocked(
         return;
     }
     let n_threads = rayon::current_num_threads().max(1);
-    // Chunk target: 2^CHUNK_LOG F128 (= 512 KiB at CHUNK_LOG=15) so a chunk
-    // stays in L2 across all of pass (a)'s layers; but never so few chunks that
-    // the pool starves. Swept 13..17 at the ranked L0 shape (log_d=20, top=12,
-    // 16 threads): Zen 5 wants the large end (17: 1.8 ms, 15: 2.6, 13: n/m) and
-    // Zen 3 the small end (13: 2.5 ms, 15: 2.6, 17: 3.1); 15 is within 0.5 ms
-    // of best on both and is the value shipped.
-    const CHUNK_LOG: usize = 15;
+    // Chunk target: 2^chunk_log F128 so a chunk stays in L2 across pass (a).
+    // SPR (avx512f, 2 MiB L2) uses 17 (= 2 MiB); otherwise 15 (512 KiB).
+    let chunk_log = tntt_chunk_log();
 
     let split = log_d
-        .saturating_sub(CHUNK_LOG)
+        .saturating_sub(chunk_log)
         .max(ceil_log2(n_threads))
         .min(top);
 
@@ -2293,8 +2312,8 @@ fn transpose_forward_ntt_dense_layers_blocked(
     if split > 0 {
         let nseg = 1usize << split;
         let seg = 1usize << (log_d - split);
-        // Tile so the resident set is ~2^CHUNK_LOG F128 across all columns.
-        let tile = ((1usize << CHUNK_LOG) / nseg).max(1).min(seg);
+        // Tile so the resident set is ~2^chunk_log F128 across all columns.
+        let tile = ((1usize << chunk_log) / nseg).max(1).min(seg);
         let ntiles = seg / tile;
         let mut tiles: Vec<Vec<&mut [F128]>> =
             (0..ntiles).map(|_| Vec::with_capacity(nseg)).collect();
