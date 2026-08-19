@@ -75,6 +75,19 @@ pub(crate) fn open_timing() -> bool {
 /// message changes — only how many tasks the same work is cut into (F128
 /// addition is XOR, and each site's per-slot summation order is preserved).
 /// Read once per process; default ON (the ranked worker clears its env).
+/// `FLOCK_NO_OPEN_MSG_SPLIT=1` restores the fixed 2048-element chunk in the
+/// round-message reduction. The fixed chunk pins the task count to `n / 2048`,
+/// which starves the pool at every recursive level (two tasks at `n = 4096`,
+/// four at `n = 8192`); the default scales the chunk with the pool instead.
+/// Bit-identical: the per-chunk results are combined with field addition,
+/// which is XOR, so the grouping of the reduction does not change its value.
+/// Read once per process.
+pub(crate) fn open_msg_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_MSG_SPLIT").is_none());
+    *ON
+}
+
 pub(crate) fn open_fill_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FILL").is_none());
@@ -3205,9 +3218,24 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
         // Chunked parallel reduce; each chunk length is a multiple of 8 when
         // possible so the AVX-512 body stays saturated.
         const CHUNK: usize = 2048;
+        // A fixed 2048-element chunk fixes the TASK COUNT to `n / 2048`, which
+        // at the recursive levels is far below the pool: two tasks at
+        // `n = 4096`, four at `n = 8192`, so most workers idle at the join.
+        // Shrink the chunk until there are several tasks per worker, keeping
+        // each chunk a multiple of eight (the AVX-512 body's stride) and even
+        // (pairs are consecutive). The reduction combines chunk results with
+        // field addition, which is XOR and therefore associative and
+        // commutative, so re-chunking is bit-identical.
+        let chunk = if open_msg_split_enabled() {
+            let want = n / (rayon::current_num_threads().max(1) * 4);
+            let want = (want / 8) * 8;
+            CHUNK.min(want.max(64))
+        } else {
+            CHUNK
+        };
         let (u_0, u_2) = f
-            .par_chunks(CHUNK)
-            .zip(b.par_chunks(CHUNK))
+            .par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
             .map(|(fc, bc)| {
                 // SAFETY: equal chunk lengths; features cfg-guaranteed.
                 unsafe { msg_reduce_avx512(fc, bc) }
