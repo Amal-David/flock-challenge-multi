@@ -941,6 +941,19 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GATHER8=1` restores four-column visits in the block-major
+/// GFNI fold (exact A/B on top of gather4). Default ON: eight consecutive
+/// columns per row visit — two 64-byte lines, the whole eight-F128 span
+/// at the ranked 2048-byte stride — so line 1 is consumed before the
+/// four-column fold can evict it from the other two L1 sets. Remainder
+/// of length 4 still takes gather4; the ragged tail stays single-column.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_gather8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER8").is_none());
+    *ON
+}
+
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -1024,9 +1037,9 @@ fn fold_block_major_gfni(
             };
             let mut mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
-            // Four column-slabs of 8×128 bytes: the grouped gather writes
-            // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            // Eight column-slabs of 8×128 bytes: gather8 writes column c
+            // at slab c; gather4 uses slabs 0..4; single-column uses slab 0.
+            let mut transposed = [0u8; 8 * DIRECT_FOLD_TILE_STRIPES * 128];
             // First tile this worker writes into a freshly zeroed plane
             // buffer: seed the GFNI acc from a register zero idiom.
             let mut first_tile = true;
@@ -1064,12 +1077,59 @@ fn fold_block_major_gfni(
                 #[cfg(target_feature = "avx512vbmi")]
                 if gather_tr_fused && lc_gather4_enabled() {
                     let full_chunks = useful_bits / 128;
+                    let gather8 = lc_gather8_enabled();
+                    while gather8 && q + 8 <= full_chunks {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let outer_base = 8 * (stripe_base + t);
+                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                                let next_base = 8 * (stripe_base + t + 1);
+                                // Two lines per row cover all eight columns.
+                                unsafe {
+                                    for r in 0..8 {
+                                        let p = z_packed
+                                            .as_ptr()
+                                            .add((next_base + r) * chunks_per_block + q);
+                                        core::arch::x86_64::_mm_prefetch(
+                                            p.cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                        core::arch::x86_64::_mm_prefetch(
+                                            p.add(4).cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T0,
+                                        );
+                                    }
+                                }
+                            }
+                            // SAFETY: eight readable F128 at q..q+8 per row;
+                            // each of 8 column slabs is 1024 writable bytes.
+                            unsafe {
+                                kernels::gather_transpose_stripe8_x86(
+                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                    chunks_per_block,
+                                    transposed.as_mut_ptr().add(t * 128),
+                                    1024,
+                                );
+                            }
+                        }
+                        for c in 0..8 {
+                            unsafe {
+                                kernels::gfni_fold_tile(
+                                    transposed.as_ptr().add(c * 1024),
+                                    128,
+                                    2,
+                                    &mats,
+                                    wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
+                                    first_tile,
+                                );
+                            }
+                        }
+                        q += 8;
+                    }
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
                             let outer_base = 8 * (stripe_base + t);
                             if t + 1 < DIRECT_FOLD_TILE_STRIPES {
                                 let next_base = 8 * (stripe_base + t + 1);
-                                // One line per row covers all four columns.
                                 unsafe {
                                     for r in 0..8 {
                                         core::arch::x86_64::_mm_prefetch(
@@ -1082,10 +1142,6 @@ fn fold_block_major_gfni(
                                     }
                                 }
                             }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q + c for c in 0..4 are the indices four
-                            // single gathers would read; each column slab is
-                            // 1024 writable bytes of `transposed`.
                             unsafe {
                                 kernels::gather_transpose_stripe4_x86(
                                     z_packed.as_ptr().add(outer_base * chunks_per_block + q),
@@ -1096,8 +1152,6 @@ fn fold_block_major_gfni(
                             }
                         }
                         for c in 0..4 {
-                            // SAFETY: as for the single-column call below;
-                            // every grouped chunk is full (2 blocks of 64).
                             unsafe {
                                 kernels::gfni_fold_tile(
                                     transposed.as_ptr().add(c * 1024),
@@ -3160,6 +3214,43 @@ mod tests {
                         want[c * 1024..c * 1024 + 128],
                         got[c * 1024..c * 1024 + 128],
                         "stride {stride} q {q} col {c}"
+                    );
+                }
+            }
+        }
+        // Eight-column twin: two four-column calls at q and q+4.
+        for stride in [8usize, 17, 128] {
+            let z: Vec<F128> = (0..8 * stride + 8).map(|_| rng.f128()).collect();
+            for q in [0usize, stride.saturating_sub(8).min(3)] {
+                let mut want = [0u8; 8 * 1024];
+                unsafe {
+                    kernels::gather_transpose_stripe4_x86(
+                        z.as_ptr().add(q),
+                        stride,
+                        want.as_mut_ptr(),
+                        1024,
+                    );
+                    kernels::gather_transpose_stripe4_x86(
+                        z.as_ptr().add(q + 4),
+                        stride,
+                        want.as_mut_ptr().add(4 * 1024),
+                        1024,
+                    );
+                }
+                let mut got = [0x3Cu8; 8 * 1024];
+                unsafe {
+                    kernels::gather_transpose_stripe8_x86(
+                        z.as_ptr().add(q),
+                        stride,
+                        got.as_mut_ptr(),
+                        1024,
+                    );
+                }
+                for c in 0..8 {
+                    assert_eq!(
+                        want[c * 1024..c * 1024 + 128],
+                        got[c * 1024..c * 1024 + 128],
+                        "gather8 stride {stride} q {q} col {c}"
                     );
                 }
             }

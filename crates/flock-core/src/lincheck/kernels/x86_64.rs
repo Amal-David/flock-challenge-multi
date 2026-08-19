@@ -263,6 +263,34 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
     }
 }
 
+/// Eight-column twin of [`gather_transpose_stripe4_x86`]: two 64-byte
+/// loads per row (columns `q..q+8`) so both cache lines of the ranked
+/// 2048-byte stride are consumed in one visit. Byte-identical to two
+/// four-column calls at `q` and `q+4`.
+///
+/// # Safety
+/// 8 readable F128 at `z_ptr + r*stride + c` for r in 0..8, c in 0..8;
+/// `out + c*out_stride` covers 128 writable bytes for c in 0..8.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather_transpose_stripe8_x86(
+    z_ptr: *const F128,
+    stride: usize,
+    out: *mut u8,
+    out_stride: usize,
+) {
+    // SAFETY: bounds per the contract; each half is the four-column kernel.
+    unsafe {
+        gather_transpose_stripe4_x86(z_ptr, stride, out, out_stride);
+        gather_transpose_stripe4_x86(z_ptr.add(4), stride, out.add(4 * out_stride), out_stride);
+    }
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
