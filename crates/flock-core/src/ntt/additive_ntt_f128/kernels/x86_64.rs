@@ -636,6 +636,191 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
     }
 }
 
+/// Process one fused-three-layer group of eight CONSECUTIVE rows.
+///
+/// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
+/// `0..dense_lanes` run the full 12-butterfly network; lanes
+/// `dense_lanes..num_ntts` run the zero-odd-row specialization (see
+/// [`super::portable::butterfly_fused_3layer_zero_odd`]).
+///
+/// # Safety
+/// The caller guarantees `avx512f` + `vpclmulqdq`, that the eight rows are
+/// valid and disjoint from any concurrently processed group,
+/// `dense_lanes <= num_ntts`, and that rows 1, 3, 5 and 7 are zero on lanes
+/// `dense_lanes..num_ntts`.
+///
+/// Kept out of line (like [`butterfly_fused_4layer_row`]) so the deep-pass
+/// closure that calls it once per block does not inline two full
+/// monomorphizations of a twelve-butterfly network into its own frame.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_3layer_rows(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_3layer_rows_impl::<false>(ptr, num_ntts, dense_lanes, twiddles)
+        } else {
+            butterfly_fused_3layer_rows_impl::<true>(ptr, num_ntts, dense_lanes, twiddles)
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_rows`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool>(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller provides target features and pointer geometry.
+    unsafe {
+        // Seven broadcasts (plus their x^64 companions under DIET) hoisted
+        // out of the lane loop: 8 rows stay live in registers across all
+        // three layers, so a row is loaded once and stored once for 12
+        // butterflies instead of the fused-two + single-layer pair's two
+        // loads and two stores for the same 12.
+        let zero = _mm512_setzero_si512();
+        let mut tw = [(zero, zero); 7];
+        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+            *slot = tw_x4::<false, DIET>(*value);
+        }
+        let row = |i: usize| ptr.add(i * num_ntts);
+        let mut lane = 0;
+
+        macro_rules! butterfly {
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr) => {{
+                let new_u =
+                    _mm512_xor_si512($values[$u], mul_x4::<false, DIET>($twiddle, $values[$v]));
+                $values[$v] = _mm512_xor_si512($values[$v], new_u);
+                $values[$u] = new_u;
+            }};
+        }
+        // Two lane chunks per iteration: 16 live row registers + 14 twiddle
+        // registers still fit the 32 zmm file, and doubling the independent
+        // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
+        // the outstanding row misses.
+        macro_rules! butterfly2 {
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr) => {{
+                for c in 0..2 {
+                    let new_u = _mm512_xor_si512(
+                        $values[c][$u],
+                        mul_x4::<false, DIET>($twiddle, $values[c][$v]),
+                    );
+                    $values[c][$v] = _mm512_xor_si512($values[c][$v], new_u);
+                    $values[c][$u] = new_u;
+                }
+            }};
+        }
+
+        while lane + 8 <= dense_lanes {
+            let mut values = [[zero; 8]; 2];
+            for (c, chunk) in values.iter_mut().enumerate() {
+                for (i, value) in chunk.iter_mut().enumerate() {
+                    *value = _mm512_loadu_si512(row(i).add(lane + 4 * c) as *const __m512i);
+                }
+            }
+
+            let outer = tw[0];
+            for i in 0..4 {
+                butterfly2!(values, i, i + 4, outer);
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..2 {
+                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            for s in 0..4 {
+                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s]);
+            }
+
+            for (c, chunk) in values.iter().enumerate() {
+                for (i, value) in chunk.iter().enumerate() {
+                    _mm512_storeu_si512(row(i).add(lane + 4 * c) as *mut __m512i, *value);
+                }
+            }
+            lane += 8;
+        }
+        while lane + 4 <= dense_lanes {
+            let mut values = [zero; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            let outer = tw[0];
+            for i in 0..4 {
+                butterfly!(values, i, i + 4, outer);
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..2 {
+                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            for s in 0..4 {
+                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s]);
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+            lane += 4;
+        }
+        while lane < dense_lanes {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+
+        // Published zero tail: rows 1, 3, 5, 7 are zero here, so only the
+        // four even rows are read and the deepest layer is a copy.
+        while lane + 4 <= num_ntts {
+            let mut values = [zero; 8];
+            for i in 0..4 {
+                values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
+            }
+            let outer = tw[0];
+            butterfly!(values, 0, 4, outer);
+            butterfly!(values, 2, 6, outer);
+            butterfly!(values, 0, 2, tw[1]);
+            butterfly!(values, 4, 6, tw[2]);
+            for i in 0..4 {
+                let v = values[2 * i];
+                _mm512_storeu_si512(row(2 * i).add(lane) as *mut __m512i, v);
+                _mm512_storeu_si512(row(2 * i + 1).add(lane) as *mut __m512i, v);
+            }
+            lane += 4;
+        }
+        while lane < num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer_zero_odd(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod diet_tests {
     use super::*;

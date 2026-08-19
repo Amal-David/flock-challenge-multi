@@ -386,6 +386,46 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// Process one fused-three-layer group of eight consecutive rows.
+///
+/// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
+/// full three-layer network; on lanes `dense_lanes..num_ntts` the group's odd
+/// rows are known to be zero and the reduced network runs instead.
+///
+/// # Safety
+/// The caller must ensure the eight rows are valid and disjoint from any row
+/// group being processed concurrently, that `dense_lanes <= num_ntts`, and
+/// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_rows(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry, disjointness and zero-tail contract.
+    unsafe {
+        x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
