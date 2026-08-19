@@ -1110,6 +1110,45 @@ impl AdditiveNttF128 {
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
     ))]
+    /// `FLOCK_NO_NTT_SCATTER_NT=1` restores plain write-allocate publish
+    /// stores in the seed-fused top pass (exact same-binary A/B); the ranked
+    /// worker's cleared env never sets it.
+    #[cfg(target_arch = "x86_64")]
+    fn scatter_nt_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_NT").is_none());
+        *ON
+    }
+
+    /// Publish one staging row to the codeword with non-temporal stores.
+    ///
+    /// The destination is written once here and next touched by the deep
+    /// pass, a separate rayon region that starts only after the whole
+    /// codeword is published — at the ranked shape that is 1 GiB, DRAM-cold
+    /// by then regardless — so plain stores' write-allocate is one pure
+    /// hidden DRAM read per output line (~1 GiB of RFO per proof). XMM
+    /// streams, not ZMM: large pool allocations land 16 mod 64, so a
+    /// 64-byte-alignment gate would silently never fire (measured trap on
+    /// this lineage); every F128 element offset preserves the base's 16-byte
+    /// alignment, which the caller checks once per pass.
+    ///
+    /// # Safety
+    /// `src`/`dst` must cover `row_len` F128s; `dst` must be 16-byte aligned.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn publish_row_nt(src: *const F128, dst: *mut F128, row_len: usize) {
+        use core::arch::x86_64::*;
+        // SAFETY: bounds per the contract; SSE2 is x86_64 baseline; the
+        // 16-byte store alignment is the caller's checked precondition.
+        unsafe {
+            let s = src as *const __m128i;
+            let d = dst as *mut __m128i;
+            for i in 0..row_len {
+                _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+            }
+        }
+    }
+
     fn seed_top_fused8_pass(
         &self,
         msg: &[F128],
@@ -1168,6 +1207,10 @@ impl AdditiveNttF128 {
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
+        // Publish with non-temporal stores when allowed and 16-byte aligned
+        // (see `publish_row_nt`); decided once per pass.
+        #[cfg(target_arch = "x86_64")]
+        let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
@@ -1225,6 +1268,22 @@ impl AdditiveNttF128 {
                     }
                 }
                 // Scatter: staging [block][k] → codeword row block·B + r + k·S.
+                #[cfg(target_arch = "x86_64")]
+                if publish_nt {
+                    for block in 0..8 {
+                        for k in 0..64 {
+                            Self::publish_row_nt(
+                                bufp.add((block * 64 + k) * row_len),
+                                base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                                row_len,
+                            );
+                        }
+                    }
+                    // Drain the WC buffers before this task returns; the
+                    // rayon join below is the reader's happens-before edge.
+                    core::arch::x86_64::_mm_sfence();
+                    return;
+                }
                 for block in 0..8 {
                     for k in 0..64 {
                         core::ptr::copy_nonoverlapping(
@@ -1238,15 +1297,21 @@ impl AdditiveNttF128 {
         };
 
         const PARALLEL_TASK_THRESHOLD: usize = 32;
+        // Staging is write-before-read: the seed kernels write all 512 rows
+        // (all lanes) before the layer loops read any of them, so the
+        // 512 KiB zero-fill per init was dead work — rayon runs the
+        // initializer once per JOB, not per worker.
         if sub_stride < PARALLEL_TASK_THRESHOLD {
-            let mut buf = vec![F128::ZERO; 512 * row_len];
+            let mut buf = crate::alloc_uninit_vec::<F128>(512 * row_len);
             for r in 0..sub_stride {
                 task(&mut buf, r);
             }
         } else {
             (0..sub_stride)
                 .into_par_iter()
-                .for_each_init(|| vec![F128::ZERO; 512 * row_len], |buf, r| task(buf, r));
+                .for_each_init(|| crate::alloc_uninit_vec::<F128>(512 * row_len), |buf, r| {
+                    task(buf, r)
+                });
         }
     }
 
