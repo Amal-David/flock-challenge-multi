@@ -207,8 +207,29 @@ macro_rules! pushf8 {
 }
 
 #[inline(always)]
+/// `FLOCK_NO_WITGEN_CARRY_ID=1` restores the explicit carry-in intermediate in
+/// [`add_carry_parts_v8`]. The carry-in `cin = sum ^ x ^ y` is never returned,
+/// and over F2 the two values built from it collapse:
+/// `x ^ cin = x ^ sum ^ x ^ y = sum ^ y` and `y ^ cin = sum ^ x`. Computing
+/// `left`/`right` directly therefore removes the three-input XOR entirely
+/// while producing the identical bits. Resolved once per process.
+#[inline(always)]
+fn carry_identity_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_CARRY_ID").is_none());
+    *ON
+}
+
+#[inline(always)]
 fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     let sum = add_v8(x, y);
+    if carry_identity_on() {
+        // `cin` is a pure intermediate: left = x^cin = sum^y, right = y^cin = sum^x.
+        let left = xor_v8(sum, y);
+        let right = xor_v8(sum, x);
+        let carry = and_v8(left, right);
+        return (sum, left, right, carry);
+    }
     let cin = xor3_v8(sum, x, y);
     let left = xor_v8(x, cin);
     let right = xor_v8(y, cin);
@@ -251,20 +272,14 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
-/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
-fn wide_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
-    *ON
-}
-
-/// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
-/// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
-/// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
-/// cache line. Publish that line with a single ZMM stream when `avx512f` is
-/// compiled in, otherwise one YMM stream per V8. `FLOCK_NO_WIDE_NT=1` keeps
-/// the historical two-XMM form. Chunks still drain in PAIRS so each line's
-/// write-combining buffer closes as soon as it fills.
+/// Non-temporal twin of [`dump_range`]: identical bytes, published through
+/// `_mm_stream_si128` (the F128-backed destinations guarantee 16-byte
+/// alignment; 32/64-byte alignment is NOT guaranteed — large pool
+/// allocations land 16 mod 64 on this lineage, so YMM/ZMM streams would
+/// fault). Chunks drain in PAIRS so every destination run receives 64
+/// contiguous bytes back-to-back and each line's write-combining buffer
+/// closes as soon as it fills — one open WC stream per run instead of a
+/// line held half-written across a whole `g` step.
 ///
 /// Caller contract: destinations are not read again until after an
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
@@ -273,14 +288,8 @@ fn wide_nt_enabled() -> bool {
 unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     #[inline(always)]
     unsafe fn stream_v8(p: *mut u32, v: V8) {
-        // SAFETY: caller guarantees 16-byte alignment of `p`; the YMM arm
-        // additionally requires 32-byte alignment (true for every in-loop
-        // pointer when `dst` is 32-aligned and `w` is a multiple of 8).
+        // SAFETY: caller guarantees 16-byte alignment of `p`.
         unsafe {
-            if wide_nt_enabled() && p as usize % 32 == 0 {
-                _mm256_stream_si256(p.cast::<__m256i>(), v);
-                return;
-            }
             _mm_stream_si128(p.cast::<__m128i>(), _mm256_castsi256_si128(v));
             _mm_stream_si128(p.add(4).cast::<__m128i>(), _mm256_extracti128_si256::<1>(v));
         }
@@ -312,13 +321,6 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
             );
             for r in 0..8 {
                 let p = dst.add(r * U32_PER_BLOCK + w);
-                #[cfg(target_feature = "avx512f")]
-                if wide_nt_enabled() && p as usize % 64 == 0 {
-                    let z = _mm512_castsi256_si512(ta[r]);
-                    let z = _mm512_inserti64x4::<1>(z, tb[r]);
-                    _mm512_stream_si512(p.cast::<__m512i>(), z);
-                    continue;
-                }
                 stream_v8(p, ta[r]);
                 stream_v8(p.add(8), tb[r]);
             }
