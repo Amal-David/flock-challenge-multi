@@ -1150,6 +1150,16 @@ pub(crate) fn zc_wsplit_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_C4_QUAD=1` restores two independent `gfni_fold64_rows_masked_c4`
+/// calls per body (exact same-binary A/B). Default occupancy-4 reuses each
+/// loaded CFoldMats ZMM across A0, B0, A1, B1 of two consecutive 64-row
+/// tiles. The ranked worker's cleared env never sets the kill switch.
+pub(crate) fn zc_c4_quad_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_C4_QUAD").is_none());
+    *ON
+}
+
 /// Deferred-reduction form of the sixteen-to-four composed pair fold. The
 /// two fold levels expand (char 2) to
 /// `out = x0 ^ ra*(x0^x1) ^ rb*(x0^x2) ^ (ra*rb)*(x0^x1^x2^x3)` per output
@@ -1427,35 +1437,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         }
     }
 
-    /// The four output groups of one tile through the general (non-composed)
-    /// path: four `group_from_packed` two-level pair folds, in one shared
-    /// out-of-line body.
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn groups_general(
-        table_data: *const F128,
-        a_pkt: *const u8,
-        b_pkt: *const u8,
-        xg: usize,
-        r1: __m512i,
-        r2: __m512i,
-        even_idx: __m512i,
-        odd_idx: __m512i,
-        pair_in_block_mask: usize,
-        useful_pairs_inclusive: usize,
-        cache: Option<(&[F128; 64], &[F128; 64], usize)>,
-    ) -> [__m512i; 8] {
-        // SAFETY: same row/table bounds as `group_from_packed`, which the
-        // caller's contract supplies for all four groups.
-        unsafe {
-            let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-            [oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3]
-        }
-    }
-
     // SAFETY: the function's contract bounds every packed-row read, table
     // read and output store; the cfg gate supplies every intrinsic feature.
     unsafe {
@@ -1494,9 +1475,19 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let pf_spread = zc_pkt_pf_spread_enabled();
         let mut fa_store = FoldCache([F128::ZERO; 64]);
         let mut fb_store = FoldCache([F128::ZERO; 64]);
+        let mut fa2_store = FoldCache([F128::ZERO; 64]);
+        let mut fb2_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
         let fb = &mut fb_store.0;
+        let fa2 = &mut fa2_store.0;
+        let fb2 = &mut fb2_store.0;
+        let c4_quad = use_c4 && zc_c4_quad_enabled();
+        let mut quad_second = false;
         while x_lo + 8 <= lo_size {
+            let consume_second = quad_second;
+            if consume_second {
+                quad_second = false;
+            }
             let ol = 2 * x_lo; // local output index of group 0
             let xg = out_base + ol;
             let cache = if use_batch {
@@ -1504,6 +1495,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
+                    if !(use_c4 && consume_second) {
                     let dead = super::super::prefold_dead_line_mask_gated(
                         4 * xg,
                         pair_in_block_mask,
@@ -1511,22 +1503,46 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     );
                     if use_c4 {
                         let c = cfold.unwrap();
-                        gfni_fold64_rows_masked_c4(
-                            a_pkt.add(4 * xg * 8),
-                            c,
-                            fa.as_mut_ptr(),
-                            dead,
-                        );
-                        gfni_fold64_rows_masked_c4(
-                            b_pkt.add(4 * xg * 8),
-                            c,
-                            fb.as_mut_ptr(),
-                            dead,
-                        );
+                        if c4_quad && x_lo + 16 <= lo_size {
+                            let xg1 = xg + 16;
+                            let dead1 = super::super::prefold_dead_line_mask_gated(
+                                4 * xg1,
+                                pair_in_block_mask,
+                                useful_pairs_inclusive,
+                            );
+                            gfni_fold64_rows_masked_c4_quad(
+                                a_pkt.add(4 * xg * 8),
+                                b_pkt.add(4 * xg * 8),
+                                a_pkt.add(4 * xg1 * 8),
+                                b_pkt.add(4 * xg1 * 8),
+                                c,
+                                fa.as_mut_ptr(),
+                                fb.as_mut_ptr(),
+                                fa2.as_mut_ptr(),
+                                fb2.as_mut_ptr(),
+                                dead,
+                                dead1,
+                            );
+                            quad_second = true;
+                        } else {
+                            gfni_fold64_rows_masked_c4(
+                                a_pkt.add(4 * xg * 8),
+                                c,
+                                fa.as_mut_ptr(),
+                                dead,
+                            );
+                            gfni_fold64_rows_masked_c4(
+                                b_pkt.add(4 * xg * 8),
+                                c,
+                                fb.as_mut_ptr(),
+                                dead,
+                            );
+                        }
                     } else {
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                    }
                     }
                     // The 512-byte bursts `pf_tiles` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
@@ -1561,9 +1577,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) = if use_c4 {
                 // The composed helper has already XOR-compressed the four
                 // residue planes, so its first four ZMMs are the four groups
-                // in output order.
-                let ap = fa.as_ptr();
-                let bp2 = fb.as_ptr();
+                // in output order. Occupancy-4 parks tile-1 in fa2/fb2.
+                let (ap, bp2) = if consume_second {
+                    (fa2.as_ptr(), fb2.as_ptr())
+                } else {
+                    (fa.as_ptr(), fb.as_ptr())
+                };
                 (
                     _mm512_loadu_si512(ap.cast::<__m512i>()),
                     _mm512_loadu_si512(bp2.cast::<__m512i>()),
@@ -1603,8 +1622,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         )
                     }
                 } else {
-                    let g = groups_general(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-                    (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
+                    let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3)
                 };
             // Spread delivery: the rest of this tile's hint block, at
             // a later point in the body.
@@ -2508,6 +2530,275 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
         _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
         _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
+    }
+}
+
+/// Occupancy-4 reconstitution of [`gfni_fold64_rows_masked_c4`]: one CFoldMats
+/// ZMM load feeds `vgf2p8affineqb` on A0, B0, A1, B1 of two consecutive
+/// 64-row tiles. Same affine products, same compact, four store destinations.
+///
+/// The two-tile consumer parks tile-0 in `out_a0`/`out_b0` and tile-1 in
+/// `out_a1`/`out_b1`. Kill switch `FLOCK_NO_C4_QUAD=1` restores two
+/// independent c4 calls (exact same-binary A/B).
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_c4`] on each of the four row pointers, with
+/// `dead0` gating tile-0's A/B lines and `dead1` gating tile-1's. Each `out_*`
+/// needs 16 writable `F128`s. Do not combine `#[inline(always)]` with
+/// `#[target_feature]` (rustc 1.97 issue 145574).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_quad(
+    rows_a0: *const u8,
+    rows_b0: *const u8,
+    rows_a1: *const u8,
+    rows_b1: *const u8,
+    m: &CFoldMats,
+    out_a0: *mut F128,
+    out_b0: *mut F128,
+    out_a1: *mut F128,
+    out_b1: *mut F128,
+    dead0: u8,
+    dead1: u8,
+) {
+    use core::arch::x86_64::*;
+    use core::mem::MaybeUninit;
+    // SAFETY (whole body): caller guarantees the four row/output bounds; every
+    // shuffle index is in range and the cfg gate supplies each intrinsic.
+    // Every MaybeUninit slot is written before it is read.
+    unsafe {
+        #[repr(C, align(64))]
+        struct QuadPc([[__m512i; 8]; 4]);
+        #[repr(C, align(64))]
+        struct QuadHalf([[__m512i; 8]; 4]);
+        #[repr(C, align(64))]
+        struct QuadProds([[__m512i; 8]; 4]);
+
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let sigma = _mm512_loadu_si512(SIGMA_C4.as_ptr() as *const __m512i);
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+
+        let prepare = |rows: *const u8, dead_lines: u8| -> [__m512i; 8] {
+            let mut z = [_mm512_setzero_si512(); 8];
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
+            }
+            let mut t = [_mm512_setzero_si512(); 8];
+            for (i, slot) in t.iter_mut().enumerate() {
+                *slot = _mm512_permutexvar_epi8(bt, z[i]);
+            }
+            let p = qword_transpose(t);
+            let mut pc = [_mm512_setzero_si512(); 8];
+            for (j, slot) in pc.iter_mut().enumerate() {
+                *slot = _mm512_permutexvar_epi8(sigma, p[j]);
+            }
+            pc
+        };
+
+        let mut pc_raw = MaybeUninit::<QuadPc>::uninit();
+        {
+            let pc = &mut *pc_raw.as_mut_ptr();
+            let streams = [rows_a0, rows_b0, rows_a1, rows_b1];
+            let deads = [dead0, dead0, dead1, dead1];
+            for s in 0..4 {
+                pc.0[s] = prepare(streams[s], deads[s]);
+            }
+        }
+        let pc = &*pc_raw.as_ptr();
+
+        // Occupancy: for each output byte k, load each of the eight chunk
+        // matrices once and apply the identical affine to all four streams.
+        // Reduction tree is the same ternary-logic XOR as `plane()` in c4.
+        let occupy_half = |k0: usize| -> QuadHalf {
+            let mut half_raw = MaybeUninit::<QuadHalf>::uninit();
+            let half = &mut *half_raw.as_mut_ptr();
+            for k in 0..8 {
+                let mut prod_raw = MaybeUninit::<QuadProds>::uninit();
+                let prod = &mut *prod_raw.as_mut_ptr();
+                for j in 0..8 {
+                    let mat = _mm512_loadu_si512(
+                        m.0[j * 16 + k0 + k].as_ptr() as *const __m512i,
+                    );
+                    for s in 0..4 {
+                        prod.0[s][j] = _mm512_gf2p8affine_epi64_epi8::<0>(pc.0[s][j], mat);
+                    }
+                }
+                let prod = &*prod_raw.as_ptr();
+                for s in 0..4 {
+                    let g = &prod.0[s];
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
+                    half.0[s][k] = _mm512_xor_si512(v2, v3);
+                }
+            }
+            half_raw.assume_init()
+        };
+
+        let lo_planes = occupy_half(0);
+        let hi_planes = occupy_half(8);
+
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        let xor4 = |a, b, c, d| {
+            _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a, b, c), d)
+        };
+        let compact = |lo_p: &[__m512i; 8], hi_p: &[__m512i; 8], out: *mut F128| {
+            let lo_half = qword_transpose(*lo_p);
+            let hi_half = qword_transpose(*hi_p);
+            let lo_even = _mm512_permutexvar_epi8(
+                bt,
+                xor4(lo_half[0], lo_half[2], lo_half[4], lo_half[6]),
+            );
+            let hi_even = _mm512_permutexvar_epi8(
+                bt,
+                xor4(hi_half[0], hi_half[2], hi_half[4], hi_half[6]),
+            );
+            let lo_odd = _mm512_permutexvar_epi8(
+                bt,
+                xor4(lo_half[1], lo_half[3], lo_half[5], lo_half[7]),
+            );
+            let hi_odd = _mm512_permutexvar_epi8(
+                bt,
+                xor4(hi_half[1], hi_half[3], hi_half[5], hi_half[7]),
+            );
+            let out_ptr = out as *mut __m512i;
+            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
+            _mm512_storeu_si512(
+                out_ptr.add(1),
+                _mm512_permutex2var_epi64(lo_even, il_hi, hi_even),
+            );
+            _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
+            _mm512_storeu_si512(
+                out_ptr.add(3),
+                _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd),
+            );
+        };
+
+        compact(&lo_planes.0[0], &hi_planes.0[0], out_a0);
+        compact(&lo_planes.0[1], &hi_planes.0[1], out_b0);
+        compact(&lo_planes.0[2], &hi_planes.0[2], out_a1);
+        compact(&lo_planes.0[3], &hi_planes.0[3], out_b1);
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+mod c4_quad_eq {
+    use super::*;
+    use crate::field::F128;
+
+    #[test]
+    fn occupancy4_matches_four_independent_c4() {
+        let mut data = vec![F128::ZERO; 8 * 256];
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = F128 {
+                lo: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                hi: (i as u64).rotate_left(17),
+            };
+        }
+        let coeffs = [
+            F128 { lo: 1, hi: 0 },
+            F128 { lo: 2, hi: 0 },
+            F128 { lo: 3, hi: 0 },
+            F128 { lo: 4, hi: 0 },
+        ];
+        let mats = build_cfold_mats(&data, coeffs);
+        let mut rows = vec![0u8; 4 * 512];
+        for (i, b) in rows.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        let mut out_seq = [[F128::ZERO; 16]; 4];
+        let mut out_quad = [[F128::ZERO; 16]; 4];
+        // SAFETY: 512-byte tiles, 16-slot outs, host has the cfg features.
+        unsafe {
+            gfni_fold64_rows_masked_c4(rows.as_ptr(), &mats, out_seq[0].as_mut_ptr(), 0);
+            gfni_fold64_rows_masked_c4(
+                rows.as_ptr().add(512),
+                &mats,
+                out_seq[1].as_mut_ptr(),
+                0,
+            );
+            gfni_fold64_rows_masked_c4(
+                rows.as_ptr().add(1024),
+                &mats,
+                out_seq[2].as_mut_ptr(),
+                0b1010,
+            );
+            gfni_fold64_rows_masked_c4(
+                rows.as_ptr().add(1536),
+                &mats,
+                out_seq[3].as_mut_ptr(),
+                0b1010,
+            );
+            gfni_fold64_rows_masked_c4_quad(
+                rows.as_ptr(),
+                rows.as_ptr().add(512),
+                rows.as_ptr().add(1024),
+                rows.as_ptr().add(1536),
+                &mats,
+                out_quad[0].as_mut_ptr(),
+                out_quad[1].as_mut_ptr(),
+                out_quad[2].as_mut_ptr(),
+                out_quad[3].as_mut_ptr(),
+                0,
+                0b1010,
+            );
+        }
+        assert_eq!(out_seq, out_quad);
     }
 }
 
