@@ -663,25 +663,35 @@ fn commit_with_round1_ab_precompute(
 ///
 /// The buffers are scratch-pool-retained (never unmapped for the process
 /// lifetime), so the detached thread cannot outlive their allocations.
+/// Non-Apple builds compile this helper to a no-op: their `gpu::prewire`
+/// implementation is empty, so spawning a thread would be pure timed work.
 fn gpu_prewire_round1_inputs(a: &[F128], b: &[F128], z: &[F128], codeword: Option<&[F128]>) {
-    let view = |v: &[F128]| (v.as_ptr() as usize, std::mem::size_of_val(v));
-    let mut bufs = [view(a), view(b), view(z), (0usize, 0usize)];
-    if let Some(cw) = codeword {
-        bufs[3] = view(cw);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (a, b, z, codeword);
     }
-    let _ = std::thread::Builder::new()
-        .name("flock-gpu-prewire".into())
-        .spawn(move || {
-            for (addr, len) in bufs {
-                if len == 0 {
-                    continue;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let view = |v: &[F128]| (v.as_ptr() as usize, std::mem::size_of_val(v));
+        let mut bufs = [view(a), view(b), view(z), (0usize, 0usize)];
+        if let Some(cw) = codeword {
+            bufs[3] = view(cw);
+        }
+        let _ = std::thread::Builder::new()
+            .name("flock-gpu-prewire".into())
+            .spawn(move || {
+                for (addr, len) in bufs {
+                    if len == 0 {
+                        continue;
+                    }
+                    // SAFETY: scratch-pool allocations stay mapped for the
+                    // process lifetime (the pool parks, never frees, them).
+                    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+                    flock_core::gpu::prewire(bytes);
                 }
-                // SAFETY: scratch-pool allocations stay mapped for the
-                // process lifetime (the pool parks, never frees, them).
-                let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
-                flock_core::gpu::prewire(bytes);
-            }
-        });
+            });
+    }
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
@@ -1188,3 +1198,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim, t)
 }
+// gin-x86-spawn-free-resample-01: independent timing sample of the target-dead thread deletion.
+// gin-x86-spawn-free-resample-02: second independent timing sample of the target-dead thread deletion.
