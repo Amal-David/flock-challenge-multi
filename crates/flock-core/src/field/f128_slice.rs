@@ -293,6 +293,34 @@ mod tests {
         }
     }
 
+    /// Fused DirectFold8 f-side equals the two-pass `fold16_banked` then
+    /// `fold4_nested` form, including a non-multiple-of-4 tail and a dirty
+    /// destination (the materializer hands this a recycled `LocalBuf`).
+    #[test]
+    fn fold16_banked_then_fold4_matches_two_pass() {
+        use super::*;
+        let mut state = 0xC0DE_F16F_4F00u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 256, 257] {
+            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let r0 = F128 { lo: next(), hi: next() };
+            let r1 = F128 { lo: next(), hi: next() };
+            let src: Vec<F128> = (0..64 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut mid = vec![F128::ZERO; 4 * n];
+            let mut two_pass = vec![F128 { lo: next(), hi: next() }; n];
+            fold16_banked(&src, &mut mid, &w);
+            fold4_nested(&mid, &mut two_pass, r0, r1);
+            let mut fused = vec![F128 { lo: next(), hi: next() }; n];
+            fold16_banked_then_fold4(&src, &mut fused, &w, r0, r1);
+            assert_eq!(fused, two_pass, "fused vs two-pass n={n}");
+        }
+    }
+
     /// AVX-512 (or portable) bind must match the scalar oracle at every
     /// ranked factor-state length plus a 4-element tail that misses the
     /// 8-output SIMD body.
@@ -591,6 +619,48 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             }
             *value = v;
         }
+    }
+}
+
+/// DirectFold8 f-side: [`fold16_banked`] then [`fold4_nested`] without a
+/// heap mid. `src.len() == 64 * dst.len()`. AVX-512 keeps a 16-F128 stack
+/// tile (one fold4 vector iteration) so the sixteen-bank ZMM mids never
+/// spill to the 16 KiB `mid4` slab. Other builds and the length contract
+/// still run the two kernels back-to-back on a short scratch vec.
+#[inline]
+pub(crate) fn fold16_banked_then_fold4(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r0: F128,
+    r1: F128,
+) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fused fold16+fold4 source must contain 64 elements per destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees avx512f+vpclmulqdq; the assert guarantees
+    // sixteen source elements per mid and four mids per output.
+    unsafe {
+        x86_64::fold16_banked_then_fold4(src, dst, w, r0, r1);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let mut mid = vec![F128::ZERO; 4 * dst.len()];
+        fold16_banked(src, &mut mid, w);
+        fold4_nested(&mid, dst, r0, r1);
     }
 }
 

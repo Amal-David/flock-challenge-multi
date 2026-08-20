@@ -240,6 +240,111 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// DirectFold8 f-side grain: the four mids of one [`fold16_banked`] vector
+/// body are exactly one [`fold4_nested`] 4-tuple. Ranked
+/// `materialize_direct_fold8` used to store those mids into a 16 KiB
+/// `LocalBuf` (`4 * SUB`) and reload them in a second kernel. This keeps
+/// a 16-F128 stack tile — one [`fold4_nested`] vector iteration — so the
+/// 2 MiB f-slab is still streamed by the sixteen-bank kernel, but the mid
+/// heap store/reload is gone. Same 16-bank deferred CLMUL, same nested
+/// pair-fold, same `FLOCK_NO_FOLD16_PF` look-ahead. `src.len() == 64 * dst.len()`.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and the length contract.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold16_banked_then_fold4(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r0: F128,
+    r1: F128,
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let wb: [__m512i; 16] = core::array::from_fn(|b| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        });
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let mid_len = 4 * dst.len();
+        let quads = mid_len & !3;
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(64);
+        let mut tile = [F128::ZERO; 16];
+        let mut tile_i = 0usize;
+        let mut out = 0usize;
+        let mut t = 0usize;
+        while t < quads {
+            if pf_ahead != 0 {
+                let ahead = 16 * t + pf_ahead;
+                if ahead <= pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut l = 0usize;
+                    while l < 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        l += 64;
+                    }
+                }
+            }
+            let mut acc = WideGhashX4::zero();
+            for g in 0..4 {
+                let base = 16 * t + 4 * g;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc(u0, wb[4 * g]);
+                acc.mul_acc(u1, wb[4 * g + 1]);
+                acc.mul_acc(u2, wb[4 * g + 2]);
+                acc.mul_acc(u3, wb[4 * g + 3]);
+            }
+            _mm512_storeu_si512(tile.as_mut_ptr().add(tile_i) as *mut __m512i, acc.reduce_lanes());
+            tile_i += 4;
+            if tile_i == 16 {
+                fold4_nested(&tile, &mut dst[out..out + 4], r0, r1);
+                tile_i = 0;
+                out += 4;
+            }
+            t += 4;
+        }
+        while t < mid_len {
+            let mut v = F128::ZERO;
+            for b in 0..16 {
+                v += w[b] * src[16 * t + b];
+            }
+            tile[tile_i] = v;
+            tile_i += 1;
+            t += 1;
+            if tile_i == 16 {
+                fold4_nested(&tile, &mut dst[out..out + 4], r0, r1);
+                tile_i = 0;
+                out += 4;
+            }
+        }
+        if tile_i != 0 {
+            debug_assert_eq!(tile_i % 4, 0);
+            let n = tile_i / 4;
+            debug_assert_eq!(out + n, dst.len());
+            fold4_nested(&tile[..tile_i], &mut dst[out..out + n], r0, r1);
+        } else {
+            debug_assert_eq!(out, dst.len());
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.

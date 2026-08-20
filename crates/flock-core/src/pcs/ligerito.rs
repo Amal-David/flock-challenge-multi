@@ -5860,6 +5860,16 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// Ranked default fuses the DirectFold8 f-side `fold16_banked` vector body
+/// with the following `fold4_nested` on a 16-F128 stack tile.
+/// `FLOCK_NO_FOLD8_F16F4_FUSE=1` restores the heap `mid4` two-pass.
+fn fold8_f16f4_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_F16F4_FUSE").is_none());
+    *ON
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5922,6 +5932,7 @@ fn materialize_direct_fold8(
     // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
     // geometries on the scalar path instead of reading through a short tail.
     let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
+    let f16f4_fuse = fold8_f16f4_fuse_enabled();
     assert_eq!(out_len, block_len * claims[0].eq_hi.len());
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
@@ -5975,7 +5986,10 @@ fn materialize_direct_fold8(
                         pooled,
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
-                    crate::scratch::LocalBuf::new(4 * SUB, pooled),
+                    crate::scratch::LocalBuf::new(
+                        if has_ordinary || !f16f4_fuse { 4 * SUB } else { 0 },
+                        pooled,
+                    ),
                     crate::scratch::LocalBuf::new(if b_gfni_on { 64 } else { 0 }, pooled),
                 )
             },
@@ -5989,20 +6003,33 @@ fn materialize_direct_fold8(
                     &[]
                 };
                 // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
+                // fold4: 64 -> 4 -> 1. Ranked default fuses the two kernels
+                // on a 16-F128 stack tile so the 16 KiB heap mid is not
+                // stored and reloaded; kill switch keeps the two-pass form.
+                // On SPR the 16-bank pass still halves VPCLMUL versus three
+                // nested pair-folds.
                 let mut slot = 0usize;
                 while slot < block_len {
                     let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
+                    if f16f4_fuse {
+                        crate::field::f128_slice::fold16_banked_then_fold4(
+                            &f_in[64 * slot..64 * (slot + n)],
+                            &mut f_out[slot..slot + n],
+                            &fold16_weight,
+                            r4,
+                            r5,
+                        );
+                    } else {
+                        let m4 = &mut mid4[..4 * n];
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                        );
+                        crate::field::f128_slice::fold4_nested(
+                            m4, &mut f_out[slot..slot + n], r4, r5,
+                        );
+                    }
                     if has_ordinary {
+                        let m4 = &mut mid4[..4 * n];
                         let m16 = &mut mid16[..16 * n];
                         crate::field::f128_slice::fold4_nested(
                             &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
