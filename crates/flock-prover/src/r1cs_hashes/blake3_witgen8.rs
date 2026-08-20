@@ -96,9 +96,23 @@ fn xor_v8(a: V8, b: V8) -> V8 {
 /// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
 /// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
+/// `FLOCK_NO_WITGEN_TERNLOG=1` or a CPU without AVX-512VL restores the
+/// two-XOR fallback. The runtime gate is required: `_mm256_ternarylogic_epi32`
+/// compiles to a bare `vpternlogd` and SIGILLs on non-AVX-512VL hosts (e.g. the
+/// local dev rig); `-C target-cpu=native` emits no gate of its own. On the
+/// official c7i.4xlarge runner `avx512vl` is always present, so the promoted
+/// fast path is byte-identical (the fallback is `a^b^c` too).
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
-    unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_WITGEN_TERNLOG").is_none()
+            && std::is_x86_feature_detected!("avx512vl")
+    });
+    if *ON {
+        unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
+    } else {
+        xor_v8(xor_v8(a, b), c)
+    }
 }
 
 #[inline(always)]

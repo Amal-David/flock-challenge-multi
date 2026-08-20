@@ -30,7 +30,7 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
@@ -77,6 +77,56 @@ const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 pub(crate) const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
+
+/// Chunk-count cap for round 1's outer eq split: `2^R1_SPLIT_MAX_N_HI`
+/// rayon `x_hi` tasks at most.
+const R1_SPLIT_MAX_N_HI: usize = 10;
+
+/// Per-`x_hi` `eq_lo` floor, in log2 windows. Round 1's GFNI eq-fold
+/// scratch is `2^(n_lo − 5) KiB` per worker; the incumbent `n_lo = 12`
+/// is 128 KiB (L1 overflow). `n_lo = 10` is 32 KiB (2/3 of an SPR L1d)
+/// and still a multiple of four (fold4 capture).
+const R1_SPLIT_MIN_LO_LOG: usize = 9;
+
+#[cfg(test)]
+thread_local! {
+    static ROUND1_SPLIT_N_HI_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Outer eq split for every round-1 production (and serial-oracle) entry.
+///
+/// Incumbent [`SplitEqGhash::new`] caps `n_hi` at 7 → 128 `x_hi` tasks at
+/// every `m ≥ 20`. Ranked `m = 32` has 19 outer variables, so that is 128
+/// chunks of `lo_size = 2^12` — 8 chunks/worker on the scoring 16-thread
+/// pool, and the GFNI eq-fold's per-worker `plane_banks` is 128 KiB.
+/// This variant raises `n_hi` to 9 at that shape (512 chunks,
+/// `lo_size = 2^10`, 32 KiB plane banks — 2/3 of an SPR L1d), the middle
+/// occupancy between the rejected 2048-chunk form (8 KiB planes, L1-hot
+/// but dispatch-heavy) and the incumbent. The regrouping is the same exact
+/// tensor move the packed-tail occupancy hop already shipped:
+/// `eq(x) = eq_hi[x_hi] · eq_lo[x_lo]`, F128 addition is XOR, the
+/// deferred reduction is F2-linear. `FLOCK_NO_ZC_R1_SPLIT=1` restores the
+/// 128-chunk split.
+fn round1_eq_split(r_outer: &[F128]) -> SplitEqGhash {
+    SplitEqGhash::with_n_hi(r_outer, round1_n_hi(r_outer.len()))
+}
+
+fn round1_n_hi(n_outer: usize) -> usize {
+    let base = n_outer.min(SplitEqGhash::MAX_N_HI);
+    #[cfg(test)]
+    if let Some(over) = ROUND1_SPLIT_N_HI_OVERRIDE.with(|c| c.get()) {
+        // Keep at least two lo variables so fold4's multiple-of-four lo
+        // half (`2^n_lo` with `n_lo ≥ 2`) still holds.
+        return over.min(n_outer.saturating_sub(2));
+    }
+    static OFF: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_SPLIT").is_some());
+    if *OFF {
+        return base;
+    }
+    base.max(R1_SPLIT_MAX_N_HI.min(n_outer.saturating_sub(R1_SPLIT_MIN_LO_LOG)))
+}
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
@@ -1299,7 +1349,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1453,7 +1503,7 @@ pub(crate) fn round1_with_s_hat_v_impl(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1548,7 +1598,7 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -1652,15 +1702,15 @@ pub(crate) fn c_fold4_capture_shape_ok(big_lo_size: usize) -> bool {
 }
 
 /// Shape predicate the zerocheck driver uses to pick the fold4 producer:
-/// the outer eq split (`SplitEqGhash::new(&r[k_skip + N_INNER..])`) must
-/// leave a multiple-of-four low half (true for every `m >= 22`, in
-/// particular the ranked `m = 32`).
+/// the outer eq split ([`round1_eq_split`]) must leave a multiple-of-four
+/// low half (true for every `m >= 22`, in particular the ranked `m = 32`).
 pub fn c_fold4_capture_available(m: usize, k_skip: usize) -> bool {
     if k_skip != K_SKIP || m < k_skip + N_INNER {
         return false;
     }
     let n = m - k_skip - N_INNER;
-    let n_lo = n - n.min(SplitEqGhash::MAX_N_HI);
+    let n_hi = round1_n_hi(n);
+    let n_lo = n - n_hi;
     c_fold4_capture_shape_ok(1usize << n_lo)
 }
 
@@ -2201,7 +2251,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     assert!(
         c_fold4_capture_shape_ok(big_lo_size),
@@ -2337,50 +2387,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
 // and the added fold read the same 2^(m-3) bytes.
 // ---------------------------------------------------------------------------
 
-/// Look-ahead, in 1 KiB outer windows, for the round-1 AB packed-row
-/// prefetch. One window is `2^N_INNER * N_CHUNKS = 1024` bytes of
-/// `ab_inner` — the sixteen contiguous 64-byte chunks one `x_outer_lo` step
-/// copies into `chunk_ab_bytes` before the GFNI accumulate consumes them.
-///
-/// The incumbent issues NO software prefetch here at all. The sweep
-/// demand-loads a window's sixteen lines back to back at the head of the
-/// window and then spends ~2 000 cycles of GFNI on them, so every window
-/// opens with a burst of misses that only the L2 streamer can have covered.
-/// At the ranked shape it frequently has not: sixteen worker threads each
-/// drive this stream while the *concurrent* identity-C fold (the other half
-/// of round one's `rayon::join`) drives eight row-strided gather streams of
-/// its own through the same L2s, and the streamer's tracker is shared per
-/// core between the two SMT siblings.
-///
-/// The ranked-shape decomposition of round one measures the exposure
-/// directly (16 threads, m = 32, k_log = 14, medians):
-///
-///   real (AB memory + compute, C full)     22.29 ms
-///   AB compute only (no `ab_inner` reads)  19.37 ms
-///   AB compute only + C compute only       18.81 ms
-///
-/// so ~2.9 ms of the AB stream is ADDITIVE, not overlapped, while the
-/// concurrent C fold's own 512 MiB costs only 0.56 ms exposed — that stream
-/// already carries the grouped-gather prefetch, this one carried nothing.
-///
-/// Two windows puts a full extra window of work behind the hint — ~2 000
-/// cycles, several times a loaded DRAM miss on this box — while keeping
-/// every line covered exactly once: window `W + 2` is requested at window
-/// `W`, so each line is hinted once, just earlier. One window only reaches
-/// back into the same window's own GFNI burst, and four or more evicts
-/// before use; both measure worse. Nothing is added to the sweep and
-/// nothing moves — a prefetch has no architectural effect — so the
-/// accumulated lanes are bit-identical either way.
-const ZC_R1AB_PF_WINDOWS: usize = 2;
-
-/// `FLOCK_NO_ZC_R1AB_PF=1` restores the incumbent no-prefetch round-1 AB
-/// sweep (exact same-binary A/B). Resolved once per process.
-fn zc_r1ab_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PF").is_none());
-    *ON
-}
-
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2427,16 +2433,6 @@ fn process_one_x_hi_ab_only(
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
-    // Packed-row prefetch look-ahead, resolved once per x_hi band (never
-    // inside the window loop).
-    #[cfg(target_arch = "x86_64")]
-    let pf_windows = if zc_r1ab_pf_enabled() {
-        ZC_R1AB_PF_WINDOWS
-    } else {
-        0
-    };
-    #[cfg(target_arch = "x86_64")]
-    let ab_inner_ptr = ab_inner.as_ptr();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -2444,33 +2440,6 @@ fn process_one_x_hi_ab_only(
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
-        // window's copy loop will demand, and exactly as many of them (the
-        // padding skip drops the last chunk of every second window). Issued
-        // BEFORE this window's own copy, so the hint sits two whole windows
-        // of work ahead of the demand load it feeds; issued after the copy it
-        // reaches only ~1.5 windows back and measures ~0.7 ms worse.
-        // `wrapping_add` keeps the past-the-end address on the last windows
-        // of the last band well defined, and that hint is simply dropped.
-        #[cfg(target_arch = "x86_64")]
-        if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_base = ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            for b_med in 0..n_next {
-                // SAFETY: `_mm_prefetch` is a hint — no memory is read, no
-                // fault is possible, and the address is formed by
-                // `wrapping_add` on the base pointer.
-                unsafe {
-                    core::arch::x86_64::_mm_prefetch(
-                        ab_inner_ptr
-                            .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                            .cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-            }
-        }
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
@@ -2569,7 +2538,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2725,7 +2694,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = round1_eq_split(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2907,6 +2876,75 @@ mod tests {
         let out1 = round1_shift_reduce_extract_c(&a, &b, &c, m, K_SKIP, &r, &table);
         let out2 = round1_shift_reduce_extract_c(&a, &b, &c, m, K_SKIP, &r, &table);
         assert_eq!(out1, out2);
+    }
+
+    /// Every admissible outer `n_hi` is value-identical: the eq tensor
+    /// factors exactly, F128 addition is XOR, and the deferred reduction is
+    /// F2-linear. Covers the fused extract_c path and the ranked AB-only
+    /// identity-C consumer.
+    #[test]
+    fn round1_outer_split_n_hi_is_value_identical() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ROUND1_SPLIT_N_HI_OVERRIDE.with(|c| c.set(None));
+            }
+        }
+        let _reset = Reset;
+
+        assert_eq!(round1_n_hi(19), 10, "ranked m=32 outer");
+        assert_eq!(round1_n_hi(17), 8, "m=30 outer hits the new floor");
+        assert_eq!(round1_n_hi(15), 7, "below lo floor stays incumbent");
+        assert_eq!(round1_n_hi(7), 7);
+
+        let m = 20usize;
+        let n_outer = m - K_SKIP - N_INNER;
+        let mut rng = Rng::new(0x51_5b17);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c = rng.bits(1 << m);
+        let a_p = pack_bits(&a);
+        let b_p = pack_bits(&b);
+        let c_p = pack_bits(&c);
+        let outer = rng.f128_vec(n_outer);
+        let r = build_protocol_r(m, &outer);
+        let table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+
+        ROUND1_SPLIT_N_HI_OVERRIDE.with(|cell| cell.set(Some(SplitEqGhash::MAX_N_HI)));
+        let expected = round1_shift_reduce_extract_c_packed(
+            &a_p, &b_p, &c_p, m, K_SKIP, &r, &table,
+        );
+        let mut pre_expected = precompute_round1_ab_inner_packed_padded(
+            &a_p, &b_p, m, K_SKIP, &table, &padding,
+        );
+        let expected_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut pre_expected,
+            &a_p,
+            &b_p,
+            m,
+            K_SKIP,
+            &r,
+            &table,
+            &padding,
+        );
+
+        // n_hi = 0 is a single chunk; n_hi = n_outer-2 keeps n_lo ≥ 2.
+        for n_hi in 0..=n_outer.saturating_sub(2) {
+            ROUND1_SPLIT_N_HI_OVERRIDE.with(|cell| cell.set(Some(n_hi)));
+            let got = round1_shift_reduce_extract_c_packed(
+                &a_p, &b_p, &c_p, m, K_SKIP, &r, &table,
+            );
+            assert_eq!(got, expected, "extract_c mismatch at n_hi={n_hi}");
+            let mut pre = precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, m, K_SKIP, &table, &padding,
+            );
+            let got_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &mut pre, &a_p, &b_p, m, K_SKIP, &r, &table, &padding,
+            );
+            assert_eq!(got_ab, expected_ab, "AB-only mismatch at n_hi={n_hi}");
+        }
     }
 
     /// **The defining cross-check**: `C_s · (opt_AB + opt_C) == naive_AB + naive_C`,
@@ -3536,7 +3574,7 @@ mod tests {
             let inv_table = make_inv_table();
             let padding = PaddingSpec::dense(m);
 
-            let hi_size = 1usize << SplitEqGhash::new(&r[K_SKIP + N_INNER..]).n_hi;
+            let hi_size = 1usize << round1_eq_split(&r[K_SKIP + N_INNER..]).n_hi;
             let g = (hi_size / 2).max(1);
 
             let pure_cpu = round1_with_s_hat_v_impl(
