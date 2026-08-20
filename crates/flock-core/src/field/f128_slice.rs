@@ -66,10 +66,23 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Ranked default routes DirectFold8 factor-state binds through the AVX-512
+/// `fold_pairs` permute plus deferred `WideGhashX4` message accumulate.
+/// `FLOCK_NO_OPEN_FOLD8_BIND_X4=1` restores the compact scalar scan. Read once
+/// per process; default ON. The selector is outside the bind, so there is no
+/// per-element dispatch — the historical "avoid dispatch" scalar comment no
+/// longer applies on Sapphire Rapids.
+fn fold8_bind_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_none());
+    *ON
+}
+
 /// Bind one bank coordinate in two bit-major DirectFold8 factor states and
-/// return the next round's `(u0,u2)` statistics. The state is only 512 KiB at
-/// entry and halves each call, so the compact scalar scan avoids dispatch and
-/// uses the one-product characteristic-two fold `e + r*(e+o)`.
+/// return the next round's `(u0,u2)` statistics. Characteristic-two identity
+/// `e + r*(e+o)` (one product per output). Ranked SPR uses four-lane VPCLMUL
+/// folds fused with the existing even/odd message reduction; other builds and
+/// the kill switch keep the scalar scan.
 #[inline]
 pub(crate) fn fold_two_and_msg_in_place(
     f: &mut Vec<F128>,
@@ -78,6 +91,28 @@ pub(crate) fn fold_two_and_msg_in_place(
 ) -> (F128, F128) {
     assert_eq!(f.len(), b.len());
     assert!(f.len().is_multiple_of(4));
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if fold8_bind_x4_enabled() {
+        // SAFETY: cfg gate guarantees avx512f+vpclmulqdq; the length
+        // assertions match the kernel contract (even pair count, in-place
+        // prefix write of already-consumed sources).
+        return unsafe { x86_64::fold_two_and_msg_in_place(f, b, r) };
+    }
+
+    fold_two_and_msg_in_place_scalar(f, b, r)
+}
+
+/// Scalar DirectFold8 bind. Also the kill-switch restore and the test oracle.
+pub(super) fn fold_two_and_msg_in_place_scalar(
+    f: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
     let half = f.len() / 2;
     let mut u0 = F128::ZERO;
     let mut u2 = F128::ZERO;
@@ -220,6 +255,48 @@ mod tests {
         for t in 0..8 {
             let want = src[16 * t..16 * t + 16].iter().fold(F128::ZERO, |a, &b| a + b);
             assert_eq!(got[t], want);
+        }
+    }
+
+    /// AVX-512 (or portable) bind must match the scalar oracle at every
+    /// ranked factor-state length plus a 4-element tail that misses the
+    /// 8-output SIMD body.
+    #[test]
+    fn fold_two_and_msg_in_place_matches_scalar() {
+        use super::*;
+        let mut state = 0xF01D_8B1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [4usize, 8, 12, 16, 64, 256, 8192] {
+            let r = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let f: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let b: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut f_got = f.clone();
+            let mut b_got = b.clone();
+            let mut f_want = f;
+            let mut b_want = b;
+            let got = fold_two_and_msg_in_place(&mut f_got, &mut b_got, r);
+            let want = fold_two_and_msg_in_place_scalar(&mut f_want, &mut b_want, r);
+            assert_eq!(got, want, "message n={n}");
+            assert_eq!(f_got, f_want, "folded f n={n}");
+            assert_eq!(b_got, b_want, "folded b n={n}");
         }
     }
 
