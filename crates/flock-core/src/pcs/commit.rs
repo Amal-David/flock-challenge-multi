@@ -373,15 +373,7 @@ fn finalize_commit(
                 0
             };
             // Publish this sub-group's depth; every sub-group must agree.
-            let seen = match local_levels.compare_exchange(
-                usize::MAX,
-                depth,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => depth,
-                Err(prev) => prev,
-            };
+            let seen = publish_local_fold_depth(&local_levels, depth);
             if seen != depth {
                 local_levels.store(0, Ordering::Release);
             }
@@ -650,6 +642,37 @@ fn cpu_join_hash_leaves(
     });
 }
 
+/// Ranked default: load the published sub-group fold depth before CAS.
+/// After the first writer publishes, later workers only need a shared-line
+/// load instead of an exclusive RMW on `local_levels`. The CAS itself is
+/// identical to the incumbent (first writer `MAX → depth`; a mismatch still
+/// stores 0). `FLOCK_NO_MERKLE_LOCAL_LOAD_CAS=1` restores always-CAS.
+fn merkle_local_load_cas_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MERKLE_LOCAL_LOAD_CAS").is_none()
+    });
+    *ON
+}
+
+#[inline]
+fn publish_local_fold_depth(local_levels: &AtomicUsize, depth: usize) -> usize {
+    if merkle_local_load_cas_enabled() {
+        let loaded = local_levels.load(Ordering::Acquire);
+        if loaded != usize::MAX {
+            return loaded;
+        }
+    }
+    match local_levels.compare_exchange(
+        usize::MAX,
+        depth,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => depth,
+        Err(prev) => prev,
+    }
+}
+
 /// `FLOCK_NO_MERKLE_SUBTREE_PARENTS=1` disables the in-callback subtree fold
 /// (exact A/B control: the full upper-level build then runs as before).
 /// Resolved once per process.
@@ -782,15 +805,7 @@ pub(crate) fn fused_encode_leaves_subtree(
         } else {
             0
         };
-        let seen = match local_levels.compare_exchange(
-            usize::MAX,
-            depth,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => depth,
-            Err(prev) => prev,
-        };
+        let seen = publish_local_fold_depth(&local_levels, depth);
         if seen != depth {
             local_levels.store(0, Ordering::Release);
         }
@@ -1218,6 +1233,33 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
+    /// Load-before-CAS must match always-CAS on first-writer, agreement, and
+    /// disagreement. The helper is the production leaf; this does not touch
+    /// hashes, transcripts, or tree layout.
+    #[test]
+    fn publish_local_fold_depth_matches_always_cas() {
+        use super::*;
+        fn always_cas(slot: &AtomicUsize, depth: usize) -> usize {
+            match slot.compare_exchange(
+                usize::MAX,
+                depth,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => depth,
+                Err(prev) => prev,
+            }
+        }
+        let a = AtomicUsize::new(usize::MAX);
+        let b = AtomicUsize::new(usize::MAX);
+        assert_eq!(publish_local_fold_depth(&a, 11), always_cas(&b, 11));
+        assert_eq!(a.load(Ordering::Acquire), b.load(Ordering::Acquire));
+        assert_eq!(publish_local_fold_depth(&a, 11), always_cas(&b, 11));
+        assert_eq!(publish_local_fold_depth(&a, 7), always_cas(&b, 7));
+        assert_eq!(a.load(Ordering::Acquire), 11);
+        assert_eq!(b.load(Ordering::Acquire), 11);
+    }
+
     /// The exact ranked selector is narrow, and regrouping sixteen retired
     /// blocks into one 2048-leaf parent fold reproduces every flat-tree node.
     #[test]
