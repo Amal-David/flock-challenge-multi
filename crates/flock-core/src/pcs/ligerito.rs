@@ -5661,6 +5661,25 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// Interleave DirectFold8 F 64-slot (`fold16_banked` + `fold4_nested`) with
+/// the ranked GFNI B 64-slot producer. The two writes are independent until
+/// `msg_reduce_avx512`; this is an equivalent schedule, not a new algebra.
+/// `FLOCK_NO_FOLD8_FB_INTERLEAVE=1` restores whole-block F then whole-block B.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_fb_interleave_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD8_FB_INTERLEAVE").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5784,27 +5803,52 @@ fn materialize_direct_fold8(
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
                 // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                //
+                // Ranked GFNI B is a 64-slot producer. The incumbent ran the
+                // whole-block F stream (SUB=256) first, then the 64-slot B
+                // producer, so DRAM and GFNI never shared a tile. Interleave
+                // restores that 64-slot grain: same fold16_banked + fold4_nested
+                // and the same four-map staged kernel, joined only at
+                // msg_reduce. Kill switch keeps the sequential schedule.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                let fb_interleave = b_gfni_on && direct_fold8_fb_interleave_enabled();
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                )))]
+                let fb_interleave = false;
+                if !fb_interleave {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
                         );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
                         crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
+                            m4, &mut f_out[slot..slot + n], r4, r5,
                         );
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4, &mut b_out[slot..slot + n], r4, r5,
+                            );
+                        }
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -5830,22 +5874,60 @@ fn materialize_direct_fold8(
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    for slot in (0..block_len).step_by(64) {
-                        // SAFETY: each packed-u64 row half supplies 512 bytes;
-                        // both output buffers cover 64 F128s; cfg features hold.
-                        unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
-                                b_out.as_mut_ptr().add(slot),
-                                gfni_tmp.as_mut_ptr().cast(),
+                    const GFNI_N: usize = 64;
+                    if fb_interleave {
+                        let mut slot = 0usize;
+                        while slot < block_len {
+                            let m4 = &mut mid4[..4 * GFNI_N];
+                            crate::field::f128_slice::fold16_banked(
+                                &f_in[64 * slot..64 * (slot + GFNI_N)],
+                                m4,
+                                &fold16_weight,
                             );
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut f_out[slot..slot + GFNI_N],
+                                r4,
+                                r5,
+                            );
+                            // SAFETY: each packed-u64 row half supplies 512 bytes;
+                            // both output buffers cover 64 F128s; cfg features hold.
+                            // F writes f_out[slot..slot+64]; B writes b_out[slot..slot+64];
+                            // the slices are disjoint until msg_reduce below.
+                            unsafe {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
+                            slot += GFNI_N;
+                        }
+                    } else {
+                        for slot in (0..block_len).step_by(GFNI_N) {
+                            // SAFETY: each packed-u64 row half supplies 512 bytes;
+                            // both output buffers cover 64 F128s; cfg features hold.
+                            unsafe {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
                         }
                     }
                 }
