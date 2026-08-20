@@ -2423,6 +2423,18 @@ fn zc_r1ab_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_PF_SPREAD=1` restores the incumbent delivery of the
+/// round-1 AB packed-row prefetch: the whole window's hint block issued back
+/// to back ahead of the window's copy loop. The default arm issues the same
+/// hints for the same lines, one per copy step, so a hint and a demand line
+/// alternate instead of sixteen hints queueing ahead of sixteen loads.
+/// Exact same-binary A/B: a prefetch has no architectural effect.
+fn zc_r1ab_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PF_SPREAD").is_none());
+    *ON
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2479,6 +2491,8 @@ fn process_one_x_hi_ab_only(
     };
     #[cfg(target_arch = "x86_64")]
     let ab_inner_ptr = ab_inner.as_ptr();
+    #[cfg(target_arch = "x86_64")]
+    let pf_spread = zc_r1ab_pf_spread_enabled();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -2494,28 +2508,52 @@ fn process_one_x_hi_ab_only(
         // reaches only ~1.5 windows back and measures ~0.7 ms worse.
         // `wrapping_add` keeps the past-the-end address on the last windows
         // of the last band well defined, and that hint is simply dropped.
+        // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
+        // padding skip leaves live.
         #[cfg(target_arch = "x86_64")]
-        if pf_windows != 0 {
+        let (n_next, next_base) = if pf_windows != 0 {
             let x_next = x_outer_lo + pf_windows;
-            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_base = ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            (
+                b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
+                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
+            )
+        } else {
+            (0, 0)
+        };
+        // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
+        // possible, and the address is formed by `wrapping_add` on the base
+        // pointer.
+        #[cfg(target_arch = "x86_64")]
+        let pf_one = |b_med: usize| unsafe {
+            core::arch::x86_64::_mm_prefetch(
+                ab_inner_ptr
+                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
+                    .cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        };
+        #[cfg(target_arch = "x86_64")]
+        if !pf_spread {
             for b_med in 0..n_next {
-                // SAFETY: `_mm_prefetch` is a hint — no memory is read, no
-                // fault is possible, and the address is formed by
-                // `wrapping_add` on the base pointer.
-                unsafe {
-                    core::arch::x86_64::_mm_prefetch(
-                        ab_inner_ptr
-                            .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                            .cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
+                pf_one(b_med);
             }
         }
         for b_med in 0..n_b_med {
+            // Spread delivery: one hint per copy step, so each hint is
+            // issued next to one demand line rather than the whole block
+            // queueing ahead of the copy. Same lines, same look-ahead.
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread && b_med < n_next {
+                pf_one(b_med);
+            }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if pf_spread {
+            for b_med in n_b_med..n_next {
+                pf_one(b_med);
+            }
         }
         #[cfg(all(
             target_arch = "x86_64",

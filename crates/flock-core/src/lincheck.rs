@@ -983,6 +983,19 @@ fn lc_zfold_pf_near_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_ZFOLD_PF_SPREAD=1` restores the incumbent delivery of the
+/// grouped gather prefetch: every stripe's hint block issued inside the
+/// gather loop, next to that stripe's own strided reads. The default arm
+/// issues the same hints for the same lines from the fold loop that follows,
+/// two stripes' worth per fold call. Exact same-binary A/B: a prefetch has
+/// no architectural effect, so the folded values are identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_SPREAD").is_none());
+    *ON
+}
+
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -1086,6 +1099,8 @@ fn fold_block_major_gfni(
             } else {
                 2 * LC_ZFOLD_PF_CHUNKS
             };
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_spread = lc_zfold_pf_spread_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1119,7 +1134,7 @@ fn fold_block_major_gfni(
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
                             let outer_base = 8 * (stripe_base + t);
-                            if pf_far {
+                            if pf_far && !pf_spread {
                                 // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
                                 // on: the lines this stripe demand-loads two
                                 // grouped visits from now. Issued here, the
@@ -1142,6 +1157,7 @@ fn fold_block_major_gfni(
                                         }
                                     }
                                 }
+                            } else if pf_far {
                             } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
                                 let next_base = 8 * (stripe_base + t + 1);
                                 // One line per row covers all four columns.
@@ -1171,6 +1187,32 @@ fn fold_block_major_gfni(
                             }
                         }
                         for c in 0..4 {
+                            // Spread delivery: the same eight-hints-per-stripe
+                            // block, issued from the fold that follows the
+                            // gather instead of from the gather itself, two
+                            // stripes at a time. Same lines, same look-ahead.
+                            if pf_far && pf_spread {
+                                let qn = q + pf_chunks;
+                                if qn <= full_chunks && qn < chunks_per_block {
+                                    for t in 2 * c..2 * c + 2 {
+                                        let outer_base = 8 * (stripe_base + t);
+                                        // SAFETY: the same indices the gather
+                                        // reads on a later grouped visit; a
+                                        // prefetch never dereferences.
+                                        unsafe {
+                                            for r in 0..8 {
+                                                core::arch::x86_64::_mm_prefetch(
+                                                    z_packed
+                                                        .as_ptr()
+                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .cast::<i8>(),
+                                                    core::arch::x86_64::_MM_HINT_T0,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {

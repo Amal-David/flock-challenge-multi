@@ -228,13 +228,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let mut fb_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
         let fb = &mut fb_store.0;
-        // Packed-row prefetch distance, resolved once per worker chunk
-        // (never inside the refill / message loops).
+        // Packed-row prefetch distance and delivery, resolved once per
+        // worker chunk (never inside the refill / message loops).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
             ZC_PKT_PF_TILES
         } else {
             1
         };
+        let pf_on = zc_pkt_pf_enabled();
+        let pf_spread = zc_pkt_pf_spread_enabled();
 
         // Residue-major refill (WRITE=false only — the chunk-store arm needs
         // row order): the prefold emits directly in the a_k/b_k register
@@ -275,7 +277,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 // burst boundary. Pull both sides in now (prefetch is a
                 // hint: `wrapping_add` keeps the past-the-end address on
                 // the last tiles well defined, and the hint is dropped).
-                if zc_pkt_pf_enabled() {
+                if pf_on && !pf_spread {
                     let next = (g0 + 64 * pf_tiles) * 8;
                     for l in 0..8 {
                         _mm_prefetch(
@@ -287,6 +289,26 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             core::arch::x86_64::_MM_HINT_T0,
                         );
                     }
+                }
+            }
+            // Spread delivery: one quarter of the same sixteen-hint block
+            // per loop body, so a tile's lines are asked for across all four
+            // bodies it feeds instead of in one burst at the refill. Same
+            // lines, same look-ahead, same instruction count per tile.
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            if use_batch && pf_on && pf_spread {
+                let tile_base = row_base + 2 * (x_lo & !31);
+                let next = (tile_base + 64 * pf_tiles) * 8;
+                let l0 = (x_lo & 31) >> 2;
+                for l in l0..l0 + 2 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
                 }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
@@ -785,6 +807,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         // Input look-ahead, resolved once per worker chunk (never inside the
         // loop). One body consumes 64 F128 from each side.
         let pf_on = zc_tail_pf_enabled();
+        let pf_spread = zc_tail_pf_spread_enabled();
         const PF_OFF: usize = ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
 
         while x_lo + 8 <= lo_size {
@@ -792,10 +815,11 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
+            let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+            let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
             if pf_on {
-                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
-                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
-                for l in 0..16 {
+                let hi = if pf_spread { 4 } else { 16 };
+                for l in 0..hi {
                     _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
                     _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
                 }
@@ -823,6 +847,14 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     fold16_to_4(b_src.add(48), ra, rb, even_idx, odd_idx),
                 )
             };
+            // Spread delivery: the rest of this body's hint block, at
+            // later points in the same body.
+            if pf_on && pf_spread {
+                for l in 4..8 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
             let ap = a_out.as_mut_ptr().add(output);
             let bp = b_out.as_mut_ptr().add(output);
             if nt_out {
@@ -845,8 +877,24 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                 _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
             }
 
+            // Spread delivery: the rest of this body's hint block, at
+            // later points in the same body.
+            if pf_on && pf_spread {
+                for l in 8..12 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
+            // Spread delivery: the rest of this body's hint block, at
+            // later points in the same body.
+            if pf_on && pf_spread {
+                for l in 12..16 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
@@ -1035,6 +1083,19 @@ pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_PKT_PF_SPREAD=1` restores the incumbent delivery of the
+/// packed-row prefetch in the round-2 and rounds-3+4 fold kernels: all
+/// sixteen hints of a tile issued back to back at the refill. The default
+/// arm issues the same sixteen hints for the same sixteen lines, two per
+/// side at each of four points spaced through the work the tile feeds.
+/// Exact same-binary A/B: a prefetch has no architectural effect, so the
+/// folded values are bit-identical either way.
+pub(crate) fn zc_pkt_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF_SPREAD").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_TAIL_PF=1` disables the look-ahead software prefetch of the
 /// composed tail fold's `a`/`b` input streams (exact same-binary A/B;
 /// prefetch is architecturally invisible).
@@ -1049,6 +1110,18 @@ pub(crate) fn zc_tail_pf_enabled() -> bool {
 /// body `T + ZC_TAIL_PF_TILES` is issued at the head of body `T` and every
 /// line is still requested exactly once — only earlier.
 const ZC_TAIL_PF_TILES: usize = 3;
+
+/// `FLOCK_NO_ZC_TAIL_PF_SPREAD=1` restores the incumbent delivery of the
+/// composed tail fold's input prefetch: all thirty-two hints of a body
+/// issued back to back at its head. The default arm issues the same
+/// thirty-two hints for the same thirty-two lines, four per side at each of
+/// four points spaced through the body. Exact same-binary A/B: a prefetch
+/// has no architectural effect.
+pub(crate) fn zc_tail_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_PF_SPREAD").is_none());
+    *ON
+}
 
 /// `FLOCK_NO_ZC_TAIL_NT=1` restores plain write-allocate stores for the
 /// composed tail fold's outputs (exact same-binary A/B).
@@ -1381,13 +1454,15 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
         let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
-        // Packed-row prefetch distance, resolved once per worker chunk
-        // (never inside the refill loop).
+        // Packed-row prefetch distance and delivery, resolved once per
+        // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
             ZC_PKT_PF_TILES
         } else {
             1
         };
+        let pf_on = zc_pkt_pf_enabled();
+        let pf_spread = zc_pkt_pf_spread_enabled();
         let mut fa_store = FoldCache([F128::ZERO; 64]);
         let mut fb_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
@@ -1427,9 +1502,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     // The 512-byte bursts `pf_tiles` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
                     // Same addresses on both refill arms.
-                    if zc_pkt_pf_enabled() {
+                    if pf_on {
                         let next = (4 * xg + 64 * pf_tiles) * 8;
-                        for l in 0..8 {
+                        let hi = if pf_spread { 2 } else { 8 };
+                        for l in 0..hi {
                             _mm_prefetch(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
@@ -1454,20 +1530,31 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             // zero in memory and every fold table maps 0 → 0, so the cached
             // row is already the zero the scalar path wrote explicitly.
             let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) = if use_c4 {
-                // The composed helper has already XOR-compressed the four
-                // residue planes, so its first four ZMMs are the four groups
-                // in output order.
+                // `out[16·k + t] = c_k · fold(row 4·t + k)`, so group `t` is
+                // the XOR of the four residue planes at the same lane offset
+                // — output order already correct, no transpose.
+                let xor4 = |p: *const F128, g: usize| -> __m512i {
+                    let q = p.add(4 * g);
+                    let v0 = _mm512_loadu_si512(q.cast::<__m512i>());
+                    let v1 = _mm512_loadu_si512(q.add(16).cast::<__m512i>());
+                    let v2 = _mm512_loadu_si512(q.add(32).cast::<__m512i>());
+                    let v3 = _mm512_loadu_si512(q.add(48).cast::<__m512i>());
+                    _mm512_xor_si512(
+                        _mm512_ternarylogic_epi64::<0x96>(v0, v1, v2),
+                        v3,
+                    )
+                };
                 let ap = fa.as_ptr();
                 let bp2 = fb.as_ptr();
                 (
-                    _mm512_loadu_si512(ap.cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(4).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(4).cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(8).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(8).cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
+                    xor4(ap, 0),
+                    xor4(bp2, 0),
+                    xor4(ap, 1),
+                    xor4(bp2, 1),
+                    xor4(ap, 2),
+                    xor4(bp2, 2),
+                    xor4(ap, 3),
+                    xor4(bp2, 3),
                 )
             } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
                     debug_assert_eq!(cache_base, 4 * xg);
@@ -1504,6 +1591,21 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
                     (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3)
                 };
+            // Spread delivery: the rest of this tile's hint block, at
+            // a later point in the body.
+            if use_batch && pf_on && pf_spread {
+                let next = (4 * xg + 64 * pf_tiles) * 8;
+                for l in 2..4 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let ap = a_out.as_mut_ptr().add(ol);
             let bp = b_out.as_mut_ptr().add(ol);
             // The round message below is computed from the same registers, so
@@ -1531,8 +1633,38 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
             }
 
+            // Spread delivery: the rest of this tile's hint block, at
+            // a later point in the body.
+            if use_batch && pf_on && pf_spread {
+                let next = (4 * xg + 64 * pf_tiles) * 8;
+                for l in 4..6 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
+            // Spread delivery: the rest of this tile's hint block, at
+            // the last point in the body.
+            if use_batch && pf_on && pf_spread {
+                let next = (4 * xg + 64 * pf_tiles) * 8;
+                for l in 6..8 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
@@ -2207,13 +2339,13 @@ const SIGMA_C4: [i8; 64] = [
 /// `coeffs[r & 3]` to every row `r` of the batch, for free, by folding the
 /// constant into the bit matrices.
 ///
-/// Writes the sixteen composed outputs directly. Output ZMM `g` contains
-/// groups `t = 4·g .. 4·g+4`, each the XOR over residues `k` of
-/// `coeffs[k] · fold(row 4·t + k)`.
+/// Writes the 64 scaled folds in **residue-major** order: `out[16·k + t]` is
+/// `coeffs[k] · fold(row 4·t + k)`. The caller's composed output for group
+/// `t` is therefore `out[t] ^ out[16 + t] ^ out[32 + t] ^ out[48 + t]`.
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked`]: 64 readable bytes at `rows.add(64 * i)`
-/// for every line not marked dead, and 16 writable `F128`s at `out`.
+/// for every line not marked dead, and 64 writable `F128`s at `out`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2332,35 +2464,13 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        // The sole c4 consumer immediately XORs chunks (0,4,8,12),
-        // (1,5,9,13), (2,6,10,14), and (3,7,11,15).  All remaining
-        // transforms are F2-linear, so combine the corresponding half rows
-        // before the byte/interleave transposes and materialize only four
-        // ZMMs instead of sixteen.
-        let xor4 = |a, b, c, d| {
-            _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a, b, c), d)
-        };
-        let lo_even = _mm512_permutexvar_epi8(
-            bt,
-            xor4(lo_half[0], lo_half[2], lo_half[4], lo_half[6]),
-        );
-        let hi_even = _mm512_permutexvar_epi8(
-            bt,
-            xor4(hi_half[0], hi_half[2], hi_half[4], hi_half[6]),
-        );
-        let lo_odd = _mm512_permutexvar_epi8(
-            bt,
-            xor4(lo_half[1], lo_half[3], lo_half[5], lo_half[7]),
-        );
-        let hi_odd = _mm512_permutexvar_epi8(
-            bt,
-            xor4(hi_half[1], hi_half[3], hi_half[5], hi_half[7]),
-        );
-        let out_ptr = out as *mut __m512i;
-        _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
-        _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
-        _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
-        _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
+        for i in 0..8 {
+            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
+            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
+            let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
+            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
+            _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo, il_hi, hi));
+        }
     }
 }
 
