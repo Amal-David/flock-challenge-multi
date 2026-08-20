@@ -24,7 +24,8 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window_with_images, round1_ab_table_images,
+    Round1AbWindowPlan, round1_ab_inner_window_ranked, round1_ab_inner_window_with_images,
+    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -237,6 +238,57 @@ impl StreamProj<'_> {
             // block's transform.
             let plan = self.plan.for_window(blk);
             let imgs = round1_ab_table_images(self.inv_table, plan);
+            let live = self.live;
+            // The kernel's remaining runtime switches — static-B dispatcher,
+            // apply mode, output store class — are the same for all eight
+            // blocks of one window, so test them ONCE for the octa. Twenty-eight
+            // window indices in thirty-two take the ranked arm, whose body
+            // carries none of the tests. `FLOCK_NO_URM_WINDOW_RUN=1` sends
+            // every window down the incumbent per-block dispatch below (exact
+            // same-binary A/B).
+            if !plan.ranked_run() {
+                self.project_general(blk, plan, imgs);
+                return;
+            }
+            // Walk the SET bits rather than testing all eight: same ascending
+            // block order, one `tzcnt`/`blsr` pair instead of a mask test and
+            // branch per candidate — and, because the trip count is no longer
+            // a literal eight, LLVM keeps the loop rolled and spends its
+            // inlining budget on one copy of the kernel body instead of
+            // declining eight.
+            let mut m = live;
+            while m != 0 {
+                let j = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + blk * 64)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_ranked(a_win, b_win, out, self.inv_table, imgs);
+            }
+        }
+    }
+
+    /// [`Self::project`]'s incumbent arm: the general per-block entry, which
+    /// re-tests the plan's static-B eligibility, apply mode and store class
+    /// inside every block's call. Reached by the four static-B window indices,
+    /// and by everything under `FLOCK_NO_URM_WINDOW_RUN=1`. Out of line so the
+    /// ranked arm — twenty-eight windows in thirty-two — gets the inliner's
+    /// budget for the kernel body instead of this one.
+    ///
+    /// # Safety
+    /// As for [`Self::project`]; `plan`/`imgs` are that window's.
+    #[inline(never)]
+    unsafe fn project_general(
+        &self,
+        blk: usize,
+        plan: Round1AbWindowPlan,
+        imgs: flock_core::zerocheck::univariate_skip_optimized::Round1AbTableImages,
+    ) {
+        unsafe {
+            let (sa, sb) = self.sides();
             let live = self.live;
             for j in 0..8usize {
                 if live & (1 << j) == 0 {
