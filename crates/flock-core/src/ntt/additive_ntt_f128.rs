@@ -479,7 +479,23 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
+    /// How many finished sub-groups the butterfly producer may run ahead of
+    /// its hashing sibling.
+    ///
+    /// The live footprint of a pair is `(depth + 1) * subgroup_bytes`, and at
+    /// the ranked shape a sub-group is 2 MiB — so depth 8 keeps **18 MiB**
+    /// resident against the **2 MiB of private L2 that both pinned siblings
+    /// share**. [`interleaved_n_top`]'s own comment already flags the hazard
+    /// for *two* competing sub-groups; the queue permits nine. The producer's
+    /// eleven-layer sweep re-reads its sub-group once per layer, which is
+    /// exactly the pattern that punishes eviction.
+    ///
+    /// Depth 2 holds the pair to 6 MiB. The cost is producer slack, and it is
+    /// cheap on this topology specifically: a producer that stalls in `PAUSE`
+    /// donates front-end slots to the sibling that is hashing, whereas the
+    /// eviction it avoids costs a DRAM refill the sibling cannot hide.
+    /// `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides; 8 restores the prior default.
+    const DEFAULT_DEPTH: usize = 2;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
