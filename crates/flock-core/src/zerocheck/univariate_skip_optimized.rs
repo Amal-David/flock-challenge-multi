@@ -39,6 +39,7 @@ use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
+pub mod pad_skip;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{

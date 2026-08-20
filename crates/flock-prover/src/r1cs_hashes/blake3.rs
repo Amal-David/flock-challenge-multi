@@ -1356,6 +1356,29 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Skip the b_med sub-windows of the streaming ab_inner projection that fall
+/// entirely in the witness padding. At the ranked shape
+/// (`k_log = 14`, `useful_bits = 15409`) `build_b_med_counts` yields
+/// `[16, 15]` — one 64-byte sub-window of every odd outer window, 1 of the 32
+/// per BLAKE3 block, is pure padding. Round 1's reader bounds its ab_inner
+/// loads by exactly those counts (`for b_med in 0..n_b_med` in
+/// `process_one_x_hi_with_precomputed_ab_fold4`), so nothing it can read is
+/// affected; the non-streaming producer has always skipped them.
+///
+/// Deletes ~3.1% of the projection's transform work per prove. The skip is
+/// derived from the `PaddingSpec` at runtime, never from a hardcoded window
+/// index, and falls back to the dense producer whenever the counts do not
+/// prove a window is entirely padding.
+///
+/// `FLOCK_NO_WITGEN_BMED_PAD_SKIP=1` restores the dense streaming producer
+/// (exact same-binary A/B; the ranked worker's cleared environment never sets
+/// it).
+fn witgen_bmed_pad_skip_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_BMED_PAD_SKIP").is_none());
+    *ON
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -1494,6 +1517,19 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         // z-only behaviour on the fused arm (exact same-binary A/B).
         let elide_on = witgen_simd::const_elide_enabled();
         let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+        // The padding this generator actually emits: every block writes
+        // `USEFUL_BITS` of trace into a `K`-bit slot, so the b_med counts are
+        // derived, not assumed. `is_dense()` means the shape proves nothing is
+        // skippable — take the incumbent producer then.
+        let pad_plan = witgen_bmed_pad_skip_enabled().then(|| {
+            flock_core::zerocheck::univariate_skip_optimized::pad_skip::BMedPadPlan::new(
+                &flock_core::zerocheck::PaddingSpec {
+                    k_log: K_LOG,
+                    useful_bits_per_block: USEFUL_BITS,
+                },
+            )
+        });
+        let pad_plan = pad_plan.filter(|p| !p.is_dense());
         generate_round1_inner_octa(
             blocks,
             skip_blocks,
@@ -1505,6 +1541,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            pad_plan.as_ref(),
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -1705,11 +1742,17 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    pad_plan: Option<
+        &flock_core::zerocheck::univariate_skip_optimized::pad_skip::BMedPadPlan,
+    >,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
     const U32_PER_BLOCK: usize = K / 32;
+    /// Outer windows per BLAKE3 block — the unit `pad_skip`'s plan is indexed
+    /// in. `(1 << N_MEDIUM) * 64` = 1024 bytes per outer window.
+    const OUTERS_PER_BLOCK: usize = BYTES_PER_BLOCK / 1024;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
@@ -1825,9 +1868,15 @@ fn generate_round1_inner_octa(
                                 let blk = half * SIMD + j;
                                 let ab_blk =
                                     &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
-                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                                );
+                                match pad_plan {
+                                    Some(plan) => flock_core::zerocheck::univariate_skip_optimized::pad_skip::precompute_round1_ab_inner_windows_padded(
+                                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                        plan, (base + j) * OUTERS_PER_BLOCK,
+                                    ),
+                                    None => flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                    ),
+                                }
                             }
                         }
                     }
@@ -1857,9 +1906,15 @@ fn generate_round1_inner_octa(
                             )
                         };
                         let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
-                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                        );
+                        match pad_plan {
+                            Some(plan) => flock_core::zerocheck::univariate_skip_optimized::pad_skip::precompute_round1_ab_inner_windows_padded(
+                                a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                plan, block_idx * OUTERS_PER_BLOCK,
+                            ),
+                            None => flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                            ),
+                        }
                     }
                 }
                 // Last NT store of the task in every arm — a/b's streams included.
@@ -4144,6 +4199,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    None,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
