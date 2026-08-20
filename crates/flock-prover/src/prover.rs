@@ -157,6 +157,79 @@ enum FastLincheckInput {
 
 const PHASE_POOLS_DISABLE_ENV: &str = "FLOCK_NO_PHASE_POOLS";
 const WITNESS_PHASE_POOL_DISABLE_ENV: &str = "FLOCK_NO_WITNESS_PHASE_POOL";
+const ZEROCHECK_PHYS_POOL_DISABLE_ENV: &str = "FLOCK_NO_ZC_PHYS8";
+
+/// First logical sibling of every physical core in the ranked Linux cpuset.
+///
+/// This deliberately mirrors the topology validation used by flock-core's
+/// global pinned pool.  The phase-local pool is a measurement probe only: it
+/// engages when the harness exposes exactly two siblings per physical core
+/// and `RAYON_NUM_THREADS` names every available logical CPU.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn zerocheck_physical_cpus() -> Option<Vec<usize>> {
+    let logical = std::thread::available_parallelism().ok()?.get();
+    let want: usize = std::env::var("RAYON_NUM_THREADS").ok()?.parse().ok()?;
+    if want != logical {
+        return None;
+    }
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut seen = vec![false; logical];
+    for cpu in 0..logical {
+        if seen[cpu] {
+            continue;
+        }
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        );
+        let list = std::fs::read_to_string(path).ok()?;
+        let mut group = Vec::new();
+        for part in list.trim().split(',') {
+            if let Some((a, b)) = part.split_once('-') {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                group.extend(a..=b);
+            } else {
+                group.push(part.parse().ok()?);
+            }
+        }
+        group.retain(|&c| c < logical);
+        group.sort_unstable();
+        group.dedup();
+        if group.len() != 2 {
+            return None;
+        }
+        for &c in &group {
+            if seen[c] {
+                return None;
+            }
+            seen[c] = true;
+        }
+        groups.push(group);
+    }
+    if groups.is_empty() || 2 * groups.len() != logical || seen.iter().any(|&v| !v) {
+        return None;
+    }
+    Some(groups.into_iter().map(|g| g[0]).collect())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+unsafe extern "C" {
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn pin_zerocheck_worker(cpu: usize) {
+    let mut mask = [0u64; 16];
+    if cpu >= 1024 {
+        return;
+    }
+    mask[cpu / 64] |= 1u64 << (cpu % 64);
+    // SAFETY: this pins only the calling worker using a valid 1024-bit mask;
+    // failure is harmless and leaves the scheduler's incumbent placement.
+    unsafe {
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+    }
+}
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
@@ -194,6 +267,31 @@ fn commit_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
 
 fn zerocheck_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if m >= 29
+        && std::env::var_os(PHASE_POOLS_DISABLE_ENV).is_none()
+        && std::env::var_os(ZEROCHECK_PHYS_POOL_DISABLE_ENV).is_none()
+    {
+        static PHYS_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+        return PHYS_POOL
+            .get_or_init(|| {
+                let cpus = std::sync::Arc::new(zerocheck_physical_cpus()?);
+                let worker_cpus = cpus.clone();
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(cpus.len())
+                    .thread_name(|i| format!("flock-zc-phys-{i}"))
+                    .start_handler(move |i| {
+                        if let Some(&cpu) = worker_cpus.get(i) {
+                            pin_zerocheck_worker(cpu);
+                        }
+                    })
+                    .build()
+                    .ok()
+            })
+            .as_ref();
+    }
+
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     let (_, width) = phase_pool_widths(m)?;
     Some(POOL.get_or_init(|| {
@@ -226,6 +324,17 @@ pub(crate) fn in_witness_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + 
     if std::env::var_os(WITNESS_PHASE_POOL_DISABLE_ENV).is_some() {
         return op();
     }
+
+    // The x86 physical-core probe is deliberately limited to zerocheck.  The
+    // ranked row-major witness benefits from the incumbent all-logical-CPU
+    // pool, so do not route it through `zerocheck_phase_pool` on this target.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        let _ = m;
+        return op();
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     in_zerocheck_phase_pool(m, op)
 }
 
