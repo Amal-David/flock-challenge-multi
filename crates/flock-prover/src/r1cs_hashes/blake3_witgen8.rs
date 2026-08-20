@@ -98,15 +98,7 @@ fn xor_v8(a: V8, b: V8) -> V8 {
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
-    #[cfg(target_feature = "avx512vl")]
-    unsafe {
-        _mm256_ternarylogic_epi32::<0x96>(a, b, c)
-    }
-    // AVX2-only hosts (no AVX-512VL): the paired XORs this folds. Bit-identical.
-    #[cfg(not(target_feature = "avx512vl"))]
-    unsafe {
-        _mm256_xor_si256(_mm256_xor_si256(a, b), c)
-    }
+    unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
 }
 
 #[inline(always)]

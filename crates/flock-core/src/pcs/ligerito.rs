@@ -2231,88 +2231,6 @@ fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
     }
 }
 
-/// Additive-NTT twiddle `(layer, 0)` is the empty span sum, hence zero.
-/// The first column group in every blocked transpose pass-B layer therefore
-/// needs only `top ^= bot`; `bot` is unchanged.  Resolve the diagnostics gate
-/// before entering the Rayon closure so the ordinary butterfly loop remains
-/// branch-free.
-#[inline]
-fn tnt_pass_b_zero_selected(disabled: bool) -> bool {
-    !disabled
-}
-
-fn tnt_pass_b_zero_enabled() -> bool {
-    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some()
-    });
-    tnt_pass_b_zero_selected(*DISABLED)
-}
-
-/// Peel pass B's zero-twiddle column group out of the generic butterfly
-/// closure. Keeping this leaf out of line is deliberate: a global zero test
-/// inside `transpose_butterfly` inflated both hot transpose closures enough
-/// to outweigh the deleted products on Sapphire Rapids.
-#[inline(never)]
-fn transpose_pass_b_block_zero_xor(
-    cols: &mut [&mut [F128]],
-    stride: usize,
-    _layer: usize,
-    _ntt: &AdditiveNttF128,
-) {
-    for u in 0..stride {
-        let (lo, hi) = cols.split_at_mut(u + stride);
-        let top = &mut *lo[u];
-        let bot = &*hi[0];
-        debug_assert_eq!(top.len(), bot.len());
-        #[cfg(target_feature = "avx512f")]
-        {
-            use core::arch::x86_64::*;
-            // SAFETY: avx512f is cfg-guaranteed and both slices have equal
-            // length. F128 addition is bitwise XOR.
-            unsafe {
-                let lanes = top.len() & !3;
-                let mut i = 0;
-                while i < lanes {
-                    let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
-                    let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
-                    _mm512_storeu_si512(
-                        top.as_mut_ptr().add(i).cast::<__m512i>(),
-                        _mm512_xor_si512(a, b),
-                    );
-                    i += 4;
-                }
-                while i < top.len() {
-                    top[i] += bot[i];
-                    i += 1;
-                }
-            }
-        }
-        #[cfg(not(target_feature = "avx512f"))]
-        {
-            for (a, &b) in top.iter_mut().zip(bot.iter()) {
-                *a += b;
-            }
-        }
-    }
-}
-
-/// Exact kill-switch arm for the peeled group. The twiddle is still obtained
-/// from the table and the established general multiply is used; only the
-/// loop's placement moved out of the hot closure.
-#[inline(never)]
-fn transpose_pass_b_block_zero_general(
-    cols: &mut [&mut [F128]],
-    stride: usize,
-    layer: usize,
-    ntt: &AdditiveNttF128,
-) {
-    let t = ntt.twiddle(layer, 0);
-    for u in 0..stride {
-        let (lo, hi) = cols.split_at_mut(u + stride);
-        transpose_butterfly(lo[u], hi[0], t);
-    }
-}
-
 /// `FLOCK_NO_OPEN_TNTT_BLOCK=1` restores the incumbent one-rayon-region-per-
 /// layer transpose sweep ([`transpose_forward_ntt_dense_layers_per_layer`]).
 /// Read once per process; default ON (the ranked worker clears its env).
@@ -2486,22 +2404,11 @@ fn transpose_forward_ntt_dense_layers_blocked(
                 tiles[ti].push(col);
             }
         }
-        // One indirect call per layer selects the peeled block-0 leaf. The
-        // production arm is XOR-only; the kill arm is the exact general
-        // butterfly. The much hotter j>=2*stride loop below is shared and has
-        // no zero test or duplicated body.
-        type BlockZeroFn = fn(&mut [&mut [F128]], usize, usize, &AdditiveNttF128);
-        let block_zero: BlockZeroFn = if tnt_pass_b_zero_enabled() {
-            transpose_pass_b_block_zero_xor
-        } else {
-            transpose_pass_b_block_zero_general
-        };
         tiles.into_par_iter().for_each(|mut cols| {
             for b in 0..split {
                 let layer = split - 1 - b;
                 let stride = 1usize << b;
-                block_zero(&mut cols, stride, layer, ntt);
-                let mut j = stride << 1;
+                let mut j = 0;
                 while j < nseg {
                     for u in j..j + stride {
                         let t = ntt.twiddle(layer, u >> (b + 1));
@@ -9748,11 +9655,11 @@ mod tests {
         assert_eq!(cfg.initial_k, 6);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
-        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
+        // Fast = JohnsonOod profile: 238 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
         // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
-        assert_eq!(cfg.levels[0].queries, 218);
+        assert_eq!(cfg.levels[0].queries, 238);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
         assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
@@ -9761,7 +9668,7 @@ mod tests {
         let default = default_config(22, 6, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
-        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.queries[0], 238);
 
         // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
@@ -9878,8 +9785,8 @@ mod tests {
     fn ligerito_prover_config_for_lookup() {
         // m=29 fast: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
-        assert_eq!(pv.queries[0], 218);
-        assert_eq!(pv.fold_grinding_bits[0], 16);
+        assert_eq!(pv.queries[0], 238);
+        assert_eq!(pv.fold_grinding_bits[0], 12);
 
         // m=29 slim: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");
@@ -12968,44 +12875,4 @@ mod tests {
             );
         }
     }
-    /// The peeled block-zero leaf is exactly the established general
-    /// butterfly at twiddle `(layer, 0)`, for every pass-B stride and for
-    /// vector/tail tile lengths. The explicit selector checks the production
-    /// and kill-switch decisions without process-global environment races.
-    #[test]
-    fn transpose_pass_b_zero_leaf_matches_general() {
-        use crate::challenger::Challenger;
-        assert!(tnt_pass_b_zero_selected(false));
-        assert!(!tnt_pass_b_zero_selected(true));
-        let ntt = AdditiveNttF128::standard(12);
-        let mut ch = crate::challenger::RandomChallenger::new(0xB10C_0000_7E80);
-        for &(stride, layer) in &[(1usize, 3usize), (2, 2), (4, 1), (8, 0)] {
-            assert_eq!(ntt.twiddle(layer, 0), F128::ZERO);
-            for &tile in &[1usize, 3, 4, 7, 16, 65] {
-                let base: Vec<Vec<F128>> = (0..2 * stride)
-                    .map(|_| (0..tile).map(|_| ch.sample_f128()).collect())
-                    .collect();
-                let mut got = base.clone();
-                let mut want = base.clone();
-                {
-                    let mut cols: Vec<&mut [F128]> =
-                        got.iter_mut().map(Vec::as_mut_slice).collect();
-                    transpose_pass_b_block_zero_xor(&mut cols, stride, layer, &ntt);
-                }
-                {
-                    let mut cols: Vec<&mut [F128]> =
-                        want.iter_mut().map(Vec::as_mut_slice).collect();
-                    transpose_pass_b_block_zero_general(&mut cols, stride, layer, &ntt);
-                }
-                assert_eq!(got, want, "stride={stride} tile={tile}");
-                for u in 0..stride {
-                    for i in 0..tile {
-                        assert_eq!(got[u][i], base[u][i] + base[u + stride][i]);
-                        assert_eq!(got[u + stride][i], base[u + stride][i]);
-                    }
-                }
-            }
-        }
-    }
-
 }

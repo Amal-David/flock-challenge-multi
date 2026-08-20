@@ -1454,31 +1454,20 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             // zero in memory and every fold table maps 0 → 0, so the cached
             // row is already the zero the scalar path wrote explicitly.
             let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) = if use_c4 {
-                // `out[16·k + t] = c_k · fold(row 4·t + k)`, so group `t` is
-                // the XOR of the four residue planes at the same lane offset
-                // — output order already correct, no transpose.
-                let xor4 = |p: *const F128, g: usize| -> __m512i {
-                    let q = p.add(4 * g);
-                    let v0 = _mm512_loadu_si512(q.cast::<__m512i>());
-                    let v1 = _mm512_loadu_si512(q.add(16).cast::<__m512i>());
-                    let v2 = _mm512_loadu_si512(q.add(32).cast::<__m512i>());
-                    let v3 = _mm512_loadu_si512(q.add(48).cast::<__m512i>());
-                    _mm512_xor_si512(
-                        _mm512_ternarylogic_epi64::<0x96>(v0, v1, v2),
-                        v3,
-                    )
-                };
+                // The composed helper has already XOR-compressed the four
+                // residue planes, so its first four ZMMs are the four groups
+                // in output order.
                 let ap = fa.as_ptr();
                 let bp2 = fb.as_ptr();
                 (
-                    xor4(ap, 0),
-                    xor4(bp2, 0),
-                    xor4(ap, 1),
-                    xor4(bp2, 1),
-                    xor4(ap, 2),
-                    xor4(bp2, 2),
-                    xor4(ap, 3),
-                    xor4(bp2, 3),
+                    _mm512_loadu_si512(ap.cast::<__m512i>()),
+                    _mm512_loadu_si512(bp2.cast::<__m512i>()),
+                    _mm512_loadu_si512(ap.add(4).cast::<__m512i>()),
+                    _mm512_loadu_si512(bp2.add(4).cast::<__m512i>()),
+                    _mm512_loadu_si512(ap.add(8).cast::<__m512i>()),
+                    _mm512_loadu_si512(bp2.add(8).cast::<__m512i>()),
+                    _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
+                    _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
             } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
                     debug_assert_eq!(cache_base, 4 * xg);
@@ -2218,13 +2207,13 @@ const SIGMA_C4: [i8; 64] = [
 /// `coeffs[r & 3]` to every row `r` of the batch, for free, by folding the
 /// constant into the bit matrices.
 ///
-/// Writes the 64 scaled folds in **residue-major** order: `out[16·k + t]` is
-/// `coeffs[k] · fold(row 4·t + k)`. The caller's composed output for group
-/// `t` is therefore `out[t] ^ out[16 + t] ^ out[32 + t] ^ out[48 + t]`.
+/// Writes the sixteen composed outputs directly. Output ZMM `g` contains
+/// groups `t = 4·g .. 4·g+4`, each the XOR over residues `k` of
+/// `coeffs[k] · fold(row 4·t + k)`.
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked`]: 64 readable bytes at `rows.add(64 * i)`
-/// for every line not marked dead, and 64 writable `F128`s at `out`.
+/// for every line not marked dead, and 16 writable `F128`s at `out`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2343,13 +2332,35 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        for i in 0..8 {
-            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
-            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
-            let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
-            _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
-            _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo, il_hi, hi));
-        }
+        // The sole c4 consumer immediately XORs chunks (0,4,8,12),
+        // (1,5,9,13), (2,6,10,14), and (3,7,11,15).  All remaining
+        // transforms are F2-linear, so combine the corresponding half rows
+        // before the byte/interleave transposes and materialize only four
+        // ZMMs instead of sixteen.
+        let xor4 = |a, b, c, d| {
+            _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a, b, c), d)
+        };
+        let lo_even = _mm512_permutexvar_epi8(
+            bt,
+            xor4(lo_half[0], lo_half[2], lo_half[4], lo_half[6]),
+        );
+        let hi_even = _mm512_permutexvar_epi8(
+            bt,
+            xor4(hi_half[0], hi_half[2], hi_half[4], hi_half[6]),
+        );
+        let lo_odd = _mm512_permutexvar_epi8(
+            bt,
+            xor4(lo_half[1], lo_half[3], lo_half[5], lo_half[7]),
+        );
+        let hi_odd = _mm512_permutexvar_epi8(
+            bt,
+            xor4(hi_half[1], hi_half[3], hi_half[5], hi_half[7]),
+        );
+        let out_ptr = out as *mut __m512i;
+        _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
+        _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
+        _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
+        _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
     }
 }
 
