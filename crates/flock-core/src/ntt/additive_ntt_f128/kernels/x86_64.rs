@@ -425,7 +425,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -434,9 +434,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 dst_r,
                 num_ntts,
                 right_twiddle,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -445,6 +446,58 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 dst_r,
                 num_ntts,
                 right_twiddle,
+                core::ptr::null(),
+            )
+        }
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse_geo`] that also asks for one line
+/// of each of the four rows starting at `pf_src` on every lane step, using the
+/// same row geometry as `src`.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`]; in
+/// addition, the four rows `pf_src + i * src_quarter * num_ntts` must lie
+/// inside the same source buffer.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    pf_src: *const F128,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true>(
+                src,
+                src_quarter,
+                src_r,
+                dst,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                pf_src,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true>(
+                src,
+                src_quarter,
+                src_r,
+                dst,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                pf_src,
             )
         }
     }
@@ -455,7 +508,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool>(
+unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, const PF: bool>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -464,6 +517,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool>(
     dst_r: usize,
     num_ntts: usize,
     right_twiddle: F128,
+    pf_src: *const F128,
 ) {
     use core::arch::x86_64::*;
 
@@ -473,9 +527,16 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool>(
         let inner_b = tw_x4::<false, DIET>(right_twiddle);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
+        let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
         while lane < lanes {
+            if PF {
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                }
+            }
             let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
             let mut vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
             let mut vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
@@ -1221,7 +1282,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1230,9 +1291,10 @@ mod diet_tests {
                             0,
                             len,
                             right,
+                            core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1241,6 +1303,7 @@ mod diet_tests {
                             0,
                             len,
                             right,
+                            core::ptr::null(),
                         );
                     }
                 }

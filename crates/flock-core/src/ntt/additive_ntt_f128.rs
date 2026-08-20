@@ -786,15 +786,18 @@ pub struct AdditiveNttF128 {
 
 /// Prefetch schedule for the seed-fused top pass's message gather.
 ///
-/// Returns `(distance, lines_per_row)`; a zero distance emits no hints.
-/// `FLOCK_NO_NTT_SEED_PF=1` restores the un-hinted gather in the same binary,
-/// and `FLOCK_NTT_SEED_PF_DIST` / `_LINES` override the schedule
+/// Returns `(distance, lines_per_row, spread)`; a zero distance emits no
+/// hints. With `spread`, the four rows the next step reads are asked for one
+/// line per lane step from inside the sparse kernel; `lines_per_row` then
+/// does not apply. `FLOCK_NO_NTT_SEED_PF=1` restores the un-hinted gather in
+/// the same binary, `FLOCK_NO_NTT_SEED_PF_SPREAD=1` restores the one-burst
+/// schedule, and `FLOCK_NTT_SEED_PF_DIST` / `_LINES` override the burst
 /// (diagnostics). Read once per process — never from inside a loop.
 #[cfg(target_arch = "x86_64")]
-fn seed_pf_params() -> (usize, usize) {
-    static P: std::sync::LazyLock<(usize, usize)> = std::sync::LazyLock::new(|| {
+fn seed_pf_params() -> (usize, usize, bool) {
+    static P: std::sync::LazyLock<(usize, usize, bool)> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_NTT_SEED_PF").is_some() {
-            return (0, 0);
+            return (0, 0, false);
         }
         let g = |k: &str, d: usize| {
             std::env::var(k)
@@ -805,6 +808,7 @@ fn seed_pf_params() -> (usize, usize) {
         (
             g("FLOCK_NTT_SEED_PF_DIST", 1),
             g("FLOCK_NTT_SEED_PF_LINES", 8),
+            std::env::var_os("FLOCK_NO_NTT_SEED_PF_SPREAD").is_none(),
         )
     });
     *P
@@ -1705,7 +1709,7 @@ impl AdditiveNttF128 {
         let stage_perm = Self::stage_perm_enabled();
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
-        let (pf_dist, pf_lines) = seed_pf_params();
+        let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
         let perm = |k: usize| if stage_perm { (k & 3) * 16 + (k >> 2) } else { k };
@@ -1742,26 +1746,47 @@ impl AdditiveNttF128 {
                 for k in 0..64 {
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
+                    // One line per lane step from inside the kernel, or the
+                    // whole burst up front; never both.
+                    let mut pf_next: *const F128 = core::ptr::null();
                     #[cfg(target_arch = "x86_64")]
                     if pf_dist != 0 && k + pf_dist < 64 {
-                        pf_msg_rows(
+                        if pf_spread {
+                            pf_next = src.add((r_s + pf_dist * sub_stride) * row_len);
+                        } else {
+                            pf_msg_rows(
+                                src,
+                                r_s + pf_dist * sub_stride,
+                                block_size,
+                                row_len,
+                                pf_lines,
+                            );
+                        }
+                    }
+                    if pf_next.is_null() {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
                             src,
-                            r_s + pf_dist * sub_stride,
                             block_size,
+                            r_s,
+                            bufp.add(kp * row_len),
+                            64,
+                            0,
                             row_len,
-                            pf_lines,
+                            seed_right,
+                        );
+                    } else {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(kp * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                            pf_next,
                         );
                     }
-                    kernels::butterfly_fused_2layer_row_from_sparse_geo(
-                        src,
-                        block_size,
-                        r_s,
-                        bufp.add(kp * row_len),
-                        64,
-                        0,
-                        row_len,
-                        seed_right,
-                    );
                     kernels::butterfly_fused_2layer_row_from_geo(
                         src,
                         block_size,
