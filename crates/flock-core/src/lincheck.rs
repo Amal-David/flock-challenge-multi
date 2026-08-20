@@ -1117,6 +1117,11 @@ fn fold_block_major_gfni(
                                 // on: the lines this stripe demand-loads two
                                 // grouped visits from now. Issued here, the
                                 // miss overlaps the current visit's GFNI fold.
+                                // Stage in L2: the 2 KiB row stride maps the
+                                // 64 tile rows to two L1 sets, so a tile-wide
+                                // T0 stream self-evicts long before qn is read.
+                                // T1 retains the latency overlap without the
+                                // transient L1 fill/eviction traffic.
                                 // `qn <= full_chunks` keeps the prefetch on
                                 // a line the sweep really demands; `qn <
                                 // chunks_per_block` keeps the address inside
@@ -1130,7 +1135,7 @@ fn fold_block_major_gfni(
                                                     .as_ptr()
                                                     .add((outer_base + r) * chunks_per_block + qn)
                                                     .cast::<i8>(),
-                                                core::arch::x86_64::_MM_HINT_T0,
+                                                core::arch::x86_64::_MM_HINT_T1,
                                             );
                                         }
                                     }
