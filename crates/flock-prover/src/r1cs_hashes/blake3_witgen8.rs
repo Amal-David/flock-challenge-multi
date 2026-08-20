@@ -96,9 +96,16 @@ fn xor_v8(a: V8, b: V8) -> V8 {
 /// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
 /// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
+/// Runtime-gated: the local dev rig lacks AVX-512VL and would SIGILL on a bare
+/// `vpternlogd`; the ranked runner resolves the check true and keeps the fast
+/// path (single CPUID at first call, then branch-predicted).
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
-    unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
+    if is_x86_feature_detected!("avx512vl") {
+        unsafe { _mm256_ternarylogic_epi32::<0x96>(a, b, c) }
+    } else {
+        unsafe { _mm256_xor_si256(_mm256_xor_si256(a, b), c) }
+    }
 }
 
 #[inline(always)]

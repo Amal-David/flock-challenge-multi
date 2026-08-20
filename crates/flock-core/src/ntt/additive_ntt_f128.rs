@@ -549,6 +549,35 @@ fn seed_pf_params() -> (usize, usize) {
     *P
 }
 
+/// Deep-pass sub-group head prefetch, sibling of the seed-pass schedule above.
+///
+/// The block-fused deep tail walks each worker's sub-groups one after the
+/// other (rayon index-splitting gives every worker a contiguous run of
+/// sub-group indices), and each sub-group's first touch is its fused-four
+/// sweep reading the whole 2 MiB slab from DRAM — the codeword is 4 GiB at
+/// the ranked shape, so a sub-group's pages are long cold by the time its
+/// turn comes. Hinting the NEXT sub-group's head at the top of the current
+/// one puts a full sub-group of butterfly work (~2 MiB of CLMUL) between the
+/// hint and the demand load, the same latency-hiding shape as
+/// `pf_msg_rows`. The hints are side-effect free (identical bytes either
+/// way). `FLOCK_NO_NTT_DEEP_PF=1` restores the un-hinted sweep, and
+/// `FLOCK_NTT_DEEP_PF_LINES` overrides the hint count (diagnostics). Read
+/// once per process — never from inside a loop.
+#[cfg(target_arch = "x86_64")]
+fn deep_pf_lines() -> usize {
+    static L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_NTT_DEEP_PF_LINES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=64).contains(v))
+            .unwrap_or(16)
+    });
+    *L
+}
+
 /// Issue `lines` L1 line hints on each of the four message rows
 /// `i · block_size + row`, `i ∈ 0..4`.
 ///
@@ -1971,6 +2000,27 @@ impl AdditiveNttF128 {
                         sub_data: &mut [F128],
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>|
          -> bool {
+            // Next sub-group's head, hinted a full sub-group of work ahead of
+            // its demand load (see `deep_pf_lines`). `wrapping_add` keeps the
+            // past-the-end address of the last sub-group well defined, and the
+            // hint there is simply dropped.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let pf_lines = deep_pf_lines();
+                if pf_lines != 0 {
+                    let next = sub_data.as_ptr().wrapping_add(sub_data.len()) as *const i8;
+                    for l in 0..pf_lines {
+                        // SAFETY: prefetch is a hint — no memory is touched,
+                        // no fault is possible.
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                next.add(l * 64),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
+                }
+            }
             if fuse_blocks && block_cb.is_some() {
                 let cb = block_cb.unwrap();
                 // Sweep 1: fused-four over the whole sub-group (layers
