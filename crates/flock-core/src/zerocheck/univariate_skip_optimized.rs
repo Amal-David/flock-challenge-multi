@@ -62,7 +62,9 @@ use kernels::shift_reduce_inner_ab_scalar;
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-use kernels::x86_64::shift_reduce_inner_ab_x86_avx512;
+use kernels::x86_64::{
+    shift_reduce_inner_ab_x86_avx512, shift_reduce_inner_ab_x86_avx512_x2,
+};
 #[cfg(all(test, target_arch = "x86_64", target_feature = "gfni"))]
 use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 
@@ -855,57 +857,6 @@ pub fn precompute_round1_ab_inner_windows(
             nt,
         );
     }
-}
-
-/// Number of 64-byte medium windows in one BLAKE3 block's round-1 transform
-/// (two 8192-bit outer windows of `1 << N_MEDIUM` medium positions each).
-pub const ROUND1_AB_WINDOWS_PER_BLOCK: usize = 2 * (1 << N_MEDIUM);
-
-/// Resolved static-B plan for [`round1_ab_inner_window`], hoisted out of the
-/// per-window call so the streaming producer resolves it once per task.
-#[derive(Clone, Copy)]
-pub struct Round1AbWindowPlan(Option<&'static kernels::BstaticPartials>);
-
-/// Resolve the round-1 window plan for `inv_table`. See
-/// [`round1_ab_inner_window`].
-pub fn prepare_round1_ab_window_plan(
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Round1AbWindowPlan {
-    Round1AbWindowPlan(kernels::prepare_bstatic(inv_table))
-}
-
-/// Transform ONE 64-byte medium window of one BLAKE3 block, given just that
-/// window's packed a and b bytes. `blk` is the window's index within the
-/// block, `0..ROUND1_AB_WINDOWS_PER_BLOCK`, ascending in packed byte order.
-///
-/// The whole-block entry point [`precompute_round1_ab_inner_windows`] is
-/// exactly this call for every `blk` in order; each window is independent, so
-/// a producer that materializes windows out of order gets the same bytes.
-///
-/// `nt_out` publishes the transformed window with non-temporal stores under
-/// the same contract as [`precompute_round1_ab_inner_windows`]: the caller
-/// MUST issue [`abinner_publish_fence`] on the producing thread before the
-/// task ends.
-#[inline]
-pub fn round1_ab_inner_window(
-    a_window: &[u8; 64],
-    b_window: &[u8; 64],
-    out: &mut [u8; 64],
-    blk: usize,
-    inv_table: &InvNttTableByteSingleGf8,
-    plan: Round1AbWindowPlan,
-    nt_out: bool,
-) {
-    let nt: u8 = if nt_out {
-        match out.as_ptr() as usize % 64 {
-            0 => 2,
-            r if r % 16 == 0 => 1,
-            _ => 0,
-        }
-    } else {
-        0
-    };
-    kernels::shift_reduce_inner_ab_at(a_window, b_window, inv_table, 0, blk, out, plan.0, nt);
 }
 
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
@@ -3633,6 +3584,88 @@ mod tests {
                 assert_eq!(
                     out_scalar, out_avx512.0,
                     "avx512/gfni (nt={nt}) disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    #[test]
+    fn x86_gfni_avx512_x2_matches_scalar_inner() {
+        // The two-window AVX-512 wavefront must produce, per window, exactly
+        // the bytes of the scalar oracle (and hence of the single-window
+        // AVX-512 kernel) for both windows of every pair, including the NT
+        // store classes.
+        let mut rng = Rng::new(0xA5_512_2);
+        let m = 14;
+        let table = make_inv_table();
+        let a_bits = rng.bits(1 << m);
+        let b_bits = rng.bits(1 << m);
+        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
+        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+
+        for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 4), (1024, 6), (4096, 14)] {
+            let needed = chunk_byte_base + (b_med + 1) * N_CHUNKS * 8 + 8 * N_CHUNKS;
+            if needed > a_packed.len() {
+                continue;
+            }
+            let mut out_scalar_0 = [0u8; 64];
+            let mut out_scalar_1 = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med,
+                &mut out_scalar_0,
+                &mut a_col,
+                &mut b_col,
+            );
+            shift_reduce_inner_ab_scalar(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med + 1,
+                &mut out_scalar_1,
+                &mut a_col,
+                &mut b_col,
+            );
+            #[repr(align(64))]
+            struct Aligned64([u8; 64]);
+            for nt in [0u8, 1, 2] {
+                let mut out0 = Aligned64([0u8; 64]);
+                let mut out1 = Aligned64([0u8; 64]);
+                // SAFETY: test compiles only when all kernel features are
+                // active; the wrappers satisfy the nt=1/2 alignment contract.
+                unsafe {
+                    shift_reduce_inner_ab_x86_avx512_x2(
+                        &a_packed,
+                        &b_packed,
+                        &table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut out0.0,
+                        &mut out1.0,
+                        nt,
+                    );
+                    core::arch::x86_64::_mm_sfence();
+                }
+                assert_eq!(
+                    out_scalar_0, out0.0,
+                    "avx512 x2 window 0 (nt={nt}) disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
+                );
+                assert_eq!(
+                    out_scalar_1, out1.0,
+                    "avx512 x2 window 1 (nt={nt}) disagrees with scalar at (base={chunk_byte_base}, b_med={})",
+                    b_med + 1
                 );
             }
         }

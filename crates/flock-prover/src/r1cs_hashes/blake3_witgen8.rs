@@ -22,10 +22,6 @@ use super::{
     USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
-use flock_core::ntt::InvNttTableByteSingleGf8;
-use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window,
-};
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -36,14 +32,7 @@ const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
 const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 const U32_PER_BLOCK: usize = K / 32;
-const BYTES_PER_BLOCK: usize = K / 8;
 const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
-/// Words a drain step publishes at once — sixteen, which is exactly one
-/// 64-byte round-1 medium window per block.
-const STEP_WORDS: usize = 16;
-/// u32s of the streaming projection's staging pair: one step's sixteen words
-/// for eight blocks, a side.
-pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
 // 62, not 61: an odd boundary leaves the z drain's paired NT loop with a
 // lone 32-byte tail chunk — one masked, partially-written NT line per block
 // (an ECC read-modify-write at the memory controller, 2^18 times per
@@ -189,69 +178,11 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
-const RING_WORDS: usize = 32;
-/// Words the pre-round prologue fills, starting at word 16.
-const PROLOGUE_WORDS: usize = 20;
-const _RING_GEOMETRY: () = {
-    assert!(RING_WORDS >= 32);
-    assert!(RING_WORDS <= U32_PER_BLOCK);
-    assert!(RING_WORDS & (RING_WORDS - 1) == 0);
-    // Every epoch boundary is a whole number of drain steps.
-    assert!(RING_WORDS % STEP_WORDS == 0);
-};
-
-/// Streaming round-1 projection wired into the a/b drain: every 16-word drain
-/// step is one 64-byte round-1 medium window per block, so the transform runs
-/// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
-/// of off two full-block window buffers.
-///
-/// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
-/// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks. Bit `j` of `live` selects block `j`.
-pub(crate) struct StreamProj<'t> {
-    pub(crate) stage: *mut u32,
-    pub(crate) out: *mut u8,
-    pub(crate) live: u32,
-    pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
-    pub(crate) plan: Round1AbWindowPlan,
-    pub(crate) nt: bool,
-}
-
-impl StreamProj<'_> {
-    #[inline(always)]
-    fn sides(&self) -> (*mut u32, *mut u32) {
-        // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
-        (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
-    }
-
-    /// Transform the staged window `blk` (`0..2 · 16`) for every live block.
-    ///
-    /// # Safety
-    /// Both staging sides hold the eight blocks' bytes for window `blk`.
-    #[inline(never)]
-    unsafe fn project(&self, blk: usize) {
-        unsafe {
-            let (sa, sb) = self.sides();
-            for j in 0..8usize {
-                if self.live & (1 << j) == 0 {
-                    continue;
-                }
-                let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let out = &mut *self
-                    .out
-                    .add(j * BYTES_PER_BLOCK + blk * 64)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan, self.nt);
-            }
-        }
-    }
-}
+const RING_WORDS: usize = 128;
 
 /// Rolling drain state shared by the three packed writers. The witness uses
-/// three reusable `RING_WORDS`-word epochs instead of three full 512-word
-/// stages.
-struct Drain8<'t> {
+/// three reusable 128-word epochs instead of three full 512-word stages.
+struct Drain8 {
     zs: *mut V8,
     ast: *mut V8,
     bs: *mut V8,
@@ -259,22 +190,21 @@ struct Drain8<'t> {
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
-    proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
 }
 
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
-struct W8<'t> {
+struct W8 {
     pending: V8,
     stage: *mut V8,
-    drain: *mut Drain8<'t>,
+    drain: *mut Drain8,
     flush: bool,
 }
 
-impl<'t> W8<'t> {
+impl W8 {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8, flush: bool) -> Self {
         Self {
             pending,
             stage,
@@ -495,57 +425,11 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
     }
 }
 
-impl Drain8<'_> {
-    /// Transpose one 16-word drain step of the current ring epoch and publish
-    /// it. `carry`, when present, additionally receives all sixteen words of
-    /// every block at `(base, row_stride)` — even where the recyclable main
-    /// destination elides a constant range.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_step(
-        stage: *const V8,
-        dst: *mut u32,
-        carry: Option<(*mut u32, usize)>,
-        abs_word: usize,
-        ring_word: usize,
-        g0: usize,
-        g1: usize,
-        nt: bool,
-    ) {
-        unsafe {
-            let lo_rows = tr8_chunk(stage, ring_word);
-            let hi_rows = tr8_chunk(stage, ring_word + 8);
-            let g = abs_word / 8;
-            let lo_live = g >= g0 && g < g1;
-            let hi_live = g + 1 >= g0 && g + 1 < g1;
-            for r in 0..8 {
-                if let Some((base, row_stride)) = carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, lo_rows[r]);
-                    store_v8(p.add(8), hi_rows[r]);
-                }
-                let p = dst.add(r * U32_PER_BLOCK + abs_word);
-                match (nt, lo_live, hi_live) {
-                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
-                    (true, true, false) => stream_v8(p, lo_rows[r]),
-                    (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
-                    (false, true, true) => {
-                        store_v8(p, lo_rows[r]);
-                        store_v8(p.add(8), hi_rows[r]);
-                    }
-                    (false, true, false) => store_v8(p, lo_rows[r]),
-                    (false, false, true) => store_v8(p.add(8), hi_rows[r]),
-                    (_, false, false) => {}
-                }
-            }
-        }
-    }
-
+impl Drain8 {
     /// Transpose and publish `words` from the current ring epoch at absolute
     /// `base_word`. `win`, when present, always receives every word even when
     /// the recyclable main destination elides a constant range.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn publish_range(
         stage: *const V8,
         dst: *mut u32,
@@ -561,42 +445,35 @@ impl Drain8<'_> {
             debug_assert_eq!(base_word % 8, 0);
             debug_assert_eq!(ring_word % 8, 0);
             debug_assert_eq!(words % 16, 0);
-            for off in (0..words).step_by(STEP_WORDS) {
+            for off in (0..words).step_by(16) {
+                let lo_rows = tr8_chunk(stage, ring_word + off);
+                let hi_rows = tr8_chunk(stage, ring_word + off + 8);
                 let abs_word = base_word + off;
-                Self::publish_step(
-                    stage,
-                    dst,
-                    win.map(|w| (w.add(abs_word), U32_PER_BLOCK)),
-                    abs_word,
-                    ring_word + off,
-                    g0,
-                    g1,
-                    nt,
-                );
+                let g = abs_word / 8;
+                let lo_live = g >= g0 && g < g1;
+                let hi_live = g + 1 >= g0 && g + 1 < g1;
+                for r in 0..8 {
+                    if let Some(w) = win {
+                        let p = w.add(r * U32_PER_BLOCK + abs_word);
+                        store_v8(p, lo_rows[r]);
+                        store_v8(p.add(8), hi_rows[r]);
+                    }
+                    let p = dst.add(r * U32_PER_BLOCK + abs_word);
+                    match (nt, lo_live, hi_live) {
+                        (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
+                        (true, true, false) => stream_v8(p, lo_rows[r]),
+                        (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
+                        (false, true, true) => {
+                            store_v8(p, lo_rows[r]);
+                            store_v8(p.add(8), hi_rows[r]);
+                        }
+                        (false, true, false) => store_v8(p, lo_rows[r]),
+                        (false, false, true) => store_v8(p.add(8), hi_rows[r]),
+                        (_, false, false) => {}
+                    }
+                }
             }
         }
-    }
-
-    #[inline(always)]
-    fn ab_ranges(&self) -> (usize, usize, usize) {
-        let a_g1 = if self.elide[1] {
-            ELIDE_ZERO_CHUNK
-        } else {
-            DUMP_CHUNKS
-        };
-        let b_g0 = if self.elide[2] {
-            ELIDE_B_PREFIX_CHUNKS
-        } else {
-            0
-        };
-        let b_g1 = if !self.elide[2] {
-            DUMP_CHUNKS
-        } else if self.win_ab.is_some() || self.proj.is_some() {
-            ELIDE_B_TAIL_CHUNK_WIN
-        } else {
-            ELIDE_B_TAIL_CHUNK
-        };
-        (a_g1, b_g0, b_g1)
     }
 
     #[inline(never)]
@@ -607,47 +484,27 @@ impl Drain8<'_> {
             } else {
                 DUMP_CHUNKS
             };
-            let (a_g1, b_g0, b_g1) = self.ab_ranges();
-
-            if let Some(proj) = &self.proj {
-                let (sa, sb) = proj.sides();
-                for off in (0..words).step_by(STEP_WORDS) {
-                    let abs_word = base_word + off;
-                    let rw = ring_word + off;
-                    Self::publish_step(
-                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt,
-                    );
-                    Self::publish_step(
-                        self.ast,
-                        self.a,
-                        Some((sa, STEP_WORDS)),
-                        abs_word,
-                        rw,
-                        0,
-                        a_g1,
-                        true,
-                    );
-                    Self::publish_step(
-                        self.bs,
-                        self.b,
-                        Some((sb, STEP_WORDS)),
-                        abs_word,
-                        rw,
-                        b_g0,
-                        b_g1,
-                        true,
-                    );
-                    proj.project(abs_word / STEP_WORDS);
-                }
-                return;
-            }
-
             Self::publish_range(
                 self.zs, self.z, None, base_word, ring_word, words, 0, z_g1, self.z_nt,
             );
 
             match self.win_ab {
                 Some((win_a, win_b)) => {
+                    let a_g1 = if self.elide[1] {
+                        ELIDE_ZERO_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    let b_g0 = if self.elide[2] {
+                        ELIDE_B_PREFIX_CHUNKS
+                    } else {
+                        0
+                    };
+                    let b_g1 = if self.elide[2] {
+                        ELIDE_B_TAIL_CHUNK_WIN
+                    } else {
+                        DUMP_CHUNKS
+                    };
                     Self::publish_range(
                         self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
                     );
@@ -656,6 +513,21 @@ impl Drain8<'_> {
                     );
                 }
                 None => {
+                    let a_g1 = if self.elide[1] {
+                        ELIDE_ZERO_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    let b_g0 = if self.elide[2] {
+                        ELIDE_B_PREFIX_CHUNKS
+                    } else {
+                        0
+                    };
+                    let b_g1 = if self.elide[2] {
+                        ELIDE_B_TAIL_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
                     Self::publish_range(
                         self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
                     );
@@ -785,28 +657,18 @@ unsafe fn dump_elide_win(
 /// blocks lands in the two window buffers, which the caller projects from
 /// instead of re-reading a/b. `None` is the incumbent temporal drain.
 ///
-/// `proj = Some(..)` selects the STREAMING form of the same fusion: a/b are
-/// published non-temporally exactly as under `win_ab`, and each drain step's
-/// eight 64-byte round-1 medium windows are transformed straight into the
-/// caller's ab_inner blocks out of a small staging pair, so no full-block
-/// window buffer exists. `win_ab` and `proj` are mutually exclusive.
-///
 /// # Safety
 /// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
 /// When `win_ab` is `Some`, both window pointers own 8 contiguous 512-word
-/// blocks too, disjoint from each other and from `z`/`a`/`b`. When `proj` is
-/// `Some`, its staging and `out` satisfy [`StreamProj`]'s contract. In every
-/// non-temporal arm the caller must `_mm_sfence()` on this thread after its
-/// last octa, before releasing a/b to another thread (same-thread reads are
-/// self-consistent regardless).
-#[allow(clippy::too_many_arguments)]
+/// blocks too, disjoint from each other and from `z`/`a`/`b`; and the caller
+/// must `_mm_sfence()` on this thread after its last octa, before releasing
+/// a/b to another thread (same-thread reads are self-consistent regardless).
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: [&Compression; 8],
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
-    proj: Option<StreamProj<'_>>,
     elide: [bool; 3],
     z_nt: bool,
 ) {
@@ -920,7 +782,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             a,
             b,
             win_ab,
-            proj,
             elide,
             z_nt,
         };
@@ -931,8 +792,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             m[13], m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
-        // rolling epochs; the writer publishes each epoch when it completes
-        // that epoch's last word.
+        // first rolling epoch; the writer publishes words 16..127 together
+        // when it completes word 127.
         for k in 0..20usize {
             let v = if k == 0 {
                 or_v8(one, shl_v8::<1>(chain[0]))
@@ -943,14 +804,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(zs.add(w & (RING_WORDS - 1)) as *mut u32, v);
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
-        }
-
-        // The round stream starts at word `PROLOGUE_WORDS + 16`, so a first
-        // epoch that ends inside the prologue never reaches the writers'
-        // epoch boundary — publish it here instead. Constant-folded away for
-        // every ring long enough to reach the round stream.
-        if RING_WORDS <= PROLOGUE_WORDS + 16 {
-            drain.drain_range(16, 16, RING_WORDS - 16);
         }
 
         let pending_bit = shr_v8::<31>(flags);
@@ -1062,7 +915,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(ast.add(i) as *mut u32, zero);
             store_v8(bs.add(i) as *mut u32, zero);
         }
-        drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain.drain_range(384, 0, RING_WORDS);
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build

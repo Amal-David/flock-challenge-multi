@@ -209,75 +209,14 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
-/// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
-/// byte offset plus the global BLAKE3 medium-window index
-/// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
-/// on their own rather than a whole packed block. Bit-identical to
-/// [`shift_reduce_inner_ab`] on the same bytes with the same `blk`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab_at(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    byte_base: usize,
-    blk: usize,
-    out: &mut [u8; 64],
-    bstatic: Option<&'static BstaticPartials>,
-    nt: u8,
-) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        // SAFETY: all required target features are enabled at compile time,
-        // and the caller vouches for 64 readable bytes at `byte_base`.
-        unsafe {
-            if let Some(partials) = bstatic {
-                if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
-                    a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
-                ) {
-                    return;
-                }
-            }
-            x86_64::shift_reduce_inner_ab_x86_avx512(
-                a_packed, b_packed, inv_table, byte_base, 0, out, nt,
-            );
-        }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    {
-        let _ = (blk, bstatic);
-        let mut a_col = [F8::ZERO; 64];
-        let mut b_col = [F8::ZERO; 64];
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            byte_base,
-            0,
-            out,
-            &mut a_col,
-            &mut b_col,
-            None,
-            nt,
-        );
-    }
-}
-
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
-/// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
-/// sequential single-window calls. Bit-identical to two calls of
+/// (`shift_reduce_inner_ab_fused_neon_x2`). On x86 AVX-512/GFNI it takes the
+/// interleaved two-window pidx Horner (`shift_reduce_inner_ab_x86_avx512_x2`)
+/// when both windows miss the static-B specialised bodies; a static-B hit on
+/// either window keeps that window on the specialised kernel and runs the
+/// sibling as a single. Everywhere else it decays to two sequential
+/// single-window calls. Bit-identical to two calls of
 /// [`shift_reduce_inner_ab`] on every path.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab_x2(
@@ -307,7 +246,109 @@ pub(super) fn shift_reduce_inner_ab_x2(
         );
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        let _ = (a_col, b_col);
+        // SAFETY: required target features are cfg-guaranteed; packed inputs
+        // cover both windows the same way the sequential singles do.
+        unsafe {
+            let mut d0 = false;
+            let mut d1 = false;
+            if let Some((w, partials)) = bstatic {
+                d0 = x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    w,
+                    partials,
+                    out0,
+                    nt,
+                );
+                d1 = x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med + 1,
+                    w,
+                    partials,
+                    out1,
+                    nt,
+                );
+            }
+            match (d0, d1) {
+                (true, true) => {}
+                (true, false) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med + 1,
+                    out1,
+                    nt,
+                ),
+                (false, true) => x86_64::shift_reduce_inner_ab_x86_avx512(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    out0,
+                    nt,
+                ),
+                (false, false) => {
+                    if x86_64::sr_avx512_x2_enabled() {
+                        x86_64::shift_reduce_inner_ab_x86_avx512_x2(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            chunk_byte_base,
+                            b_med,
+                            out0,
+                            out1,
+                            nt,
+                        );
+                    } else {
+                        x86_64::shift_reduce_inner_ab_x86_avx512(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            chunk_byte_base,
+                            b_med,
+                            out0,
+                            nt,
+                        );
+                        x86_64::shift_reduce_inner_ab_x86_avx512(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            chunk_byte_base,
+                            b_med + 1,
+                            out1,
+                            nt,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )
+    )))]
     {
         shift_reduce_inner_ab(
             a_packed,

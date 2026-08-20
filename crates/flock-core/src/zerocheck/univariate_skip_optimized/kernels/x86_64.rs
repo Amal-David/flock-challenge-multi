@@ -244,6 +244,172 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     }
 }
 
+/// `FLOCK_NO_SR_AVX512_X2=1` restores two sequential single-window Horner
+/// calls from [`super::shift_reduce_inner_ab_x2`] (exact same-binary A/B).
+/// Ranked worker env is cleared, so the paired kernel is the default.
+pub(crate) fn sr_avx512_x2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SR_AVX512_X2").is_none());
+    *ON
+}
+
+/// Two-window twin of [`shift_reduce_inner_ab_x86_avx512_pidx`]. Bit-identical
+/// to two pidx calls: each window still Horner's `Σ_k x^k·(a_k·b_k)` over the
+/// same 16 inverse-NTT applies, but the K-rows of windows `b_med` and
+/// `b_med + 1` are interleaved (w0-K, w1-K, w0-K-1, w1-K-1, …) so the second
+/// window's table loads / port-5 shuffles issue under the first window's GFNI
+/// Horner tail.
+///
+/// Same register-resident math as the single-window pidx path; the two
+/// windows share no state. `off` is 256 pre-scaled `u16`s: window 0 at
+/// `[0..128)`, window 1 at `[128..256)`, each half `a` then `b` like pidx.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    nt: u8,
+) {
+    use core::arch::x86_64::*;
+    let byte_base_b0 = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let byte_base_b1 = chunk_byte_base + (b_med + 1) * N_CHUNKS * 8;
+
+    #[repr(align(64))]
+    struct Off([u16; 256]);
+
+    // SAFETY: each window's packed-input bounds match the single-window pidx
+    // kernel (64 readable bytes of A and of B at `byte_base_b*`). `off` is a
+    // fully written 256-u16 stack buffer; `out0`/`out1` are one ZMM each.
+    unsafe {
+        let a0 = a_packed.as_ptr().add(byte_base_b0);
+        let b0 = b_packed.as_ptr().add(byte_base_b0);
+        let a1 = a_packed.as_ptr().add(byte_base_b1);
+        let b1 = b_packed.as_ptr().add(byte_base_b1);
+
+        let mut off = core::mem::MaybeUninit::<Off>::uninit();
+        let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a0));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
+        _mm512_store_si512(op.add(128) as *mut __m512i, scale(a1));
+        _mm512_store_si512(op.add(160) as *mut __m512i, scale(a1.add(32)));
+        _mm512_store_si512(op.add(192) as *mut __m512i, scale(b1));
+        _mm512_store_si512(op.add(224) as *mut __m512i, scale(b1.add(32)));
+
+        let xb = _mm512_set1_epi8(2);
+        // Window 0 a-row k at op + k*8; b-row k at op + 64 + k*8.
+        // Window 1 is the same layout shifted by 128 u16s.
+        macro_rules! horner_x2 {
+            ($apply:ident) => {{
+                let mut acc0 = _mm512_gf2p8mul_epi8(
+                    inv_table.$apply(op.add(7 * 8)),
+                    inv_table.$apply(op.add(64 + 7 * 8)),
+                );
+                let mut acc1 = _mm512_gf2p8mul_epi8(
+                    inv_table.$apply(op.add(128 + 7 * 8)),
+                    inv_table.$apply(op.add(192 + 7 * 8)),
+                );
+                for k in (0..7usize).rev() {
+                    let p0 = _mm512_gf2p8mul_epi8(
+                        inv_table.$apply(op.add(k * 8)),
+                        inv_table.$apply(op.add(64 + k * 8)),
+                    );
+                    acc0 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc0, xb), p0);
+                    let p1 = _mm512_gf2p8mul_epi8(
+                        inv_table.$apply(op.add(128 + k * 8)),
+                        inv_table.$apply(op.add(192 + k * 8)),
+                    );
+                    acc1 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc1, xb), p1);
+                }
+                (acc0, acc1)
+            }};
+        }
+        let (acc0, acc1) = if urm_offw_enabled() {
+            horner_x2!(apply_x86_avx512_register_2img_offw_unchecked)
+        } else {
+            horner_x2!(apply_x86_avx512_register_2img_off_unchecked)
+        };
+        store_out64(out0, acc0, nt);
+        store_out64(out1, acc1, nt);
+    }
+}
+
+/// Two-window dispatcher: paired pidx Horner when the single-window kernel
+/// would have taken that path, otherwise two sequential singles. Bit-identical
+/// to two [`shift_reduce_inner_ab_x86_avx512`] calls.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    nt: u8,
+) {
+    let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
+    if img2 && urm_pidx_enabled() {
+        // SAFETY: same contract as the single-window pidx kernel, twice.
+        unsafe {
+            shift_reduce_inner_ab_x86_avx512_pidx_x2(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out0,
+                out1,
+                nt,
+            );
+        }
+        return;
+    }
+    // SAFETY: same contract as the sequential singles this decays to.
+    unsafe {
+        shift_reduce_inner_ab_x86_avx512(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            nt,
+        );
+        shift_reduce_inner_ab_x86_avx512(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med + 1,
+            out1,
+            nt,
+        );
+    }
+}
+
 /// Fused AVX-512/GFNI x86 kernel. Each inverse-NTT apply returns all 64 F_8
 /// evaluations in one ZMM register; the product and x^k scaling stay 64-wide
 /// and register-resident through the final XOR accumulation.
