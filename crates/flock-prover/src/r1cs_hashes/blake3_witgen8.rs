@@ -277,6 +277,7 @@ struct Drain8<'t> {
     elide: [bool; 3],
     z_nt: bool,
     wide_nt: bool,
+    cls_on: bool,
 }
 
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
@@ -510,14 +511,126 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     }
 }
 
+/// `FLOCK_NO_DRAIN_PUBLISH_CLS=1` restores the incumbent per-row drain publish
+/// (`Drain8::publish_step_perrow`): the store class and the live-chunk arm are
+/// re-decided inside every one of the eight row iterations. Resolved once per
+/// process; the ranked worker's cleared environment never sets it.
+fn drain_publish_cls_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DRAIN_PUBLISH_CLS").is_none());
+    *ON
+}
+
+/// The store class [`stream_v8`] / [`stream_pair_v8`] would pick for `p` and
+/// for every `p + 64k`: `2` = one ZMM stream per 64-byte chunk pair, `1` = one
+/// YMM stream per 32-byte chunk, `0` = the two-XMM form. All eight rows of a
+/// drain step share it — rows are `U32_PER_BLOCK` = 2048 B apart and every
+/// step's `abs_word` is a whole 64-byte window — so it is decided once.
+///
+/// Same selection as the incumbent: `wide_nt && p % 32 == 0` picks YMM over
+/// the XMM pair, and `wide_nt && p % 64 == 0` additionally allows the ZMM
+/// pair. `p` is always 16-aligned (the drain's destinations are), so
+/// `p % 64 ∈ {0, 16, 32, 48}` and `p % 32 == 0` is exactly `p % 64 ∈ {0, 32}`.
+#[inline(always)]
+#[cfg_attr(not(target_feature = "avx512f"), allow(dead_code))]
+fn nt_class(p: *const u32, wide_nt: bool) -> u8 {
+    if !wide_nt {
+        return 0;
+    }
+    match p as usize % 64 {
+        0 => 2,
+        32 => 1,
+        _ => 0,
+    }
+}
+
 impl Drain8<'_> {
     /// Transpose one 16-word drain step of the current ring epoch and publish
     /// it. `carry`, when present, additionally receives all sixteen words of
     /// every block at `(base, row_stride)` — even where the recyclable main
     /// destination elides a constant range.
+    ///
+    /// Everything the eight rows disagree about is the row pointer: the store
+    /// class (`stream_pair_v8`'s `p % 64` plus `stream_v8`'s `p % 32`) and the
+    /// `(nt, lo_live, hi_live)` arm are the SAME for all eight, because rows
+    /// are `U32_PER_BLOCK` = 2048 B apart and every step starts on a 64-byte
+    /// window. Both are therefore resolved once per step here, and the row
+    /// loop becomes a straight-line publish of the sixteen transposed
+    /// registers. `FLOCK_NO_DRAIN_PUBLISH_CLS=1` restores the incumbent
+    /// per-row form ([`Self::publish_step_perrow`], exact same-binary A/B).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn publish_step(
+        stage: *const V8,
+        dst: *mut u32,
+        carry: Option<(*mut u32, usize)>,
+        abs_word: usize,
+        ring_word: usize,
+        g0: usize,
+        g1: usize,
+        nt: bool,
+        wide_nt: bool,
+        cls_on: bool,
+    ) {
+        unsafe {
+            if !cls_on {
+                Self::publish_step_perrow(
+                    stage, dst, carry, abs_word, ring_word, g0, g1, nt, wide_nt,
+                );
+                return;
+            }
+            let lo_rows = tr8_chunk(stage, ring_word);
+            let hi_rows = tr8_chunk(stage, ring_word + 8);
+            let g = abs_word / 8;
+            let lo_live = g >= g0 && g < g1;
+            let hi_live = g + 1 >= g0 && g + 1 < g1;
+            if let Some((base, row_stride)) = carry {
+                for r in 0..8 {
+                    let p = base.add(r * row_stride);
+                    store_v8(p, lo_rows[r]);
+                    store_v8(p.add(8), hi_rows[r]);
+                }
+            }
+            // Nothing of this step reaches the main destination: the elide
+            // range covers both its chunks. Every g0/g1 the drain uses is
+            // chunk-PAIR aligned (`_ELIDE_GEOMETRY`), so this and the
+            // ZMM-pair arm below are the only two outcomes the ranked
+            // geometry ever produces.
+            if !lo_live && !hi_live {
+                return;
+            }
+            #[cfg(target_feature = "avx512f")]
+            if nt && lo_live && hi_live && nt_class(dst.add(abs_word), wide_nt) == 2 {
+                let base = dst.add(abs_word);
+                for r in 0..8 {
+                    let p = base.add(r * U32_PER_BLOCK);
+                    let z = _mm512_castsi256_si512(lo_rows[r]);
+                    let z = _mm512_inserti64x4::<1>(z, hi_rows[r]);
+                    _mm512_stream_si512(p.cast::<__m512i>(), z);
+                }
+                return;
+            }
+            // Every other publish shape — a partially-live chunk pair, a
+            // temporal destination, or an alignment the wide stream cannot
+            // take. None of them occurs at the ranked geometry. Re-derive the
+            // rows inside the outlined body rather than handing them over:
+            // passing `[V8; 8]`s would materialize all sixteen registers to
+            // the stack ahead of the branch, on the hot path, for a call that
+            // is never made. `carry` is already published above.
+            Self::publish_step_perrow(
+                stage, dst, None, abs_word, ring_word, g0, g1, nt, wide_nt,
+            );
+        }
+    }
+
+    /// The incumbent [`Self::publish_step`]: one row loop that re-decides the
+    /// `(nt, lo_live, hi_live)` arm and re-classifies the store width from the
+    /// row pointer on every iteration. Byte-for-byte the same publishes.
+    /// Out of line so the resolved-once form above keeps its own register
+    /// allocation. `FLOCK_NO_DRAIN_PUBLISH_CLS=1` selects it.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn publish_step_perrow(
         stage: *const V8,
         dst: *mut u32,
         carry: Option<(*mut u32, usize)>,
@@ -573,6 +686,7 @@ impl Drain8<'_> {
         g1: usize,
         nt: bool,
         wide_nt: bool,
+        cls_on: bool,
     ) {
         unsafe {
             debug_assert_eq!(base_word % 8, 0);
@@ -590,6 +704,7 @@ impl Drain8<'_> {
                     g1,
                     nt,
                     wide_nt,
+                    cls_on,
                 );
             }
         }
@@ -628,11 +743,13 @@ impl Drain8<'_> {
                 };
                 let (a_g1, b_g0, b_g1) = self.ab_ranges();
                 let (sa, sb) = proj.sides();
+                let cls_on = self.cls_on;
                 for off in (0..words).step_by(STEP_WORDS) {
                     let abs_word = base_word + off;
                     let rw = ring_word + off;
                     Self::publish_step(
                         self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, self.wide_nt,
+                        cls_on,
                     );
                     Self::publish_step(
                         self.ast,
@@ -644,6 +761,7 @@ impl Drain8<'_> {
                         a_g1,
                         true,
                         self.wide_nt,
+                        cls_on,
                     );
                     Self::publish_step(
                         self.bs,
@@ -655,6 +773,7 @@ impl Drain8<'_> {
                         b_g1,
                         true,
                         self.wide_nt,
+                        cls_on,
                     );
                     proj.project(abs_word / STEP_WORDS);
                 }
@@ -688,27 +807,28 @@ impl Drain8<'_> {
                 z_g1,
                 self.z_nt,
                 self.wide_nt,
+                self.cls_on,
             );
 
             match self.win_ab {
                 Some((win_a, win_b)) => {
                     Self::publish_range(
                         self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
-                        self.wide_nt,
+                        self.wide_nt, self.cls_on,
                     );
                     Self::publish_range(
                         self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
-                        self.wide_nt,
+                        self.wide_nt, self.cls_on,
                     );
                 }
                 None => {
                     Self::publish_range(
                         self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
-                        self.wide_nt,
+                        self.wide_nt, self.cls_on,
                     );
                     Self::publish_range(
                         self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
-                        self.wide_nt,
+                        self.wide_nt, self.cls_on,
                     );
                 }
             }
@@ -861,6 +981,41 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     elide: [bool; 3],
     z_nt: bool,
 ) {
+    // SAFETY: forwarded verbatim.
+    unsafe {
+        build_octa_witness_ab_stream_elide_tuned(
+            inputs,
+            z,
+            a,
+            b,
+            win_ab,
+            proj,
+            elide,
+            z_nt,
+            drain_publish_cls_enabled(),
+        );
+    }
+}
+
+/// [`build_octa_witness_ab_stream_elide`] with the drain's publish form
+/// spelled out, so tests can A/B the resolved-once publish against its
+/// `FLOCK_NO_DRAIN_PUBLISH_CLS=1` restore inside one process (the env is a
+/// process-wide `LazyLock`). Same contract.
+///
+/// # Safety
+/// As for [`build_octa_witness_ab_stream_elide`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide_tuned(
+    inputs: [&Compression; 8],
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    win_ab: Option<(*mut u32, *mut u32)>,
+    proj: Option<StreamProj<'_>>,
+    elide: [bool; 3],
+    z_nt: bool,
+    cls_on: bool,
+) {
     unsafe {
         let ptrs = [
             inputs[0].0.as_ptr(),
@@ -975,6 +1130,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             elide,
             z_nt,
             wide_nt: wide_nt_enabled(),
+            cls_on,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -1143,6 +1299,78 @@ mod tests {
             return;
         }
         unsafe { tr8_check() }
+    }
+
+    /// **Resolved-once drain publish oracle.** The default drain decides the
+    /// store class and the live-chunk arm once per 16-word step and publishes
+    /// the sixteen transposed rows straight out of registers;
+    /// `FLOCK_NO_DRAIN_PUBLISH_CLS=1` restores the per-row form. The two must
+    /// write byte-identical z, a and b for every elide setting, at both z
+    /// store classes, and with the fused window buffers on.
+    ///
+    /// (Runs the octa builder directly, so it covers the AVX-512 ZMM-stream
+    /// arm on any AVX-512 host and the AVX2 fallback everywhere else.)
+    #[test]
+    fn witgen8_drain_publish_cls_matches_perrow() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const WORDS: usize = 8 * U32_PER_BLOCK;
+        let mk_block = |seed: u32| -> Compression {
+            let mut s = seed.wrapping_mul(0x9E37_79B9) | 1;
+            let mut next = move || {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s
+            };
+            let cv: [u32; 8] = core::array::from_fn(|_| next());
+            let m: [u32; 16] = core::array::from_fn(|_| next());
+            (cv, m, ((next() as u64) << 32) | next() as u64, 64, next() & 0xFF)
+        };
+        let blocks: Vec<Compression> = (0..8u32).map(mk_block).collect();
+        let octa: [&Compression; 8] = core::array::from_fn(|j| &blocks[j]);
+
+        for z_nt in [false, true] {
+            for elide in [[false; 3], [true, true, true]] {
+                let mut out: Vec<Vec<u32>> = Vec::new();
+                for cls_on in [true, false] {
+                    // 64-byte aligned destinations, as the witness pool hands
+                    // out — the class the resolved-once arm is built for.
+                    let mut buf = vec![0u32; 5 * WORDS + 16];
+                    let base = {
+                        let p = buf.as_mut_ptr();
+                        let pad = (64 - (p as usize % 64)) % 64 / 4;
+                        pad
+                    };
+                    // SAFETY: `buf` owns 5 · WORDS words past `base`, split
+                    // into five disjoint 8-block regions; `win_a`/`win_b` are
+                    // disjoint from z/a/b as the contract requires.
+                    unsafe {
+                        let p = buf.as_mut_ptr().add(base);
+                        let (z, a, b) = (p, p.add(WORDS), p.add(2 * WORDS));
+                        let (wa, wb) = (p.add(3 * WORDS), p.add(4 * WORDS));
+                        build_octa_witness_ab_stream_elide_tuned(
+                            octa,
+                            z,
+                            a,
+                            b,
+                            Some((wa, wb)),
+                            None,
+                            elide,
+                            z_nt,
+                            cls_on,
+                        );
+                        core::arch::x86_64::_mm_sfence();
+                    }
+                    out.push(buf);
+                }
+                assert_eq!(
+                    out[0], out[1],
+                    "publish form mismatch (z_nt={z_nt}, elide={elide:?})"
+                );
+            }
+        }
     }
 
     unsafe fn tr8_check() {
