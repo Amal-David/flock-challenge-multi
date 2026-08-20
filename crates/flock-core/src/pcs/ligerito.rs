@@ -6915,7 +6915,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 n_next,
                 ood_count(i + 2),
                 sc_prover.f().len(),
-                direct_fold4_mode || direct_fold8_mode,
+                direct_fold4_mode,
             );
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);

@@ -72,6 +72,11 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
 /// per process; default ON. The selector is outside the bind, so there is no
 /// per-element dispatch — the historical "avoid dispatch" scalar comment no
 /// longer applies on Sapphire Rapids.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 fn fold8_bind_x4_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_none());
@@ -299,7 +304,6 @@ mod tests {
             assert_eq!(b_got, b_want, "folded b n={n}");
         }
     }
-
 
     use super::*;
 
