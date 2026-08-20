@@ -2526,23 +2526,56 @@ fn process_one_x_hi_ab_only(
     if let Some((eq_bot, _, _)) = eq_fold {
         // Plane-major → F128 through the same vectorized kernel the C drain
         // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
-        // of 16 scalar byte loads per lane. The eq_bot multiply stays scalar
-        // here — this level compiles for every arch and the loads were the
-        // bulk of the band tail.
+        // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
+        // shared `add_scaled` leaf, which selects the architecture kernel.
         let mut bank_f128 = [F128::ZERO; ELL];
+        let wide = r1_eqfold_x4_enabled();
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
             let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
                 .try_into()
                 .expect("one 16-plane bank");
             kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            for lane in 0..ELL {
-                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+            if wide {
+                crate::field::f128_slice::add_scaled(
+                    &mut state.partial_ab,
+                    &bank_f128,
+                    *eq_bot_val,
+                );
+            } else {
+                for lane in 0..ELL {
+                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+                }
             }
         }
     }
-    for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+    if r1_eqfold_x4_enabled() {
+        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        }
     }
+}
+
+/// Ranked default routes the round-one AB band folds — the plane-bank
+/// accumulate and the band-end `eq_hi` fold — through the shared
+/// `f128_slice::add_scaled` leaf. `FLOCK_NO_ZC_R1_EQFOLD_X4=1` restores the
+/// per-lane scalar loops. Read once per process; default ON.
+fn r1_eqfold_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_EQFOLD_X4").is_none());
+    *ON
+}
+
+/// Ranked default routes the round-one identity-C bank collapses (sixty-four
+/// banks to sixteen, sixteen to four) through the shared
+/// `f128_slice::add_scaled` leaf. `FLOCK_NO_ZC_R1_CFOLD_X4=1` restores the
+/// per-slot scalar loops. Read once per process; default ON.
+fn r1_cfold_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_CFOLD_X4").is_none());
+    *ON
 }
 
 /// Round-one AB message from the challenge-independent precompute, with no C
@@ -2678,12 +2711,21 @@ pub fn round1_c_fold4_from_block_major_z(
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
         let retained_top_eq = build_eq(&inner_tail[4..6]);
         let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+        let wide = r1_cfold_x4_enabled();
         for high in 0..4 {
             for bank in 0..16 {
                 let src = (bank + 16 * high) * n_packed;
                 let dst = bank * n_packed;
-                for packed in 0..n_packed {
-                    fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                if wide {
+                    crate::field::f128_slice::add_scaled(
+                        &mut fold4[dst..dst + n_packed],
+                        &fold8[src..src + n_packed],
+                        retained_top_eq[high],
+                    );
+                } else {
+                    for packed in 0..n_packed {
+                        fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                    }
                 }
             }
         }
@@ -2701,12 +2743,21 @@ pub fn round1_c_fold4_from_block_major_z(
     // tensor (coordinates 0 and 1 stay bank selectors).
     let retained_hi_eq = build_eq(&inner_tail[2..4]);
     let mut quad = vec![F128::ZERO; 4 * n_packed];
+    let wide_quad = r1_cfold_x4_enabled();
     for q in 0..4 {
         for e in 0..4 {
             let src = (e + 4 * q) * n_packed;
             let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+            if wide_quad {
+                crate::field::f128_slice::add_scaled(
+                    &mut quad[dst..dst + n_packed],
+                    &fold4[src..src + n_packed],
+                    retained_hi_eq[q],
+                );
+            } else {
+                for packed in 0..n_packed {
+                    quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                }
             }
         }
     }
