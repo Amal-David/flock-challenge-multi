@@ -291,14 +291,13 @@ fn blake3_platform() -> blake3::platform::Platform {
 
 /// Inputs handed to `hash_many` per call.
 ///
-/// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
-/// entry can loop over several such groups. Four groups amortize the FFI and
-/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
-/// the established 16-input policy on non-x86 targets, where an M4 sweep found
-/// it marginally best and the SIMD width is only four.
-#[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
-#[cfg(not(target_arch = "x86_64"))]
+/// Sized to the widest `simd_degree` that exists — 4 under NEON, 8 under AVX2,
+/// 16 under AVX-512 — so the batch fills the machine's vector rather than
+/// leaving lanes idle. This is portability insurance, not a local win: swept
+/// over 4/8/16/64/256 on an M4 Max (NEON, degree 4) the spread was ~1-5%, i.e.
+/// inside run-to-run noise, with 16 marginally best. It should matter on an
+/// AVX-512 host, where a 4-input call can only ever fill a quarter of the
+/// vector; that has not been measured here.
 const BLAKE3_BATCH: usize = 16;
 
 /// Drive `hash_many` over `data`, a run of `out.len()` contiguous `N`-byte

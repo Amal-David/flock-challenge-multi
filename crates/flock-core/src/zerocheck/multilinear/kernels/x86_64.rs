@@ -1456,6 +1456,73 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         }
     }
 
+    /// Non-c4 GFNI producer: two 64-row masked folds into FoldCache.
+    /// Out-of-line leftover of #403 (`groups_general`): ranked `use_c4`
+    /// never enters this arm, but LLVM otherwise keeps its induction vars
+    /// on the hot tile latch.
+    #[inline(never)]
+    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+    unsafe fn gfni_fold64_masked_ab(
+        a_src: *const u8,
+        b_src: *const u8,
+        m: &[u64; 128],
+        fa: *mut F128,
+        fb: *mut F128,
+        dead: u8,
+    ) {
+        // SAFETY: same row/out bounds as the two inlined calls this wraps.
+        unsafe {
+            gfni_fold64_rows_masked(a_src, m, fa, dead);
+            gfni_fold64_rows_masked(b_src, m, fb, dead);
+        }
+    }
+
+    /// Cache+regfold consume: eight `fold16_to_4` / deferred calls.
+    /// Out-of-line leftover of #403 — ranked `use_c4` never enters this
+    /// arm; `fold16_to_4` is `#[inline(always)]` so leaving the calls in
+    /// the hot function body lets LLVM park their IVs on the latch.
+    #[inline(never)]
+    unsafe fn fold_cache_regfold_consume(
+        fa: &[F128; 64],
+        fb: &[F128; 64],
+        r1: __m512i,
+        r2: __m512i,
+        r12: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+        defer: bool,
+    ) -> [__m512i; 8] {
+        // SAFETY: caller supplies 64 readable F128 per side and the same
+        // register contract as the eight inlined fold16_to_4 calls.
+        unsafe {
+            let ap = fa.as_ptr();
+            let bp2 = fb.as_ptr();
+            if defer {
+                [
+                    fold16_to_4_deferred(ap, r1, r2, r12),
+                    fold16_to_4_deferred(bp2, r1, r2, r12),
+                    fold16_to_4_deferred(ap.add(16), r1, r2, r12),
+                    fold16_to_4_deferred(bp2.add(16), r1, r2, r12),
+                    fold16_to_4_deferred(ap.add(32), r1, r2, r12),
+                    fold16_to_4_deferred(bp2.add(32), r1, r2, r12),
+                    fold16_to_4_deferred(ap.add(48), r1, r2, r12),
+                    fold16_to_4_deferred(bp2.add(48), r1, r2, r12),
+                ]
+            } else {
+                [
+                    fold16_to_4(ap, r1, r2, even_idx, odd_idx),
+                    fold16_to_4(bp2, r1, r2, even_idx, odd_idx),
+                    fold16_to_4(ap.add(16), r1, r2, even_idx, odd_idx),
+                    fold16_to_4(bp2.add(16), r1, r2, even_idx, odd_idx),
+                    fold16_to_4(ap.add(32), r1, r2, even_idx, odd_idx),
+                    fold16_to_4(bp2.add(32), r1, r2, even_idx, odd_idx),
+                    fold16_to_4(ap.add(48), r1, r2, even_idx, odd_idx),
+                    fold16_to_4(bp2.add(48), r1, r2, even_idx, odd_idx),
+                ]
+            }
+        }
+    }
+
     // SAFETY: the function's contract bounds every packed-row read, table
     // read and output store; the cfg gate supplies every intrinsic feature.
     unsafe {
@@ -1525,8 +1592,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         );
                     } else {
                         let m = mats.unwrap();
-                        gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
-                        gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                        gfni_fold64_masked_ab(
+                            a_pkt.add(4 * xg * 8),
+                            b_pkt.add(4 * xg * 8),
+                            m,
+                            fa.as_mut_ptr(),
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
                     }
                     // The 512-byte bursts `pf_tiles` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
@@ -1577,31 +1650,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
-                    let ap = fa.as_ptr();
-                    let bp2 = fb.as_ptr();
-                    if defer {
-                        (
-                            fold16_to_4_deferred(ap, r1, r2, r12),
-                            fold16_to_4_deferred(bp2, r1, r2, r12),
-                            fold16_to_4_deferred(ap.add(16), r1, r2, r12),
-                            fold16_to_4_deferred(bp2.add(16), r1, r2, r12),
-                            fold16_to_4_deferred(ap.add(32), r1, r2, r12),
-                            fold16_to_4_deferred(bp2.add(32), r1, r2, r12),
-                            fold16_to_4_deferred(ap.add(48), r1, r2, r12),
-                            fold16_to_4_deferred(bp2.add(48), r1, r2, r12),
-                        )
-                    } else {
-                        (
-                            fold16_to_4(ap, r1, r2, even_idx, odd_idx),
-                            fold16_to_4(bp2, r1, r2, even_idx, odd_idx),
-                            fold16_to_4(ap.add(16), r1, r2, even_idx, odd_idx),
-                            fold16_to_4(bp2.add(16), r1, r2, even_idx, odd_idx),
-                            fold16_to_4(ap.add(32), r1, r2, even_idx, odd_idx),
-                            fold16_to_4(bp2.add(32), r1, r2, even_idx, odd_idx),
-                            fold16_to_4(ap.add(48), r1, r2, even_idx, odd_idx),
-                            fold16_to_4(bp2.add(48), r1, r2, even_idx, odd_idx),
-                        )
-                    }
+                    let g = fold_cache_regfold_consume(
+                        fa, fb, r1, r2, r12, even_idx, odd_idx, defer,
+                    );
+                    (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
                 } else {
                     let g = groups_general(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
                     (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
