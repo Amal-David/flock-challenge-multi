@@ -4042,6 +4042,121 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+/// Fuse the ranked x86 DRAM-cold fold, message reduction, and XMM NT publish.
+/// `FLOCK_NO_OPEN_NT_FUSED=1` restores the incumbent 64 KiB stage roundtrip.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_nt_fused_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_NT_FUSED").is_none());
+    *ON
+}
+
+/// Stage-free x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
+///
+/// The folded ZMMs feed the same message products as [`msg_reduce_avx512`]
+/// and are then split into canonical 128-bit quarters for the incumbent XMM
+/// streaming-store contract. Production chunks are exactly 2048 outputs.
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` are equal-length, 16-byte
+/// aligned, non-overlapping output slices whose length is a multiple of eight;
+/// `f`/`b` contain `2 * (base + fc.len())` elements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_nt_fused_x86(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn fold4(
+        src: *const F128,
+        r_bcast: __m512i,
+        idx_even: __m512i,
+        idx_odd: __m512i,
+    ) -> __m512i {
+        unsafe {
+            let lo = _mm512_loadu_si512(src.cast::<__m512i>());
+            let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
+            let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+            let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+            _mm512_xor_si512(
+                even,
+                crate::field::gf2_128::x86_64::ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)),
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn stream_zmm_as_xmm(dst: *mut F128, v: __m512i) {
+        unsafe {
+            let d = dst.cast::<__m128i>();
+            _mm_stream_si128(d, _mm512_castsi512_si128(v));
+            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        }
+    }
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(8));
+    debug_assert!((fc.as_ptr() as usize).is_multiple_of(16));
+    debug_assert!((bc.as_ptr() as usize).is_multiple_of(16));
+
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+
+        let mut t = 0usize;
+        while t < len {
+            let s = 2 * (base + t);
+            let f0 = fold4(f.as_ptr().add(s), r_bcast, idx_even, idx_odd);
+            let f1 = fold4(f.as_ptr().add(s + 8), r_bcast, idx_even, idx_odd);
+            let b0 = fold4(b.as_ptr().add(s), r_bcast, idx_even, idx_odd);
+            let b1 = fold4(b.as_ptr().add(s + 8), r_bcast, idx_even, idx_odd);
+
+            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            stream_zmm_as_xmm(fc.as_mut_ptr().add(t), f0);
+            stream_zmm_as_xmm(fc.as_mut_ptr().add(t + 4), f1);
+            stream_zmm_as_xmm(bc.as_mut_ptr().add(t), b0);
+            stream_zmm_as_xmm(bc.as_mut_ptr().add(t + 4), b1);
+            t += 8;
+        }
+        _mm_sfence();
+        (u0_acc.fold().reduce(), u2_acc.fold().reduce())
+    }
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
@@ -4271,6 +4386,15 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "vpclmulqdq"
             ))]
             if use_nt {
+                let aligned = (fc.as_ptr() as usize).is_multiple_of(16)
+                    && (bc.as_ptr() as usize).is_multiple_of(16);
+                if aligned && open_nt_fused_enabled() {
+                    // Ranked DRAM-cold arm: take the message from the folded
+                    // ZMMs, then publish those registers through the exact
+                    // incumbent XMM NT-store contract. Kill switch restores
+                    // the stage path below byte-for-byte.
+                    return unsafe { fold_and_msg_chunk_nt_fused_x86(f, b, base, fc, bc, r) };
+                }
                 // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
                 // reused scratch; dest sees only the NT publish.
                 return OPEN_NT_STAGE.with(|cell| {
@@ -9555,6 +9679,25 @@ mod tests {
             assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
             assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
             assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+
+            let mut fc_fused = vec![F128::ZERO; n_pairs];
+            let mut bc_fused = vec![F128::ZERO; n_pairs];
+            // SAFETY: test cfg supplies the target features; Vec<F128> is
+            // 16-byte aligned and every selected length is a multiple of 8.
+            let (u0_fused, u2_fused) = unsafe {
+                super::fold_and_msg_chunk_nt_fused_x86(
+                    &f,
+                    &b,
+                    base,
+                    &mut fc_fused,
+                    &mut bc_fused,
+                    r,
+                )
+            };
+            assert_eq!(fc_ref, fc_fused, "fused f mismatch n_pairs={n_pairs}");
+            assert_eq!(bc_ref, bc_fused, "fused b mismatch n_pairs={n_pairs}");
+            assert_eq!(u0_ref, u0_fused, "fused u0 mismatch n_pairs={n_pairs}");
+            assert_eq!(u2_ref, u2_fused, "fused u2 mismatch n_pairs={n_pairs}");
         }
     }
 
