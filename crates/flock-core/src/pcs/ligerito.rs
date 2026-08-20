@@ -2799,8 +2799,12 @@ fn induce_fused_densify_enabled() -> bool {
 /// densify pass can be indexed (and therefore parallelised) by window number.
 /// `nwin` is `2^(log_d - k)`; every `w` in `processed` is `< nwin` and unique
 /// (they are the keys of the grouping `HashMap`).
-fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<Vec<F128>>> {
-    let mut slots: Vec<Option<Vec<F128>>> = (0..nwin).map(|_| None).collect();
+fn window_slots(
+    nwin: usize,
+    processed: Vec<(usize, crate::scratch::LocalBuf)>,
+) -> Vec<Option<crate::scratch::LocalBuf>> {
+    let mut slots: Vec<Option<crate::scratch::LocalBuf>> =
+        (0..nwin).map(|_| None).collect();
     for (w, buf) in processed {
         debug_assert!(w < nwin);
         debug_assert!(slots[w].is_none(), "window {w} densified twice");
@@ -2820,7 +2824,11 @@ fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<V
 /// ([`crate::alloc_uninit_vec`]'s write-before-read contract is discharged by
 /// the partition), which deletes the serial 16 MiB zero pass and spreads the
 /// first-touch page faults across the rayon pool instead of one thread.
-fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> Vec<F128> {
+fn densify_windows_fused(
+    n: usize,
+    k: usize,
+    slots: Vec<Option<crate::scratch::LocalBuf>>,
+) -> Vec<F128> {
     use rayon::prelude::*;
     debug_assert_eq!(slots.len(), n >> k);
     let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
@@ -2836,13 +2844,14 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
 /// Dense `2^k` transpose for one sparse-prefix window. This is the incumbent
 /// path and remains the exact collision fallback for the singleton shortcut.
 #[inline]
-fn transpose_forward_ntt_window_dense(
+fn transpose_forward_ntt_window_dense<B: AsMut<[F128]>>(
     ntt: &AdditiveNttF128,
     log_d: usize,
     k: usize,
     w: usize,
-    mut buf: Vec<F128>,
-) -> (usize, Vec<F128>) {
+    mut buf: B,
+) -> (usize, B) {
+    let data = buf.as_mut();
     for s in 0..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
@@ -2851,7 +2860,7 @@ fn transpose_forward_ntt_window_dense(
         for jb in 0..nblocks {
             let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
             let base = jb * block_size;
-            let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
+            let (top_h, bot) = data[base..base + block_size].split_at_mut(bsh);
             transpose_butterfly(top_h, bot, t);
         }
     }
@@ -2876,12 +2885,32 @@ fn singleton_uninit_enabled() -> bool {
 /// [`expand_singleton_into`] is write-complete, so the buffer may start
 /// uninitialized; `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores the incumbent
 /// zero-fill. Output bytes are identical either way.
-fn take_singleton_buf(k: usize) -> Vec<F128> {
-    if singleton_uninit_enabled() {
+fn take_singleton_buf(k: usize) -> crate::scratch::LocalBuf {
+    let buf = if singleton_uninit_enabled() {
         crate::alloc_uninit_vec::<F128>(1usize << k)
     } else {
         vec![F128::ZERO; 1usize << k]
+    };
+    crate::scratch::LocalBuf::from_unpooled(buf)
+}
+
+/// Recycle dense sparse-induce windows across the untimed and timed proofs.
+/// The dense fallback still clears every slot before scattering its nonzeros;
+/// only the allocation/free pair disappears.
+fn induce_dense_buf_pool_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_INDUCE_DENSE_BUF_POOL").is_none()
+    });
+    *ON
+}
+
+fn take_dense_induce_buf(k: usize) -> crate::scratch::LocalBuf {
+    let pooled = induce_dense_buf_pool_enabled();
+    let mut buf = crate::scratch::LocalBuf::new(1usize << k, pooled);
+    if pooled {
+        buf.fill(F128::ZERO);
     }
+    buf
 }
 
 /// Expand one nonzero at local index `p` through the window's `k` transpose
@@ -2943,7 +2972,7 @@ fn transpose_forward_ntt_window_singleton(
     w: usize,
     p: usize,
     value: F128,
-) -> (usize, Vec<F128>) {
+) -> (usize, crate::scratch::LocalBuf) {
     let mut buf = take_singleton_buf(k);
     expand_singleton_into(ntt, log_d, k, w, p, value, &mut buf);
     (w, buf)
@@ -3083,7 +3112,7 @@ fn transpose_forward_ntt_sparse_inner(
     // would accumulate in their original order. The window ORDER in the output
     // vector is irrelevant — `window_slots` scatters by window index (the
     // incumbent's `HashMap` iteration order was already nondeterministic).
-    let mut win_vec: Vec<(usize, Vec<F128>)> = Vec::new();
+    let mut win_vec: Vec<(usize, crate::scratch::LocalBuf)> = Vec::new();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut order: Vec<u32> = Vec::new();
     if fill {
@@ -3100,11 +3129,11 @@ fn transpose_forward_ntt_sparse_inner(
             s = e;
         }
     } else {
-        let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
+        let mut windows: HashMap<usize, crate::scratch::LocalBuf> = HashMap::new();
         for (&p, &v) in positions.iter().zip(values) {
             let buf = windows
                 .entry(p >> k)
-                .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+                .or_insert_with(|| take_dense_induce_buf(k));
             buf[p & wmask] += v;
         }
         win_vec = windows.into_iter().collect();
@@ -3132,7 +3161,7 @@ fn transpose_forward_ntt_sparse_inner(
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
+    let processed: Vec<(usize, crate::scratch::LocalBuf)> = if fill {
         runs.par_iter()
             .map_init(
                 Vec::<F128>::new,
@@ -3159,7 +3188,7 @@ fn transpose_forward_ntt_sparse_inner(
                     );
                         if nnz > 1 {
                             if scratch.len() < 1usize << k {
-                                *scratch = take_singleton_buf(k);
+                                *scratch = crate::alloc_uninit_vec::<F128>(1usize << k);
                             }
                             let scratch = &mut scratch[..1usize << k];
                             for &i in &order[rs + 1..re] {
@@ -3183,7 +3212,7 @@ fn transpose_forward_ntt_sparse_inner(
                     // Past the cost boundary: incumbent dense window
                     // (needs the zeroed allocation — only the nonzero slots
                     // are scattered).
-                let mut buf = vec![F128::ZERO; 1 << k];
+                let mut buf = take_dense_induce_buf(k);
                 for &i in &order[rs..re] {
                     let i = i as usize;
                     buf[positions[i] & wmask] += values[i];
@@ -10682,7 +10711,8 @@ mod tests {
                     let want = transpose_forward_ntt_window_dense(&ntt, log_d, K, w, dense);
                     let got =
                         transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
-                    assert_eq!(got, want, "log_d={log_d} w={w} p={p}");
+                    assert_eq!(got.0, want.0, "log_d={log_d} w={w} p={p}");
+                    assert_eq!(&*got.1, want.1.as_slice(), "log_d={log_d} w={w} p={p}");
                 }
             }
         }
@@ -10811,7 +10841,7 @@ mod tests {
                             *d += s;
                         }
                     }
-                    assert_eq!(buf, want, "k={k} w={w} nnz={nnz}");
+                    assert_eq!(&*buf, want.as_slice(), "k={k} w={w} nnz={nnz}");
                 }
             }
         }
@@ -10888,6 +10918,10 @@ mod tests {
                 for (w, buf) in &processed {
                     want[(w << k)..((w + 1) << k)].copy_from_slice(buf);
                 }
+                let processed = processed
+                    .into_iter()
+                    .map(|(w, buf)| (w, crate::scratch::LocalBuf::from_unpooled(buf)))
+                    .collect();
                 let got = densify_windows_fused(n, k, window_slots(nwin, processed));
                 assert_eq!(got.len(), want.len(), "log_d={log_d} active={active}");
                 assert!(got == want, "log_d={log_d} k={k} active={active}");

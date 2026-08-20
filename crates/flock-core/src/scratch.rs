@@ -385,6 +385,10 @@ pub(crate) struct LocalBuf {
 }
 
 impl LocalBuf {
+    pub(crate) fn from_unpooled(buf: Vec<F128>) -> Self {
+        Self { buf, pooled: false }
+    }
+
     /// Never inlined: this runs once per rayon job, from inside the fold
     /// loop. Inlining it would splice both arms' allocator code — the pooled
     /// arm's fallback and the kill-switch arm's `vec![ZERO; n]` — into the
@@ -411,6 +415,12 @@ impl std::ops::Deref for LocalBuf {
 impl std::ops::DerefMut for LocalBuf {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [F128] {
+        &mut self.buf
+    }
+}
+
+impl AsMut<[F128]> for LocalBuf {
+    fn as_mut(&mut self) -> &mut [F128] {
         &mut self.buf
     }
 }
