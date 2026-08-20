@@ -617,6 +617,8 @@ fn shift_reduce_inner_ab(
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
     nt: u8,
+    plan: kernels::ShiftReducePlan,
+    imgs: (*const u8, *const u8),
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -629,6 +631,8 @@ fn shift_reduce_inner_ab(
         b_col,
         bstatic,
         nt,
+        plan,
+        imgs,
     );
 }
 
@@ -662,6 +666,14 @@ fn shift_reduce_transpose_windows(
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
 ) {
+    // Process-invariant URM mode switches, resolved once per worker chunk
+    // (never inside the window loop).
+    let plan = kernels::prepare_shift_reduce(inv_table);
+    let imgs = if plan.uses_images() {
+        inv_table.image_ptrs()
+    } else {
+        (core::ptr::null(), core::ptr::null())
+    };
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
         let (lo, hi) = chunk_ab_bytes.split_at_mut(b_med + 1);
@@ -679,6 +691,8 @@ fn shift_reduce_transpose_windows(
             // Fold-time staging arrays are re-read L1-hot immediately:
             // always temporal.
             0,
+            plan,
+            imgs,
         );
         for w in b_med..b_med + 2 {
             let byte_base_b = chunk_byte_base + w * N_CHUNKS * 8;
@@ -701,6 +715,8 @@ fn shift_reduce_transpose_windows(
             b_col,
             bstatic,
             0,
+            plan,
+            imgs,
         );
         let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
         let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -730,6 +746,14 @@ fn shift_reduce_windows_into_blocks(
     bstatic: kernels::BstaticHint,
     nt: u8,
 ) {
+    // Process-invariant URM mode switches, resolved once per worker chunk
+    // (never inside the window loop).
+    let plan = kernels::prepare_shift_reduce(inv_table);
+    let imgs = if plan.uses_images() {
+        inv_table.image_ptrs()
+    } else {
+        (core::ptr::null(), core::ptr::null())
+    };
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
         let (blk0, rest) = out_outer[b_med * 64..].split_at_mut(64);
@@ -749,6 +773,8 @@ fn shift_reduce_windows_into_blocks(
             b_col,
             bstatic,
             nt,
+            plan,
+            imgs,
         );
         b_med += 2;
     }
@@ -767,6 +793,8 @@ fn shift_reduce_windows_into_blocks(
             b_col,
             bstatic,
             nt,
+            plan,
+            imgs,
         );
     }
 }

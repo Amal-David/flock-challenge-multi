@@ -877,7 +877,7 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, None, 0);
+                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, None, 0, super::super::prepare_shift_reduce(&inv_table), inv_table.image_ptrs());
                         sink ^= out[0] as u64;
                     }
                 }
@@ -888,7 +888,7 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
+                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0, super::super::prepare_shift_reduce(&inv_table), inv_table.image_ptrs());
                         sink ^= out[0] as u64;
                     }
                 }
@@ -997,14 +997,14 @@ mod microbench {
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, None, 0);
+                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, None, 0, super::super::prepare_shift_reduce(&inv_table), inv_table.image_ptrs());
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_off = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
+                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0, super::super::prepare_shift_reduce(&inv_table), inv_table.image_ptrs());
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_on = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
