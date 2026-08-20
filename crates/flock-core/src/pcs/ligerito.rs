@@ -2596,6 +2596,17 @@ fn induce_fused_densify_enabled() -> bool {
     *ON
 }
 
+/// Fuse ranked L0 densification with the cache-local half of the blocked
+/// transpose. `FLOCK_NO_INDUCE_FUSED_BLOCK_A=1` restores the ordinary
+/// densify-then-blocked schedule.
+#[inline]
+fn induce_fused_block_a_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_INDUCE_FUSED_BLOCK_A").is_none()
+    });
+    *ON
+}
+
 /// Scatter the processed active windows into a dense `nwin`-slot table so the
 /// densify pass can be indexed (and therefore parallelised) by window number.
 /// `nwin` is `2^(log_d - k)`; every `w` in `processed` is `< nwin` and unique
@@ -2632,6 +2643,61 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
             None => dst.fill(F128::ZERO),
         });
     data
+}
+
+/// Initialize each cache-sized blocked-transpose chunk from its sparse window
+/// slots and immediately apply all chunk-local layers while that chunk is
+/// owned by the same worker. The returned `split` is the number of remaining
+/// cross-chunk layers.
+fn densify_windows_fused_block_a(
+    ntt: &AdditiveNttF128,
+    n: usize,
+    k: usize,
+    mut slots: Vec<Option<Vec<F128>>>,
+    log_d: usize,
+    top: usize,
+) -> (Vec<F128>, usize) {
+    use rayon::prelude::*;
+
+    const CHUNK_LOG: usize = 16;
+    let n_threads = rayon::current_num_threads().max(1);
+    let split = log_d
+        .saturating_sub(CHUNK_LOG)
+        .max(ceil_log2(n_threads))
+        .min(top);
+    debug_assert!(top > split);
+
+    let chunk_len = 1usize << (log_d - split);
+    let window_len = 1usize << k;
+    let windows_per_chunk = chunk_len >> k;
+    debug_assert_eq!(slots.len(), n >> k);
+    debug_assert_eq!(chunk_len % window_len, 0);
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(chunk_len)
+        .zip(slots.par_chunks_mut(windows_per_chunk))
+        .enumerate()
+        .for_each(|(c, (chunk, chunk_slots))| {
+            for (dst, src) in chunk.chunks_mut(window_len).zip(chunk_slots.iter_mut()) {
+                match src.take() {
+                    Some(buf) => dst.copy_from_slice(&buf),
+                    None => dst.fill(F128::ZERO),
+                }
+            }
+
+            for layer in (split..top).rev() {
+                let nb = 1usize << (layer - split);
+                let block_size = 1usize << (log_d - layer);
+                let bsh = block_size >> 1;
+                for jb in 0..nb {
+                    let t = ntt.twiddle(layer, (c << (layer - split)) + jb);
+                    let (top_h, bot) =
+                        chunk[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
+                    transpose_butterfly(top_h, bot, t);
+                }
+            }
+        });
+    (data, split)
 }
 
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
@@ -2771,14 +2837,35 @@ fn transpose_forward_ntt_sparse(
     let ot = open_timing();
     let _ta = std::time::Instant::now();
     let mf0 = if ot { minor_faults() } else { 0 };
-    let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
+    let remaining_top = log_d - k;
+    let ranked_block_a_shape = cfg!(target_arch = "x86_64")
+        && log_d == 20
+        && k == 8
+        && positions.len() == 218
+        && values.len() == 218;
+    let (mut data, alloc_ms, dens_ms, dense_top) = if induce_fused_densify_enabled() {
         // FUSED: one parallel pass writes every window exactly once, from an
         // UNINITIALIZED buffer. See `densify_windows_fused`.
         let slots = window_slots(n >> k, processed);
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
         let _td = std::time::Instant::now();
-        let data = densify_windows_fused(n, k, slots);
-        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+        if ranked_block_a_shape
+            && fill
+            && tntt_block_enabled()
+            && induce_fused_block_a_enabled()
+        {
+            let (data, split) =
+                densify_windows_fused_block_a(ntt, n, k, slots, log_d, remaining_top);
+            (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3, split)
+        } else {
+            let data = densify_windows_fused(n, k, slots);
+            (
+                data,
+                alloc_ms,
+                _td.elapsed().as_secs_f64() * 1e3,
+                remaining_top,
+            )
+        }
     } else {
         let mut data = vec![F128::ZERO; n];
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
@@ -2786,18 +2873,23 @@ fn transpose_forward_ntt_sparse(
         for (w, buf) in processed {
             data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
         }
-        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+        (
+            data,
+            alloc_ms,
+            _td.elapsed().as_secs_f64() * 1e3,
+            remaining_top,
+        )
     };
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let _ts = std::time::Instant::now();
-    transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    transpose_forward_ntt_dense_layers(ntt, &mut data, dense_top);
     if ot {
         eprintln!(
             "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
             nwin = nwins,
             win_ms = win_ms,
-            dl = log_d - k,
+            dl = dense_top,
             ds = _ts.elapsed().as_secs_f64() * 1e3,
             mf = minor_faults() - mf0,
         );
@@ -9372,6 +9464,76 @@ mod tests {
                 assert!(got == want, "log_d={log_d} k={k} active={active}");
             }
         }
+    }
+
+    /// Ranked L0 oracle for the fused densify + blocked pass-(a) seam. The
+    /// candidate must produce exactly the same full vector as publishing the
+    /// dense buffer first and then running the complete blocked transpose.
+    #[test]
+    fn densify_fused_block_a_matches_published_dense_ranked_l0() {
+        use crate::challenger::Challenger;
+
+        let log_d = 20usize;
+        let k = 8usize;
+        let n = 1usize << log_d;
+        let nwin = n >> k;
+        let mut ch = crate::challenger::RandomChallenger::new(0xF011_B10C_A);
+        let mut seen = vec![false; nwin];
+        let mut processed = Vec::with_capacity(214);
+        while processed.len() < 214 {
+            let w = (ch.sample_f128().lo as usize) % nwin;
+            if seen[w] {
+                continue;
+            }
+            seen[w] = true;
+            processed.push((w, ch.sample_f128_vec(1usize << k)));
+        }
+
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut want = densify_windows_fused(n, k, window_slots(nwin, processed.clone()));
+        transpose_forward_ntt_dense_layers_blocked(&ntt, &mut want, log_d - k);
+
+        let (mut got, split) = densify_windows_fused_block_a(
+            &ntt,
+            n,
+            k,
+            window_slots(nwin, processed),
+            log_d,
+            log_d - k,
+        );
+        transpose_forward_ntt_dense_layers_blocked(&ntt, &mut got, split);
+        assert_eq!(got, want);
+    }
+
+    /// Exercise the complete sparse selector at the exact ranked L0 geometry,
+    /// including window construction, fused initialization/pass-(a), and the
+    /// remaining cross-chunk pass-(b).
+    #[test]
+    fn transpose_sparse_ranked_l0_matches_dense() {
+        use crate::challenger::Challenger;
+
+        let log_d = 20usize;
+        let n = 1usize << log_d;
+        let mut ch = crate::challenger::RandomChallenger::new(0x5E1E_C70A);
+        let mut positions = Vec::with_capacity(218);
+        let mut values = Vec::with_capacity(218);
+        while positions.len() < 218 {
+            let p = (ch.sample_f128().lo as usize) % n;
+            if positions.contains(&p) {
+                continue;
+            }
+            positions.push(p);
+            values.push(ch.sample_f128());
+        }
+
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut want = vec![F128::ZERO; n];
+        for (&p, &v) in positions.iter().zip(&values) {
+            want[p] += v;
+        }
+        transpose_forward_ntt(&ntt, &mut want, log_d);
+        let got = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+        assert_eq!(got, want);
     }
 
     /// The split-product eq table must be BYTE-identical to the serial
