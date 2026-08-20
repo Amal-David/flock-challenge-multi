@@ -1576,7 +1576,7 @@ impl AdditiveNttF128 {
     /// cleared env never sets it.
     fn stage_perm_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_STAGE_PERM").is_some());
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_STAGE_PERM").is_none());
         *ON
     }
 
