@@ -495,6 +495,72 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     }
 }
 
+/// Every fused-four row group of one block, with the fifteen twiddles
+/// broadcast (and companion-multiplied) ONCE for the whole block instead of
+/// once per row group. Same butterflies, same twiddles, same per-row order as
+/// the [`butterfly_fused_4layer_row`] loop it replaces → identical output.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`] for every row group
+/// `0..sixteenth` of the block at `ptr`; `odd_tail` must be 0 unless
+/// `sixteenth` is even, and `hint` must be 0, 1 or 2.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_rows_block(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+    hint: u8,
+) {
+    debug_assert!(odd_tail <= num_ntts);
+    debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry and disjointness contract.
+    unsafe {
+        x86_64::butterfly_fused_4layer_rows_block(
+            ptr, sixteenth, num_ntts, odd_tail, twiddles, hint,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract; the portable leaf has no twiddle
+    // preparation to share, so the row loop stays here.
+    unsafe {
+        let _ = hint;
+        for r in 0..sixteenth {
+            let lanes = if r & 1 == 1 {
+                num_ntts - odd_tail
+            } else {
+                num_ntts
+            };
+            portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        }
+    }
+}
+
+/// Print the fused-three low-outer reachability tally, if
+/// `FLOCK_PROBE_FUSED3_OUTER=1` armed it. Silent otherwise, and silent on
+/// targets without the AVX-512 kernel. Counters accumulate across proves, so
+/// read the ratio, not the absolute count.
+pub(super) fn report_fused3_low_outer_probe() {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    x86_64::report_fused3_low_outer_probe();
+}
+
 /// Process one fused-three-layer group of eight consecutive rows.
 ///
 /// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the

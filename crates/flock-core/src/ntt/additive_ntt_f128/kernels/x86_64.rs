@@ -684,6 +684,48 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
         for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
             *slot = tw_x4::<false, DIET>(*value);
         }
+        butterfly_fused_4layer_lanes::<DIET, H>(
+            ptr,
+            sixteenth,
+            num_ntts,
+            active_lanes,
+            r,
+            &tw,
+            twiddles,
+            pf_r,
+        );
+    }
+}
+
+/// The fused-four sweep's lane loop for ONE row group, against twiddles that
+/// are already broadcast into `tw` (and, under `DIET`, carry their `x^64`
+/// companions). Split out of [`butterfly_fused_4layer_row_impl`] so a whole
+/// block can share one preparation — see
+/// [`butterfly_fused_4layer_rows_block`].
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; in addition `tw` must be
+/// `tw_x4::<false, DIET>` of `twiddles`, entry for entry.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_lanes<const DIET: bool, const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    tw: &[TwX4; 15],
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller provides target features, pointer geometry and the
+    // `tw`/`twiddles` correspondence.
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        let tw = *tw;
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -755,6 +797,109 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
     }
 }
 
+/// Every row group of one fused-four block, sharing a single twiddle
+/// preparation.
+///
+/// The fifteen twiddles of a fused-four block depend on the block, not on the
+/// row group, yet [`butterfly_fused_4layer_row`] re-derives them on every
+/// call: fifteen `vbroadcasti32x4` plus (under the diet product) fifteen
+/// companion CLMULs and their `vpslldq`, all on port 5, against a body of
+/// `⌊lanes/4⌋ × 32` butterflies. At the ranked deep geometry the block driver
+/// pays that on all 128 row groups of the first sweep and all 8 of each
+/// per-block sweep. Hoisting it here leaves the butterflies, their twiddles
+/// and their per-row order untouched — only the setup count changes — so the
+/// output bytes are identical.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`] for every row group
+/// `0..sixteenth` of the block at `ptr`; `odd_tail` must be 0 unless
+/// `sixteenth` is even (so a row group is single-parity), and `hint` must be
+/// 0, 1 or 2.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_rows_block(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+    hint: u8,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        match (mul_diet_disabled(), hint) {
+            (true, 0) => butterfly_fused_4layer_rows_block_impl::<false, 0>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+            (true, 1) => butterfly_fused_4layer_rows_block_impl::<false, 1>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+            (true, _) => butterfly_fused_4layer_rows_block_impl::<false, 2>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+            (false, 0) => butterfly_fused_4layer_rows_block_impl::<true, 0>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+            (false, 1) => butterfly_fused_4layer_rows_block_impl::<true, 1>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+            (false, _) => butterfly_fused_4layer_rows_block_impl::<true, 2>(
+                ptr, sixteenth, num_ntts, odd_tail, twiddles,
+            ),
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_rows_block`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_rows_block_impl<const DIET: bool, const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller provides target features and pointer geometry.
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        let mut tw = [(zero, zero); 15];
+        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+            *slot = tw_x4::<false, DIET>(*value);
+        }
+        for r in 0..sixteenth {
+            // Mirrors the parent module's `row_lanes`: a row group is
+            // single-parity, so an odd one may stop before the published
+            // zero tail.
+            let lanes = if r & 1 == 1 {
+                num_ntts - odd_tail
+            } else {
+                num_ntts
+            };
+            // The last row group has no successor to hint for, exactly as in
+            // the per-row driver this replaces.
+            if H == 0 || r + 1 >= sixteenth {
+                butterfly_fused_4layer_lanes::<DIET, 0>(
+                    ptr, sixteenth, num_ntts, lanes, r, &tw, twiddles, 0,
+                );
+            } else {
+                butterfly_fused_4layer_lanes::<DIET, H>(
+                    ptr,
+                    sixteenth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    &tw,
+                    twiddles,
+                    r + 1,
+                );
+            }
+        }
+    }
+}
+
 /// Process one fused-three-layer group of eight CONSECUTIVE rows.
 ///
 /// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
@@ -789,23 +934,99 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // group. The predicate is still checked on the values themselves, so a
     // non-final fused-three group simply keeps the general form.
     let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
-    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
-    // precondition for `twiddles[1..]` by inspection of the values.
+    // The OUTER twiddle is the domain's third-deepest layer. Its basis row
+    // (`evals[2]` of the standard basis) is low in every coordinate except the
+    // top two, whose high limbs are the distinct constants 1 and 0x17 — so the
+    // outer twiddle's high limb is zero exactly when both of those index bits
+    // are clear, i.e. for a QUARTER of the blocks, and the four outer
+    // butterflies of those groups take the 3-CLMUL `LOW` product instead of the
+    // 5-CLMUL split form. At the ranked geometry those two bits come from the
+    // sub-group index, so the choice is constant across a whole sub-group.
+    // Checked on the value itself, so any other shape simply keeps the general
+    // form. See `deepest_standard_twiddle_layers_have_zero_high_limb` and
+    // `third_deepest_standard_twiddle_layer_is_quarter_low`.
+    let low_outer = !low_twiddle_fused3_outer_disabled() && twiddles[0].hi == 0;
+    if fused3_low_outer_probe() {
+        fused3_low_outer_tally(twiddles[0].hi == 0);
+    }
+    // SAFETY: forwarded caller contract; `low_inner` / `low_outer` prove the
+    // LOW precondition for the twiddles they gate by inspection of the values.
     unsafe {
-        match (mul_diet_disabled(), low_inner) {
-            (true, false) => {
-                butterfly_fused_3layer_rows_impl::<false, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (true, true) => {
-                butterfly_fused_3layer_rows_impl::<false, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, false) => {
-                butterfly_fused_3layer_rows_impl::<true, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, true) => {
-                butterfly_fused_3layer_rows_impl::<true, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
+        match (mul_diet_disabled(), low_inner, low_outer) {
+            (true, false, false) => butterfly_fused_3layer_rows_impl::<false, false, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, false, true) => butterfly_fused_3layer_rows_impl::<false, false, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, true, false) => butterfly_fused_3layer_rows_impl::<false, true, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, true, true) => butterfly_fused_3layer_rows_impl::<false, true, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, false, false) => butterfly_fused_3layer_rows_impl::<true, false, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, false, true) => butterfly_fused_3layer_rows_impl::<true, false, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, true, false) => butterfly_fused_3layer_rows_impl::<true, true, false>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, true, true) => butterfly_fused_3layer_rows_impl::<true, true, true>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
         }
+    }
+}
+
+/// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3_OUTER=1` restores the general twiddle
+/// product for the fused-three sweep's OUTER layer inside the same binary, so a
+/// candidate/control pair differs only in that product form. Read once, outside
+/// every lane loop.
+#[inline]
+fn low_twiddle_fused3_outer_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3_OUTER").is_some())
+}
+
+/// Reachability probe for the low-outer dispatch: `FLOCK_PROBE_FUSED3_OUTER=1`
+/// tallies how many fused-three groups a process actually runs and how many of
+/// them take the low form, and prints the pair once at exit. A symbol's
+/// disassembly says nothing about whether it runs, and this dispatch is chosen
+/// by a runtime value, so this is how "the ranked prove hits it on a quarter of
+/// its groups" gets confirmed on the target rather than argued. Off by default:
+/// one predictable branch on a cached bool per (≈2700-port-5-cycle) call.
+#[inline]
+fn fused3_low_outer_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_PROBE_FUSED3_OUTER").is_some())
+}
+
+static FUSED3_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FUSED3_LOW_OUTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cold]
+#[inline(never)]
+fn fused3_low_outer_tally(low: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    FUSED3_CALLS.fetch_add(1, Relaxed);
+    if low {
+        FUSED3_LOW_OUTER.fetch_add(1, Relaxed);
+    }
+}
+
+/// Print the low-outer tally. Call once, after the timed window.
+pub fn report_fused3_low_outer_probe() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let calls = FUSED3_CALLS.load(Relaxed);
+    if calls != 0 {
+        eprintln!(
+            "fused3 groups: {calls}, low outer twiddle: {} ({:.1}%)",
+            FUSED3_LOW_OUTER.load(Relaxed),
+            100.0 * FUSED3_LOW_OUTER.load(Relaxed) as f64 / calls as f64,
+        );
     }
 }
 
@@ -823,7 +1044,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// Same contract as [`butterfly_fused_3layer_rows`].
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bool>(
+unsafe fn butterfly_fused_3layer_rows_impl<
+    const DIET: bool,
+    const LOW_INNER: bool,
+    const LOW_OUTER: bool,
+>(
     ptr: *mut F128,
     num_ntts: usize,
     dense_lanes: usize,
@@ -840,7 +1065,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
         // loads and two stores for the same 12.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 7];
-        tw[0] = tw_x4::<false, DIET>(twiddles[0]);
+        tw[0] = tw_x4::<LOW_OUTER, DIET>(twiddles[0]);
         for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
             *slot = tw_x4::<LOW_INNER, DIET>(*value);
         }
@@ -882,7 +1107,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, false);
+                butterfly2!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -909,7 +1134,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, false);
+                butterfly!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -946,8 +1171,8 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
                 values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
             }
             let outer = tw[0];
-            butterfly!(values, 0, 4, outer, false);
-            butterfly!(values, 2, 6, outer, false);
+            butterfly!(values, 0, 4, outer, LOW_OUTER);
+            butterfly!(values, 2, 6, outer, LOW_OUTER);
             butterfly!(values, 0, 2, tw[1], LOW_INNER);
             butterfly!(values, 4, 6, tw[2], LOW_INNER);
             for i in 0..4 {
@@ -989,14 +1214,23 @@ mod diet_tests {
         }
     }
 
-    /// The fused-three sweep's low-inner specialization must be
-    /// bit-identical to the general product form and to the portable
+    /// The fused-three sweep's low-inner and low-outer specializations must
+    /// be bit-identical to the general product form and to the portable
     /// reference, for every lane path (8-wide, 4-wide, scalar tail) and for
-    /// both `DIET` arms.
+    /// both `DIET` arms. `outer_low` also sweeps the outer twiddle's high
+    /// limb, so the `LOW_OUTER` arms are exercised on twiddles that satisfy
+    /// their precondition and the general arms on ones that do not.
     #[test]
     fn fused3_low_inner_matches_general() {
         let mut next = rng(0x0BAD_C0DE);
-        for (num_ntts, dense_lanes) in [(64usize, 64usize), (67, 67), (64, 48), (67, 50)] {
+        for (num_ntts, dense_lanes, outer_low) in [
+            (64usize, 64usize, false),
+            (67, 67, false),
+            (64, 48, false),
+            (67, 50, false),
+            (64, 64, true),
+            (67, 50, true),
+        ] {
             let mut base = vec![F128::ZERO; 8 * num_ntts];
             for v in base.iter_mut() {
                 *v = next();
@@ -1012,7 +1246,13 @@ mod diet_tests {
             // 1..7 are the two deepest layers, whose production twiddles
             // always have a zero high limb.
             let mut twiddles = [F128::ZERO; 7];
-            twiddles[0] = next();
+            twiddles[0] = {
+                let v = next();
+                F128 {
+                    lo: v.lo,
+                    hi: if outer_low { 0 } else { v.hi | 1 },
+                }
+            };
             for t in twiddles[1..].iter_mut() {
                 let v = next();
                 *t = F128 { lo: v.lo, hi: 0 };
@@ -1034,31 +1274,57 @@ mod diet_tests {
                 }
             }
 
-            for (diet, low) in [(false, false), (false, true), (true, false), (true, true)] {
+            for (diet, low, lowo) in [
+                (false, false, false),
+                (false, true, false),
+                (true, false, false),
+                (true, true, false),
+                (false, false, true),
+                (false, true, true),
+                (true, false, true),
+                (true, true, true),
+            ] {
+                // The LOW_OUTER arms require `twiddles[0].hi == 0`.
+                if lowo && !outer_low {
+                    continue;
+                }
                 let mut got = base.clone();
                 // SAFETY: this module compiles only with avx512f+vpclmulqdq;
-                // the buffer is 8 rows of `num_ntts` lanes, and every
-                // `twiddles[1..]` entry has a zero high limb as the LOW arm
-                // requires.
+                // the buffer is 8 rows of `num_ntts` lanes, every
+                // `twiddles[1..]` entry has a zero high limb as the LOW_INNER
+                // arm requires, and `twiddles[0]` does too whenever a
+                // LOW_OUTER arm is selected.
                 unsafe {
-                    match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false>(
+                    match (diet, low, lowo) {
+                        (false, false, false) => butterfly_fused_3layer_rows_impl::<false, false, false>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true>(
+                        (false, true, false) => butterfly_fused_3layer_rows_impl::<false, true, false>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false>(
+                        (true, false, false) => butterfly_fused_3layer_rows_impl::<true, false, false>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true>(
+                        (true, true, false) => butterfly_fused_3layer_rows_impl::<true, true, false>(
+                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        ),
+                        (false, false, true) => butterfly_fused_3layer_rows_impl::<false, false, true>(
+                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        ),
+                        (false, true, true) => butterfly_fused_3layer_rows_impl::<false, true, true>(
+                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        ),
+                        (true, false, true) => butterfly_fused_3layer_rows_impl::<true, false, true>(
+                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        ),
+                        (true, true, true) => butterfly_fused_3layer_rows_impl::<true, true, true>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
                     }
                 }
                 assert_eq!(
                     got, want,
-                    "num_ntts={num_ntts} dense={dense_lanes} diet={diet} low={low}"
+                    "num_ntts={num_ntts} dense={dense_lanes} diet={diet} low={low} lowo={lowo}"
                 );
             }
         }

@@ -565,6 +565,16 @@ fn deep_pf_hint() -> u8 {
     *H
 }
 
+/// `FLOCK_NO_NTT_FUSED4_TW_HOIST=1` restores the per-row-group twiddle
+/// preparation of the fused-four sweep inside the same binary, so a
+/// candidate/control pair differs only in how often the fifteen broadcasts and
+/// their `x^64` companions are rebuilt. Read once, outside every row loop.
+#[inline]
+fn ntt_fused4_tw_hoist_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED4_TW_HOIST").is_some())
+}
+
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
 #[inline]
 fn ntt_fused3_disabled() -> bool {
@@ -2631,6 +2641,7 @@ impl AdditiveNttF128 {
                             }
                         }
                     });
+                    kernels::report_fused3_low_outer_probe();
                     crate::gaptime::mark("ntt: deep pass done");
                     return;
                 }
@@ -2645,6 +2656,7 @@ impl AdditiveNttF128 {
                         }
                     });
                 if big {
+                    kernels::report_fused3_low_outer_probe();
                     crate::gaptime::mark("ntt: deep pass done");
                 }
             }
@@ -3239,6 +3251,20 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    if !ntt_fused4_tw_hoist_disabled() {
+        // The fifteen twiddles are a property of the block, not of the row
+        // group, so prepare them once for the whole block instead of once per
+        // call. Same butterflies, same twiddles, same per-row order.
+        // SAFETY: every row group `{i*sixteenth + r : i in 0..16}` of this
+        // block is valid and owned exclusively here; `odd_tail` is 0 unless
+        // `sixteenth` is even (asserted above), and `hint` is 0, 1 or 2.
+        unsafe {
+            kernels::butterfly_fused_4layer_rows_block(
+                base, sixteenth, num_ntts, odd_tail, t, hint,
+            );
+        }
+        return;
+    }
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line
@@ -5264,5 +5290,34 @@ mod low_twiddle_invariant {
                 }
             }
         }
+    }
+
+    /// The THIRD-deepest layer's basis row (`evals[2]`) is low in its first
+    /// fifteen coordinates and non-low, with linearly independent high limbs,
+    /// after that — so its twiddle has a zero high limb on exactly the blocks
+    /// below 2^15. That is what the fused-three sweep's `low_outer` dispatch
+    /// harvests: on those blocks four of the group's twelve butterflies drop
+    /// from the 5-CLMUL split product to the 3-CLMUL low product. At the
+    /// ranked dim (20) the third-deepest layer has 2^17 blocks, so a quarter
+    /// of them qualify. Checked exhaustively.
+    #[test]
+    fn third_deepest_standard_twiddle_layer_low_below_2_pow_15() {
+        const LOW_BLOCKS: usize = 1 << 15;
+        for dim in 12..=21usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            let layer = dim - 3;
+            let blocks = 1usize << layer;
+            for block in 0..blocks {
+                assert_eq!(
+                    ntt.twiddle(layer, block).hi == 0,
+                    block < LOW_BLOCKS,
+                    "dim={dim} layer={layer} block={block}"
+                );
+            }
+        }
+        // The ranked commit's own shape: a quarter of the fused-three groups.
+        let ntt = AdditiveNttF128::standard(20);
+        let low = (0..1usize << 17).filter(|&b| ntt.twiddle(17, b).hi == 0).count();
+        assert_eq!(low, 1 << 15);
     }
 }
