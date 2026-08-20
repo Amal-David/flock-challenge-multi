@@ -11,13 +11,11 @@ use super::super::{ELL, F128, N_MEDIUM};
 ))]
 use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q};
 
-/// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
 /// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
 /// are identical to the NEON version, applied to all eight 64-bit lanes at once.
 ///
 /// Replaces `bit_transpose_64bytes_scalar` (512 branchy bit ops/call) — which
-/// profiling showed was ~85% of round1's time on x86.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -111,6 +109,15 @@ pub(crate) fn urm_apply_2img_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_PIDX=1` restores per-byte index scaling (`movzbl` + `shl $6`)
+/// in the shift-reduce AB kernel instead of the pre-scaled `u16` offset
+/// buffer. Resolved once per process.
+pub(crate) fn urm_pidx_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_PIDX").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -143,6 +150,81 @@ pub(crate) unsafe fn store_out64(out: &mut [u8; 64], acc: core::arch::x86_64::__
     }
 }
 
+/// Pre-scaled-index twin of [`shift_reduce_inner_ab_x86_avx512`] (two-image
+/// apply only). Bit-identical output — every table address is the same — but
+/// the eight-per-apply `movzbl` + `shl $0x6` index pairs become a single
+/// `movzwl` each, because the window's 128 input bytes are widened to `u16`
+/// and multiplied by the row stride 64 up front with four `vpmovzxbw` +
+/// `vpsllw` + store triples.
+///
+/// which is what makes the two SMT siblings add up to one core), the incumbent
+/// loop branch, so trading 128 shifts for 4 loads + 4 shifts + 4 stores moves
+/// work off the two ports that are actually full onto ones that are not.
+///
+/// reloads of the offset buffer do not stall on the 64-byte stores.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    nt: u8,
+) {
+    use core::arch::x86_64::*;
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+
+    #[repr(align(64))]
+    struct Off([u16; 128]);
+
+    // SAFETY: the caller's packed-input bounds guarantee 64 readable bytes at
+    // `byte_base_b` in both A and B (the incumbent kernel reads exactly that
+    // range across its eight K rows). `off` is a fully written 128-u16 stack
+    // buffer, and `out` is one writable ZMM register.
+    unsafe {
+        let a0 = a_packed.as_ptr().add(byte_base_b);
+        let b0 = b_packed.as_ptr().add(byte_base_b);
+
+        let mut off = core::mem::MaybeUninit::<Off>::uninit();
+        let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+        // byte -> byte * 64, 32 lanes at a time.
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a0));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
+
+        // Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same
+        // count of `vgf2p8mulb` as the explicit x^k form (8 products + 7
+        // scalings), but the multiplier is the loop-invariant x = 0x02, so
+        // the per-iteration `mov $1` / `shl %cl` / `vpbroadcastb` that
+        // rebuilt x^k disappear. GF(2^8) multiplication is associative and
+        // distributes over XOR, so the value is bit-identical.
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(
+            inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(7 * 8)),
+            inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(64 + 7 * 8)),
+        );
+        for k in (0..7usize).rev() {
+            let av = inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(k * 8));
+            let bv = inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(64 + k * 8));
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        store_out64(out, acc, nt);
+    }
+}
+
 /// Fused AVX-512/GFNI x86 kernel. Each inverse-NTT apply returns all 64 F_8
 /// evaluations in one ZMM register; the product and x^k scaling stay 64-wide
 /// and register-resident through the final XOR accumulation.
@@ -172,6 +254,21 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     // uop stream in the prover. `FLOCK_NO_URM_APPLY_2IMG=1` restores the
     // one-image form (exact same-binary A/B).
     let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
+    if img2 && urm_pidx_enabled() {
+        // SAFETY: same contract as this function; `img2` proves the σ₈ image.
+        unsafe {
+            shift_reduce_inner_ab_x86_avx512_pidx(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt,
+            );
+        }
+        return;
+    }
     // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
     // every K-row offset. The table has the protocol-fixed ell=64/chunks=8
     // shape (and carries the σ₈ image when `img2`), and `out` is exactly one
