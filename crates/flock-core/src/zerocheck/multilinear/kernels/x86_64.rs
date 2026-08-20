@@ -2304,8 +2304,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             *slot = _mm512_permutexvar_epi8(sigma, p[j]);
         }
 
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        let acc: [__m512i; 16] = std::array::from_fn(|k| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     pc[j],
@@ -2315,8 +2314,8 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        });
 
         let lo_half = qword_transpose(acc[..8].try_into().unwrap());
         let hi_half = qword_transpose(acc[8..].try_into().unwrap());
@@ -2457,8 +2456,7 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
         }
 
         // Sixteen output-byte planes: eight GFNI products folded per plane.
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        let acc: [__m512i; 16] = std::array::from_fn(|k| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     p[j],
@@ -2468,8 +2466,8 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        });
 
         // Reassemble: inverse qword transpose + inverse byte transpose per
         // half, then interleave lo/hi qwords into row-major F128s.
