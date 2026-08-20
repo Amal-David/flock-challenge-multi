@@ -1815,13 +1815,43 @@ fn evaluate_scaled_basis_inplace(
     }
 
     basis[0] = alpha;
+    let wide = open_basis_x4_enabled();
     for k in 0..log_n {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
-        for i in 0..current_len {
-            basis[i + current_len] = s_at_x * basis[i];
+        if wide {
+            // Doubling step: the upper half is `s_at_x` times the lower half,
+            // element by element, with the two halves disjoint. Same shape as
+            // `eq_expand_block_x4`, which writes each product directly.
+            let (current, rest) = basis[..2 * current_len].split_at_mut(current_len);
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            // SAFETY: target features are cfg-guaranteed and `split_at_mut`
+            // hands back two disjoint halves of equal length.
+            unsafe {
+                eq_expand_block_x4(rest, current, s_at_x);
+            }
+            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+            for (dst, &src) in rest.iter_mut().zip(current.iter()) {
+                *dst = s_at_x * src;
+            }
+        } else {
+            for i in 0..current_len {
+                basis[i + current_len] = s_at_x * basis[i];
+            }
         }
     }
+}
+
+/// Ranked default runs the [`evaluate_scaled_basis_inplace`] doubling step
+/// through the four-lane `eq_expand_block_x4` leaf: every entry of the upper
+/// half is an independent product of the same scalar with one lower-half
+/// entry, so widening computes the identical set of canonical products.
+/// `FLOCK_NO_OPEN_BASIS_X4=1` restores the per-element scalar doubling loop.
+/// Read once per call, outside the doubling loop.
+fn open_basis_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_BASIS_X4").is_none());
+    *ON
 }
 
 // ===================================================================
@@ -10270,6 +10300,57 @@ mod tests {
             t_r,
             "residual inner product != t_r"
         );
+    }
+
+    /// `evaluate_scaled_basis_inplace` under the ranked x4 doubling path must
+    /// match an independent scalar doubling oracle bit-for-bit. The two
+    /// halves of each doubling step are disjoint, so `eq_expand_block_x4`
+    /// (or its portable zip) writes the same canonical products as the
+    /// per-element loop that `FLOCK_NO_OPEN_BASIS_X4=1` restores.
+    #[test]
+    fn evaluate_scaled_basis_x4_matches_scalar_doubling() {
+        use crate::challenger::Challenger;
+        for log_n in 1..=12 {
+            let n = 1usize << log_n;
+            let mut ch = crate::challenger::RandomChallenger::new(0x0B45_15C4 ^ log_n as u64);
+            let x = ch.sample_f128();
+            let alpha = ch.sample_f128();
+            let sks_vks = eval_sk_at_vks(log_n);
+            let inv_sks_vks: Vec<F128> = sks_vks.iter().map(|s| s.inv()).collect();
+
+            let mut sks_at_x = vec![F128::ZERO; log_n];
+            let mut got = vec![F128::ZERO; n];
+            evaluate_scaled_basis_inplace(
+                &mut sks_at_x,
+                &mut got,
+                &sks_vks,
+                &inv_sks_vks,
+                x,
+                alpha,
+            );
+
+            let mut want_sks = vec![F128::ZERO; log_n];
+            if log_n > 0 {
+                want_sks[0] = x;
+                for i in 1..log_n {
+                    want_sks[i] = next_s(want_sks[i - 1], sks_vks[i - 1]);
+                }
+                for i in 0..log_n {
+                    want_sks[i] *= inv_sks_vks[i];
+                }
+            }
+            let mut want = vec![F128::ZERO; n];
+            want[0] = alpha;
+            for k in 0..log_n {
+                let s_at_x = want_sks[k];
+                let current_len = 1 << k;
+                for i in 0..current_len {
+                    want[i + current_len] = s_at_x * want[i];
+                }
+            }
+            assert_eq!(got, want, "x4 doubling diverged from scalar oracle log_n={log_n}");
+            assert_eq!(sks_at_x, want_sks, "sks_at_x diverged log_n={log_n}");
+        }
     }
 
     /// `induce_sumcheck_poly` is consistent with the codeword:
