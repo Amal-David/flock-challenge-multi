@@ -5672,6 +5672,54 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+#[inline]
+fn direct_fold8_f_packed64_selected(
+    packed_len: usize,
+    out_len: usize,
+    spr_capable: bool,
+    disabled: bool,
+) -> bool {
+    spr_capable
+        && !disabled
+        && packed_len == (1usize << 25)
+        && out_len == (1usize << 19)
+}
+
+#[inline]
+fn direct_fold8_f_packed64_enabled(packed_len: usize, out_len: usize) -> bool {
+    // Ranked-only until an SPR run establishes a win. The kill arm provides
+    // a same-binary A/B against the incumbent fold16 -> fold4 materializer.
+    direct_fold8_f_packed64_selected(
+        packed_len,
+        out_len,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os("FLOCK_NO_FOLD8_F_PACKED64").is_some(),
+    )
+}
+
+#[inline]
+fn direct_fold64_weights(challenges: [F128; 6]) -> [F128; 64] {
+    let mut weights = [F128::ZERO; 64];
+    weights[0] = F128::ONE;
+    let mut active = 1usize;
+    for challenge in challenges {
+        for bank in 0..active {
+            // Characteristic two: base·(1+r) = base + base·r. Thus each
+            // challenge doubles the table with one product per old entry.
+            let high = weights[bank] * challenge;
+            weights[bank + active] = high;
+            weights[bank] += high;
+        }
+        active *= 2;
+    }
+    weights
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5690,18 +5738,29 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+    let out_len = packed_witness.len() / 64;
+    let f_packed64_on = direct_fold8_f_packed64_enabled(packed_witness.len(), out_len);
     let [r0, r1, r2, r3, r4, r5] = challenges;
-    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges[..4].iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    let fold16_weight: [F128; 16] = if f_packed64_on {
+        [F128::ZERO; 16]
+    } else {
+        std::array::from_fn(|bank| {
+            let mut weight = F128::ONE;
+            for (bit, &challenge) in challenges[..4].iter().enumerate() {
+                weight *= if (bank >> bit) & 1 == 0 {
+                    F128::ONE + challenge
+                } else {
+                    challenge
+                };
+            }
+            weight
+        })
+    };
+    let fold64_weight = if f_packed64_on {
+        direct_fold64_weights(challenges)
+    } else {
+        [F128::ZERO; 64]
+    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5728,7 +5787,6 @@ fn materialize_direct_fold8(
         })
         .collect();
 
-    let out_len = packed_witness.len() / 64;
     let block_len = claims[0].eq_lo.len();
     assert!(block_len.is_multiple_of(4));
     // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
@@ -5778,7 +5836,14 @@ fn materialize_direct_fold8(
                         }
                     ],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
+                    vec![
+                        F128::ZERO;
+                        if f_packed64_on && !has_ordinary {
+                            0
+                        } else {
+                            4 * SUB
+                        }
+                    ],
                     vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
                 )
             },
@@ -5791,31 +5856,54 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                // Ranked SPR: consume all sixty-four native adjacent banks
+                // directly, with four different bank weights in each ZMM.
+                // This removes both the global four-value intermediate and
+                // the bank-to-output lane transposes. The fallback remains
+                // the deferred-reduction fold16 followed by nested fold4.
+                if f_packed64_on {
+                    crate::field::f128_slice::fold64_packed_banks(
+                        f_in,
+                        f_out,
+                        &fold64_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
-                        crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
-                        );
+                }
+                if !f_packed64_on || has_ordinary {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        if !f_packed64_on {
+                            crate::field::f128_slice::fold16_banked(
+                                &f_in[64 * slot..64 * (slot + n)],
+                                m4,
+                                &fold16_weight,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut f_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)],
+                                m16,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut b_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -8901,6 +8989,62 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_fold8_f_packed64_selector_is_ranked_shape_only() {
+        let ranked_in = 1usize << 25;
+        let ranked_out = 1usize << 19;
+        assert!(direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, false, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, true
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in / 2,
+            ranked_out,
+            true,
+            false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in,
+            ranked_out / 2,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn direct_fold64_weights_match_six_adjacent_pair_folds() {
+        let mut state = 0xD1CE_F064_5EED_0001u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F128::new(state, state.rotate_left(29))
+        };
+        for _ in 0..17 {
+            let challenges = std::array::from_fn(|_| random());
+            let weights = direct_fold64_weights(challenges);
+            let src: Vec<F128> = (0..64).map(|_| random()).collect();
+            let weighted = src
+                .iter()
+                .zip(weights)
+                .map(|(&value, weight)| value * weight)
+                .fold(F128::ZERO, |acc, product| acc + product);
+
+            let mut state = src;
+            for challenge in challenges {
+                let mut next = vec![F128::ZERO; state.len() / 2];
+                crate::field::f128_slice::fold_pairs(&state, 0, &mut next, challenge);
+                state = next;
+            }
+            assert_eq!(state, vec![weighted]);
+        }
+    }
 
     #[test]
     fn direct_ab_materialization_matches_full_basis_oracle() {
