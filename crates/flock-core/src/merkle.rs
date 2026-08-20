@@ -902,6 +902,49 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     proof
 }
 
+/// Flat-tree indices of the sibling hashes [`merkle_multi_proof`] emits, in
+/// the exact emission order. Pure index arithmetic — no tree reads — so the
+/// prover can walk the paths first and gather the (DRAM-cold, random-access)
+/// sibling hashes in one order-preserving parallel pass:
+/// `indices.map(|i| tree[i])` reproduces `merkle_multi_proof` byte-for-byte.
+pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]) -> Vec<usize> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+
+    if positions.is_empty() || num_leaves == 1 {
+        return Vec::new();
+    }
+
+    let mut active: Vec<usize> = positions.to_vec();
+    active.sort_unstable();
+    active.dedup();
+    debug_assert!(active.iter().all(|&p| p < num_leaves));
+
+    let mut indices = Vec::new();
+    let mut level_start = 0usize;
+    let mut level_len = num_leaves;
+
+    while level_len > 1 {
+        let mut next = Vec::with_capacity(active.len());
+        let mut i = 0;
+        while i < active.len() {
+            let p = active[i];
+            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
+            if sib_active {
+                i += 2;
+            } else {
+                indices.push(level_start + (p ^ 1));
+                i += 1;
+            }
+            next.push(p >> 1);
+        }
+        active = next;
+        level_start += level_len;
+        level_len >>= 1;
+    }
+
+    indices
+}
+
 /// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].
 ///
 /// `sorted_unique_positions` and `leaf_hashes` must be aligned and sorted:
