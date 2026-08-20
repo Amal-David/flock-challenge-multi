@@ -2201,6 +2201,88 @@ fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
     }
 }
 
+/// Additive-NTT twiddle `(layer, 0)` is the empty span sum, hence zero.
+/// The first column group in every blocked transpose pass-B layer therefore
+/// needs only `top ^= bot`; `bot` is unchanged.  Resolve the diagnostics gate
+/// before entering the Rayon closure so the ordinary butterfly loop remains
+/// branch-free.
+#[inline]
+fn tnt_pass_b_zero_selected(disabled: bool) -> bool {
+    !disabled
+}
+
+fn tnt_pass_b_zero_enabled() -> bool {
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some()
+    });
+    tnt_pass_b_zero_selected(*DISABLED)
+}
+
+/// Peel pass B's zero-twiddle column group out of the generic butterfly
+/// closure. Keeping this leaf out of line is deliberate: a global zero test
+/// inside `transpose_butterfly` inflated both hot transpose closures enough
+/// to outweigh the deleted products on Sapphire Rapids.
+#[inline(never)]
+fn transpose_pass_b_block_zero_xor(
+    cols: &mut [&mut [F128]],
+    stride: usize,
+    _layer: usize,
+    _ntt: &AdditiveNttF128,
+) {
+    for u in 0..stride {
+        let (lo, hi) = cols.split_at_mut(u + stride);
+        let top = &mut *lo[u];
+        let bot = &*hi[0];
+        debug_assert_eq!(top.len(), bot.len());
+        #[cfg(target_feature = "avx512f")]
+        {
+            use core::arch::x86_64::*;
+            // SAFETY: avx512f is cfg-guaranteed and both slices have equal
+            // length. F128 addition is bitwise XOR.
+            unsafe {
+                let lanes = top.len() & !3;
+                let mut i = 0;
+                while i < lanes {
+                    let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+                    let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                    _mm512_storeu_si512(
+                        top.as_mut_ptr().add(i).cast::<__m512i>(),
+                        _mm512_xor_si512(a, b),
+                    );
+                    i += 4;
+                }
+                while i < top.len() {
+                    top[i] += bot[i];
+                    i += 1;
+                }
+            }
+        }
+        #[cfg(not(target_feature = "avx512f"))]
+        {
+            for (a, &b) in top.iter_mut().zip(bot.iter()) {
+                *a += b;
+            }
+        }
+    }
+}
+
+/// Exact kill-switch arm for the peeled group. The twiddle is still obtained
+/// from the table and the established general multiply is used; only the
+/// loop's placement moved out of the hot closure.
+#[inline(never)]
+fn transpose_pass_b_block_zero_general(
+    cols: &mut [&mut [F128]],
+    stride: usize,
+    layer: usize,
+    ntt: &AdditiveNttF128,
+) {
+    let t = ntt.twiddle(layer, 0);
+    for u in 0..stride {
+        let (lo, hi) = cols.split_at_mut(u + stride);
+        transpose_butterfly(lo[u], hi[0], t);
+    }
+}
+
 /// `FLOCK_NO_OPEN_TNTT_BLOCK=1` restores the incumbent one-rayon-region-per-
 /// layer transpose sweep ([`transpose_forward_ntt_dense_layers_per_layer`]).
 /// Read once per process; default ON (the ranked worker clears its env).
@@ -2374,11 +2456,22 @@ fn transpose_forward_ntt_dense_layers_blocked(
                 tiles[ti].push(col);
             }
         }
+        // One indirect call per layer selects the peeled block-0 leaf. The
+        // production arm is XOR-only; the kill arm is the exact general
+        // butterfly. The much hotter j>=2*stride loop below is shared and has
+        // no zero test or duplicated body.
+        type BlockZeroFn = fn(&mut [&mut [F128]], usize, usize, &AdditiveNttF128);
+        let block_zero: BlockZeroFn = if tnt_pass_b_zero_enabled() {
+            transpose_pass_b_block_zero_xor
+        } else {
+            transpose_pass_b_block_zero_general
+        };
         tiles.into_par_iter().for_each(|mut cols| {
             for b in 0..split {
                 let layer = split - 1 - b;
                 let stride = 1usize << b;
-                let mut j = 0;
+                block_zero(&mut cols, stride, layer, ntt);
+                let mut j = stride << 1;
                 while j < nseg {
                     for u in j..j + stride {
                         let t = ntt.twiddle(layer, u >> (b + 1));
@@ -5631,6 +5724,54 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+#[inline]
+fn direct_fold8_f_packed64_selected(
+    packed_len: usize,
+    out_len: usize,
+    spr_capable: bool,
+    disabled: bool,
+) -> bool {
+    spr_capable
+        && !disabled
+        && packed_len == (1usize << 25)
+        && out_len == (1usize << 19)
+}
+
+#[inline]
+fn direct_fold8_f_packed64_enabled(packed_len: usize, out_len: usize) -> bool {
+    // Ranked-only until an SPR run establishes a win. The kill arm provides
+    // a same-binary A/B against the incumbent fold16 -> fold4 materializer.
+    direct_fold8_f_packed64_selected(
+        packed_len,
+        out_len,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os("FLOCK_NO_FOLD8_F_PACKED64").is_some(),
+    )
+}
+
+#[inline]
+fn direct_fold64_weights(challenges: [F128; 6]) -> [F128; 64] {
+    let mut weights = [F128::ZERO; 64];
+    weights[0] = F128::ONE;
+    let mut active = 1usize;
+    for challenge in challenges {
+        for bank in 0..active {
+            // Characteristic two: base·(1+r) = base + base·r. Thus each
+            // challenge doubles the table with one product per old entry.
+            let high = weights[bank] * challenge;
+            weights[bank + active] = high;
+            weights[bank] += high;
+        }
+        active *= 2;
+    }
+    weights
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5649,18 +5790,29 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+    let out_len = packed_witness.len() / 64;
+    let f_packed64_on = direct_fold8_f_packed64_enabled(packed_witness.len(), out_len);
     let [r0, r1, r2, r3, r4, r5] = challenges;
-    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges[..4].iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    let fold16_weight: [F128; 16] = if f_packed64_on {
+        [F128::ZERO; 16]
+    } else {
+        std::array::from_fn(|bank| {
+            let mut weight = F128::ONE;
+            for (bit, &challenge) in challenges[..4].iter().enumerate() {
+                weight *= if (bank >> bit) & 1 == 0 {
+                    F128::ONE + challenge
+                } else {
+                    challenge
+                };
+            }
+            weight
+        })
+    };
+    let fold64_weight = if f_packed64_on {
+        direct_fold64_weights(challenges)
+    } else {
+        [F128::ZERO; 64]
+    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5687,7 +5839,6 @@ fn materialize_direct_fold8(
         })
         .collect();
 
-    let out_len = packed_witness.len() / 64;
     let block_len = claims[0].eq_lo.len();
     assert!(block_len.is_multiple_of(4));
     // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
@@ -5737,7 +5888,14 @@ fn materialize_direct_fold8(
                         }
                     ],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
+                    vec![
+                        F128::ZERO;
+                        if f_packed64_on && !has_ordinary {
+                            0
+                        } else {
+                            4 * SUB
+                        }
+                    ],
                     vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
                 )
             },
@@ -5750,31 +5908,54 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                // Ranked SPR: consume all sixty-four native adjacent banks
+                // directly, with four different bank weights in each ZMM.
+                // This removes both the global four-value intermediate and
+                // the bank-to-output lane transposes. The fallback remains
+                // the deferred-reduction fold16 followed by nested fold4.
+                if f_packed64_on {
+                    crate::field::f128_slice::fold64_packed_banks(
+                        f_in,
+                        f_out,
+                        &fold64_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
-                        crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
-                        );
+                }
+                if !f_packed64_on || has_ordinary {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        if !f_packed64_on {
+                            crate::field::f128_slice::fold16_banked(
+                                &f_in[64 * slot..64 * (slot + n)],
+                                m4,
+                                &fold16_weight,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut f_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)],
+                                m16,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut b_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -9029,6 +9210,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_fold8_f_packed64_selector_is_ranked_shape_only() {
+        let ranked_in = 1usize << 25;
+        let ranked_out = 1usize << 19;
+        assert!(direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, false, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, true
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in / 2,
+            ranked_out,
+            true,
+            false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in,
+            ranked_out / 2,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn direct_fold64_weights_match_six_adjacent_pair_folds() {
+        let mut state = 0xD1CE_F064_5EED_0001u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F128::new(state, state.rotate_left(29))
+        };
+        for _ in 0..17 {
+            let challenges = std::array::from_fn(|_| random());
+            let weights = direct_fold64_weights(challenges);
+            let src: Vec<F128> = (0..64).map(|_| random()).collect();
+            let weighted = src
+                .iter()
+                .zip(weights)
+                .map(|(&value, weight)| value * weight)
+                .fold(F128::ZERO, |acc, product| acc + product);
+
+            let mut state = src;
+            for challenge in challenges {
+                let mut next = vec![F128::ZERO; state.len() / 2];
+                crate::field::f128_slice::fold_pairs(&state, 0, &mut next, challenge);
+                state = next;
+            }
+            assert_eq!(state, vec![weighted]);
+        }
+    }
+
+    #[test]
     fn direct_ab_materialization_matches_full_basis_oracle() {
         let mut state = 0xD1CE_F01D_u64;
         let mut random = || {
@@ -10845,6 +11082,46 @@ mod tests {
                 transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut a, top);
                 transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
+            }
+        }
+    }
+
+    /// The peeled block-zero leaf is exactly the established general
+    /// butterfly at twiddle `(layer, 0)`, for every pass-B stride and for
+    /// vector/tail tile lengths. The explicit selector checks the production
+    /// and kill-switch decisions without process-global environment races.
+    #[test]
+    fn transpose_pass_b_zero_leaf_matches_general() {
+        use crate::challenger::Challenger;
+        assert!(tnt_pass_b_zero_selected(false));
+        assert!(!tnt_pass_b_zero_selected(true));
+        let ntt = AdditiveNttF128::standard(12);
+        let mut ch = crate::challenger::RandomChallenger::new(0xB10C_0000_7E80);
+        for &(stride, layer) in &[(1usize, 3usize), (2, 2), (4, 1), (8, 0)] {
+            assert_eq!(ntt.twiddle(layer, 0), F128::ZERO);
+            for &tile in &[1usize, 3, 4, 7, 16, 65] {
+                let base: Vec<Vec<F128>> = (0..2 * stride)
+                    .map(|_| (0..tile).map(|_| ch.sample_f128()).collect())
+                    .collect();
+                let mut got = base.clone();
+                let mut want = base.clone();
+                {
+                    let mut cols: Vec<&mut [F128]> =
+                        got.iter_mut().map(Vec::as_mut_slice).collect();
+                    transpose_pass_b_block_zero_xor(&mut cols, stride, layer, &ntt);
+                }
+                {
+                    let mut cols: Vec<&mut [F128]> =
+                        want.iter_mut().map(Vec::as_mut_slice).collect();
+                    transpose_pass_b_block_zero_general(&mut cols, stride, layer, &ntt);
+                }
+                assert_eq!(got, want, "stride={stride} tile={tile}");
+                for u in 0..stride {
+                    for i in 0..tile {
+                        assert_eq!(got[u][i], base[u][i] + base[u + stride][i]);
+                        assert_eq!(got[u + stride][i], base[u + stride][i]);
+                    }
+                }
             }
         }
     }
