@@ -687,7 +687,12 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
+#[inline(never)]
+unsafe fn fold2_and_message_lookahead_x86_avx512_store_leaf<
+    const NT_OUT: bool,
+    const A_ZMM_ALIGNED: bool,
+    const B_ZMM_ALIGNED: bool,
+>(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -696,7 +701,6 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     rho_b: F128,
     eq_lo: &[F128],
     wtab: Option<&[F128]>,
-    nt_out: bool,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -825,15 +829,15 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             };
             let ap = a_out.as_mut_ptr().add(output);
             let bp = b_out.as_mut_ptr().add(output);
-            if nt_out {
-                stream_zmm_as_xmm4(ap, oa0);
-                stream_zmm_as_xmm4(ap.add(4), oa1);
-                stream_zmm_as_xmm4(ap.add(8), oa2);
-                stream_zmm_as_xmm4(ap.add(12), oa3);
-                stream_zmm_as_xmm4(bp, ob0);
-                stream_zmm_as_xmm4(bp.add(4), ob1);
-                stream_zmm_as_xmm4(bp.add(8), ob2);
-                stream_zmm_as_xmm4(bp.add(12), ob3);
+            if NT_OUT {
+                stream_zmm_const::<A_ZMM_ALIGNED>(ap, oa0);
+                stream_zmm_const::<A_ZMM_ALIGNED>(ap.add(4), oa1);
+                stream_zmm_const::<A_ZMM_ALIGNED>(ap.add(8), oa2);
+                stream_zmm_const::<A_ZMM_ALIGNED>(ap.add(12), oa3);
+                stream_zmm_const::<B_ZMM_ALIGNED>(bp, ob0);
+                stream_zmm_const::<B_ZMM_ALIGNED>(bp.add(4), ob1);
+                stream_zmm_const::<B_ZMM_ALIGNED>(bp.add(8), ob2);
+                stream_zmm_const::<B_ZMM_ALIGNED>(bp.add(12), ob3);
             } else {
                 _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
                 _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
@@ -924,7 +928,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             x_lo += 2;
         }
 
-        if nt_out {
+        if NT_OUT {
             _mm_sfence();
         }
         let mut out = [F128::ZERO; 8];
@@ -933,6 +937,51 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             out[i] = tail[i].reduce();
         }
         out
+    }
+}
+
+/// Select the temporal/NT store mode and each output's invariant 64-byte
+/// alignment once per worker chunk. Every vector tile advances each pointer
+/// by 64 bytes, so the selected leaf needs no per-store alignment tests.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+    wtab: Option<&[F128]>,
+    nt_out: bool,
+) -> [F128; 8] {
+    let a_zmm = (a_out.as_ptr() as usize).is_multiple_of(64);
+    let b_zmm = (b_out.as_ptr() as usize).is_multiple_of(64);
+    // SAFETY: each leaf has this wrapper's exact slice contract. The two
+    // alignment booleans describe the whole synchronous call because vector
+    // tiles advance both output pointers by exactly 64 bytes.
+    unsafe {
+        match (nt_out, a_zmm, b_zmm) {
+            (false, _, _) => fold2_and_message_lookahead_x86_avx512_store_leaf::<
+                false, false, false,
+            >(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab),
+            (true, false, false) => fold2_and_message_lookahead_x86_avx512_store_leaf::<
+                true, false, false,
+            >(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab),
+            (true, false, true) => fold2_and_message_lookahead_x86_avx512_store_leaf::<
+                true, false, true,
+            >(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab),
+            (true, true, false) => fold2_and_message_lookahead_x86_avx512_store_leaf::<
+                true, true, false,
+            >(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab),
+            (true, true, true) => fold2_and_message_lookahead_x86_avx512_store_leaf::<
+                true, true, true,
+            >(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab),
+        }
     }
 }
 
@@ -1148,6 +1197,33 @@ unsafe fn stream_zmm_as_xmm4(p: *mut F128, v: core::arch::x86_64::__m512i) {
         _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
         _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
         _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+    }
+}
+
+/// Const-selected counterpart of [`stream_zmm_as_xmm4`] for a worker whose
+/// output alignment was classified before entering the tile loop.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn stream_zmm_const<const ZMM_ALIGNED: bool>(
+    p: *mut F128,
+    v: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: the public worker wrapper selects this const from the exact
+    // output pointer. Every later tile advances by 64 bytes; F128 alignment
+    // supplies the 16-byte fallback contract.
+    unsafe {
+        if ZMM_ALIGNED {
+            debug_assert!((p as usize).is_multiple_of(64));
+            _mm512_stream_si512(p as *mut __m512i, v);
+        } else {
+            debug_assert!((p as usize).is_multiple_of(16));
+            let d = p as *mut __m128i;
+            _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
+            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        }
     }
 }
 
