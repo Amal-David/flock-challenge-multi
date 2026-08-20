@@ -1843,9 +1843,8 @@ pub(crate) struct WorkerStateFold4 {
     /// empty until the folded arm first sizes it.
     plane_banks: Vec<u8>,
     /// Byte-plane C banks for the fused GFNI drain (`[q][bank][plane][lane]`,
-    /// 32 KiB) followed by the 4 KiB group staging buffer; over-allocated by
-    /// 63 bytes so both stay cache-line aligned. Empty until the fused arm
-    /// first sizes it.
+    /// 32 KiB); over-allocated by 63 bytes so it stays cache-line aligned.
+    /// Empty until the fused arm first sizes it.
     plane_c: Vec<u8>,
     plane_c_off: usize,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
@@ -1922,7 +1921,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // nibble-LUT drain (`c_gfni_mats == None`).
     if c_gfni_mats.is_some() {
         if state.plane_c.is_empty() {
-            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
+            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + 63];
             let off = state.plane_c.as_ptr().align_offset(64);
             state.plane_c_off = if off <= 63 { off } else { 0 };
         } else {
@@ -1944,10 +1943,10 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             *count = b_med_counts[x_outer & within_outer_mask] as usize;
             any_live |= *count != 0;
         }
-        // Early staged fetch: pull this group's 4 KiB of `c_packed` in strict
-        // address order BEFORE the AB completion runs, so its DRAM misses
-        // retire underneath four windows of AB work instead of stalling the
-        // drain at the end of the group.
+        // Start this group's 4 KiB of `c_packed` before AB completion so its
+        // misses retire underneath four windows of independent AB work. Keep
+        // the lines in their source page: staging them through worker scratch
+        // would add 4 KiB of stores and another 4 KiB of reads per group.
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -1958,12 +1957,15 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
         ))]
         if any_live && c_gfni_mats.is_some() {
             let group_base = (((4 * group) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let off = state.plane_c_off + C_PLANE_BANK_BYTES;
-            let stage: &mut [u8; C_GROUP_BYTES] = (&mut state.plane_c
-                [off..off + C_GROUP_BYTES])
-                .try_into()
-                .expect("aligned 4 KiB group staging window");
-            kernels::stage_c_group(&c_packed[group_base..group_base + C_GROUP_BYTES], stage);
+            let base = unsafe { c_packed.as_ptr().add(group_base) };
+            for line in 0..C_GROUP_BYTES / 64 {
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch(
+                        base.add(line * 64).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
         }
         for w in 0..4 {
             let x_outer_lo = 4 * group + w;
@@ -2067,11 +2069,17 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 .try_into()
                 .expect("32 matrix qwords per four-window group");
             let off = state.plane_c_off;
-            let (planes, stage) = state.plane_c[off..off + C_PLANE_BANK_BYTES + C_GROUP_BYTES]
-                .split_at_mut(C_PLANE_BANK_BYTES);
-            let planes: &mut [u8; C_PLANE_BANK_BYTES] =
-                planes.try_into().expect("aligned 32 KiB plane C bank window");
-            kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
+            let planes: &mut [u8; C_PLANE_BANK_BYTES] = (&mut state.plane_c
+                [off..off + C_PLANE_BANK_BYTES])
+                .try_into()
+                .expect("aligned 32 KiB plane C bank window");
+            let group_base = (((4 * group) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            kernels::accumulate_c_banks_fold4_fused_gfni(
+                &c_packed[group_base..group_base + C_GROUP_BYTES],
+                &group_counts,
+                mats_g,
+                planes,
+            );
             continue;
         }
         let c_tables =
