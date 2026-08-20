@@ -279,21 +279,6 @@ pub(crate) fn alloc_uninit_f128_vec(n: usize) -> Vec<crate::field::F128> {
     alloc_uninit_vec::<crate::field::F128>(n)
 }
 
-/// Ranked default parallelizes a family of previously single-threaded
-/// segments on the prover's Fiat–Shamir chain — pure per-element gathers,
-/// bit-transposes, and eq-table builds that ran alone on one core while the
-/// pool idled (ligerito query-phase gathers, zerocheck round-one table
-/// preparation). Every gated site is byte-neutral: pure functions of
-/// already-sampled values, order-preserving indexed parallel maps, and
-/// exact-field factorizations — nothing the challenger observes changes.
-/// Read once per process. `FLOCK_NO_SERIAL_PAR=1` restores every incumbent
-/// sequential form (each site keeps it verbatim as its oracle).
-pub(crate) fn serial_par_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SERIAL_PAR").is_none());
-    *ON
-}
-
 /// Cached [`perf_core_count`]. The uncached version may spawn `sysctl`; this
 /// memoizes it so hot paths can cheaply ask "is the current rayon pool the
 /// homogeneous P-core pool?" (i.e. `current_num_threads() <= this`).

@@ -851,9 +851,8 @@ fn partial_fold_packed_z_block_major_factorized_padded(
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
 /// [`prove_padded_inner`]: factorized eq when `n_log == 18`, else a
 /// materialized outer table. Used by the last-ρ kick and the sequential
-/// fallback so both produce the same `ẑ`, and by zerocheck's identity-C
-/// round-one fold (see `univariate_skip_optimized::identity_c_inner_fold`).
-pub(crate) fn fold_block_major_one_shot(
+/// fallback so both produce the same `ẑ`.
+fn fold_block_major_one_shot(
     z: &[F128],
     m: usize,
     k_log: usize,
@@ -2002,26 +2001,6 @@ fn sumcheck_x4_enabled() -> bool {
     *ON
 }
 
-/// Ranked default gates the FUSED bind+eval pass's parallelism on `half =
-/// len/2` — the same granularity the standalone bind and eval passes use —
-/// instead of `half2 = len/4`. The incumbent `half2` comparison sent the
-/// fused rounds serial at twice the table size the unfused passes would
-/// have, despite the fused pass doing strictly more work per index: at the
-/// ranked lincheck shape (2^14 tables) rounds 1..6 of the product-sumcheck
-/// ran on one core. Width cannot change wire bytes: bound values are pure
-/// per-slot functions and the message terms are XOR sums, so chunked and
-/// serial evaluation give the same field elements (pinned by
-/// `split_half_chunking_is_exact` and
-/// `fused_bind_eval_threshold_arms_agree`).
-/// `FLOCK_NO_LC_SUMCHECK_PAR_FIX=1` restores the incumbent `half2`
-/// comparison for exact same-binary A/B. Read once per process; default ON.
-fn sumcheck_par_fix_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none()
-    });
-    *ON
-}
-
 /// Rayon chunk width for one sumcheck round over `n` slots: enough chunks to
 /// fill the pool, never finer than a whole cache line of `F128`.
 fn sumcheck_chunk(n: usize) -> usize {
@@ -2102,11 +2081,6 @@ fn sumcheck_bind_both_and_eval_next(
     let half = len / 2;
     let half2 = half / 2;
     debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
-    // Parallelism granularity: `half` matches the standalone bind/eval passes
-    // this fusion replaced; the incumbent compared `half2` (see
-    // [`sumcheck_par_fix_enabled`]). Same field elements either way — the
-    // choice only picks serial vs chunked execution.
-    let par_gate = if sumcheck_par_fix_enabled() { half } else { half2 };
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
@@ -2117,7 +2091,7 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if sumcheck_x4_enabled() {
-        if par_gate < SUMCHECK_PAR_THRESHOLD {
+        if half2 < SUMCHECK_PAR_THRESHOLD {
             crate::field::f128_slice::bind_both_and_msg_split(
                 cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r, half2,
             )
@@ -2141,7 +2115,7 @@ fn sumcheck_bind_both_and_eval_next(
                 })
                 .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
         }
-    } else if par_gate < SUMCHECK_PAR_THRESHOLD {
+    } else if half2 < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half2 {
@@ -2888,43 +2862,6 @@ pub fn verify<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
-
-    /// The fused bind+eval must equal the unfused bind-bind-eval sequence —
-    /// bound tables AND next message — at sizes on BOTH sides of the parallel
-    /// threshold, including `len = 2^13` (serial under the incumbent `half2`
-    /// comparison, parallel under the `half` fix) and `2^14` (parallel under
-    /// both). Negative control: one corrupted table slot must change the
-    /// message.
-    #[test]
-    fn fused_bind_eval_threshold_arms_agree() {
-        let mut rng = Rng::new(0xF05E_D9A7);
-        for &len in &[1usize << 12, 1 << 13, 1 << 14] {
-            let comb: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let z: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let r = rng.f128();
-
-            // Oracle: standalone binds, then the standalone eval.
-            let mut want_comb = comb.clone();
-            let mut want_z = z.clone();
-            sumcheck_bind_top_in_place_par(&mut want_comb, r);
-            sumcheck_bind_top_in_place_par(&mut want_z, r);
-            let want_msg = sumcheck_round_eval_par(&want_comb, &want_z);
-
-            let mut got_comb = comb.clone();
-            let mut got_z = z.clone();
-            let got_msg = sumcheck_bind_both_and_eval_next(&mut got_comb, &mut got_z, r);
-            assert_eq!(got_msg, want_msg, "fused message len={len}");
-            assert_eq!(got_comb, want_comb, "fused comb table len={len}");
-            assert_eq!(got_z, want_z, "fused z table len={len}");
-
-            // Negative control: one corrupted slot must not still match.
-            let mut bad_comb = comb.clone();
-            bad_comb[len / 3] += F128::ONE;
-            let mut bad_z = z.clone();
-            let bad_msg = sumcheck_bind_both_and_eval_next(&mut bad_comb, &mut bad_z, r);
-            assert_ne!(bad_msg, want_msg, "corrupted table went undetected len={len}");
-        }
-    }
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);

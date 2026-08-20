@@ -224,10 +224,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && mats.is_some()
             && lo_size >= 32
             && lo_size.is_multiple_of(32);
-        let mut fa_store = FoldCache([F128::ZERO; 64]);
-        let mut fb_store = FoldCache([F128::ZERO; 64]);
-        let fa = &mut fa_store.0;
-        let fb = &mut fb_store.0;
+        let mut fa = [F128::ZERO; 64];
+        let mut fb = [F128::ZERO; 64];
         // Packed-row prefetch distance, resolved once per worker chunk
         // (never inside the refill / message loops).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1334,10 +1332,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         } else {
             1
         };
-        let mut fa_store = FoldCache([F128::ZERO; 64]);
-        let mut fb_store = FoldCache([F128::ZERO; 64]);
-        let fa = &mut fa_store.0;
-        let fb = &mut fb_store.0;
+        let mut fa = [F128::ZERO; 64];
+        let mut fb = [F128::ZERO; 64];
         while x_lo + 8 <= lo_size {
             let ol = 2 * x_lo; // local output index of group 0
             let xg = out_base + ol;
@@ -1387,7 +1383,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         }
                     }
                 }
-                Some((&*fa, &*fb, 4 * xg))
+                Some((&fa, &fb, 4 * xg))
             } else {
                 None
             };
@@ -2055,14 +2051,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 ///
 /// Entry `j * 16 + k` is the ZMM of eight 8×8 GF(2) matrices the batch feeds
 /// `vgf2p8affineqb` for input chunk `j`, output byte `k`; qword `i` carries
-/// 64-byte-aligned backing for the per-worker prefold caches `fa`/`fb`:
-/// every refill store and every consume load of these buffers is ZMM-wide,
-/// and `[F128; 64]`'s natural 16-byte alignment lets those 64-byte accesses
-/// straddle cache lines (a split load/store each time the base is not
-/// line-aligned).
-#[repr(C, align(64))]
-struct FoldCache([F128; 64]);
-
 /// the matrix of residue `i / 2` (the layout [`SIGMA_C4`] produces).
 #[cfg(all(
     target_arch = "x86_64",

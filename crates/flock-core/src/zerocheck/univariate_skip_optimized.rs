@@ -241,40 +241,9 @@ fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>)
     target_feature = "gfni"
 ))]
 fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
-    build_ab_eq_fold_mats_gated(eq_top_scaled, convert, crate::serial_par_enabled())
-}
-
-/// `w`-count floor for the parallel matrix build: below it a rayon dispatch
-/// costs more than the remaining rows.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-const AB_EQ_FOLD_MATS_PAR_MIN_W: usize = 8;
-
-/// Body of [`build_ab_eq_fold_mats`]. The per-`w` row — eight basis scales
-/// plus a 128×8 bit transpose into sixteen 8×8 matrices — is a pure function
-/// of `eq_top_scaled[w]` writing its own disjoint 256-qword row, so `par`
-/// fans the 32 ranked rows across the pool with an order-preserving indexed
-/// map; the incumbent ran them on ONE core immediately ahead of round one's
-/// wide region. Identical per-row body either way, so the table is
-/// bit-identical; `false` is the incumbent sequential build, kept as the
-/// kill-switch path and the byte-identity oracle (`FLOCK_NO_SERIAL_PAR=1`).
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-fn build_ab_eq_fold_mats_gated(
-    eq_top_scaled: &[F128],
-    convert: &[F128],
-    par: bool,
-) -> Vec<u64> {
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
-    let fill_row = |scale: &F128, row: &mut [u64]| {
+    let mut mats = vec![0u64; eq_top_scaled.len() * 256];
+    for (w, scale) in eq_top_scaled.iter().enumerate() {
         for bm in 0..16 {
             let basis: [F128; 8] =
                 std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
@@ -282,30 +251,19 @@ fn build_ab_eq_fold_mats_gated(
                 let mut qword = 0u64;
                 for i in 0..8 {
                     let bit_index = 8 * k + i;
-                    let mut row_bits = 0u8;
+                    let mut row = 0u8;
                     for (j, b) in basis.iter().enumerate() {
                         let bit = if bit_index < 64 {
                             (b.lo >> bit_index) & 1
                         } else {
                             (b.hi >> (bit_index - 64)) & 1
                         };
-                        row_bits |= (bit as u8) << j;
+                        row |= (bit as u8) << j;
                     }
-                    qword |= (row_bits as u64) << (8 * (7 - i));
+                    qword |= (row as u64) << (8 * (7 - i));
                 }
-                row[bm * 16 + k] = qword;
+                mats[w * 256 + bm * 16 + k] = qword;
             }
-        }
-    };
-    let mut mats = vec![0u64; eq_top_scaled.len() * 256];
-    if par && eq_top_scaled.len() >= AB_EQ_FOLD_MATS_PAR_MIN_W {
-        use rayon::prelude::*;
-        mats.par_chunks_mut(256)
-            .zip(eq_top_scaled.par_iter())
-            .for_each(|(row, scale)| fill_row(scale, row));
-    } else {
-        for (row, scale) in mats.chunks_mut(256).zip(eq_top_scaled.iter()) {
-            fill_row(scale, row);
         }
     }
     mats
@@ -2713,40 +2671,6 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     res_ab.to_vec()
 }
 
-/// Identity-C's block-major outer fold at `r_outer`. `par` routes through
-/// [`crate::lincheck::fold_block_major_one_shot`] — lincheck's shipped
-/// one-shot dispatch, whose ranked `n_log == 18` arm keeps eq(r_outer, ·)
-/// factored as two 2^9 tables consumed inside the (already parallel) fold
-/// kernel instead of materializing the dense 2^18 table with 262,144
-/// serially-chained GHASH multiplies on ONE core ahead of it. The factors
-/// are exact (`eq[i] = eq_lo[i_lo] · eq_hi[i_hi]` — field multiply is
-/// associative with no rounding) and the fold kernel underneath is the same
-/// `partial_fold_packed_z_block_major_padded_with_tables` accumulation, so
-/// `ẑ` is bit-identical — the same identity lincheck's own one-shot/kick
-/// paths already rely on (`last_rho_kick_then_wait_matches_oneshot_fold`).
-/// Every other geometry takes the one-shot's dense arm, which is this
-/// function's `par = false` body verbatim. `false` is the incumbent
-/// sequential form, kept as the kill-switch path and the byte-identity
-/// oracle (`FLOCK_NO_SERIAL_PAR=1`).
-pub(crate) fn identity_c_inner_fold(
-    z_packed: &[F128],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    r_outer: &[F128],
-    par: bool,
-) -> Vec<F128> {
-    debug_assert_eq!(r_outer.len(), m - k_log);
-    if par {
-        crate::lincheck::fold_block_major_one_shot(z_packed, m, k_log, useful_bits, r_outer)
-    } else {
-        let eq_outer = crate::lincheck::build_eq_table(r_outer);
-        crate::lincheck::partial_fold_packed_z_block_major_padded(
-            z_packed, m, k_log, useful_bits, &eq_outer,
-        )
-    }
-}
-
 /// Derive the exact legacy round-one C message and its RingSwitch capture
 /// tensors from one block-major outer fold of the identity-C witness.
 ///
@@ -2775,13 +2699,9 @@ pub fn round1_c_fold4_from_block_major_z(
 
     // One fold at the original r_outer: the length-2^k_log inner table over
     // witness coordinates [0, k_log).
-    let c_inner = identity_c_inner_fold(
-        z_packed,
-        m,
-        k_log,
-        useful_bits,
-        &r[k_log..],
-        crate::serial_par_enabled(),
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    let c_inner = crate::lincheck::partial_fold_packed_z_block_major_padded(
+        z_packed, m, k_log, useful_bits, &eq_outer,
     );
 
     let inner_tail = &r[k_skip + 1..k_log];
@@ -2918,65 +2838,6 @@ mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
-
-    /// The gated identity-C outer fold must match the incumbent
-    /// dense-eq-table oracle bit-for-bit — on the ranked `n_log = 18`
-    /// factorized dispatch and on a dense-arm geometry — and a corrupted
-    /// witness must be caught.
-    #[test]
-    fn identity_c_inner_fold_par_matches_seq() {
-        // (m, k_log, useful_bits): first case hits the factorized n_log=18
-        // arm without a full LOG2=18 prove; second stays on the dense arm.
-        let cases: &[(usize, usize, usize)] = &[(25, 7, 121), (16, 8, 241)];
-        for &(m, k_log, useful_bits) in cases {
-            let mut rng = Rng(0x1DC0_11EC + (m * 131 + k_log) as u64);
-            let n_outer = 1usize << (m - k_log);
-            let chunks_per_block = (1usize << k_log) / 128;
-            let z: Vec<F128> = rng.f128_vec(n_outer * chunks_per_block);
-            let r_outer: Vec<F128> = rng.f128_vec(m - k_log);
-            let seq = identity_c_inner_fold(&z, m, k_log, useful_bits, &r_outer, false);
-            let par = identity_c_inner_fold(&z, m, k_log, useful_bits, &r_outer, true);
-            assert_eq!(par, seq, "m={m} k_log={k_log}");
-            // Negative control: a corrupted useful witness word must reach
-            // the folded table through both routes.
-            let mut bad = z.clone();
-            bad[0] += F128::ONE;
-            assert_ne!(
-                identity_c_inner_fold(&bad, m, k_log, useful_bits, &r_outer, true),
-                seq,
-                "corrupted witness went undetected m={m}"
-            );
-        }
-    }
-
-    /// The gated parallel GFNI matrix build must match the sequential
-    /// oracle bit-for-bit, and a corrupted scale must be caught.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn ab_eq_fold_mats_par_matches_seq() {
-        let mut rng = Rng(0xAB_E0_F01D);
-        let convert = convert_table();
-        // Ranked width (32 rows, above the par floor) and a tiny width
-        // (below the floor — par falls back and must still match).
-        for &n_w in &[32usize, 2] {
-            let eq_top_scaled: Vec<F128> = rng.f128_vec(n_w);
-            let seq = build_ab_eq_fold_mats_gated(&eq_top_scaled, convert, false);
-            let par = build_ab_eq_fold_mats_gated(&eq_top_scaled, convert, true);
-            assert_eq!(par, seq, "n_w={n_w}");
-            let mut bad = eq_top_scaled.clone();
-            bad[0] += F128::ONE;
-            assert_ne!(
-                build_ab_eq_fold_mats_gated(&bad, convert, true),
-                seq,
-                "corrupted scale went undetected n_w={n_w}"
-            );
-        }
-    }
 
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
