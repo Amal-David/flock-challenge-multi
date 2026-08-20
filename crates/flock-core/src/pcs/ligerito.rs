@@ -3782,11 +3782,6 @@ fn eval_fold4_lookahead3(
     }
 }
 
-/// `FLOCK_NO_MDF4_PF=1` restores the incumbent [`materialize_direct_fold4`],
-/// which issues no software prefetch at all. Exact same-binary A/B: a
-/// prefetch is a hint with no architectural effect, so both arms produce
-/// byte-identical proofs.
-///
 /// Round 3 of the open sumcheck is the single biggest loop in the phase
 /// (~10.2 ms of open's ~25.5 ms local, measured with `LIG_PROVE_TRACE`).
 /// Each rayon task does exactly two things, in sequence:
@@ -3822,14 +3817,6 @@ fn eval_fold4_lookahead3(
 /// line is asked for ~2·(block_len/4) iterations (~0.2 ms) before the demand
 /// load, and the latest ~0.05 ms before; both are far past a DRAM miss.
 ///
-/// Read once per process, outside every loop.
-#[cfg(target_arch = "x86_64")]
-fn mdf4_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PF").is_none());
-    *ON
-}
-
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
 /// direct basis in ONE N→N/16 pass and emits the round-4 message. Both ranked
@@ -3889,10 +3876,6 @@ fn materialize_direct_fold4(
     } else {
         0
     };
-    // Grouped-gather prefetch state, resolved once for the whole
-    // materialization — never inside the block / claim / slot loops.
-    #[cfg(target_arch = "x86_64")]
-    let pf_on = mdf4_pf_enabled();
     #[cfg(target_arch = "x86_64")]
     let n_blocks = out_len / block_len;
     let (u_0, u_2) = folded_b
@@ -3906,12 +3889,12 @@ fn materialize_direct_fold4(
                 let f_in = &packed_witness[start..start + 16 * block_len];
                 // Head of the NEXT block's f-side slab, and how far into it
                 // the b-side loops below may walk. Null when there is no next
-                // block or the kill switch is set — the only check the loops
-                // make. `block + 1 < n_blocks` is exactly the condition that
+                // block — the only check the loops make.
+                // `block + 1 < n_blocks` is exactly the condition that
                 // keeps the whole slab inside `packed_witness`:
                 // `16·(block+2)·block_len ≤ 16·n_blocks·block_len = len`.
                 #[cfg(target_arch = "x86_64")]
-                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                let (pf_base, pf_span) = if block + 1 < n_blocks {
                     // SAFETY: bounds argued above; `add` stays inside the
                     // allocation and the pointer is never dereferenced.
                     let p = unsafe { packed_witness.as_ptr().add(start + 16 * block_len) };

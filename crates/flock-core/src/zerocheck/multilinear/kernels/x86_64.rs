@@ -226,25 +226,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && lo_size.is_multiple_of(32);
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
-        // Packed-row prefetch distance, resolved once per worker chunk
-        // (never inside the refill / message loops).
-        let pf_tiles = if zc_pkt_pf_far_enabled() {
-            ZC_PKT_PF_TILES
-        } else {
-            1
-        };
-
         // Residue-major refill (WRITE=false only — the chunk-store arm needs
         // row order): the prefold emits directly in the a_k/b_k register
         // grouping, deleting both consumer lane transposes per iteration.
         // Gated to shapes the 8-pair batch loop consumes exhaustively: the
-        // scalar tail (and the regfold-off arm) index the cache BY ROW and
-        // must never see the residue-major layout.
+        // The scalar tail indexes the cache BY ROW and must never see the
+        // residue-major layout.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_emit = !WRITE
             && use_batch
             && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
             && zc_r2_tr_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
@@ -268,23 +259,21 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
-                // The packed bursts `pf_tiles` refills ahead — a gap the
+                // The packed bursts `ZC_PKT_PF_TILES` refills ahead — a gap the
                 // hardware prefetcher does not bridge across the strided
                 // burst boundary. Pull both sides in now (prefetch is a
                 // hint: `wrapping_add` keeps the past-the-end address on
                 // the last tiles well defined, and the hint is dropped).
-                if zc_pkt_pf_enabled() {
-                    let next = (g0 + 64 * pf_tiles) * 8;
-                    for l in 0..8 {
-                        _mm_prefetch(
-                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
-                    }
+                let next = (g0 + 64 * ZC_PKT_PF_TILES) * 8;
+                for l in 0..8 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
                 }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
@@ -296,7 +285,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
-            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
                     // Residue-major cache: a_k for this window is the
@@ -921,20 +910,6 @@ pub(crate) fn zc_fold_nt_enabled() -> bool {
     *ON
 }
 
-/// `FLOCK_NO_ZC_REGFOLD=1` restores the scalar staging arms (stack arrays
-/// re-read as ZMM loads) in the round-2 and rounds-3+4 kernels (exact
-/// same-binary A/B); the ranked worker's cleared env never sets it.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-pub(crate) fn zc_regfold_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_REGFOLD").is_none());
-    *ON
-}
-
 /// `FLOCK_NO_ZC_FOLD_DEFER=1` restores fully-reduced multiplies in the
 /// composed (rho_a, rho_b) pair folds (exact same-binary A/B); the ranked
 /// worker's cleared env never sets it.
@@ -965,15 +940,6 @@ pub(crate) fn zc_r2_tr_enabled() -> bool {
     *ON
 }
 
-/// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
-/// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
-/// same-binary A/B; prefetch is architecturally invisible).
-pub(crate) fn zc_pkt_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF").is_none());
-    *ON
-}
-
 /// Look-ahead, in 64-row tiles, for the packed-row prefetch in the round-2
 /// and rounds-3+4 fold kernels. One tile is 512 bytes per side (64 rows ×
 /// 8 packed bytes) and is exactly one refill of the `fa`/`fb` fold caches.
@@ -997,14 +963,6 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
 /// changes, and a prefetch has no architectural effect, so the folded
 /// values are bit-identical either way.
 const ZC_PKT_PF_TILES: usize = 3;
-
-/// `FLOCK_NO_ZC_PKT_PF_FAR=1` restores the incumbent one-tile look-ahead in
-/// both packed-row prefetches (exact same-binary A/B).
-pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF_FAR").is_none());
-    *ON
-}
 
 /// `FLOCK_NO_ZC_WTAB=1` disables the hoisted per-pass `(w, w·x⁶⁴)` pair
 /// table in the zerocheck message sweeps (exact same-binary A/B; the table
@@ -1324,14 +1282,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // constant multiplies per output (14 CLMUL per sixteen rows) and the
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
-        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
-        // Packed-row prefetch distance, resolved once per worker chunk
-        // (never inside the refill loop).
-        let pf_tiles = if zc_pkt_pf_far_enabled() {
-            ZC_PKT_PF_TILES
-        } else {
-            1
-        };
+        let use_c4 = use_batch && cfold.is_some();
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
         while x_lo + 8 <= lo_size {
@@ -1366,21 +1317,19 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
                     }
-                    // The 512-byte bursts `pf_tiles` refills ahead of the
+                    // The 512-byte bursts `ZC_PKT_PF_TILES` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
                     // Same addresses on both refill arms.
-                    if zc_pkt_pf_enabled() {
-                        let next = (4 * xg + 64 * pf_tiles) * 8;
-                        for l in 0..8 {
-                            _mm_prefetch(
-                                a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
-                        }
+                    let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
+                    for l in 0..8 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
                     }
                 }
                 Some((&fa, &fb, 4 * xg))
@@ -1422,7 +1371,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     xor4(ap, 3),
                     xor4(bp2, 3),
                 )
-            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            } else if let Some((fa, fb, cache_base)) = cache {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
                     let ap = fa.as_ptr();
