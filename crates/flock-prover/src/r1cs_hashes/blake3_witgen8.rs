@@ -402,6 +402,21 @@ fn wide_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_PUBLISH_WIN_THEN_NT=1` restores the STREAM_STAGE `publish_step`
+/// per-row interleave of temporal staging stores with destination NT streams.
+/// Ranked default groups the eight staging stores ahead of the eight NT pair
+/// streams — the same write-combining occupancy [`dump_range_nt_win`] uses
+/// for the whole-block fused window. Bytes are identical either way: the
+/// eight rows' staging stores and destination publishes commute, and
+/// `StreamProj::project` still runs after this step completes.
+fn publish_win_then_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_PUBLISH_WIN_THEN_NT").is_none()
+        });
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -517,11 +532,27 @@ impl Drain8<'_> {
             let g = abs_word / 8;
             let lo_live = g >= g0 && g < g1;
             let hi_live = g + 1 >= g0 && g + 1 < g1;
-            for r in 0..8 {
+            // Restore dump_range_nt_win's window-then-NT grain when this step
+            // also fills a STREAM_STAGE staging pair: eight temporal stores
+            // first, then eight destination publishes. The interleaved form
+            // (kill switch) writes the same bytes in a different order.
+            let grouped = carry.is_some() && publish_win_then_nt_enabled();
+            if grouped {
                 if let Some((base, row_stride)) = carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, lo_rows[r]);
-                    store_v8(p.add(8), hi_rows[r]);
+                    for r in 0..8 {
+                        let p = base.add(r * row_stride);
+                        store_v8(p, lo_rows[r]);
+                        store_v8(p.add(8), hi_rows[r]);
+                    }
+                }
+            }
+            for r in 0..8 {
+                if !grouped {
+                    if let Some((base, row_stride)) = carry {
+                        let p = base.add(r * row_stride);
+                        store_v8(p, lo_rows[r]);
+                        store_v8(p.add(8), hi_rows[r]);
+                    }
                 }
                 let p = dst.add(r * U32_PER_BLOCK + abs_word);
                 match (nt, lo_live, hi_live) {
@@ -707,6 +738,8 @@ unsafe fn dump_range_nt_win(
             // Window first: plain stores to a 16 KiB L1-resident buffer, and
             // grouping them ahead of the streams keeps each row's write-
             // combining buffer open across consecutive NT stores.
+            // STREAM_STAGE `publish_step` restores the same grouping for its
+            // 64-byte staging pair (`FLOCK_NO_PUBLISH_WIN_THEN_NT=1` undoes it).
             for r in 0..8 {
                 let p = win.add(r * U32_PER_BLOCK + w);
                 store_v8(p, ta[r]);
