@@ -2608,6 +2608,98 @@ impl AdditiveNttF128 {
             });
     }
 
+    /// Finish a rate-1/2 encode whose codeword was **pre-seeded to layer 9**
+    /// by [`SeedTopFuse::run_class_task`] during witness generation: run the
+    /// remaining layers (`9..log_d`) with the same scheduler
+    /// [`Self::rs_encode_interleaved_on_range_done`] uses, firing the same
+    /// per-sub-group callback. Byte-identical to the full encode by
+    /// construction — layers `0..9` were produced by the exact
+    /// [`Self::seed_top_fused8_pass`] task body, and the deep scheduler
+    /// already supports a start layer past `n_top` (see `deep_sub`), so any
+    /// `n_top` the pool width induces is handled.
+    pub fn transform_preseeded_on_range_done(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(codeword.len() % num_ntts, 0);
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        assert!(SeedTopFuse::PRESEEDED_LAYERS <= log_d && log_d <= self.log_domain_size());
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                SeedTopFuse::PRESEEDED_LAYERS,
+                None,
+                Some(on_range_done),
+                None,
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            self.forward_transform_interleaved_scalar_from_layer(
+                codeword,
+                num_ntts,
+                SeedTopFuse::PRESEEDED_LAYERS,
+            );
+            on_range_done(0..n_positions, codeword);
+        }
+    }
+
+    /// [`Self::transform_preseeded_on_range_done`]'s ordered-chunk-streaming
+    /// twin (the GPU-Merkle commit's shape; contract as in
+    /// [`Self::rs_encode_interleaved_streamed`]).
+    pub fn transform_preseeded_streamed(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        n_chunks: usize,
+        on_chunk: &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(codeword.len() % num_ntts, 0);
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        assert!(SeedTopFuse::PRESEEDED_LAYERS <= log_d && log_d <= self.log_domain_size());
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                SeedTopFuse::PRESEEDED_LAYERS,
+                Some((n_chunks, on_chunk)),
+                None,
+                None,
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            let _ = n_chunks;
+            self.forward_transform_interleaved_scalar_from_layer(
+                codeword,
+                num_ntts,
+                SeedTopFuse::PRESEEDED_LAYERS,
+            );
+            on_chunk(0, 0..n_positions);
+        }
+    }
+
     /// Inverse additive NTT in place. Exact inverse of `forward_transform`.
     pub fn inverse_transform(&self, data: &mut [F128]) {
         let log_d = log2_pow2(data.len());
@@ -2626,6 +2718,326 @@ impl AdditiveNttF128 {
                     let new_v = data[idx1] + u;
                     data[idx1] = new_v;
                     data[idx0] = u + new_v * twiddle;
+                }
+            }
+        }
+    }
+}
+
+/// `FLOCK_NO_SEED_FUSE=1` disables the witgen-side seed+top fusion
+/// ([`SeedTopFuse`]): [`SeedTopFuse::new`] then returns `None`, the witness
+/// generator keeps its incumbent shape and the commit re-reads the whole
+/// message for its own seed pass — the exact pre-fusion behaviour, same
+/// binary. Resolved once per process.
+fn seed_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SEED_FUSE").is_none());
+    *ON
+}
+
+/// Witgen-side seed+top fusion for the ranked rate-1/2 commit.
+///
+/// ## Geometry
+///
+/// At rate 1/2 the commit's [`AdditiveNttF128::seed_top_fused8_pass`] task
+/// `r ∈ 0..S` (`S = 2^(log_d−9)`) reads exactly the message rows
+/// `{r + j·S : j ∈ 0..256}` and writes the codeword rows
+/// `{block·B + r + k·S : block ∈ 0..8, k ∈ 0..64}` (`B = 2^(log_d−3) = 64·S`)
+/// at layer 9. Grouping message rows sixteen at a time (one witgen octa = 8
+/// hash blocks = 16 rows at the ranked `K = 2^14`, `num_ntts = 64` shape),
+/// the task set splits into `n_classes = S/16` **classes**: class
+/// `u ∈ 0..n_classes` owns tasks `16u..16u+16` and its input is precisely the
+/// 256 octas `{u + j·n_classes : j ∈ 0..256}` — 4 MiB of message, independent
+/// of `log_d`. The witness generator can therefore produce octas class-major
+/// and run a class's sixteen seed+top tasks (reading the just-published z
+/// rows straight from the main witness buffer) as soon as its last octa
+/// retires — moving the commit's whole seed pass into the witness phase. The
+/// commit then finishes from layer 9 with
+/// [`AdditiveNttF128::transform_preseeded_on_range_done`].
+///
+/// ## Byte identity
+///
+/// `run_task_from_msg` is the `seed_top_fused8_pass` task body verbatim —
+/// same kernels, same twiddles, same source geometry (the flat message,
+/// which for the fused witness generator is the main z buffer itself), same
+/// staging shape, same lane bounds and the same non-temporal publish — so
+/// the codeword bytes match the incumbent encode exactly
+/// (`seed_fuse_tasks_from_msg_match_rs_encode` asserts it).
+pub struct SeedTopFuse {
+    ntt: AdditiveNttF128,
+    log_d: usize,
+    num_ntts: usize,
+    /// Trailing zero lanes skippable on odd rows (0 = dense; always correct).
+    odd_tail: usize,
+    seed_right: F128,
+    seed_dense: [F128; 3],
+    tw4: [[F128; 15]; 8],
+}
+
+impl SeedTopFuse {
+    /// Layers already applied to a pre-seeded codeword (replication + the
+    /// eight fused layers 1..9 of `seed_top_fused8_pass`).
+    pub const PRESEEDED_LAYERS: usize = 9;
+    /// Octas (of 16 message rows each) whose z output one class comprises.
+    pub const OCTAS_PER_CLASS: usize = 256;
+    /// Seed+top tasks per class.
+    pub const TASKS_PER_CLASS: usize = 16;
+
+    /// Whether the fused kernels this fusion mirrors are live in this build
+    /// and none of the schedule switches it must stay consistent with is
+    /// disabled. Mirrors the gates `rs_encode_interleaved`'s seed-fused top
+    /// pass runs under, so a pre-seeded codeword is only ever produced when
+    /// the incumbent would have taken the same kernel route.
+    pub fn available() -> bool {
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            // `FLOCK_SEED_FUSE_FORCE=1` (tests/diagnostics only): admit the
+            // fusion on builds without the AVX-512 fused kernels, where the
+            // portable kernels run instead. Output bytes are identical either
+            // way — `top_fusion_available` is a "worth it" gate, not a
+            // correctness gate — this simply lets non-AVX-512 hosts (Rosetta)
+            // execute the fused path in cross tests. The ranked worker's
+            // cleared env never sets it.
+            let force = {
+                static F: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                    matches!(std::env::var_os("FLOCK_SEED_FUSE_FORCE"), Some(v) if v == "1")
+                });
+                *F
+            };
+            (AdditiveNttF128::top_fusion_available() || force)
+                && !ntt_top_fusion_disabled()
+                && !ntt_seed_top_fusion_disabled()
+                && !rate_half_seed_disabled()
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            false
+        }
+    }
+
+    /// Build the fusion plan for a rate-1/2 encode of `2^(log_d−1)·num_ntts`
+    /// message words into a `2^log_d·num_ntts` codeword. `None` when the
+    /// fusion is disabled (`FLOCK_NO_SEED_FUSE=1`), the fused kernels are not
+    /// available in this build, a schedule switch it must stay consistent
+    /// with is off, or the shape is unsupported (`log_d < 13` leaves no whole
+    /// class; `log_d` must also fit the standard domain).
+    ///
+    /// `odd_tail` is the trailing zero-lane count skippable on odd rows
+    /// (see [`ZeroOddTailLanes`]); pass 0 for the always-correct dense
+    /// schedule — the skipped lanes are structurally zero either way, so the
+    /// output bytes do not depend on it.
+    pub fn new(log_d: usize, num_ntts: usize, odd_tail: usize) -> Option<Self> {
+        if !seed_fuse_enabled() || !Self::available() {
+            return None;
+        }
+        if log_d < 13 || log_d > 64 || !num_ntts.is_power_of_two() || num_ntts == 0 {
+            return None;
+        }
+        let ntt = AdditiveNttF128::standard(log_d);
+        // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = ntt.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let seed_right = seed_tw[0][2];
+        let seed_dense = seed_tw[1];
+        // Layer 3..7 twiddles exactly as `seed_top_fused8_pass`.
+        let tw4 = std::array::from_fn(|block| {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+            tw[0] = ntt.twiddle(3, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(4, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(5, 4 * block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = ntt.twiddle(6, 8 * block + s);
+            }
+            tw
+        });
+        Some(Self {
+            ntt,
+            log_d,
+            num_ntts,
+            odd_tail: if odd_tail < num_ntts { odd_tail } else { 0 },
+            seed_right,
+            seed_dense,
+            tw4,
+        })
+    }
+
+    pub fn log_d(&self) -> usize {
+        self.log_d
+    }
+    pub fn num_ntts(&self) -> usize {
+        self.num_ntts
+    }
+    /// Number of classes = `2^(log_d − 13)`.
+    pub fn n_classes(&self) -> usize {
+        1usize << (self.log_d - 13)
+    }
+    /// Total seed+top tasks = `2^(log_d − 9)`.
+    pub fn n_tasks(&self) -> usize {
+        1usize << (self.log_d - 9)
+    }
+    /// Per-worker scratch for [`Self::run_task_from_msg`]. Contents may be
+    /// stale/uninit: every element is written by the seed before any read
+    /// (same census as `seed_top_fused8_pass`).
+    pub fn take_task_buf(&self) -> Vec<F128> {
+        staging_block(512, self.num_ntts)
+    }
+
+    /// Run seed+top task `r` — verbatim the
+    /// [`AdditiveNttF128::seed_top_fused8_pass`] task body, reading the flat
+    /// message (for the fused witness generator: the main z buffer) — and
+    /// publish its 512 codeword rows at layer 9.
+    ///
+    /// # Safety
+    /// - `msg` points to `2^(log_d−1) · num_ntts` F128s; the rows this task
+    ///   reads (`(r + k·S) + i·B` for `k ∈ 0..64`, `i ∈ 0..4`) must be fully
+    ///   published — for NT-written rows the writer must have fenced on its
+    ///   own thread and a happens-before edge (e.g. an acquire on the class's
+    ///   retire counter) must reach this caller;
+    /// - `codeword` points to `2^log_d · num_ntts` F128s, 16-byte aligned;
+    /// - `r < n_tasks()`;
+    /// - concurrent calls use distinct `r` (their codeword row sets are then
+    ///   pairwise disjoint) and distinct `buf`s from [`Self::take_task_buf`];
+    ///   concurrent writers of `msg` regions this task does NOT read are fine
+    ///   (raw-pointer reads, no `&`-aliasing is asserted).
+    ///
+    /// On x86_64 the publish uses the same non-temporal row stream as the
+    /// commit's own scatter and issues an `_mm_sfence` before returning, so a
+    /// cross-thread reader is ordered by any subsequent happens-before edge
+    /// (e.g. the rayon join that ends the calling scope).
+    pub unsafe fn run_task_from_msg(
+        &self,
+        msg: *const F128,
+        codeword: *mut F128,
+        r: usize,
+        buf: &mut [F128],
+    ) {
+        let num_ntts = self.num_ntts;
+        let row_len = num_ntts;
+        debug_assert!(r < self.n_tasks());
+        debug_assert!(buf.len() >= 512 * row_len);
+        let block_size = 1usize << (self.log_d - 3); // B, also the seed quarter
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6; // S
+        let sixteenth = block_size >> 4;
+        let quarter = sub_stride;
+        let lanes4_tail = if sixteenth.is_multiple_of(2) { self.odd_tail } else { 0 };
+        let lanes2_tail = if quarter.is_multiple_of(2) { self.odd_tail } else { 0 };
+        let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        let publish_nt =
+            AdditiveNttF128::scatter_nt_enabled() && codeword as usize % 16 == 0;
+        // SAFETY: message rows `(r + k·S) + i·B` (i < 4) lie inside the
+        // `4B = 2^(log_d−1)`-position message; codeword rows `block·B + r +
+        // k·S` lie inside `2^log_d` positions; `buf` is this caller's private
+        // scratch and is fully seed-written before any read.
+        // Message-gather hints, identical schedule to the unfused pass (see
+        // `seed_pf_params`); in the fused schedule the rows were NT-written
+        // by witgen, so they are DRAM-class here exactly as in the unfused
+        // pass and want the same look-ahead.
+        #[cfg(target_arch = "x86_64")]
+        let (pf_dist, pf_lines) = seed_pf_params();
+        unsafe {
+            let bufp = buf.as_mut_ptr();
+            #[cfg(target_arch = "x86_64")]
+            if pf_dist != 0 {
+                for k in 0..pf_dist.min(64) {
+                    pf_msg_rows(msg, r + k * sub_stride, block_size, row_len, pf_lines);
+                }
+            }
+            for k in 0..64 {
+                let r_s = r + k * sub_stride;
+                #[cfg(target_arch = "x86_64")]
+                if pf_dist != 0 && k + pf_dist < 64 {
+                    pf_msg_rows(
+                        msg,
+                        r_s + pf_dist * sub_stride,
+                        block_size,
+                        row_len,
+                        pf_lines,
+                    );
+                }
+                kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                    msg,
+                    block_size,
+                    r_s,
+                    bufp.add(k * row_len),
+                    64,
+                    0,
+                    row_len,
+                    self.seed_right,
+                );
+                kernels::butterfly_fused_2layer_row_from_geo(
+                    msg,
+                    block_size,
+                    r_s,
+                    bufp.add((256 + k) * row_len),
+                    64,
+                    0,
+                    row_len,
+                    &self.seed_dense,
+                );
+            }
+            // Layers 3..9 per block, in the staging block — verbatim
+            // `seed_top_fused8_pass`.
+            for block in 0..8 {
+                let region = bufp.add(block * 64 * row_len);
+                let tw = &self.tw4[block];
+                for j in 0..4 {
+                    let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                    kernels::butterfly_fused_4layer_row(region, 4, row_len, lanes4, j, tw);
+                }
+                for m in 0..16 {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.ntt.twiddle(7, outer_block);
+                    let t_inner_a = self.ntt.twiddle(8, 2 * outer_block);
+                    let t_inner_b = self.ntt.twiddle(8, 2 * outer_block + 1);
+                    let p = region.add(4 * m * row_len);
+                    let a = std::slice::from_raw_parts_mut(p, lanes2);
+                    let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
+                    let c = std::slice::from_raw_parts_mut(p.add(2 * row_len), lanes2);
+                    let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
+                    kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+                }
+            }
+            // Scatter: staging [block][k] → codeword row block·B + r + k·S.
+            #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+            if publish_nt {
+                for block in 0..8 {
+                    for k in 0..64 {
+                        AdditiveNttF128::publish_row_nt(
+                            bufp.add((block * 64 + k) * row_len),
+                            codeword.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                            row_len,
+                        );
+                    }
+                }
+                core::arch::x86_64::_mm_sfence();
+                return;
+            }
+            for block in 0..8 {
+                for k in 0..64 {
+                    core::ptr::copy_nonoverlapping(
+                        bufp.add((block * 64 + k) * row_len),
+                        codeword.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                        row_len,
+                    );
                 }
             }
         }
@@ -2923,6 +3335,77 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    /// Witgen-side seed+top fusion: running every
+    /// [`SeedTopFuse::run_task_from_msg`] (in a scrambled task order, as the
+    /// barrier-free scheduler would) and finishing with the preseeded
+    /// transform must reproduce `rs_encode_interleaved` bit for bit —
+    /// codeword AND the `on_range_done` sub-group coverage. Junk-filled
+    /// candidate buffers catch any "accidentally zero" slot.
+    #[test]
+    fn seed_fuse_tasks_from_msg_match_rs_encode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // (log_d, num_ntts): ranked-like lane count plus narrow/ragged lanes,
+        // one class (log_d 13) and multiple classes (14, 15).
+        for &(log_d, num_ntts) in &[
+            (13usize, 4usize),
+            (13, 8),
+            (14, 8),
+            (13, 64),
+            (14, 64),
+            (15, 2),
+            (13, 1),
+        ] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg_positions = 1usize << (log_d - 1);
+            let mut rng = Rng::new(0xF0_5EED ^ ((log_d as u64) << 8) ^ num_ntts as u64);
+            let msg = rand_vec(&mut rng, msg_positions * num_ntts);
+
+            let mut control = vec![F128::ZERO; msg.len() * 2];
+            ntt.rs_encode_interleaved(&msg, &mut control, num_ntts);
+
+            let fuse = SeedTopFuse::new(log_d, num_ntts, 0)
+                .expect("seed fuse must be constructible in tests at these shapes");
+            assert_eq!(fuse.n_classes(), 1usize << (log_d - 13));
+            assert_eq!(fuse.n_tasks(), 1usize << (log_d - 9));
+
+            let mut candidate = vec![F128::new(u64::MAX, u64::MAX); msg.len() * 2];
+            let mut buf = fuse.take_task_buf();
+            // Scrambled (bit-reversed-ish) task order: the scheduler runs
+            // tasks in class-retirement order, not ascending r; order must
+            // not matter (tasks own disjoint codeword rows).
+            let n_tasks = fuse.n_tasks();
+            for i in 0..n_tasks {
+                let r = (i * 0x9E37 + 7) % n_tasks;
+                // SAFETY: msg fully initialized; candidate is the full
+                // codeword; the r sequence is a permutation of 0..n_tasks
+                // (0x9E37 odd, n_tasks a power of two → i·c+7 mod 2^k is a
+                // bijection).
+                unsafe {
+                    fuse.run_task_from_msg(
+                        msg.as_ptr(),
+                        candidate.as_mut_ptr(),
+                        r,
+                        &mut buf,
+                    );
+                }
+            }
+            let ranges_seen = AtomicUsize::new(0);
+            ntt.transform_preseeded_on_range_done(&mut candidate, num_ntts, &|range, sub| {
+                assert_eq!(sub.len(), range.len() * num_ntts);
+                ranges_seen.fetch_add(range.len(), Ordering::Relaxed);
+            });
+            assert_eq!(
+                ranges_seen.load(Ordering::Relaxed),
+                1usize << log_d,
+                "on_range_done must cover every position (log_d={log_d} n={num_ntts})"
+            );
+            assert_eq!(
+                control, candidate,
+                "seed-fused codeword mismatch at log_d={log_d} num_ntts={num_ntts}"
+            );
+        }
     }
 
     /// The generalized rate-1/2^k encode seed must reproduce, bit for bit,

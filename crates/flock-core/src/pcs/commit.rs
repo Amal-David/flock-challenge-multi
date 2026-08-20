@@ -217,7 +217,35 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    finalize_commit(codeword, z_packed, params)
+    finalize_commit(codeword, z_packed, params, false)
+}
+
+/// Like [`commit_into`], but for a codeword buffer whose layers `0..9` were
+/// already produced during witness generation by the witgen-side seed+top
+/// fusion ([`crate::ntt::additive_ntt_f128::SeedTopFuse`]). The encode skips
+/// its message-reading seed pass entirely and finishes from layer 9
+/// (`AdditiveNttF128::transform_preseeded_*`); everything downstream (deep
+/// pass, Merkle, GPU stream) is the incumbent code. Byte-identical to
+/// [`commit_into`] on the same witness by construction.
+pub fn commit_into_preseeded(params: &PcsParams, codeword: Vec<F128>) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(params.log_inv_rate, 1, "preseeded commit is rate-1/2 only");
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_into_preseeded: codeword buffer has wrong length"
+    );
+    finalize_commit(codeword, &[], params, true)
+}
+
+/// Warm-pool take of a codeword-sized buffer for the witgen-side seed+top
+/// fusion, which must own the buffer BEFORE witness generation starts. `None`
+/// when no pooled buffer of that size is resident (cold first prove) — the
+/// caller then falls back to the incumbent
+/// [`prefault_codeword_during`] + [`commit_into`] shape.
+pub fn try_take_codeword(params: &PcsParams) -> Option<Vec<F128>> {
+    crate::scratch::try_take_f128(params.n_positions() * params.num_ntts())
 }
 
 /// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
@@ -245,6 +273,7 @@ fn finalize_commit(
     mut codeword: Vec<F128>,
     z_packed: &[F128],
     params: &PcsParams,
+    preseeded: bool,
 ) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let ntt = AdditiveNttF128::standard(params.k_code());
@@ -268,6 +297,7 @@ fn finalize_commit(
             N_STREAM_CHUNKS,
             GPU_STOP_NODES,
             timing,
+            preseeded,
         ) {
             return (
                 Commitment {
@@ -318,11 +348,7 @@ fn finalize_commit(
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
-    ntt.rs_encode_interleaved_on_range_done(
-        z_packed,
-        &mut codeword,
-        num_ntts,
-        &|range, sub_data| {
+    let on_range_done = &|range: core::ops::Range<usize>, sub_data: &[F128]| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
             // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
             // the one-shot `merkle_tree` cast in the previous barrier path.
@@ -402,8 +428,12 @@ fn finalize_commit(
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
             }
-        },
-    );
+    };
+    if preseeded {
+        ntt.transform_preseeded_on_range_done(&mut codeword, num_ntts, on_range_done);
+    } else {
+        ntt.rs_encode_interleaved_on_range_done(z_packed, &mut codeword, num_ntts, on_range_done);
+    }
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",
@@ -782,6 +812,7 @@ pub(crate) fn build_upper_levels(
 /// yet, caller falls through to the pure-CPU path). Any failure AFTER the
 /// session starts is repaired here on the CPU (the codeword is always fully
 /// encoded by the CPU regardless of GPU health) and still returns `Some`.
+#[allow(clippy::too_many_arguments)]
 fn gpu_streamed_commit(
     ntt: &AdditiveNttF128,
     codeword: &mut Vec<F128>,
@@ -790,6 +821,7 @@ fn gpu_streamed_commit(
     n_chunks: usize,
     stop_nodes: usize,
     timing: bool,
+    preseeded: bool,
 ) -> Option<(Vec<Hash>, Hash)> {
     use crate::gpu;
 
@@ -865,12 +897,8 @@ fn gpu_streamed_commit(
     let mut gpu_failed = false;
 
     let t_ntt = std::time::Instant::now();
-    ntt.rs_encode_interleaved_streamed(
-        z_packed,
-        codeword,
-        num_ntts,
-        n_chunks,
-        &mut |idx, range| {
+    {
+        let on_chunk = &mut |idx: usize, range: core::ops::Range<usize>| {
             let give_gpu = !gpu_failed && idx < gpu_share;
             if give_gpu && session.commit_leaves(range.start, range.end) {
                 gpu_ranges.push(range);
@@ -882,8 +910,13 @@ fn gpu_streamed_commit(
                 }
                 cpu_ranges.push(range);
             }
-        },
-    );
+        };
+        if preseeded {
+            ntt.transform_preseeded_streamed(codeword, num_ntts, n_chunks, on_chunk);
+        } else {
+            ntt.rs_encode_interleaved_streamed(z_packed, codeword, num_ntts, n_chunks, on_chunk);
+        }
+    }
     let ntt_seconds = t_ntt.elapsed().as_secs_f64();
 
     let codeword_bytes: &[u8] = unsafe { core::slice::from_raw_parts(cw_ptr, cw_len) };
@@ -1492,6 +1525,7 @@ mod tests {
                 &params,
                 N_STREAM_CHUNKS,
                 stop_nodes,
+                false,
                 false,
             )
             .expect("gpu_streamed_commit refused to start (begin() returned None)");

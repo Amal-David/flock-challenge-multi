@@ -1412,6 +1412,35 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
         use_nt,
         use_simd,
         witgen_simd::witgen_ab_nt_enabled(),
+        None,
+    )
+}
+
+/// Seed-fused entry: like
+/// [`generate_witness_with_ab_packed_and_round1_inner_from`], but the witness
+/// pass also produces the commit codeword's layers `0..9` into `codeword`
+/// (see [`generate_round1_inner_octa_seed_fused`]). The caller must have
+/// verified the geometry via [`Blake3Setup::seed_fuse_plan`]-style gating and
+/// must finish the commit with [`flock_core::pcs::commit_into_preseeded`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) fn generate_witness_with_ab_packed_and_round1_inner_from_seed_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    fuse: &flock_core::ntt::additive_ntt_f128::SeedTopFuse,
+    codeword: &mut [F128],
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+        blocks,
+        n_blocks_log,
+        false,
+        true,
+        witgen_simd::witgen_ab_nt_enabled(),
+        Some((fuse, codeword)),
     )
 }
 
@@ -1425,6 +1454,10 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     use_nt: bool,
     use_simd: bool,
     ab_nt: bool,
+    #[allow(unused_mut, unused_variables)] mut seed_fuse: Option<(
+        &flock_core::ntt::additive_ntt_f128::SeedTopFuse,
+        &mut [F128],
+    )>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -1494,18 +1527,62 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         // z-only behaviour on the fused arm (exact same-binary A/B).
         let elide_on = witgen_simd::const_elide_enabled();
         let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
-        generate_round1_inner_octa(
-            blocks,
-            skip_blocks,
-            &mut z,
-            &mut a,
-            &mut b,
-            &mut ab_inner,
-            &inv_table,
-            &padding,
-            [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
-            ab_nt,
-        );
+        let elide = [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide];
+        // Order probe (measurement only): class-major octa order, nothing
+        // else — see `seed_fuse_probe_order_active`. Never taken when a
+        // caller passed the real seed fuse (direct-call tests stay exact).
+        let probe_order = seed_fuse.is_none() && seed_fuse_probe_order_active();
+        if probe_order && n_total < (1 << 11) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[seed-fuse-probe] FLOCK_SEED_FUSE_PROBE=order ignored: \
+                     n_total={n_total} < 2^11 (no whole class); incumbent order runs"
+                );
+            });
+        }
+        if probe_order && n_total >= (1 << 11) {
+            generate_round1_inner_octa_order_probe(
+                blocks,
+                skip_blocks,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                elide,
+                ab_nt,
+            );
+        } else if let Some((fuse, codeword)) = seed_fuse.take() {
+            generate_round1_inner_octa_seed_fused(
+                blocks,
+                skip_blocks,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                elide,
+                ab_nt,
+                fuse,
+                codeword,
+            );
+        } else {
+            generate_round1_inner_octa(
+                blocks,
+                skip_blocks,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                elide,
+                ab_nt,
+            );
+        }
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
         // shared `&[u8]` views only, so the buffers reach their release
@@ -1531,6 +1608,13 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let _ = (ab_nt, a_tok, b_tok, z_tok);
+    // The seed fuse ONLY exists on the 8-wide octa arm above; a caller whose
+    // gates let it reach the scalar/NT fallbacks would leave the codeword
+    // unseeded — fail loudly rather than commit garbage.
+    assert!(
+        seed_fuse.is_none(),
+        "seed fuse requires the 8-wide AVX2 witgen path (gate bug)"
+    );
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -1868,6 +1952,482 @@ fn generate_round1_inner_octa(
                 }
             },
         );
+}
+
+/// MEASUREMENT INSTRUMENT, not a ship candidate: `FLOCK_SEED_FUSE_PROBE=order`
+/// isolates the octa processing ORDER as a single variable. Witness
+/// generation runs over the main buffers exactly as the incumbent does —
+/// same octa internals, no staging writes, no seed tasks, ONE rayon region
+/// with the incumbent's item shape (2 octas + 1 fence per item, same item
+/// count, same per-item 32 KiB window) — except items walk octas class-major
+/// (the fused schedule's order: consecutive octas `n_classes` apart) instead
+/// of sequentially. The commit runs the incumbent unfused encode
+/// ([`Blake3Setup::seed_fuse_plan`] yields to the probe). Every output byte
+/// is identical; only WHERE consecutive NT writes land changes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn seed_fuse_probe_order_active() -> bool {
+    #[cfg(test)]
+    if PROBE_ORDER_TEST_FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var_os("FLOCK_SEED_FUSE_PROBE"), Some(v) if v == "order")
+    });
+    *ON
+}
+
+/// Test-only latch for the order probe, so one process can A/B probe vs
+/// incumbent without fighting the env LazyLock.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", test))]
+static PROBE_ORDER_TEST_FORCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `FLOCK_SEED_FUSE_PROBE=order` driver (see
+/// [`seed_fuse_probe_order_active`]). Byte-identical to
+/// [`generate_round1_inner_octa`]: per-octa work is verbatim (dump, window
+/// projection, elide, fence cadence of one per two octas); the ONLY delta is
+/// that item `t` processes octas `(u + 2jj·n_classes, u + (2jj+1)·n_classes)`
+/// (`u = t / (SLOTS/2)`, `jj = t % (SLOTS/2)`) instead of `(2t, 2t+1)`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_order_probe(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+) {
+    use flock_core::ntt::additive_ntt_f128::SeedTopFuse;
+    use rayon::prelude::*;
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
+    const SIMD: usize = 8;
+    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
+    const SLOTS: usize = SeedTopFuse::OCTAS_PER_CLASS; // 256 octas per class
+
+    let n_total = z.len() / F128_PER_BLOCK;
+    let n_octas = n_total / SIMD;
+    assert!(n_octas >= SLOTS && n_octas % SLOTS == 0, "probe needs whole classes");
+    let n_classes = n_octas / SLOTS;
+    let octa_f128 = SIMD * F128_PER_BLOCK;
+    let octa_bytes = SIMD * BYTES_PER_BLOCK;
+
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+
+    let z_addr = z.as_mut_ptr() as usize;
+    let a_addr = a.as_mut_ptr() as usize;
+    let b_addr = b.as_mut_ptr() as usize;
+    let ab_addr = ab_inner.as_bytes_mut().as_mut_ptr() as usize;
+
+    // One region, incumbent item shape: 2 octas per item, n_octas/2 items.
+    (0..n_octas / 2).into_par_iter().for_each_init(
+        || {
+            let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+            if ab_nt {
+                v.reserve_exact(WIN_LINES);
+                // SAFETY: `MaybeUninit` needs no initialization.
+                unsafe { v.set_len(WIN_LINES) };
+            }
+            v
+        },
+        |win, t| {
+            let u = t / (SLOTS / 2);
+            let jj = t % (SLOTS / 2);
+            for half in 0..2 {
+                let o = u + (2 * jj + half) * n_classes;
+                let base = o * SIMD;
+                let win_ab = if ab_nt {
+                    let wa = win.as_mut_ptr().cast::<u32>();
+                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+                    Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+                } else {
+                    None
+                };
+                // SAFETY: same contracts as `generate_round1_inner_octa`;
+                // (u, jj, half) → o is injective, so every octa's regions are
+                // written by exactly one item.
+                unsafe {
+                    let staged: [Compression; SIMD];
+                    let octa: [&Compression; SIMD] = match blocks {
+                        crate::seed_pipe::BlockSource::Slice(s) => {
+                            std::array::from_fn(|q| s.get(base + q).unwrap_or(padding))
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len } => {
+                            staged = std::array::from_fn(|q| {
+                                let idx = base + q;
+                                if idx < len {
+                                    crate::seed_pipe::gen_block(init, idx)
+                                } else {
+                                    *padding
+                                }
+                            });
+                            std::array::from_fn(|q| &staged[q])
+                        }
+                    };
+                    let off = o * octa_f128;
+                    blake3_witgen8::build_octa_witness_ab_stream_elide(
+                        octa,
+                        (z_addr as *mut F128).add(off).cast::<u32>(),
+                        (a_addr as *mut F128).add(off).cast::<u32>(),
+                        (b_addr as *mut F128).add(off).cast::<u32>(),
+                        win_ab,
+                        elide,
+                        z_nt,
+                    );
+                    let ab_octa = std::slice::from_raw_parts_mut(
+                        (ab_addr as *mut u8).add(o * octa_bytes),
+                        octa_bytes,
+                    );
+                    for q in 0..SIMD {
+                        if base + q < skip_blocks {
+                            continue;
+                        }
+                        let (a_bytes, b_bytes) = match win_ab {
+                            Some((win_a, win_b)) => (
+                                std::slice::from_raw_parts(
+                                    win_a.add(q * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                ),
+                                std::slice::from_raw_parts(
+                                    win_b.add(q * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                ),
+                            ),
+                            None => (
+                                std::slice::from_raw_parts(
+                                    (a_addr as *const F128)
+                                        .add(off + q * F128_PER_BLOCK)
+                                        .cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                ),
+                                std::slice::from_raw_parts(
+                                    (b_addr as *const F128)
+                                        .add(off + q * F128_PER_BLOCK)
+                                        .cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                ),
+                            ),
+                        };
+                        let ab_blk =
+                            &mut ab_octa[q * BYTES_PER_BLOCK..(q + 1) * BYTES_PER_BLOCK];
+                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                        );
+                    }
+                }
+            }
+            // Incumbent fence cadence: once per item (= per two octas).
+            if abinner_nt || z_nt || ab_nt {
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            }
+        },
+    );
+}
+
+/// Classes-in-flight cap for the barrier-free seed fuse: when the witgen
+/// cursor has entered a class this many classes ahead of the seeded count,
+/// units prefer draining ready seed classes over claiming new witgen items.
+/// A producer that runs too far ahead lets pending seed work pile up to the
+/// end of the phase; the knob is the box's tuning surface.
+/// `FLOCK_SEED_FUSE_INFLIGHT=N` overrides (1..=1024, default 4).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn seed_fuse_inflight() -> usize {
+    #[cfg(test)]
+    {
+        let v = SEED_FUSE_INFLIGHT_TEST.load(std::sync::atomic::Ordering::Relaxed);
+        if v != 0 {
+            return v;
+        }
+    }
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_SEED_FUSE_INFLIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v| (1..=1024).contains(v))
+            .unwrap_or(4)
+    });
+    *V
+}
+
+/// Test-only override for [`seed_fuse_inflight`] (0 = none), so one process
+/// can force the backpressure branch on small shapes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", test))]
+static SEED_FUSE_INFLIGHT_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// Per-worker scratch for the seed-fuse NTT tasks (512 rows x `num_ntts`).
+// Thread-local so it lives across work units without per-unit allocation;
+// write-before-read, so stale contents are fine.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+thread_local! {
+    static SEED_TASK_BUF: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Barrier-free seed-fused twin of [`generate_round1_inner_octa`].
+///
+/// ONE rayon region; no staging buffers; no bout barriers. Witness items run
+/// in class-major octa order (the exact order `FLOCK_SEED_FUSE_PROBE=order`
+/// measured at +0.4 ms vs the incumbent) claimed from an ascending atomic
+/// cursor, so classes start and finish nearly in order. Each item is the
+/// incumbent shape - 2 octas + 1 fence - and, after its fence, decrements its
+/// class's retire counter (AcqRel); the item that closes a class pushes the
+/// class onto a ready queue. Work units prefer a ready class's sixteen
+/// seed+top NTT tasks whenever the producer is `FLOCK_SEED_FUSE_INFLIGHT`
+/// classes ahead of the seeded count (or out of witgen work); the seed tasks
+/// read the class's z rows straight from the main witness buffer
+/// ([`SeedTopFuse::run_task_from_msg`] - sfence-then-AcqRel-then-Mutex is the
+/// happens-before chain for the NT-published rows) and publish the codeword
+/// at layer 9. The commit then finishes with
+/// [`flock_core::pcs::commit_into_preseeded`].
+///
+/// Unit accounting: the region has `n_items + n_classes` units and exactly
+/// that many work pieces behind shared cursors; every unit claims exactly one
+/// piece, so no unit can exit while work remains and the only join is the
+/// region's own. A unit spins (bounded by the last in-flight witgen items)
+/// only once the witgen cursor is exhausted and no class is ready yet.
+///
+/// Byte identity: every octa runs the identical incumbent internals, the
+/// octa->memory mapping is fixed by index, and seed tasks own pairwise
+/// disjoint codeword rows - z/a/b/ab_inner and the codeword are
+/// schedule-invariant (asserted in
+/// `seed_fused_witgen_matches_incumbent_and_commit`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_seed_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    fuse: &flock_core::ntt::additive_ntt_f128::SeedTopFuse,
+    codeword: &mut [F128],
+) {
+    use flock_core::ntt::additive_ntt_f128::SeedTopFuse;
+    use rayon::prelude::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
+    const SIMD: usize = 8;
+    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
+    // Witgen items per class: 2 octas per item, the incumbent task shape.
+    const ITEMS_PER_CLASS: usize = SeedTopFuse::OCTAS_PER_CLASS / 2;
+
+    let n_total = z.len() / F128_PER_BLOCK;
+    let n_octas = n_total / SIMD;
+    let n_classes = fuse.n_classes();
+    let num_ntts = fuse.num_ntts();
+    assert_eq!(2 * num_ntts, F128_PER_BLOCK, "seed fuse: 2 msg rows per block");
+    assert_eq!(n_octas, n_classes * SeedTopFuse::OCTAS_PER_CLASS);
+    assert_eq!(codeword.len(), 2 * z.len());
+    assert!(witgen_simd::witgen_z_nt_enabled(), "seed fuse requires the NT z drain");
+    let octa_f128 = SIMD * F128_PER_BLOCK;
+    let octa_bytes = SIMD * BYTES_PER_BLOCK;
+    let n_items = n_octas / 2;
+    let n_units = n_items + n_classes;
+    let inflight = seed_fuse_inflight();
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+
+    // Carry addresses as integers (raw pointers are not Sync). Each item owns
+    // its two octas' disjoint z/a/b/ab_inner regions; each seed task owns
+    // disjoint codeword rows; the seed source reads only fully retired,
+    // fenced z regions.
+    let z_addr = z.as_mut_ptr() as usize;
+    let a_addr = a.as_mut_ptr() as usize;
+    let b_addr = b.as_mut_ptr() as usize;
+    let ab_addr = ab_inner.as_bytes_mut().as_mut_ptr() as usize;
+    let cw_addr = codeword.as_mut_ptr() as usize;
+
+    // Scheduler state.
+    let witgen_cursor = AtomicUsize::new(0);
+    let retire: Vec<AtomicUsize> =
+        (0..n_classes).map(|_| AtomicUsize::new(ITEMS_PER_CLASS)).collect();
+    let ready: Mutex<Vec<usize>> = Mutex::new(Vec::with_capacity(n_classes));
+    let classes_seeded = AtomicUsize::new(0);
+
+    let run_witgen_item = |win: &mut Vec<core::mem::MaybeUninit<AbWinLine>>, t: usize| {
+        let u = t / ITEMS_PER_CLASS;
+        let jj = t % ITEMS_PER_CLASS;
+        for half in 0..2 {
+            let o = u + (2 * jj + half) * n_classes;
+            let base = o * SIMD;
+            let win_ab = if ab_nt {
+                debug_assert_eq!(win.len(), WIN_LINES);
+                let wa = win.as_mut_ptr().cast::<u32>();
+                // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+                Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+            } else {
+                None
+            };
+            // SAFETY: crate compiled with AVX2; (u, jj, half) -> o is
+            // injective, so octa o's 8 contiguous 512-word blocks of
+            // z/a/b/ab_inner are written by exactly one item.
+            unsafe {
+                let staged: [Compression; SIMD];
+                let octa: [&Compression; SIMD] = match blocks {
+                    crate::seed_pipe::BlockSource::Slice(s) => {
+                        std::array::from_fn(|q| s.get(base + q).unwrap_or(padding))
+                    }
+                    crate::seed_pipe::BlockSource::Closed { init, len } => {
+                        staged = std::array::from_fn(|q| {
+                            let idx = base + q;
+                            if idx < len {
+                                crate::seed_pipe::gen_block(init, idx)
+                            } else {
+                                *padding
+                            }
+                        });
+                        std::array::from_fn(|q| &staged[q])
+                    }
+                };
+                let off = o * octa_f128;
+                blake3_witgen8::build_octa_witness_ab_stream_elide(
+                    octa,
+                    (z_addr as *mut F128).add(off).cast::<u32>(),
+                    (a_addr as *mut F128).add(off).cast::<u32>(),
+                    (b_addr as *mut F128).add(off).cast::<u32>(),
+                    win_ab,
+                    elide,
+                    true,
+                );
+                // Projection, same per-block bytes and ascending order within
+                // the octa as the incumbent.
+                let ab_octa = std::slice::from_raw_parts_mut(
+                    (ab_addr as *mut u8).add(o * octa_bytes),
+                    octa_bytes,
+                );
+                for q in 0..SIMD {
+                    if base + q < skip_blocks {
+                        continue;
+                    }
+                    let (a_bytes, b_bytes) = match win_ab {
+                        // Fused arm: L1-hot windows.
+                        Some((win_a, win_b)) => (
+                            std::slice::from_raw_parts(
+                                win_a.add(q * U32_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            ),
+                            std::slice::from_raw_parts(
+                                win_b.add(q * U32_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            ),
+                        ),
+                        // Incumbent arm: a/b dumped temporally above;
+                        // same-thread read-back.
+                        None => (
+                            std::slice::from_raw_parts(
+                                (a_addr as *const F128)
+                                    .add(off + q * F128_PER_BLOCK)
+                                    .cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            ),
+                            std::slice::from_raw_parts(
+                                (b_addr as *const F128)
+                                    .add(off + q * F128_PER_BLOCK)
+                                    .cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            ),
+                        ),
+                    };
+                    let ab_blk = &mut ab_octa[q * BYTES_PER_BLOCK..(q + 1) * BYTES_PER_BLOCK];
+                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                    );
+                }
+            }
+        }
+        // NT publish fence BEFORE the retire: the sfence orders this item's
+        // z (and a/b/ab_inner) streams on this thread; the AcqRel decrement
+        // and - for the class-closing item - the Mutex'd push then carry the
+        // happens-before to whichever unit seeds the class.
+        flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+        if retire[u].fetch_sub(1, Ordering::AcqRel) == 1 {
+            ready.lock().unwrap().push(u);
+        }
+    };
+
+    let run_seed_class = |u: usize| {
+        SEED_TASK_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < 512 * num_ntts {
+                *buf = fuse.take_task_buf();
+            }
+            for tsk in 0..SeedTopFuse::TASKS_PER_CLASS {
+                let r = u * SeedTopFuse::TASKS_PER_CLASS + tsk;
+                // SAFETY: class u fully retired and fenced (ready-queue
+                // hand-off above); distinct r -> disjoint codeword rows;
+                // buf is thread-local.
+                unsafe {
+                    fuse.run_task_from_msg(
+                        z_addr as *const F128,
+                        cw_addr as *mut F128,
+                        r,
+                        &mut buf,
+                    );
+                }
+            }
+        });
+        classes_seeded.fetch_add(1, Ordering::Release);
+    };
+
+    (0..n_units).into_par_iter().for_each_init(
+        || {
+            // Same uninit per-worker a/b window allocation as the incumbent
+            // loop (write-before-read; see there).
+            let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+            if ab_nt {
+                v.reserve_exact(WIN_LINES);
+                // SAFETY: `MaybeUninit` needs no initialization.
+                unsafe { v.set_len(WIN_LINES) };
+            }
+            v
+        },
+        |win, _unit| {
+            loop {
+                let claimed = witgen_cursor.load(Ordering::Relaxed).min(n_items);
+                let witgen_left = claimed < n_items;
+                let backpressured = (claimed / ITEMS_PER_CLASS)
+                    .saturating_sub(classes_seeded.load(Ordering::Relaxed))
+                    >= inflight;
+                if backpressured || !witgen_left {
+                    let popped = ready.lock().unwrap().pop();
+                    if let Some(u) = popped {
+                        run_seed_class(u);
+                        return;
+                    }
+                }
+                if witgen_left {
+                    let t = witgen_cursor.fetch_add(1, Ordering::Relaxed);
+                    if t < n_items {
+                        run_witgen_item(win, t);
+                        return;
+                    }
+                    continue; // lost the race for the last item
+                }
+                // Witgen exhausted, nothing ready: either everything is done
+                // (unreachable under exact unit accounting; safety net) or a
+                // straggler item is about to retire a class - spin briefly.
+                if classes_seeded.load(Ordering::Acquire) == n_classes {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        },
+    );
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -3182,6 +3742,44 @@ impl Blake3Setup {
         setup.prove_fast_inner(blocks, &mut challenger)
     }
 
+    /// Witgen-side seed+top fusion plan for THIS setup's exact geometry, or
+    /// `None` when any gate is off (then the incumbent
+    /// prefault + `commit_into` shape runs, byte-identically).
+    ///
+    /// Prover-side gates: the 8-wide AVX2 octa witgen with the NT z drain
+    /// (the fusion's dual z drain lives there), power-of-two block count with
+    /// `n_blocks ≥ 2^11` (at least one whole class), and the ranked commit
+    /// geometry (rate 1/2, 64 lanes, 2 message rows per block). Core-side
+    /// gates (FLOCK_NO_SEED_FUSE, fused-kernel availability, NTT schedule
+    /// switches) live in `SeedTopFuse::new`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn seed_fuse_plan(&self) -> Option<flock_core::ntt::additive_ntt_f128::SeedTopFuse> {
+        // The order probe takes priority: witgen runs class-major over the
+        // main buffers only (impl_tuned dispatches), no codeword is taken and
+        // the commit runs the incumbent unfused encode.
+        if seed_fuse_probe_order_active() {
+            return None;
+        }
+        if !live_witgen_simd_enabled() || !witgen_simd::witgen_z_nt_enabled() {
+            return None;
+        }
+        if !self.n_blocks.is_power_of_two() {
+            return None;
+        }
+        let nbl = self.n_blocks_log();
+        if nbl < 11 {
+            return None;
+        }
+        if self.pcs_params.log_inv_rate != 1
+            || self.pcs_params.num_ntts() != 64
+            || self.pcs_params.log_msg_len() != nbl + K_LOG - 7
+        {
+            return None;
+        }
+        let log_d = self.pcs_params.k_code(); // = nbl + 2 given the above
+        flock_core::ntt::additive_ntt_f128::SeedTopFuse::new(log_d, 64, 0)
+    }
+
     fn prove_fast_inner<Ch: Challenger>(
         &self,
         blocks: crate::seed_pipe::BlockSource<'_>,
@@ -3193,14 +3791,37 @@ impl Blake3Setup {
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
-                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        // Witgen-side seed+top fusion: needs the codeword
+                        // buffer up front (warm pool only — the ranked
+                        // worker's untimed warm-up parks it), and produces
+                        // the codeword's layers 0..9 during witness
+                        // generation so the commit never re-reads the packed
+                        // witness for its seed pass. `FLOCK_NO_SEED_FUSE=1`
+                        // (or any gate miss) restores the incumbent shape.
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                        if let Some(fuse) = self.seed_fuse_plan() {
+                            if let Some(mut cw) =
+                                flock_core::pcs::try_take_codeword(&self.pcs_params)
+                            {
+                                let w =
+                                    generate_witness_with_ab_packed_and_round1_inner_from_seed_fused(
+                                        blocks,
+                                        self.n_blocks_log(),
+                                        &fuse,
+                                        &mut cw,
+                                    );
+                                flock_core::gaptime::mark("witness: work done (seed-fused)");
+                                return (Some(crate::prover::CodewordBuf::Preseeded(cw)), w);
+                            }
+                        }
+                        let (cw, r) = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                             generate_witness_with_ab_packed_and_round1_inner_from(
                                 blocks,
                                 self.n_blocks_log(),
                             )
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
-                        r
+                        (cw.map(crate::prover::CodewordBuf::Prefaulted), r)
                     });
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.r1cs.csc_lincheck_circuit();
@@ -4040,6 +4661,7 @@ mod tests {
                     false,
                     true,
                     true,
+                    None,
                 );
             let (z_t, a_t, b_t, mut ab_t) =
                 generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
@@ -4048,6 +4670,7 @@ mod tests {
                     false,
                     true,
                     false,
+                    None,
                 );
 
             assert_eq!(z_f, z_t, "z mismatch, n_blocks={n_blocks}");
@@ -4319,6 +4942,94 @@ mod tests {
         assert_eq!(ab_s.as_bytes_mut(), ab_c.as_bytes_mut());
     }
 
+    /// Seed-fuse cross check (the FLOCK_NO_SEED_FUSE on/off pair, expressed
+    /// through the explicit path toggle so one process runs both arms):
+    /// the seed-fused witgen must leave EVERY witness artifact byte-identical
+    /// to the incumbent (z — the buffer zerocheck later re-reads — plus a, b,
+    /// ab_inner), and the preseeded commit finish on its codeword must be
+    /// bit-identical (codeword, full Merkle tree, root) to the incumbent
+    /// `commit_into` on the incumbent z. Shapes: one class (nbl=11) and two
+    /// classes with half the slots padding (nbl=12, ragged block count).
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn seed_fused_witgen_matches_incumbent_and_commit() {
+        use crate::seed_pipe::{BlockSource, generate_compressions_par};
+        use flock_core::ntt::additive_ntt_f128::SeedTopFuse;
+        use std::sync::atomic::Ordering;
+        // (padding shape, forced inflight override): default scheduling on
+        // both shapes, plus inflight=1 to force the backpressure branch, on
+        // the starvation shape (one class, every seed unit waits for the last
+        // witgen straggler) and the two-class padded shape.
+        for &(nbl_extra, inflight) in &[(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            let log2 = 11u32;
+            let seed = 0x5EED_F05E ^ nbl_extra as u64 ^ ((inflight as u64) << 8);
+            let blocks = generate_compressions_par(log2, seed);
+            let nbl = min_n_blocks_log(blocks.len()) + nbl_extra;
+            SEED_FUSE_INFLIGHT_TEST.store(inflight, Ordering::Relaxed);
+            let ab_nt = witgen_simd::witgen_ab_nt_enabled();
+            let (z0, a0, b0, mut ab0) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    BlockSource::Slice(&blocks),
+                    nbl,
+                    false,
+                    true,
+                    ab_nt,
+                    None,
+                );
+            let params = flock_core::pcs::PcsParams {
+                m: K_LOG + nbl,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: Default::default(),
+                merkle_hash: Default::default(),
+            };
+            assert_eq!(params.k_code(), nbl + 2);
+            let Some(fuse) = SeedTopFuse::new(nbl + 2, 64, 0) else {
+                // Non-AVX-512 build without the force override (or a
+                // schedule switch is off): nothing to cross-check.
+                eprintln!(
+                    "skipping seed-fuse cross check: SeedTopFuse unavailable \
+                     (set FLOCK_SEED_FUSE_FORCE=1 on non-AVX-512 hosts)"
+                );
+                return;
+            };
+            let cw_len = params.codeword_len_f128();
+            let mut cw = vec![F128::new(u64::MAX, u64::MAX); cw_len];
+            let (z1, a1, b1, mut ab1) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    BlockSource::Slice(&blocks),
+                    nbl,
+                    false,
+                    true,
+                    ab_nt,
+                    Some((&fuse, &mut cw)),
+                );
+            assert_eq!(z0, z1, "z must remain byte-identical (nbl={nbl})");
+            assert_eq!(a0, a1, "a mismatch (nbl={nbl})");
+            assert_eq!(b0, b1, "b mismatch (nbl={nbl})");
+            assert_eq!(
+                ab0.as_bytes_mut(),
+                ab1.as_bytes_mut(),
+                "ab_inner mismatch (nbl={nbl})"
+            );
+            // Incumbent commit vs preseeded finish, junk-filled incumbent
+            // buffer so an "accidentally equal" stale slot cannot pass.
+            let junk = vec![F128::new(0xAAAA_AAAA, 0x5555_5555); cw_len];
+            let (c0, pd0) = flock_core::pcs::commit_into(&z0, &params, junk);
+            let (c1, pd1) = flock_core::pcs::commit_into_preseeded(&params, cw);
+            assert_eq!(
+                pd0.codeword, pd1.codeword,
+                "codeword mismatch (nbl={nbl} inflight={inflight})"
+            );
+            assert_eq!(
+                pd0.merkle_tree, pd1.merkle_tree,
+                "tree mismatch (nbl={nbl} inflight={inflight})"
+            );
+            assert_eq!(c0.root, c1.root, "root mismatch (nbl={nbl} inflight={inflight})");
+            SEED_FUSE_INFLIGHT_TEST.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Full-buffer oracle at m = 20 (64 blocks): the fused round1_inner
     /// generator's (z, a, b) must be byte-identical to
     /// `generate_witness_with_ab_packed`, and its streamed ab_inner must be
@@ -4570,6 +5281,148 @@ mod tests {
             .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("ligerito verify rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
+    }
+
+    /// The order probe (`FLOCK_SEED_FUSE_PROBE=order`) must be a pure
+    /// re-ordering: z/a/b/ab_inner byte-identical to the incumbent's, at a
+    /// one-class shape and a padded two-class shape.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn seed_fuse_order_probe_matches_incumbent() {
+        use crate::seed_pipe::{BlockSource, generate_compressions_par};
+        use std::sync::atomic::Ordering;
+        for &nbl_extra in &[0usize, 1] {
+            let blocks = generate_compressions_par(11, 0x0BDE_0000 ^ nbl_extra as u64);
+            let nbl = min_n_blocks_log(blocks.len()) + nbl_extra;
+            let ab_nt = witgen_simd::witgen_ab_nt_enabled();
+            let (z0, a0, b0, mut ab0) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    BlockSource::Slice(&blocks),
+                    nbl,
+                    false,
+                    true,
+                    ab_nt,
+                    None,
+                );
+            PROBE_ORDER_TEST_FORCE.store(true, Ordering::Relaxed);
+            let (z1, a1, b1, mut ab1) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    BlockSource::Slice(&blocks),
+                    nbl,
+                    false,
+                    true,
+                    ab_nt,
+                    None,
+                );
+            PROBE_ORDER_TEST_FORCE.store(false, Ordering::Relaxed);
+            assert_eq!(z0, z1, "probe z mismatch (nbl={nbl})");
+            assert_eq!(a0, a1, "probe a mismatch (nbl={nbl})");
+            assert_eq!(b0, b1, "probe b mismatch (nbl={nbl})");
+            assert_eq!(
+                ab0.as_bytes_mut(),
+                ab1.as_bytes_mut(),
+                "probe ab_inner mismatch (nbl={nbl})"
+            );
+        }
+    }
+
+    /// Full-prove transcript oracle for the witgen-side seed+top fusion: at
+    /// m = 25 (2^11 blocks, one class) the proof built from the seed-fused
+    /// witness + preseeded commit (`CodewordBuf::Preseeded`) must be
+    /// byte-identical to the incumbent chain's proof, and must verify.
+    /// On non-AVX-512 hosts run with `FLOCK_SEED_FUSE_FORCE=1` (portable
+    /// kernels; bytes identical). Run alone in release:
+    /// `cargo test seed_fused_prove_bytes_identical -- --ignored --exact`
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    #[ignore] // moderately heavy full double-prove; run alone in release
+    fn seed_fused_prove_bytes_identical() {
+        use crate::seed_pipe::BlockSource;
+        use flock_core::challenger::FsChallenger;
+        use flock_core::ntt::additive_ntt_f128::SeedTopFuse;
+        let n_blocks = 1usize << 11;
+        let setup = Blake3Setup::new(n_blocks);
+        assert_eq!(setup.m(), 25);
+        let mut rng = Rng::new(0x5EED_FA5E);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, 0u64, 64u32, 11u32)
+            })
+            .collect();
+        let nbl = setup.n_blocks_log();
+        let ab_nt = witgen_simd::witgen_ab_nt_enabled();
+
+        // Incumbent arm: unfused witness, commit encodes from z.
+        let (z0, a0, b0, ab0) = generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+            BlockSource::Slice(&blocks),
+            nbl,
+            false,
+            true,
+            ab_nt,
+            None,
+        );
+        let lc0 = setup.r1cs.csc_lincheck_circuit();
+        let mut ch0 = FsChallenger::new(b"flock-blake3-seedfuse-ab");
+        let (proof0, commit0, claim0) =
+            crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z0,
+                a0,
+                b0,
+                ab0,
+                lc0,
+                None,
+                &mut ch0,
+            );
+
+        // Fused arm: seed-fused witness, preseeded commit finish.
+        let Some(fuse) = SeedTopFuse::new(setup.pcs_params.k_code(), 64, 0) else {
+            eprintln!(
+                "skipping seed-fuse prove oracle: SeedTopFuse unavailable \
+                 (set FLOCK_SEED_FUSE_FORCE=1 on non-AVX-512 hosts)"
+            );
+            return;
+        };
+        let mut cw =
+            vec![F128::new(u64::MAX, u64::MAX); setup.pcs_params.codeword_len_f128()];
+        let (z1, a1, b1, ab1) = generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+            BlockSource::Slice(&blocks),
+            nbl,
+            false,
+            true,
+            ab_nt,
+            Some((&fuse, &mut cw)),
+        );
+        let lc1 = setup.r1cs.csc_lincheck_circuit();
+        let mut ch1 = FsChallenger::new(b"flock-blake3-seedfuse-ab");
+        let (proof1, commit1, claim1) =
+            crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z1,
+                a1,
+                b1,
+                ab1,
+                lc1,
+                Some(crate::prover::CodewordBuf::Preseeded(cw)),
+                &mut ch1,
+            );
+
+        assert_eq!(commit0.root, commit1.root, "commit root");
+        assert_eq!(claim0, claim1, "claims");
+        assert_eq!(
+            bincode::serialize(&proof0).unwrap(),
+            bincode::serialize(&proof1).unwrap(),
+            "seed-fused proof must be byte-identical to the incumbent's"
+        );
+        let mut ch_v = FsChallenger::new(b"flock-blake3-seedfuse-ab");
+        let claim_v = setup
+            .verify(&commit1, &proof1, &mut ch_v)
+            .unwrap_or_else(|e| panic!("verify rejected seed-fused proof: {e:?}"));
+        assert_eq!(claim1, claim_v);
     }
 
     /// Transcript oracle for the opt-in merged pcs-combine kernel: at m = 29

@@ -365,6 +365,31 @@ pub fn prove_ligerito<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
+/// A commit codeword buffer handed in ahead of the commit phase.
+///
+/// `Prefaulted`: an allocated/resident buffer whose CONTENTS are arbitrary —
+/// the commit encodes into it from the packed witness
+/// ([`pcs::commit_into`]); the incumbent
+/// [`pcs::prefault_codeword_during`] shape.
+///
+/// `Preseeded`: the witgen-side seed+top fusion already produced layers
+/// `0..9` of the rate-1/2 encode in it
+/// ([`flock_core::ntt::additive_ntt_f128::SeedTopFuse`]); the commit finishes
+/// from layer 9 ([`pcs::commit_into_preseeded`]) and never re-reads the
+/// packed witness for its seed pass. Byte-identical commitment either way.
+pub enum CodewordBuf {
+    Prefaulted(Vec<F128>),
+    Preseeded(Vec<F128>),
+}
+
+impl CodewordBuf {
+    fn as_slice(&self) -> &[F128] {
+        match self {
+            CodewordBuf::Prefaulted(v) | CodewordBuf::Preseeded(v) => v.as_slice(),
+        }
+    }
+}
+
 /// Shared `prove_fast` pipeline for the monolithic hash R1CS modules. Takes
 /// the four packed buffers produced by the per-hash
 /// `generate_witness_with_ab_packed_and_lincheck` and runs commit → zerocheck
@@ -390,7 +415,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
-        prefaulted_codeword,
+        prefaulted_codeword.map(CodewordBuf::Prefaulted),
         challenger,
     )
 }
@@ -418,7 +443,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         None,
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
-        prefaulted_codeword,
+        prefaulted_codeword.map(CodewordBuf::Prefaulted),
         challenger,
     )
 }
@@ -435,7 +460,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
     b_packed_f128: Vec<F128>,
     ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    codeword: Option<CodewordBuf>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_inner(
@@ -447,7 +472,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         Some(ab_inner),
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
-        prefaulted_codeword,
+        codeword,
         challenger,
     )
 }
@@ -462,7 +487,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<CodewordBuf>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -587,7 +612,7 @@ fn commit_with_round1_ab_precompute(
     b_packed_f128: &[F128],
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<CodewordBuf>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -604,7 +629,8 @@ fn commit_with_round1_ab_precompute(
 
     rayon::join(
         || match prefaulted_codeword {
-            Some(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            Some(CodewordBuf::Prefaulted(buf)) => pcs::commit_into(z_packed, pcs_params, buf),
+            Some(CodewordBuf::Preseeded(buf)) => pcs::commit_into_preseeded(pcs_params, buf),
             None => pcs::commit(z_packed, pcs_params),
         },
         || {
@@ -710,7 +736,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
-        prefaulted_codeword,
+        prefaulted_codeword.map(CodewordBuf::Prefaulted),
         challenger,
     )
 }
@@ -725,7 +751,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: Option<CodewordBuf>,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -741,7 +767,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         &a_packed_f128,
         &b_packed_f128,
         &z_packed,
-        prefaulted_codeword.as_deref(),
+        prefaulted_codeword.as_ref().map(|c| c.as_slice()),
     );
     flock_core::gaptime::mark("core: gpu prewire spawned");
     // The BLAKE3 padding rows force every block's tail words to zero, which in
@@ -762,7 +788,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = match prefaulted_codeword {
-                Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+                Some(CodewordBuf::Prefaulted(buf)) => pcs::commit_into(&z_packed, pcs_params, buf),
+                Some(CodewordBuf::Preseeded(buf)) => pcs::commit_into_preseeded(pcs_params, buf),
                 None => pcs::commit(&z_packed, pcs_params),
             };
             flock_core::gaptime::mark("commit: work done");
@@ -1038,7 +1065,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             &b_packed_f128,
             pcs_params,
             &padding,
-            prefaulted_codeword,
+            prefaulted_codeword.map(CodewordBuf::Prefaulted),
         )
     });
     t.commit_s = t0.elapsed().as_secs_f64();
