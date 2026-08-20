@@ -953,33 +953,33 @@ fn lc_alpha_overlap_enabled() -> bool {
 
 /// Chunks of look-ahead for the grouped block-major gather prefetch. One
 /// grouped visit consumes four F128 chunks = one 64-byte line per row, so
-/// `8` is two visits (two lines) ahead on the SAME eight rows.
+/// `4` is the next visit's line on the SAME eight rows.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-const LC_ZFOLD_PF_CHUNKS: usize = 8;
+const LC_ZFOLD_PF_CHUNKS: usize = 4;
 
 /// `FLOCK_NO_LC_ZFOLD_PF=1` restores the incumbent one-stripe-ahead prefetch
 /// in the grouped block-major gather (exact same-binary A/B).
 ///
-/// The incumbent prefetches the NEXT STRIPE's eight rows at the column the
-/// loop is on right now. That is ~56 uops of look-ahead — one
-/// `gather_transpose_stripe4_x86` call — while the lines it asks for are
-/// consumed later in the SAME grouped visit, so the demand loads reach the
-/// line before DRAM does and the visit degenerates into
-/// [stall on eight strided misses] → [GFNI burst], with no overlap. The
-/// ranked-shape decomposition of the fold measured that directly:
-/// memory-only 5.2 ms + gather/transpose 2.3 ms + GFNI 5.8 ms ≈ 13.3 ms
-/// wall, i.e. strictly additive.
-///
-/// This arm instead asks for the lines the SAME eight rows will need two
-/// grouped visits from now — one whole visit (~3.3 K uops) of look-ahead —
-/// so the miss is issued while the previous visit's GFNI fold is still
-/// draining. Same eight prefetch instructions per stripe, different address:
-/// no work is added, and prefetches have no architectural effect, so the
-/// folded values are bit-identical either way.
+/// The incumbent asks for the next stripe's eight rows at the column the loop
+/// is on now. This arm asks instead for the lines the SAME eight rows will
+/// need on a later grouped visit. Same eight prefetch instructions per stripe,
+/// different address: no work is added, and prefetches have no architectural
+/// effect, so the folded values are bit-identical either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
 fn lc_zfold_pf_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ZFOLD_PF_NEAR=1` restores the incumbent two-visit look-ahead
+/// in the grouped gather prefetch above (exact same-binary A/B). Same eight
+/// prefetch instructions per stripe, one line further out; a prefetch has no
+/// architectural effect, so the folded values are identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_near_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_NEAR").is_none());
     *ON
 }
 
@@ -1080,6 +1080,12 @@ fn fold_block_major_gfni(
             // (never inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let pf_far = lc_zfold_pf_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_chunks = if lc_zfold_pf_near_enabled() {
+                LC_ZFOLD_PF_CHUNKS
+            } else {
+                2 * LC_ZFOLD_PF_CHUNKS
+            };
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1122,7 +1128,7 @@ fn fold_block_major_gfni(
                                 // a line the sweep really demands; `qn <
                                 // chunks_per_block` keeps the address inside
                                 // the block for any (useful_bits, k) shape.
-                                let qn = q + LC_ZFOLD_PF_CHUNKS;
+                                let qn = q + pf_chunks;
                                 if qn <= full_chunks && qn < chunks_per_block {
                                     unsafe {
                                         for r in 0..8 {
