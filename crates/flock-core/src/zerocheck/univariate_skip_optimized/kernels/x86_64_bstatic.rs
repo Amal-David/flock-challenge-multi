@@ -146,6 +146,29 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_SHIFT_REDUCE").is_none())
 }
 
+/// `FLOCK_NO_BSTATIC_HORNER_CONSUME=1` keeps mixed windows 2..=29 on the
+/// incumbent pidx Horner (full B-side 2img apply). Same-binary A/B: consume
+/// only replaces `bv = T(b)` for STATIC rows whose vary-popcount is at most
+/// [`COMPACT_MAX_VARY`], after the plan-hit check. The ranked worker's
+/// cleared env never sets this.
+pub(crate) fn horner_consume_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_HORNER_CONSUME").is_none())
+}
+
+/// Port-5 inequality versus the ranked 2img apply (3 lane shuffles): a
+/// STATIC row with `vary.count_ones() <= 3` patches with ≤3 `vpermq` plus one
+/// aligned partial load, instead of eight table loads. This is the compact
+/// Horner consume cutoff — not a laptop-tuned window. vary ≥ 4 stays on the
+/// incumbent 2img B apply (those 40 mixed STATIC rows are not this delta).
+const COMPACT_MAX_VARY: u32 = 3;
+
+/// GF(2⁸) AES-poly inverses of `x^k = 2^k` as `F8(1 << k)`. Fully-static
+/// (`vary == 0`) partials are stored as `T(expected) · x^k`; Horner needs the
+/// unscaled `T(expected)` before the recurrence applies `x^k`. Checked
+/// against `F8::inv` in tests.
+const INV_XK: [u8; 8] = [1, 141, 203, 232, 116, 58, 29, 131];
+
 
 /// Blocks whose specialised kernel measured faster than the incumbent on the
 /// AVX-512 box (single-thread hot, production entry point, plan-shaped
@@ -528,6 +551,121 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
     }
 }
 
+/// Reconstruct unscaled `T(b)` from a STATIC partial, or `None` so the
+/// caller keeps the incumbent 2img apply for that K-row.
+///
+/// Hit path (after `(b & mask) == expected`):
+/// - `vary == 0`: aligned load of the prescaled image, one GFNI mul by
+///   `INV_XK[k]` to undo `x^k`.
+/// - `1..=COMPACT_MAX_VARY`: aligned load plus `vc` one-image `perm_row`
+///   patches — the same `T(b) = T(expected) ⊕ Σ_j π_j(T₀[b_j])` the
+///   specialised STATIC branch uses, without the specialised body's
+///   explicit `x^k` product scale (Horner owns that).
+///
+/// Miss / GENERIC / vary>3 → `None`. Unexpected `blk` is rejected by the
+/// caller before this is reached.
+///
+/// # Safety
+/// As for [`kernel`]: `table` is 256×64, `b_row` has 8 readable bytes,
+/// `partials` was built from that table, `blk < BSTATIC_BLOCKS`.
+#[inline(always)]
+unsafe fn bstatic_horner_bv(
+    table: *const u8,
+    b_row: *const u8,
+    blk: usize,
+    k: usize,
+    partials: &BstaticPartials,
+) -> Option<__m512i> {
+    // SAFETY: forwarded from the function contract.
+    unsafe {
+        let p: BstaticRow = BSTATIC_PLAN[blk][k];
+        if p.kind != ROW_STATIC || p.vary.count_ones() > COMPACT_MAX_VARY {
+            return None;
+        }
+        let w = u64::from_le(core::ptr::read_unaligned(b_row as *const u64));
+        if (w & p.mask) != p.expected {
+            return None;
+        }
+        let mut bv = _mm512_load_si512(partials.rows[blk][k].as_ptr() as *const __m512i);
+        if p.vary == 0 {
+            bv = _mm512_gf2p8mul_epi8(bv, _mm512_set1_epi8(INV_XK[k] as i8));
+        } else {
+            let mut v = p.vary;
+            while v != 0 {
+                let j = v.trailing_zeros() as usize;
+                let byte = (w >> (8 * j)) as u8 as usize;
+                let r = _mm512_loadu_si512(table.add(byte * 64) as *const __m512i);
+                bv = _mm512_xor_si512(bv, perm_row(r, j));
+                v &= v - 1;
+            }
+        }
+        Some(bv)
+    }
+}
+
+/// Mixed-window (blk 2..=29) pidx Horner that consumes STATIC vary≤3 B
+/// partials inside the incumbent recurrence. Same A applies, same 8
+/// products + 7 `×x` scalings, same store. Not the specialised relocate
+/// and not the killed explicit-`x^k` mixed body.
+///
+/// # Safety
+/// As for [`super::x86_64::shift_reduce_inner_ab_x86_avx512_pidx`], plus:
+/// `blk ∈ 2..=29`, `partials` from this `inv_table`, `imgs` the table's
+/// base/σ₈ pointers, `offw` already selected.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx_horner_consume(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    blk: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) {
+    let _ = inv_table;
+    #[repr(align(64))]
+    struct Off([u16; 128]);
+
+    // SAFETY: same 64-byte window contract as the incumbent pidx body.
+    unsafe {
+        let a0 = a_packed.as_ptr().add(byte_base_b);
+        let b0 = b_packed.as_ptr().add(byte_base_b);
+        let table = imgs.0;
+
+        let mut off = core::mem::MaybeUninit::<Off>::uninit();
+        let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a0));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
+
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let bv_of = |k: usize| match bstatic_horner_bv(table, b0.add(k * N_CHUNKS), blk, k, partials)
+        {
+            Some(v) => v,
+            None => apply(op.add(64 + k * 8)),
+        };
+
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), bv_of(7));
+        for k in (0..7usize).rev() {
+            let av = apply(op.add(k * 8));
+            let bv = bv_of(k);
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        super::x86_64::store_out64(out, acc, nt);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::x86_64::shift_reduce_inner_ab_x86_avx512;
@@ -551,6 +689,66 @@ mod tests {
         let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
         let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
         InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    }
+
+    #[test]
+    fn inv_xk_matches_f8_inv() {
+        for k in 0..8u8 {
+            assert_eq!(INV_XK[k as usize], F8(1u8 << k).inv().0, "k={k}");
+        }
+    }
+
+    /// Mixed-window Horner consume must match the incumbent pidx/2img kernel
+    /// bit-for-bit on hit, miss, zero, and all-ones b words.
+    #[test]
+    fn horner_consume_matches_incumbent_mixed_windows() {
+        let inv_table = standard_table();
+        let partials = build_partials(&inv_table);
+        let imgs = inv_table.image_ptrs();
+        let mut rng = Rng(0xC0C0_A11C);
+        const OUTER: usize = 1024;
+        let n_windows = 4;
+        for blk in 2..=29usize {
+            let b_med = blk % 16;
+            for mode in 0..4 {
+                let mut a = vec![0u8; OUTER * n_windows];
+                let mut b = vec![0u8; OUTER * n_windows];
+                for x in 0..n_windows {
+                    for bm in 0..16 {
+                        for k in 0..8 {
+                            let off = x * OUTER + bm * 64 + k * 8;
+                            let a_word = rng.next_u64();
+                            let p = BSTATIC_PLAN[blk][k];
+                            let b_word = match mode {
+                                0 => (p.expected & p.mask) | (rng.next_u64() & !p.mask),
+                                1 => rng.next_u64(),
+                                2 => 0,
+                                _ => u64::MAX,
+                            };
+                            a[off..off + 8].copy_from_slice(&a_word.to_le_bytes());
+                            b[off..off + 8].copy_from_slice(&b_word.to_le_bytes());
+                        }
+                    }
+                }
+                for x in 0..n_windows {
+                    let mut got = [0u8; 64];
+                    let mut want = [0u8; 64];
+                    let byte_base_b = x * OUTER + b_med * N_CHUNKS * 8;
+                    unsafe {
+                        shift_reduce_inner_ab_x86_avx512_pidx_horner_consume(
+                            &a, &b, &inv_table, byte_base_b, blk, &partials, &mut got, 0, imgs,
+                        );
+                        shift_reduce_inner_ab_x86_avx512(
+                            &a, &b, &inv_table, x * OUTER, b_med, &mut want, 0,
+                        );
+                    }
+                    assert_eq!(
+                        got, want,
+                        "blk={blk} mode={mode} x={x}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every plan (all 32 BLAKE3 blocks + the generic control), on b words

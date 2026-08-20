@@ -872,13 +872,13 @@ pub struct Round1AbWindowPlan {
 
 impl Round1AbWindowPlan {
     /// This plan specialised to one medium-window index: the static-B partials
-    /// are dropped for every window whose plan is not live, so a producer that
-    /// transforms several blocks at the same window index resolves the
-    /// window's static-B eligibility once instead of once per block.
+    /// stay attached for specialised live windows `{0,1,30,31}` and for mixed
+    /// Horner-consume windows `2..=29`. A producer that transforms several
+    /// blocks at the same window index resolves eligibility once per window.
     #[inline]
     pub fn for_window(self, blk: usize) -> Self {
         Self {
-            bstatic: if kernels::bstatic_window_live(blk) {
+            bstatic: if kernels::bstatic_partials_for_window(blk) {
                 self.bstatic
             } else {
                 None

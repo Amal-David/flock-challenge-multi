@@ -75,6 +75,36 @@ pub(super) fn bstatic_window_live(blk: usize) -> bool {
     blk <= 1 || blk == 30 || blk == 31
 }
 
+/// Keep the precomputed STATIC partials attached to this window's plan.
+/// Specialised kernels consume them on `{0,1,30,31}`; Horner consume reads
+/// them on mixed `2..=29` (kill `FLOCK_NO_BSTATIC_HORNER_CONSUME`). Without
+/// this, `for_window` drops mixed partials and consume is a ranked nop.
+#[inline]
+pub(super) fn bstatic_partials_for_window(blk: usize) -> bool {
+    if bstatic_window_live(blk) {
+        return true;
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        (2..=29).contains(&blk) && x86_64_bstatic::horner_consume_enabled()
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = blk;
+        false
+    }
+}
+
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
 /// the 8192-bit window being transformed plus the resolved partial images.
 /// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
@@ -311,6 +341,21 @@ pub(super) fn shift_reduce_inner_ab_at(
                         a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
                     )
                 {
+                    return;
+                }
+                // Mixed 2..=29: keep the incumbent pidx Horner skeleton and
+                // splice STATIC vary≤3 B-partials into `bv`. Unexpected
+                // geometry (pidx/offw/img2 off, blk outside 2..=29, kill
+                // switch) falls through to the prepared generic body.
+                if (2..=29).contains(&blk)
+                    && prepared.img2
+                    && prepared.pidx
+                    && prepared.offw
+                    && x86_64_bstatic::horner_consume_enabled()
+                {
+                    x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_pidx_horner_consume(
+                        a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt, imgs,
+                    );
                     return;
                 }
             }
