@@ -543,24 +543,40 @@ impl DeepQueue {
     }
 }
 
-/// Line-hint level for the deep pass's fused-four row driver under the
-/// sibling-paired schedule (see `deep_split_pairs`): each row group asks for
-/// the sixteen rows the next group will read, one line per lane step.
-/// 0 = no hints, 1 = L1, 2 = L2. Only the paired schedule passes it; the
-/// alternating schedule always runs un-hinted.
-/// `FLOCK_NO_NTT_DEEP_PF=1` removes the hints in the same binary;
-/// `FLOCK_NTT_DEEP_PF_HINT` overrides the level (diagnostics). Read once per
-/// process — never inside a loop.
+/// Line-hint levels for the deep pass's fused-four row drivers under the
+/// sibling-paired schedule (see `deep_split_pairs`). The cold 2 MiB sweep
+/// retains L1 hints, while the per-128 KiB tail defaults off: its block is
+/// already L2-resident and T0 competes with the hash sibling for shared L1.
+/// 0 = no hints, 1 = L1, 2 = L2. `FLOCK_NO_NTT_DEEP_PF=1` removes both;
+/// `FLOCK_NTT_DEEP_PF_HINT` overrides the cold sweep and
+/// `FLOCK_NTT_DEEP_TAIL_PF_HINT=1` restores the previous tail behavior.
+/// Read once per process — never inside a loop.
 #[cfg(target_os = "linux")]
-fn deep_pf_hint() -> u8 {
-    static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some() {
-            return 0;
-        }
-        std::env::var("FLOCK_NTT_DEEP_PF_HINT")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(1)
+fn deep_pf_hints_selected(
+    disabled: bool,
+    sweep_hint: Option<u8>,
+    tail_hint: Option<u8>,
+) -> (u8, u8) {
+    if disabled {
+        (0, 0)
+    } else {
+        (sweep_hint.unwrap_or(1), tail_hint.unwrap_or(0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn deep_pf_hints() -> (u8, u8) {
+    static H: std::sync::LazyLock<(u8, u8)> = std::sync::LazyLock::new(|| {
+        let parse = |name| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+        };
+        deep_pf_hints_selected(
+            std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some(),
+            parse("FLOCK_NTT_DEEP_PF_HINT"),
+            parse("FLOCK_NTT_DEEP_TAIL_PF_HINT"),
+        )
     });
     *H
 }
@@ -2232,7 +2248,7 @@ impl AdditiveNttF128 {
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
-                        hint: u8|
+                        hints: (u8, u8)|
          -> bool {
             if fuse_blocks && block_cb.is_some() {
                 let cb = block_cb.unwrap();
@@ -2260,7 +2276,7 @@ impl AdditiveNttF128 {
                         sixteenth,
                         num_ntts,
                         if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
-                        hint,
+                        hints.0,
                     );
                 }
                 // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
@@ -2294,7 +2310,7 @@ impl AdditiveNttF128 {
                         sixteenth4,
                         num_ntts,
                         if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
-                        hint,
+                        hints.1,
                     );
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
@@ -2366,7 +2382,7 @@ impl AdditiveNttF128 {
                                 sixteenth,
                                 num_ntts,
                                 if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
-                                hint,
+                                hints.0,
                             );
                         }
                         layer += 4;
@@ -2510,7 +2526,7 @@ impl AdditiveNttF128 {
                     let n_subs = n_total / sub_bytes;
                     let n_pairs = pairs.len();
                     let depth = deep_split_depth();
-                    let hint = deep_pf_hint();
+                    let hints = deep_pf_hints();
                     let queues: Vec<DeepQueue> =
                         (0..n_pairs).map(|_| DeepQueue::new()).collect();
                     let next_sub = AtomicUsize::new(0);
@@ -2582,7 +2598,7 @@ impl AdditiveNttF128 {
                                         sub_bytes,
                                     )
                                 };
-                                if !deep_sub(i, sub_data, Some(&enqueue), hint) {
+                                if !deep_sub(i, sub_data, Some(&enqueue), hints) {
                                     enqueue(
                                         i * sub_size_positions
                                             ..(i + 1) * sub_size_positions,
@@ -2612,7 +2628,7 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, (0, 0)) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
@@ -2641,7 +2657,9 @@ impl AdditiveNttF128 {
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
-                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None, 0); });
+                            .for_each(|(i, sub_data)| {
+                                deep_sub(sub_cursor + i, sub_data, None, (0, 0));
+                            });
                         on_chunk(
                             c,
                             sub_cursor * sub_size_positions..end_sub * sub_size_positions,
@@ -2737,7 +2755,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None, 0);
+                    deep_sub(i, sub_data, None, (0, 0));
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -3294,6 +3312,31 @@ fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_pf_phase_selector_is_exact() {
+        assert_eq!(deep_pf_hints_selected(false, None, None), (1, 0));
+        assert_eq!(deep_pf_hints_selected(false, Some(2), None), (2, 0));
+        assert_eq!(deep_pf_hints_selected(false, None, Some(1)), (1, 1));
+        assert_eq!(deep_pf_hints_selected(false, Some(2), Some(1)), (2, 1));
+        assert_eq!(deep_pf_hints_selected(true, Some(2), Some(1)), (0, 0));
+
+        // One hint for each of sixteen rows at each four-lane step, except
+        // that the final row group has no successor to stage. The ranked
+        // identity-C layout has 64 dense lanes and a seven-lane odd tail.
+        let count = |sixteenth: usize| {
+            (0..sixteenth - 1)
+                .map(|r| 16 * (row_lanes(r, 64, 7) & !3) / 4)
+                .sum::<usize>()
+        };
+        let sweep_per_sub = count(128);
+        let tail_per_block = count(8);
+        assert_eq!(sweep_per_sub, 30_496);
+        assert_eq!(tail_per_block, 1_696);
+        assert_eq!(sweep_per_sub * 512, 15_613_952);
+        assert_eq!(tail_per_block * 16 * 512, 13_893_632);
+    }
 
     /// The ranked deep split gives one queue to each physical core. Keep the
     /// producer/consumer atomics for adjacent cores on distinct cache lines;
