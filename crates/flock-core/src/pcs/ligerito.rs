@@ -1815,13 +1815,43 @@ fn evaluate_scaled_basis_inplace(
     }
 
     basis[0] = alpha;
+    let wide = open_basis_x4_enabled();
     for k in 0..log_n {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
-        for i in 0..current_len {
-            basis[i + current_len] = s_at_x * basis[i];
+        if wide {
+            // Doubling step: the upper half is `s_at_x` times the lower half,
+            // element by element, with the two halves disjoint. Same shape as
+            // `eq_expand_block_x4`, which writes each product directly.
+            let (current, rest) = basis[..2 * current_len].split_at_mut(current_len);
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            // SAFETY: target features are cfg-guaranteed and `split_at_mut`
+            // hands back two disjoint halves of equal length.
+            unsafe {
+                eq_expand_block_x4(rest, current, s_at_x);
+            }
+            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+            for (dst, &src) in rest.iter_mut().zip(current.iter()) {
+                *dst = s_at_x * src;
+            }
+        } else {
+            for i in 0..current_len {
+                basis[i + current_len] = s_at_x * basis[i];
+            }
         }
     }
+}
+
+/// Ranked default runs the [`evaluate_scaled_basis_inplace`] doubling step
+/// through the four-lane `eq_expand_block_x4` leaf: every entry of the upper
+/// half is an independent product of the same scalar with one lower-half
+/// entry, so widening computes the identical set of canonical products.
+/// `FLOCK_NO_OPEN_BASIS_X4=1` restores the per-element scalar doubling loop.
+/// Read once per call, outside the doubling loop.
+fn open_basis_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_BASIS_X4").is_none());
+    *ON
 }
 
 // ===================================================================
