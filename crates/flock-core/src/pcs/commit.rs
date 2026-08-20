@@ -373,15 +373,7 @@ fn finalize_commit(
                 0
             };
             // Publish this sub-group's depth; every sub-group must agree.
-            let seen = match local_levels.compare_exchange(
-                usize::MAX,
-                depth,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => depth,
-                Err(prev) => prev,
-            };
+            let seen = publish_local_fold_depth(&local_levels, depth);
             if seen != depth {
                 local_levels.store(0, Ordering::Release);
             }
@@ -658,6 +650,25 @@ pub(crate) fn subtree_parents_enabled() -> bool {
         std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none()
     });
     *ON
+}
+
+/// Publish the first callback-local Merkle fold depth, then keep the marker
+/// read-mostly. Once initialized, a compare-exchange can only fail, so avoid
+/// taking exclusive ownership of this line on every subsequent callback.
+#[inline]
+fn publish_local_fold_depth(local_levels: &AtomicUsize, depth: usize) -> usize {
+    match local_levels.load(Ordering::Acquire) {
+        usize::MAX => match local_levels.compare_exchange(
+            usize::MAX,
+            depth,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => depth,
+            Err(prev) => prev,
+        },
+        prev => prev,
+    }
 }
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
@@ -1218,6 +1229,39 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_fold_depth_publication_is_exact_under_contention() {
+        use super::*;
+
+        let marker = AtomicUsize::new(usize::MAX);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..64 {
+                        assert_eq!(publish_local_fold_depth(&marker, 11), 11);
+                    }
+                });
+            }
+        });
+        assert_eq!(marker.load(Ordering::Acquire), 11);
+
+        marker.store(usize::MAX, Ordering::Release);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let marker = &marker;
+                scope.spawn(move || {
+                    let depth = if worker == 0 { 10 } else { 11 };
+                    let seen = publish_local_fold_depth(&marker, depth);
+                    if seen != depth {
+                        marker.store(0, Ordering::Release);
+                    }
+                });
+            }
+        });
+        assert_eq!(marker.load(Ordering::Acquire), 0);
+        assert_eq!(publish_local_fold_depth(&marker, 11), 0);
+    }
+
     /// The exact ranked selector is narrow, and regrouping sixteen retired
     /// blocks into one 2048-leaf parent fold reproduces every flat-tree node.
     #[test]
