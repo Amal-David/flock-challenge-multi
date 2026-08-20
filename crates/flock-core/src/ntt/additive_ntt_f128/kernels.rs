@@ -469,6 +469,46 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
 }
 
+/// [`butterfly_fused_3layer_rows`] with one line hint per row of the
+/// eight-row group starting at `pf_ptr` issued at every dense lane step.
+/// `H` selects the hint level (1 = L1, 2 = L2). Portable builds ignore the
+/// hint.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_rows`]; the eight rows starting
+/// at `pf_ptr` must also lie inside the same allocation.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_rows_pf<const H: u8>(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+    pf_ptr: *const F128,
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry, disjointness, zero-tail and hint-range contract.
+    unsafe {
+        x86_64::butterfly_fused_3layer_rows_pf::<H>(ptr, num_ntts, dense_lanes, twiddles, pf_ptr);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = pf_ptr;
+        portable::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
