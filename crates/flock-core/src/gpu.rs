@@ -71,6 +71,10 @@ use stub as imp;
 
 pub use imp::{is_disabled, metal_available, prewire, undisable};
 
+/// `true` when the facade above resolved to the real implementation, `false`
+/// when it resolved to the inert stub whose entry points have empty bodies.
+pub const IMP_IS_REAL: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
 /// URM round-1 GPU split (season-1 pipeline, verbatim shader).
 pub mod urm {
     use super::{ELL, F128, InvNttTableByteSingleGf8};

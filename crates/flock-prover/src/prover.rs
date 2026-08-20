@@ -645,6 +645,17 @@ fn commit_with_round1_ab_precompute(
     )
 }
 
+/// Whether [`gpu_prewire_round1_inputs`] spawns its thread. The spawn is kept
+/// for builds whose GPU facade resolves to the real implementation; builds that
+/// resolve to the inert stub skip it. `FLOCK_GPU_PREWIRE_SPAWN=1` restores the
+/// unconditional spawn. Read once per process.
+fn prewire_spawn_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        flock_core::gpu::IMP_IS_REAL || std::env::var_os("FLOCK_GPU_PREWIRE_SPAWN").is_some()
+    });
+    *ON
+}
+
 /// Fire-and-forget async prewire of the round-1 GPU inputs — the witness
 /// buffers a, b, c (= z) plus, when it already exists, the codeword buffer
 /// the commit will encode into (the tree buffer is prewired inside
@@ -664,6 +675,9 @@ fn commit_with_round1_ab_precompute(
 /// The buffers are scratch-pool-retained (never unmapped for the process
 /// lifetime), so the detached thread cannot outlive their allocations.
 fn gpu_prewire_round1_inputs(a: &[F128], b: &[F128], z: &[F128], codeword: Option<&[F128]>) {
+    if !prewire_spawn_enabled() {
+        return;
+    }
     let view = |v: &[F128]| (v.as_ptr() as usize, std::mem::size_of_val(v));
     let mut bufs = [view(a), view(b), view(z), (0usize, 0usize)];
     if let Some(cw) = codeword {
