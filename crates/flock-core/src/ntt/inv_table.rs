@@ -475,6 +475,59 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
+    /// Wide-read twin of
+    /// [`Self::apply_x86_avx512_register_2img_off_unchecked`]. Identical value
+    /// and identical table addresses; the eight pre-scaled `u16` offsets are
+    /// fetched as two 64-bit reads and split with shifts instead of eight
+    /// separate 16-bit reads.
+    ///
+    /// # Safety
+    /// As for [`Self::apply_x86_avx512_register_2img_off_unchecked`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_unchecked(
+        &self,
+        off: *const u16,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        debug_assert_eq!(self.ell, 64);
+        debug_assert_eq!(self.n_chunks, 8);
+        debug_assert!(self.has_second_image());
+        let base = self.data_ptr();
+        let base8 = self.half_swapped_data_ptr();
+        // SAFETY: eight readable pre-scaled offsets per the contract, i.e. two
+        // readable 64-bit words. Each extracted field is one of those offsets,
+        // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
+        // 64 readable bytes per row.
+        unsafe {
+            let w0 = (off as *const u64).read_unaligned();
+            let w1 = (off.add(4) as *const u64).read_unaligned();
+            let row = |img: *const u8, o: usize| {
+                _mm512_loadu_si512(img.add(o) as *const __m512i)
+            };
+            let u0 = _mm512_xor_si512(
+                row(base, w0 as u16 as usize),
+                row(base8, (w0 >> 16) as u16 as usize),
+            );
+            let u1 = _mm512_xor_si512(
+                row(base, (w0 >> 32) as u16 as usize),
+                row(base8, (w0 >> 48) as usize),
+            );
+            let u2 = _mm512_xor_si512(
+                row(base, w1 as u16 as usize),
+                row(base8, (w1 >> 16) as u16 as usize),
+            );
+            let u3 = _mm512_xor_si512(
+                row(base, (w1 >> 32) as u16 as usize),
+                row(base8, (w1 >> 48) as usize),
+            );
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        }
+    }
+
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
     pub fn apply_triple(
@@ -708,6 +761,34 @@ mod tests {
                         "scalar/avx512-2img apply disagree at k={k}, bytes={:02x?}",
                         bytes
                     );
+                    // Pre-scaled-offset forms: same value from `byte * 64`
+                    // offsets, read either eight-wide or two-wide.
+                    let off: Vec<u16> = bytes.iter().map(|&b| b as u16 * 64).collect();
+                    for wide in [false, true] {
+                        // SAFETY: avx512f; ell == 64; second image present;
+                        // eight pre-scaled offsets in `off`.
+                        let reg = unsafe {
+                            if wide {
+                                table.apply_x86_avx512_register_2img_offw_unchecked(off.as_ptr())
+                            } else {
+                                table.apply_x86_avx512_register_2img_off_unchecked(off.as_ptr())
+                            }
+                        };
+                        let mut got = [0u8; 64];
+                        // SAFETY: 64-byte destination for one ZMM store.
+                        unsafe {
+                            core::arch::x86_64::_mm512_storeu_si512(
+                                got.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                                reg,
+                            )
+                        };
+                        let got: Vec<F8> = got.iter().map(|&b| F8(b)).collect();
+                        assert_eq!(
+                            out_scalar, got,
+                            "scalar/avx512-off(wide={wide}) apply disagree at k={k}, bytes={:02x?}",
+                            bytes
+                        );
+                    }
                 }
             }
         }

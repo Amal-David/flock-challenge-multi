@@ -118,6 +118,15 @@ pub(crate) fn urm_pidx_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
+/// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
+/// 64-bit reads split with shifts. Resolved once per process.
+pub(crate) fn urm_offw_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFFW").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -211,16 +220,26 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         // rebuilt x^k disappear. GF(2^8) multiplication is associative and
         // distributes over XOR, so the value is bit-identical.
         let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(
-            inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(7 * 8)),
-            inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(64 + 7 * 8)),
-        );
-        for k in (0..7usize).rev() {
-            let av = inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(k * 8));
-            let bv = inv_table.apply_x86_avx512_register_2img_off_unchecked(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        macro_rules! horner {
+            ($apply:ident) => {{
+                let mut acc = _mm512_gf2p8mul_epi8(
+                    inv_table.$apply(op.add(7 * 8)),
+                    inv_table.$apply(op.add(64 + 7 * 8)),
+                );
+                for k in (0..7usize).rev() {
+                    let av = inv_table.$apply(op.add(k * 8));
+                    let bv = inv_table.$apply(op.add(64 + k * 8));
+                    let product = _mm512_gf2p8mul_epi8(av, bv);
+                    acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+                }
+                acc
+            }};
         }
+        let acc = if urm_offw_enabled() {
+            horner!(apply_x86_avx512_register_2img_offw_unchecked)
+        } else {
+            horner!(apply_x86_avx512_register_2img_off_unchecked)
+        };
         store_out64(out, acc, nt);
     }
 }

@@ -1427,6 +1427,35 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         }
     }
 
+    /// The four output groups of one tile through the general (non-composed)
+    /// path: four `group_from_packed` two-level pair folds, in one shared
+    /// out-of-line body.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn groups_general(
+        table_data: *const F128,
+        a_pkt: *const u8,
+        b_pkt: *const u8,
+        xg: usize,
+        r1: __m512i,
+        r2: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        cache: Option<(&[F128; 64], &[F128; 64], usize)>,
+    ) -> [__m512i; 8] {
+        // SAFETY: same row/table bounds as `group_from_packed`, which the
+        // caller's contract supplies for all four groups.
+        unsafe {
+            let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            [oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3]
+        }
+    }
+
     // SAFETY: the function's contract bounds every packed-row read, table
     // read and output store; the cfg gate supplies every intrinsic feature.
     unsafe {
@@ -1574,11 +1603,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         )
                     }
                 } else {
-                    let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-                    let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-                    let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-                    let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
-                    (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3)
+                    let g = groups_general(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
                 };
             // Spread delivery: the rest of this tile's hint block, at
             // a later point in the body.
