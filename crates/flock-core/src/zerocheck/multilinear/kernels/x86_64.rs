@@ -2457,52 +2457,44 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             _mm512_xor_si512(v2, v3)
         };
 
-        let lo_half = qword_transpose([
-            plane(0),
-            plane(1),
-            plane(2),
-            plane(3),
-            plane(4),
-            plane(5),
-            plane(6),
-            plane(7),
-        ]);
-        let hi_half = qword_transpose([
-            plane(8),
-            plane(9),
-            plane(10),
-            plane(11),
-            plane(12),
-            plane(13),
-            plane(14),
-            plane(15),
-        ]);
+        // The sole c4 consumer XORs the four residue contributions of a
+        // group.  Those sit in qwords {i, i+2, i+4, i+6} of one plane, and
+        // every remaining transform is F2-linear, so the reduction is done
+        // while the planes are still plane-major: `pair` halves the qword
+        // span of two planes at once, `quad` halves it again across four,
+        // and each group of four planes collapses to one register holding
+        // its four even folds followed by its four odd folds.  The two
+        // reduced registers per half are then what the reassembly needs.
+        let pair = |a: __m512i, b: __m512i| -> __m512i {
+            _mm512_xor_si512(
+                _mm512_permutex2var_epi64(a, s2_lo, b),
+                _mm512_permutex2var_epi64(a, s2_hi, b),
+            )
+        };
+        let q_lo = _mm512_setr_epi64(0, 2, 8, 10, 1, 3, 9, 11);
+        let q_hi = _mm512_setr_epi64(4, 6, 12, 14, 5, 7, 13, 15);
+        let quad = |a: __m512i, b: __m512i, c: __m512i, d: __m512i| -> __m512i {
+            let z0 = pair(a, b);
+            let z1 = pair(c, d);
+            _mm512_xor_si512(
+                _mm512_permutex2var_epi64(z0, q_lo, z1),
+                _mm512_permutex2var_epi64(z0, q_hi, z1),
+            )
+        };
+        let w0 = quad(plane(0), plane(1), plane(2), plane(3));
+        let w1 = quad(plane(4), plane(5), plane(6), plane(7));
+        let w2 = quad(plane(8), plane(9), plane(10), plane(11));
+        let w3 = quad(plane(12), plane(13), plane(14), plane(15));
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        // The sole c4 consumer immediately XORs chunks (0,4,8,12),
-        // (1,5,9,13), (2,6,10,14), and (3,7,11,15).  All remaining
-        // transforms are F2-linear, so combine the corresponding half rows
-        // before the byte/interleave transposes and materialize only four
-        // ZMMs instead of sixteen.
-        let xor4 = |a, b, c, d| {
-            _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a, b, c), d)
-        };
-        let lo_even = _mm512_permutexvar_epi8(
-            bt,
-            xor4(lo_half[0], lo_half[2], lo_half[4], lo_half[6]),
-        );
-        let hi_even = _mm512_permutexvar_epi8(
-            bt,
-            xor4(hi_half[0], hi_half[2], hi_half[4], hi_half[6]),
-        );
-        let lo_odd = _mm512_permutexvar_epi8(
-            bt,
-            xor4(lo_half[1], lo_half[3], lo_half[5], lo_half[7]),
-        );
-        let hi_odd = _mm512_permutexvar_epi8(
-            bt,
-            xor4(hi_half[1], hi_half[3], hi_half[5], hi_half[7]),
-        );
+        let lo_even =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_lo, w1));
+        let lo_odd =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_hi, w1));
+        let hi_even =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_lo, w3));
+        let hi_odd =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_hi, w3));
         let out_ptr = out as *mut __m512i;
         _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
         _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));

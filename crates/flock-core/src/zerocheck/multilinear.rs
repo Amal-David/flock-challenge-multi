@@ -4707,6 +4707,76 @@ mod tests {
         }
     }
 
+    /// The residue reduction the c4 producer performs is a 4:1 XOR over
+    /// qwords {i, i+2, i+4, i+6} of each plane, and the reassembly that
+    /// follows it is a qword transpose.  Both are qword-granular and
+    /// F2-linear, so pairing planes and halving the qword span twice
+    /// (`pair`/`quad`) reaches the same two reduced registers per half that
+    /// the full eight-plane transpose followed by the XOR reaches.
+    #[test]
+    fn gfni_c4_paired_qword_reduction_matches_transposed_xor() {
+        fn plane(seed: u64, k: usize) -> [u64; 8] {
+            std::array::from_fn(|q| {
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((k as u64) << 32)
+                    .wrapping_add(q as u64)
+                    .rotate_left(((k * 8 + q) % 61) as u32)
+            })
+        }
+
+        /// `out[j][i] = in[i][j]`, the kernel's eight-plane qword transpose.
+        fn qword_transpose(input: [[u64; 8]; 8]) -> [[u64; 8]; 8] {
+            std::array::from_fn(|j| std::array::from_fn(|i| input[i][j]))
+        }
+
+        /// `_mm512_permutex2var_epi64`: index `< 8` picks `a`, else `b`.
+        fn permx2(a: [u64; 8], idx: [usize; 8], b: [u64; 8]) -> [u64; 8] {
+            std::array::from_fn(|n| {
+                if idx[n] < 8 {
+                    a[idx[n]]
+                } else {
+                    b[idx[n] - 8]
+                }
+            })
+        }
+
+        fn xor(a: [u64; 8], b: [u64; 8]) -> [u64; 8] {
+            std::array::from_fn(|n| a[n] ^ b[n])
+        }
+
+        const S2_LO: [usize; 8] = [0, 1, 8, 9, 2, 3, 10, 11];
+        const S2_HI: [usize; 8] = [4, 5, 12, 13, 6, 7, 14, 15];
+        const S3_LO: [usize; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+        const S3_HI: [usize; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+        const Q_LO: [usize; 8] = [0, 2, 8, 10, 1, 3, 9, 11];
+        const Q_HI: [usize; 8] = [4, 6, 12, 14, 5, 7, 13, 15];
+
+        let pair = |a, b| xor(permx2(a, S2_LO, b), permx2(a, S2_HI, b));
+        let quad = |a, b, c, d| {
+            let z0 = pair(a, b);
+            let z1 = pair(c, d);
+            xor(permx2(z0, Q_LO, z1), permx2(z0, Q_HI, z1))
+        };
+
+        for seed in [0u64, 1, 0x5A5A_5A5A, 0xDEAD_BEEF, u64::MAX] {
+            for half in 0..2 {
+                let planes: [[u64; 8]; 8] =
+                    std::array::from_fn(|k| plane(seed, 8 * half + k));
+                let t = qword_transpose(planes);
+                let want_even = xor(xor(t[0], t[2]), xor(t[4], t[6]));
+                let want_odd = xor(xor(t[1], t[3]), xor(t[5], t[7]));
+
+                let w0 = quad(planes[0], planes[1], planes[2], planes[3]);
+                let w1 = quad(planes[4], planes[5], planes[6], planes[7]);
+                let got_even = permx2(w0, S3_LO, w1);
+                let got_odd = permx2(w0, S3_HI, w1);
+
+                assert_eq!(got_even, want_even, "even seed={seed:#x} half={half}");
+                assert_eq!(got_odd, want_odd, "odd seed={seed:#x} half={half}");
+            }
+        }
+    }
+
     /// The consumer-level claim that licenses the skip: no row of a dead line
     /// reaches any accumulator or any written table slot. Checked on the
     /// portable round-two chunk path (the same predicate the AVX-512 kernel
