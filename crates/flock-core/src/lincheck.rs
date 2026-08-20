@@ -1117,12 +1117,15 @@ fn fold_block_major_gfni(
                                 // on: the lines this stripe demand-loads two
                                 // grouped visits from now. Issued here, the
                                 // miss overlaps the current visit's GFNI fold.
-                                // `qn <= full_chunks` keeps the prefetch on
-                                // a line the sweep really demands; `qn <
-                                // chunks_per_block` keeps the address inside
-                                // the block for any (useful_bits, k) shape.
+                                // A grouped visit consumes qn..qn+3, so all
+                                // four chunks must be full. The old
+                                // `qn <= full_chunks` bound issued one final
+                                // tile-wide request at qn == full_chunks,
+                                // beyond the grouped work. `qn <
+                                // chunks_per_block` separately keeps the
+                                // address inside the block for every shape.
                                 let qn = q + LC_ZFOLD_PF_CHUNKS;
-                                if qn <= full_chunks && qn < chunks_per_block {
+                                if qn + 4 <= full_chunks && qn < chunks_per_block {
                                     unsafe {
                                         for r in 0..8 {
                                             core::arch::x86_64::_mm_prefetch(
