@@ -2304,8 +2304,11 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             *slot = _mm512_permutexvar_epi8(sigma, p[j]);
         }
 
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        // Keep the two eight-plane transpose inputs explicit.  A runtime
+        // 0..16 collector forces all sixteen ZMMs through a 1 KiB stack
+        // array; constant half schedules let LLVM retain both transposes in
+        // registers while preserving the exact plane order.
+        let plane = |k: usize| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     pc[j],
@@ -2315,11 +2318,29 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        };
 
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let lo_half = qword_transpose([
+            plane(0),
+            plane(1),
+            plane(2),
+            plane(3),
+            plane(4),
+            plane(5),
+            plane(6),
+            plane(7),
+        ]);
+        let hi_half = qword_transpose([
+            plane(8),
+            plane(9),
+            plane(10),
+            plane(11),
+            plane(12),
+            plane(13),
+            plane(14),
+            plane(15),
+        ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
@@ -2457,8 +2478,11 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
         }
 
         // Sixteen output-byte planes: eight GFNI products folded per plane.
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        // Constant half schedules avoid materializing the sixteen planes on
+        // the stack.  The indices are the same 0..16 order as the scalar
+        // collector, merely presented directly to the two independent
+        // eight-plane transposes.
+        let plane = |k: usize| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     p[j],
@@ -2468,13 +2492,31 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        };
 
         // Reassemble: inverse qword transpose + inverse byte transpose per
         // half, then interleave lo/hi qwords into row-major F128s.
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let lo_half = qword_transpose([
+            plane(0),
+            plane(1),
+            plane(2),
+            plane(3),
+            plane(4),
+            plane(5),
+            plane(6),
+            plane(7),
+        ]);
+        let hi_half = qword_transpose([
+            plane(8),
+            plane(9),
+            plane(10),
+            plane(11),
+            plane(12),
+            plane(13),
+            plane(14),
+            plane(15),
+        ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {

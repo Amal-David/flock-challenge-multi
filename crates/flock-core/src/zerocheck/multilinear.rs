@@ -4553,6 +4553,84 @@ mod tests {
         assert_ne!(off, reference, "poison must be visible with the skip OFF");
     }
 
+    /// Byte oracle for the GFNI output-plane split.  It models the complete
+    /// 16-plane -> two qword transposes -> byte transpose -> lo/hi interleave
+    /// reassembly and compares the explicit constant half schedule against
+    /// the former full-array schedule across every one of the 1,024 bytes.
+    #[test]
+    fn gfni_split_plane_halves_preserve_all_output_bytes() {
+        fn plane(seed: u8, k: usize) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                seed.wrapping_add((k as u8).wrapping_mul(67))
+                    .rotate_left((i & 7) as u32)
+                    ^ (i as u8).wrapping_mul(29)
+            })
+        }
+
+        fn qword_transpose(input: [[u8; 64]; 8]) -> [[u8; 64]; 8] {
+            let mut out = [[0u8; 64]; 8];
+            for src in 0..8 {
+                for qword in 0..8 {
+                    out[qword][8 * src..8 * src + 8]
+                        .copy_from_slice(&input[src][8 * qword..8 * qword + 8]);
+                }
+            }
+            out
+        }
+
+        fn byte_transpose(input: [u8; 64]) -> [u8; 64] {
+            std::array::from_fn(|i| input[8 * (i & 7) + (i >> 3)])
+        }
+
+        fn reassemble(lo: [[u8; 64]; 8], hi: [[u8; 64]; 8]) -> [u8; 1024] {
+            let lo = qword_transpose(lo);
+            let hi = qword_transpose(hi);
+            let mut out = [0u8; 1024];
+            for row in 0..8 {
+                let l = byte_transpose(lo[row]);
+                let h = byte_transpose(hi[row]);
+                for qword in 0..8 {
+                    let dst = 128 * row + 16 * qword;
+                    out[dst..dst + 8].copy_from_slice(&l[8 * qword..8 * qword + 8]);
+                    out[dst + 8..dst + 16]
+                        .copy_from_slice(&h[8 * qword..8 * qword + 8]);
+                }
+            }
+            out
+        }
+
+        for seed in [0u8, 1, 0x5A, 0xA5, 0xFF] {
+            let full: [[u8; 64]; 16] = std::array::from_fn(|k| plane(seed, k));
+            let want = reassemble(
+                full[..8].try_into().unwrap(),
+                full[8..].try_into().unwrap(),
+            );
+            let got = reassemble(
+                [
+                    plane(seed, 0),
+                    plane(seed, 1),
+                    plane(seed, 2),
+                    plane(seed, 3),
+                    plane(seed, 4),
+                    plane(seed, 5),
+                    plane(seed, 6),
+                    plane(seed, 7),
+                ],
+                [
+                    plane(seed, 8),
+                    plane(seed, 9),
+                    plane(seed, 10),
+                    plane(seed, 11),
+                    plane(seed, 12),
+                    plane(seed, 13),
+                    plane(seed, 14),
+                    plane(seed, 15),
+                ],
+            );
+            assert_eq!(got, want, "all output bytes, seed={seed:#04x}");
+        }
+    }
+
     /// The consumer-level claim that licenses the skip: no row of a dead line
     /// reaches any accumulator or any written table slot. Checked on the
     /// portable round-two chunk path (the same predicate the AVX-512 kernel
