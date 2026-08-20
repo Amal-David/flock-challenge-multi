@@ -207,3 +207,102 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         }
     }
 }
+
+/// Sixty-four-bank weighted fold with one deferred reduction, four final
+/// output slots per pass. This is the DirectFold8 analogue of
+/// [`fold16_banked`]: 64 bank products accumulate into one `WideGhashX4`, so
+/// each lane is reduced once rather than reducing four 16-bank mids and then
+/// performing a reduced 4:1 fold.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 64 * dst.len()`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold64_banked(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        // Four independent four-slot accumulators break the 64-product
+        // dependency chain and amortize every cached weight-vector load over
+        // 16 final outputs. Twelve ZMM accumulator registers plus four live
+        // weights leave room for the sequential transpose temporaries on SPR.
+        let tiles = dst.len() & !15;
+        let mut t = 0usize;
+        while t < tiles {
+            let mut acc0 = WideGhashX4::zero();
+            let mut acc1 = WideGhashX4::zero();
+            let mut acc2 = WideGhashX4::zero();
+            let mut acc3 = WideGhashX4::zero();
+            for g in 0..16 {
+                // Broadcast four scalar weights once, then reuse them across
+                // all four quads. Loading a pre-broadcast 4 KiB table would
+                // spend 128 MiB of L1 traffic at the ranked shape; these four
+                // 16-byte loads spend 32 MiB and need no table initialization.
+                let w0 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    w.as_ptr().add(4 * g) as *const __m128i
+                ));
+                let w1 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    w.as_ptr().add(4 * g + 1) as *const __m128i
+                ));
+                let w2 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    w.as_ptr().add(4 * g + 2) as *const __m128i
+                ));
+                let w3 = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    w.as_ptr().add(4 * g + 3) as *const __m128i
+                ));
+                macro_rules! accumulate_quad {
+                    ($quad:expr, $acc:ident) => {{
+                        let base = 64 * t + 256 * $quad + 4 * g;
+                        let a0 =
+                            _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                        let a1 =
+                            _mm512_loadu_si512(src.as_ptr().add(base + 64) as *const __m512i);
+                        let a2 =
+                            _mm512_loadu_si512(src.as_ptr().add(base + 128) as *const __m512i);
+                        let a3 =
+                            _mm512_loadu_si512(src.as_ptr().add(base + 192) as *const __m512i);
+                        let p0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                        let p1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                        let p2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                        let p3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                        $acc.mul_acc(_mm512_permutex2var_epi64(p0, s2_lo, p2), w0);
+                        $acc.mul_acc(_mm512_permutex2var_epi64(p0, s2_hi, p2), w1);
+                        $acc.mul_acc(_mm512_permutex2var_epi64(p1, s2_lo, p3), w2);
+                        $acc.mul_acc(_mm512_permutex2var_epi64(p1, s2_hi, p3), w3);
+                    }};
+                }
+                accumulate_quad!(0, acc0);
+                accumulate_quad!(1, acc1);
+                accumulate_quad!(2, acc2);
+                accumulate_quad!(3, acc3);
+            }
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc0.reduce_lanes());
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(t + 4) as *mut __m512i,
+                acc1.reduce_lanes(),
+            );
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(t + 8) as *mut __m512i,
+                acc2.reduce_lanes(),
+            );
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(t + 12) as *mut __m512i,
+                acc3.reduce_lanes(),
+            );
+            t += 16;
+        }
+        while t < dst.len() {
+            let mut v = F128::ZERO;
+            for bank in 0..64 {
+                v += w[bank] * src[64 * t + bank];
+            }
+            dst[t] = v;
+            t += 1;
+        }
+    }
+}
