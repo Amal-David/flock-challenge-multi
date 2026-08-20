@@ -450,6 +450,7 @@ struct DeepBlock {
 
 /// Single-producer / single-consumer ring for one SMT pair.
 #[cfg(target_os = "linux")]
+#[repr(align(64))]
 struct DeepQueue {
     slots: Vec<std::cell::UnsafeCell<DeepBlock>>,
     head: std::sync::atomic::AtomicUsize, // next to publish
@@ -3282,6 +3283,43 @@ fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ranked deep split gives one queue to each physical core. Keep the
+    /// producer/consumer atomics for adjacent cores on distinct cache lines;
+    /// otherwise the 48-byte natural layout lets neighboring queues share a
+    /// line and turns independent SPSC publications into cross-core traffic.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_metadata_is_cacheline_isolated() {
+        const CACHE_LINE: usize = 64;
+        assert_eq!(core::mem::align_of::<DeepQueue>(), CACHE_LINE);
+        assert_eq!(core::mem::size_of::<DeepQueue>(), CACHE_LINE);
+
+        for offset in [
+            core::mem::offset_of!(DeepQueue, head),
+            core::mem::offset_of!(DeepQueue, tail),
+            core::mem::offset_of!(DeepQueue, done),
+            core::mem::offset_of!(DeepQueue, gone),
+        ] {
+            assert!(offset < CACHE_LINE);
+        }
+
+        let queues: Vec<DeepQueue> = (0..8).map(|_| DeepQueue::new()).collect();
+        let base = queues.as_ptr() as usize;
+        assert_eq!(base % CACHE_LINE, 0);
+        for (i, queue) in queues.iter().enumerate() {
+            let addr = queue as *const DeepQueue as usize;
+            assert_eq!(addr, base + i * CACHE_LINE);
+            assert_eq!(
+                core::ptr::addr_of!(queue.head) as usize / CACHE_LINE,
+                addr / CACHE_LINE
+            );
+            assert_eq!(
+                core::ptr::addr_of!(queue.tail) as usize / CACHE_LINE,
+                addr / CACHE_LINE
+            );
+        }
+    }
 
     struct Rng(u64);
     impl Rng {
