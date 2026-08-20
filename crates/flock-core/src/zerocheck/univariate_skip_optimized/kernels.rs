@@ -332,6 +332,29 @@ pub(super) fn accumulate_convert_ab_nomul_gfni(
     }
 }
 
+/// Packed-row twin of [`accumulate_convert_ab_nomul_gfni`].
+///
+/// # Safety
+/// `ab_rows` must point at `n_b_med` readable 64-byte rows at stride 64.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn accumulate_convert_ab_nomul_gfni_ptr(
+    ab_rows: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: forwarded to the kernel; caller owns the packed-row contract.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni_ptr(ab_rows, n_b_med, mats, bank_planes);
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused

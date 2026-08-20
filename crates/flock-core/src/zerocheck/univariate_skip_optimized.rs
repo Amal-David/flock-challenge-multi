@@ -1993,10 +1993,28 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 continue;
             }
             // AB completion: identical to the incumbent per-window path.
-            for b_med in 0..n_b_med {
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                state.chunk_ab_bytes[b_med]
-                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            // Ranked eq-folded GFNI drain can consume `ab_inner` in place
+            // (`N_CHUNKS * 8 == ELL`; live rows `0..n_b_med` are contiguous).
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let ab_direct = eq_fold.is_some() && zc_ab_direct_enabled();
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let ab_direct = false;
+            if !ab_direct {
+                for b_med in 0..n_b_med {
+                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                    state.chunk_ab_bytes[b_med]
+                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+                }
             }
             #[cfg(all(
                 target_arch = "x86_64",
@@ -2014,12 +2032,27 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                     [u * 16 * ELL..(u + 1) * 16 * ELL])
                     .try_into()
                     .expect("one plane bank per low index");
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                if ab_direct {
+                    debug_assert!(chunk_byte_base + n_b_med * ELL <= ab_inner.len());
+                    // SAFETY: live rows `0..n_b_med` are the same 64-byte
+                    // slices the scratch copy used to materialize, packed at
+                    // stride ELL from `chunk_byte_base`.
+                    unsafe {
+                        kernels::accumulate_convert_ab_nomul_gfni_ptr(
+                            ab_inner.as_ptr().add(chunk_byte_base),
+                            n_b_med,
+                            mats_w,
+                            bank,
+                        );
+                    }
+                } else {
+                    kernels::accumulate_convert_ab_nomul_gfni(
+                        &state.chunk_ab_bytes,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                }
             } else {
                 kernels::accumulate_convert_ab(
                     &state.chunk_ab_bytes,
@@ -2381,6 +2414,22 @@ fn zc_r1ab_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_AB_DIRECT=1` restores the 64-byte-per-row scratch copy into
+/// `chunk_ab_bytes` before the eq-folded GFNI drain. Ranked default loads
+/// those already-contiguous packed rows straight out of `ab_inner`.
+/// Resolved once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_DIRECT").is_none());
+    *ON
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2471,9 +2520,26 @@ fn process_one_x_hi_ab_only(
                 }
             }
         }
-        for b_med in 0..n_b_med {
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let ab_direct = eq_fold.is_some() && zc_ab_direct_enabled();
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        let ab_direct = false;
+        if !ab_direct {
+            for b_med in 0..n_b_med {
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -2491,12 +2557,27 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            kernels::accumulate_convert_ab_nomul_gfni(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                mats_w,
-                bank,
-            );
+            if ab_direct {
+                debug_assert!(chunk_byte_base + n_b_med * ELL <= ab_inner.len());
+                // SAFETY: live rows `0..n_b_med` are the same 64-byte slices
+                // the scratch copy used to materialize, packed at stride ELL
+                // from `chunk_byte_base`.
+                unsafe {
+                    kernels::accumulate_convert_ab_nomul_gfni_ptr(
+                        ab_inner.as_ptr().add(chunk_byte_base),
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                }
+            } else {
+                kernels::accumulate_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            }
         } else {
             kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,

@@ -1024,15 +1024,47 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
+    // Dense `[[u8; 64]; 16]` — same addresses as a 1024-byte packed buffer.
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ptr(
+            chunk_ab_bytes.as_ptr() as *const u8,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// Pointer twin of [`accumulate_convert_ab_nomul_x86_gfni`]. Loads row `bm`
+/// from `ab_rows + bm * ELL`. Bit-identical to staging into
+/// `[[u8; 64]; 16]` first whenever those 64-byte rows are already contiguous.
+///
+/// # Safety
+/// `ab_rows` must point at `n_b_med` readable 64-byte rows at stride `ELL`.
+/// The rest of the contract matches [`accumulate_convert_ab_nomul_x86_gfni`].
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_ptr(
+    ab_rows: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    // SAFETY: the fixed-size input/plane arrays contain every 64-byte load
-    // and store below; `mats` is exactly the 16×16 qword matrix block for
-    // this table slice. The cfg gate supplies the required target features.
+    // SAFETY: the caller guarantees `n_b_med` packed 64-byte rows at `ab_rows`;
+    // `mats` is exactly the 16×16 qword matrix block for this table slice.
+    // The cfg gate supplies the required target features.
     unsafe {
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
         for (bm, row) in rows.iter_mut().enumerate().take(n_b_med) {
-            *row = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+            *row = _mm512_loadu_si512(ab_rows.add(bm * ELL) as *const __m512i);
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
