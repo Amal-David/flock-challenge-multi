@@ -1442,21 +1442,6 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
     let mut out = vec![F128::ZERO; n_packed];
-    if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf as [`collapse_s_hat_v_fold8`] — identical per-element
-        // operation in identical order, so the result is bit-identical to
-        // the scalar loop below. (This ranked-live call sat scalar when the
-        // fold8 twin was converted.)
-        for q in 0..4 {
-            crate::field::f128_slice::add_scaled(
-                &mut out,
-                &s_hat_v_quad[q * n_packed..(q + 1) * n_packed],
-                low_eq[q],
-            );
-        }
-        return out;
-    }
     for q in 0..4 {
         for b in 0..n_packed {
             out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
@@ -3722,35 +3707,6 @@ mod tests {
     use super::*;
     use crate::pcs::pack::pack_witness;
     use crate::zerocheck::univariate_skip::build_eq;
-
-    /// The vectorized quad collapse must be bit-identical to the scalar
-    /// bank-major accumulation it replaced (same per-element op, same order),
-    /// and the identity must have teeth: one corrupted bank entry changes
-    /// the collapse.
-    #[test]
-    fn collapse_s_hat_v_quad_matches_scalar_oracle() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x_9AD_C011);
-        let n_packed = 1usize << LOG_PACKING;
-        let mut quad: Vec<F128> = (0..4 * n_packed).map(|_| rng.sample_f128()).collect();
-        let low_point: Vec<F128> = (0..2).map(|_| rng.sample_f128()).collect();
-
-        let low_eq = build_eq(&low_point);
-        let mut want = vec![F128::ZERO; n_packed];
-        for q in 0..4 {
-            for b in 0..n_packed {
-                want[b] += low_eq[q] * quad[q * n_packed + b];
-            }
-        }
-
-        let got = collapse_s_hat_v_quad(&quad, &low_point);
-        assert_eq!(got, want, "quad collapse vs scalar oracle");
-
-        // Negative control: one corrupted bank entry must not still match.
-        quad[n_packed + 3] += F128::ONE;
-        let bad = collapse_s_hat_v_quad(&quad, &low_point);
-        assert_ne!(bad, want, "corrupted bank entry went undetected");
-    }
 
     /// Deferred-reduction IP is bit-identical to the historical per-product
     /// reduce (`acc += x * y`), including the AVX-512 wide path on this cfg.
