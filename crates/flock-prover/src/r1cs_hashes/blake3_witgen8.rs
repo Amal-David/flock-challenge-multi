@@ -285,20 +285,12 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
-/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
-fn wide_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
-    *ON
-}
-
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
 /// cache line. Publish that line with a single ZMM stream when `avx512f` is
-/// compiled in, otherwise one YMM stream per V8. `FLOCK_NO_WIDE_NT=1` keeps
-/// the historical two-XMM form. Chunks still drain in PAIRS so each line's
-/// write-combining buffer closes as soon as it fills.
+/// compiled in, otherwise one YMM stream per V8. Chunks still drain in PAIRS
+/// so each line's write-combining buffer closes as soon as it fills.
 ///
 /// Caller contract: destinations are not read again until after an
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
@@ -354,7 +346,7 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 #[inline(always)]
 unsafe fn stream_v8(p: *mut u32, v: V8) {
     unsafe {
-        if wide_nt_enabled() && p as usize % 32 == 0 {
+        if p as usize % 32 == 0 {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -373,7 +365,7 @@ unsafe fn stream_v8(p: *mut u32, v: V8) {
 unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
     unsafe {
         #[cfg(target_feature = "avx512f")]
-        if wide_nt_enabled() && p as usize % 64 == 0 {
+        if p as usize % 64 == 0 {
             let z = _mm512_castsi256_si512(va);
             let z = _mm512_inserti64x4::<1>(z, vb);
             _mm512_stream_si512(p.cast::<__m512i>(), z);
