@@ -778,7 +778,11 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let defer = zc_fold_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
-        let mut acc = [WideGhashX4::zero(); 8];
+        // Keep the eight bilinear message coefficients in two vectors of
+        // message lanes. This replaces eight three-ZMM deferred accumulators
+        // with two while preserving the exact products and XOR grouping.
+        let mut acc_lo = WideGhashX4::zero();
+        let mut acc_hi = WideGhashX4::zero();
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
@@ -883,18 +887,32 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+
+            // Rows are message coefficients; transpose them so each call
+            // contributes one source group to four independent message lanes.
+            let [al0, al1, al2, al3] = transpose4(a1w, a01w, a3w, a23w);
+            let [bl0, bl1, bl2, bl3] = transpose4(b1, b01, b3, b23);
+            acc_lo.mul_acc(al0, bl0);
+            acc_lo.mul_acc(al1, bl1);
+            acc_lo.mul_acc(al2, bl2);
+            acc_lo.mul_acc(al3, bl3);
+
+            let [ah0, ah1, ah2, ah3] =
+                transpose4(a2w, e_aw, o_aw, _mm512_xor_si512(e_aw, o_aw));
+            let [bh0, bh1, bh2, bh3] =
+                transpose4(b2, e_b, o_b, _mm512_xor_si512(e_b, o_b));
+            acc_hi.mul_acc(ah0, bh0);
+            acc_hi.mul_acc(ah1, bh1);
+            acc_hi.mul_acc(ah2, bh2);
+            acc_hi.mul_acc(ah3, bh3);
             x_lo += 8;
         }
 
@@ -928,9 +946,13 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             _mm_sfence();
         }
         let mut out = [F128::ZERO; 8];
+        _mm512_storeu_si512(out.as_mut_ptr().cast::<__m512i>(), acc_lo.reduce_lanes());
+        _mm512_storeu_si512(out.as_mut_ptr().add(4).cast::<__m512i>(), acc_hi.reduce_lanes());
         for i in 0..8 {
-            tail[i] ^= acc[i].fold();
-            out[i] = tail[i].reduce();
+            // Reduction is F2-linear, so reducing the vector accumulator and
+            // scalar tail separately is identical to the incumbent's
+            // XOR-before-reduce order.
+            out[i] += tail[i].reduce();
         }
         out
     }

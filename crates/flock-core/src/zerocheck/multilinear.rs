@@ -4027,6 +4027,72 @@ mod tests {
         }
     }
 
+    /// Packing the eight cascade coefficients into two four-lane accumulators
+    /// is exactly the incumbent's eight independent unreduced sums. This
+    /// portable oracle covers the algebra used by the AVX-512 message-major
+    /// loop even on builders without AVX-512 execution support.
+    #[test]
+    fn lookahead_message_major_accumulation_matches_group_major() {
+        for &groups in &[1usize, 2, 4, 17, 64] {
+            let mut rng = Rng::new(0x6E00 + groups as u64);
+            let mut group_major = [F256Unreduced::ZERO; 8];
+            let mut packed_lo = [F256Unreduced::ZERO; 4];
+            let mut packed_hi = [F256Unreduced::ZERO; 4];
+
+            for _ in 0..groups {
+                let a = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+                let b = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+                let w = rng.f128();
+                let aw = [w * a[0], w * a[1], w * a[2], w * a[3]];
+                let e_aw = aw[0] + aw[2];
+                let e_b = b[0] + b[2];
+                let o_aw = aw[1] + aw[3];
+                let o_b = b[1] + b[3];
+
+                let direct_a = [
+                    aw[1],
+                    aw[0] + aw[1],
+                    aw[3],
+                    aw[2] + aw[3],
+                    aw[2],
+                    e_aw,
+                    o_aw,
+                    e_aw + o_aw,
+                ];
+                let direct_b = [
+                    b[1],
+                    b[0] + b[1],
+                    b[3],
+                    b[2] + b[3],
+                    b[2],
+                    e_b,
+                    o_b,
+                    e_b + o_b,
+                ];
+                for i in 0..8 {
+                    group_major[i] ^= direct_a[i].mul_unreduced(direct_b[i]);
+                }
+                for i in 0..4 {
+                    packed_lo[i] ^= direct_a[i].mul_unreduced(direct_b[i]);
+                    packed_hi[i] ^= direct_a[i + 4].mul_unreduced(direct_b[i + 4]);
+                }
+            }
+
+            let group_reduced = group_major.map(F256Unreduced::reduce);
+            let packed_reduced = [
+                packed_lo[0].reduce(),
+                packed_lo[1].reduce(),
+                packed_lo[2].reduce(),
+                packed_lo[3].reduce(),
+                packed_hi[0].reduce(),
+                packed_hi[1].reduce(),
+                packed_hi[2].reduce(),
+                packed_hi[3].reduce(),
+            ];
+            assert_eq!(group_reduced, packed_reduced, "groups={groups}");
+        }
+    }
+
     /// AVX-512 cascade kernel vs the portable reference on one chunk.
     #[cfg(all(
         target_arch = "x86_64",
