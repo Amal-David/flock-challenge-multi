@@ -4631,6 +4631,43 @@ mod tests {
         }
     }
 
+    /// The ranked GFNI input shortcut accepts only masks with no dead line in
+    /// slots 0..6, then handles slot 7 explicitly. Every other mask retains
+    /// the generic per-line schedule. Check the complete u8 mask space so an
+    /// unusual padding geometry cannot change which rows enter the fold.
+    #[test]
+    fn gfni_ranked_mask_ingest_matches_generic_for_every_mask() {
+        type Row = [u64; 8];
+        let rows: [Row; 8] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| ((i as u64 + 1) << 32) ^ (j as u64 * 0x9E37_79B9))
+        });
+        let zero = [0u64; 8];
+
+        for dead_lines in 0u8..=u8::MAX {
+            let generic: [Row; 8] =
+                std::array::from_fn(|i| if dead_lines & (1u8 << i) == 0 { rows[i] } else { zero });
+            let candidate = match dead_lines {
+                0 => rows,
+                0x80 => [
+                    rows[0],
+                    rows[1],
+                    rows[2],
+                    rows[3],
+                    rows[4],
+                    rows[5],
+                    rows[6],
+                    zero,
+                ],
+                _ => generic,
+            };
+            assert_eq!(candidate, generic, "dead_lines={dead_lines:#010b}");
+        }
+
+        let fast_masks: Vec<u8> =
+            (0u8..=u8::MAX).filter(|m| m & 0x7f == 0).collect();
+        assert_eq!(fast_masks, [0, 0x80]);
+    }
+
     /// The consumer-level claim that licenses the skip: no row of a dead line
     /// reaches any accumulator or any written table slot. Checked on the
     /// portable round-two chunk path (the same predicate the AVX-512 kernel

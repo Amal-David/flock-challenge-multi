@@ -2095,12 +2095,40 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     use core::arch::x86_64::*;
     // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
     unsafe {
-        let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        // Ranked BLAKE3 tiles repeat masks [0, 0, 0, 0x80].  Peel both
+        // overwhelmingly common inputs, but retain the exact generic mask
+        // schedule for every other padding geometry.
+        let z = match dead_lines {
+            0 => [
+                _mm512_loadu_si512(rows as *const __m512i),
+                _mm512_loadu_si512(rows.add(64) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 2) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 3) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 4) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 5) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 6) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 7) as *const __m512i),
+            ],
+            0x80 => [
+                _mm512_loadu_si512(rows as *const __m512i),
+                _mm512_loadu_si512(rows.add(64) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 2) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 3) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 4) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 5) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 6) as *const __m512i),
+                _mm512_setzero_si512(),
+            ],
+            _ => {
+                let mut z = [_mm512_setzero_si512(); 8];
+                for (i, slot) in z.iter_mut().enumerate() {
+                    if dead_lines & (1u8 << i) == 0 {
+                        *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                    }
+                }
+                z
             }
-        }
+        };
         gfni_fold64_regs_sigma(z, mats, out);
     }
 }
@@ -2243,12 +2271,40 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     // SAFETY (whole body): caller guarantees the row and output bounds; every
     // shuffle index is in range and the cfg gate supplies each intrinsic.
     unsafe {
-        let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        // Ranked BLAKE3 tiles repeat masks [0, 0, 0, 0x80].  Peel both
+        // overwhelmingly common inputs, but retain the exact generic mask
+        // schedule for every other padding geometry.
+        let z = match dead_lines {
+            0 => [
+                _mm512_loadu_si512(rows as *const __m512i),
+                _mm512_loadu_si512(rows.add(64) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 2) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 3) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 4) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 5) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 6) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 7) as *const __m512i),
+            ],
+            0x80 => [
+                _mm512_loadu_si512(rows as *const __m512i),
+                _mm512_loadu_si512(rows.add(64) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 2) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 3) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 4) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 5) as *const __m512i),
+                _mm512_loadu_si512(rows.add(64 * 6) as *const __m512i),
+                _mm512_setzero_si512(),
+            ],
+            _ => {
+                let mut z = [_mm512_setzero_si512(); 8];
+                for (i, slot) in z.iter_mut().enumerate() {
+                    if dead_lines & (1u8 << i) == 0 {
+                        *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                    }
+                }
+                z
             }
-        }
+        };
 
         #[rustfmt::skip]
         const BT: [i8; 64] = [
