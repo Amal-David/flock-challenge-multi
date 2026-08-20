@@ -2490,6 +2490,46 @@ fn eq_split_enabled() -> bool {
 ///
 /// `h` is chosen so the expansion has ~4 blocks per thread; below
 /// `SPLIT_MIN_LOG` the serial recurrence wins.
+/// `FLOCK_NO_EQ_SPLIT_X4=1` restores the scalar expansion loop of
+/// [`build_eq_table_split`] (exact same-binary A/B; `ghash_mul_x4` is the same
+/// canonical mod-p product as the scalar `Mul`, cross-checked in the field
+/// tests, so the table is bit-identical).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn eq_split_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_SPLIT_X4").is_none());
+    *ON
+}
+
+/// Four-lane expansion block of [`build_eq_table_split`]: `out[i] = lo[i]·e`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq` (cfg-gated at the call site). `out` and
+/// `lo` must have equal length.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(out.len(), lo.len());
+    // SAFETY: caller carries the target features; the slices are equal-length
+    // and every offset below stays inside both.
+    unsafe {
+        let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
+        let lanes = out.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, ghash_mul_x4(eb, v));
+            i += 4;
+        }
+        while i < out.len() {
+            out[i] = lo[i] * e;
+            i += 1;
+        }
+    }
+}
+
 fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
     // The incumbent floor (17) let the L2 and L3 OOD tables (d = 16, 13) fall
@@ -2518,11 +2558,20 @@ fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(lo.len(), 1usize << h);
     debug_assert_eq!(hi.len(), 1usize << log_blocks);
     let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    let x4 = eq_split_x4_enabled();
     out.par_chunks_mut(1usize << h)
         .zip(hi.par_iter())
         .for_each(|(chunk, &e)| {
             // Every slot of `chunk` is written here — upholds
             // `alloc_uninit_vec`'s write-before-read contract.
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            if x4 {
+                // SAFETY: target features cfg-guaranteed; `chunk` and `lo`
+                // are both `2^h` long.
+                unsafe { eq_expand_block_x4(chunk, &lo, e) };
+                return;
+            }
             for (o, &l) in chunk.iter_mut().zip(lo.iter()) {
                 *o = l * e;
             }
@@ -3277,6 +3326,29 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
 
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    if open_ood_x4_enabled() {
+        const PAR_THRESHOLD: usize = 4096;
+        if n < PAR_THRESHOLD {
+            // SAFETY: features cfg-guaranteed; equal lengths.
+            let (u_0, u_2, y) = unsafe { msg_reduce_eval_avx512(f, b) };
+            return (SumcheckMessage { u_0, u_2 }, y);
+        }
+        const CHUNK: usize = 2048;
+        let (u_0, u_2, y) = f
+            .par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .map(|(fc, bc)| {
+                // SAFETY: equal chunk lengths; features cfg-guaranteed.
+                unsafe { msg_reduce_eval_avx512(fc, bc) }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, F128::ZERO),
+                |(a0, a2, ay), (c0, c2, cy)| (a0 + c0, a2 + c2, ay + cy),
+            );
+        return (SumcheckMessage { u_0, u_2 }, y);
+    }
+
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
     let term = |j: usize| -> (F128, F128, F128) {
@@ -3543,6 +3615,121 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     }
 
     (u0, u2)
+}
+
+/// [`msg_reduce_avx512`] with the full inner product `Σ_i fc[i]·bc[i]`
+/// accumulated in the same sweep — the leaf of [`round_msg_and_eval_lsb`].
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq` (cfg-gated at the call site). `fc` and
+/// `bc` must have equal length.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    let lanes = len & !7;
+    // SAFETY: caller carries the target features; every load below is inside
+    // the equal-length slices.
+    unsafe {
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let mut y_acc = WideGhashX4::zero();
+
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+        let mut k = 0;
+        while k < lanes {
+            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            // y is the inner product over EVERY slot, so both registers feed it.
+            y_acc.mul_acc(f0, b0);
+            y_acc.mul_acc(f1, b1);
+
+            k += 8;
+        }
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        let mut y = y_acc.fold().reduce();
+
+        while k + 1 < len {
+            let f0 = fc[k];
+            let f1 = fc[k + 1];
+            let b0 = bc[k];
+            let b1 = bc[k + 1];
+            let e0 = f0 * b0;
+            u0 += e0;
+            u2 += (f0 + f1) * (b0 + b1);
+            y += e0 + f1 * b1;
+            k += 2;
+        }
+
+        (u0, u2, y)
+    }
+}
+
+/// Four-lane `acc[i] += alpha·src[i]` — the leaf of [`SumcheckProver::glue`].
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq` (cfg-gated at the call site). `acc` and
+/// `src` must have equal length.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(acc.len(), src.len());
+    // SAFETY: caller carries the target features; the slices are equal-length
+    // and every offset below stays inside both.
+    unsafe {
+        let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+        let lanes = acc.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
+            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            _mm512_storeu_si512(
+                acc.as_mut_ptr().add(i) as *mut __m512i,
+                _mm512_xor_si512(a, ghash_mul_x4(ab, v)),
+            );
+            i += 4;
+        }
+        while i < acc.len() {
+            acc[i] += alpha * src[i];
+            i += 1;
+        }
+    }
+}
+
+/// `FLOCK_NO_OPEN_OOD_X4=1` restores the scalar per-pair loops of
+/// [`round_msg_and_eval_lsb`] and [`SumcheckProver::glue`] (exact same-binary
+/// A/B; the wide leaves accumulate the same canonical products and F128
+/// addition is XOR, so both results are bit-identical).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn open_ood_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_OOD_X4").is_none());
+    *ON
 }
 
 /// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
@@ -5697,7 +5884,28 @@ impl SumcheckProver {
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let x4 = open_ood_x4_enabled();
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        let x4 = false;
+        if x4 {
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                const CHUNK: usize = 2048;
+                let acc: &mut [F128] = &mut self.combined_basis;
+                if acc.len() < PAR_THRESHOLD {
+                    // SAFETY: features cfg-guaranteed; equal lengths.
+                    unsafe { glue_block_x4(acc, &b_new, alpha) };
+                } else {
+                    acc.par_chunks_mut(CHUNK)
+                        .zip(b_new.par_chunks(CHUNK))
+                        .for_each(|(a, v)| {
+                            // SAFETY: equal chunk lengths; features cfg-guaranteed.
+                            unsafe { glue_block_x4(a, v, alpha) }
+                        });
+                }
+            }
+        } else if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
