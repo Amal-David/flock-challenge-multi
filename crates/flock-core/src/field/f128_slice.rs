@@ -223,6 +223,46 @@ mod tests {
         }
     }
 
+    /// The actual SPR 64-bank deferred kernel equals the independently
+    /// reduced scalar sum, including vector bodies and scalar tails.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold64_banked_matches_scalar_reduced_sum() {
+        use super::*;
+        let mut state = 0xF064_BA6E_D5E5_7A11u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 64] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let mut got = vec![F128::ZERO; n];
+            fold64_banked(&src, &mut got, &w);
+            for t in 0..n {
+                let mut want = F128::ZERO;
+                for bank in 0..64 {
+                    want += w[bank] * src[64 * t + bank];
+                }
+                assert_eq!(got[t], want, "n={n} t={t}");
+            }
+        }
+    }
+
 
     use super::*;
 
@@ -374,4 +414,26 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             *value = v;
         }
     }
+}
+
+/// Sixty-four-bank weighted fold used by the x86 DirectFold8 materializer:
+/// `dst[t] = Σ_{b<64} w[b] · src[64t + b]`. The AVX-512 kernel holds one
+/// unreduced accumulator per output lane across all 64 products, eliminating
+/// the four reduced intermediates and final three-product fold of the
+/// `fold16_banked` + `fold4_nested` decomposition.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn fold64_banked(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold64 source must contain sixty-four elements for every destination slot"
+    );
+    // SAFETY: cfg guarantees both target features; the length assertion gives
+    // the kernel all 64 source banks for every destination slot.
+    unsafe { x86_64::fold64_banked(src, dst, w) }
 }

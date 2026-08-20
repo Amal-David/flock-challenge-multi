@@ -5209,6 +5209,42 @@ fn direct_fold8_final_generators(
     generators
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn direct_fold64_banked_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD64_BANKED").is_none()
+    });
+    *ON
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+#[inline]
+fn direct_fold64_weights(challenges: [F128; 6]) -> [F128; 64] {
+    std::array::from_fn(|bank| {
+        let mut weight = F128::ONE;
+        for (bit, &challenge) in challenges.iter().enumerate() {
+            weight *= if (bank >> bit) & 1 == 0 {
+                F128::ONE + challenge
+            } else {
+                challenge
+            };
+        }
+        weight
+    })
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5239,6 +5275,24 @@ fn materialize_direct_fold8(
         }
         weight
     });
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fold64_weight = direct_fold64_weights(challenges);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fold64_on = direct_fold64_banked_enabled();
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let fold64_on = false;
 
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
@@ -5268,7 +5322,14 @@ fn materialize_direct_fold8(
                 (
                     vec![F128::ZERO; super::ring_switch::FOLD_TABLE_TOTAL],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
+                    vec![
+                        F128::ZERO;
+                        if has_ordinary || !fold64_on {
+                            4 * SUB
+                        } else {
+                            0
+                        }
+                    ],
                 )
             },
             |(scratch, mid16, mid4), (block, (b_out, f_out))| {
@@ -5279,21 +5340,45 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
+                // SPR binds all 64 witness banks into four final lanes under
+                // one deferred reduction. This removes the four reduced mids,
+                // the final three products, and the mid4 scratch round trip.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if fold64_on {
+                    crate::field::f128_slice::fold64_banked(f_in, f_out, &fold64_weight);
+                }
+
+                // Portable architectures retain the proven 16:1 + 4:1
+                // decomposition and its bounded 16 KiB worker scratch.
+                if !fold64_on {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)],
+                            m4,
+                            &fold16_weight,
+                        );
+                        crate::field::f128_slice::fold4_nested(
+                            m4,
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
+                        );
+                        slot += n;
+                    }
+                }
+
+                if has_ordinary {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
                         let m16 = &mut mid16[..16 * n];
                         crate::field::f128_slice::fold4_nested(
                             &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
@@ -5302,8 +5387,8 @@ fn materialize_direct_fold8(
                         crate::field::f128_slice::fold4_nested(
                             m4, &mut b_out[slot..slot + n], r4, r5,
                         );
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 let (first_claim, rest_claims) = claims.split_first().unwrap();
@@ -10588,6 +10673,38 @@ mod tests {
         let ok =
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
+    }
+
+    #[test]
+    fn direct_fold64_weights_match_six_pair_folds() {
+        let mut state = 0x6408_51A7_C0DE_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values: Vec<F128> = (0..64)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let challenges: [F128; 6] = core::array::from_fn(|_| F128 {
+            lo: next(),
+            hi: next(),
+        });
+        let weights = super::direct_fold64_weights(challenges);
+        let direct = values
+            .iter()
+            .zip(weights)
+            .fold(F128::ZERO, |sum, (&value, weight)| sum + value * weight);
+        for challenge in challenges {
+            let mut folded = vec![F128::ZERO; values.len() / 2];
+            crate::field::f128_slice::fold_pairs(&values, 0, &mut folded, challenge);
+            values = folded;
+        }
+        assert_eq!(values, vec![direct]);
     }
 
     #[test]
