@@ -1945,8 +1945,14 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
         }
 
         let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        // By-value transpose args: slice-ref forms address-take `acc` and
+        // force it through the stack (see the battery sites below).
+        let lo_half = qword_transpose([
+            acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
+        ]);
+        let hi_half = qword_transpose([
+            acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
+        ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
@@ -2238,8 +2244,11 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             *slot = _mm512_permutexvar_epi8(sigma, p[j]);
         }
 
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        // `from_fn` + by-value transpose args: a `mut` zero-init array whose
+        // halves are then passed as slices is address-taken, which defeats
+        // SROA and materializes the dead zero-init as a real 1 KiB memset
+        // call (plus caller-saved zmm spills around it) in the hot battery.
+        let acc: [__m512i; 16] = core::array::from_fn(|k| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     pc[j],
@@ -2249,11 +2258,15 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        });
 
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let lo_half = qword_transpose([
+            acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
+        ]);
+        let hi_half = qword_transpose([
+            acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
+        ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
@@ -2391,8 +2404,10 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
         }
 
         // Sixteen output-byte planes: eight GFNI products folded per plane.
-        let mut acc = [_mm512_setzero_si512(); 16];
-        for (k, slot) in acc.iter_mut().enumerate() {
+        // `from_fn` + by-value transpose args keep `acc` in registers — the
+        // `mut` + slice form was address-taken, turning the dead zero-init
+        // into a real 1 KiB memset call with zmm spills in the hot battery.
+        let acc: [__m512i; 16] = core::array::from_fn(|k| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     p[j],
@@ -2402,13 +2417,17 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            *slot = _mm512_xor_si512(v2, v3);
-        }
+            _mm512_xor_si512(v2, v3)
+        });
 
         // Reassemble: inverse qword transpose + inverse byte transpose per
         // half, then interleave lo/hi qwords into row-major F128s.
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let lo_half = qword_transpose([
+            acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7],
+        ]);
+        let hi_half = qword_transpose([
+            acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
+        ]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
