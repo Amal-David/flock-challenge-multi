@@ -145,16 +145,39 @@ pub(crate) unsafe fn store_out64(out: &mut [u8; 64], acc: core::arch::x86_64::__
     use core::arch::x86_64::*;
     // SAFETY: `out` is 64 writable bytes; alignment per the `nt` contract.
     unsafe {
-        match nt {
-            2 => _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc),
-            1 => {
-                let p = out.as_mut_ptr();
-                _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
-                _mm_stream_si128(p.add(16) as *mut __m128i, _mm512_extracti32x4_epi32::<1>(acc));
-                _mm_stream_si128(p.add(32) as *mut __m128i, _mm512_extracti32x4_epi32::<2>(acc));
-                _mm_stream_si128(p.add(48) as *mut __m128i, _mm512_extracti32x4_epi32::<3>(acc));
-            }
-            _ => _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc),
+        if nt == 2 {
+            _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+        } else {
+            store_out64_split(out, acc, nt);
+        }
+    }
+}
+
+/// The `nt = 1` and `nt = 0` store classes of [`store_out64`], out of line so
+/// the ZMM-stream class does not carry their register allocation into the
+/// kernels that inline it.
+///
+/// # Safety
+/// As for [`store_out64`].
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i, nt: u8) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from [`store_out64`]'s contract.
+    unsafe {
+        if nt == 1 {
+            let p = out.as_mut_ptr();
+            _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
+            _mm_stream_si128(p.add(16) as *mut __m128i, _mm512_extracti32x4_epi32::<1>(acc));
+            _mm_stream_si128(p.add(32) as *mut __m128i, _mm512_extracti32x4_epi32::<2>(acc));
+            _mm_stream_si128(p.add(48) as *mut __m128i, _mm512_extracti32x4_epi32::<3>(acc));
+        } else {
+            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }
     }
 }
@@ -188,6 +211,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     out: &mut [u8; 64],
     nt: u8,
     offw: bool,
+    imgs: (*const u8, *const u8),
 ) {
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -214,34 +238,91 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
         _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
 
-        // Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same
-        // count of `vgf2p8mulb` as the explicit x^k form (8 products + 7
-        // scalings), but the multiplier is the loop-invariant x = 0x02, so
-        // the per-iteration `mov $1` / `shl %cl` / `vpbroadcastb` that
-        // rebuilt x^k disappear. GF(2^8) multiplication is associative and
-        // distributes over XOR, so the value is bit-identical.
-        let xb = _mm512_set1_epi8(2);
-        macro_rules! horner {
-            ($apply:ident) => {{
-                let mut acc = _mm512_gf2p8mul_epi8(
-                    inv_table.$apply(op.add(7 * 8)),
-                    inv_table.$apply(op.add(64 + 7 * 8)),
-                );
-                for k in (0..7usize).rev() {
-                    let av = inv_table.$apply(op.add(k * 8));
-                    let bv = inv_table.$apply(op.add(64 + k * 8));
-                    let product = _mm512_gf2p8mul_epi8(av, bv);
-                    acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
-                }
-                acc
-            }};
-        }
         let acc = if offw {
-            horner!(apply_x86_avx512_register_2img_offw_unchecked)
+            horner_2img_offw(imgs, op)
         } else {
-            horner!(apply_x86_avx512_register_2img_off_unchecked)
+            horner_2img_off_narrow(inv_table, op)
         };
         store_out64(out, acc, nt);
+    }
+}
+
+/// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
+/// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
+/// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
+/// `shl %cl` / `vpbroadcastb` that rebuilt x^k disappear. GF(2^8)
+/// multiplication is associative and distributes over XOR, so the value is
+/// bit-identical.
+///
+/// The eight pre-scaled `u16` offsets of every apply are fetched as two
+/// 64-bit reads and split with shifts. `imgs` are the table images the caller
+/// resolved for this run of windows.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_pidx`], with `imgs` the table's
+/// base and σ₈ image pointers.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
+        for k in (0..7usize).rev() {
+            let av = apply(op.add(k * 8));
+            let bv = apply(op.add(64 + k * 8));
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        acc
+    }
+}
+
+/// [`horner_2img_offw`] with the eight offsets read separately as 16-bit
+/// values, out of line so the wide-read form does not carry its register
+/// allocation. Identical value and identical table addresses.
+/// `FLOCK_NO_URM_OFFW=1` restores it.
+///
+/// # Safety
+/// As for [`horner_2img_offw`].
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+unsafe fn horner_2img_off_narrow(
+    inv_table: &InvNttTableByteSingleGf8,
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let apply =
+            |o: *const u16| inv_table.apply_x86_avx512_register_2img_off_unchecked(o);
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
+        for k in (0..7usize).rev() {
+            let av = apply(op.add(k * 8));
+            let bv = apply(op.add(64 + k * 8));
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        acc
     }
 }
 
@@ -268,6 +349,11 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
     let pidx = img2 && urm_pidx_enabled();
     let offw = pidx && urm_offw_enabled();
+    let imgs = if img2 {
+        inv_table.image_ptrs()
+    } else {
+        (core::ptr::null(), core::ptr::null())
+    };
     // SAFETY: same contract as this function; the mode flags merely cache
     // the three process-invariant selectors used by the incumbent body.
     unsafe {
@@ -282,6 +368,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
             img2,
             pidx,
             offw,
+            imgs,
         );
     }
 }
@@ -308,8 +395,8 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
     img2: bool,
     pidx: bool,
     offw: bool,
+    imgs: (*const u8, *const u8),
 ) {
-    use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
     // Two-image apply: 3 port-5 shuffles per table apply instead of 10 (see
@@ -329,10 +416,51 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
                 out,
                 nt,
                 offw,
+                imgs,
             );
         }
         return;
     }
+    // SAFETY: same contract as this function.
+    unsafe {
+        shift_reduce_inner_ab_x86_avx512_rows(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            out,
+            nt,
+            img2,
+        );
+    }
+}
+
+/// The explicit-x^k row loop of [`shift_reduce_inner_ab_x86_avx512_prepared`]
+/// — the form used whenever the pre-scaled-index apply is not selected. Out of
+/// line so the pre-scaled body does not carry its register allocation.
+/// `FLOCK_NO_URM_PIDX=1` / `FLOCK_NO_URM_APPLY_2IMG=1` restore it.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_prepared`]; `byte_base_b` is
+/// `chunk_byte_base + b_med * N_CHUNKS * 8`.
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+unsafe fn shift_reduce_inner_ab_x86_avx512_rows(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+    nt: u8,
+    img2: bool,
+) {
+    use core::arch::x86_64::*;
     // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
     // every K-row offset. The table has the protocol-fixed ell=64/chunks=8
     // shape (and carries the σ₈ image when `img2`), and `out` is exactly one
