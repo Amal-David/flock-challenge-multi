@@ -213,7 +213,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     unsafe {
         // Select the odd F128 lanes of eight consecutive eq_lo values.
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        // Keep the materializing specialization on its established eight
+        // accumulators.  The ranked no-materialize specialization packs two
+        // message coefficients into each of four accumulators, halving its
+        // packing shuffles while cutting live deferred state from 24 ZMMs to
+        // twelve.
         let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc01 = WideGhashX4::zero();
+        let mut acc23 = WideGhashX4::zero();
+        let mut acc45 = WideGhashX4::zero();
+        let mut acc67 = WideGhashX4::zero();
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
@@ -437,18 +446,65 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
-            let e_aw = _mm512_xor_si512(a0w, a2w);
-            let e_b = _mm512_xor_si512(b0, b2);
-            let o_aw = _mm512_xor_si512(a1w, a3w);
-            let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            if WRITE {
+                acc[0].mul_acc(a1w, b1);
+                acc[1]
+                    .mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3]
+                    .mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7]
+                    .mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            } else {
+                let a01w = _mm512_xor_si512(a0w, a1w);
+                let b01 = _mm512_xor_si512(b0, b1);
+                let a23w = _mm512_xor_si512(a2w, a3w);
+                let b23 = _mm512_xor_si512(b2, b3);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+
+                // Each shuffle packs two messages for two groups.  The low
+                // and high group halves accumulate into adjacent lanes and
+                // are XOR-folded once after the loop.
+                let a01_02 = _mm512_shuffle_i64x2::<0x44>(a1w, a01w);
+                let a01_13 = _mm512_shuffle_i64x2::<0xEE>(a1w, a01w);
+                let b01_02 = _mm512_shuffle_i64x2::<0x44>(b1, b01);
+                let b01_13 = _mm512_shuffle_i64x2::<0xEE>(b1, b01);
+                acc01.mul_acc(a01_02, b01_02);
+                acc01.mul_acc(a01_13, b01_13);
+
+                let a23_02 = _mm512_shuffle_i64x2::<0x44>(a3w, a23w);
+                let a23_13 = _mm512_shuffle_i64x2::<0xEE>(a3w, a23w);
+                let b23_02 = _mm512_shuffle_i64x2::<0x44>(b3, b23);
+                let b23_13 = _mm512_shuffle_i64x2::<0xEE>(b3, b23);
+                acc23.mul_acc(a23_02, b23_02);
+                acc23.mul_acc(a23_13, b23_13);
+
+                let a45_02 = _mm512_shuffle_i64x2::<0x44>(a2w, e_aw);
+                let a45_13 = _mm512_shuffle_i64x2::<0xEE>(a2w, e_aw);
+                let b45_02 = _mm512_shuffle_i64x2::<0x44>(b2, e_b);
+                let b45_13 = _mm512_shuffle_i64x2::<0xEE>(b2, e_b);
+                acc45.mul_acc(a45_02, b45_02);
+                acc45.mul_acc(a45_13, b45_13);
+
+                let a7w = _mm512_xor_si512(e_aw, o_aw);
+                let b7 = _mm512_xor_si512(e_b, o_b);
+                let a67_02 = _mm512_shuffle_i64x2::<0x44>(o_aw, a7w);
+                let a67_13 = _mm512_shuffle_i64x2::<0xEE>(o_aw, a7w);
+                let b67_02 = _mm512_shuffle_i64x2::<0x44>(o_b, b7);
+                let b67_13 = _mm512_shuffle_i64x2::<0xEE>(o_b, b7);
+                acc67.mul_acc(a67_02, b67_02);
+                acc67.mul_acc(a67_13, b67_13);
+            }
             x_lo += 8;
         }
 
@@ -507,9 +563,27 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         }
 
         let mut out = [F128::ZERO; 8];
-        for i in 0..8 {
-            tail[i] ^= acc[i].fold();
-            out[i] = tail[i].reduce();
+        if WRITE {
+            for i in 0..8 {
+                tail[i] ^= acc[i].fold();
+                out[i] = tail[i].reduce();
+            }
+        } else {
+            let r01 = acc01.reduce_lanes();
+            let r23 = acc23.reduce_lanes();
+            let r45 = acc45.reduce_lanes();
+            let r67 = acc67.reduce_lanes();
+            let r01 = _mm512_xor_si512(r01, _mm512_shuffle_i64x2::<0xB1>(r01, r01));
+            let r23 = _mm512_xor_si512(r23, _mm512_shuffle_i64x2::<0xB1>(r23, r23));
+            let r45 = _mm512_xor_si512(r45, _mm512_shuffle_i64x2::<0xB1>(r45, r45));
+            let r67 = _mm512_xor_si512(r67, _mm512_shuffle_i64x2::<0xB1>(r67, r67));
+            let out_lo = _mm512_shuffle_i64x2::<0x88>(r01, r23);
+            let out_hi = _mm512_shuffle_i64x2::<0x88>(r45, r67);
+            _mm512_storeu_si512(out.as_mut_ptr().cast::<__m512i>(), out_lo);
+            _mm512_storeu_si512(out.as_mut_ptr().add(4).cast::<__m512i>(), out_hi);
+            for i in 0..8 {
+                out[i] += tail[i].reduce();
+            }
         }
         out
     }

@@ -3837,6 +3837,89 @@ mod tests {
         }
     }
 
+    /// The no-write AVX-512 round-two kernel packs two of the eight message
+    /// coefficients into each deferred accumulator.  This portable oracle
+    /// models the exact `0x44`/`0xEE` lane grouping and final adjacent-lane
+    /// XOR, including a separately reduced scalar tail.
+    #[test]
+    fn round2_no_write_message_pairs_match_group_major() {
+        for &blocks in &[1usize, 2, 7, 31, 64] {
+            let mut rng = Rng::new(0x3B00 + blocks as u64);
+            let mut direct = [F256Unreduced::ZERO; 8];
+            let mut paired = [[F256Unreduced::ZERO; 4]; 4];
+
+            for _ in 0..blocks {
+                let mut ma = [[F128::ZERO; 4]; 8];
+                let mut mb = [[F128::ZERO; 4]; 8];
+                for group in 0..4 {
+                    let a = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+                    let b = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+                    let w = rng.f128();
+                    let aw = [w * a[0], w * a[1], w * a[2], w * a[3]];
+                    let e_aw = aw[0] + aw[2];
+                    let e_b = b[0] + b[2];
+                    let o_aw = aw[1] + aw[3];
+                    let o_b = b[1] + b[3];
+                    let a_msg = [
+                        aw[1],
+                        aw[0] + aw[1],
+                        aw[3],
+                        aw[2] + aw[3],
+                        aw[2],
+                        e_aw,
+                        o_aw,
+                        e_aw + o_aw,
+                    ];
+                    let b_msg = [
+                        b[1],
+                        b[0] + b[1],
+                        b[3],
+                        b[2] + b[3],
+                        b[2],
+                        e_b,
+                        o_b,
+                        e_b + o_b,
+                    ];
+                    for message in 0..8 {
+                        ma[message][group] = a_msg[message];
+                        mb[message][group] = b_msg[message];
+                    }
+                }
+
+                for message in 0..8 {
+                    for group in 0..4 {
+                        direct[message] ^=
+                            ma[message][group].mul_unreduced(mb[message][group]);
+                        // `0x44` contributes groups 0/1 and `0xEE` groups
+                        // 2/3 to the same adjacent lanes of each message.
+                        let pair = message / 2;
+                        let lane = 2 * (message & 1) + (group & 1);
+                        paired[pair][lane] ^=
+                            ma[message][group].mul_unreduced(mb[message][group]);
+                    }
+                }
+            }
+
+            let tail: [F256Unreduced; 8] = std::array::from_fn(|_| {
+                rng.f128().mul_unreduced(rng.f128())
+                    ^ rng.f128().mul_unreduced(rng.f128())
+            });
+            for message in 0..8 {
+                direct[message] ^= tail[message];
+            }
+            let direct = direct.map(F256Unreduced::reduce);
+            let mut packed = [F128::ZERO; 8];
+            for pair in 0..4 {
+                packed[2 * pair] =
+                    (paired[pair][0] ^ paired[pair][1]).reduce() + tail[2 * pair].reduce();
+                packed[2 * pair + 1] =
+                    (paired[pair][2] ^ paired[pair][3]).reduce()
+                        + tail[2 * pair + 1].reduce();
+            }
+            assert_eq!(direct, packed, "blocks={blocks}");
+        }
+    }
+
     /// AVX-512 lookahead sweep kernel vs the portable reference on one chunk,
     /// with and without padded pairs, at several `lo_size` (incl. the scalar
     /// tail sizes 2 and 4).
