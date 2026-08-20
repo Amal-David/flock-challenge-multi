@@ -2449,6 +2449,26 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
+    // Same hoisted `(w, w·x⁶⁴)` pair table the packed r2/n26 sweeps
+    // already pass. The kernel accepted `Some` since `FLOCK_NO_ZC_WTAB`
+    // landed; this cascade call site still passed `None`. Ranked n24
+    // `lo_size` is a multiple of 8, so the constructor's gate fires.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
 
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -2467,7 +2487,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, None,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg,
                 )
             };
             #[cfg(not(all(

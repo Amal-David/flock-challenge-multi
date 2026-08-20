@@ -2723,7 +2723,15 @@ fn transpose_forward_ntt_window_singleton(
 ) -> (usize, Vec<F128>) {
     assert!(k > 0 && k <= log_d);
     assert!(p < 1usize << k);
-    let mut buf = vec![F128::ZERO; 1usize << k];
+    // Every slot is written before any later read: index 0 here, then each
+    // layer's `eq_expand_block_x4` / scalar product storeu's the new half
+    // without loading it. `alloc_uninit_vec` deletes the 4 KiB zero that
+    // the dense collision fallback still needs (it scatters into zeros).
+    let mut buf = if induce_singleton_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(1usize << k)
+    } else {
+        vec![F128::ZERO; 1usize << k]
+    };
     buf[0] = value;
     let mut len = 1usize;
     for s in 0..k {
@@ -2763,6 +2771,19 @@ fn ranked_induce_singleton_selected(
         && fill
         && k == 8
         && matches!((log_d, n_queries), (20, 218) | (18, 106))
+}
+
+/// `FLOCK_NO_LIG_INDUCE_SINGLETON_UNINIT=1` restores the incumbent
+/// `vec![F128::ZERO; 2^k]` allocation inside the singleton expander.
+/// Default ON: the expansion writes every slot (`buf[0] = value`, then
+/// each layer storeu's a new upper half from the live prefix), so the
+/// 4 KiB zero-fill is dead work. Same field values; kill switch is
+/// diagnostics only. Ranked env is cleared.
+fn induce_singleton_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_INDUCE_SINGLETON_UNINIT").is_none()
+    });
+    *ON
 }
 
 fn ranked_induce_singleton_enabled(log_d: usize, n_queries: usize, k: usize, fill: bool) -> bool {

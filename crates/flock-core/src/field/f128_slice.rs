@@ -301,6 +301,112 @@ mod tests {
     }
 
 
+    /// The three split-half leaves match the straightforward scalar formulas
+    /// at lengths that hit the four-slot body, every tail residue, and the
+    /// body-free short case.
+    #[test]
+    fn split_half_leaves_match_scalar() {
+        use super::*;
+        let mut state = 0xD15E_A5E0_1234_5678_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut draw = |n: usize| -> Vec<F128> {
+            (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect()
+        };
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 64, 4096] {
+            let r = draw(1)[0];
+            // bind_split_half
+            let lo0 = draw(n);
+            let hi = draw(n);
+            let mut got = lo0.clone();
+            bind_split_half(&mut got, &hi, r);
+            for i in 0..n {
+                assert_eq!(got[i], lo0[i] + r * (hi[i] + lo0[i]), "bind n={n} i={i}");
+            }
+            // msg_split_half
+            let (chi, clo, zhi, zlo) = (draw(n), draw(n), draw(n), draw(n));
+            let (e1, einf) = msg_split_half(&chi, &clo, &zhi, &zlo, n);
+            let mut we1 = F128::ZERO;
+            let mut weinf = F128::ZERO;
+            for i in 0..n {
+                we1 += chi[i] * zhi[i];
+                weinf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            }
+            assert_eq!((e1, einf), (we1, weinf), "msg n={n}");
+            // bind_both_and_msg_split
+            let (c0, c1, c2, c3) = (draw(n), draw(n), draw(n), draw(n));
+            let (z0, z1, z2, z3) = (draw(n), draw(n), draw(n), draw(n));
+            let (mut gc0, mut gc1, mut gz0, mut gz1) =
+                (c0.clone(), c1.clone(), z0.clone(), z1.clone());
+            let got = bind_both_and_msg_split(
+                &mut gc0, &mut gc1, &c2, &c3, &mut gz0, &mut gz1, &z2, &z3, r, n,
+            );
+            let (mut wc0, mut wc1, mut wz0, mut wz1) =
+                (c0.clone(), c1.clone(), z0.clone(), z1.clone());
+            let mut we1 = F128::ZERO;
+            let mut weinf = F128::ZERO;
+            for i in 0..n {
+                let lo = c0[i] + r * (c2[i] + c0[i]);
+                let hi = c1[i] + r * (c3[i] + c1[i]);
+                let zl = z0[i] + r * (z2[i] + z0[i]);
+                let zh = z1[i] + r * (z3[i] + z1[i]);
+                wc0[i] = lo;
+                wc1[i] = hi;
+                wz0[i] = zl;
+                wz1[i] = zh;
+                we1 += hi * zh;
+                weinf += (hi + lo) * (zh + zl);
+            }
+            assert_eq!(got, (we1, weinf), "fused message n={n}");
+            assert_eq!((gc0, gc1, gz0, gz1), (wc0, wc1, wz0, wz1), "fused tables n={n}");
+        }
+    }
+
+    /// Chunking the split-half message and the fused bind is exact: the
+    /// per-chunk results recombine to the whole-slice result.
+    #[test]
+    fn split_half_chunking_is_exact() {
+        use super::*;
+        let mut state = 0x0BAD_C0DE_F00D_9911_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut draw = |n: usize| -> Vec<F128> {
+            (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect()
+        };
+        let n = 300usize;
+        let (chi, clo, zhi, zlo) = (draw(n), draw(n), draw(n), draw(n));
+        let whole = msg_split_half(&chi, &clo, &zhi, &zlo, n);
+        for chunk in [1usize, 3, 4, 7, 64, 256] {
+            let mut acc = (F128::ZERO, F128::ZERO);
+            let mut i = 0;
+            while i < n {
+                let len = chunk.min(n - i);
+                let part = msg_split_half(&chi[i..], &clo[i..], &zhi[i..], &zlo[i..], len);
+                acc = (acc.0 + part.0, acc.1 + part.1);
+                i += len;
+            }
+            assert_eq!(acc, whole, "chunk={chunk}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -450,5 +556,143 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             }
             *value = v;
         }
+    }
+}
+
+/// Bind one top-bit split in place: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.
+///
+/// The pair members live in two separate contiguous runs (top-bit split),
+/// not adjacent slots — [`fold_pairs`] handles the adjacent layout instead.
+/// Same char-2 one-mul identity either way.
+#[inline]
+pub(crate) fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
+    assert!(hi.len() >= lo.len(), "split bind needs one high slot per low");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees one readable high slot per low slot.
+    unsafe {
+        x86_64::bind_split_half(lo, hi, r);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for i in 0..lo.len() {
+        lo[i] = lo[i] + r * (hi[i] + lo[i]);
+    }
+}
+
+/// Product-sumcheck message over a top-bit split:
+/// `(Σ chi·zhi, Σ (chi+clo)·(zhi+zlo))` over the first `n` slots.
+///
+/// AVX-512 accumulates each sum unreduced and reduces once; reduction is
+/// F₂-linear, so that is the same field element as the reduced-per-term sum,
+/// and XOR regrouping across lanes is exact.
+#[inline]
+pub(crate) fn msg_split_half(
+    chi: &[F128],
+    clo: &[F128],
+    zhi: &[F128],
+    zlo: &[F128],
+    n: usize,
+) -> (F128, F128) {
+    assert!(
+        chi.len() >= n && clo.len() >= n && zhi.len() >= n && zlo.len() >= n,
+        "split message needs all four runs"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // assertion guarantees every run covers `n`.
+    return unsafe { x86_64::msg_split_half(chi, clo, zhi, zlo, n) };
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        for i in 0..n {
+            e1 += chi[i] * zhi[i];
+            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+        }
+        (e1, einf)
+    }
+}
+
+/// Fused quarter bind of `(comb, z)` at `r` plus the next round's message.
+/// See the x86 kernel for the per-slot definition; the quarters are four
+/// separate contiguous runs.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_both_and_msg_split(
+    cq0: &mut [F128],
+    cq1: &mut [F128],
+    cq2: &[F128],
+    cq3: &[F128],
+    zq0: &mut [F128],
+    zq1: &mut [F128],
+    zq2: &[F128],
+    zq3: &[F128],
+    r: F128,
+    n: usize,
+) -> (F128, F128) {
+    assert!(
+        cq0.len() >= n
+            && cq1.len() >= n
+            && cq2.len() >= n
+            && cq3.len() >= n
+            && zq0.len() >= n
+            && zq1.len() >= n
+            && zq2.len() >= n
+            && zq3.len() >= n,
+        "fused split bind needs all eight quarters"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // assertion guarantees every quarter covers `n`.
+    return unsafe {
+        x86_64::bind_both_and_msg_split(cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r, n)
+    };
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        for i in 0..n {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zq0[i] = zlo;
+            zq1[i] = zhi;
+            e1 += hi * zhi;
+            einf += (hi + lo) * (zhi + zlo);
+        }
+        (e1, einf)
     }
 }

@@ -1956,23 +1956,56 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
-    if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+    if !sumcheck_x4_enabled() {
+        if half < SUMCHECK_PAR_THRESHOLD {
+            let mut e1 = F128::ZERO;
+            let mut einf = F128::ZERO;
+            for i in 0..half {
+                e1 += chi[i] * zhi[i];
+                einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            }
+            return (e1, einf);
         }
-        return (e1, einf);
+        return (0..half)
+            .into_par_iter()
+            .map(|i| {
+                let e1_i = chi[i] * zhi[i];
+                let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+                (e1_i, einf_i)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+    if half < SUMCHECK_PAR_THRESHOLD {
+        return crate::field::f128_slice::msg_split_half(chi, clo, zhi, zlo, half);
+    }
+    // Chunked: the per-chunk sums are XORed, and XOR is associative and
+    // commutative, so any chunking yields the same field element.
+    let chunk = sumcheck_chunk(half);
+    chi.par_chunks(chunk)
+        .zip(clo.par_chunks(chunk))
+        .zip(zhi.par_chunks(chunk))
+        .zip(zlo.par_chunks(chunk))
+        .map(|(((chi_c, clo_c), zhi_c), zlo_c)| {
+            crate::field::f128_slice::msg_split_half(chi_c, clo_c, zhi_c, zlo_c, chi_c.len())
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+}
+
+/// Ranked default routes the lincheck product-sumcheck rounds through the
+/// four-lane split-half leaves in `field::f128_slice`, with chunk-granular
+/// rayon instead of one item per element. `FLOCK_NO_LC_SUMCHECK_X4=1` restores
+/// the per-element scalar rounds. Read once per process; default ON.
+fn sumcheck_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_X4").is_none());
+    *ON
+}
+
+/// Rayon chunk width for one sumcheck round over `n` slots: enough chunks to
+/// fill the pool, never finer than a whole cache line of `F128`.
+fn sumcheck_chunk(n: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    n.div_ceil(threads).max(4)
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1980,17 +2013,33 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
-    if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+    if !sumcheck_x4_enabled() {
+        if half < SUMCHECK_PAR_THRESHOLD {
+            for i in 0..half {
+                v[i] = v[i] + r * (v[i + half] + v[i]);
+            }
+        } else {
+            let (lo, hi) = v.split_at_mut(half);
+            let hi = &hi[..half];
+            lo.par_iter_mut()
+                .zip(hi.par_iter())
+                .for_each(|(lo_i, &hi_i)| {
+                    *lo_i = *lo_i + r * (hi_i + *lo_i);
+                });
         }
+        v.truncate(half);
+        return;
+    }
+    let (lo, hi) = v.split_at_mut(half);
+    let hi = &hi[..half];
+    if half < SUMCHECK_PAR_THRESHOLD {
+        crate::field::f128_slice::bind_split_half(lo, hi, r);
     } else {
-        let (lo, hi) = v.split_at_mut(half);
-        let hi = &hi[..half];
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(lo_i, &hi_i)| {
-                *lo_i = *lo_i + r * (hi_i + *lo_i);
+        let chunk = sumcheck_chunk(half);
+        lo.par_chunks_mut(chunk)
+            .zip(hi.par_chunks(chunk))
+            .for_each(|(lo_c, hi_c)| {
+                crate::field::f128_slice::bind_split_half(lo_c, hi_c, r);
             });
     }
     v.truncate(half);
@@ -2041,7 +2090,32 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq0, zq1) = z_lo.split_at_mut(half2);
     let (zq2, zq3) = z_hi.split_at(half2);
 
-    let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
+    let (e1, einf) = if sumcheck_x4_enabled() {
+        if half2 < SUMCHECK_PAR_THRESHOLD {
+            crate::field::f128_slice::bind_both_and_msg_split(
+                cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r, half2,
+            )
+        } else {
+            // Chunked: bound values depend only on their own slot, and the
+            // message terms are XOR-summed, so any chunking is exact.
+            let chunk = sumcheck_chunk(half2);
+            cq0.par_chunks_mut(chunk)
+                .zip(cq1.par_chunks_mut(chunk))
+                .zip(cq2.par_chunks(chunk))
+                .zip(cq3.par_chunks(chunk))
+                .zip(zq0.par_chunks_mut(chunk))
+                .zip(zq1.par_chunks_mut(chunk))
+                .zip(zq2.par_chunks(chunk))
+                .zip(zq3.par_chunks(chunk))
+                .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
+                    let n = c0.len();
+                    crate::field::f128_slice::bind_both_and_msg_split(
+                        c0, c1, c2, c3, z0, z1, z2, z3, r, n,
+                    )
+                })
+                .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        }
+    } else if half2 < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half2 {
