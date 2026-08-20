@@ -42,6 +42,11 @@ use super::x86_64_bstatic_plan::{
 #[repr(C, align(64))]
 pub(crate) struct BstaticPartials {
     rows: [[[u8; 64]; 8]; BSTATIC_BLOCKS],
+    /// Resolved once, at cache build: use the paired two-image apply
+    /// ([`apply_full_2img`]) for the a-side row transforms. Process-invariant
+    /// (kill switch + table shape), so the per-window kernel reads a plain
+    /// bool from an already-resident line instead of entering a `OnceLock`.
+    img2: bool,
 }
 
 /// Process-wide cache of the partial images together with a fingerprint of the
@@ -71,6 +76,7 @@ fn fingerprint_of(inv_table: &InvNttTableByteSingleGf8) -> [u8; 8 * 64] {
 fn build_partials(inv_table: &InvNttTableByteSingleGf8) -> Box<BstaticPartials> {
     let mut out = Box::new(BstaticPartials {
         rows: [[[0u8; 64]; 8]; BSTATIC_BLOCKS],
+        img2: apply_2img_for(inv_table),
     });
     let mut f = [F8::ZERO; 64];
     for blk in 0..BSTATIC_BLOCKS {
@@ -107,12 +113,30 @@ pub(crate) fn prepare_bstatic(inv_table: &InvNttTableByteSingleGf8) -> Option<&'
         fingerprint: fingerprint_of(inv_table),
         partials: build_partials(inv_table),
     });
-    if cached.fingerprint == fingerprint_of(inv_table) {
+    if cached.fingerprint == fingerprint_of(inv_table)
+        && cached.partials.img2 == apply_2img_for(inv_table)
+    {
         VERIFIED_PTR.store(ptr, Ordering::Release);
         Some(&*cached.partials)
     } else {
         None
     }
+}
+
+/// Whether this table can serve the paired two-image apply. Both terms are
+/// process-invariant for a given table, so the result is cached inside
+/// [`BstaticPartials`] and re-checked only once per buffer in
+/// [`prepare_bstatic`], never per window.
+fn apply_2img_for(inv_table: &InvNttTableByteSingleGf8) -> bool {
+    bstatic_apply_2img_enabled() && inv_table.has_second_image()
+}
+
+/// `FLOCK_NO_BSTATIC_APPLY_2IMG=1` restores the one-image `perm_row` apply in
+/// the static-B kernel (same-binary A/B); the ranked worker's cleared env
+/// never sets it.
+pub(crate) fn bstatic_apply_2img_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_APPLY_2IMG").is_none())
 }
 
 /// `FLOCK_NO_FAST_SHIFT_REDUCE=1` restores the incumbent kernel (same-binary
@@ -191,6 +215,75 @@ unsafe fn apply_full(table: *const u8, bytes: *const u8) -> __m512i {
     }
 }
 
+/// Two-image twin of [`apply_full`]: identical value, first butterfly level
+/// folded into the loads.
+///
+/// The apply is `⊕_j σ_{8j}(T₀[b_j])` with `σ_s(v)[i] = v[i ^ s]`, an F₂-linear
+/// coordinate permutation composing as `σ_s ∘ σ_t = σ_{s^t}`. Taking the
+/// odd-`j` rows from the σ₈ image gives `U_c = T₀[b_{2c}] ⊕ σ₈(T₀[b_{2c+1}])`,
+/// and the whole apply is `(U₀ ⊕ σ₃₂(U₂)) ⊕ σ₁₆(U₁ ⊕ σ₃₂(U₃))` — three
+/// 128-bit-lane shuffles (σ₁₆ = imm 0xB1, σ₃₂ = imm 0x4E) instead of the
+/// one-image form's seven `vpermq`. Same eight loads, same seven XORs; the
+/// port-5-only stream per apply drops 7 → 3, and the seven `PERM_IDX` index
+/// vectors the one-image form pins in ZMM registers are no longer needed.
+///
+/// This is [`crate::ntt::InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_unchecked`]
+/// specialised to the raw table pointers the static-B kernel already holds.
+///
+/// # Safety
+/// As for [`apply_full`], plus: `table8` must be the σ₈ second image of
+/// `table` (`inv_table.half_swapped_data_ptr()`, guarded by
+/// `has_second_image()`).
+#[inline(always)]
+unsafe fn apply_full_2img(table: *const u8, table8: *const u8, bytes: *const u8) -> __m512i {
+    // SAFETY: caller guarantees eight readable bytes at `bytes` and two
+    // images of 256 rows × 64 readable bytes.
+    unsafe {
+        let row = |img: *const u8, b: usize| {
+            _mm512_loadu_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
+        };
+        let u0 = _mm512_xor_si512(row(table, 0), row(table8, 1));
+        let u1 = _mm512_xor_si512(row(table, 2), row(table8, 3));
+        let u2 = _mm512_xor_si512(row(table, 4), row(table8, 5));
+        let u3 = _mm512_xor_si512(row(table, 6), row(table8, 7));
+        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
+/// The eight fully-static K-rows of an `ALL_FULLY_STATIC` block: each row's
+/// a-side apply times its `x^K`-prescaled `T(expected)` image, XOR-accumulated.
+/// Identical arithmetic in both instantiations — `IMG2` only selects which of
+/// the two bit-identical apply forms produces `av`.
+///
+/// # Safety
+/// As for [`kernel`]; `parts` addresses the block's eight 64-byte-aligned
+/// partial images and `a_base` its eight packed a-rows. With `IMG2`, as for
+/// [`apply_full_2img`].
+#[inline(always)]
+unsafe fn all_static_acc<const IMG2: bool>(
+    table: *const u8,
+    table8: *const u8,
+    a_base: *const u8,
+    parts: *const u8,
+) -> __m512i {
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let mut acc = _mm512_setzero_si512();
+        for k in 0..8usize {
+            let av = if IMG2 {
+                apply_full_2img(table, table8, a_base.add(k * N_CHUNKS))
+            } else {
+                apply_full(table, a_base.add(k * N_CHUNKS))
+            };
+            let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
+            acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
+        }
+        acc
+    }
+}
+
 /// One `(BLK)`-specialised static-B kernel call. Same contract as
 /// [`super::x86_64::shift_reduce_inner_ab_x86_avx512`]; `byte_base_b` is
 /// `chunk_byte_base + b_med * N_CHUNKS * 8`.
@@ -221,6 +314,11 @@ unsafe fn kernel<const BLK: usize>(
     nt: u8,
 ) -> bool {
     let table = inv_table.data_ptr();
+    // Paired two-image apply, resolved once per buffer into `partials`
+    // (never a per-window `OnceLock` entry). `table8` is only formed when the
+    // mode is live, i.e. when the table actually carries the σ₈ image.
+    let img2 = partials.img2;
+    let table8 = if img2 { inv_table.half_swapped_data_ptr() } else { table };
     // SAFETY: see the function contract; every load below is either an
     // 8-byte packed-row read the caller vouches for, a table-row read (u8
     // index into 256 rows of 64 bytes), or an aligned read of static/partial
@@ -276,13 +374,14 @@ unsafe fn kernel<const BLK: usize>(
             t
         };
         if ALL_FULLY_STATIC[BLK] {
-            let mut acc = _mm512_setzero_si512();
+            // The apply form is loop-invariant, so it is a const-generic
+            // parameter of the row loop, not a per-row branch.
             let parts = partials.rows[BLK].as_ptr() as *const u8;
-            for k in 0..8usize {
-                let av = apply_full(table, a_base.add(k * N_CHUNKS));
-                let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
-                acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
-            }
+            let acc = if img2 {
+                all_static_acc::<true>(table, table8, a_base, parts)
+            } else {
+                all_static_acc::<false>(table, table8, a_base, parts)
+            };
             super::x86_64::store_out64(out, acc, nt);
             return true;
         }
@@ -295,7 +394,11 @@ unsafe fn kernel<const BLK: usize>(
                 if p.kind == ROW_ZERO {
                     // b row is structurally zero ⇒ contributes nothing.
                 } else if p.kind == ROW_STATIC {
-                    let av = apply_full(table, a_ptr);
+                    let av = if img2 {
+                        apply_full_2img(table, table8, a_ptr)
+                    } else {
+                        apply_full(table, a_ptr)
+                    };
                     let part = _mm512_load_si512(partials.rows[BLK][$k].as_ptr() as *const __m512i);
                     if p.vary == 0 {
                         // `part` is already `T(expected) · x^K`.
