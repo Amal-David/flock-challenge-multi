@@ -66,6 +66,41 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Bind one bank coordinate in two bit-major DirectFold8 factor states and
+/// return the next round's `(u0,u2)` statistics. The state is only 512 KiB at
+/// entry and halves each call, so the compact scalar scan avoids dispatch and
+/// uses the one-product characteristic-two fold `e + r*(e+o)`.
+#[inline]
+pub(crate) fn fold_two_and_msg_in_place(
+    f: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    assert_eq!(f.len(), b.len());
+    assert!(f.len().is_multiple_of(4));
+    let half = f.len() / 2;
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    let mut t = 0usize;
+    while t < half {
+        let source = 2 * t;
+        let f0 = f[source] + r * (f[source] + f[source + 1]);
+        let f1 = f[source + 2] + r * (f[source + 2] + f[source + 3]);
+        let b0 = b[source] + r * (b[source] + b[source + 1]);
+        let b1 = b[source + 2] + r * (b[source + 2] + b[source + 3]);
+        f[t] = f0;
+        f[t + 1] = f1;
+        b[t] = b0;
+        b[t + 1] = b1;
+        u0 += f0 * b0;
+        u2 += (f0 + f1) * (b0 + b1);
+        t += 2;
+    }
+    f.truncate(half);
+    b.truncate(half);
+    (u0, u2)
+}
+
 /// Add one scaled field slice into another: `dst[i] += scale * addend[i]`.
 ///
 /// The ranked lazy-OOD fold uses this after folding the incumbent basis and

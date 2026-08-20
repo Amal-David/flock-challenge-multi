@@ -364,6 +364,10 @@ pub struct CapturedSHatVC {
     /// gate is on and the round-1 split admits the four-window producer. It
     /// collapses under `suffix[..4]` to `s_hat_v_c` exactly.
     pub fold4: Option<Vec<F128>>,
+    /// Sixty-four-bank form for the direct-fold8 route; collapses under
+    /// `suffix[..6]` to `s_hat_v_c` exactly like `fold4` does under
+    /// `suffix[..4]`. Present only behind the shared DirectFold8 opt-in.
+    pub fold8: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -518,7 +522,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // interleaved recovers the fused kernel's stream-level
             // parallelism over the same total bytes.
             let t_r1 = std::time::Instant::now();
-            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, t_c_ms)) = rayon::join(
+            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) = rayon::join(
                 || {
                     let t = std::time::Instant::now();
                     let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
@@ -528,7 +532,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 },
                 || {
                     let t = std::time::Instant::now();
-                    let (c, s_hat_v_c, quad, fold4) =
+                    let (c, s_hat_v_c, quad, fold4, fold8) =
                         crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
                             c_identity_z,
                             m,
@@ -538,7 +542,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             &r,
                             inv_table,
                         );
-                    (c, s_hat_v_c, quad, fold4, t.elapsed().as_secs_f64() * 1e3)
+                    (c, s_hat_v_c, quad, fold4, fold8, t.elapsed().as_secs_f64() * 1e3)
                 },
             );
             if zc_timing {
@@ -554,6 +558,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     s_hat_v_c,
                     quad,
                     fold4: Some(fold4),
+                    fold8: (!fold8.is_empty()).then_some(fold8),
                 }),
             )
         } else if crate::pcs::ranked_direct_fold4_enabled()
@@ -563,20 +568,47 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                     ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
                 );
-            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: Some(fold4) }))
+            (
+                ab,
+                c,
+                Some(CapturedSHatVC {
+                    s_hat_v_c,
+                    quad,
+                    fold4: Some(fold4),
+                    fold8: None,
+                }),
+            )
         } else {
             let (ab, c, s_hat_v_c, quad) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
                     ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
                 );
-            (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None }))
+            (
+                ab,
+                c,
+                Some(CapturedSHatVC {
+                    s_hat_v_c,
+                    quad,
+                    fold4: None,
+                    fold8: None,
+                }),
+            )
         }
     } else if capture_s_hat_v_c {
         let (ab, c, s_hat_v_c, quad) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
                 a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
             );
-        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad, fold4: None }))
+        (
+            ab,
+            c,
+            Some(CapturedSHatVC {
+                s_hat_v_c,
+                quad,
+                fold4: None,
+                fold8: None,
+            }),
+        )
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,

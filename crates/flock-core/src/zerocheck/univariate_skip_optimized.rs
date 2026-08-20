@@ -2641,10 +2641,11 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
 /// Derive the exact legacy round-one C message and its RingSwitch capture
 /// tensors from one block-major outer fold of the identity-C witness.
 ///
-/// Returns `(res_c_lifted, s_hat_v_c, quad_c, fold4_c)` — the same four values
-/// [`finish_c_banks_fold4`] produces from the 32-bank row-major drain, and in
-/// the same conventions (`res_c_lifted` still omits the `C_s` factor, which the
-/// zerocheck caller restores before the message reaches the transcript).
+/// Returns `(res_c_lifted, s_hat_v_c, quad_c, fold4_c, fold8_c)`.  The
+/// sixty-four-bank statistic is widened only after the block-major outer fold
+/// has reduced identity C to its 16,384-element inner table; unlike the old
+/// raw-row DirectFold8 experiment, this does not widen round one's GFNI plane
+/// state or revisit the 512 MiB witness.
 pub fn round1_c_fold4_from_block_major_z(
     z_packed: &[F128],
     m: usize,
@@ -2653,11 +2654,11 @@ pub fn round1_c_fold4_from_block_major_z(
     useful_bits: usize,
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
-        k_log >= k_skip + 5,
-        "Fold4 needs four retained tail coordinates"
+        k_log >= k_skip + 7,
+        "Fold8 needs six retained tail coordinates"
     );
     assert_eq!(r.len(), m);
     assert_eq!(z_packed.len(), (1usize << m) / 128);
@@ -2671,12 +2672,34 @@ pub fn round1_c_fold4_from_block_major_z(
     );
 
     let inner_tail = &r[k_skip + 1..k_log];
-    let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    let (fold4, fold8) = if crate::pcs::ranked_direct_fold8_enabled() {
+        let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
+        // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
+        let retained_top_eq = build_eq(&inner_tail[4..6]);
+        let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+        for high in 0..4 {
+            for bank in 0..16 {
+                let src = (bank + 16 * high) * n_packed;
+                let dst = bank * n_packed;
+                for packed in 0..n_packed {
+                    fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                }
+            }
+        }
+        (fold4, fold8)
+    } else {
+        // Kill switch restores the incumbent sixteen-bank producer; do not
+        // pay for widening and collapsing a statistic no consumer will use.
+        (
+            crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail),
+            Vec::new(),
+        )
+    };
 
     // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
     // tensor (coordinates 0 and 1 stay bank selectors).
     let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let mut quad = vec![F128::ZERO; 4 * n_packed];
     for q in 0..4 {
         for e in 0..4 {
@@ -2699,7 +2722,7 @@ pub fn round1_c_fold4_from_block_major_z(
         res_c_s[lane] = c_s_inv * naive;
     }
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (res_c_lifted, s_hat_v_c, quad, fold4)
+    (res_c_lifted, s_hat_v_c, quad, fold4, fold8)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -3794,9 +3817,10 @@ mod tests {
             let ab_new = round1_shift_reduce_ab_packed_padded_with_precomputed(
                 &mut precomputed_ab_only, &a_p, &b_p, m, K_SKIP, &r, &table, &padding,
             );
-            let (c_new, s_hat_new, quad_new, fold4_new) = round1_c_fold4_from_block_major_z(
-                &c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table,
-            );
+            let (c_new, s_hat_new, quad_new, fold4_new, fold8_new) =
+                round1_c_fold4_from_block_major_z(
+                    &c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table,
+                );
 
             assert_eq!(ab_new, ab_ref, "AB-only mismatch at m={m} useful={useful_bits}");
             assert_eq!(c_new, c_ref, "stripe C message mismatch at m={m} useful={useful_bits}");
@@ -3809,6 +3833,18 @@ mod tests {
                 fold4_new, fold4_ref,
                 "stripe fold4 tensor mismatch at m={m} useful={useful_bits}"
             );
+            if crate::pcs::ranked_direct_fold8_enabled() {
+                assert_eq!(
+                    crate::pcs::ring_switch::collapse_s_hat_v_fold8(
+                        &fold8_new,
+                        &r[K_SKIP + 1..K_SKIP + 7],
+                    ),
+                    s_hat_new,
+                    "stripe fold8 tensor mismatch at m={m} useful={useful_bits}"
+                );
+            } else {
+                assert!(fold8_new.is_empty(), "Fold8 kill switch still widened C");
+            }
         }
     }
 

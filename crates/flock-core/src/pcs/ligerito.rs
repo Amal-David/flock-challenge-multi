@@ -3975,6 +3975,35 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+#[inline]
+fn eval_fold8_lookahead4(
+    coefficients: &super::Fold8Lookahead4,
+    r0: F128,
+    r1: F128,
+    r2: F128,
+    r3: F128,
+) -> SumcheckMessage {
+    SumcheckMessage {
+        u_0: eval_quadratic_tensor(&coefficients[..81], &[r0, r1, r2, r3]),
+        u_2: eval_quadratic_tensor(&coefficients[81..], &[r0, r1, r2, r3]),
+    }
+}
+
+#[inline]
+fn eval_fold8_lookahead5(
+    coefficients: &super::Fold8Lookahead5,
+    r0: F128,
+    r1: F128,
+    r2: F128,
+    r3: F128,
+    r4: F128,
+) -> SumcheckMessage {
+    SumcheckMessage {
+        u_0: eval_quadratic_tensor(&coefficients[..243], &[r0, r1, r2, r3, r4]),
+        u_2: eval_quadratic_tensor(&coefficients[243..], &[r0, r1, r2, r3, r4]),
+    }
+}
+
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
 /// direct basis in ONE N→N/16 pass and emits the round-4 message. Both ranked
@@ -5133,6 +5162,201 @@ enum PendingOodEq {
     },
 }
 
+#[inline]
+fn fold_one_direct_fold8_claim_and_message(
+    claim: &mut super::ring_switch::DirectFold8Factors,
+    challenge: F128,
+) -> (F128, F128) {
+    assert_eq!(claim.a_state.len(), claim.w_state.len());
+    assert_eq!(claim.a_state.len() % (1usize << super::LOG_PACKING), 0);
+    let banks = claim.a_state.len() >> super::LOG_PACKING;
+    assert!(banks >= 4 && banks.is_power_of_two());
+    crate::field::f128_slice::fold_two_and_msg_in_place(
+        &mut claim.a_state,
+        &mut claim.w_state,
+        challenge,
+    )
+}
+
+fn fold_direct_fold8_factors_and_message(
+    claims: &mut [super::ring_switch::DirectFold8Factors],
+    challenge: F128,
+) -> SumcheckMessage {
+    let (u0, u2) = if claims.len() == 2 {
+        let (left, right) = claims.split_at_mut(1);
+        let (a, b) = rayon::join(
+            || fold_one_direct_fold8_claim_and_message(&mut left[0], challenge),
+            || fold_one_direct_fold8_claim_and_message(&mut right[0], challenge),
+        );
+        (a.0 + b.0, a.1 + b.1)
+    } else {
+        claims.iter_mut().fold((F128::ZERO, F128::ZERO), |mut total, claim| {
+            let part = fold_one_direct_fold8_claim_and_message(claim, challenge);
+            total.0 += part.0;
+            total.1 += part.1;
+            total
+        })
+    };
+    SumcheckMessage { u_0: u0, u_2: u2 }
+}
+
+fn direct_fold8_final_generators(
+    claim: &super::ring_switch::DirectFold8Factors,
+    challenge: F128,
+) -> Vec<F128> {
+    let mut generators = vec![F128::ZERO; claim.w_state.len() / 2];
+    crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
+    generators
+}
+
+/// Sixty-four-bank materializer. Six challenges are sampled from direct
+/// product statistics before this function binds the witness and combined
+/// basis in one N→N/64 pass. It emits M6 — the round message of the folded
+/// 2^19 state — fused into the same pass; no lookahead follows because the
+/// initial cadence is exhausted (the fold2 pair of the fold4 route never
+/// runs and the 2^21/2^20 states never exist).
+fn materialize_direct_fold8(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    assert!(!claims.is_empty());
+    let has_ordinary = !ordinary_basis.is_empty();
+    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
+    assert!(packed_witness.len().is_multiple_of(64));
+    let [r0, r1, r2, r3, r4, r5] = challenges;
+    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
+        let mut weight = F128::ONE;
+        for (bit, &challenge) in challenges[..4].iter().enumerate() {
+            weight *= if (bank >> bit) & 1 == 0 {
+                F128::ONE + challenge
+            } else {
+                challenge
+            };
+        }
+        weight
+    });
+
+    let direct_tables: Vec<Vec<F128>> = claims
+        .par_iter()
+        .map(|claim| {
+            let generators = direct_fold8_final_generators(claim, challenges[5]);
+            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+        })
+        .collect();
+
+    let out_len = packed_witness.len() / 64;
+    let block_len = claims[0].eq_lo.len();
+    assert!(block_len.is_multiple_of(4));
+    assert_eq!(out_len, block_len * claims[0].eq_hi.len());
+    assert!(claims.iter().all(|claim| {
+        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
+    }));
+
+    let mut folded_f = crate::scratch::take_f128(out_len);
+    let mut folded_b = crate::scratch::take_f128(out_len);
+    const SUB: usize = 256;
+    let stats = folded_b
+        .par_chunks_mut(block_len)
+        .zip(folded_f.par_chunks_mut(block_len))
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    vec![F128::ZERO; super::ring_switch::FOLD_TABLE_TOTAL],
+                    vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
+                    vec![F128::ZERO; 4 * SUB],
+                )
+            },
+            |(scratch, mid16, mid4), (block, (b_out, f_out))| {
+                let start = 64 * block * block_len;
+                let f_in = &packed_witness[start..start + 64 * block_len];
+                let b_in: &[F128] = if has_ordinary {
+                    &ordinary_basis[start..start + 64 * block_len]
+                } else {
+                    &[]
+                };
+                // Deferred-reduction 16-bank fold followed by one nested
+                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
+                // count versus three nested passes while keeping bounded
+                // scratch and eliminating the scalar 64-product chain.
+                let mut slot = 0usize;
+                while slot < block_len {
+                    let n = SUB.min(block_len - slot);
+                    let m4 = &mut mid4[..4 * n];
+                    crate::field::f128_slice::fold16_banked(
+                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                    );
+                    crate::field::f128_slice::fold4_nested(
+                        m4, &mut f_out[slot..slot + n], r4, r5,
+                    );
+                    if has_ordinary {
+                        let m16 = &mut mid16[..16 * n];
+                        crate::field::f128_slice::fold4_nested(
+                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                        );
+                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                        crate::field::f128_slice::fold4_nested(
+                            m4, &mut b_out[slot..slot + n], r4, r5,
+                        );
+                    }
+                    slot += n;
+                }
+
+                let (first_claim, rest_claims) = claims.split_first().unwrap();
+                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+                super::ring_switch::compose_block_table(
+                    first_table,
+                    first_claim.eq_hi[block],
+                    scratch,
+                );
+                for slot in 0..block_len {
+                    let direct =
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                    b_out[slot] = if has_ordinary {
+                        direct + b_out[slot]
+                    } else {
+                        direct
+                    };
+                }
+                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+                    super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
+                    for (slot, out) in b_out.iter_mut().enumerate() {
+                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                    }
+                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: features cfg-guaranteed; slices are equal and
+                    // block_len is an even power of two.
+                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    super::round0_scalar(f_out, b_out)
+                }
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+
+    crate::scratch::give_f128(packed_witness);
+    crate::scratch::give_f128(ordinary_basis);
+    (
+        folded_f,
+        folded_b,
+        SumcheckMessage {
+            u_0: stats.0,
+            u_2: stats.1,
+        },
+    )
+}
+
 pub struct SumcheckProver {
     f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -5230,6 +5454,25 @@ impl SumcheckProver {
         basis: Vec<F128>,
         target: F128,
         transcript: [SumcheckMessage; 3],
+        fold_arena: Option<FoldArena>,
+    ) -> Self {
+        assert_eq!(f.len(), basis.len());
+        Self {
+            f: FoldBuf::Owned(f),
+            combined_basis: FoldBuf::Owned(basis),
+            fold_arena,
+            t_r: target,
+            transcript: transcript.to_vec(),
+            pending_glue: None,
+            pending_ood_eq: None,
+        }
+    }
+
+    fn new_after_direct_fold8(
+        f: Vec<F128>,
+        basis: Vec<F128>,
+        target: F128,
+        transcript: [SumcheckMessage; 7],
         fold_arena: Option<FoldArena>,
     ) -> Self {
         assert_eq!(f.len(), basis.len());
@@ -5646,6 +5889,9 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
+        None,
+        None,
         challenger,
     )
 }
@@ -5678,6 +5924,9 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -5718,7 +5967,10 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         Some(round1_lookahead),
         None,
         None,
+        None,
+        None,
         Some(direct),
+        None,
         None,
         fold_arena,
         challenger,
@@ -5761,6 +6013,51 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         Some(round2_lookahead),
         Some(round3_lookahead),
         None,
+        None,
+        None,
+        Some(direct),
+        None,
+        fold_arena,
+        challenger,
+    )
+}
+/// Direct-fold8 entry. The first six transcript messages come entirely from
+/// `direct` 64×64 product matrices; after six sequential FS samples the state
+/// is materialized at N/64 = 2^19 in ONE pass and the incumbent cadence
+/// resumes — the fold2 pair of the fold4 route never runs (the 2^21 and
+/// 2^20 states never exist).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
+    config: &ProverConfig,
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    direct: Vec<super::ring_switch::DirectFold8Factors>,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    round0_uv: (F128, F128),
+    fold_arena: Option<FoldArena>,
+    challenger: &mut Ch,
+) -> LigeritoProof {
+    assert_eq!(config.initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
+    recursive_prover_with_basis_impl(
+        config,
+        packed_witness,
+        ordinary_basis,
+        target,
+        l0_codeword,
+        l0_tree,
+        Some(SumcheckMessage {
+            u_0: round0_uv.0,
+            u_2: round0_uv.1,
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         Some(direct),
         fold_arena,
         challenger,
@@ -5779,8 +6076,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
     round3_lookahead: Option<super::Fold4Lookahead3>,
+    round4_lookahead: Option<super::Fold8Lookahead4>,
+    round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
+    direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
@@ -5789,10 +6089,21 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    if direct_fold2.is_some() || direct_fold4.is_some() {
+    assert!(
+        direct_fold2.is_none() || (direct_fold4.is_none() && direct_fold8.is_none()),
+        "direct-fold2 and direct-fold4/fold8 modes are mutually exclusive"
+    );
+    assert!(
+        direct_fold4.is_none() || direct_fold8.is_none(),
+        "direct-fold4 and direct-fold8 modes are mutually exclusive"
+    );
+    if direct_fold2.is_some() || direct_fold4.is_some() || direct_fold8.is_some() {
         assert!(b_initial.is_empty() || b_initial.len() == 1usize << log_n);
     } else {
         assert_eq!(b_initial.len(), 1usize << log_n);
+    }
+    if direct_fold8.is_some() {
+        assert_eq!(initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
     }
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
@@ -5847,12 +6158,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     let _t = std::time::Instant::now();
     assert!(
-        direct_fold2.is_none() || direct_fold4.is_none(),
-        "direct-fold2 and direct-fold4 modes are mutually exclusive"
+        direct_fold2.is_none() || (direct_fold4.is_none() && direct_fold8.is_none()),
+        "direct-fold2 and direct-fold4/fold8 modes are mutually exclusive"
     );
+    assert!(direct_fold4.is_none() || direct_fold8.is_none());
     let direct_fold4_mode = direct_fold4.is_some();
-    let direct_mode = direct_fold2.is_some() || direct_fold4_mode;
-    if direct_fold4_mode {
+    let direct_fold8_mode = direct_fold8.is_some();
+    let direct_mode = direct_fold2.is_some() || direct_fold4_mode || direct_fold8_mode;
+    if direct_fold8_mode {
+        assert_eq!(initial_k, 6, "direct fold8 needs six initial rounds");
+    } else if direct_fold4_mode {
         assert!(initial_k >= 4, "direct fold4 needs four initial rounds");
     } else if direct_mode {
         assert!(initial_k >= 2, "direct AB fold2 needs two initial rounds");
@@ -5861,8 +6176,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut b_initial = Some(b_initial);
     let mut direct_fold2 = direct_fold2;
     let mut direct_fold4 = direct_fold4;
-    let mut fold4_challenges: Vec<F128> = Vec::with_capacity(4);
-    let mut fold4_msgs: Vec<SumcheckMessage> = Vec::with_capacity(4);
+    let mut direct_fold8 = direct_fold8;
+    let mut fold4_challenges: Vec<F128> = Vec::with_capacity(6);
+    let mut fold4_msgs: Vec<SumcheckMessage> = Vec::with_capacity(6);
     let mut fold_arena = fold_arena;
     let (mut sc_prover, start_msg) = if direct_mode {
         (
@@ -5916,7 +6232,50 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
-        let msg = if direct_fold4_mode && j < 4 {
+        let msg = if direct_fold8_mode && j < 6 {
+            let msg = if j < 5 {
+                fold_direct_fold8_factors_and_message(
+                    direct_fold8
+                        .as_mut()
+                        .expect("direct-fold8 factors remain live through round five"),
+                    r,
+                )
+            } else {
+                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                    let (f8, b8, msg) = materialize_direct_fold8(
+                        packed_witness.take().unwrap(),
+                        b_initial.take().unwrap(),
+                        &direct,
+                        [
+                            fold4_challenges[0],
+                            fold4_challenges[1],
+                            fold4_challenges[2],
+                            fold4_challenges[3],
+                            fold4_challenges[4],
+                            r,
+                        ],
+                    );
+                    sc_prover = Some(SumcheckProver::new_after_direct_fold8(
+                        f8,
+                        b8,
+                        target,
+                        [
+                            start_msg,
+                            fold4_msgs[0],
+                            fold4_msgs[1],
+                            fold4_msgs[2],
+                            fold4_msgs[3],
+                            fold4_msgs[4],
+                            msg,
+                        ],
+                        fold_arena.take(),
+                    ));
+                    msg
+            };
+            fold4_challenges.push(r);
+            fold4_msgs.push(msg);
+            msg
+        } else if direct_fold4_mode && j < 4 {
             let msg = match j {
                 0 => eval_lookahead(
                     round1_lookahead
@@ -6035,7 +6394,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         n1,
         ood_count(1),
         sc_prover.f().len(),
-        direct_fold4_mode,
+        direct_fold4_mode || direct_fold8_mode,
     );
 
     // OOD binding for the L1 commit: each sample evaluates f1's multilinear
@@ -10229,6 +10588,162 @@ mod tests {
         let ok =
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
+    }
+
+    #[test]
+    fn direct_fold8_full_proof_and_claim_bytes_match_ordinary_fold2() {
+        use crate::challenger::Challenger;
+
+        let log_n = 12;
+        let initial_k = 6;
+        let k_0 = 2;
+        let log_inv_rate = 3;
+        let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
+        let poly: Vec<F128> = (0..(1usize << log_n))
+            .map(|_| rng.sample_f128())
+            .collect();
+        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let scaled_rdp: Vec<F128> = build_eq_table(
+            &(0..crate::pcs::LOG_PACKING)
+                .map(|_| rng.sample_f128())
+                .collect::<Vec<_>>(),
+        );
+        let combined_basis = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix),
+            &scaled_rdp,
+        );
+        let target = poly
+            .iter()
+            .zip(combined_basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let tail_eq = build_eq_table(&suffix[6..]);
+        let table = super::super::ring_switch::build_fold_byte_table(&scaled_rdp);
+        let low_eq = build_eq_table(&suffix[..6]);
+        let mut a_state = vec![F128::ZERO; 64 * n_packed];
+        for e in 0..64 {
+            let strided: Vec<F128> =
+                (0..poly.len() / 64).map(|rest| poly[64 * rest + e]).collect();
+            let bank = super::super::ring_switch::fold_1b_rows_naive(&strided, &tail_eq);
+            let transposed = super::super::ring_switch::tensor_algebra_transpose(&bank);
+            for (bit, value) in transposed.into_iter().enumerate() {
+                a_state[bit * 64 + e] = value;
+            }
+        }
+        let mut w_state = vec![F128::ZERO; 64 * n_packed];
+        for d_low in 0..64 {
+            let mut basis_product = low_eq[d_low];
+            w_state[d_low] = super::super::ring_switch::fold_one_slot(basis_product, &table);
+            for bit in 1..n_packed {
+                basis_product = crate::field::mul_by_x(basis_product);
+                w_state[bit * 64 + d_low] =
+                    super::super::ring_switch::fold_one_slot(basis_product, &table);
+            }
+        }
+        let mut round0 = (F128::ZERO, F128::ZERO);
+        for i in (0..a_state.len()).step_by(2) {
+            let a0 = a_state[i];
+            let a1 = a_state[i + 1];
+            let b0 = w_state[i];
+            let b1 = w_state[i + 1];
+            round0.0 += a0 * b0;
+            round0.1 += (a0 + a1) * (b0 + b1);
+        }
+        let (eq_lo, eq_hi) =
+            super::super::ring_switch::build_eq_split(&suffix[6..], (log_n - 6) / 2);
+        let direct = vec![super::super::ring_switch::DirectFold8Factors {
+            eq_lo,
+            eq_hi,
+            a_state,
+            w_state,
+            round0,
+        }];
+
+        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+        let cfg = ProverConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_n - initial_k,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_ks: vec![k_0],
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
+        };
+        let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_n - initial_k,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
+
+        let mut ordinary_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let ordinary = recursive_prover_with_basis_precomputed_round0(
+            &cfg,
+            poly.clone(),
+            combined_basis.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            round0,
+            None,
+            &mut ordinary_challenger,
+        );
+        let mut direct_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let got = recursive_prover_with_basis_direct_fold8(
+            &cfg,
+            poly,
+            Vec::new(),
+            direct,
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            round0,
+            None,
+            &mut direct_challenger,
+        );
+
+        assert_eq!(got, ordinary);
+        assert_eq!(
+            bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
+            bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
+        );
+
+        let v_cfg = VerifierConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_n - initial_k,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_ks: vec![k_0],
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
+        };
+        let mut verifier_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        assert!(recursive_verifier_with_basis(
+            &v_cfg,
+            &got,
+            &combined_basis,
+            target,
+            &wtns_0.root(),
+            &mut verifier_challenger,
+        ));
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense
