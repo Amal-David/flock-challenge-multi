@@ -167,6 +167,51 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// XOR one field slice into another: `dst[i] += src[i]` (F128 addition IS
+/// XOR — no reduction, no carries).
+///
+/// The sparse-induce multi-singleton accumulation uses this to sum window
+/// expansions; routing it through [`add_scaled`] with `scale = ONE` would
+/// spend a full carry-less multiply per lane on a no-op.
+#[inline]
+pub(crate) fn xor_into(dst: &mut [F128], src: &[F128]) {
+    assert_eq!(dst.len(), src.len(), "xor addend length changed");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees avx512f; the length assertion
+    // guarantees one readable source per destination slot, and every offset
+    // below stays inside both slices (loadu/storeu need no alignment).
+    unsafe {
+        use core::arch::x86_64::*;
+        let lanes = dst.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let d = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
+            let s = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(d, s));
+            i += 4;
+        }
+        while i < dst.len() {
+            let v = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) += v;
+            i += 1;
+        }
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (value, &extra) in dst.iter_mut().zip(src) {
+        *value += extra;
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where

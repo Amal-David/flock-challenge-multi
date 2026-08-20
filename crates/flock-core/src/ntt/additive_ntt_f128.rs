@@ -393,29 +393,92 @@ impl Drop for DeepSplitClaim {
     }
 }
 
+/// Queued-backlog byte budget for the deep split's SPSC rings. The pairing's
+/// rationale is the shared L2: the consumer should hash blocks its sibling
+/// just wrote while they are still resident. The producer's live sub-group
+/// already claims most of the 2 MiB private L2, so the backlog gets half a
+/// MiB — at the ranked 128 KiB block that is a depth of 4; the previous
+/// depth-8 default queued 1 MiB and let the oldest blocks age out of L2
+/// before they were hashed. The asymmetry that makes a small budget cheap:
+/// a full ring stalls the producer in PAUSE, which donates its front-end
+/// slots to the SMT sibling doing the hashing, while a deep backlog costs
+/// real DRAM refills on every evicted block. Denominated in BYTES, not
+/// blocks, so a future change to the fused tail's block size cannot
+/// silently break the arithmetic.
+#[cfg(target_os = "linux")]
+const DEEP_SPLIT_L2_BACKLOG_BUDGET_BYTES: usize = 512 << 10;
+
 /// How many finished blocks a butterfly worker may publish before waiting
-/// for its paired hash worker. Eight blocks cover the fused-tail's natural
-/// production burst while keeping the queued payload within the shared L2.
-/// `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides it (diagnostics). Read once per
-/// process — never from inside a loop.
+/// for its paired hash worker: the backlog byte budget above divided by the
+/// pass's block size, clamped to the physical ring.
+/// `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides the block count directly
+/// (diagnostics; `=8` restores the previous fixed default). The env is read
+/// once per process — never from inside a loop.
 #[cfg(target_os = "linux")]
 #[inline]
-fn select_deep_split_depth(requested: Option<usize>) -> usize {
+fn select_deep_split_depth(requested: Option<usize>, block_bytes: usize) -> usize {
     requested
-        .unwrap_or(DeepQueue::DEFAULT_DEPTH)
+        .unwrap_or_else(|| DEEP_SPLIT_L2_BACKLOG_BUDGET_BYTES / block_bytes.max(1))
         .clamp(1, DeepQueue::CAP)
 }
 
 #[cfg(target_os = "linux")]
-fn deep_split_depth() -> usize {
-    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        select_deep_split_depth(
-            std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok()),
-        )
+fn deep_split_depth(block_bytes: usize) -> usize {
+    static REQUESTED: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
     });
-    *D
+    select_deep_split_depth(*REQUESTED, block_bytes)
+}
+
+/// Sub-group boundary drain: how many published-but-unconsumed blocks the
+/// producer may carry INTO a new sub-group's first sweep. The queue depth
+/// above bounds the steady-state backlog while producing inside a
+/// sub-group; this bounds the one overlap the depth cannot see — a fresh
+/// sub-group's 2 MiB sweep-1 walking the private L2 while up to
+/// depth×block_bytes of the PREVIOUS sub-group's unhashed blocks still
+/// need to stay resident for the sibling. Waiting is a PAUSE spin, which
+/// donates the producer's front-end slots to the hashing sibling — cheap
+/// on this topology — and happens at most once per sub-group (~512 short
+/// stalls per prove worst case). Scheduling only: no byte can change.
+/// `FLOCK_NTT_DEEP_BOUNDARY_DRAIN` overrides the block count; `0` disables
+/// the drain (the incumbent schedule). Read once per process — never from
+/// inside a loop.
+#[cfg(target_os = "linux")]
+fn deep_boundary_drain() -> usize {
+    static B: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_DEEP_BOUNDARY_DRAIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+    });
+    *B
+}
+
+/// How many PAUSE iterations a full ring's producer spends waiting for its
+/// consumer before hashing the block itself (the existing inline-callback
+/// fallback). The default budget is about one block's hash time; it fires
+/// only when the consumer is saturated — exactly when handing the block
+/// over buys no port-mix benefit — and the producer then hashes data still
+/// hot in its own L1. Leaves and subtree nodes are addressed by index, so
+/// WHICH thread hashes a block cannot change a byte.
+/// `FLOCK_NTT_DEEP_PUSH_SPIN` overrides the budget; `0` restores the
+/// unbounded incumbent spin. Read once per process — never from inside a
+/// loop.
+#[cfg(target_os = "linux")]
+fn deep_push_spin_budget() -> usize {
+    static B: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        match std::env::var("FLOCK_NTT_DEEP_PUSH_SPIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => 256,
+        }
+    });
+    *B
 }
 
 #[cfg(target_os = "linux")]
@@ -479,7 +542,6 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
@@ -500,14 +562,23 @@ impl DeepQueue {
     }
     /// Publish a block, waiting while the consumer is more than `depth`
     /// blocks behind. Returns false if the consumer is gone (its panic is
-    /// already unwinding); the caller then handles the block itself.
-    fn push(&self, b: DeepBlock, depth: usize) -> bool {
+    /// already unwinding) or if the ring stays full for `spin_budget` spin
+    /// iterations (see [`deep_push_spin_budget`]); the caller then handles
+    /// the block itself. Either bail-out leaves the ring untouched, so no
+    /// ordering with the consumer is introduced beyond the existing
+    /// acquire on `tail`.
+    fn push(&self, b: DeepBlock, depth: usize, spin_budget: usize) -> bool {
         use std::sync::atomic::Ordering;
         let h = self.head.load(Ordering::Relaxed);
+        let mut budget = spin_budget;
         while h - self.tail.load(Ordering::Acquire) >= depth {
             if self.gone.load(Ordering::Acquire) {
                 return false;
             }
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
             std::hint::spin_loop();
         }
         // SAFETY: the slot is free (checked above) and only this producer
@@ -517,6 +588,21 @@ impl DeepQueue {
         }
         self.head.store(h + 1, Ordering::Release);
         true
+    }
+    /// Sub-group boundary drain (see [`deep_boundary_drain`]): PAUSE until
+    /// at most `budget` published blocks remain unconsumed, or the consumer
+    /// is gone (its panic is already unwinding — do not deadlock behind it).
+    /// Only this producer writes `head`, so the Relaxed load reads its own
+    /// last store; the Acquire on `tail` pairs with the consumer's Release.
+    fn wait_backlog_at_most(&self, budget: usize) {
+        use std::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        while h - self.tail.load(Ordering::Acquire) > budget {
+            if self.gone.load(Ordering::Acquire) {
+                return;
+            }
+            std::hint::spin_loop();
+        }
     }
     fn pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
@@ -543,15 +629,15 @@ impl DeepQueue {
     }
 }
 
-/// Line-hint level for the deep pass's fused-four row driver under the
-/// sibling-paired schedule (see `deep_split_pairs`): each row group asks for
-/// the sixteen rows the next group will read, one line per lane step.
-/// 0 = no hints, 1 = L1, 2 = L2. Only the paired schedule passes it; the
-/// alternating schedule always runs un-hinted.
+/// Line-hint level for the deep pass's fused-four and fused-three row
+/// drivers: each row group asks for the rows the group `deep_pf_dist()`
+/// ahead will read, one line per lane step. 0 = no hints, 1 = L1, 2 = L2.
+/// Every deep schedule threads it — the sibling-paired split, the plain
+/// parallel pass, and both streaming regimes — so the hints are live (and
+/// A/B-measurable) wherever the deep pass runs.
 /// `FLOCK_NO_NTT_DEEP_PF=1` removes the hints in the same binary;
 /// `FLOCK_NTT_DEEP_PF_HINT` overrides the level (diagnostics). Read once per
 /// process — never inside a loop.
-#[cfg(target_os = "linux")]
 fn deep_pf_hint() -> u8 {
     static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some() {
@@ -563,6 +649,24 @@ fn deep_pf_hint() -> u8 {
             .unwrap_or(1)
     });
     *H
+}
+
+/// Row-group lookahead distance for the deep-pass prefetch hints: group `r`
+/// hints the rows group `r + D` will read. Default 1 — the incumbent
+/// next-group behavior. `FLOCK_NTT_DEEP_PF_DIST` overrides it (diagnostics),
+/// clamped to at least 1; every call site keeps `r + D` inside the block, so
+/// a larger distance simply leaves the last `D` groups un-hinted. Hints move
+/// no data of their own and change no value. Read once per process — never
+/// inside a loop.
+fn deep_pf_dist() -> usize {
+    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_DEEP_PF_DIST")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    });
+    *D
 }
 
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
@@ -2208,6 +2312,7 @@ impl AdditiveNttF128 {
                 layer += 1;
             }
         }
+        crate::gaptime::mark("ntt: top layers done");
 
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
@@ -2229,6 +2334,9 @@ impl AdditiveNttF128 {
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
 
+        // Prefetch lookahead for the fused-three groups below, resolved once
+        // per pass (see `deep_pf_dist`).
+        let pf_dist = deep_pf_dist();
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
@@ -2296,6 +2404,9 @@ impl AdditiveNttF128 {
                         if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
                         hint,
                     );
+                    // Raw base over the block so the hinted group `pf_dist`
+                    // ahead keeps whole-block provenance.
+                    let blk_base = blk.as_mut_ptr();
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
                         let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
@@ -2306,18 +2417,39 @@ impl AdditiveNttF128 {
                         for s in 0..4 {
                             tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
                         }
-                        let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
                         // SAFETY: eight consecutive rows of `num_ntts` lanes,
                         // owned exclusively by this sub-group task; the zero
                         // tail lives on odd rows exactly as in the sweep
-                        // schedule (blocks start at even global rows).
+                        // schedule (blocks start at even global rows). The
+                        // guard keeps the hinted group inside the block; the
+                        // hints move no data and change no value
+                        // (`FLOCK_NO_NTT_DEEP_PF=1` removes them).
                         unsafe {
-                            kernels::butterfly_fused_3layer_rows(
-                                eight.as_mut_ptr(),
-                                num_ntts,
-                                dense_lanes,
-                                &tw3,
-                            );
+                            let eight = blk_base.add(j * 8 * num_ntts);
+                            if hint == 0 || j + pf_dist >= 16 {
+                                kernels::butterfly_fused_3layer_rows(
+                                    eight,
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw3,
+                                );
+                            } else if hint == 1 {
+                                kernels::butterfly_fused_3layer_rows_pf::<1>(
+                                    eight,
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw3,
+                                    blk_base.add((j + pf_dist) * 8 * num_ntts),
+                                );
+                            } else {
+                                kernels::butterfly_fused_3layer_rows_pf::<2>(
+                                    eight,
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw3,
+                                    blk_base.add((j + pf_dist) * 8 * num_ntts),
+                                );
+                            }
                         }
                     }
                     let lo = sub_idx * sub_size_positions + b * block_size4;
@@ -2394,6 +2526,9 @@ impl AdditiveNttF128 {
                         // zero-odd-row contract. The two even-stride layers
                         // it fuses have preserved that tail up to here.
                         let dense_lanes = num_ntts - odd_tail;
+                        // Raw base over the sub-group so the hinted group
+                        // `pf_dist` ahead keeps whole-sub-group provenance.
+                        let sub_base = sub_data.as_mut_ptr();
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                             let mut tw = [F128 { lo: 0, hi: 0 }; 7];
@@ -2405,18 +2540,39 @@ impl AdditiveNttF128 {
                                 tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
                             }
                             let block_start = block_in_sub * block_bytes;
-                            let block = &mut sub_data[block_start..block_start + block_bytes];
-                            debug_assert_eq!(block.len(), 8 * num_ntts);
-                            // SAFETY: `block` is eight consecutive rows of
-                            // `num_ntts` lanes, owned exclusively by this
-                            // sub-group task.
+                            debug_assert_eq!(block_bytes, 8 * num_ntts);
+                            // SAFETY: eight consecutive rows of `num_ntts`
+                            // lanes, owned exclusively by this sub-group
+                            // task. The guard keeps the hinted group inside
+                            // the sub-group; the hints move no data and
+                            // change no value (`FLOCK_NO_NTT_DEEP_PF=1`
+                            // removes them).
                             unsafe {
-                                kernels::butterfly_fused_3layer_rows(
-                                    block.as_mut_ptr(),
-                                    num_ntts,
-                                    dense_lanes,
-                                    &tw,
-                                );
+                                let block = sub_base.add(block_start);
+                                if hint == 0 || block_in_sub + pf_dist >= num_blocks_in_sub {
+                                    kernels::butterfly_fused_3layer_rows(
+                                        block,
+                                        num_ntts,
+                                        dense_lanes,
+                                        &tw,
+                                    );
+                                } else if hint == 1 {
+                                    kernels::butterfly_fused_3layer_rows_pf::<1>(
+                                        block,
+                                        num_ntts,
+                                        dense_lanes,
+                                        &tw,
+                                        sub_base.add(block_start + pf_dist * block_bytes),
+                                    );
+                                } else {
+                                    kernels::butterfly_fused_3layer_rows_pf::<2>(
+                                        block,
+                                        num_ntts,
+                                        dense_lanes,
+                                        &tw,
+                                        sub_base.add(block_start + pf_dist * block_bytes),
+                                    );
+                                }
                             }
                         }
                         layer += 3;
@@ -2509,7 +2665,13 @@ impl AdditiveNttF128 {
                     let cb = on_sub_done.expect("big implies a callback");
                     let n_subs = n_total / sub_bytes;
                     let n_pairs = pairs.len();
-                    let depth = deep_split_depth();
+                    // `fuse_blocks` publishes sixteen blocks per sub-group;
+                    // size the ring backlog by their BYTE payload (see
+                    // `select_deep_split_depth`). `sub_bytes` counts F128s.
+                    let block_bytes = (sub_bytes / 16) * core::mem::size_of::<F128>();
+                    let depth = deep_split_depth(block_bytes);
+                    let push_spin = deep_push_spin_budget();
+                    let boundary_drain = deep_boundary_drain();
                     let hint = deep_pf_hint();
                     let queues: Vec<DeepQueue> =
                         (0..n_pairs).map(|_| DeepQueue::new()).collect();
@@ -2564,7 +2726,12 @@ impl AdditiveNttF128 {
                                     lo: range.start,
                                     hi: range.end,
                                 };
-                                if !q.push(b, depth) {
+                                if !q.push(b, depth, push_spin) {
+                                    // Consumer gone or saturated past the
+                                    // spin budget: hash the block here, while
+                                    // it is hottest in this core's own cache.
+                                    // Blocks are index-addressed, so which
+                                    // thread hashes one cannot change bytes.
                                     cb(range, blk);
                                 }
                             };
@@ -2572,6 +2739,14 @@ impl AdditiveNttF128 {
                                 let i = next_sub.fetch_add(1, Ordering::Relaxed);
                                 if i >= n_subs {
                                     break;
+                                }
+                                // Boundary drain: don't start walking a fresh
+                                // sub-group's 2 MiB sweep while more than
+                                // `boundary_drain` of the previous sub-group's
+                                // blocks still wait unhashed in the shared L2
+                                // (see `deep_boundary_drain`; 0 = incumbent).
+                                if boundary_drain != 0 {
+                                    q.wait_backlog_at_most(boundary_drain);
                                 }
                                 // SAFETY: `i` is claimed by exactly one worker,
                                 // so the sub-group slices are disjoint and in
@@ -2609,10 +2784,13 @@ impl AdditiveNttF128 {
                     crate::gaptime::mark("ntt: deep pass done");
                     return;
                 }
+                // The hints are schedule-independent: wire them in the
+                // unsplit regimes too (see `deep_pf_hint`).
+                let unsplit_hint = deep_pf_hint();
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, unsplit_hint) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
@@ -2626,6 +2804,9 @@ impl AdditiveNttF128 {
             Some((n_chunks, on_chunk)) => {
                 let n_subs = 1usize << n_top;
                 let chunks = n_chunks.clamp(1, n_subs);
+                // The hints are schedule-independent: wire them in both
+                // streaming regimes too (see `deep_pf_hint`).
+                let hint = deep_pf_hint();
 
                 if std::env::var_os("FLOCK_NTT_STREAM_BARRIERS").is_some() {
                     // Kill switch: season-1 scheme — ordered super-chunks
@@ -2641,7 +2822,7 @@ impl AdditiveNttF128 {
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
-                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None, 0); });
+                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None, hint); });
                         on_chunk(
                             c,
                             sub_cursor * sub_size_positions..end_sub * sub_size_positions,
@@ -2737,7 +2918,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None, 0);
+                    deep_sub(i, sub_data, None, hint);
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -3214,24 +3395,26 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    let dist = deep_pf_dist();
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
-        // The sixteen rows the NEXT row group reads are asked for one line
-        // per lane step. The hints move no data of their own and change no
-        // value; `FLOCK_NO_NTT_DEEP_PF=1` removes them.
+        // The sixteen rows the row group `dist` ahead reads are asked for
+        // one line per lane step. The hints move no data of their own and
+        // change no value; `FLOCK_NO_NTT_DEEP_PF=1` removes them and
+        // `FLOCK_NTT_DEEP_PF_DIST` re-aims them (default 1 = next group).
         // SAFETY: each call writes the valid, disjoint row group
         // `{i*sixteenth + r : i in 0..16}` and calls are sequential here; the
-        // hinted group is inside the same block.
+        // guard keeps the hinted group inside the same block.
         unsafe {
-            if hint == 0 || r + 1 >= sixteenth {
+            if hint == 0 || r + dist >= sixteenth {
                 kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
             } else if hint == 1 {
                 kernels::butterfly_fused_4layer_row_pf::<1>(
-                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                    base, sixteenth, num_ntts, lanes, r, t, r + dist,
                 )
             } else {
                 kernels::butterfly_fused_4layer_row_pf::<2>(
-                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                    base, sixteenth, num_ntts, lanes, r, t, r + dist,
                 )
             }
         };
@@ -3335,27 +3518,40 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deep_split_depth_default_override_and_clamp() {
-        assert_eq!(select_deep_split_depth(None), 8);
-        assert_eq!(select_deep_split_depth(Some(0)), 1);
-        assert_eq!(select_deep_split_depth(Some(1)), 1);
-        assert_eq!(select_deep_split_depth(Some(7)), 7);
-        assert_eq!(select_deep_split_depth(Some(8)), 8);
-        assert_eq!(select_deep_split_depth(Some(63)), 63);
-        assert_eq!(select_deep_split_depth(Some(64)), 64);
-        assert_eq!(select_deep_split_depth(Some(65)), 64);
-        assert_eq!(select_deep_split_depth(Some(usize::MAX)), 64);
+        // Byte-budget default: 512 KiB of backlog over the pass's block size.
+        const RANKED_BLOCK_BYTES: usize = 128 << 10;
+        assert_eq!(select_deep_split_depth(None, RANKED_BLOCK_BYTES), 4);
+        assert_eq!(select_deep_split_depth(None, 512 << 10), 1);
+        assert_eq!(select_deep_split_depth(None, 1 << 20), 1);
+        assert_eq!(select_deep_split_depth(None, 64 << 10), 8);
+        // Tiny blocks clamp to the physical ring; zero cannot divide-fault.
+        assert_eq!(select_deep_split_depth(None, 16), 64);
+        assert_eq!(select_deep_split_depth(None, 0), 64);
+        // The env override is block-denominated and wins at every geometry.
+        for &bytes in &[16usize, RANKED_BLOCK_BYTES, 1 << 20] {
+            assert_eq!(select_deep_split_depth(Some(0), bytes), 1);
+            assert_eq!(select_deep_split_depth(Some(1), bytes), 1);
+            assert_eq!(select_deep_split_depth(Some(7), bytes), 7);
+            assert_eq!(select_deep_split_depth(Some(8), bytes), 8);
+            assert_eq!(select_deep_split_depth(Some(63), bytes), 63);
+            assert_eq!(select_deep_split_depth(Some(64), bytes), 64);
+            assert_eq!(select_deep_split_depth(Some(65), bytes), 64);
+            assert_eq!(select_deep_split_depth(Some(usize::MAX), bytes), 64);
+        }
     }
 
     /// Exercise the ranked depth through enough publications to wrap the
     /// physical ring repeatedly. The consumer waits for the first full
-    /// depth-sized burst, proving that the producer cannot publish a ninth
-    /// block until the consumer advances `tail`.
+    /// depth-sized burst, proving that the producer cannot publish a block
+    /// beyond the default depth until the consumer advances `tail`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deep_queue_depth_eight_wraps_without_loss_or_reordering() {
+    fn deep_queue_default_depth_wraps_without_loss_or_reordering() {
         use std::sync::atomic::Ordering;
 
         const N: usize = DeepQueue::CAP * 64;
+        // The ranked byte-budget depth (512 KiB / 128 KiB blocks).
+        let depth = select_deep_split_depth(None, 128 << 10);
         let queue = DeepQueue::new();
         let (all_published, initial_head, seen) = std::thread::scope(|scope| {
             let producer = scope.spawn(|| {
@@ -3368,7 +3564,8 @@ mod tests {
                             lo: i * 2,
                             hi: i * 2 + 1,
                         },
-                        DeepQueue::DEFAULT_DEPTH,
+                        depth,
+                        usize::MAX,
                     );
                 }
                 queue.done.store(true, Ordering::Release);
@@ -3377,7 +3574,7 @@ mod tests {
 
             let initial_head = loop {
                 let head = queue.head.load(Ordering::Acquire);
-                if head >= DeepQueue::DEFAULT_DEPTH {
+                if head >= depth {
                     break head;
                 }
                 std::hint::spin_loop();
@@ -3390,13 +3587,189 @@ mod tests {
         });
 
         assert!(all_published);
-        assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
+        assert_eq!(initial_head, depth);
         assert_eq!(seen.len(), N);
         for (i, block) in seen.into_iter().enumerate() {
             assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
         }
         assert_eq!(queue.head.load(Ordering::Relaxed), N);
         assert_eq!(queue.tail.load(Ordering::Relaxed), N);
+    }
+
+    /// The prefetch-hinted fused-three kernel must be byte-identical to the
+    /// plain one at both hint levels: hints move no data and change no
+    /// value. Runs on every platform (portable builds ignore the hint but
+    /// must still route through the same dispatch). Covers the general and
+    /// the low-inner-twiddle products, the 8/4/1-lane dense loops
+    /// (`num_ntts = 13`), and a corrupted-input negative control.
+    #[test]
+    fn fused3_pf_matches_plain_with_negative_control() {
+        let mut rng = Rng::new(0xF3_9F_D157);
+        let num_ntts = 13usize;
+        let groups = 16usize;
+        for low_inner in [false, true] {
+            let twiddles: Vec<[F128; 7]> = (0..groups)
+                .map(|_| {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    for slot in tw.iter_mut() {
+                        *slot = rng.f128();
+                    }
+                    if low_inner {
+                        for slot in tw[1..].iter_mut() {
+                            slot.hi = 0;
+                        }
+                    }
+                    tw
+                })
+                .collect();
+            let input = rand_vec(&mut rng, groups * 8 * num_ntts);
+
+            let run = |data: &mut [F128], pf: bool| {
+                let base = data.as_mut_ptr();
+                for j in 0..groups {
+                    // SAFETY: eight consecutive in-bounds rows per group,
+                    // processed sequentially; the hinted group is inside the
+                    // same buffer (guarded).
+                    unsafe {
+                        let eight = base.add(j * 8 * num_ntts);
+                        if !pf || j + 1 >= groups {
+                            kernels::butterfly_fused_3layer_rows(
+                                eight,
+                                num_ntts,
+                                num_ntts,
+                                &twiddles[j],
+                            );
+                        } else if j.is_multiple_of(2) {
+                            kernels::butterfly_fused_3layer_rows_pf::<1>(
+                                eight,
+                                num_ntts,
+                                num_ntts,
+                                &twiddles[j],
+                                base.add((j + 1) * 8 * num_ntts),
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_rows_pf::<2>(
+                                eight,
+                                num_ntts,
+                                num_ntts,
+                                &twiddles[j],
+                                base.add((j + 1) * 8 * num_ntts),
+                            );
+                        }
+                    }
+                }
+            };
+
+            let mut want = input.clone();
+            run(&mut want, false);
+            let mut got = input.clone();
+            run(&mut got, true);
+            assert_eq!(got, want, "hinted fused-three diverged (low_inner={low_inner})");
+
+            // Negative control: one corrupted input element must show up.
+            let mut bad = input.clone();
+            bad[8 * num_ntts + 3] += F128 { lo: 1, hi: 0 };
+            run(&mut bad, true);
+            assert_ne!(
+                bad, want,
+                "corrupted input went undetected (low_inner={low_inner})"
+            );
+        }
+    }
+
+    /// A stalled consumer must bound the producer: after the ring holds
+    /// `depth` blocks, a budgeted push returns false WITHOUT publishing (the
+    /// caller's inline-hash fallback then owns that block), and every block
+    /// is accounted for exactly once — published or handled inline — in
+    /// order. Draining afterwards recovers exactly the published prefix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_budgeted_push_falls_back_without_loss() {
+        use std::sync::atomic::Ordering;
+
+        let depth = 4usize;
+        let queue = DeepQueue::new();
+        let mut inline = Vec::new();
+        let mut published = 0usize;
+        for i in 0..16usize {
+            let block = DeepBlock {
+                ptr: i,
+                len_f128: i + 1,
+                lo: i * 2,
+                hi: i * 2 + 1,
+            };
+            if queue.push(block, depth, 32) {
+                published += 1;
+            } else {
+                inline.push(i);
+            }
+        }
+        // Exactly the first `depth` fit; every later push burned its budget
+        // against the stalled consumer and fell back.
+        assert_eq!(published, depth);
+        assert_eq!(inline, (depth..16).collect::<Vec<_>>());
+        assert_eq!(queue.head.load(Ordering::Relaxed), depth);
+        assert_eq!(queue.tail.load(Ordering::Relaxed), 0);
+
+        // The consumer still sees the published prefix, unreordered.
+        queue.done.store(true, Ordering::Release);
+        let mut seen = Vec::new();
+        while let Some(block) = queue.pop() {
+            seen.push(block.ptr);
+        }
+        assert_eq!(seen, (0..depth).collect::<Vec<_>>());
+
+        // With room again, a budgeted push succeeds (the budget only fires
+        // while the ring is actually full).
+        assert!(queue.push(
+            DeepBlock {
+                ptr: 99,
+                len_f128: 1,
+                lo: 0,
+                hi: 1,
+            },
+            depth,
+            32,
+        ));
+    }
+
+    /// The boundary drain returns immediately once the backlog is within
+    /// budget, waits for the consumer otherwise, and never deadlocks behind
+    /// a gone consumer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_boundary_drain_waits_and_never_deadlocks() {
+        use std::sync::atomic::Ordering;
+
+        let queue = DeepQueue::new();
+        let block = |i: usize| DeepBlock {
+            ptr: i,
+            len_f128: 1,
+            lo: 0,
+            hi: 1,
+        };
+        for i in 0..4 {
+            assert!(queue.push(block(i), 8, 32));
+        }
+        // Backlog 4: budgets >= 4 return immediately.
+        queue.wait_backlog_at_most(4);
+        queue.wait_backlog_at_most(64);
+
+        // Budget 2 waits until a concurrent consumer drains down to 2.
+        std::thread::scope(|scope| {
+            let consumer = scope.spawn(|| {
+                for _ in 0..2 {
+                    queue.pop().expect("two published blocks remain");
+                }
+            });
+            queue.wait_backlog_at_most(2);
+            assert!(queue.head.load(Ordering::Relaxed) - queue.tail.load(Ordering::Acquire) <= 2);
+            consumer.join().unwrap();
+        });
+
+        // A gone consumer releases the drain even with backlog left.
+        queue.gone.store(true, Ordering::Release);
+        queue.wait_backlog_at_most(0);
     }
 
     struct Rng(u64);

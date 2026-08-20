@@ -729,21 +729,92 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // non-final fused-three group simply keeps the general form.
     let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
+    // precondition for `twiddles[1..]` by inspection of the values. `H = 0`
+    // folds every hint away; `ptr` stands in for the unused hint base.
+    unsafe {
+        match (mul_diet_disabled(), low_inner) {
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                ptr,
+            ),
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                ptr,
+            ),
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                ptr,
+            ),
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                ptr,
+            ),
+        }
+    }
+}
+
+/// [`butterfly_fused_3layer_rows`] that also issues one line hint per row of
+/// the eight-row group starting at `pf_ptr`, at every dense lane step. `H`
+/// selects the hint level (1 = L1, 2 = L2). The hints move no data of their
+/// own and change no value.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_rows`]; in addition, the eight
+/// rows starting at `pf_ptr` must lie inside the same allocation.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_3layer_rows_pf<const H: u8>(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+    pf_ptr: *const F128,
+) {
+    let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
+    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]` by inspection of the values.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
-            (true, false) => {
-                butterfly_fused_3layer_rows_impl::<false, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (true, true) => {
-                butterfly_fused_3layer_rows_impl::<false, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, false) => {
-                butterfly_fused_3layer_rows_impl::<true, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, true) => {
-                butterfly_fused_3layer_rows_impl::<true, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, H>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                pf_ptr,
+            ),
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, H>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                pf_ptr,
+            ),
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, H>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                pf_ptr,
+            ),
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, H>(
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
+                pf_ptr,
+            ),
         }
     }
 }
@@ -759,14 +830,16 @@ fn low_twiddle_fused3_disabled() -> bool {
 }
 
 /// # Safety
-/// Same contract as [`butterfly_fused_3layer_rows`].
+/// Same contract as [`butterfly_fused_3layer_rows`]; when `H != 0` the eight
+/// rows starting at `pf_ptr` must lie inside the same allocation.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bool>(
+unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bool, const H: u8>(
     ptr: *mut F128,
     num_ntts: usize,
     dense_lanes: usize,
     twiddles: &[F128; 7],
+    pf_ptr: *const F128,
 ) {
     use core::arch::x86_64::*;
 
@@ -812,6 +885,21 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
         }
 
         while lane + 8 <= dense_lanes {
+            if H != 0 {
+                // One line per row of the hinted group per 4-lane step; the
+                // 8-lane body covers two steps, so both lines are asked for.
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..8 {
+                    let p = (pf_ptr.add(i * num_ntts) as *const i8).add(off);
+                    if H == 1 {
+                        _mm_prefetch::<_MM_HINT_T0>(p);
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(64));
+                    } else {
+                        _mm_prefetch::<_MM_HINT_T1>(p);
+                        _mm_prefetch::<_MM_HINT_T1>(p.add(64));
+                    }
+                }
+            }
             let mut values = [[zero; 8]; 2];
             for (c, chunk) in values.iter_mut().enumerate() {
                 for (i, value) in chunk.iter_mut().enumerate() {
@@ -841,6 +929,17 @@ unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bo
             lane += 8;
         }
         while lane + 4 <= dense_lanes {
+            if H != 0 {
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..8 {
+                    let p = (pf_ptr.add(i * num_ntts) as *const i8).add(off);
+                    if H == 1 {
+                        _mm_prefetch::<_MM_HINT_T0>(p);
+                    } else {
+                        _mm_prefetch::<_MM_HINT_T1>(p);
+                    }
+                }
+            }
             let mut values = [zero; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
@@ -980,18 +1079,19 @@ mod diet_tests {
                 // `twiddles[1..]` entry has a zero high limb as the LOW arm
                 // requires.
                 unsafe {
+                    let p = got.as_mut_ptr();
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
+                            p, num_ntts, dense_lanes, &twiddles, p,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
+                            p, num_ntts, dense_lanes, &twiddles, p,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
+                            p, num_ntts, dense_lanes, &twiddles, p,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                            p, num_ntts, dense_lanes, &twiddles, p,
                         ),
                     }
                 }
