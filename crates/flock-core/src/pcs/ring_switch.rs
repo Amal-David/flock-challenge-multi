@@ -2597,6 +2597,107 @@ fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     (u0, u2)
 }
 
+/// `FLOCK_NO_FOLD8_W_GFNI=1` restores the serial `fold_one_slot` mul_by_x
+/// chain that fills DirectFold8 `w_state`. Ranked SPR compiles the GFNI
+/// two-map tile (`gfni_fold64_two_maps`) that already landed for the later
+/// basis materializer; this path is the remaining one-thread producer of
+/// the same Φ map, over the 64 retained banks at each of the 128 packed
+/// bits. The algebraic identity is `fold_one_slot(x, T) = M_lo(x.lo) +
+/// M_hi(x.hi)` with T a `build_fold_byte_table` output.
+///
+/// Read once per process, outside every loop. Ranked env is cleared, so
+/// the GFNI arm is the one scored.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_w_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_W_GFNI").is_none());
+    *ON
+}
+
+/// Bit-major `W[b, d] = Φ(low_eq[d] · x^b)` for `d < 64`, `b < n_packed`.
+/// Layout matches the incumbent nested loops: `w_state[b * 64 + d]`.
+fn fill_direct_fold8_w_state(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
+    debug_assert_eq!(w_state.len() % 64, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    if direct_fold8_w_gfni_enabled() && table.len() == FOLD_TABLE_TOTAL {
+        fill_direct_fold8_w_state_gfni(low_eq, table, w_state);
+        return;
+    }
+    fill_direct_fold8_w_state_scalar(low_eq, table, w_state);
+}
+
+fn fill_direct_fold8_w_state_scalar(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
+    let n_packed = w_state.len() / 64;
+    for d_low in 0..64 {
+        let mut basis_product = low_eq[d_low];
+        w_state[d_low] = fold_one_slot(basis_product, table);
+        for bit in 1..n_packed {
+            basis_product = crate::field::mul_by_x(basis_product);
+            w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
+        }
+    }
+}
+
+/// One GFNI two-map tile per packed bit: the 64 banks at bit `b` are
+/// exactly `w_state[b * 64 .. b * 64 + 64]`. Inputs are the current
+/// `mul_by_x` chain, split into lo/hi u64 rows so each 128-bit Φ
+/// evaluation is `M_lo(lo) XOR M_hi(hi)` — the same terms `fold_one_slot`
+/// XOR-reduces from the 16 byte tables.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn fill_direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
+    use crate::zerocheck::multilinear::kernels::x86_64::{
+        build_row_fold_mats, gfni_fold64_two_maps,
+    };
+    let n_packed = w_state.len() / 64;
+    let mats_lo = build_row_fold_mats(&table[..8 * FOLD_TABLE_SIZE]);
+    let mats_hi = build_row_fold_mats(&table[8 * FOLD_TABLE_SIZE..]);
+    let mut products = *low_eq;
+    let mut lo_rows = [0u64; 64];
+    let mut hi_rows = [0u64; 64];
+    for bit in 0..n_packed {
+        for d in 0..64 {
+            lo_rows[d] = products[d].lo;
+            hi_rows[d] = products[d].hi;
+        }
+        // SAFETY: 64 packed u64s per half, complete matrices, 64 F128
+        // outputs, ADD=false so `add` is unread, cfg features hold.
+        unsafe {
+            gfni_fold64_two_maps::<false>(
+                lo_rows.as_ptr().cast(),
+                &mats_lo,
+                hi_rows.as_ptr().cast(),
+                &mats_hi,
+                w_state[bit * 64..].as_mut_ptr(),
+                core::ptr::null(),
+            );
+        }
+        if bit + 1 < n_packed {
+            for p in &mut products {
+                *p = crate::field::mul_by_x(*p);
+            }
+        }
+    }
+}
+
 /// Ranked default runs the per-claim direct-factor tail of
 /// [`prove_batched_padded_with_precomputed`] full-width: the two ranked
 /// claims in parallel, each claim's 64 independent bank chains / stripe
@@ -2673,14 +2774,7 @@ fn direct_fold8_states_seq(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
     let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    for d_low in 0..64 {
-        let mut basis_product = low_eq[d_low];
-        w_state[d_low] = fold_one_slot(basis_product, table);
-        for bit in 1..n_packed {
-            basis_product = crate::field::mul_by_x(basis_product);
-            w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
-        }
-    }
+    fill_direct_fold8_w_state(low_eq, table, &mut w_state);
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
     for e in 0..64 {
         let bank = &fold8[e * n_packed..(e + 1) * n_packed];
@@ -2704,6 +2798,42 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
+    // Ranked GFNI w_state writes bit-major directly, so the 64-row
+    // allocate/transpose for W is skipped. The kill switch restores this
+    // incumbent 64-way scalar chain so A/B stays same-binary.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    if direct_fold8_w_gfni_enabled() && table.len() == FOLD_TABLE_TOTAL {
+        let (w_state, a_rows) = rayon::join(
+            || {
+                let mut w_state = vec![F128::ZERO; 64 * n_packed];
+                fill_direct_fold8_w_state(low_eq, table, &mut w_state);
+                w_state
+            },
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
+                    .collect::<Vec<Vec<F128>>>()
+            },
+        );
+        let mut a_state = vec![F128::ZERO; 64 * n_packed];
+        a_state
+            .par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(bit, a_row)| {
+                for lane in 0..64 {
+                    a_row[lane] = a_rows[lane][bit];
+                }
+            });
+        let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+        return (a_state, w_state, round0);
+    }
     let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
         || {
             (0..64usize)
@@ -4341,6 +4471,37 @@ mod tests {
                 bad_par.round0, seq.round0,
                 "corrupted statistic went undetected in round0 tail_len={tail_len}"
             );
+        }
+    }
+
+    /// DirectFold8 `w_state` helper matches the incumbent mul_by_x /
+    /// `fold_one_slot` chain, including the GFNI two-map arm when the
+    /// ranked ISA features are compiled in.
+    #[test]
+    fn direct_fold8_w_state_matches_fold_one_slot_chain() {
+        let mut rng = Rng::new(0xF01D_8105);
+        let n_packed = 1usize << LOG_PACKING;
+        for trial in 0..3 {
+            let eq_r_dprime: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
+            let table = build_fold_byte_table(&eq_r_dprime);
+            let low_eq: [F128; 64] = std::array::from_fn(|_| rng.f128());
+            let mut got = vec![F128::ZERO; 64 * n_packed];
+            fill_direct_fold8_w_state(&low_eq, &table, &mut got);
+            let mut expect = vec![F128::ZERO; 64 * n_packed];
+            fill_direct_fold8_w_state_scalar(&low_eq, &table, &mut expect);
+            assert_eq!(got, expect, "trial {trial} dispatch ≠ scalar");
+            for d_low in 0..64 {
+                let mut basis_product = low_eq[d_low];
+                assert_eq!(got[d_low], fold_one_slot(basis_product, &table));
+                for bit in 1..n_packed {
+                    basis_product = crate::field::mul_by_x(basis_product);
+                    assert_eq!(
+                        got[bit * 64 + d_low],
+                        fold_one_slot(basis_product, &table),
+                        "trial {trial} bank {d_low} bit {bit}"
+                    );
+                }
+            }
         }
     }
 
