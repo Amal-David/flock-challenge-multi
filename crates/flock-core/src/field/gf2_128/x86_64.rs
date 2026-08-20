@@ -497,6 +497,32 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// [`Self::mul_acc`] with an instruction-free compiler scheduling fence.
+    ///
+    /// This is useful only in very long fully-unrolled product chains. LLVM
+    /// otherwise reassociates the XORs and keeps dozens of CLMUL results live,
+    /// spilling them despite ample registers for the three true accumulators.
+    /// The empty asm makes the updated accumulators observable after each
+    /// product while generating no machine instruction and touching no memory.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_ordered(&mut self, x: __m512i, y: __m512i) {
+        // SAFETY: caller carries avx512f + vpclmulqdq.
+        unsafe {
+            self.mul_acc(x, y);
+            core::arch::asm!(
+                "/* {lo} {hi} {mid} */",
+                lo = inout(zmm_reg) self.lo,
+                hi = inout(zmm_reg) self.hi,
+                mid = inout(zmm_reg) self.mid,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.
