@@ -88,6 +88,31 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    // SAFETY: same contract as [`fold4_nested_prefetch_t1`] with a null walk.
+    unsafe { fold4_nested_prefetch_t1(src, dst, r0, r1, core::ptr::null(), 0) }
+}
+
+/// [`fold4_nested`] plus an optional T1 walk of `[pf_base, pf_base+pf_span)`.
+///
+/// The walk is a hint: it does not load or store `pf_base`, so the folded
+/// field values are identical to [`fold4_nested`] for every `pf_span`. Line
+/// count per 4-slot trip is `ceil((pf_span/64) / (dst.len()/4))` — derived
+/// from the destination length and the byte span, not a host-tuned depth.
+/// A null base or zero span is a pure no-op (the production kill switch).
+///
+/// # Safety
+/// Same as [`fold4_nested`]. When `pf_base` is non-null, `pf_span` bytes
+/// starting at `pf_base` must lie inside a live allocation; the address is
+/// never dereferenced.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold4_nested_prefetch_t1(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+    pf_base: *const u8,
+    pf_span: usize,
+) {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -99,8 +124,22 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
         let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let lanes = dst.len() & !3;
+        let trips = lanes / 4;
+        let lines_total = pf_span / 64;
+        let lines_per_trip = if pf_base.is_null() || trips == 0 || lines_total == 0 {
+            0
+        } else {
+            (lines_total + trips - 1) / trips
+        };
+        let mut pf_at = 0usize;
         let mut t = 0;
         while t < lanes {
+            let mut k = 0usize;
+            while k < lines_per_trip && pf_at < pf_span {
+                _mm_prefetch::<_MM_HINT_T1>(pf_base.add(pf_at).cast::<i8>());
+                pf_at += 64;
+                k += 1;
+            }
             let s = 4 * t;
             let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
             let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
@@ -137,6 +176,11 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             let high = a2 + r0 * (a2 + a3);
             dst[t] = low + r1 * (low + high);
             t += 1;
+        }
+        // Drain any remainder the ceil-division left on a short last trip.
+        while pf_at < pf_span && !pf_base.is_null() {
+            _mm_prefetch::<_MM_HINT_T1>(pf_base.add(pf_at).cast::<i8>());
+            pf_at += 64;
         }
     }
 }

@@ -4547,6 +4547,29 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_MDF8_SUB_PF=1` restores the incumbent [`materialize_direct_fold8`]
+/// f-side, which issues no software prefetch during `fold4_nested`. A prefetch
+/// is a hint with no architectural effect, so both arms produce byte-identical
+/// proofs.
+///
+/// DirectFold8 destroyed MDF4_PF's grain: the 2 MiB f-slab is now eight 256 KiB
+/// SUB-chunks (`SUB = 256` slots × 64 banks). Each chunk is `fold16_banked`
+/// (DRAM) then `fold4_nested` of a 16 KiB mid (L1, no DRAM). The analog of
+/// MDF4's DRAM-idle T1 window is that `fold4_nested`, aimed at the NEXT SUB
+/// of THIS slab — not the next 2 MiB block, and not the GFNI b-side
+/// (MDF8_PF / #470 / 98d1a3b3, official −0.335%, retryIf=never).
+///
+/// Ranked geometry: `n = 256` outputs ⇒ 64 four-slot trips; next SUB is
+/// `64 * 256 * 16 = 262144` bytes ⇒ 64 T1 lines per trip. That ratio is
+/// `ceil((span/64) / (n/4))`, not a host-tuned depth. Last SUB and the kill
+/// switch pass a null base. Read once per process, outside every loop.
+#[cfg(target_arch = "x86_64")]
+fn mdf8_sub_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF8_SUB_PF").is_none());
+    *ON
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -5950,6 +5973,10 @@ fn materialize_direct_fold8(
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
+    // This-slab SUB-chunk T1 selector, resolved once per materialization —
+    // never inside the block / SUB loops.
+    #[cfg(target_arch = "x86_64")]
+    let sub_pf_on = mdf8_sub_pf_enabled();
     let stats = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -5999,8 +6026,35 @@ fn materialize_direct_fold8(
                     crate::field::f128_slice::fold16_banked(
                         &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
+                    // This-slab SUB-chunk T1 during fold4_nested of the
+                    // current 256-slot f-side chunk. Null on the last SUB
+                    // and when FLOCK_NO_MDF8_SUB_PF=1. Never the next block
+                    // (that was MDF8_PF, killed).
+                    #[cfg(target_arch = "x86_64")]
+                    let (pf_base, pf_span) = if sub_pf_on
+                        && slot + n < block_len
+                    {
+                        let next_n = SUB.min(block_len - (slot + n));
+                        // SAFETY: next SUB is inside this block's `f_in`:
+                        // 64*(slot+n+next_n) <= 64*block_len = f_in.len().
+                        // Prefetch does not dereference the pointer.
+                        let p = unsafe { f_in.as_ptr().add(64 * (slot + n)) };
+                        (
+                            p.cast::<u8>(),
+                            64 * next_n * core::mem::size_of::<F128>(),
+                        )
+                    } else {
+                        (core::ptr::null::<u8>(), 0usize)
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let (pf_base, pf_span) = (core::ptr::null::<u8>(), 0usize);
+                    crate::field::f128_slice::fold4_nested_prefetch_t1(
+                        m4,
+                        &mut f_out[slot..slot + n],
+                        r4,
+                        r5,
+                        pf_base,
+                        pf_span,
                     );
                     if has_ordinary {
                         let m16 = &mut mid16[..16 * n];

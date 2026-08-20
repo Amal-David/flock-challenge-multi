@@ -210,6 +210,53 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     }
 }
 
+/// [`fold4_nested`] with an optional T1 walk of `[pf_base, pf_base+pf_span)`.
+///
+/// On the AVX-512 ranked path the walk is issued inside the 4-slot body so
+/// it occupies the DRAM-idle window after a `fold16_banked` of the current
+/// DirectFold8 SUB-chunk. A null base or zero span is bit-identical to
+/// [`fold4_nested`]. Non-AVX-512 targets ignore the walk (no `prefetch`
+/// intrinsic in the portable / aarch64 kernels).
+///
+/// # Safety
+/// When `pf_base` is non-null, `pf_span` bytes from that pointer must lie
+/// inside a live allocation. The walk never dereferences the address.
+#[inline]
+pub(crate) fn fold4_nested_prefetch_t1(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+    pf_base: *const u8,
+    pf_span: usize,
+) {
+    assert_eq!(
+        src.len(),
+        4 * dst.len(),
+        "fold4 source must contain four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg features + bounds as [`fold4_nested`]; caller owns `pf_span`.
+    unsafe {
+        x86_64::fold4_nested_prefetch_t1(src, dst, r0, r1, pf_base, pf_span);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = (pf_base, pf_span);
+        fold4_nested(src, dst, r0, r1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
@@ -290,6 +337,23 @@ mod tests {
             fold4_nested(&src4, &mut zeroed, r0, r1);
             fold4_nested(&src4, &mut dirty, r0, r1);
             assert_eq!(dirty, zeroed, "fold4_nested n={n}");
+
+            // Prefetch walk is a hint: same field values as the no-walk kernel
+            // even when the T1 range is a distinct live buffer (or null).
+            let mut walked = vec![F128::ZERO; n];
+            let dummy = vec![0u8; 4096];
+            fold4_nested_prefetch_t1(
+                &src4,
+                &mut walked,
+                r0,
+                r1,
+                dummy.as_ptr(),
+                dummy.len(),
+            );
+            assert_eq!(walked, zeroed, "fold4_nested_prefetch_t1 n={n}");
+            let mut null_walk = vec![F128::ZERO; n];
+            fold4_nested_prefetch_t1(&src4, &mut null_walk, r0, r1, core::ptr::null(), 0);
+            assert_eq!(null_walk, zeroed, "fold4_nested_prefetch_t1 null n={n}");
         }
     }
 
