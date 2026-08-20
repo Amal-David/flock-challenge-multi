@@ -3666,7 +3666,7 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
+pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
 
