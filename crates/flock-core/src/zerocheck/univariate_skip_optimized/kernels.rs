@@ -75,6 +75,31 @@ pub(super) fn bstatic_window_live(blk: usize) -> bool {
     blk <= 1 || blk == 30 || blk == 31
 }
 
+/// Windows that keep the static-B partials in [`super::Round1AbWindowPlan::for_window`]:
+/// the four live specialised bodies plus the compact mixed 2-image body.
+#[inline]
+pub(super) fn bstatic_plan_live(blk: usize) -> bool {
+    if bstatic_window_live(blk) {
+        return true;
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        return x86_64_bstatic::bstatic_mixed_window(blk);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    false
+}
+
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
 /// the 8192-bit window being transformed plus the resolved partial images.
 /// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
@@ -309,6 +334,27 @@ pub(super) fn shift_reduce_inner_ab_at(
                 if bstatic_window_live(blk)
                     && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
                         a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
+                    )
+                {
+                    return;
+                }
+                // Mixed windows 2..=29: compact 2-image static-B. The unrolled
+                // 2b body and the 1-image `kernel_dyn` experiment both lost to
+                // the incumbent because GENERIC rows used `apply_full`. This
+                // path keeps the ranked 2-image apply for GENERIC rows.
+                // Unexpected `blk` / plan miss / `FLOCK_NO_BSTATIC_MIXED=1`
+                // fall through to the prepared generic Horner.
+                if x86_64_bstatic::bstatic_mixed_window(blk)
+                    && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_mixed_at(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base,
+                        blk,
+                        partials,
+                        out,
+                        nt,
+                        imgs,
                     )
                 {
                     return;

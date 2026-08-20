@@ -25,6 +25,8 @@
 //! rows are the incumbent computation verbatim.
 //!
 //! Kill switch: `FLOCK_NO_FAST_SHIFT_REDUCE=1` keeps the incumbent kernel.
+//! Mixed windows 2..=29 use a compact 2-image body (`FLOCK_NO_BSTATIC_MIXED=1`
+//! restores the generic Horner for those windows only).
 
 use core::arch::x86_64::*;
 use std::sync::OnceLock;
@@ -494,6 +496,141 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     }
 }
 
+/// Compact mixed-window static-B (blk 2..=29).
+///
+/// The live dispatcher only runs the specialised body on windows 0, 1, 30,
+/// 31. Mixed windows were measured 1.03–1.16× *with the unrolled 2b body*,
+/// whose GENERIC rows used 1-image `apply_full` (10 port-5 shuffles) against
+/// an incumbent Horner leaf that uses the 2-image offw apply (3 shuffles).
+/// The data-driven rolled experiment in this file's microbench (`kernel_dyn`)
+/// lost the same way (1.08×) for the same apply. After #454 the 2-image
+/// apply is a process-invariant pair of table pointers — the compact 2a
+/// grain, GENERIC rows identical to the incumbent leaf.
+///
+/// `FLOCK_NO_BSTATIC_MIXED=1` restores the generic Horner. A plan miss
+/// writes nothing and returns false so the caller keeps the incumbent.
+fn bstatic_mixed_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_MIXED").is_none())
+}
+
+/// True for the 28 BLAKE3 medium windows whose plan is mixed STATIC/GENERIC
+/// (not the four live unrolled/compact-all-static windows).
+#[inline]
+pub(crate) fn bstatic_mixed_window(blk: usize) -> bool {
+    blk >= 2 && blk <= 29
+}
+
+/// # Safety
+/// As for [`kernel`], plus `imgs` is the table's base and σ₈ image (the
+/// ranked 2-image offw apply). `a_packed`/`b_packed` expose 64 readable
+/// bytes at `byte_base_b`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_mixed_at(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    blk: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) -> bool {
+    if !bstatic_mixed_enabled()
+        || !bstatic_mixed_window(blk)
+        || imgs.0.is_null()
+        || imgs.1.is_null()
+        || !inv_table.has_second_image()
+    {
+        return false;
+    }
+    let table = inv_table.data_ptr();
+    // SAFETY: 64 readable bytes at `byte_base_b`; plan/partials exist for
+    // every mixed blk; `imgs` are this table's two 256×64 images.
+    unsafe {
+        let a0 = a_packed.as_ptr().add(byte_base_b);
+        let b0 = b_packed.as_ptr().add(byte_base_b);
+        let plan = &BSTATIC_PLAN[blk];
+        let parts = &partials.rows[blk];
+        let mut b_words = [0u64; 8];
+        let mut hit = true;
+        for k in 0..8 {
+            let p = plan[k];
+            if p.kind != ROW_GENERIC {
+                let w = u64::from_le(core::ptr::read_unaligned(
+                    b0.add(k * N_CHUNKS) as *const u64,
+                ));
+                b_words[k] = w;
+                hit &= (w & p.mask) == p.expected;
+            }
+        }
+        if !hit {
+            return false;
+        }
+
+        #[repr(align(64))]
+        struct Off([u16; 128]);
+        let mut off = core::mem::MaybeUninit::<Off>::uninit();
+        let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a0));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
+        let _keep_off = &off;
+
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let mut acc = _mm512_setzero_si512();
+        for k in 0..8usize {
+            let p = plan[k];
+            if p.kind == ROW_ZERO {
+                continue;
+            }
+            let av = apply(op.add(k * 8));
+            if p.kind == ROW_STATIC {
+                let mut bv = _mm512_load_si512(parts[k].as_ptr() as *const __m512i);
+                if p.vary == 0 {
+                    acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, bv));
+                    continue;
+                }
+                let b_word = b_words[k];
+                let mut v = p.vary;
+                while v != 0 {
+                    let j = v.trailing_zeros() as usize;
+                    let byte = (b_word >> (8 * j)) as u8 as usize;
+                    let r = _mm512_loadu_si512(table.add(byte * 64) as *const __m512i);
+                    bv = _mm512_xor_si512(bv, perm_row(r, j));
+                    v &= v - 1;
+                }
+                let prod = _mm512_gf2p8mul_epi8(av, bv);
+                let scaled = if k == 0 {
+                    prod
+                } else {
+                    _mm512_gf2p8mul_epi8(prod, _mm512_set1_epi8((1u8 << k) as i8))
+                };
+                acc = _mm512_xor_si512(acc, scaled);
+            } else {
+                let bv = apply(op.add(64 + k * 8));
+                let prod = _mm512_gf2p8mul_epi8(av, bv);
+                let scaled = if k == 0 {
+                    prod
+                } else {
+                    _mm512_gf2p8mul_epi8(prod, _mm512_set1_epi8((1u8 << k) as i8))
+                };
+                acc = _mm512_xor_si512(acc, scaled);
+            }
+        }
+        super::x86_64::store_out64(out, acc, nt);
+        true
+    }
+}
+
 /// [`shift_reduce_inner_ab_x86_avx512_bstatic`] addressed directly by the
 /// window's absolute byte offset and its global block index
 /// `blk = w * 16 + b_med`.
@@ -702,6 +839,84 @@ mod tests {
             let want: [u8; 64] = core::array::from_fn(|i| want[i].0);
             assert_eq!(got, want);
         }
+    }
+
+    /// Compact mixed 2-image body matches the incumbent Horner leaf bit for
+    /// bit on every mixed plan, on plan-shaped hits, random misses (fallback),
+    /// all-zero, and all-ones b words.
+    #[test]
+    fn mixed_compact_matches_incumbent() {
+        let inv_table = standard_table();
+        assert!(inv_table.has_second_image());
+        let partials = build_partials(&inv_table);
+        let imgs = inv_table.image_ptrs();
+        let mut rng = Rng(0xC0FF_EE11);
+        for plan in 2..=29 {
+            for mode in 0..4 {
+                let mut a = [0u8; 64];
+                let mut b = [0u8; 64];
+                for k in 0..8 {
+                    let off = k * 8;
+                    let a_word = rng.next_u64();
+                    let p = BSTATIC_PLAN[plan][k];
+                    let b_word = match mode {
+                        0 => (p.expected & p.mask) | (rng.next_u64() & !p.mask),
+                        1 => rng.next_u64(),
+                        2 => 0,
+                        _ => u64::MAX,
+                    };
+                    a[off..off + 8].copy_from_slice(&a_word.to_le_bytes());
+                    b[off..off + 8].copy_from_slice(&b_word.to_le_bytes());
+                }
+                let mut got = [0u8; 64];
+                let mut want = [0u8; 64];
+                unsafe {
+                    let ran = shift_reduce_inner_ab_x86_avx512_bstatic_mixed_at(
+                        &a, &b, &inv_table, 0, plan, &partials, &mut got, 0, imgs,
+                    );
+                    shift_reduce_inner_ab_x86_avx512(
+                        &a, &b, &inv_table, 0, 0, &mut want, 0,
+                    );
+                    if mode == 0 {
+                        assert!(
+                            ran,
+                            "mixed plan {plan} mode 0 unexpectedly missed"
+                        );
+                    }
+                    if ran {
+                        assert_eq!(got, want, "mixed plan {plan} mode {mode}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_kill_switch_restores_incumbent_path() {
+        // The kill switch is process-once; this test only checks the window
+        // predicate and the null-image fallback, not the env latch.
+        assert!(bstatic_mixed_window(2) && bstatic_mixed_window(29));
+        assert!(!bstatic_mixed_window(0) && !bstatic_mixed_window(1));
+        assert!(!bstatic_mixed_window(30) && !bstatic_mixed_window(31));
+        let inv_table = standard_table();
+        let partials = build_partials(&inv_table);
+        let a = [0u8; 64];
+        let b = [0u8; 64];
+        let mut out = [0u8; 64];
+        let ran = unsafe {
+            shift_reduce_inner_ab_x86_avx512_bstatic_mixed_at(
+                &a,
+                &b,
+                &inv_table,
+                0,
+                2,
+                &partials,
+                &mut out,
+                0,
+                (core::ptr::null(), core::ptr::null()),
+            )
+        };
+        assert!(!ran);
     }
 }
 

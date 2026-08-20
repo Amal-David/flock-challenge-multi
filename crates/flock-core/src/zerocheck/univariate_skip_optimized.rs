@@ -878,7 +878,7 @@ impl Round1AbWindowPlan {
     #[inline]
     pub fn for_window(self, blk: usize) -> Self {
         Self {
-            bstatic: if kernels::bstatic_window_live(blk) {
+            bstatic: if kernels::bstatic_plan_live(blk) {
                 self.bstatic
             } else {
                 None
