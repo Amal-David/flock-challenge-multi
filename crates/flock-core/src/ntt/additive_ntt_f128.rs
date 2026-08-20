@@ -304,6 +304,255 @@ fn deep_block_fuse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
 }
 
+/// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
+/// when this machine or pool cannot be paired.
+///
+/// The split runs one butterfly worker per physical core, each handing its
+/// finished blocks to a leaf-hash worker on that core's SMT sibling, instead
+/// of every worker alternating the two itself. Leaves are written by index,
+/// so the leaf ORDER is unchanged either way.
+/// `FLOCK_NO_NTT_DEEP_SPLIT=1` restores the alternating schedule in the same
+/// binary. Resolved once per process; requires an even pool that covers
+/// exactly one logical CPU per sibling of each core, all inside this
+/// process's affinity set.
+#[cfg(target_os = "linux")]
+fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
+    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_NTT_DEEP_SPLIT").is_some() {
+            return None;
+        }
+        let n = rayon::current_num_threads();
+        if n % 2 != 0 || n < 4 {
+            return None;
+        }
+        // One pair per physical core, in CPU order, covering exactly the
+        // first `n` logical CPUs.
+        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n / 2);
+        let mut seen = vec![false; n];
+        for c in 0..n {
+            if seen[c] {
+                continue;
+            }
+            let list = std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+            ))
+            .ok()?;
+            let mut ids = Vec::new();
+            for part in list.trim().split(',') {
+                ids.push(part.trim().parse::<usize>().ok()?);
+            }
+            if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
+                return None;
+            }
+            seen[c] = true;
+            seen[ids[1]] = true;
+            pairs.push((ids[0], ids[1]));
+        }
+        if pairs.len() != n / 2 {
+            return None;
+        }
+        // Every paired CPU must be in this process's own affinity set, or the
+        // pinning below could not place the pair on one core.
+        let mask = affinity::get();
+        for c in 0..n {
+            if mask[c / 64] & (1u64 << (c % 64)) == 0 {
+                return None;
+            }
+        }
+        Some(pairs)
+    });
+    P.as_ref()
+}
+
+/// One deep pass at a time may take over the pool. Two overlapping
+/// `rayon::broadcast` calls would interleave producer and consumer roles
+/// across passes; the second pass falls back to the unsplit schedule.
+#[cfg(target_os = "linux")]
+static DEEP_SPLIT_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Releases [`DEEP_SPLIT_BUSY`] on the way out, including on unwind.
+#[cfg(target_os = "linux")]
+struct DeepSplitClaim;
+
+#[cfg(target_os = "linux")]
+impl DeepSplitClaim {
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        DEEP_SPLIT_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DeepSplitClaim {
+    fn drop(&mut self) {
+        DEEP_SPLIT_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How many finished blocks a butterfly worker may publish before waiting
+/// for its paired hash worker. `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides it
+/// (diagnostics). Read once per process — never from inside a loop.
+#[cfg(target_os = "linux")]
+fn deep_split_depth() -> usize {
+    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DeepQueue::CAP)
+            .clamp(1, DeepQueue::CAP)
+    });
+    *D
+}
+
+#[cfg(target_os = "linux")]
+mod affinity {
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
+    }
+    pub type Mask = [u64; 16];
+    pub fn get() -> Mask {
+        let mut m: Mask = [0; 16];
+        // SAFETY: `m` is a 1024-bit buffer, the size the kernel is told.
+        unsafe {
+            sched_getaffinity(0, core::mem::size_of::<Mask>(), m.as_mut_ptr());
+        }
+        m
+    }
+    pub fn set(m: &Mask) {
+        // SAFETY: same buffer contract as `get`.
+        unsafe {
+            sched_setaffinity(0, core::mem::size_of::<Mask>(), m.as_ptr());
+        }
+    }
+    pub fn pin(cpu: usize) {
+        let mut m: Mask = [0; 16];
+        m[cpu / 64] = 1u64 << (cpu % 64);
+        set(&m);
+    }
+}
+
+/// One finished block handed from a butterfly worker to its paired
+/// leaf-hash worker: where the block starts in the codeword, how many
+/// elements it holds, and the leaf range it covers.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct DeepBlock {
+    ptr: usize,
+    len_f128: usize,
+    lo: usize,
+    hi: usize,
+}
+
+/// Single-producer / single-consumer ring for one SMT pair.
+#[cfg(target_os = "linux")]
+struct DeepQueue {
+    slots: Vec<std::cell::UnsafeCell<DeepBlock>>,
+    head: std::sync::atomic::AtomicUsize, // next to publish
+    tail: std::sync::atomic::AtomicUsize, // next to consume
+    done: std::sync::atomic::AtomicBool,  // producer will publish no more
+    gone: std::sync::atomic::AtomicBool,  // consumer left (panic)
+}
+
+// SAFETY: exactly one producer writes `slots[head % cap]` before publishing
+// `head` with Release, and exactly one consumer reads it after an Acquire
+// load of `head`; the bounded ring keeps the producer from lapping the
+// consumer, so no slot is written while it may be read.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for DeepQueue {}
+
+#[cfg(target_os = "linux")]
+impl DeepQueue {
+    const CAP: usize = 64;
+    fn new() -> Self {
+        Self {
+            slots: (0..Self::CAP)
+                .map(|_| {
+                    std::cell::UnsafeCell::new(DeepBlock {
+                        ptr: 0,
+                        len_f128: 0,
+                        lo: 0,
+                        hi: 0,
+                    })
+                })
+                .collect(),
+            head: std::sync::atomic::AtomicUsize::new(0),
+            tail: std::sync::atomic::AtomicUsize::new(0),
+            done: std::sync::atomic::AtomicBool::new(false),
+            gone: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// Publish a block, waiting while the consumer is more than `depth`
+    /// blocks behind. Returns false if the consumer is gone (its panic is
+    /// already unwinding); the caller then handles the block itself.
+    fn push(&self, b: DeepBlock, depth: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        while h - self.tail.load(Ordering::Acquire) >= depth {
+            if self.gone.load(Ordering::Acquire) {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        // SAFETY: the slot is free (checked above) and only this producer
+        // writes it.
+        unsafe {
+            *self.slots[h % Self::CAP].get() = b;
+        }
+        self.head.store(h + 1, Ordering::Release);
+        true
+    }
+    fn pop(&self) -> Option<DeepBlock> {
+        use std::sync::atomic::Ordering;
+        let t = self.tail.load(Ordering::Relaxed);
+        loop {
+            if self.head.load(Ordering::Acquire) > t {
+                // SAFETY: published by the producer with Release before the
+                // Acquire load above.
+                let b = unsafe { *self.slots[t % Self::CAP].get() };
+                self.tail.store(t + 1, Ordering::Release);
+                return Some(b);
+            }
+            if self.done.load(Ordering::Acquire) {
+                // The producer's last `head` store is released before its
+                // `done` store, so one more look at `head` settles whether a
+                // block was published between the load above and that flag.
+                if self.head.load(Ordering::Acquire) > t {
+                    continue;
+                }
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Line-hint level for the deep pass's fused-four row driver under the
+/// sibling-paired schedule (see `deep_split_pairs`): each row group asks for
+/// the sixteen rows the next group will read, one line per lane step.
+/// 0 = no hints, 1 = L1, 2 = L2. Only the paired schedule passes it; the
+/// alternating schedule always runs un-hinted.
+/// `FLOCK_NO_NTT_DEEP_PF=1` removes the hints in the same binary;
+/// `FLOCK_NTT_DEEP_PF_HINT` overrides the level (diagnostics). Read once per
+/// process — never inside a loop.
+#[cfg(target_os = "linux")]
+fn deep_pf_hint() -> u8 {
+    static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_NTT_DEEP_PF_HINT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1)
+    });
+    *H
+}
+
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
 #[inline]
 fn ntt_fused3_disabled() -> bool {
@@ -1310,8 +1559,9 @@ impl AdditiveNttF128 {
         *ON
     }
 
-    /// `FLOCK_NTT_STAGE_PERM=1` selects the interleaved staging order; the
-    /// default is the natural `[block][k]` order.
+    /// `FLOCK_NO_NTT_STAGE_PERM=1` restores the natural `[block][k]` staging
+    /// order in the same binary (exact same-binary A/B); the ranked worker's
+    /// cleared env never sets it.
     fn stage_perm_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_STAGE_PERM").is_some());
@@ -1969,7 +2219,8 @@ impl AdditiveNttF128 {
 
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
-                        block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>|
+                        block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
+                        hint: u8|
          -> bool {
             if fuse_blocks && block_cb.is_some() {
                 let cb = block_cb.unwrap();
@@ -1997,6 +2248,7 @@ impl AdditiveNttF128 {
                         sixteenth,
                         num_ntts,
                         if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
+                        hint,
                     );
                 }
                 // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
@@ -2030,6 +2282,7 @@ impl AdditiveNttF128 {
                         sixteenth4,
                         num_ntts,
                         if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
+                        hint,
                     );
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
@@ -2101,6 +2354,7 @@ impl AdditiveNttF128 {
                                 sixteenth,
                                 num_ntts,
                                 if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
+                                hint,
                             );
                         }
                         layer += 4;
@@ -2227,16 +2481,135 @@ impl AdditiveNttF128 {
                 // Optional same-worker hook after each sub-group's last write
                 // (Merkle rewrite 1). Regular stores: this thread wrote the
                 // range, so the callback may read it without SFENCE.
+                let big = on_sub_done.is_some() && n_total >= (1usize << 24);
+                // Sibling-paired deep pass: eight butterfly workers, one per
+                // physical core, each feeding finished blocks to a leaf-hash
+                // worker on its SMT sibling. Leaves are written by index, so
+                // the leaf order is unchanged. See `deep_split_pairs`.
+                #[cfg(target_os = "linux")]
+                if let Some(pairs) = deep_split_pairs()
+                    .filter(|p| big && fuse_blocks && p.len() * 2 == rayon::current_num_threads())
+                    .filter(|_| rayon::current_thread_index().is_none())
+                    .and_then(|p| DeepSplitClaim::take().map(|c| (p, c)))
+                {
+                    let (pairs, _claim) = pairs;
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    let cb = on_sub_done.expect("big implies a callback");
+                    let n_subs = n_total / sub_bytes;
+                    let n_pairs = pairs.len();
+                    let depth = deep_split_depth();
+                    let hint = deep_pf_hint();
+                    let queues: Vec<DeepQueue> =
+                        (0..n_pairs).map(|_| DeepQueue::new()).collect();
+                    let next_sub = AtomicUsize::new(0);
+                    let base_addr = data.as_mut_ptr() as usize;
+                    let deep_sub = &deep_sub;
+                    let queues = &queues;
+                    let next_sub = &next_sub;
+                    rayon::broadcast(|ctx| {
+                        let idx = ctx.index();
+                        if idx >= 2 * n_pairs {
+                            return;
+                        }
+                        let producer = idx < n_pairs;
+                        let slot = if producer { idx } else { idx - n_pairs };
+                        let q = &queues[slot];
+                        let cpu = if producer {
+                            pairs[slot].0
+                        } else {
+                            pairs[slot].1
+                        };
+                        // Restores this worker's original CPU set even if the
+                        // body unwinds, and releases the paired worker so a
+                        // panic can never leave the other end spinning.
+                        struct Guard<'a> {
+                            saved: affinity::Mask,
+                            q: &'a DeepQueue,
+                            producer: bool,
+                        }
+                        impl Drop for Guard<'_> {
+                            fn drop(&mut self) {
+                                use std::sync::atomic::Ordering;
+                                if self.producer {
+                                    self.q.done.store(true, Ordering::Release);
+                                } else {
+                                    self.q.gone.store(true, Ordering::Release);
+                                }
+                                affinity::set(&self.saved);
+                            }
+                        }
+                        let _guard = Guard {
+                            saved: affinity::get(),
+                            q,
+                            producer,
+                        };
+                        affinity::pin(cpu);
+                        if producer {
+                            let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
+                                let b = DeepBlock {
+                                    ptr: blk.as_ptr() as usize,
+                                    len_f128: blk.len(),
+                                    lo: range.start,
+                                    hi: range.end,
+                                };
+                                if !q.push(b, depth) {
+                                    cb(range, blk);
+                                }
+                            };
+                            loop {
+                                let i = next_sub.fetch_add(1, Ordering::Relaxed);
+                                if i >= n_subs {
+                                    break;
+                                }
+                                // SAFETY: `i` is claimed by exactly one worker,
+                                // so the sub-group slices are disjoint and in
+                                // bounds of the codeword.
+                                let sub_data = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        (base_addr as *mut F128).add(i * sub_bytes),
+                                        sub_bytes,
+                                    )
+                                };
+                                if !deep_sub(i, sub_data, Some(&enqueue), hint) {
+                                    enqueue(
+                                        i * sub_size_positions
+                                            ..(i + 1) * sub_size_positions,
+                                        sub_data,
+                                    );
+                                }
+                            }
+                        } else {
+                            while let Some(b) = q.pop() {
+                                // SAFETY: the producer finished every write to
+                                // this block before publishing it, and the
+                                // release/acquire pair on the ring head orders
+                                // those writes before this read.
+                                let blk = unsafe {
+                                    std::slice::from_raw_parts(
+                                        b.ptr as *const F128,
+                                        b.len_f128,
+                                    )
+                                };
+                                cb(b.lo..b.hi, blk);
+                            }
+                        }
+                    });
+                    crate::gaptime::mark("ntt: deep pass done");
+                    return;
+                }
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
                             }
                         }
                     });
+                if big {
+                    crate::gaptime::mark("ntt: deep pass done");
+                }
             }
             Some((n_chunks, on_chunk)) => {
                 let n_subs = 1usize << n_top;
@@ -2256,7 +2629,7 @@ impl AdditiveNttF128 {
                         rest = tail;
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
-                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None); });
+                            .for_each(|(i, sub_data)| { deep_sub(sub_cursor + i, sub_data, None, 0); });
                         on_chunk(
                             c,
                             sub_cursor * sub_size_positions..end_sub * sub_size_positions,
@@ -2352,7 +2725,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None);
+                    deep_sub(i, sub_data, None, 0);
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -2824,22 +3197,31 @@ fn butterfly_interleaved_fused_4layer_rows(
     sixteenth: usize,
     num_ntts: usize,
     odd_tail: usize,
+    hint: u8,
 ) {
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
     for r in 0..sixteenth {
+        let lanes = row_lanes(r, num_ntts, odd_tail);
+        // The sixteen rows the NEXT row group reads are asked for one line
+        // per lane step. The hints move no data of their own and change no
+        // value; `FLOCK_NO_NTT_DEEP_PF=1` removes them.
         // SAFETY: each call writes the valid, disjoint row group
-        // `{i*sixteenth + r : i in 0..16}` and calls are sequential here.
+        // `{i*sixteenth + r : i in 0..16}` and calls are sequential here; the
+        // hinted group is inside the same block.
         unsafe {
-            kernels::butterfly_fused_4layer_row(
-                base,
-                sixteenth,
-                num_ntts,
-                row_lanes(r, num_ntts, odd_tail),
-                r,
-                t,
-            )
+            if hint == 0 || r + 1 >= sixteenth {
+                kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
+            } else if hint == 1 {
+                kernels::butterfly_fused_4layer_row_pf::<1>(
+                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                )
+            } else {
+                kernels::butterfly_fused_4layer_row_pf::<2>(
+                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                )
+            }
         };
     }
 }

@@ -386,6 +386,49 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// [`butterfly_fused_4layer_row`] with one line hint per row of row group
+/// `pf_r` issued at every lane step. `H` selects the hint level (1 = L1,
+/// 2 = L2). Portable builds ignore the hint.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
+/// also lie inside the block.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    debug_assert!(lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry and disjointness contract.
+    unsafe {
+        x86_64::butterfly_fused_4layer_row_pf::<H>(
+            ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = pf_r;
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+    }
+}
+
 /// Process one fused-three-layer group of eight consecutive rows.
 ///
 /// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
