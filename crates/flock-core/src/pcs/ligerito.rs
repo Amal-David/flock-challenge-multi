@@ -3545,22 +3545,48 @@ unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     (u0, u2)
 }
 
-/// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
-/// `MOVNTDQ`). Same helper shape as the promoted seed-fused publish
-/// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM, because large pool /
-/// arena slices on this lineage land 16 mod 64 — a 64-byte gate in front of
-/// `_mm512_stream_si512` would silently never fire.
+/// Publish `n` F128s with non-temporal stores. Same helper as the promoted
+/// seed-fused [`AdditiveNttF128::publish_row_nt`]: 64-aligned destinations
+/// use ZMM `VMOVNTDQ` (`_mm512_stream_si512`); everything else stays on XMM
+/// `MOVNTDQ`.
+///
+/// The XMM-only comment on this helper is stale. Ranked `FLOCK_NO_ALIGN64`
+/// is unset, so recyclable FoldArena / scratch-pool buffers land 0 mod 64.
+/// Each NT fold chunk is 2048 F128s (32 KiB), a whole number of cache lines.
+/// ZMM streams write one line per uop instead of four XMM stores that
+/// straddle or split-combine the same line.
+///
+/// `FLOCK_NO_FOLD_NT_ZMM=1` restores XMM-only publish inside the same binary.
+/// Bytes are identical either way; NT stores have no architectural effect
+/// on the written values after the caller's `sfence`.
 ///
 /// # Safety
 /// `src`/`dst` cover `n` F128s; `dst` is 16-byte aligned. SSE2 is x86_64
-/// baseline.
+/// baseline. The ZMM arm additionally requires `dst` 64-byte aligned and
+/// `avx512f` (cfg-gated).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
+    // `_mm_loadu_si128` accepts any src alignment. The 64-aligned arm matches
+    // `AdditiveNttF128::publish_row_nt`: whole-line ZMM streams, XMM tail.
     unsafe {
+        #[cfg(target_feature = "avx512f")]
+        if dst as usize % 64 == 0 && fold_nt_zmm_enabled() {
+            let s = src as *const __m512i;
+            let d = dst as *mut __m512i;
+            for i in 0..n / 4 {
+                _mm512_stream_si512(d.add(i), _mm512_loadu_si512(s.add(i)));
+            }
+            let done = (n / 4) * 4;
+            let s = src as *const __m128i;
+            let d = dst as *mut __m128i;
+            for i in done..n {
+                _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+            }
+            return;
+        }
         let s = src as *const __m128i;
         let d = dst as *mut __m128i;
         for i in 0..n {
@@ -3569,14 +3595,25 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+/// `FLOCK_NO_FOLD_NT_ZMM=1` keeps the incumbent XMM-only L0-fold NT publish
+/// (exact same-binary A/B). Ranked env is cleared, so ZMM is on when dest
+/// is 64-aligned.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline]
+fn fold_nt_zmm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FOLD_NT_ZMM").is_none())
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
 /// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
 /// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
+/// (no destination reload); the destination is published with NT stores so
+/// each output line skips write-allocate RFO. Ranked 64-aligned dests use
+/// ZMM streams; see [`publish_f128_row_nt`]. Next reader is the following
+/// sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
 /// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
 ///
 /// # Safety
@@ -9384,6 +9421,31 @@ mod tests {
             let point: Vec<F128> = (0..d).map(|_| ch.sample_f128()).collect();
             assert_eq!(build_eq_table_split(&point), build_eq_table(&point), "d={d}");
         }
+    }
+
+    /// ZMM and XMM NT publish write the same F128 bytes as a plain copy.
+    /// Length 2048 is the ranked fold chunk; dest is forced 64-aligned so the
+    /// ZMM arm actually runs on AVX-512 builds.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn publish_f128_row_nt_matches_copy_on_64_aligned_chunk() {
+        let n = 2048usize;
+        let src: Vec<F128> = (0..n)
+            .map(|i| F128 {
+                lo: i as u64,
+                hi: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            })
+            .collect();
+        let mut raw = vec![F128::ZERO; n + 4];
+        let mis = raw.as_ptr() as usize % 64;
+        let skip = if mis == 0 { 0 } else { (64 - mis) / core::mem::size_of::<F128>() };
+        let dst = &mut raw[skip..skip + n];
+        assert_eq!(dst.as_ptr() as usize % 64, 0, "test dest must hit the ZMM arm");
+        unsafe {
+            publish_f128_row_nt(src.as_ptr(), dst.as_mut_ptr(), n);
+            core::arch::x86_64::_mm_sfence();
+        }
+        assert_eq!(dst, src.as_slice());
     }
 
     /// Retaining the OOD equality as low/high factors must reproduce both
