@@ -72,6 +72,49 @@ pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&
 /// verifies every planned row against the actual b word.
 pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
 
+/// Process-invariant mode switches for the x86 round-1 AB kernel. The
+/// streaming witness path resolves these once, rather than entering three
+/// `LazyLock` accessors for every 64-byte window.
+#[derive(Clone, Copy)]
+pub(super) struct ShiftReducePlan {
+    img2: bool,
+    pidx: bool,
+    offw: bool,
+}
+
+#[inline]
+pub(super) fn prepare_shift_reduce(
+    inv_table: &InvNttTableByteSingleGf8,
+) -> ShiftReducePlan {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        let img2 = x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
+        let pidx = img2 && x86_64::urm_pidx_enabled();
+        let offw = pidx && x86_64::urm_offw_enabled();
+        ShiftReducePlan { img2, pidx, offw }
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = inv_table;
+        ShiftReducePlan {
+            img2: false,
+            pidx: false,
+            offw: false,
+        }
+    }
+}
+
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     #[cfg(target_arch = "aarch64")]
@@ -224,6 +267,7 @@ pub(super) fn shift_reduce_inner_ab_at(
     blk: usize,
     out: &mut [u8; 64],
     bstatic: Option<&'static BstaticPartials>,
+    prepared: ShiftReducePlan,
     nt: u8,
 ) {
     #[cfg(all(
@@ -243,8 +287,17 @@ pub(super) fn shift_reduce_inner_ab_at(
                     return;
                 }
             }
-            x86_64::shift_reduce_inner_ab_x86_avx512(
-                a_packed, b_packed, inv_table, byte_base, 0, out, nt,
+            x86_64::shift_reduce_inner_ab_x86_avx512_prepared(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base,
+                0,
+                out,
+                nt,
+                prepared.img2,
+                prepared.pidx,
+                prepared.offw,
             );
         }
     }
@@ -256,7 +309,7 @@ pub(super) fn shift_reduce_inner_ab_at(
         target_feature = "avx512bw"
     )))]
     {
-        let _ = (blk, bstatic);
+        let _ = (blk, bstatic, prepared);
         let mut a_col = [F8::ZERO; 64];
         let mut b_col = [F8::ZERO; 64];
         shift_reduce_inner_ab(

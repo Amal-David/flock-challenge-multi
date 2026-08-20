@@ -214,7 +214,6 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) live: u32,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
-    pub(crate) nt: bool,
 }
 
 impl StreamProj<'_> {
@@ -242,7 +241,7 @@ impl StreamProj<'_> {
                     .out
                     .add(j * BYTES_PER_BLOCK + blk * 64)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan, self.nt);
+                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan);
             }
         }
     }

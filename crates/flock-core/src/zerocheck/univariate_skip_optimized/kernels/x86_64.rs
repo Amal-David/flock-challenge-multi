@@ -187,6 +187,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     b_med: usize,
     out: &mut [u8; 64],
     nt: u8,
+    offw: bool,
 ) {
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -235,7 +236,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
                 acc
             }};
         }
-        let acc = if urm_offw_enabled() {
+        let acc = if offw {
             horner!(apply_x86_avx512_register_2img_offw_unchecked)
         } else {
             horner!(apply_x86_avx512_register_2img_off_unchecked)
@@ -264,6 +265,50 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     out: &mut [u8; 64],
     nt: u8,
 ) {
+    let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
+    let pidx = img2 && urm_pidx_enabled();
+    let offw = pidx && urm_offw_enabled();
+    // SAFETY: same contract as this function; the mode flags merely cache
+    // the three process-invariant selectors used by the incumbent body.
+    unsafe {
+        shift_reduce_inner_ab_x86_avx512_prepared(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+            nt,
+            img2,
+            pidx,
+            offw,
+        );
+    }
+}
+
+/// [`shift_reduce_inner_ab_x86_avx512`] with its process-invariant mode
+/// switches already resolved. Arithmetic, loads and stores are identical.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    nt: u8,
+    img2: bool,
+    pidx: bool,
+    offw: bool,
+) {
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
@@ -272,8 +317,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     // window over the whole packed input make this the largest port-5-only
     // uop stream in the prover. `FLOCK_NO_URM_APPLY_2IMG=1` restores the
     // one-image form (exact same-binary A/B).
-    let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
-    if img2 && urm_pidx_enabled() {
+    if img2 && pidx {
         // SAFETY: same contract as this function; `img2` proves the σ₈ image.
         unsafe {
             shift_reduce_inner_ab_x86_avx512_pidx(
@@ -284,6 +328,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
                 b_med,
                 out,
                 nt,
+                offw,
             );
         }
         return;

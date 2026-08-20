@@ -1720,8 +1720,6 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
-        prepare_round1_ab_window_plan(inv_table);
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -1734,10 +1732,13 @@ fn generate_round1_inner_octa(
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
+        prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
-        .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
             || {
@@ -1832,7 +1833,6 @@ fn generate_round1_inner_octa(
                                 live,
                                 inv_table,
                                 plan: win_plan,
-                                nt: abinner_nt,
                             }
                         });
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
