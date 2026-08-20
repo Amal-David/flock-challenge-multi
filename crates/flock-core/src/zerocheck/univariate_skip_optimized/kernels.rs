@@ -209,6 +209,71 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
+/// byte offset plus the global BLAKE3 medium-window index
+/// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
+/// on their own rather than a whole packed block. Bit-identical to
+/// [`shift_reduce_inner_ab`] on the same bytes with the same `blk`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_at(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base: usize,
+    blk: usize,
+    out: &mut [u8; 64],
+    bstatic: Option<&'static BstaticPartials>,
+    nt: u8,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        // SAFETY: all required target features are enabled at compile time,
+        // and the caller vouches for 64 readable bytes at `byte_base`.
+        unsafe {
+            if let Some(partials) = bstatic {
+                if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
+                    a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
+                ) {
+                    return;
+                }
+            }
+            x86_64::shift_reduce_inner_ab_x86_avx512(
+                a_packed, b_packed, inv_table, byte_base, 0, out, nt,
+            );
+        }
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (blk, bstatic);
+        let mut a_col = [F8::ZERO; 64];
+        let mut b_col = [F8::ZERO; 64];
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base,
+            0,
+            out,
+            &mut a_col,
+            &mut b_col,
+            None,
+            nt,
+        );
+    }
+}
+
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
 /// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two

@@ -857,6 +857,57 @@ pub fn precompute_round1_ab_inner_windows(
     }
 }
 
+/// Number of 64-byte medium windows in one BLAKE3 block's round-1 transform
+/// (two 8192-bit outer windows of `1 << N_MEDIUM` medium positions each).
+pub const ROUND1_AB_WINDOWS_PER_BLOCK: usize = 2 * (1 << N_MEDIUM);
+
+/// Resolved static-B plan for [`round1_ab_inner_window`], hoisted out of the
+/// per-window call so the streaming producer resolves it once per task.
+#[derive(Clone, Copy)]
+pub struct Round1AbWindowPlan(Option<&'static kernels::BstaticPartials>);
+
+/// Resolve the round-1 window plan for `inv_table`. See
+/// [`round1_ab_inner_window`].
+pub fn prepare_round1_ab_window_plan(
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Round1AbWindowPlan {
+    Round1AbWindowPlan(kernels::prepare_bstatic(inv_table))
+}
+
+/// Transform ONE 64-byte medium window of one BLAKE3 block, given just that
+/// window's packed a and b bytes. `blk` is the window's index within the
+/// block, `0..ROUND1_AB_WINDOWS_PER_BLOCK`, ascending in packed byte order.
+///
+/// The whole-block entry point [`precompute_round1_ab_inner_windows`] is
+/// exactly this call for every `blk` in order; each window is independent, so
+/// a producer that materializes windows out of order gets the same bytes.
+///
+/// `nt_out` publishes the transformed window with non-temporal stores under
+/// the same contract as [`precompute_round1_ab_inner_windows`]: the caller
+/// MUST issue [`abinner_publish_fence`] on the producing thread before the
+/// task ends.
+#[inline]
+pub fn round1_ab_inner_window(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    blk: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+    nt_out: bool,
+) {
+    let nt: u8 = if nt_out {
+        match out.as_ptr() as usize % 64 {
+            0 => 2,
+            r if r % 16 == 0 => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    kernels::shift_reduce_inner_ab_at(a_window, b_window, inv_table, 0, blk, out, plan.0, nt);
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the

@@ -84,9 +84,9 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
 // GFNI prefold dead-line plan (x86 round-2 / cascade-L1 batch folds).
 // ---------------------------------------------------------------------------
 
-/// `FLOCK_NO_PREFOLD_ROW_SKIP=1` restores the unpredicated 64-row GFNI
-/// prefold (every tile line loaded). Output is bit-identical either way —
-/// the switch exists only for same-binary A/B screening and bisection.
+/// `FLOCK_PREFOLD_ROW_SKIP=1` selects the predicated 64-row GFNI prefold, which
+/// skips tile lines whose rows are all padding. The default loads every tile
+/// line. Output is bit-identical either way.
 #[cfg_attr(
     not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
     allow(dead_code)
@@ -94,7 +94,7 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
 fn prefold_row_skip_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_PREFOLD_ROW_SKIP").as_deref() != Some(std::ffi::OsStr::new("1"))
+        std::env::var_os("FLOCK_PREFOLD_ROW_SKIP").as_deref() == Some(std::ffi::OsStr::new("1"))
     })
 }
 

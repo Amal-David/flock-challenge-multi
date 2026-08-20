@@ -360,7 +360,7 @@ unsafe fn kernel<const BLK: usize>(
 ///
 /// # Safety
 /// As for [`kernel`].
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     a_packed: &[u8],
@@ -376,8 +376,39 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     if w > 1 || b_med >= 16 {
         return false;
     }
-    let blk = w * 16 + b_med;
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        shift_reduce_inner_ab_x86_avx512_bstatic_at(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base + b_med * N_CHUNKS * 8,
+            w * 16 + b_med,
+            partials,
+            out,
+            nt,
+        )
+    }
+}
+
+/// [`shift_reduce_inner_ab_x86_avx512_bstatic`] addressed directly by the
+/// window's absolute byte offset and its global block index
+/// `blk = w * 16 + b_med`.
+///
+/// # Safety
+/// As for [`kernel`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    blk: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) -> bool {
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         if blk == 31 {
