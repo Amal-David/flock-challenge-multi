@@ -1065,6 +1065,74 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     }
 }
 
+/// Ranked direct-source twin of [`accumulate_convert_ab_nomul_x86_gfni`].
+/// `N` is the exact number of contiguous live 64-byte medium rows; the
+/// BLAKE3 round-one collector alternates `N = 16` and `N = 15`.  Keeping the
+/// extent constant lets LLVM retain the rows in registers and erase the
+/// generic per-plane `n_b_med` ladder.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+#[inline(never)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_direct_x86_gfni<const N: usize>(
+    src_rows: *const u8,
+    pf_rows: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(matches!(N, 15 | 16));
+    // SAFETY: the caller provides N contiguous readable 64-byte rows and the
+    // fixed matrix/output arrays cover every indexed load and store. The cfg
+    // gate supplies all required target features.
+    unsafe {
+        let rows: [__m512i; N] = std::array::from_fn(|bm| {
+            // Keep b63's promoted hint/load alternation as one indivisible
+            // compiler operation. Separate intrinsics were legally grouped
+            // into all loads followed by all hints, undoing the cadence.
+            let row: __m512i;
+            core::arch::asm!(
+                "prefetcht0 [{pf}]",
+                "vmovdqu64 {row}, [{src}]",
+                pf = in(reg) pf_rows.wrapping_add(bm * ELL),
+                src = in(reg) src_rows.add(bm * ELL),
+                row = lateout(zmm_reg) row,
+                options(nostack, preserves_flags)
+            );
+            row
+        });
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            for pair in 0..N / 2 {
+                let bm = 2 * pair;
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+            }
+            if N & 1 != 0 {
+                let bm = N - 1;
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
 /// 8x64 byte transpose: eight 64-byte rows in, eight registers out with
 /// `out[k].byte[8L + b] = rows[REV ? 7 - b : b][8k + L]` — i.e. output
 /// register `k` holds, in qword `L`, the eight rows' byte `8k + L`.

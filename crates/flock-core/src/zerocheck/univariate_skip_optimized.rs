@@ -2481,6 +2481,30 @@ fn process_one_x_hi_ab_only(
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
+    // Validate the complete canonical AB band once in release mode. The hot
+    // N=15/N=16 leaves below derive their pointers from this checked borrow,
+    // so no per-window bounds branch or debug-only safety assumption is
+    // needed. One outer window is exactly sixteen contiguous 64-byte rows.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_ab_band = {
+        const AB_WINDOW_BYTES: usize = (1 << N_MEDIUM) * ELL;
+        let band_base = x_hi
+            .checked_shl(n_lo_and_inner as u32)
+            .and_then(|outer| outer.checked_mul(N_CHUNKS))
+            .expect("round-one AB band base");
+        let band_len = big_lo_size
+            .checked_mul(AB_WINDOW_BYTES)
+            .expect("round-one AB band length");
+        ab_inner
+            .get(band_base..)
+            .and_then(|tail| tail.get(..band_len))
+            .expect("canonical round-one AB band")
+    };
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
     // inside the window loop).
     #[cfg(target_arch = "x86_64")]
@@ -2538,16 +2562,69 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if pf_spread && pf_windows != 0 && n_next == n_b_med {
+            if let Some((_, mats, bank_bits)) = eq_fold {
+                let w_idx = x_outer_lo >> bank_bits;
+                let u = x_outer_lo & ((1usize << bank_bits) - 1);
+                let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                    .try_into()
+                    .expect("one 16x16 qword matrix block per w");
+                let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                    [u * 16 * ELL..(u + 1) * 16 * ELL])
+                    .try_into()
+                    .expect("one plane bank per low index");
+                match n_b_med {
+                    15 => {
+                        // SAFETY: `direct_ab_band` was checked once above and
+                        // each loop step selects one complete 1 KiB window.
+                        unsafe {
+                            kernels::accumulate_convert_ab_nomul_gfni_direct::<15>(
+                                direct_ab_band
+                                    .as_ptr()
+                                    .add(x_outer_lo * ((1 << N_MEDIUM) * ELL)),
+                                ab_inner_ptr.wrapping_add(next_base),
+                                mats_w,
+                                bank,
+                            );
+                        }
+                        continue;
+                    }
+                    16 => {
+                        // SAFETY: as above; this leaf consumes the complete
+                        // checked window.
+                        unsafe {
+                            kernels::accumulate_convert_ab_nomul_gfni_direct::<16>(
+                                direct_ab_band
+                                    .as_ptr()
+                                    .add(x_outer_lo * ((1 << N_MEDIUM) * ELL)),
+                                ab_inner_ptr.wrapping_add(next_base),
+                                mats_w,
+                                bank,
+                            );
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Every non-ranked extent, diagnostic prefetch arm, and the existing
+        // no-eq-fold arm retain b63's exact spread-copy fallback.
         for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
             #[cfg(target_arch = "x86_64")]
             if pf_spread && b_med < n_next {
                 pf_one(b_med);
             }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            state.chunk_ab_bytes[b_med]
+                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + ELL]);
         }
         #[cfg(target_arch = "x86_64")]
         if pf_spread {
@@ -2555,36 +2632,39 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
+
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
             target_feature = "vpclmulqdq",
             target_feature = "gfni"
         ))]
-        if let Some((_, mats, bank_bits)) = eq_fold {
-            let w_idx = x_outer_lo >> bank_bits;
-            let u = x_outer_lo & ((1usize << bank_bits) - 1);
-            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
-                .try_into()
-                .expect("one 16x16 qword matrix block per w");
-            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
-                [u * 16 * ELL..(u + 1) * 16 * ELL])
-                .try_into()
-                .expect("one plane bank per low index");
-            kernels::accumulate_convert_ab_nomul_gfni(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                mats_w,
-                bank,
-            );
-        } else {
-            kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
+        {
+            if let Some((_, mats, bank_bits)) = eq_fold {
+                let w_idx = x_outer_lo >> bank_bits;
+                let u = x_outer_lo & ((1usize << bank_bits) - 1);
+                let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                    .try_into()
+                    .expect("one 16x16 qword matrix block per w");
+                let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                    [u * 16 * ELL..(u + 1) * 16 * ELL])
+                    .try_into()
+                    .expect("one plane bank per low index");
+                kernels::accumulate_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            } else {
+                kernels::accumulate_convert_ab(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_scaled[x_outer_lo],
+                    &mut state.partial_ab,
+                );
+            }
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -3013,6 +3093,139 @@ mod tests {
                 seq,
                 "corrupted scale went undetected n_w={n_w}"
             );
+        }
+    }
+
+    /// The ranked direct-source GFNI leaves must consume the canonical
+    /// contiguous AB bytes exactly like the incumbent scratch-array leaf.
+    /// Exercise both alternating BLAKE3 extents from a deliberately
+    /// unaligned source address and retain non-zero accumulator state.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn ab_gfni_direct_ranked_extents_match_scratch() {
+        const OFFSET: usize = 13;
+        let mut source = vec![0u8; OFFSET + 16 * ELL + 7];
+        for (i, byte) in source[OFFSET..OFFSET + 16 * ELL].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32)
+                ^ ((i >> 3) as u8).wrapping_mul(0x47);
+        }
+        let mut scratch = [[0u8; ELL]; 1 << N_MEDIUM];
+        for (row, dst) in scratch.iter_mut().enumerate() {
+            dst.copy_from_slice(&source[OFFSET + row * ELL..OFFSET + (row + 1) * ELL]);
+        }
+        let mut mats = [0u64; 256];
+        for (i, value) in mats.iter_mut().enumerate() {
+            let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            *value = x.rotate_left((i & 63) as u32) ^ 0xd6e8_feb8_6659_fd93;
+        }
+        let mut seed = [0u8; 16 * ELL];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0xa7) ^ 0x5c;
+        }
+
+        for n in [15usize, 16] {
+            let mut expected = seed;
+            kernels::accumulate_convert_ab_nomul_gfni(&scratch, n, &mats, &mut expected);
+            let mut got = seed;
+            // SAFETY: OFFSET starts sixteen contiguous readable rows, and
+            // the match chooses the exact extent consumed by each leaf.
+            unsafe {
+                match n {
+                    15 => kernels::accumulate_convert_ab_nomul_gfni_direct::<15>(
+                        source.as_ptr().add(OFFSET),
+                        source.as_ptr().add(OFFSET),
+                        &mats,
+                        &mut got,
+                    ),
+                    16 => kernels::accumulate_convert_ab_nomul_gfni_direct::<16>(
+                        source.as_ptr().add(OFFSET),
+                        source.as_ptr().add(OFFSET),
+                        &mats,
+                        &mut got,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(got, expected, "direct GFNI mismatch at N={n}");
+        }
+    }
+
+    /// Portable byte-level oracle for the direct-source extent and row
+    /// layout. This runs even when the host cannot execute AVX-512/GFNI; the
+    /// target-specific test above separately checks the actual SIMD leaf.
+    #[test]
+    fn ab_direct_source_ranked_extents_portable_layout() {
+        fn affine_byte(input: u8, matrix: u64) -> u8 {
+            let rows = matrix.to_le_bytes();
+            let mut output = 0u8;
+            for bit in 0..8 {
+                output |= (((rows[7 - bit] & input).count_ones() as u8) & 1) << bit;
+            }
+            output
+        }
+
+        fn direct_reference<const N: usize>(
+            source: &[u8],
+            offset: usize,
+            mats: &[u64; 256],
+            bank: &mut [u8; 16 * ELL],
+        ) {
+            let rows = source
+                .get(offset..)
+                .and_then(|tail| tail.get(..N * ELL))
+                .expect("ranked direct rows");
+            for k in 0..16 {
+                for lane in 0..ELL {
+                    for bm in 0..N {
+                        bank[k * ELL + lane] ^=
+                            affine_byte(rows[bm * ELL + lane], mats[bm * 16 + k]);
+                    }
+                }
+            }
+        }
+
+        const OFFSET: usize = 13;
+        let mut source = vec![0u8; OFFSET + 16 * ELL + 9];
+        for (i, byte) in source[OFFSET..OFFSET + 16 * ELL].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0x9d).rotate_left((i & 7) as u32)
+                ^ ((i >> 3) as u8).wrapping_mul(0x47);
+        }
+        let mut scratch = [[0u8; ELL]; 1 << N_MEDIUM];
+        for (row, dst) in scratch.iter_mut().enumerate() {
+            dst.copy_from_slice(&source[OFFSET + row * ELL..OFFSET + (row + 1) * ELL]);
+        }
+        let mut mats = [0u64; 256];
+        for (i, value) in mats.iter_mut().enumerate() {
+            let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            *value = x.rotate_left((i & 63) as u32) ^ 0xd6e8_feb8_6659_fd93;
+        }
+        let mut seed = [0u8; 16 * ELL];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0xa7) ^ 0x5c;
+        }
+
+        for n in [15usize, 16] {
+            let mut expected = seed;
+            for k in 0..16 {
+                for lane in 0..ELL {
+                    for (bm, row) in scratch.iter().enumerate().take(n) {
+                        expected[k * ELL + lane] ^=
+                            affine_byte(row[lane], mats[bm * 16 + k]);
+                    }
+                }
+            }
+            let mut got = seed;
+            match n {
+                15 => direct_reference::<15>(&source, OFFSET, &mats, &mut got),
+                16 => direct_reference::<16>(&source, OFFSET, &mats, &mut got),
+                _ => unreachable!(),
+            }
+            assert_eq!(got, expected, "portable direct layout mismatch at N={n}");
         }
     }
 

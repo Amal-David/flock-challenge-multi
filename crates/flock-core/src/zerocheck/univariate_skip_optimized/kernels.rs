@@ -332,6 +332,34 @@ pub(super) fn accumulate_convert_ab_nomul_gfni(
     }
 }
 
+/// Constant-extent direct-source form used by the ranked identity-C AB
+/// collector. `src_rows` points into the canonical `Round1AbInner` storage,
+/// so no per-window 1 KiB copy is required.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn accumulate_convert_ab_nomul_gfni_direct<const N: usize>(
+    src_rows: *const u8,
+    pf_rows: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: forwarded from the caller, which proves N contiguous readable
+    // rows in Round1AbInner. The cfg gate supplies every SIMD feature.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_direct_x86_gfni::<N>(
+            src_rows,
+            pf_rows,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
