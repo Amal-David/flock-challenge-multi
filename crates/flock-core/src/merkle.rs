@@ -334,10 +334,21 @@ fn blake3_hash_many<const N: usize>(
         // Fill a stack array of input pointers. Slot 0 seeds the array so the
         // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
         // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
+        //
+        // `as_chunks::<N>` makes the length relation structural: it yields
+        // `&[[u8; N]]`, so splitting the batch into messages needs no checked
+        // indexing and no `try_into().unwrap()`. The incumbent
+        // `msgs[i * N..(i + 1) * N]` form left `slice_index_fail` landing pads
+        // in this body — LLVM could not prove `(i + 1) * N <= msgs.len()` from
+        // the const generic alone, so every message paid a bounds check. Same
+        // pointers, same order, same hashes.
+        let (chunks, _tail) = msgs.as_chunks::<N>();
+        let Some(first) = chunks.first() else {
+            continue;
+        };
         let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+        for (slot, chunk) in inputs[..n].iter_mut().zip(chunks) {
+            *slot = chunk;
         }
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
@@ -379,6 +390,13 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
             }
         };
     }
+    // NOTE (measured, do not re-attempt blindly): peeling the ranked
+    // 1024-byte size out in front of this match was tried and REJECTED. In the
+    // full crate's Sapphire Rapids assembly it collapsed no call chain
+    // (`blake3_hash_many` / `Platform::hash_many` / `hash_many_leaves` call
+    // sites stayed at 5 / 1 / 7, and N=1024 remained inlined-only both ways);
+    // it merely added a sixth copy of the 1024 body, +16 instructions, for
+    // four saved compares on a path entered once per `BLAKE3_GROUP` chunk.
     // Leaf sizes are `16 << log_batch_size`, so only powers of two arise.
     dispatch!(64, 128, 256, 512, 1024)
 }
@@ -1272,6 +1290,45 @@ mod tests {
                 blake3_leaf_size_is_batchable(leaf_size),
                 "predicate and dispatch disagree at leaf_size={leaf_size}"
             );
+        }
+    }
+
+    /// Every batchable leaf size, at every batch-boundary message count, must
+    /// produce exactly the per-leaf `blake3_leaf_cv` hashes in the same order.
+    /// This pins the `as_chunks::<N>`-based input-pointer construction —
+    /// including its empty-batch guard and the partial final batch — against
+    /// the one-leaf-at-a-time reference, for both `BLAKE3_BATCH` widths (64 on
+    /// x86_64, 16 elsewhere). Negative control: perturbing one input byte must
+    /// change exactly the hash of the leaf that contains it.
+    #[test]
+    fn blake3_batched_leaves_match_per_leaf_hashes() {
+        for leaf_size in [64usize, 128, 256, 512, 1024] {
+            for n in [1usize, 2, 15, 16, 17, 63, 64, 65, 100] {
+                let mut data = random_data(n, leaf_size, 0xB3 ^ n as u64);
+                let mut got = vec![[0u8; 32]; n];
+                assert!(
+                    blake3_hash_many_leaves(&data, leaf_size, &mut got),
+                    "size {leaf_size} must batch"
+                );
+                let want: Vec<Hash> = (0..n)
+                    .map(|i| blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]))
+                    .collect();
+                assert_eq!(got, want, "leaf_size={leaf_size} n={n}");
+
+                // Negative control: flip a byte in the last leaf.
+                let touched = (n - 1) * leaf_size + leaf_size / 2;
+                data[touched] ^= 0xFF;
+                let mut bad = vec![[0u8; 32]; n];
+                assert!(blake3_hash_many_leaves(&data, leaf_size, &mut bad));
+                assert_ne!(
+                    bad[n - 1],
+                    want[n - 1],
+                    "perturbed leaf undetected leaf_size={leaf_size} n={n}"
+                );
+                if n > 1 {
+                    assert_eq!(bad[0], want[0], "untouched leaf changed");
+                }
+            }
         }
     }
 

@@ -435,6 +435,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 num_ntts,
                 right_twiddle,
                 core::ptr::null(),
+                false,
             )
         } else {
             butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false>(
@@ -447,9 +448,30 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 num_ntts,
                 right_twiddle,
                 core::ptr::null(),
+                false,
             )
         }
     }
+}
+
+/// `FLOCK_NTT_SEED_LANE_PF_SPREAD=1` spreads the seed-pass sparse kernel's
+/// per-lane-step hints: instead of all four rows' lines going out back to
+/// back ahead of that step's four loads, one hint issues per compute step of
+/// the body they sit in — before the loads, after them, after the XOR triple,
+/// after the twiddle multiply. Same addresses, same instruction count per
+/// lane step; a prefetch has no architectural effect, so the staged rows are
+/// bit-identical either way.
+///
+/// Off by default, unlike the other spread arms, because the mechanism is
+/// weakest exactly here: four outstanding hints is not a flood against a
+/// twelve-deep fill queue, so there is little pacing to win, while this is
+/// the tightest body of the three (~30 uops) and the arm adds a runtime
+/// branch to it. The burst-into-a-full-queue pathology the other two arms
+/// address does not apply at four.
+fn seed_lane_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_SEED_LANE_PF_SPREAD").is_some());
+    *ON
 }
 
 /// [`butterfly_fused_2layer_row_from_sparse_geo`] that also asks for one line
@@ -473,6 +495,9 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     right_twiddle: F128,
     pf_src: *const F128,
 ) {
+    // Hint delivery, resolved once per process and read here — once per row,
+    // outside the lane loop the hints are issued from.
+    let pf_spread = seed_lane_pf_spread_enabled();
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
@@ -486,6 +511,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 num_ntts,
                 right_twiddle,
                 pf_src,
+                pf_spread,
             )
         } else {
             butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true>(
@@ -498,6 +524,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 num_ntts,
                 right_twiddle,
                 pf_src,
+                pf_spread,
             )
         }
     }
@@ -518,6 +545,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
     num_ntts: usize,
     right_twiddle: F128,
     pf_src: *const F128,
+    pf_spread: bool,
 ) {
     use core::arch::x86_64::*;
 
@@ -530,26 +558,49 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
-        while lane < lanes {
-            if PF {
-                let off = lane * core::mem::size_of::<F128>();
-                for i in 0..4 {
-                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+        // Rows `$lo..$hi` of this lane step's hint block. Spread delivery
+        // calls this once per compute step of the body; the burst arm calls
+        // it once with 0..4.
+        macro_rules! pf_rows {
+            ($lo:expr, $hi:expr) => {
+                if PF {
+                    let off = lane * core::mem::size_of::<F128>();
+                    for i in $lo..$hi {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                    }
                 }
+            };
+        }
+        while lane < lanes {
+            if pf_spread {
+                pf_rows!(0, 1);
+            } else {
+                pf_rows!(0, 4);
             }
             let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
             let mut vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
             let mut vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
             let mut vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+            // Spread delivery: the rest of this lane step's hint block, one
+            // line per compute step of the same body.
+            if pf_spread {
+                pf_rows!(1, 2);
+            }
 
             // t_outer = 0, t_inner_a = 0: a stays a.
             vc = _mm512_xor_si512(vc, va);
             vd = _mm512_xor_si512(vd, vb);
             vb = _mm512_xor_si512(vb, va);
+            if pf_spread {
+                pf_rows!(2, 3);
+            }
 
             let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
+            if pf_spread {
+                pf_rows!(3, 4);
+            }
 
             _mm512_storeu_si512(dst_row(0).add(lane) as *mut __m512i, va);
             _mm512_storeu_si512(dst_row(1).add(lane) as *mut __m512i, vb);
@@ -601,6 +652,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                false,
             )
         } else {
             butterfly_fused_4layer_row_impl::<true, 0>(
@@ -611,9 +663,25 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                false,
             )
         }
     }
+}
+
+/// `FLOCK_NO_NTT_DEEP_PF_SPREAD=1` restores the incumbent delivery of the
+/// deep-pass row-group prefetch: all sixteen of a lane step's line hints
+/// issued back to back ahead of that step's sixteen loads. The default arm
+/// issues the same sixteen hints for the same lines four at a time, one
+/// quarter per butterfly stage of the step that follows, so the fill queue
+/// never sees more than four outstanding hints while it is still draining
+/// the step's own demand misses. Same addresses, same instruction count per
+/// lane step, different pacing: a prefetch has no architectural effect, so
+/// the transformed block is bit-identical either way.
+fn deep_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_DEEP_PF_SPREAD").is_none());
+    *ON
 }
 
 /// [`butterfly_fused_4layer_row`] that also issues one line hint per row of
@@ -633,6 +701,9 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
+    // Hint delivery, resolved once per process and read here — once per row
+    // group, outside the lane loop the hints are issued from.
+    let pf_spread = deep_pf_spread_enabled();
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
@@ -644,6 +715,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                pf_spread,
             )
         } else {
             butterfly_fused_4layer_row_impl::<true, H>(
@@ -654,6 +726,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                pf_spread,
             )
         }
     }
@@ -671,6 +744,7 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
     r: usize,
     twiddles: &[F128; 15],
     pf_r: usize,
+    pf_spread: bool,
 ) {
     use core::arch::x86_64::*;
 
@@ -688,17 +762,29 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
-        while lane < lanes {
-            if H != 0 {
-                let off = lane * core::mem::size_of::<F128>();
-                for i in 0..16 {
-                    let p = pf_row(i).add(off);
-                    if H == 1 {
-                        _mm_prefetch::<_MM_HINT_T0>(p);
-                    } else {
-                        _mm_prefetch::<_MM_HINT_T1>(p);
+        // One quarter of a lane step's hint block: the current lane's line in
+        // rows `$lo..$hi` of the hinted row group. Spread delivery calls this
+        // once per butterfly stage; the burst arm calls it once with 0..16.
+        macro_rules! pf_quarter {
+            ($lo:expr, $hi:expr) => {
+                if H != 0 {
+                    let off = lane * core::mem::size_of::<F128>();
+                    for i in $lo..$hi {
+                        let p = pf_row(i).add(off);
+                        if H == 1 {
+                            _mm_prefetch::<_MM_HINT_T0>(p);
+                        } else {
+                            _mm_prefetch::<_MM_HINT_T1>(p);
+                        }
                     }
                 }
+            };
+        }
+        while lane < lanes {
+            if pf_spread {
+                pf_quarter!(0, 4);
+            } else {
+                pf_quarter!(0, 16);
             }
             let mut values = [zero; 16];
             for (i, value) in values.iter_mut().enumerate() {
@@ -718,17 +804,28 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
             for i in 0..8 {
                 butterfly!(i, i + 8, outer);
             }
+            // Spread delivery: the rest of this lane step's hint block, one
+            // quarter per butterfly stage of the same step.
+            if pf_spread {
+                pf_quarter!(4, 8);
+            }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..4 {
                     butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
                 }
             }
+            if pf_spread {
+                pf_quarter!(8, 12);
+            }
             for s in 0..4 {
                 let twiddle = tw[3 + s];
                 for i in 0..2 {
                     butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
                 }
+            }
+            if pf_spread {
+                pf_quarter!(12, 16);
             }
             for s in 0..8 {
                 let twiddle = tw[7 + s];
@@ -1292,6 +1389,7 @@ mod diet_tests {
                             len,
                             right,
                             core::ptr::null(),
+                            false,
                         );
                     } else {
                         butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false>(
@@ -1304,6 +1402,7 @@ mod diet_tests {
                             len,
                             right,
                             core::ptr::null(),
+                            false,
                         );
                     }
                 }
@@ -1330,6 +1429,7 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            false,
                         );
                     } else {
                         butterfly_fused_4layer_row_impl::<false, 0>(
@@ -1340,6 +1440,7 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            false,
                         );
                     }
                 }
