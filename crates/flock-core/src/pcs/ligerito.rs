@@ -3904,8 +3904,8 @@ fn materialize_direct_fold4(
                 // Deletes the `b_out.fill(ZERO)` memset that used to paint the
                 // whole chunk before the same += loop. Same F128 values — XOR
                 // with zero is the identity; the assign *is* that identity
-                // without the store. Existing 4-wide stride kept (not unrolled
-                // further; #120's 8-wide was cancelled with no official score).
+                // without the store. Eight independent table folds expose more
+                // of the gather latency to the out-of-order core.
                 let table = &mut scratch[..table_len];
                 let mut claims_iter = claims.iter().zip(direct_tables.iter());
                 if !has_ordinary {
@@ -3918,12 +3918,16 @@ fn materialize_direct_fold4(
                         table,
                     );
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 7 < block_len {
                         b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
                         b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
                         b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
                         b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
-                        s += 4;
+                        b_out[s + 4] = super::ring_switch::fold_one_slot(first.eq_lo[s + 4], table);
+                        b_out[s + 5] = super::ring_switch::fold_one_slot(first.eq_lo[s + 5], table);
+                        b_out[s + 6] = super::ring_switch::fold_one_slot(first.eq_lo[s + 6], table);
+                        b_out[s + 7] = super::ring_switch::fold_one_slot(first.eq_lo[s + 7], table);
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
@@ -3933,12 +3937,16 @@ fn materialize_direct_fold4(
                 for (claim, direct_table) in claims_iter {
                     super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 7 < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         b_out[s + 1] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
                         b_out[s + 2] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
                         b_out[s + 3] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
-                        s += 4;
+                        b_out[s + 4] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 4], table);
+                        b_out[s + 5] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 5], table);
+                        b_out[s + 6] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 6], table);
+                        b_out[s + 7] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 7], table);
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
