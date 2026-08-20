@@ -394,16 +394,26 @@ impl Drop for DeepSplitClaim {
 }
 
 /// How many finished blocks a butterfly worker may publish before waiting
-/// for its paired hash worker. `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides it
-/// (diagnostics). Read once per process — never from inside a loop.
+/// for its paired hash worker. Eight blocks cover the fused-tail's natural
+/// production burst while keeping the queued payload within the shared L2.
+/// `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides it (diagnostics). Read once per
+/// process — never from inside a loop.
+#[cfg(target_os = "linux")]
+#[inline]
+fn select_deep_split_depth(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DeepQueue::DEFAULT_DEPTH)
+        .clamp(1, DeepQueue::CAP)
+}
+
 #[cfg(target_os = "linux")]
 fn deep_split_depth() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DeepQueue::CAP)
-            .clamp(1, DeepQueue::CAP)
+        select_deep_split_depth(
+            std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok()),
+        )
     });
     *D
 }
@@ -469,6 +479,7 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
+    const DEFAULT_DEPTH: usize = 8;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
@@ -3319,6 +3330,73 @@ mod tests {
                 addr / CACHE_LINE
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_split_depth_default_override_and_clamp() {
+        assert_eq!(select_deep_split_depth(None), 8);
+        assert_eq!(select_deep_split_depth(Some(0)), 1);
+        assert_eq!(select_deep_split_depth(Some(1)), 1);
+        assert_eq!(select_deep_split_depth(Some(7)), 7);
+        assert_eq!(select_deep_split_depth(Some(8)), 8);
+        assert_eq!(select_deep_split_depth(Some(63)), 63);
+        assert_eq!(select_deep_split_depth(Some(64)), 64);
+        assert_eq!(select_deep_split_depth(Some(65)), 64);
+        assert_eq!(select_deep_split_depth(Some(usize::MAX)), 64);
+    }
+
+    /// Exercise the ranked depth through enough publications to wrap the
+    /// physical ring repeatedly. The consumer waits for the first full
+    /// depth-sized burst, proving that the producer cannot publish a ninth
+    /// block until the consumer advances `tail`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_depth_eight_wraps_without_loss_or_reordering() {
+        use std::sync::atomic::Ordering;
+
+        const N: usize = DeepQueue::CAP * 64;
+        let queue = DeepQueue::new();
+        let (all_published, initial_head, seen) = std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                let mut all_published = true;
+                for i in 0..N {
+                    all_published &= queue.push(
+                        DeepBlock {
+                            ptr: i,
+                            len_f128: i + 1,
+                            lo: i * 2,
+                            hi: i * 2 + 1,
+                        },
+                        DeepQueue::DEFAULT_DEPTH,
+                    );
+                }
+                queue.done.store(true, Ordering::Release);
+                all_published
+            });
+
+            let initial_head = loop {
+                let head = queue.head.load(Ordering::Acquire);
+                if head >= DeepQueue::DEFAULT_DEPTH {
+                    break head;
+                }
+                std::hint::spin_loop();
+            };
+            let mut seen = Vec::with_capacity(N);
+            while let Some(block) = queue.pop() {
+                seen.push((block.ptr, block.len_f128, block.lo, block.hi));
+            }
+            (producer.join().unwrap(), initial_head, seen)
+        });
+
+        assert!(all_published);
+        assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
+        assert_eq!(seen.len(), N);
+        for (i, block) in seen.into_iter().enumerate() {
+            assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
+        }
+        assert_eq!(queue.head.load(Ordering::Relaxed), N);
+        assert_eq!(queue.tail.load(Ordering::Relaxed), N);
     }
 
     struct Rng(u64);
