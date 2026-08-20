@@ -2563,6 +2563,24 @@ pub(crate) struct DirectFold8Factors {
     pub(crate) round0: (F128, F128),
 }
 
+/// `FLOCK_NO_DF8_PAR=1` restores the incumbent serial construction of the
+/// direct-fold8 factor states. This arm builds the two bank-major states and
+/// their cached round-zero statistic across the pool instead of on the one
+/// thread that owns the claim.
+///
+/// Both arms evaluate the same field expressions: each retained bank's column
+/// is an independent chain, and GF(2^128) addition is XOR, so the split
+/// round-zero accumulation recombines to the same pair of elements. The
+/// published proof is byte-identical either way.
+///
+/// Read once per process, outside every loop.
+#[inline]
+pub(crate) fn direct_fold8_parallel_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_PAR").is_none());
+    *ON
+}
+
 fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     assert_eq!(witness.len(), basis.len());
     let mut u0 = F128::ZERO;
@@ -3241,23 +3259,76 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     // Keep H[e,d] = <A_e,W_d> factored. Bit-major storage
                     // makes every retained-coordinate pair contiguous, so
                     // the six challenges bind these 512 KiB states online.
+                    use rayon::prelude::*;
+                    let parallel = direct_fold8_parallel_enabled();
                     let mut w_state = vec![F128::ZERO; 64 * n_packed];
-                    for d_low in 0..64 {
-                        let mut basis_product = low_eq[d_low];
-                        w_state[d_low] = fold_one_slot(basis_product, &table);
-                        for bit in 1..n_packed {
-                            basis_product = crate::field::mul_by_x(basis_product);
-                            w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
-                        }
-                    }
                     let mut a_state = vec![F128::ZERO; 64 * n_packed];
-                    for e in 0..64 {
-                        let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                        for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
-                            a_state[bit * 64 + e] = value;
+                    if parallel {
+                        // One contiguous column per retained bank, filled in
+                        // parallel, then transposed into the bit-major state.
+                        let mut w_cols = vec![F128::ZERO; 64 * n_packed];
+                        let mut a_cols = vec![F128::ZERO; 64 * n_packed];
+                        rayon::join(
+                            || {
+                                w_cols
+                                    .par_chunks_mut(n_packed)
+                                    .enumerate()
+                                    .for_each(|(d_low, column)| {
+                                        let mut basis_product = low_eq[d_low];
+                                        column[0] = fold_one_slot(basis_product, &table);
+                                        for slot in column.iter_mut().skip(1) {
+                                            basis_product =
+                                                crate::field::mul_by_x(basis_product);
+                                            *slot = fold_one_slot(basis_product, &table);
+                                        }
+                                    });
+                            },
+                            || {
+                                a_cols
+                                    .par_chunks_mut(n_packed)
+                                    .enumerate()
+                                    .for_each(|(e, column)| {
+                                        let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                        column.copy_from_slice(&tensor_algebra_transpose(bank));
+                                    });
+                            },
+                        );
+                        for bank in 0..64 {
+                            for bit in 0..n_packed {
+                                w_state[bit * 64 + bank] = w_cols[bank * n_packed + bit];
+                                a_state[bit * 64 + bank] = a_cols[bank * n_packed + bit];
+                            }
+                        }
+                    } else {
+                        for d_low in 0..64 {
+                            let mut basis_product = low_eq[d_low];
+                            w_state[d_low] = fold_one_slot(basis_product, &table);
+                            for bit in 1..n_packed {
+                                basis_product = crate::field::mul_by_x(basis_product);
+                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
+                            }
+                        }
+                        for e in 0..64 {
+                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                            for (bit, value) in
+                                tensor_algebra_transpose(bank).into_iter().enumerate()
+                            {
+                                a_state[bit * 64 + e] = value;
+                            }
                         }
                     }
-                    let round0 = direct_fold8_round0(&a_state, &w_state);
+                    let round0 = if parallel {
+                        a_state
+                            .par_chunks(2 * 64)
+                            .zip(w_state.par_chunks(2 * 64))
+                            .map(|(a, b)| direct_fold8_round0(a, b))
+                            .reduce(
+                                || (F128::ZERO, F128::ZERO),
+                                |x, y| (x.0 + y.0, x.1 + y.1),
+                            )
+                    } else {
+                        direct_fold8_round0(&a_state, &w_state)
+                    };
                     let tail = &suffix[6..];
                     let (eq_lo, eq_hi) =
                         build_eq_split(tail, deferred_split_n_lo(tail.len()));
