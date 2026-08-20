@@ -996,7 +996,7 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
 /// `prefetcht0` instructions issue at the same point, only the address
 /// changes, and a prefetch has no architectural effect, so the folded
 /// values are bit-identical either way.
-const ZC_PKT_PF_TILES: usize = 3;
+const ZC_PKT_PF_TILES: usize = 4; // r2pf4: far-prefetch sweep step past the shipped 3 (fe680ba +1.30%)
 
 /// `FLOCK_NO_ZC_PKT_PF_FAR=1` restores the incumbent one-tile look-ahead in
 /// both packed-row prefetches (exact same-binary A/B).

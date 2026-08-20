@@ -2337,50 +2337,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
 // and the added fold read the same 2^(m-3) bytes.
 // ---------------------------------------------------------------------------
 
-/// Look-ahead, in 1 KiB outer windows, for the round-1 AB packed-row
-/// prefetch. One window is `2^N_INNER * N_CHUNKS = 1024` bytes of
-/// `ab_inner` — the sixteen contiguous 64-byte chunks one `x_outer_lo` step
-/// copies into `chunk_ab_bytes` before the GFNI accumulate consumes them.
-///
-/// The incumbent issues NO software prefetch here at all. The sweep
-/// demand-loads a window's sixteen lines back to back at the head of the
-/// window and then spends ~2 000 cycles of GFNI on them, so every window
-/// opens with a burst of misses that only the L2 streamer can have covered.
-/// At the ranked shape it frequently has not: sixteen worker threads each
-/// drive this stream while the *concurrent* identity-C fold (the other half
-/// of round one's `rayon::join`) drives eight row-strided gather streams of
-/// its own through the same L2s, and the streamer's tracker is shared per
-/// core between the two SMT siblings.
-///
-/// The ranked-shape decomposition of round one measures the exposure
-/// directly (16 threads, m = 32, k_log = 14, medians):
-///
-///   real (AB memory + compute, C full)     22.29 ms
-///   AB compute only (no `ab_inner` reads)  19.37 ms
-///   AB compute only + C compute only       18.81 ms
-///
-/// so ~2.9 ms of the AB stream is ADDITIVE, not overlapped, while the
-/// concurrent C fold's own 512 MiB costs only 0.56 ms exposed — that stream
-/// already carries the grouped-gather prefetch, this one carried nothing.
-///
-/// Two windows puts a full extra window of work behind the hint — ~2 000
-/// cycles, several times a loaded DRAM miss on this box — while keeping
-/// every line covered exactly once: window `W + 2` is requested at window
-/// `W`, so each line is hinted once, just earlier. One window only reaches
-/// back into the same window's own GFNI burst, and four or more evicts
-/// before use; both measure worse. Nothing is added to the sweep and
-/// nothing moves — a prefetch has no architectural effect — so the
-/// accumulated lanes are bit-identical either way.
-const ZC_R1AB_PF_WINDOWS: usize = 2;
-
-/// `FLOCK_NO_ZC_R1AB_PF=1` restores the incumbent no-prefetch round-1 AB
-/// sweep (exact same-binary A/B). Resolved once per process.
-fn zc_r1ab_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PF").is_none());
-    *ON
-}
-
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2427,16 +2383,6 @@ fn process_one_x_hi_ab_only(
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
-    // Packed-row prefetch look-ahead, resolved once per x_hi band (never
-    // inside the window loop).
-    #[cfg(target_arch = "x86_64")]
-    let pf_windows = if zc_r1ab_pf_enabled() {
-        ZC_R1AB_PF_WINDOWS
-    } else {
-        0
-    };
-    #[cfg(target_arch = "x86_64")]
-    let ab_inner_ptr = ab_inner.as_ptr();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -2444,33 +2390,6 @@ fn process_one_x_hi_ab_only(
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
-        // window's copy loop will demand, and exactly as many of them (the
-        // padding skip drops the last chunk of every second window). Issued
-        // BEFORE this window's own copy, so the hint sits two whole windows
-        // of work ahead of the demand load it feeds; issued after the copy it
-        // reaches only ~1.5 windows back and measures ~0.7 ms worse.
-        // `wrapping_add` keeps the past-the-end address on the last windows
-        // of the last band well defined, and that hint is simply dropped.
-        #[cfg(target_arch = "x86_64")]
-        if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_base = ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            for b_med in 0..n_next {
-                // SAFETY: `_mm_prefetch` is a hint — no memory is read, no
-                // fault is possible, and the address is formed by
-                // `wrapping_add` on the base pointer.
-                unsafe {
-                    core::arch::x86_64::_mm_prefetch(
-                        ab_inner_ptr
-                            .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                            .cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-            }
-        }
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);

@@ -264,6 +264,7 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
+    /// x86_64 variant of `apply` — operates in 16-byte chunks. Direct port of
     /// [`apply_neon_unchecked`]: SSE2 `_mm_loadu_si128` / `_mm_xor_si128` /
     /// `_mm_storeu_si128`, with the odd-`b` 8-byte half-swap (`vextq_u8::<8>`)
     /// realized as `_mm_shuffle_epi32::<0x4E>` (swap the two 64-bit halves).
@@ -433,50 +434,9 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
-    /// Pre-scaled-offset twin of
-    /// [`Self::apply_x86_avx512_register_2img_unchecked`]. Identical value and
-    /// identical table addresses; the only difference is that the eight row
-    /// offsets arrive already multiplied by `ell = 64` in a `u16` array, so
-    /// each row address is one `movzwl` instead of `movzbl` + `shl $6`.
-    ///
-    /// That shift is the kernel's single largest port-0/port-6 consumer
-    /// occupied in the fused AB kernel.
-    ///
-    /// # Safety
-    /// As for [`Self::apply_x86_avx512_register_2img_unchecked`], with `off`
-    /// pointing to eight readable `u16`s each equal to `input_byte * 64`.
-    #[cfg(target_arch = "x86_64")]
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub(crate) unsafe fn apply_x86_avx512_register_2img_off_unchecked(
-        &self,
-        off: *const u16,
-    ) -> core::arch::x86_64::__m512i {
-        use core::arch::x86_64::*;
-        debug_assert_eq!(self.ell, 64);
-        debug_assert_eq!(self.n_chunks, 8);
-        debug_assert!(self.has_second_image());
-        let base = self.data_ptr();
-        let base8 = self.half_swapped_data_ptr();
-        // SAFETY: eight readable pre-scaled offsets per the contract; each is
-        // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image
-        // of 64 readable bytes per row.
-        unsafe {
-            let row = |img: *const u8, b: usize| {
-                _mm512_loadu_si512(img.add(*off.add(b) as usize) as *const __m512i)
-            };
-            let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
-            let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
-            let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
-            let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
-            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
-            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
-        }
-    }
-
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
+    /// future NEON port can batch loads across the three rows.
     pub fn apply_triple(
         &self,
         a_bytes: &[u8],
