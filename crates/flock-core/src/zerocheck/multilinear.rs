@@ -4707,6 +4707,92 @@ mod tests {
         }
     }
 
+    /// The paired c4 producer transposes four A planes and four B planes
+    /// together, then stitches adjacent four-plane groups back into the exact
+    /// eight-plane vectors used by two independent compact producers.  This
+    /// byte oracle exercises the group4 packing and both `pick_a`/`pick_b`
+    /// maps without requiring GFNI or AVX-512 on the host.
+    #[test]
+    fn gfni_c4_pair_group4_matches_two_compact_sides() {
+        fn plane(seed: u8, k: usize) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                seed.wrapping_add((k as u8).wrapping_mul(73))
+                    .rotate_left(((i + k) & 7) as u32)
+                    ^ (i as u8).wrapping_mul(41)
+            })
+        }
+
+        fn qword_transpose(input: [[u8; 64]; 8]) -> [[u8; 64]; 8] {
+            let mut out = [[0u8; 64]; 8];
+            for src in 0..8 {
+                for qword in 0..8 {
+                    out[qword][8 * src..8 * src + 8]
+                        .copy_from_slice(&input[src][8 * qword..8 * qword + 8]);
+                }
+            }
+            out
+        }
+
+        fn xor4(a: [u8; 64], b: [u8; 64], c: [u8; 64], d: [u8; 64]) -> [u8; 64] {
+            std::array::from_fn(|i| a[i] ^ b[i] ^ c[i] ^ d[i])
+        }
+
+        fn compact_half(input: [[u8; 64]; 8]) -> ([u8; 64], [u8; 64]) {
+            let q = qword_transpose(input);
+            (
+                xor4(q[0], q[2], q[4], q[6]),
+                xor4(q[1], q[3], q[5], q[7]),
+            )
+        }
+
+        fn paired_group(
+            a: [[u8; 64]; 4],
+            b: [[u8; 64]; 4],
+        ) -> ([u8; 64], [u8; 64]) {
+            let q = qword_transpose([
+                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+            ]);
+            (
+                xor4(q[0], q[2], q[4], q[6]),
+                xor4(q[1], q[3], q[5], q[7]),
+            )
+        }
+
+        fn pick(lo: [u8; 64], hi: [u8; 64], b: bool) -> [u8; 64] {
+            let base = if b { 4 } else { 0 };
+            let mut out = [0u8; 64];
+            for q in 0..4 {
+                out[8 * q..8 * q + 8]
+                    .copy_from_slice(&lo[8 * (base + q)..8 * (base + q + 1)]);
+                out[8 * (q + 4)..8 * (q + 5)]
+                    .copy_from_slice(&hi[8 * (base + q)..8 * (base + q + 1)]);
+            }
+            out
+        }
+
+        for (seed_a, seed_b) in [(0, 1), (1, 0), (0x5A, 0xA5), (0xFF, 0x33)] {
+            let a: [[u8; 64]; 16] = std::array::from_fn(|k| plane(seed_a, k));
+            let b: [[u8; 64]; 16] = std::array::from_fn(|k| plane(seed_b, k));
+            for half in 0..2 {
+                let k = 8 * half;
+                let (want_ae, want_ao) = compact_half(a[k..k + 8].try_into().unwrap());
+                let (want_be, want_bo) = compact_half(b[k..k + 8].try_into().unwrap());
+                let (g0e, g0o) = paired_group(
+                    a[k..k + 4].try_into().unwrap(),
+                    b[k..k + 4].try_into().unwrap(),
+                );
+                let (g1e, g1o) = paired_group(
+                    a[k + 4..k + 8].try_into().unwrap(),
+                    b[k + 4..k + 8].try_into().unwrap(),
+                );
+                assert_eq!(pick(g0e, g1e, false), want_ae, "A/even half={half}");
+                assert_eq!(pick(g0o, g1o, false), want_ao, "A/odd half={half}");
+                assert_eq!(pick(g0e, g1e, true), want_be, "B/even half={half}");
+                assert_eq!(pick(g0o, g1o, true), want_bo, "B/odd half={half}");
+            }
+        }
+    }
+
     /// The consumer-level claim that licenses the skip: no row of a dead line
     /// reaches any accumulator or any written table slot. Checked on the
     /// portable round-two chunk path (the same predicate the AVX-512 kernel

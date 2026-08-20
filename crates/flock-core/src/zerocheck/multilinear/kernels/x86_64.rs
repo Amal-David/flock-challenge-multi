@@ -1482,15 +1482,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     );
                     if use_c4 {
                         let c = cfold.unwrap();
-                        gfni_fold64_rows_masked_c4(
+                        gfni_fold64_rows_masked_c4_pair_g4(
                             a_pkt.add(4 * xg * 8),
-                            c,
-                            fa.as_mut_ptr(),
-                            dead,
-                        );
-                        gfni_fold64_rows_masked_c4(
                             b_pkt.add(4 * xg * 8),
                             c,
+                            fa.as_mut_ptr(),
                             fb.as_mut_ptr(),
                             dead,
                         );
@@ -2482,6 +2478,211 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
         _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
         _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
+    }
+}
+
+/// Paired-A/B form of [`gfni_fold64_rows_masked_c4`] that shares every
+/// composed-fold matrix load.  The two pretransposed eight-plane inputs are
+/// parked in exactly one 1 KiB, cache-line-aligned scratch block.  Four
+/// output planes per side are then accumulated together: each matrix is
+/// loaded once and applied to both sides before the next matrix is visited.
+///
+/// The compact finish does not materialize sixteen planes per side.  For one
+/// four-plane group it transposes `[a0,a1,a2,a3,b0,b1,b2,b3]`; XORing the
+/// even or odd transpose rows therefore yields
+/// `[A(k0..k3), B(k0..k3)]`.  Two adjacent groups are regrouped into the
+/// exact eight-plane vectors consumed by the incumbent compact finish.
+///
+/// # Safety
+/// `a_rows` and `b_rows` follow [`gfni_fold64_rows_masked_c4`]'s readable-row
+/// contract. `a_out` and `b_out` each cover sixteen writable [`F128`] values
+/// and are disjoint from every input and from each other.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(never)]
+unsafe fn gfni_fold64_rows_masked_c4_pair_g4(
+    a_rows: *const u8,
+    b_rows: *const u8,
+    m: &CFoldMats,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+
+    #[repr(C, align(64))]
+    struct PcPairScratch([[u64; 8]; 16]);
+
+    // SAFETY (whole body): bounds and disjointness are the caller contract;
+    // all scratch slots are written before they are read, and every shuffle
+    // index is in range.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let sigma = _mm512_loadu_si512(SIGMA_C4.as_ptr() as *const __m512i);
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+        let mut scratch = core::mem::MaybeUninit::<PcPairScratch>::uninit();
+        let pc = scratch.as_mut_ptr().cast::<__m512i>();
+        let prepare = |rows: *const u8, off: usize| {
+            let mut z = [_mm512_setzero_si512(); 8];
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
+            }
+            let t = std::array::from_fn(|i| _mm512_permutexvar_epi8(bt, z[i]));
+            let p = qword_transpose(t);
+            for j in 0..8 {
+                _mm512_store_si512(pc.add(off + j), _mm512_permutexvar_epi8(sigma, p[j]));
+            }
+        };
+        prepare(a_rows, 0);
+        prepare(b_rows, 8);
+
+        // Return packed horizontal reductions for four consecutive planes:
+        // lanes 0..4 are A, lanes 4..8 are B. `maps(j)` loads each matrix
+        // once, applies it to both sides, and the 3-input XOR tree matches the
+        // incumbent's four reduction instructions per plane exactly.
+        let group = |k0: usize| -> (__m512i, __m512i) {
+            let maps = |j: usize| -> ([__m512i; 4], [__m512i; 4]) {
+                let pa = _mm512_load_si512(pc.add(j));
+                let pb = _mm512_load_si512(pc.add(8 + j));
+                let pair = |d: usize| {
+                    let matrix = _mm512_loadu_si512(
+                        m.0[j * 16 + k0 + d].as_ptr() as *const __m512i,
+                    );
+                    (
+                        _mm512_gf2p8affine_epi64_epi8::<0>(pa, matrix),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(pb, matrix),
+                    )
+                };
+                let (a0, b0) = pair(0);
+                let (a1, b1) = pair(1);
+                let (a2, b2) = pair(2);
+                let (a3, b3) = pair(3);
+                ([a0, a1, a2, a3], [b0, b1, b2, b3])
+            };
+
+            let (mut aa, mut bb) = maps(0);
+            let (a1, b1) = maps(1);
+            let (a2, b2) = maps(2);
+            for d in 0..4 {
+                aa[d] = _mm512_ternarylogic_epi64::<0x96>(aa[d], a1[d], a2[d]);
+                bb[d] = _mm512_ternarylogic_epi64::<0x96>(bb[d], b1[d], b2[d]);
+            }
+            let (a3, b3) = maps(3);
+            let (a4, b4) = maps(4);
+            for d in 0..4 {
+                aa[d] = _mm512_ternarylogic_epi64::<0x96>(aa[d], a3[d], a4[d]);
+                bb[d] = _mm512_ternarylogic_epi64::<0x96>(bb[d], b3[d], b4[d]);
+            }
+            let (a5, b5) = maps(5);
+            let (a6, b6) = maps(6);
+            for d in 0..4 {
+                aa[d] = _mm512_ternarylogic_epi64::<0x96>(aa[d], a5[d], a6[d]);
+                bb[d] = _mm512_ternarylogic_epi64::<0x96>(bb[d], b5[d], b6[d]);
+            }
+            let (a7, b7) = maps(7);
+            for d in 0..4 {
+                aa[d] = _mm512_xor_si512(aa[d], a7[d]);
+                bb[d] = _mm512_xor_si512(bb[d], b7[d]);
+            }
+
+            let q = qword_transpose([
+                aa[0], aa[1], aa[2], aa[3], bb[0], bb[1], bb[2], bb[3],
+            ]);
+            let xor4 = |a, b, c, d| {
+                _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a, b, c), d)
+            };
+            (
+                xor4(q[0], q[2], q[4], q[6]),
+                xor4(q[1], q[3], q[5], q[7]),
+            )
+        };
+
+        let pick_a = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let pick_b = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        let (g0e, g0o) = group(0);
+        let (g1e, g1o) = group(4);
+        let a_lo_e = _mm512_permutex2var_epi64(g0e, pick_a, g1e);
+        let b_lo_e = _mm512_permutex2var_epi64(g0e, pick_b, g1e);
+        let a_lo_o = _mm512_permutex2var_epi64(g0o, pick_a, g1o);
+        let b_lo_o = _mm512_permutex2var_epi64(g0o, pick_b, g1o);
+        let (g2e, g2o) = group(8);
+        let (g3e, g3o) = group(12);
+        let a_hi_e = _mm512_permutex2var_epi64(g2e, pick_a, g3e);
+        let b_hi_e = _mm512_permutex2var_epi64(g2e, pick_b, g3e);
+        let a_hi_o = _mm512_permutex2var_epi64(g2o, pick_a, g3o);
+        let b_hi_o = _mm512_permutex2var_epi64(g2o, pick_b, g3o);
+
+        let a_lo_e = _mm512_permutexvar_epi8(bt, a_lo_e);
+        let a_hi_e = _mm512_permutexvar_epi8(bt, a_hi_e);
+        let a_lo_o = _mm512_permutexvar_epi8(bt, a_lo_o);
+        let a_hi_o = _mm512_permutexvar_epi8(bt, a_hi_o);
+        let b_lo_e = _mm512_permutexvar_epi8(bt, b_lo_e);
+        let b_hi_e = _mm512_permutexvar_epi8(bt, b_hi_e);
+        let b_lo_o = _mm512_permutexvar_epi8(bt, b_lo_o);
+        let b_hi_o = _mm512_permutexvar_epi8(bt, b_hi_o);
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+
+        let store = |out: *mut F128,
+                     lo_e: __m512i,
+                     hi_e: __m512i,
+                     lo_o: __m512i,
+                     hi_o: __m512i| {
+            let out = out as *mut __m512i;
+            _mm512_storeu_si512(out, _mm512_permutex2var_epi64(lo_e, il_lo, hi_e));
+            _mm512_storeu_si512(out.add(1), _mm512_permutex2var_epi64(lo_e, il_hi, hi_e));
+            _mm512_storeu_si512(out.add(2), _mm512_permutex2var_epi64(lo_o, il_lo, hi_o));
+            _mm512_storeu_si512(out.add(3), _mm512_permutex2var_epi64(lo_o, il_hi, hi_o));
+        };
+        store(a_out, a_lo_e, a_hi_e, a_lo_o, a_hi_o);
+        store(b_out, b_lo_e, b_hi_e, b_lo_o, b_hi_o);
     }
 }
 
