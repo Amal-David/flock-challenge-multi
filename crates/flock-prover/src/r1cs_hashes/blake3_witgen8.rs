@@ -476,6 +476,73 @@ impl Drain8 {
         }
     }
 
+    /// `FLOCK_NO_RING128_WIN_GROUP=1` restores RING128's per-row interleave of
+    /// a window storeu with an NT stream. Default reconstitutes
+    /// [`dump_range_nt_win`]'s grouping: all eight window stores, then all
+    /// eight NT publishes, on each 16-word fused band.
+    fn ring128_win_group_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RING128_WIN_GROUP").is_none());
+        *ON
+    }
+
+    /// Fused RING128 band publisher: same bytes as
+    /// [`Self::publish_range`] with `win = Some(_)` and `nt = true`, different
+    /// store schedule. Window destinations and main `dst` are disjoint, so
+    /// issuing every window storeu of a 16-word pair before every NT stream
+    /// of that pair cannot change the published words. It does restore the
+    /// write-combining occupancy [`dump_range_nt_win`] was built around:
+    /// eight consecutive `stream_pair_v8`/`stream_v8` to `dst` are no longer
+    /// split by temporal window stores to a different allocation.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::publish_range`], with `win` owning eight
+    /// row-major `U32_PER_BLOCK`-word blocks disjoint from `dst` and `stage`.
+    #[inline(always)]
+    unsafe fn publish_range_win_grouped(
+        stage: *const V8,
+        dst: *mut u32,
+        win: *mut u32,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+        g0: usize,
+        g1: usize,
+    ) {
+        unsafe {
+            debug_assert_eq!(base_word % 8, 0);
+            debug_assert_eq!(ring_word % 8, 0);
+            debug_assert_eq!(words % 16, 0);
+            for off in (0..words).step_by(16) {
+                let lo_rows = tr8_chunk(stage, ring_word + off);
+                let hi_rows = tr8_chunk(stage, ring_word + off + 8);
+                let abs_word = base_word + off;
+                let g = abs_word / 8;
+                let lo_live = g >= g0 && g < g1;
+                let hi_live = g + 1 >= g0 && g + 1 < g1;
+                // Window first, every row of this pair — dump_range_nt_win.
+                for r in 0..8 {
+                    let p = win.add(r * U32_PER_BLOCK + abs_word);
+                    store_v8(p, lo_rows[r]);
+                    store_v8(p.add(8), hi_rows[r]);
+                }
+                if lo_live && hi_live {
+                    for r in 0..8 {
+                        stream_pair_v8(dst.add(r * U32_PER_BLOCK + abs_word), lo_rows[r], hi_rows[r]);
+                    }
+                } else if lo_live {
+                    for r in 0..8 {
+                        stream_v8(dst.add(r * U32_PER_BLOCK + abs_word), lo_rows[r]);
+                    }
+                } else if hi_live {
+                    for r in 0..8 {
+                        stream_v8(dst.add(r * U32_PER_BLOCK + abs_word + 8), hi_rows[r]);
+                    }
+                }
+            }
+        }
+    }
+
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
@@ -505,12 +572,24 @@ impl Drain8 {
                     } else {
                         DUMP_CHUNKS
                     };
-                    Self::publish_range(
-                        self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
-                    );
-                    Self::publish_range(
-                        self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
-                    );
+                    // Ranked fused path: restore dump_range_nt_win grouping
+                    // on each RING128 16-word band. Kill switch keeps the
+                    // RING128 per-row interleave byte-identical in schedule.
+                    if Self::ring128_win_group_enabled() {
+                        Self::publish_range_win_grouped(
+                            self.ast, self.a, win_a, base_word, ring_word, words, 0, a_g1,
+                        );
+                        Self::publish_range_win_grouped(
+                            self.bs, self.b, win_b, base_word, ring_word, words, b_g0, b_g1,
+                        );
+                    } else {
+                        Self::publish_range(
+                            self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
+                        );
+                        Self::publish_range(
+                            self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
+                        );
+                    }
                 }
                 None => {
                     let a_g1 = if self.elide[1] {
@@ -978,6 +1057,60 @@ mod tests {
                 _mm256_storeu_si256(b.as_mut_ptr().cast(), back[i]);
                 assert_eq!(a, b, "tr8² row {i}");
             }
+        }
+    }
+
+    /// Byte identity of the RING128 fused schedule reconstitution: window-then-NT
+    /// grouping vs the per-row interleave, including a half-live pair (g0/g1
+    /// cutting the 16-word band) so both `stream_pair_v8` and the single-chunk
+    /// arms run. `_mm_sfence` before reading `dst` because those stores are NT.
+    #[test]
+    fn ring128_win_group_matches_interleave_bytes() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe { ring128_win_group_check() }
+    }
+
+    unsafe fn ring128_win_group_check() {
+        unsafe {
+            const WORDS: usize = 32;
+            let mut stage = vec![super::dup_u32(0); super::RING_WORDS];
+            for w in 0..WORDS {
+                stage[w] = _mm256_set1_epi32((0xA000 + w as i32) * 17);
+            }
+            let blocks = 8 * super::U32_PER_BLOCK;
+            let mut dst_a = vec![0u32; blocks];
+            let mut dst_b = vec![0u32; blocks];
+            let mut win_a = vec![0u32; blocks];
+            let mut win_b = vec![0u32; blocks];
+            // Elide the first 4 chunks (b prefix) and keep a live tail past 16.
+            let g0 = 4;
+            let g1 = 6;
+            super::Drain8::publish_range(
+                stage.as_ptr(),
+                dst_a.as_mut_ptr(),
+                Some(win_a.as_mut_ptr()),
+                0,
+                0,
+                WORDS,
+                g0,
+                g1,
+                true,
+            );
+            super::Drain8::publish_range_win_grouped(
+                stage.as_ptr(),
+                dst_b.as_mut_ptr(),
+                win_b.as_mut_ptr(),
+                0,
+                0,
+                WORDS,
+                g0,
+                g1,
+            );
+            _mm_sfence();
+            assert_eq!(win_a, win_b, "window bytes drifted");
+            assert_eq!(dst_a, dst_b, "NT dst bytes drifted");
         }
     }
 }
