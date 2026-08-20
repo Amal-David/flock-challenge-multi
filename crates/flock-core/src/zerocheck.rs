@@ -137,6 +137,22 @@ pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Test-only forced-off latches for cascade levels 5..9 (rounds 13+14 through
+/// 21+22). All ship on; the latches let the transcript-identity test force
+/// them off to prove the deeper chain emits the same bytes either way.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE6_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE7_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE8_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE9_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 
 /// `FLOCK_NO_ZC_CASCADE4=1` stops the cascade after rounds 7+8 (the incumbent
 /// frontier behavior); the default runs one more composed pass over rounds
@@ -167,6 +183,51 @@ fn cascade5_off() -> bool {
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
 }
+
+/// Deeper cascade levels 5..11 (rounds 13+14 through 25+26) ship on. The
+/// parity weights r[k_skip+11..k_skip+23] are sampled slots (non-zero w.p.
+/// 1−2⁻¹²⁸), and the n_mlv floor (≥ 14, 16, 18, 20, 22, 24, 26) keeps the
+/// composed input at 2^(n_mlv−2L) ≥ 16 — the same margin rule as the shipped
+/// levels 3 and 4. Each level deletes two tail iterations (their DRAM passes
+/// and one FS round boundary), exactly like the shallower levels.
+/// `FLOCK_NO_ZC_CASCADE6..11=1` restore the shorter chain (same-binary A/B).
+#[inline]
+fn cascade6_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE6_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE6").is_some()
+}
+
+#[inline]
+fn cascade7_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE7_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE7").is_some()
+}
+
+#[inline]
+fn cascade8_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE8_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE8").is_some()
+}
+
+#[inline]
+fn cascade9_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE9_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE9").is_some()
+}
+
+
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
@@ -822,19 +883,46 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    // Deeper chain: levels 5..11 (rounds 13+14 through 25+26) carry the same
+    // deferred-quadratic machinery to the end of the tail. At the ranked shape
+    // (n_mlv = 26) every level ships, turning each pair of tail iterations
+    // into a composed pass and deleting its FS round boundary — the last
+    // remaining plain tail iterations at the ranked shape are n4 and n2. The
+    // n_mlv floor for level L is 2L+4 (level 5 needs ≥ 14, level 6 ≥ 16, ...,
+    // level 11 ≥ 26), keeping the composed input at 2^(n_mlv−2L) ≥ 16 with
+    // the same margin as the shipped levels. Parity weights r[k_skip+11] ..
+    // r[k_skip+23] are sampled slots (non-zero w.p. 1−2⁻¹²⁸), so the chain
+    // effectively always continues; a zero weight stops it one level early
+    // and the incumbent tail picks up, exactly like the shallower levels.
+    let use_cascade6 =
+        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO && !cascade6_off();
+    let use_cascade7 =
+        use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO && !cascade7_off();
+    let use_cascade8 =
+        use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO && !cascade8_off();
+    let use_cascade9 =
+        use_cascade8 && n_mlv >= 20 && r[k_skip + 17] != F128::ZERO && !cascade9_off();
     let n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
         use_cascade4,
         use_cascade5,
+        use_cascade6,
+        use_cascade7,
+        use_cascade8,
+        use_cascade9,
     ) {
         (false, ..) => 0,
         (true, false, ..) => 1,
         (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+        (true, true, true, false, ..) => 3,
+        (true, true, true, true, false, ..) => 4,
+        (true, true, true, true, true, false, ..) => 5,
+        (true, true, true, true, true, true, false, ..) => 6,
+        (true, true, true, true, true, true, true, false, _) => 7,
+        (true, true, true, true, true, true, true, true, false) => 8,
+        (true, true, true, true, true, true, true, true, true) => 9,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -1328,6 +1416,10 @@ mod tests {
             (17, false),
             (18, false),
             (19, false),
+            (20, false),
+            (22, false),
+            (24, false),
+            (26, false),
             (17, true),
             (18, true),
         ] {
@@ -1353,20 +1445,29 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
-            // nomat) forced-off flags.
+            // Arms: (lookahead, cascade2..7, nomat) forced-off flags.
             let arms = [
-                (false, false, false, false, false, false), // full: nomat sweep + every level
-                (false, false, false, false, false, true),  // materializing sweep + every level
-                (false, false, false, false, true, false),  // cascade capped at level 3
-                (false, false, false, true, true, false),   // capped at level 2 (frontier)
-                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
-                (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true),      // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),       // incumbent
+                // (la, c2, c3, c4, c5, c6, c7, nm)
+                (false, false, false, false, false, false, false, false), // full: nomat + every level
+                (false, false, false, false, false, false, false, true),  // materializing sweep + every level
+                (false, false, false, false, false, false, true, false),  // cascade capped at level 5
+                (false, false, false, false, true, true, true, false),    // capped at level 4
+                (false, false, false, true, true, true, true, false),     // capped at level 3 (frontier)
+                (false, false, true, true, true, true, true, false),      // nomat + lookahead + cascade2
+                (false, true, true, true, true, true, true, false),       // nomat + lookahead only
+                (false, true, true, true, true, true, true, true),        // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true, true, true),         // incumbent
             ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 12 {
+            let all = if n_mlv >= 20 {
+                9
+            } else if n_mlv >= 18 {
+                8
+            } else if n_mlv >= 16 {
+                7
+            } else if n_mlv >= 14 {
+                6
+            } else if n_mlv >= 12 {
                 5
             } else if n_mlv >= 10 {
                 4
@@ -1380,6 +1481,7 @@ mod tests {
             let expect_levels = [
                 all,
                 all,
+                all.min(6),
                 all.min(4),
                 all.min(3),
                 all.min(2),
@@ -1387,14 +1489,18 @@ mod tests {
                 1,
                 0,
             ];
-            let expect_nomat = [true, false, true, true, true, true, false, false];
+            let expect_nomat = [true, false, true, true, true, true, true, false, false];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, c6_off, c7_off, nm_off)) in
+                arms.iter().enumerate()
+            {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
                 ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
+                ZC_CASCADE6_FORCED_OFF.store(c6_off, Ordering::Relaxed);
+                ZC_CASCADE7_FORCED_OFF.store(c7_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1414,6 +1520,8 @@ mod tests {
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE6_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE7_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];

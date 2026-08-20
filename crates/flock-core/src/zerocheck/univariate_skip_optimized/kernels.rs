@@ -176,6 +176,8 @@ pub(super) fn shift_reduce_inner_ab(
     b_col: &mut [F8],
     bstatic: BstaticHint,
     nt: u8,
+    plan: ShiftReducePlan,
+    imgs: (*const u8, *const u8),
 ) {
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -183,7 +185,7 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512f",
         target_feature = "avx512bw"
     )))]
-    let _ = (bstatic, nt);
+    let _ = (bstatic, nt, plan, imgs);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -223,7 +225,7 @@ pub(super) fn shift_reduce_inner_ab(
                     return;
                 }
             }
-            x86_64::shift_reduce_inner_ab_x86_avx512(
+            x86_64::shift_reduce_inner_ab_x86_avx512_prepared(
                 a_packed,
                 b_packed,
                 inv_table,
@@ -231,6 +233,10 @@ pub(super) fn shift_reduce_inner_ab(
                 b_med,
                 out,
                 nt,
+                plan.img2,
+                plan.pidx,
+                plan.offw,
+                imgs,
             );
         }
     }
@@ -351,6 +357,8 @@ pub(super) fn shift_reduce_inner_ab_at(
             &mut b_col,
             None,
             nt,
+            prepared,
+            imgs,
         );
     }
 }
@@ -373,10 +381,12 @@ pub(super) fn shift_reduce_inner_ab_x2(
     b_col: &mut [F8],
     bstatic: BstaticHint,
     nt: u8,
+    plan: ShiftReducePlan,
+    imgs: (*const u8, *const u8),
 ) {
     #[cfg(target_arch = "aarch64")]
     {
-        let _ = (a_col, b_col, bstatic, nt);
+        let _ = (a_col, b_col, bstatic, nt, plan, imgs);
         aarch64::shift_reduce_inner_ab_fused_neon_x2(
             a_packed,
             b_packed,
@@ -390,6 +400,13 @@ pub(super) fn shift_reduce_inner_ab_x2(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )))]
+        let _ = (plan, imgs);
         shift_reduce_inner_ab(
             a_packed,
             b_packed,
@@ -401,6 +418,8 @@ pub(super) fn shift_reduce_inner_ab_x2(
             b_col,
             bstatic,
             nt,
+            plan,
+            imgs,
         );
         shift_reduce_inner_ab(
             a_packed,
@@ -413,6 +432,8 @@ pub(super) fn shift_reduce_inner_ab_x2(
             b_col,
             bstatic,
             nt,
+            plan,
+            imgs,
         );
     }
 }
