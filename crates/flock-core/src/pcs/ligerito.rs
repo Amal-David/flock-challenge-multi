@@ -2712,6 +2712,21 @@ pub(crate) fn induce_sched_enabled() -> bool {
     *ON
 }
 
+/// Ranked default computes the dense arm's `eval_sk_at_vks` table INSIDE
+/// [`induce_sumcheck_poly_auto`]'s dense arm instead of eagerly at the call
+/// sites: the Fᵀ-NTT arm never reads it, and both ranked prover sites that
+/// can take the NTT arm were paying the O(log²) serial GHASH chain (plus an
+/// allocation) inside the Fiat–Shamir critical path for a table that was
+/// then dropped unread. Bit-identical output: the same table is built from
+/// the same `log_msg_cols` whenever the dense arm actually runs.
+/// `FLOCK_NO_INDUCE_LAZY_SKS=1` restores the eager call-site computation.
+/// Read once per process; default ON.
+fn induce_lazy_sks_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_INDUCE_LAZY_SKS").is_none());
+    *ON
+}
+
 /// Crossover constant `C` in the [`induce_sumcheck_poly_auto`] dispatch rule
 /// `n_queries > C · 2^log_inv_rate · log_block`.
 ///
@@ -2725,10 +2740,14 @@ fn induce_ntt_crossover_c() -> usize {
     if induce_sched_enabled() { 1 } else { 4 }
 }
 
+/// `sks_vks` feeds ONLY the dense arm (the Fᵀ-NTT arm never reads it); pass
+/// `None` to have the dense arm build the table itself when — and only
+/// when — it is actually taken. `Some` keeps the caller's precomputed table
+/// (the incumbent shape, and the `FLOCK_NO_INDUCE_LAZY_SKS` rollback).
 pub(crate) fn induce_sumcheck_poly_auto(
     log_msg_cols: usize,
     log_inv_rate: usize,
-    sks_vks: &[F128],
+    sks_vks: Option<&[F128]>,
     opened_rows: &[Vec<F128>],
     v_challenges: &[F128],
     queries: &[usize],
@@ -2747,6 +2766,14 @@ pub(crate) fn induce_sumcheck_poly_auto(
             alpha,
         )
     } else {
+        let computed;
+        let sks_vks = match sks_vks {
+            Some(table) => table,
+            None => {
+                computed = eval_sk_at_vks(log_msg_cols);
+                &computed
+            }
+        };
         induce_sumcheck_poly(
             log_msg_cols,
             sks_vks,
@@ -2831,6 +2858,19 @@ fn transpose_forward_ntt_window_dense(
     (w, buf)
 }
 
+/// Ranked default skips the singleton window buffer's zero-fill (every slot
+/// is written exactly once before any read — see the buffer comment in
+/// [`transpose_forward_ntt_window_singleton`]). Identical output bytes: the
+/// zeroed slots were never read. `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores
+/// the incumbent `vec![F128::ZERO; _]` for exact same-binary A/B. Read once
+/// per process; default ON.
+fn singleton_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_SINGLETON_UNINIT").is_none()
+    });
+    *ON
+}
+
 /// Expand one nonzero at local index `p` through the window's `k` transpose
 /// layers. Before layer `s`, only one `2^s` half can be live; either source
 /// orientation produces the same top half (`current`) and a bottom half
@@ -2846,7 +2886,17 @@ fn transpose_forward_ntt_window_singleton(
 ) -> (usize, Vec<F128>) {
     assert!(k > 0 && k <= log_d);
     assert!(p < 1usize << k);
-    let mut buf = vec![F128::ZERO; 1usize << k];
+    // Every slot is written exactly once before any read: slot 0 here, and
+    // step `s` writes exactly `buf[2^s..2^(s+1)]` (both expansion arms below
+    // WRITE the product — they never load/accumulate the destination), so
+    // the zero-fill is dead work: 4 KiB of kernel memset per window at the
+    // ranked `k = 8`, ~213 active windows per L0 induce.
+    // `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores the zeroing for A/B.
+    let mut buf = if singleton_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(1usize << k)
+    } else {
+        vec![F128::ZERO; 1usize << k]
+    };
     buf[0] = value;
     let mut len = 1usize;
     for s in 0..k {
@@ -2859,8 +2909,10 @@ fn transpose_forward_ntt_window_singleton(
         let (current, rest) = buf[..2 * len].split_at_mut(len);
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
         // SAFETY: target features are cfg-guaranteed and the two halves have
-        // equal length. `rest` is freshly zeroed, so write the product
-        // directly rather than load/XOR/store through `add_scaled`.
+        // equal length. The kernel WRITES the product into `rest` (never
+        // loads it), which both upholds `alloc_uninit_vec`'s
+        // write-before-read contract and avoids the load/XOR/store an
+        // `add_scaled` into zeroed memory would pay.
         unsafe {
             eq_expand_block_x4(&mut rest[..len], current, scale)
         }
@@ -5702,6 +5754,54 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+#[inline]
+fn direct_fold8_f_packed64_selected(
+    packed_len: usize,
+    out_len: usize,
+    spr_capable: bool,
+    disabled: bool,
+) -> bool {
+    spr_capable
+        && !disabled
+        && packed_len == (1usize << 25)
+        && out_len == (1usize << 19)
+}
+
+#[inline]
+fn direct_fold8_f_packed64_enabled(packed_len: usize, out_len: usize) -> bool {
+    // Ranked-only until an SPR run establishes a win. The kill arm provides
+    // a same-binary A/B against the incumbent fold16 -> fold4 materializer.
+    direct_fold8_f_packed64_selected(
+        packed_len,
+        out_len,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os("FLOCK_NO_FOLD8_F_PACKED64").is_some(),
+    )
+}
+
+#[inline]
+fn direct_fold64_weights(challenges: [F128; 6]) -> [F128; 64] {
+    let mut weights = [F128::ZERO; 64];
+    weights[0] = F128::ONE;
+    let mut active = 1usize;
+    for challenge in challenges {
+        for bank in 0..active {
+            // Characteristic two: base·(1+r) = base + base·r. Thus each
+            // challenge doubles the table with one product per old entry.
+            let high = weights[bank] * challenge;
+            weights[bank + active] = high;
+            weights[bank] += high;
+        }
+        active *= 2;
+    }
+    weights
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5720,18 +5820,29 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+    let out_len = packed_witness.len() / 64;
+    let f_packed64_on = direct_fold8_f_packed64_enabled(packed_witness.len(), out_len);
     let [r0, r1, r2, r3, r4, r5] = challenges;
-    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges[..4].iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    let fold16_weight: [F128; 16] = if f_packed64_on {
+        [F128::ZERO; 16]
+    } else {
+        std::array::from_fn(|bank| {
+            let mut weight = F128::ONE;
+            for (bit, &challenge) in challenges[..4].iter().enumerate() {
+                weight *= if (bank >> bit) & 1 == 0 {
+                    F128::ONE + challenge
+                } else {
+                    challenge
+                };
+            }
+            weight
+        })
+    };
+    let fold64_weight = if f_packed64_on {
+        direct_fold64_weights(challenges)
+    } else {
+        [F128::ZERO; 64]
+    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5758,7 +5869,6 @@ fn materialize_direct_fold8(
         })
         .collect();
 
-    let out_len = packed_witness.len() / 64;
     let block_len = claims[0].eq_lo.len();
     assert!(block_len.is_multiple_of(4));
     // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
@@ -5808,7 +5918,14 @@ fn materialize_direct_fold8(
                         }
                     ],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
+                    vec![
+                        F128::ZERO;
+                        if f_packed64_on && !has_ordinary {
+                            0
+                        } else {
+                            4 * SUB
+                        }
+                    ],
                     vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
                 )
             },
@@ -5821,31 +5938,54 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                // Ranked SPR: consume all sixty-four native adjacent banks
+                // directly, with four different bank weights in each ZMM.
+                // This removes both the global four-value intermediate and
+                // the bank-to-output lane transposes. The fallback remains
+                // the deferred-reduction fold16 followed by nested fold4.
+                if f_packed64_on {
+                    crate::field::f128_slice::fold64_packed_banks(
+                        f_in,
+                        f_out,
+                        &fold64_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
-                        crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
-                        );
+                }
+                if !f_packed64_on || has_ordinary {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        if !f_packed64_on {
+                            crate::field::f128_slice::fold16_banked(
+                                &f_in[64 * slot..64 * (slot + n)],
+                                m4,
+                                &fold16_weight,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut f_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)],
+                                m16,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4,
+                                &mut b_out[slot..slot + n],
+                                r4,
+                                r5,
+                            );
+                        }
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -6280,6 +6420,55 @@ impl SumcheckProver {
 /// Sample `count` distinct positions in `[0, block_len)` via the challenger.
 /// Asserts `count <= block_len` — otherwise no number of samples could satisfy
 /// the distinctness requirement (would infinite-loop).
+/// Ranked default parallelizes the query-phase gathers — the opened-row
+/// copies and the Merkle multi-proof sibling reads. Both are random-access
+/// walks over DRAM-cold structures (the 1 GiB L0 codeword and 64 MiB L0 tree
+/// were written a full commit + zerocheck + lincheck earlier; each deeper
+/// level's tree is bigger than L2) that run alone on the Fiat–Shamir chain
+/// between the query sample and the induce — serial, latency-bound, with 15
+/// of 16 ranked cores idle. Width cannot change wire bytes: both gathers are
+/// pure reads producing an output whose order is fixed by index arithmetic
+/// alone, and the indexed parallel collects preserve that order exactly.
+/// Read once per process. `FLOCK_NO_SERIAL_PAR=1` restores the exact
+/// incumbent sequential gathers (shared switch — see
+/// [`crate::serial_par_enabled`]).
+fn serial_par_enabled() -> bool {
+    crate::serial_par_enabled()
+}
+
+/// Work floor (total F128 copied) below which the opened-row gather stays on
+/// the sequential path: tiny gathers (deep levels of test geometries) are
+/// below rayon dispatch break-even.
+const ROW_GATHER_PAR_MIN_ELEMS: usize = 512;
+
+/// Copy the queried codeword rows, in query order. `par` selects an
+/// order-preserving indexed parallel map (bit-identical to the sequential
+/// map: each row copy is a pure function of its own query index); `false` is
+/// the incumbent sequential gather, kept verbatim as the kill-switch path
+/// and the byte-identity oracle.
+fn gather_opened_rows<'a, F>(queries: &[usize], row: F, par: bool) -> Vec<Vec<F128>>
+where
+    F: Fn(usize) -> &'a [F128] + Sync,
+{
+    use rayon::prelude::*;
+    let row_len = queries.first().map_or(0, |&q| row(q).len());
+    if par && queries.len() * row_len >= ROW_GATHER_PAR_MIN_ELEMS {
+        queries.par_iter().map(|&q| row(q).to_vec()).collect()
+    } else {
+        queries.iter().map(|&q| row(q).to_vec()).collect()
+    }
+}
+
+/// Sibling-count floor below which the multi-proof gather stays on the
+/// incumbent single-pass walk (index walk + parallel gather costs a rayon
+/// dispatch; tiny test trees don't earn it).
+const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
+
+/// One rayon task per this many sibling gathers: each gather is a single
+/// (usually cold) 32-byte tree read, so a task is ~64 line fills — big
+/// enough to amortize dispatch, small enough to spread the misses wide.
+const MULTIPROOF_PAR_CHUNK: usize = 64;
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -6304,6 +6493,33 @@ fn sample_distinct_queries<Ch: Challenger>(
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
+    multi_proof_gather(tree, block_len, queries, serial_par_enabled())
+}
+
+/// Multi-proof body. `par` splits the incumbent walk into its two halves —
+/// a pure index walk (integer arithmetic, no tree reads) followed by an
+/// order-preserving parallel gather of the sibling hashes — which emits the
+/// exact bytes of the fused sequential walk (see
+/// [`merkle::merkle_multi_proof_sibling_indices`]); `false` is the incumbent
+/// single-pass walk, kept verbatim as the kill-switch path and the
+/// byte-identity oracle.
+fn multi_proof_gather(
+    tree: &[Hash],
+    block_len: usize,
+    queries: &[usize],
+    par: bool,
+) -> Vec<Hash> {
+    use rayon::prelude::*;
+    if par {
+        let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+        if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
+            return indices
+                .par_iter()
+                .with_min_len(MULTIPROOF_PAR_CHUNK)
+                .map(|&i| tree[i])
+                .collect();
+        }
+    }
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
@@ -7057,7 +7273,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> =
+        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -7078,13 +7295,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
-    // levels stay dense).
-    let sks_vks_n1 = eval_sk_at_vks(n1);
+    // levels stay dense). The dense arm's `sks_vks` table is built inside the
+    // dispatcher only when that arm is taken (see [`induce_lazy_sks_enabled`]).
+    let sks_vks_n1 = if induce_lazy_sks_enabled() {
+        None
+    } else {
+        Some(eval_sk_at_vks(n1))
+    };
     let _t = std::time::Instant::now();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        &sks_vks_n1,
+        sks_vks_n1.as_deref(),
         &opened_rows_0,
         &r_lane_fold,
         &queries_0,
@@ -7158,10 +7380,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = gather_opened_rows(
+                &queries_last,
+                |q| wtns_prev.row(q),
+                serial_par_enabled(),
+            );
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -7300,10 +7523,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(
+            &queries_i,
+            |q| wtns_prev.row(q),
+            serial_par_enabled(),
+        );
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
@@ -7319,7 +7543,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             });
         }
 
-        let sks_vks_i = eval_sk_at_vks(n_next);
+        // The dispatcher builds the dense arm's table itself on the lazy
+        // path (see [`induce_lazy_sks_enabled`]); the sched-disabled arm
+        // below always runs dense and so always needs it eagerly.
+        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
+            None
+        } else {
+            Some(eval_sk_at_vks(n_next))
+        };
         let _t = std::time::Instant::now();
         // `n_next` is exactly wtns_prev's message-column count and
         // `log_inv_rates[i+1]` its rate, so the same dense-vs-Fᵀ-NTT cost
@@ -7330,7 +7561,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             induce_sumcheck_poly_auto(
                 n_next,
                 config.log_inv_rates[i + 1],
-                &sks_vks_i,
+                sks_vks_i.as_deref(),
                 &opened_rows_i,
                 &level_rs,
                 &queries_i,
@@ -7339,7 +7570,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             induce_sumcheck_poly(
                 n_next,
-                &sks_vks_i,
+                sks_vks_i
+                    .as_deref()
+                    .expect("sched-disabled induce always precomputes sks_vks"),
                 &opened_rows_i,
                 &level_rs,
                 &queries_i,
@@ -8108,7 +8341,7 @@ pub fn recursive_verifier_with_basis<Ch: Challenger>(
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        &sks_vks_n1,
+        Some(&sks_vks_n1),
         &proof.initial_proof.opened_rows,
         &r_lane_fold,
         &queries_0,
@@ -8463,7 +8696,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        &sks_vks_n1,
+        Some(&sks_vks_n1),
         &opened_rows_0,
         &v_challenges_0,
         &queries_0,
@@ -8705,7 +8938,7 @@ pub fn recursive_verifier<Ch: Challenger>(
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
-        &sks_vks_n1,
+        Some(&sks_vks_n1),
         &proof.initial_proof.opened_rows,
         &eval_point[..initial_k],
         &queries_0,
@@ -8931,6 +9164,136 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gated parallel query-phase gathers must match the sequential
+    /// oracles bit-for-bit — the opened rows against the incumbent
+    /// `iter().map(to_vec)` gather, the multi-proof against the incumbent
+    /// fused `merkle_multi_proof` walk — and a corrupted source must be
+    /// caught by both routes.
+    #[test]
+    fn query_phase_gathers_match_sequential_oracles() {
+        let mut state = 0x9A7B_5EED_F00D_u64;
+        let mut random_u64 = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        // Ranked-L0-like shape (218 queries, wide rows, deep tree — both
+        // gathers above their par floors) plus a tiny shape (below both
+        // floors — the par route must fall back and still match).
+        for &(log_leaves, n_queries, row_len) in
+            &[(12usize, 218usize, 64usize), (4, 3, 2)]
+        {
+            let num_leaves = 1usize << log_leaves;
+            let mut tree: Vec<Hash> = Vec::with_capacity(2 * num_leaves - 1);
+            for _ in 0..(2 * num_leaves - 1) {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&random_u64().to_le_bytes());
+                h[8..16].copy_from_slice(&random_u64().to_le_bytes());
+                tree.push(h);
+            }
+            let codeword: Vec<F128> = (0..num_leaves * row_len)
+                .map(|_| F128::new(random_u64(), random_u64()))
+                .collect();
+            let mut queries: Vec<usize> = (0..n_queries)
+                .map(|_| random_u64() as usize % num_leaves)
+                .collect();
+            queries.sort_unstable();
+            queries.dedup();
+
+            let row = |q: usize| &codeword[q * row_len..(q + 1) * row_len];
+            let rows_seq = gather_opened_rows(&queries, row, false);
+            let rows_par = gather_opened_rows(&queries, row, true);
+            assert_eq!(rows_par, rows_seq, "rows log_leaves={log_leaves}");
+
+            let proof_seq = multi_proof_gather(&tree, num_leaves, &queries, false);
+            let proof_par = multi_proof_gather(&tree, num_leaves, &queries, true);
+            assert_eq!(proof_par, proof_seq, "multi-proof log_leaves={log_leaves}");
+            assert_eq!(
+                proof_seq,
+                merkle::merkle_multi_proof(&tree, num_leaves, &queries),
+                "sequential arm drifted from the merkle oracle"
+            );
+
+            // Negative controls: a corrupted codeword row and a corrupted
+            // emitted sibling must both reach the parallel outputs.
+            let mut bad_codeword = codeword.clone();
+            bad_codeword[queries[0] * row_len] += F128::ONE;
+            let bad_row = |q: usize| &bad_codeword[q * row_len..(q + 1) * row_len];
+            assert_ne!(
+                gather_opened_rows(&queries, bad_row, true),
+                rows_seq,
+                "corrupted row went undetected log_leaves={log_leaves}"
+            );
+            let sibling_indices =
+                merkle::merkle_multi_proof_sibling_indices(num_leaves, &queries);
+            assert!(!sibling_indices.is_empty());
+            let mut bad_tree = tree.clone();
+            bad_tree[sibling_indices[0]][0] ^= 1;
+            assert_ne!(
+                multi_proof_gather(&bad_tree, num_leaves, &queries, true),
+                proof_seq,
+                "corrupted sibling went undetected log_leaves={log_leaves}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_fold8_f_packed64_selector_is_ranked_shape_only() {
+        let ranked_in = 1usize << 25;
+        let ranked_out = 1usize << 19;
+        assert!(direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, false, false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in, ranked_out, true, true
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in / 2,
+            ranked_out,
+            true,
+            false
+        ));
+        assert!(!direct_fold8_f_packed64_selected(
+            ranked_in,
+            ranked_out / 2,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn direct_fold64_weights_match_six_adjacent_pair_folds() {
+        let mut state = 0xD1CE_F064_5EED_0001u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F128::new(state, state.rotate_left(29))
+        };
+        for _ in 0..17 {
+            let challenges = std::array::from_fn(|_| random());
+            let weights = direct_fold64_weights(challenges);
+            let src: Vec<F128> = (0..64).map(|_| random()).collect();
+            let weighted = src
+                .iter()
+                .zip(weights)
+                .map(|(&value, weight)| value * weight)
+                .fold(F128::ZERO, |acc, product| acc + product);
+
+            let mut state = src;
+            for challenge in challenges {
+                let mut next = vec![F128::ZERO; state.len() / 2];
+                crate::field::f128_slice::fold_pairs(&state, 0, &mut next, challenge);
+                state = next;
+            }
+            assert_eq!(state, vec![weighted]);
+        }
+    }
 
     #[test]
     fn direct_ab_materialization_matches_full_basis_oracle() {
