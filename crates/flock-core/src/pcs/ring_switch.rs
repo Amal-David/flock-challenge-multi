@@ -5143,6 +5143,28 @@ mod tests {
         }
     }
 
+    /// The open-phase materializers hand `compose_block_table` a RECYCLED
+    /// buffer (see `crate::scratch::LocalBuf`), so its documented
+    /// write-before-read contract has to hold against arbitrary stale bytes,
+    /// not just against zeros. Composing into a dirty buffer must reproduce
+    /// the allocating form's output exactly.
+    #[test]
+    fn compose_block_table_ignores_stale_contents() {
+        let mut rng = Rng::new(0x5C_2A_7C_40_1D);
+        for trial in 0..4 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_direct_fold8_table_from_generators(&generators);
+            let e_hi = rng.f128();
+            // The allocating form: a freshly zeroed buffer.
+            let mut zeroed = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+            compose_block_table(&base, e_hi, &mut zeroed);
+            // The pooled form: whatever an earlier job left behind.
+            let mut dirty: Vec<F128> = (0..FOLD_TABLE_TOTAL).map(|_| rng.f128()).collect();
+            compose_block_table(&base, e_hi, &mut dirty);
+            assert_eq!(dirty, zeroed, "trial {trial}");
+        }
+    }
+
     /// Parallel one-mul doubling is bit-identical to the two-GHASH formula.
     #[test]
     fn build_eq_parallel_matches_two_mul() {

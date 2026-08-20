@@ -283,14 +283,213 @@ pub fn prewarm_prover(m: usize) {
     }
 }
 
-/// Release every pooled buffer back to the OS.
+/// Release every pooled buffer back to the OS. The per-thread free lists
+/// behind [`LocalBuf`] are unreachable from here and are unaffected; they
+/// retain at most a few tens of KiB per worker thread.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread recycler for small per-job working buffers.
+// ---------------------------------------------------------------------------
+
+/// `FLOCK_NO_PCS_FOLD_BUF_POOL=1` restores the incumbent per-job
+/// `vec![F128::ZERO; n]` for the rayon `map_init` working buffers of the PCS
+/// open-phase folds — allocate, zero, use, free, once per job. Resolved once
+/// per process; the OFF arm is the exact-values oracle for the pooled arm
+/// (every one of those buffers is written before it is read, so the zero fill
+/// is dead and the recycled stale bytes are never observed).
+pub(crate) fn fold_buf_pool_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PCS_FOLD_BUF_POOL").is_none());
+    *ON
+}
+
+thread_local! {
+    /// Free list of buffers released by [`LocalBuf`] on this thread.
+    static LOCAL_POOL: std::cell::RefCell<Vec<Vec<F128>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take a length-`n` buffer from this thread's free list, or allocate one.
+///
+/// [`take_f128`]'s pool is the wrong shape for per-job working buffers: it is
+/// one process-wide mutex holding at most [`MAX_POOLED`] entries sized for the
+/// prove's multi-MB vectors, and it evicts the SMALLEST entry on overflow — so
+/// 16–64 KiB job buffers would be evicted about as fast as they are returned,
+/// while taking the lock once per job on every worker. This list is
+/// thread-local: no synchronization, and its size is bounded by what one
+/// thread actually holds concurrently.
+///
+/// Contents are UNINITIALIZED (stale bytes from an earlier job) — same
+/// write-before-read contract as [`take_f128`].
+#[inline(never)]
+fn take_local_f128(n: usize) -> Vec<F128> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let hit = LOCAL_POOL
+        .try_with(|p| {
+            let mut p = p.borrow_mut();
+            let mut best: Option<usize> = None;
+            for (i, v) in p.iter().enumerate() {
+                if v.capacity() < n {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some(b) => v.capacity() < p[b].capacity(),
+                };
+                if better {
+                    best = Some(i);
+                }
+            }
+            best.map(|i| p.swap_remove(i))
+        })
+        .ok()
+        .flatten();
+    match hit {
+        Some(mut v) => {
+            v.clear();
+            // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
+            // exposing stale elements is sound to *hold* — the caller upholds
+            // write-before-read per this function's contract.
+            unsafe { v.set_len(n) };
+            v
+        }
+        None => crate::alloc_uninit_vec::<F128>(n),
+    }
+}
+
+/// Return a buffer to this thread's free list. Dropped instead if the
+/// thread-local is already destroyed (thread teardown).
+#[inline(never)]
+fn give_local_f128(v: Vec<F128>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let _ = LOCAL_POOL.try_with(|p| p.borrow_mut().push(v));
+}
+
+/// One `F128` working buffer held for the lifetime of a rayon job.
+///
+/// Pooled (the default): the buffer comes from this thread's free list and
+/// goes back on drop, so a worker allocates each size once per process
+/// instead of once per job. Unpooled (the kill switch): a freshly zeroed
+/// `Vec` that is freed on drop — the incumbent behaviour, kept as the A/B
+/// oracle. Callers see `[F128]` either way and must write before they read.
+pub(crate) struct LocalBuf {
+    buf: Vec<F128>,
+    pooled: bool,
+}
+
+impl LocalBuf {
+    /// Never inlined: this runs once per rayon job, from inside the fold
+    /// loop. Inlining it would splice both arms' allocator code — the pooled
+    /// arm's fallback and the kill-switch arm's `vec![ZERO; n]` — into the
+    /// loop body, which is exactly the cost this type exists to remove.
+    #[inline(never)]
+    pub(crate) fn new(n: usize, pooled: bool) -> Self {
+        let buf = if pooled {
+            take_local_f128(n)
+        } else {
+            vec![F128::ZERO; n]
+        };
+        Self { buf, pooled }
+    }
+}
+
+impl std::ops::Deref for LocalBuf {
+    type Target = [F128];
+    #[inline(always)]
+    fn deref(&self) -> &[F128] {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for LocalBuf {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [F128] {
+        &mut self.buf
+    }
+}
+
+impl Drop for LocalBuf {
+    /// Never inlined, for the same reason as [`LocalBuf::new`]. Both arms
+    /// take the buffer out of `self`, so the compiler-generated field drop
+    /// that follows this call always sees an empty `Vec` and never reaches
+    /// its deallocator.
+    #[inline(never)]
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        if self.pooled {
+            give_local_f128(buf);
+        }
+        // Kill-switch arm: `buf` falls out of scope here, so the free happens
+        // in this outlined body rather than at the (in-loop) drop site.
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pooled arm must recycle one allocation per thread per size, and
+    /// the unpooled (kill-switch) arm must behave exactly like the
+    /// `vec![F128::ZERO; n]` it replaces.
+    #[test]
+    fn local_buf_recycles_and_kill_switch_allocates() {
+        // Pooled: the same allocation comes back, carrying stale bytes.
+        let mut a = LocalBuf::new(512, true);
+        let ptr = a.as_ptr();
+        for slot in a.iter_mut() {
+            *slot = F128 { lo: 5, hi: 6 };
+        }
+        drop(a);
+        let b = LocalBuf::new(512, true);
+        assert_eq!(
+            b.as_ptr(),
+            ptr,
+            "pooled take must reuse the released buffer"
+        );
+        assert_eq!(b.len(), 512);
+        assert!(
+            b.iter().all(|s| *s == F128 { lo: 5, hi: 6 }),
+            "pooled buffers are stale, never cleared"
+        );
+        drop(b);
+
+        // A shorter request reuses the same (larger) allocation.
+        let c = LocalBuf::new(64, true);
+        assert_eq!(c.as_ptr(), ptr);
+        assert_eq!(c.len(), 64);
+        drop(c);
+
+        // Unpooled: freshly zeroed every time, never entering the free list.
+        let d = LocalBuf::new(512, false);
+        assert!(d.iter().all(|s| *s == F128::ZERO));
+        drop(d);
+        // ...and the pooled buffer is still the one the free list holds.
+        let e = LocalBuf::new(512, true);
+        assert_eq!(e.as_ptr(), ptr);
+        drop(e);
+
+        // Zero-length buffers never touch the free list.
+        let z = LocalBuf::new(0, true);
+        assert!(z.is_empty());
+    }
+
+    /// Two buffers alive at once are distinct allocations — the invariant a
+    /// nested job on the same worker thread relies on.
+    #[test]
+    fn concurrently_live_local_bufs_never_alias() {
+        let a = LocalBuf::new(256, true);
+        let b = LocalBuf::new(256, true);
+        assert_ne!(a.as_ptr(), b.as_ptr());
+        drop(a);
+        drop(b);
+    }
 
     #[test]
     fn take_reuses_given_buffer() {

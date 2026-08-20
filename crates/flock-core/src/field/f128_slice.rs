@@ -258,6 +258,41 @@ mod tests {
         }
     }
 
+    /// The PCS open-phase materializers hand these two folds a RECYCLED
+    /// destination (`crate::scratch::LocalBuf`), so both must write every
+    /// output slot before reading it — the result may not depend on what an
+    /// earlier job left in the buffer. This is the identity check for the
+    /// `mid4` / `mid16` buffers of `materialize_direct_fold8` against the
+    /// zero-filled form the kill switch restores.
+    #[test]
+    fn folds_ignore_stale_destination_contents() {
+        use super::*;
+        let mut state = 0xD1_47_57_A1_E0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 4, 5, 64, 257] {
+            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let src16: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut zeroed = vec![F128::ZERO; n];
+            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            fold16_banked(&src16, &mut zeroed, &w);
+            fold16_banked(&src16, &mut dirty, &w);
+            assert_eq!(dirty, zeroed, "fold16_banked n={n}");
+
+            let (r0, r1) = (F128 { lo: next(), hi: next() }, F128 { lo: next(), hi: next() });
+            let src4: Vec<F128> = (0..4 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut zeroed = vec![F128::ZERO; n];
+            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            fold4_nested(&src4, &mut zeroed, r0, r1);
+            fold4_nested(&src4, &mut dirty, r0, r1);
+            assert_eq!(dirty, zeroed, "fold4_nested n={n}");
+        }
+    }
+
     /// AVX-512 (or portable) bind must match the scalar oracle at every
     /// ranked factor-state length plus a 4-element tail that misses the
     /// 8-output SIMD body.

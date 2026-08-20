@@ -4879,15 +4879,22 @@ fn materialize_direct_ab_fold2(
         .enumerate()
         .map_init(
             // Table-hot 2-claim keeps one 64 KiB composed table live per phase.
+            //
+            // Recycled through this thread's free list rather than allocated,
+            // zeroed and freed once per job: rayon calls this init once per
+            // leaf job, i.e. inside the fold loop, and every slot is written
+            // by `compose_block_table` before any read (which that function
+            // documents). `FLOCK_NO_PCS_FOLD_BUF_POOL=1` restores the
+            // allocating form.
             || {
-                vec![
-                    F128::ZERO;
+                crate::scratch::LocalBuf::new(
                     if claims.len() == 2 {
                         table_len
                     } else {
                         claims.len() * table_len
-                    }
-                ]
+                    },
+                    crate::scratch::fold_buf_pool_enabled(),
+                )
             },
             |scratch, (block, (b_out, f_out))| {
                 // Production 2-claim table-hot path composes inside each phase.
@@ -5948,19 +5955,28 @@ fn materialize_direct_fold8(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
+            // Per-job working buffers, recycled through this thread's free
+            // list instead of being allocated, zeroed and freed once per job:
+            // rayon calls this init once per leaf job, i.e. inside the fold
+            // loop, and every one of the four is written before it is read
+            // (`compose_block_table` documents it for `scratch`; the fold
+            // kernels write every output slot; the GFNI kernel stores all
+            // sixteen planes before loading any). `FLOCK_NO_PCS_FOLD_BUF_POOL=1`
+            // restores the allocating form.
             || {
+                let pooled = crate::scratch::fold_buf_pool_enabled();
                 (
-                    vec![
-                        F128::ZERO;
+                    crate::scratch::LocalBuf::new(
                         if b_gfni_on {
                             0
                         } else {
                             super::ring_switch::FOLD_TABLE_TOTAL
-                        }
-                    ],
-                    vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
-                    vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
+                        },
+                        pooled,
+                    ),
+                    crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
+                    crate::scratch::LocalBuf::new(4 * SUB, pooled),
+                    crate::scratch::LocalBuf::new(if b_gfni_on { 64 } else { 0 }, pooled),
                 )
             },
             |(scratch, mid16, mid4, gfni_tmp), (block, (b_out, f_out))| {
