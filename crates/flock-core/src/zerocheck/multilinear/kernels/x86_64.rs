@@ -687,7 +687,8 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
+#[inline(never)]
+unsafe fn fold2_and_message_lookahead_x86_avx512_leaf<const PRECOMPUTED_W: bool>(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -695,7 +696,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     rho_a: F128,
     rho_b: F128,
     eq_lo: &[F128],
-    wtab: Option<&[F128]>,
+    wtab: &[F128],
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -823,13 +824,13 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
 
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
-            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+            let (a0w, a1w, a2w, a3w) = if PRECOMPUTED_W {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
                 // companions), yet the incumbent recomputed the companion —
                 // a permute plus a CLMUL of pure latency — at the head of
                 // the chain feeding all eight accumulates, every iteration.
-                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let wp = wtab.as_ptr().add(x_lo) as *const __m512i;
                 let w = _mm512_loadu_si512(wp);
                 let w64 = _mm512_loadu_si512(wp.add(1));
                 (
@@ -906,6 +907,38 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             out[i] = tail[i].reduce();
         }
         out
+    }
+}
+
+/// Select the precomputed-weight or on-demand-weight cascade leaf once per
+/// worker chunk. The ranked path always supplies `Some`; keeping the choice
+/// outside the `x_lo` loop lets LLVM give each leaf its own spill schedule.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
+    // SAFETY: both leaves have the public function's exact slice contract;
+    // the borrowed weight slice remains live for the synchronous leaf call.
+    unsafe {
+        match wtab {
+            Some(wt) => fold2_and_message_lookahead_x86_avx512_leaf::<true>(
+                a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wt,
+            ),
+            None => fold2_and_message_lookahead_x86_avx512_leaf::<false>(
+                a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, eq_lo,
+            ),
+        }
     }
 }
 

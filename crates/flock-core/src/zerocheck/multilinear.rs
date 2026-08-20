@@ -4066,6 +4066,9 @@ mod tests {
                 assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
                 assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
                 assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+                assert_eq!(a_v, a_w, "selector a lo_size={lo_size}");
+                assert_eq!(b_v, b_w, "selector b lo_size={lo_size}");
+                assert_eq!(out_v, out_w, "selector sums lo_size={lo_size}");
             }
         }
     }
