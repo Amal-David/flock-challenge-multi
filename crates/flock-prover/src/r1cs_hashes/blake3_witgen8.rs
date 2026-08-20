@@ -276,6 +276,7 @@ struct Drain8<'t> {
     proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
+    wide_nt: bool,
 }
 
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
@@ -429,7 +430,7 @@ fn wide_nt_enabled() -> bool {
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
 /// task; same-thread reads are self-consistent regardless).
 #[inline(always)]
-unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
+unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
         let mut g = g0;
@@ -438,7 +439,7 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
             let ta = tr8_chunk(stage, w);
             let tb = tr8_chunk(stage, w + 8);
             for r in 0..8 {
-                stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r]);
+                stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r], wide_nt);
             }
             g += 2;
         }
@@ -446,7 +447,7 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
             let w = 8 * g;
             let t = tr8_chunk(stage, w);
             for r in 0..8 {
-                stream_v8(dst.add(r * U32_PER_BLOCK + w), t[r]);
+                stream_v8(dst.add(r * U32_PER_BLOCK + w), t[r], wide_nt);
             }
         }
     }
@@ -477,9 +478,9 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 /// requires 32-byte alignment (true for every in-loop pointer when `dst` is
 /// 32-aligned and `w` is a multiple of 8).
 #[inline(always)]
-unsafe fn stream_v8(p: *mut u32, v: V8) {
+unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     unsafe {
-        if wide_nt_enabled() && p as usize % 32 == 0 {
+        if wide_nt && p as usize % 32 == 0 {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -495,17 +496,17 @@ unsafe fn stream_v8(p: *mut u32, v: V8) {
 /// # Safety
 /// Same alignment contract as [`stream_v8`], for both `p` and `p.add(8)`.
 #[inline(always)]
-unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
+unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     unsafe {
         #[cfg(target_feature = "avx512f")]
-        if wide_nt_enabled() && p as usize % 64 == 0 {
+        if wide_nt && p as usize % 64 == 0 {
             let z = _mm512_castsi256_si512(va);
             let z = _mm512_inserti64x4::<1>(z, vb);
             _mm512_stream_si512(p.cast::<__m512i>(), z);
             return;
         }
-        stream_v8(p, va);
-        stream_v8(p.add(8), vb);
+        stream_v8(p, va, wide_nt);
+        stream_v8(p.add(8), vb, wide_nt);
     }
 }
 
@@ -525,6 +526,7 @@ impl Drain8<'_> {
         g0: usize,
         g1: usize,
         nt: bool,
+        wide_nt: bool,
     ) {
         unsafe {
             let lo_rows = tr8_chunk(stage, ring_word);
@@ -540,9 +542,9 @@ impl Drain8<'_> {
                 }
                 let p = dst.add(r * U32_PER_BLOCK + abs_word);
                 match (nt, lo_live, hi_live) {
-                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
-                    (true, true, false) => stream_v8(p, lo_rows[r]),
-                    (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
+                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], wide_nt),
+                    (true, true, false) => stream_v8(p, lo_rows[r], wide_nt),
+                    (true, false, true) => stream_v8(p.add(8), hi_rows[r], wide_nt),
                     (false, true, true) => {
                         store_v8(p, lo_rows[r]);
                         store_v8(p.add(8), hi_rows[r]);
@@ -570,6 +572,7 @@ impl Drain8<'_> {
         g0: usize,
         g1: usize,
         nt: bool,
+        wide_nt: bool,
     ) {
         unsafe {
             debug_assert_eq!(base_word % 8, 0);
@@ -586,6 +589,7 @@ impl Drain8<'_> {
                     g0,
                     g1,
                     nt,
+                    wide_nt,
                 );
             }
         }
@@ -628,7 +632,7 @@ impl Drain8<'_> {
                     let abs_word = base_word + off;
                     let rw = ring_word + off;
                     Self::publish_step(
-                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt,
+                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, self.wide_nt,
                     );
                     Self::publish_step(
                         self.ast,
@@ -639,6 +643,7 @@ impl Drain8<'_> {
                         0,
                         a_g1,
                         true,
+                        self.wide_nt,
                     );
                     Self::publish_step(
                         self.bs,
@@ -649,6 +654,7 @@ impl Drain8<'_> {
                         b_g0,
                         b_g1,
                         true,
+                        self.wide_nt,
                     );
                     proj.project(abs_word / STEP_WORDS);
                 }
@@ -672,24 +678,37 @@ impl Drain8<'_> {
             let (a_g1, b_g0, b_g1) = self.ab_ranges();
 
             Self::publish_range(
-                self.zs, self.z, None, base_word, ring_word, words, 0, z_g1, self.z_nt,
+                self.zs,
+                self.z,
+                None,
+                base_word,
+                ring_word,
+                words,
+                0,
+                z_g1,
+                self.z_nt,
+                self.wide_nt,
             );
 
             match self.win_ab {
                 Some((win_a, win_b)) => {
                     Self::publish_range(
                         self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
+                        self.wide_nt,
                     );
                     Self::publish_range(
                         self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
+                        self.wide_nt,
                     );
                 }
                 None => {
                     Self::publish_range(
                         self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
+                        self.wide_nt,
                     );
                     Self::publish_range(
                         self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
+                        self.wide_nt,
                     );
                 }
             }
@@ -726,6 +745,7 @@ unsafe fn dump_range_nt_win(
     win: *mut u32,
     g0: usize,
     g1: usize,
+    wide_nt: bool,
 ) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
@@ -746,15 +766,15 @@ unsafe fn dump_range_nt_win(
             let hi = g + 1 >= g0 && g + 1 < g1;
             if lo && hi {
                 for r in 0..8 {
-                    stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r]);
+                    stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r], wide_nt);
                 }
             } else if lo {
                 for r in 0..8 {
-                    stream_v8(dst.add(r * U32_PER_BLOCK + w), ta[r]);
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], wide_nt);
                 }
             } else if hi {
                 for r in 0..8 {
-                    stream_v8(dst.add(r * U32_PER_BLOCK + w + 8), tb[r]);
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w + 8), tb[r], wide_nt);
                 }
             }
             g += 2;
@@ -770,6 +790,7 @@ unsafe fn dump_elide(
     elide_prefix: bool,
     tail_chunk: usize,
     nt: bool,
+    wide_nt: bool,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -779,7 +800,7 @@ unsafe fn dump_elide(
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
     unsafe {
         if nt {
-            dump_range_nt(stage, dst, g0, g1)
+            dump_range_nt(stage, dst, g0, g1, wide_nt)
         } else {
             dump_range(stage, dst, g0, g1)
         }
@@ -796,6 +817,7 @@ unsafe fn dump_elide_win(
     elide_tail: bool,
     elide_prefix: bool,
     tail_chunk: usize,
+    wide_nt: bool,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -803,7 +825,7 @@ unsafe fn dump_elide_win(
         0
     };
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
-    unsafe { dump_range_nt_win(stage, dst, win, g0, g1) }
+    unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
 }
 
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
@@ -952,6 +974,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             z_nt,
+            wide_nt: wide_nt_enabled(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
