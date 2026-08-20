@@ -307,6 +307,15 @@ const BLAKE3_BATCH: usize = 16;
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
 /// `Vec`-per-call formulation this costs nothing per batch.
+///
+/// On x86_64 the ranked default talks to the same `blake3_hash_many_avx512`
+/// the crate already links, with a live-prefix `*const u8` array. That is
+/// the leftover #410 explicitly did not bundle on the B64 grain: B64 still
+/// broadcast-initialized a 64-wide `&[u8; N]` array and re-entered
+/// `Platform::hash_many` (enum dispatch, `out.len()` assert, thin-ref
+/// reconstruction) once per four AVX-512 groups. Compression rounds, flags,
+/// IV, counters, and message order are unchanged. `FLOCK_NO_BLAKE3_AVX512_FFI=1`
+/// restores the B64 `Platform::hash_many` construction in the same binary.
 #[inline]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
@@ -316,25 +325,58 @@ fn blake3_hash_many<const N: usize>(
     flags_end: u8,
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
-    let plat = blake3_platform();
+    debug_assert_eq!(N % 64, 0);
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
-        }
+        debug_assert_eq!(msgs.len(), n * N);
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+
+        #[cfg(target_arch = "x86_64")]
+        if blake3_avx512_ffi_enabled() {
+            // Live prefix only: C reads `num_inputs` pointers and never the
+            // uninitialized tail. Each message is `N` contiguous bytes of
+            // `msgs`, so the pointer is an arithmetic sequence.
+            let mut ptrs = [core::mem::MaybeUninit::<*const u8>::uninit(); BLAKE3_BATCH];
+            let base = msgs.as_ptr();
+            for i in 0..n {
+                ptrs[i].write(unsafe { base.add(i * N) });
+            }
+            // SAFETY: AVX-512F+VL checked by the selector; `n` pointers are
+            // initialized and each covers `N` readable bytes; `out_bytes` is
+            // `n * 32` writable bytes; `N` is a multiple of the 64-byte block
+            // size; flags/IV match the incumbent Platform::hash_many call;
+            // the symbol is the blake3 1.8.6 object this crate already links.
+            unsafe {
+                blake3_hash_many_avx512(
+                    ptrs.as_ptr() as *const *const u8,
+                    n,
+                    N / 64,
+                    BLAKE3_IV.as_ptr(),
+                    0,
+                    false,
+                    flags,
+                    flags_start,
+                    flags_end,
+                    out_bytes.as_mut_ptr(),
+                );
+            }
+            continue;
+        }
+
+        // Incumbent B64 construction (kill switch / non-AVX-512 hosts).
+        let plat = blake3_platform();
+        let first: &[u8; N] = msgs[..N].try_into().unwrap();
+        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        for (i, slot) in inputs[..n].iter_mut().enumerate() {
+            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+        }
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
@@ -346,6 +388,40 @@ fn blake3_hash_many<const N: usize>(
             out_bytes,
         );
     }
+}
+
+/// `FLOCK_NO_BLAKE3_AVX512_FFI=1` restores the B64 `Platform::hash_many`
+/// pointer-array construction. Ranked workers clear the environment, so the
+/// FFI path is the scored default. Read once per process.
+#[cfg(target_arch = "x86_64")]
+fn blake3_avx512_ffi_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_BLAKE3_AVX512_FFI").is_none()
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vl")
+    })
+}
+
+// The AVX-512 hash_many already compiled into blake3 1.8.6. Global
+// symbol blake3_hash_many_avx512 (T) in the crate's avx512 object.
+// Must only be called when AVX-512F+VL are present; the selector above
+// is the gate.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn blake3_hash_many_avx512(
+        inputs: *const *const u8,
+        num_inputs: usize,
+        blocks: usize,
+        key: *const u32,
+        counter: u64,
+        increment_counter: bool,
+        flags: u8,
+        flags_start: u8,
+        flags_end: u8,
+        out: *mut u8,
+    );
 }
 
 /// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
