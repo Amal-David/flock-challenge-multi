@@ -2201,6 +2201,38 @@ fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
     }
 }
 
+/// Retained half of the final transpose butterfly: `top' = top + bottom`.
+/// The discarded half is not written and its field product is not formed.
+#[inline(always)]
+fn transpose_butterfly_top_only(top: &mut [F128], bottom: &[F128]) {
+    debug_assert_eq!(top.len(), bottom.len());
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    // SAFETY: target features are cfg-guaranteed and both slices have the
+    // same length. Four F128 values fill one ZMM.
+    unsafe {
+        use core::arch::x86_64::*;
+        let lanes = top.len() & !3;
+        let mut i = 0;
+        while i < lanes {
+            let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+            let b = _mm512_loadu_si512(bottom.as_ptr().add(i).cast::<__m512i>());
+            _mm512_storeu_si512(
+                top.as_mut_ptr().add(i).cast::<__m512i>(),
+                _mm512_xor_si512(a, b),
+            );
+            i += 4;
+        }
+        while i < top.len() {
+            top[i] += bottom[i];
+            i += 1;
+        }
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    for (top, &bottom) in top.iter_mut().zip(bottom) {
+        *top += bottom;
+    }
+}
+
 /// `FLOCK_NO_OPEN_TNTT_BLOCK=1` restores the incumbent one-rayon-region-per-
 /// layer transpose sweep ([`transpose_forward_ntt_dense_layers_per_layer`]).
 /// Read once per process; default ON (the ranked worker clears its env).
@@ -2222,7 +2254,7 @@ fn tntt_block_enabled() -> bool {
 ///    incumbent one parallel sweep per layer.
 fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
     if tntt_block_enabled() {
-        transpose_forward_ntt_dense_layers_blocked(ntt, data, top);
+        transpose_forward_ntt_dense_layers_blocked(ntt, data, top, false);
     } else {
         transpose_forward_ntt_dense_layers_per_layer(ntt, data, top);
     }
@@ -2294,6 +2326,7 @@ fn transpose_forward_ntt_dense_layers_blocked(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
     top: usize,
+    truncate_low_half: bool,
 ) {
     use rayon::prelude::*;
     let log_d = data.len().trailing_zeros() as usize;
@@ -2381,9 +2414,17 @@ fn transpose_forward_ntt_dense_layers_blocked(
                 let mut j = 0;
                 while j < nseg {
                     for u in j..j + stride {
-                        let t = ntt.twiddle(layer, u >> (b + 1));
                         let (lo, hi) = cols.split_at_mut(u + stride);
-                        transpose_butterfly(lo[u], hi[0], t);
+                        if truncate_low_half && layer == 0 {
+                            // The caller keeps only the low half. The final
+                            // transpose butterfly's retained output is
+                            // exactly `top + bottom`; its multiplication and
+                            // high-half store are dead.
+                            transpose_butterfly_top_only(lo[u], hi[0]);
+                        } else {
+                            let t = ntt.twiddle(layer, u >> (b + 1));
+                            transpose_butterfly(lo[u], hi[0], t);
+                        }
                     }
                     j += stride << 1;
                 }
@@ -2400,6 +2441,42 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
     transpose_forward_ntt_dense_layers(ntt, data, log_d);
+}
+
+/// Exact ranked top-level induction shape. The caller retains only the low
+/// half of a rate-two transposed NTT, so the high result of layer zero is
+/// provably dead.
+#[inline]
+fn is_ranked_induce_truncated_ntt_shape(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    log_msg_cols == 19
+        && log_inv_rate == 1
+        && log_num_interleaved == 6
+        && n_queries == 218
+        && alpha_len == 8
+}
+
+#[inline]
+fn ranked_induce_truncated_ntt_enabled(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    is_ranked_induce_truncated_ntt_shape(
+        log_msg_cols,
+        log_inv_rate,
+        log_num_interleaved,
+        n_queries,
+        alpha_len,
+    ) && tntt_block_enabled()
+        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
 }
 
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
@@ -2446,7 +2523,19 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse_impl(
+            &ntt,
+            queries,
+            &alpha_pows,
+            log_block,
+            ranked_induce_truncated_ntt_enabled(
+                log_msg_cols,
+                log_inv_rate,
+                v_challenges.len(),
+                n_queries,
+                alpha.len(),
+            ),
+        )
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2647,6 +2736,16 @@ fn transpose_forward_ntt_sparse(
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
+    transpose_forward_ntt_sparse_impl(ntt, positions, values, log_d, false)
+}
+
+fn transpose_forward_ntt_sparse_impl(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    truncate_low_half: bool,
+) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
     let n = 1usize << log_d;
@@ -2654,6 +2753,7 @@ fn transpose_forward_ntt_sparse(
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
+        assert!(!truncate_low_half, "truncated NTT requires the ranked sparse prefix");
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
@@ -2791,7 +2891,13 @@ fn transpose_forward_ntt_sparse(
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let _ts = std::time::Instant::now();
-    transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    if truncate_low_half {
+        debug_assert!(tntt_block_enabled());
+        transpose_forward_ntt_dense_layers_blocked(ntt, &mut data, log_d - k, true);
+        data.truncate(n >> 1);
+    } else {
+        transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    }
     if ot {
         eprintln!(
             "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
@@ -9008,6 +9114,62 @@ mod tests {
         }
     }
 
+    /// The low-half termination must equal a complete transposed NTT followed
+    /// by truncation. This directly covers the dead final-layer multiply and
+    /// high-store branch used by ranked L0 induction.
+    #[test]
+    fn transpose_sparse_truncated_matches_full_low_half() {
+        use crate::challenger::Challenger;
+        for &(log_d, nq) in &[(12usize, 43usize), (14, 106), (18, 218)] {
+            let n = 1usize << log_d;
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0x7A11_CAFE ^ (log_d * 257 + nq) as u64,
+            );
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut positions = Vec::with_capacity(nq);
+            let mut values = Vec::with_capacity(nq);
+            while positions.len() < nq {
+                let p = (ch.sample_f128().lo as usize) % n;
+                if !positions.contains(&p) {
+                    positions.push(p);
+                    values.push(ch.sample_f128());
+                }
+            }
+            let mut full = transpose_forward_ntt_sparse_impl(
+                &ntt,
+                &positions,
+                &values,
+                log_d,
+                false,
+            );
+            let truncated = transpose_forward_ntt_sparse_impl(
+                &ntt,
+                &positions,
+                &values,
+                log_d,
+                true,
+            );
+            full.truncate(n >> 1);
+            assert_eq!(truncated, full, "log_d={log_d}, nq={nq}");
+        }
+    }
+
+    #[test]
+    fn ranked_induce_truncated_ntt_shape_gate_is_exact() {
+        assert!(is_ranked_induce_truncated_ntt_shape(19, 1, 6, 218, 8));
+        for args in [
+            (18, 1, 6, 218, 8),
+            (19, 2, 6, 218, 8),
+            (19, 1, 5, 218, 8),
+            (19, 1, 6, 217, 8),
+            (19, 1, 6, 218, 7),
+        ] {
+            assert!(!is_ranked_induce_truncated_ntt_shape(
+                args.0, args.1, args.2, args.3, args.4
+            ));
+        }
+    }
+
     /// The fused parallel densify must be BYTE-identical to the incumbent
     /// two-pass form (`vec![F128::ZERO; n]` + serial scatter of the active
     /// windows) — including at the ranked L0 shape (log_d=20, k=8, ~214 of
@@ -9077,7 +9239,7 @@ mod tests {
                 let mut a = base.clone();
                 let mut b = base;
                 transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut a, top);
-                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
+                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top, false);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
         }
