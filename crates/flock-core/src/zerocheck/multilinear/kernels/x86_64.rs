@@ -696,6 +696,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     rho_b: F128,
     eq_lo: &[F128],
     wtab: Option<&[F128]>,
+    nt_out: bool,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -781,12 +782,24 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
+        // Input look-ahead, resolved once per worker chunk (never inside the
+        // loop). One body consumes 64 F128 from each side.
+        let pf_on = zc_tail_pf_enabled();
+        const PF_OFF: usize = ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
 
         while x_lo + 8 <= lo_size {
             let output = 2 * x_lo;
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
+            if pf_on {
+                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+                for l in 0..16 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
             let (oa0, oa1, oa2, oa3, ob0, ob1, ob2, ob3) = if defer {
                 (
                     fold16_to_4_deferred(a_src, ra, rb, rarb),
@@ -812,14 +825,25 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             };
             let ap = a_out.as_mut_ptr().add(output);
             let bp = b_out.as_mut_ptr().add(output);
-            _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
-            _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
-            _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), oa2);
-            _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), oa3);
-            _mm512_storeu_si512(bp.cast::<__m512i>(), ob0);
-            _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), ob1);
-            _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), ob2);
-            _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
+            if nt_out {
+                stream_zmm_as_xmm4(ap, oa0);
+                stream_zmm_as_xmm4(ap.add(4), oa1);
+                stream_zmm_as_xmm4(ap.add(8), oa2);
+                stream_zmm_as_xmm4(ap.add(12), oa3);
+                stream_zmm_as_xmm4(bp, ob0);
+                stream_zmm_as_xmm4(bp.add(4), ob1);
+                stream_zmm_as_xmm4(bp.add(8), ob2);
+                stream_zmm_as_xmm4(bp.add(12), ob3);
+            } else {
+                _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
+                _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
+                _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), oa2);
+                _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), oa3);
+                _mm512_storeu_si512(bp.cast::<__m512i>(), ob0);
+                _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), ob1);
+                _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), ob2);
+                _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
+            }
 
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
             let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
@@ -900,6 +924,9 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             x_lo += 2;
         }
 
+        if nt_out {
+            _mm_sfence();
+        }
         let mut out = [F128::ZERO; 8];
         for i in 0..8 {
             tail[i] ^= acc[i].fold();
@@ -1007,6 +1034,33 @@ pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF_FAR").is_none());
     *ON
 }
+
+/// `FLOCK_NO_ZC_TAIL_PF=1` disables the look-ahead software prefetch of the
+/// composed tail fold's `a`/`b` input streams (exact same-binary A/B;
+/// prefetch is architecturally invisible).
+pub(crate) fn zc_tail_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_PF").is_none());
+    *ON
+}
+
+/// Look-ahead, in loop bodies, for the composed tail fold's input prefetch.
+/// One body consumes sixteen lines from each of `a` and `b`, so the hint for
+/// body `T + ZC_TAIL_PF_TILES` is issued at the head of body `T` and every
+/// line is still requested exactly once — only earlier.
+const ZC_TAIL_PF_TILES: usize = 3;
+
+/// `FLOCK_NO_ZC_TAIL_NT=1` restores plain write-allocate stores for the
+/// composed tail fold's outputs (exact same-binary A/B).
+pub(crate) fn zc_tail_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_NT").is_none());
+    *ON
+}
+
+/// Smallest composed tail fold output length, in log2 `F128` per array, that
+/// publishes non-temporally. Smaller levels keep write-allocate stores.
+pub(crate) const ZC_TAIL_NT_LOG: u32 = 20;
 
 /// `FLOCK_NO_ZC_WTAB=1` disables the hoisted per-pass `(w, w·x⁶⁴)` pair
 /// table in the zerocheck message sweeps (exact same-binary A/B; the table

@@ -2469,6 +2469,20 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     ))]
     let wtab_arg = wtab_vec.as_deref();
 
+    // Non-temporal publish of the fold outputs, for the levels whose outputs
+    // are too large to still be cache-resident when the next level reads
+    // them. The message terms come from registers, so the stores are
+    // write-once.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let nt_out = kernels::x86_64::zc_tail_nt_enabled()
+        && quarter >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
+        && (a_out.as_ptr() as usize) % 16 == 0
+        && (b_out.as_ptr() as usize) % 16 == 0;
+
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -2486,7 +2500,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out,
                 )
             };
             #[cfg(not(all(
@@ -4038,7 +4052,7 @@ mod tests {
             // SAFETY: lengths satisfy the kernel's contract.
             let out_v = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None,
+                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None, false,
                 )
             };
             assert_eq!(a_s, a_v, "a lo_size={lo_size}");
@@ -4061,6 +4075,7 @@ mod tests {
                         rho_b,
                         &eq_lo,
                         Some(&wtab),
+                        false,
                     )
                 };
                 assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
