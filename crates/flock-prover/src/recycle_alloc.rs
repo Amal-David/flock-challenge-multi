@@ -14,7 +14,13 @@ use std::sync::atomic::{
 
 const RECYCLE_MIN: usize = 32 * 1024;
 const MAX_ALIGN: usize = 16;
-const MAX_CLASSES: usize = 512;
+/// Slots in the size-class table. The table is open-addressed with linear
+/// probing; a size that finds no slot is not parked at all, so the block goes
+/// back to the OS and its pages are re-faulted on the next allocation of that
+/// size. The prover's distinct recyclable sizes must therefore all fit.
+const MAX_CLASSES: usize = 4096;
+/// Slots the table is limited to under `FLOCK_NO_CLASS_SPAN`.
+const NARROW_CLASSES: usize = 512;
 
 struct Class {
     size: AtomicUsize,
@@ -28,16 +34,34 @@ const EMPTY: Class = Class {
 };
 static CLASSES: [Class; MAX_CLASSES] = [EMPTY; MAX_CLASSES];
 
+/// Slots actually used. `FLOCK_NO_CLASS_SPAN=1` restores the narrow table
+/// (same binary A/B). Latched once, and only ever initialized from a
+/// RECYCLABLE allocation — `var_os`'s own small allocations take the
+/// non-recyclable branch straight to System, so initialization cannot
+/// re-enter this latch.
 #[inline]
-fn class_slot(size: usize) -> usize {
-    (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
+fn class_span() -> usize {
+    static SPAN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        if std::env::var_os("FLOCK_NO_CLASS_SPAN").is_some() {
+            NARROW_CLASSES
+        } else {
+            MAX_CLASSES
+        }
+    })
+}
+
+#[inline]
+fn class_slot(size: usize, span: usize) -> usize {
+    ((size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize) % span
 }
 
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
-    let start = class_slot(size);
-    for probe in 0..MAX_CLASSES {
-        let i = (start + probe) % MAX_CLASSES;
+    let span = class_span();
+    let start = class_slot(size, span);
+    for probe in 0..span {
+        let i = (start + probe) % span;
         let s = CLASSES[i].size.load(Acquire);
         if s == size {
             return Some(i);
