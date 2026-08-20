@@ -160,6 +160,20 @@ fn fold16_pf_ahead() -> usize {
     *D
 }
 
+/// `FLOCK_NO_FOLD16_PF_SPREAD=1` restores the incumbent delivery of the
+/// [`fold16_banked`] source prefetch: the whole KiB — sixteen line hints —
+/// issued back to back at the head of a four-output block. The default arm
+/// issues the same sixteen hints for the same lines one bank group at a
+/// time, four per group, so four hints queue against that group's four
+/// demand loads instead of sixteen queueing ahead of all sixteen. Same
+/// addresses, same instruction count per block, different pacing: a prefetch
+/// has no architectural effect, so the folded values are identical either way.
+fn fold16_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_PF_SPREAD").is_none());
+    *ON
+}
+
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
@@ -191,22 +205,36 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
         let quads = dst.len() & !3;
         let pf_ahead = fold16_pf_ahead();
+        let pf_spread = fold16_pf_spread_enabled();
         let pf_limit = src.len().saturating_sub(64);
         let mut t = 0usize;
         while t < quads {
-            if pf_ahead != 0 {
-                let ahead = 16 * t + pf_ahead;
-                if ahead <= pf_limit {
-                    let p = src.as_ptr().add(ahead).cast::<i8>();
-                    let mut l = 0usize;
-                    while l < 1024 {
-                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
-                        l += 64;
-                    }
+            // The KiB this block's reads reach `pf_ahead` F128 on. `ahead <=
+            // pf_limit` keeps all sixteen lines inside `src`, so the offset
+            // arithmetic below never leaves the allocation.
+            let pf_p = if pf_ahead != 0 && 16 * t + pf_ahead <= pf_limit {
+                src.as_ptr().add(16 * t + pf_ahead).cast::<i8>()
+            } else {
+                core::ptr::null()
+            };
+            if !pf_p.is_null() && !pf_spread {
+                let mut l = 0usize;
+                while l < 1024 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_p.add(l));
+                    l += 64;
                 }
             }
             let mut acc = WideGhashX4::zero();
             for g in 0..4 {
+                // Spread delivery: one quarter of the same sixteen-line block
+                // per bank group, so the KiB is asked for across all four
+                // groups this block runs instead of in one burst at its head.
+                // Same lines, same look-ahead, same hints per block.
+                if !pf_p.is_null() && pf_spread {
+                    for l in 4 * g..4 * g + 4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_p.add(64 * l));
+                    }
+                }
                 // v_s = banks 4g..4g+3 of slot t+s.
                 let base = 16 * t + 4 * g;
                 let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
