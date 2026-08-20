@@ -372,7 +372,18 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
     // geometry and disjointness contract.
     unsafe {
-        x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        // Same dispatch idiom as `butterfly_fused_2layer`: a zero high limb on
+        // the layer-0 twiddle kills two limb products and the reduction that
+        // folds them. Decided once per row group, outside the lane loop;
+        // `low_twiddle_disabled()` restores the general kernel for a
+        // same-binary A/B.
+        if twiddles[0].hi == 0 && !low_twiddle_disabled() {
+            x86_64::butterfly_fused_4layer_row_gen::<true>(
+                ptr, sixteenth, num_ntts, lanes, r, twiddles,
+            );
+        } else {
+            x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        }
     }
 
     #[cfg(not(all(
@@ -412,9 +423,15 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
     // geometry and disjointness contract.
     unsafe {
-        x86_64::butterfly_fused_4layer_row_pf::<H>(
+        if twiddles[0].hi == 0 && !low_twiddle_disabled() {
+            x86_64::butterfly_fused_4layer_row_pf_gen::<H, true>(
             ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
         );
+        } else {
+            x86_64::butterfly_fused_4layer_row_pf_gen::<H, false>(
+            ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
+        );
+        }
     }
 
     #[cfg(not(all(

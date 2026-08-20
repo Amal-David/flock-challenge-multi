@@ -529,10 +529,33 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     r: usize,
     twiddles: &[F128; 15],
 ) {
+    // SAFETY: forwarded caller contract; `LOW0 = false` keeps the general form.
+    unsafe {
+        butterfly_fused_4layer_row_gen::<false>(ptr, sixteenth, num_ntts, active_lanes, r, twiddles)
+    }
+}
+
+/// [`butterfly_fused_4layer_row`] with `LOW0` asserting that the layer-0
+/// twiddle's high limb is zero, which lets its eight butterflies take the
+/// 3-CLMUL short product instead of the 5-CLMUL split form.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; when `LOW0`,
+/// `twiddles[0].hi` must be zero.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_gen<const LOW0: bool>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0>(
+            butterfly_fused_4layer_row_impl::<false, 0, LOW0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -542,7 +565,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 0,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0>(
+            butterfly_fused_4layer_row_impl::<true, 0, LOW0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -563,7 +586,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 /// Same contract as [`butterfly_fused_4layer_row`]; in addition, row group
 /// `pf_r` must lie inside the same block.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
+pub(super) unsafe fn butterfly_fused_4layer_row_pf_gen<const H: u8, const LOW0: bool>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
@@ -575,7 +598,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H>(
+            butterfly_fused_4layer_row_impl::<false, H, LOW0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -585,7 +608,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 pf_r,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H>(
+            butterfly_fused_4layer_row_impl::<true, H, LOW0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -602,7 +625,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// Same contract as [`butterfly_fused_4layer_row`].
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
+unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8, const LOW0: bool>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
@@ -623,6 +646,10 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
         for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
             *slot = tw_x4::<false, DIET>(*value);
         }
+        // Layer 0's twiddle drives eight of the thirty-two butterflies. When
+        // its high limb is zero the short product applies, so build it in the
+        // LOW form (no x^64 companion) and multiply with 3 CLMUL instead of 5.
+        let tw0 = tw_x4::<LOW0, DIET>(twiddles[0]);
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -653,9 +680,16 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
                 }};
             }
 
-            let outer = tw[0];
+            macro_rules! butterfly_low0 {
+                ($u:expr, $v:expr) => {{
+                    let new_u =
+                        _mm512_xor_si512(values[$u], mul_x4::<LOW0, DIET>(tw0, values[$v]));
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    values[$u] = new_u;
+                }};
+            }
             for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+                butterfly_low0!(i, i + 8);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -1259,7 +1293,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0>(
+                        butterfly_fused_4layer_row_impl::<true, 0, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1269,7 +1303,7 @@ mod diet_tests {
                             0,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0>(
+                        butterfly_fused_4layer_row_impl::<false, 0, false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1283,6 +1317,45 @@ mod diet_tests {
                 buf
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
+
+            // --- fused four-layer, LOW layer-0 twiddle --------------------
+            // With `twiddles[0].hi == 0` the short product applies to the
+            // eight layer-0 butterflies. The LOW form must be bit-identical
+            // to the general form on the very same data.
+            let mut tw15_low = tw15;
+            tw15_low[0] = F128 { lo: tw15[0].lo, hi: 0 };
+            let run_fused4_low = |low0: bool| {
+                let mut buf = base.clone();
+                // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0; the
+                // LOW precondition holds by construction above.
+                unsafe {
+                    if low0 {
+                        butterfly_fused_4layer_row_gen::<true>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw15_low,
+                        );
+                    } else {
+                        butterfly_fused_4layer_row_gen::<false>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw15_low,
+                        );
+                    }
+                }
+                buf
+            };
+            assert_eq!(
+                run_fused4_low(true),
+                run_fused4_low(false),
+                "fused4 LOW0 len={len}"
+            );
         }
     }
 }
