@@ -4162,6 +4162,34 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_MDF8_PF=1` restores the incumbent [`materialize_direct_fold8`]
+/// GFNI b-side: the four-map tile kernel with no software prefetch of the
+/// next f-slab. Exact same-binary A/B. Prefetch is a hint with no
+/// architectural effect, so both arms produce byte-identical proofs.
+///
+/// Ranked DirectFold8 is on (`has_ordinary == false`, two claims,
+/// `block_len` divisible by 64). Each rayon task (a) streams this block's
+/// 8 MiB f-slab through `fold16_banked` then (b) runs the GFNI four-map
+/// kernel over packed `eq_lo` rows. The GFNI b-side does not stream the
+/// NEXT block's f-slab, so that slab is still DRAM-cold when the next
+/// task's `fold16_banked` demand-loads it.
+///
+/// DirectFold4 already ships this b-side schedule: one T1 line per four
+/// slots (16 bytes of next-slab coverage per output). The GFNI tile is
+/// 64 slots, so sixteen T1 lines per tile keep that same density. Depth
+/// is the DirectFold4 optimum (one line per four-slot equivalent; two
+/// and above evicted DF4's live 64 KiB table). Hint is T1, not T0: the
+/// slab belongs in L2. The kill switch is independent of
+/// `FLOCK_NO_FOLD8_B_GFNI`.
+///
+/// Read once per process, outside every loop.
+#[cfg(target_arch = "x86_64")]
+fn mdf8_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF8_PF").is_none());
+    *ON
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -5558,6 +5586,24 @@ fn materialize_direct_fold8(
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
+    // Next-slab T1 prefetch, resolved once for the whole materialization —
+    // never inside the block / tile loops. Ranked GFNI b-side only.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let pf_on = mdf8_pf_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let n_blocks = out_len / block_len;
     let stats = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -5637,7 +5683,46 @@ fn materialize_direct_fold8(
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    // Head of the NEXT block's f-side slab. Null when there
+                    // is no next block or the kill switch is set.
+                    // `block + 1 < n_blocks` keeps the whole slab inside
+                    // `packed_witness`:
+                    // `64·(block+2)·block_len ≤ 64·n_blocks·block_len = len`.
+                    let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                        // SAFETY: bounds argued above; `add` stays inside
+                        // the allocation and the pointer is never
+                        // dereferenced.
+                        let p = unsafe {
+                            packed_witness.as_ptr().add(start + 64 * block_len)
+                        };
+                        (
+                            p.cast::<u8>(),
+                            64 * block_len * core::mem::size_of::<F128>(),
+                        )
+                    } else {
+                        (core::ptr::null::<u8>(), 0usize)
+                    };
+                    let mut pf_at = 0usize;
                     for slot in (0..block_len).step_by(64) {
+                        if !pf_base.is_null() {
+                            // Sixteen T1 lines per 64-slot tile = 16 bytes of
+                            // next-slab coverage per output, matching DirectFold4.
+                            let mut k = 0usize;
+                            while k < 16 && pf_at < pf_span {
+                                // SAFETY: `pf_at < pf_span` and the slab is
+                                // `pf_span` bytes, so the address is inside
+                                // `packed_witness`. Prefetch has no
+                                // architectural effect.
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        pf_base.add(pf_at).cast::<i8>(),
+                                        core::arch::x86_64::_MM_HINT_T1,
+                                    );
+                                }
+                                pf_at += 64;
+                                k += 1;
+                            }
+                        }
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
