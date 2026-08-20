@@ -316,6 +316,44 @@ fn ntt_fused3_disabled() -> bool {
         || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3").is_some())
 }
 
+/// Rows of look-ahead for the fused-top-pass gather prefetches (see
+/// [`ntt_pf_enabled`]).
+///
+/// In `top_fused6_pass` one gather step is one row copy — 512 bytes, ~40
+/// uops at the ranked shape, far less than a DRAM round-trip — so no
+/// distance measured in copy steps hides a single miss behind compute; the
+/// win is memory-level parallelism. Two rows ahead keeps ~16
+/// prefetched lines plus the current row's eight demand lines in flight, so
+/// the gather pays overlapping misses instead of one serialized row-start
+/// miss per round-trip. Further ahead adds nothing (the fill buffers are the
+/// cap) and risks T0 evicting the staging lines the copy is writing (source
+/// rows plus staging already exceed L1D at the ranked shape).
+///
+/// In `seed_top_fused8_pass` one gather step is a sparse+dense seed-kernel
+/// pair over four rows (~600 uops of PCLMUL butterflies), so two rows ahead
+/// is ~1.2K uops until demand — past one DRAM round-trip, with the misses
+/// draining behind real compute.
+#[cfg(target_arch = "x86_64")]
+const NTT_PF_ROWS: usize = 2;
+
+/// `FLOCK_NO_NTT_PF=1` removes the software prefetches from the fused top
+/// passes' row gathers (exact same-binary A/B; prefetch has no architectural
+/// effect, so the codeword bytes are identical either way).
+///
+/// A fused-top task gathers 64 rows whose starts sit `S·num_ntts·16` bytes
+/// apart — multi-megabyte at the top layers. The hardware prefetchers never
+/// learn that stride (they do not cross 4 KiB page boundaries), so every row
+/// start is a cold demand miss, and even the eight sequential lines inside a
+/// 512-byte row barely ramp the streamer before the next jump.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn ntt_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_PF").is_none());
+    *ON
+}
+
+
 /// Test-only latch for the kernel diet (see [`TOP_FUSION_TEST_OFF`]).
 /// Bit 0 disables the lane rounding, bit 1 the fused-three deep tail, so one
 /// process can time each half of the diet on its own.
@@ -1167,6 +1205,10 @@ impl AdditiveNttF128 {
         let base_addr = data.as_mut_ptr() as usize;
         let n_tasks = num_blocks * sub_stride;
         let row_len = num_ntts;
+        // Gather prefetch, resolved once per pass (never inside the task or
+        // row loops).
+        #[cfg(target_arch = "x86_64")]
+        let pf = ntt_pf_enabled();
         let task = |buf: &mut Vec<F128>, idx: usize| {
             let block = idx / sub_stride;
             let r = idx % sub_stride;
@@ -1181,6 +1223,22 @@ impl AdditiveNttF128 {
                 let row_ptr = |k: usize| base.add(block_start + (r + k * sub_stride) * row_len);
                 // Gather: 64 rows → contiguous staging rows k·num_ntts.
                 for k in 0..64 {
+                    // Row k+NTT_PF_ROWS starts NTT_PF_ROWS·S·num_ntts·16
+                    // bytes on — a jump the hardware prefetchers never
+                    // follow. Ask for its lines before touching row k so its
+                    // miss overlaps the copies (and misses) in between;
+                    // `k + NTT_PF_ROWS < 64` keeps every prefetch on a row
+                    // this task really gathers.
+                    #[cfg(target_arch = "x86_64")]
+                    if pf && k + NTT_PF_ROWS < 64 {
+                        let p = row_ptr(k + NTT_PF_ROWS) as *const i8;
+                        for l in 0..(row_len * 16).div_ceil(64) {
+                            core::arch::x86_64::_mm_prefetch(
+                                p.add(l * 64),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
                     core::ptr::copy_nonoverlapping(row_ptr(k), buf.as_mut_ptr().add(k * row_len), row_len);
                 }
                 // Layers layer..layer+4: fused-four on rows {4i + j}, i.e.
@@ -1366,6 +1424,11 @@ impl AdditiveNttF128 {
         // (see `publish_row_nt`); decided once per pass.
         #[cfg(target_arch = "x86_64")]
         let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
+        // No gather prefetch here: the seed pass measured decisively slower
+        // with it (10/10 same-binary pairs, +3.7 ms) — its PCLMUL step
+        // already keeps the message-row misses covered, and the extra T0
+        // lines only tax the fill buffers. The fused-top gather keeps its
+        // prefetch (see `ntt_pf_enabled`).
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
