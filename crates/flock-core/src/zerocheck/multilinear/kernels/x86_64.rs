@@ -1096,6 +1096,17 @@ pub(crate) fn zc_pkt_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_C4_REG_OUT=1` restores the compact c4 helper's write through the
+/// 64-entry `FoldCache` and the consumer's four ZMM reloads (exact same-binary
+/// A/B). The ranked worker's cleared env never sets it. Default keeps the four
+/// group registers in the lookahead body: the helper no longer materializes
+/// a 64-F128 cache that only four ZMMs of the compact emit occupy.
+pub(crate) fn c4_reg_out_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_C4_REG_OUT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_TAIL_PF=1` disables the look-ahead software prefetch of the
 /// composed tail fold's `a`/`b` input streams (exact same-binary A/B;
 /// prefetch is architecturally invisible).
@@ -1467,6 +1478,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let mut fb_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
         let fb = &mut fb_store.0;
+        let mut c4_groups: Option<([__m512i; 4], [__m512i; 4])> = None;
         while x_lo + 8 <= lo_size {
             let ol = 2 * x_lo; // local output index of group 0
             let xg = out_base + ol;
@@ -1482,18 +1494,29 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     );
                     if use_c4 {
                         let c = cfold.unwrap();
-                        gfni_fold64_rows_masked_c4(
+                        let ar = gfni_fold64_rows_masked_c4(
                             a_pkt.add(4 * xg * 8),
                             c,
-                            fa.as_mut_ptr(),
                             dead,
                         );
-                        gfni_fold64_rows_masked_c4(
+                        let br = gfni_fold64_rows_masked_c4(
                             b_pkt.add(4 * xg * 8),
                             c,
-                            fb.as_mut_ptr(),
                             dead,
                         );
+                        if !c4_reg_out_enabled() {
+                            let ap = fa.as_mut_ptr().cast::<__m512i>();
+                            let bp = fb.as_mut_ptr().cast::<__m512i>();
+                            _mm512_storeu_si512(ap, ar[0]);
+                            _mm512_storeu_si512(ap.add(1), ar[1]);
+                            _mm512_storeu_si512(ap.add(2), ar[2]);
+                            _mm512_storeu_si512(ap.add(3), ar[3]);
+                            _mm512_storeu_si512(bp, br[0]);
+                            _mm512_storeu_si512(bp.add(1), br[1]);
+                            _mm512_storeu_si512(bp.add(2), br[2]);
+                            _mm512_storeu_si512(bp.add(3), br[3]);
+                        }
+                        c4_groups = Some((ar, br));
                     } else {
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
@@ -1530,21 +1553,27 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             // zero in memory and every fold table maps 0 → 0, so the cached
             // row is already the zero the scalar path wrote explicitly.
             let (oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3) = if use_c4 {
-                // The composed helper has already XOR-compressed the four
-                // residue planes, so its first four ZMMs are the four groups
-                // in output order.
-                let ap = fa.as_ptr();
-                let bp2 = fb.as_ptr();
-                (
-                    _mm512_loadu_si512(ap.cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(4).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(4).cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(8).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(8).cast::<__m512i>()),
-                    _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
-                    _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
-                )
+                // Compact helper already XOR-compressed the four residue
+                // groups. Default (`c4_reg_out`) keeps those four ZMMs in
+                // the body; the kill switch reloads them from FoldCache
+                // exactly as the #397 compact consumer did.
+                if c4_reg_out_enabled() {
+                    let (ar, br) = c4_groups.expect("c4 helper runs before consume");
+                    (ar[0], br[0], ar[1], br[1], ar[2], br[2], ar[3], br[3])
+                } else {
+                    let ap = fa.as_ptr();
+                    let bp2 = fb.as_ptr();
+                    (
+                        _mm512_loadu_si512(ap.cast::<__m512i>()),
+                        _mm512_loadu_si512(bp2.cast::<__m512i>()),
+                        _mm512_loadu_si512(ap.add(4).cast::<__m512i>()),
+                        _mm512_loadu_si512(bp2.add(4).cast::<__m512i>()),
+                        _mm512_loadu_si512(ap.add(8).cast::<__m512i>()),
+                        _mm512_loadu_si512(bp2.add(8).cast::<__m512i>()),
+                        _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
+                        _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
+                    )
+                }
             } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
@@ -2328,13 +2357,14 @@ const SIGMA_C4: [i8; 64] = [
 /// `coeffs[r & 3]` to every row `r` of the batch, for free, by folding the
 /// constant into the bit matrices.
 ///
-/// Writes the sixteen composed outputs directly. Output ZMM `g` contains
+/// Returns the four composed group ZMMs. Output ZMM `g` contains
 /// groups `t = 4·g .. 4·g+4`, each the XOR over residues `k` of
-/// `coeffs[k] · fold(row 4·t + k)`.
+/// `coeffs[k] · fold(row 4·t + k)`. Inlined into the lookahead body so
+/// those four registers never round-trip through the 64-entry fold cache.
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked`]: 64 readable bytes at `rows.add(64 * i)`
-/// for every line not marked dead, and 16 writable `F128`s at `out`.
+/// for every line not marked dead. AVX-512F/VBMI/GFNI are required.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2342,13 +2372,12 @@ const SIGMA_C4: [i8; 64] = [
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     rows: *const u8,
     m: &CFoldMats,
-    out: *mut F128,
     dead_lines: u8,
-) {
+) -> [core::arch::x86_64::__m512i; 4] {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees the row and output bounds; every
     // shuffle index is in range and the cfg gate supplies each intrinsic.
@@ -2477,11 +2506,12 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
             bt,
             xor4(hi_half[1], hi_half[3], hi_half[5], hi_half[7]),
         );
-        let out_ptr = out as *mut __m512i;
-        _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
-        _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
-        _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
-        _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
+        [
+            _mm512_permutex2var_epi64(lo_even, il_lo, hi_even),
+            _mm512_permutex2var_epi64(lo_even, il_hi, hi_even),
+            _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd),
+            _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd),
+        ]
     }
 }
 
