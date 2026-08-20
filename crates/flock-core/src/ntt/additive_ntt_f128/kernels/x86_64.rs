@@ -532,67 +532,22 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0>(
+            butterfly_fused_4layer_row_impl::<false>(
                 ptr,
                 sixteenth,
                 num_ntts,
                 active_lanes,
                 r,
                 twiddles,
-                0,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0>(
+            butterfly_fused_4layer_row_impl::<true>(
                 ptr,
                 sixteenth,
                 num_ntts,
                 active_lanes,
                 r,
                 twiddles,
-                0,
-            )
-        }
-    }
-}
-
-/// [`butterfly_fused_4layer_row`] that also issues one line hint per row of
-/// row group `pf_r` at every lane step. `H` selects the hint level
-/// (1 = L1, 2 = L2).
-///
-/// # Safety
-/// Same contract as [`butterfly_fused_4layer_row`]; in addition, row group
-/// `pf_r` must lie inside the same block.
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
-    ptr: *mut F128,
-    sixteenth: usize,
-    num_ntts: usize,
-    active_lanes: usize,
-    r: usize,
-    twiddles: &[F128; 15],
-    pf_r: usize,
-) {
-    // SAFETY: forwarded caller contract.
-    unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-                pf_r,
-            )
-        } else {
-            butterfly_fused_4layer_row_impl::<true, H>(
-                ptr,
-                sixteenth,
-                num_ntts,
-                active_lanes,
-                r,
-                twiddles,
-                pf_r,
             )
         }
     }
@@ -602,14 +557,13 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// Same contract as [`butterfly_fused_4layer_row`].
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
+unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
     active_lanes: usize,
     r: usize,
     twiddles: &[F128; 15],
-    pf_r: usize,
 ) {
     use core::arch::x86_64::*;
 
@@ -624,21 +578,9 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
             *slot = tw_x4::<false, DIET>(*value);
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
-        let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
-            if H != 0 {
-                let off = lane * core::mem::size_of::<F128>();
-                for i in 0..16 {
-                    let p = pf_row(i).add(off);
-                    if H == 1 {
-                        _mm_prefetch::<_MM_HINT_T0>(p);
-                    } else {
-                        _mm_prefetch::<_MM_HINT_T1>(p);
-                    }
-                }
-            }
             let mut values = [zero; 16];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
@@ -1259,24 +1201,22 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0>(
+                        butterfly_fused_4layer_row_impl::<true>(
                             buf.as_mut_ptr(),
                             1,
                             len,
                             len,
                             0,
                             &tw15,
-                            0,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0>(
+                        butterfly_fused_4layer_row_impl::<false>(
                             buf.as_mut_ptr(),
                             1,
                             len,
                             len,
                             0,
                             &tw15,
-                            0,
                         );
                     }
                 }
