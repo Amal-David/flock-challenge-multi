@@ -4448,6 +4448,36 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// DirectFold8 ranked B is GFNI-64, not `fold_one_slot`. The fold4 MDF4 walk
+/// (one T1 line per 4-wide slot group per claim) never ran on this path:
+/// `materialize_direct_fold8` still does the whole f-side slab, then 32×
+/// `gfni_fold64_four_maps_staged`, with the memory system idle for the
+/// whole B window. Same next-slab T1 walk, same 4-wide×claim rate, mapped
+/// onto one helper = 64 slots × 2 claims = 32 lines. Prefetch is a hint;
+/// both arms are bit-identical. `FLOCK_NO_FOLD8_MDF4_PF=1` restores the
+/// incumbent all-F-then-all-B schedule with no hints.
+fn fold8_mdf4_pf_selected(disabled: bool) -> bool {
+    !disabled
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn fold8_mdf4_pf_enabled() -> bool {
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD8_MDF4_PF").is_some()
+    });
+    fold8_mdf4_pf_selected(*DISABLED)
+}
+
+/// Landed MDF4: one T1 line per 4-wide slot group per claim. One DirectFold8
+/// GFNI helper covers 64 slots and two ranked claims.
+const FOLD8_MDF4_LINES_PER_HELPER: usize = (64 / 4) * 2;
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -5911,6 +5941,20 @@ fn materialize_direct_fold8(
                     use crate::zerocheck::multilinear::kernels::x86_64::{
                         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
+                    // Next block's f-side slab. Null when last block or killed.
+                    // `block + 1 < n_blocks` ⇒ 64·(block+2)·block_len ≤ len.
+                    let n_blocks = out_len / block_len;
+                    let (pf_base, pf_span) = if fold8_mdf4_pf_enabled() && block + 1 < n_blocks {
+                        // SAFETY: bounds argued above; pointer never dereferenced.
+                        let p = unsafe { packed_witness.as_ptr().add(start + 64 * block_len) };
+                        (
+                            p.cast::<u8>(),
+                            64 * block_len * core::mem::size_of::<F128>(),
+                        )
+                    } else {
+                        (core::ptr::null::<u8>(), 0usize)
+                    };
+                    let mut pf_at = 0usize;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
                         &direct_tables[0], claim0.eq_hi[block],
@@ -5924,6 +5968,22 @@ fn materialize_direct_fold8(
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
+                        if !pf_base.is_null() {
+                            // SAFETY: `pf_at < pf_span` keeps each address
+                            // inside `packed_witness`. Prefetch has no
+                            // architectural effect.
+                            let mut k = 0usize;
+                            while k < FOLD8_MDF4_LINES_PER_HELPER && pf_at < pf_span {
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        pf_base.add(pf_at).cast::<i8>(),
+                                        core::arch::x86_64::_MM_HINT_T1,
+                                    );
+                                }
+                                pf_at += 64;
+                                k += 1;
+                            }
+                        }
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
@@ -11674,6 +11734,13 @@ mod tests {
         let ok =
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
+    }
+
+    #[test]
+    fn fold8_mdf4_pf_selector_is_on_unless_killed() {
+        assert!(fold8_mdf4_pf_selected(false));
+        assert!(!fold8_mdf4_pf_selected(true));
+        assert_eq!(FOLD8_MDF4_LINES_PER_HELPER, 32);
     }
 
     #[cfg(all(
