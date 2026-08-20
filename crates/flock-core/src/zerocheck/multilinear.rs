@@ -238,29 +238,23 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 }
 
 /// Cached `1 / ∏_{j ≠ i} (s_i + s_j)` for one φ_8 node set, indexed by
-/// `k_skip`. The denominators depend only on the nodes, so a node set's
-/// inverses are computed once per process and shared by every fold point.
+/// `k_skip`. Each node set is an additive subspace or one of its cosets, so
+/// this denominator is independent of `i`. It is computed once per process
+/// and shared by every fold point.
 /// `node_base` is the node set's first index into `PHI_8_TABLE` (`0` for the
 /// S domain, `2^k_skip` for Λ).
-fn lagrange_denominator_inv(k_skip: usize, node_base: usize) -> &'static [F128] {
-    static CACHE: [[std::sync::OnceLock<Vec<F128>>; 9]; 2] =
+fn lagrange_denominator_inv(k_skip: usize, node_base: usize) -> F128 {
+    static CACHE: [[std::sync::OnceLock<F128>; 9]; 2] =
         [const { [const { std::sync::OnceLock::new() }; 9] }; 2];
     let domain = usize::from(node_base != 0);
-    CACHE[domain][k_skip].get_or_init(|| {
+    *CACHE[domain][k_skip].get_or_init(|| {
         let ell = 1usize << k_skip;
-        let mut out = vec![F128::ZERO; ell];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let si = PHI_8_TABLE[node_base + i];
-            let mut den = F128::ONE;
-            for j in 0..ell {
-                if j == i {
-                    continue;
-                }
-                den *= si + PHI_8_TABLE[node_base + j];
-            }
-            *slot = den.inv();
+        let s0 = PHI_8_TABLE[node_base];
+        let mut den = F128::ONE;
+        for j in 1..ell {
+            den *= s0 + PHI_8_TABLE[node_base + j];
         }
-        out
+        den.inv()
     })
 }
 
@@ -277,40 +271,27 @@ fn lagrange_batch_inv_off() -> bool {
 /// Lagrange weights at `z` over the φ_8 node set starting at `node_base`.
 ///
 /// `L_i(z) = ∏_{j ≠ i} (z + s_j) / ∏_{j ≠ i} (s_i + s_j)`. The numerators are
-/// all cofactors of the same product `P(z) = ∏_j (z + s_j)`, so one batch
-/// inversion of the `z + s_i` terms yields every cofactor as `P · (z + s_i)⁻¹`,
-/// and the denominators come from the cached node-set table. When `z` lands
-/// exactly on a node the cofactor form is unavailable and the per-node
-/// products are used instead.
+/// all cofactors of the same product `P(z) = ∏_j (z + s_j)`. Prefix and
+/// suffix products form every cofactor directly, including when `z` is a
+/// node. The common denominator inverse comes from the cached node-set value.
 fn lagrange_weights_on_nodes(k_skip: usize, z: F128, node_base: usize) -> Vec<F128> {
     let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
 
     if !lagrange_batch_inv_off() {
         let mut terms = vec![F128::ZERO; ell];
-        let mut on_node = false;
+        let mut prefix = F128::ONE;
         for (i, slot) in terms.iter_mut().enumerate() {
-            let t = z + PHI_8_TABLE[node_base + i];
-            on_node |= t.is_zero();
-            *slot = t;
+            *slot = z + PHI_8_TABLE[node_base + i];
+            weights[i] = prefix;
+            prefix *= *slot;
         }
-        if !on_node {
-            let den_inv = lagrange_denominator_inv(k_skip, node_base);
-            // Montgomery batch inverse: prefix[i] = ∏_{j < i} terms[j].
-            let mut prefix = vec![F128::ZERO; ell];
-            let mut acc = F128::ONE;
-            for (i, slot) in prefix.iter_mut().enumerate() {
-                *slot = acc;
-                acc *= terms[i];
-            }
-            let total = acc;
-            let mut suffix = total.inv();
-            for i in (0..ell).rev() {
-                weights[i] = total * (prefix[i] * suffix) * den_inv[i];
-                suffix *= terms[i];
-            }
-            return weights;
+        let mut suffix = lagrange_denominator_inv(k_skip, node_base);
+        for i in (0..ell).rev() {
+            weights[i] *= suffix;
+            suffix *= terms[i];
         }
+        return weights;
     }
 
     for i in 0..ell {
