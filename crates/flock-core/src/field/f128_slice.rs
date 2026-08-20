@@ -258,6 +258,59 @@ mod tests {
         }
     }
 
+    /// The packed-bank Fold64 leaf must agree with sixty-four independently
+    /// reduced field products. These lengths cover both the two-output body
+    /// and its one-output tail on Sapphire Rapids; other targets exercise the
+    /// exact portable definition used by the same public wrapper.
+    #[test]
+    fn fold64_packed_banks_matches_scalar_reduced_sum() {
+        use super::*;
+        let mut state = 0x5eed_f01d_6400_0001u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 2, 3, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 64] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let mut got = vec![F128::ZERO; n];
+            fold64_packed_banks(&src, &mut got, &w);
+            for t in 0..n {
+                let want = (0..64)
+                    .map(|b| w[b] * src[64 * t + b])
+                    .fold(F128::ZERO, |acc, product| acc + product);
+                assert_eq!(got[t], want, "n={n} t={t}");
+            }
+        }
+
+        // Degenerate weights catch bank-order mistakes directly.
+        let src: Vec<F128> = (0..64 * 3)
+            .map(|i| F128 {
+                lo: i as u64 * 7 + 1,
+                hi: (i as u64) << 40,
+            })
+            .collect();
+        for b0 in 0..64 {
+            let mut w = [F128::ZERO; 64];
+            w[b0] = F128::ONE;
+            let mut got = vec![F128::ZERO; 3];
+            fold64_packed_banks(&src, &mut got, &w);
+            for t in 0..3 {
+                assert_eq!(got[t], src[64 * t + b0], "one-hot bank {b0}");
+            }
+        }
+    }
+
     /// AVX-512 (or portable) bind must match the scalar oracle at every
     /// ranked factor-state length plus a 4-element tail that misses the
     /// 8-output SIMD body.
@@ -553,6 +606,46 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             let mut v = F128::ZERO;
             for b in 0..16 {
                 v += w[b] * src[16 * t + b];
+            }
+            *value = v;
+        }
+    }
+}
+
+/// Sixty-four-bank weighted fold: `dst[t] = Σ_{b<64} w[b]·src[64t+b]`.
+///
+/// The Sapphire Rapids leaf keeps the four adjacent-bank products in ZMM
+/// lanes, horizontally folds their unreduced sums, and performs one reduction
+/// per output. Other targets use the exact scalar definition.
+#[inline]
+pub(crate) fn fold64_packed_banks(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold64 source must contain sixty-four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all sixty-four source elements per output.
+    unsafe {
+        x86_64::fold64_packed_banks(src, dst, w);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let mut v = F128::ZERO;
+            for b in 0..64 {
+                v += w[b] * src[64 * t + b];
             }
             *value = v;
         }

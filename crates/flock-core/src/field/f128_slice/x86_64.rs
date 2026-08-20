@@ -240,6 +240,156 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Sixty-four-bank weighted fold in the source's native slot-major layout:
+/// `dst[t] = Σ_{b<64} w[b] · src[64t + b]`.
+///
+/// Four adjacent banks occupy the four F128 lanes of one ZMM.  Their four
+/// distinct weights are packed the same way, so sixteen vector products cover
+/// all sixty-four banks without transposing banks into output lanes.  The four
+/// lane accumulators are XOR-folded before the one final field reduction.
+/// Keeping the sixteen packed weight vectors live has the same register cost
+/// as [`fold16_banked`]'s sixteen broadcast weights; unlike the rejected
+/// output-lane Fold64 shape it never needs sixty-four broadcasts per output
+/// tile or a materialized four-value intermediate.
+///
+/// Two outputs are interleaved to hide the VPCLMUL dependency chain while
+/// leaving ample registers for all sixteen weights and both three-ZMM wide
+/// accumulators.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 64 * dst.len()`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold64_packed_banks(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        // Resolve the shared LazyLock before making the sixteen packed
+        // weights live. On the cold initialization edge this avoids spilling
+        // a full 1 KiB weight set around the runtime initializer.
+        let pf_ahead = fold16_pf_ahead();
+
+        // Keep these as named values rather than an indexed array. LLVM then
+        // assigns the sixteen loop-invariant packed weights to zmm0..zmm15;
+        // an indexed `[__m512i; 16]` is instead copied to a 1 KiB stack slot
+        // and reread in the hot loop.
+        macro_rules! load_weight {
+            ($q:literal) => {
+                _mm512_loadu_si512(w.as_ptr().add(4 * $q).cast::<__m512i>())
+            };
+        }
+        let w0 = load_weight!(0);
+        let w1 = load_weight!(1);
+        let w2 = load_weight!(2);
+        let w3 = load_weight!(3);
+        let w4 = load_weight!(4);
+        let w5 = load_weight!(5);
+        let w6 = load_weight!(6);
+        let w7 = load_weight!(7);
+        let w8 = load_weight!(8);
+        let w9 = load_weight!(9);
+        let w10 = load_weight!(10);
+        let w11 = load_weight!(11);
+        let w12 = load_weight!(12);
+        let w13 = load_weight!(13);
+        let w14 = load_weight!(14);
+        let w15 = load_weight!(15);
+
+        // Preserve the promoted fold16 source-prefetch cadence. This loop
+        // consumes two adjacent 1 KiB final-output slabs at a time, so one
+        // pair iteration asks for the same thirty-two T0 cache lines that two
+        // incumbent fold16 iterations requested sixteen at a time. The
+        // distance and both environment overrides remain shared exactly.
+        let pair_pf_limit = src.len().saturating_sub(128);
+        let pairs = dst.len() & !1;
+        let mut t = 0usize;
+        while t < pairs {
+            if pf_ahead != 0 {
+                let ahead = 64 * t + pf_ahead;
+                if ahead <= pair_pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut l = 0usize;
+                    while l < 2048 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        l += 64;
+                    }
+                }
+            }
+            let mut acc0 = WideGhashX4::zero();
+            let mut acc1 = WideGhashX4::zero();
+            let p0 = src.as_ptr().add(64 * t);
+            let p1 = p0.add(64);
+            macro_rules! mul_pair {
+                ($q:literal, $weight:expr) => {{
+                    let x0 = _mm512_loadu_si512(p0.add(4 * $q).cast::<__m512i>());
+                    let x1 = _mm512_loadu_si512(p1.add(4 * $q).cast::<__m512i>());
+                    acc0.mul_acc_ordered(x0, $weight);
+                    acc1.mul_acc_ordered(x1, $weight);
+                }};
+            }
+            mul_pair!(0, w0);
+            mul_pair!(1, w1);
+            mul_pair!(2, w2);
+            mul_pair!(3, w3);
+            mul_pair!(4, w4);
+            mul_pair!(5, w5);
+            mul_pair!(6, w6);
+            mul_pair!(7, w7);
+            mul_pair!(8, w8);
+            mul_pair!(9, w9);
+            mul_pair!(10, w10);
+            mul_pair!(11, w11);
+            mul_pair!(12, w12);
+            mul_pair!(13, w13);
+            mul_pair!(14, w14);
+            mul_pair!(15, w15);
+            dst[t] = acc0.fold().reduce();
+            dst[t + 1] = acc1.fold().reduce();
+            t += 2;
+        }
+        if t < dst.len() {
+            if pf_ahead != 0 {
+                let ahead = 64 * t + pf_ahead;
+                let one_pf_limit = src.len().saturating_sub(64);
+                if ahead <= one_pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut l = 0usize;
+                    while l < 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        l += 64;
+                    }
+                }
+            }
+            let mut acc = WideGhashX4::zero();
+            let p = src.as_ptr().add(64 * t);
+            macro_rules! mul_one {
+                ($q:literal, $weight:expr) => {{
+                    let x = _mm512_loadu_si512(p.add(4 * $q).cast::<__m512i>());
+                    acc.mul_acc_ordered(x, $weight);
+                }};
+            }
+            mul_one!(0, w0);
+            mul_one!(1, w1);
+            mul_one!(2, w2);
+            mul_one!(3, w3);
+            mul_one!(4, w4);
+            mul_one!(5, w5);
+            mul_one!(6, w6);
+            mul_one!(7, w7);
+            mul_one!(8, w8);
+            mul_one!(9, w9);
+            mul_one!(10, w10);
+            mul_one!(11, w11);
+            mul_one!(12, w12);
+            mul_one!(13, w13);
+            mul_one!(14, w14);
+            mul_one!(15, w15);
+            dst[t] = acc.fold().reduce();
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.
