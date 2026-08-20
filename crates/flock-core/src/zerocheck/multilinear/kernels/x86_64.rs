@@ -785,7 +785,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         // Input look-ahead, resolved once per worker chunk (never inside the
         // loop). One body consumes 64 F128 from each side.
         let pf_on = zc_tail_pf_enabled();
-        const PF_OFF: usize = ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
+        let pf_off = zc_tail_pf_off();
 
         while x_lo + 8 <= lo_size {
             let output = 2 * x_lo;
@@ -793,8 +793,8 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
             if pf_on {
-                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
-                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+                let pa = a_src.cast::<i8>().wrapping_add(pf_off);
+                let pb = b_src.cast::<i8>().wrapping_add(pf_off);
                 for l in 0..16 {
                     _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
                     _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
@@ -1046,9 +1046,54 @@ pub(crate) fn zc_tail_pf_enabled() -> bool {
 
 /// Look-ahead, in loop bodies, for the composed tail fold's input prefetch.
 /// One body consumes sixteen lines from each of `a` and `b`, so the hint for
-/// body `T + ZC_TAIL_PF_TILES` is issued at the head of body `T` and every
-/// line is still requested exactly once — only earlier.
-const ZC_TAIL_PF_TILES: usize = 3;
+/// body `T + tiles` is issued at the head of body `T` and every line is still
+/// requested exactly once — only earlier.
+///
+/// **Why one and not three.** Three was inherited from [`ZC_PKT_PF_TILES`],
+/// whose value is justified by an instruction-count argument that does not
+/// carry over. That argument: the packed-row body leaves only ~860
+/// post-prefetch instructions, ~500 cycles, between the hint and the demand
+/// load, which is the same order as a loaded miss — so one tile is too near
+/// and three are needed.
+///
+/// This body is far larger. Measured on a `-C target-cpu=sapphirerapids`
+/// build of the ranked worker, the composed tail fold's loop is **2 664
+/// instructions**, with the first of its thirty-two hints at offset 442, so
+/// **~2 190 instructions — ~1 270 cycles at the same ~1.72 IPC the packed-row
+/// analysis assumes — already separate the hint from the load inside a single
+/// body.** That is 2.5-4x a loaded miss, so one tile covers the latency on
+/// its own and the extra two only buy residency.
+///
+/// They are not free. Each tile in flight holds 16 lines of `a` plus 16 of
+/// `b`, so three tiles keep 6 KiB prefetched-but-untouched for thousands of
+/// cycles, against a 48 KiB L1D shared by the runner's two SMT threads —
+/// about a quarter of the effective capacity, competing with the body's own
+/// working set.
+const ZC_TAIL_PF_TILES_NEAR: usize = 1;
+
+/// The inherited three-tile distance, restored by `FLOCK_NO_ZC_TAIL_PF_NEAR=1`.
+const ZC_TAIL_PF_TILES_FAR: usize = 3;
+
+/// `FLOCK_NO_ZC_TAIL_PF_NEAR=1` restores the inherited three-body look-ahead
+/// (exact same-binary A/B; only the hinted address changes, and a prefetch has
+/// no architectural effect).
+pub(crate) fn zc_tail_pf_near_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_PF_NEAR").is_none());
+    *ON
+}
+
+/// Look-ahead in bytes, resolved once per worker chunk. Out of line so the
+/// one-shot switch read cannot be inlined into the fold kernel's prologue.
+#[inline(never)]
+pub(crate) fn zc_tail_pf_off() -> usize {
+    let tiles = if zc_tail_pf_near_enabled() {
+        ZC_TAIL_PF_TILES_NEAR
+    } else {
+        ZC_TAIL_PF_TILES_FAR
+    };
+    tiles * 64 * core::mem::size_of::<F128>()
+}
 
 /// `FLOCK_NO_ZC_TAIL_NT=1` restores plain write-allocate stores for the
 /// composed tail fold's outputs (exact same-binary A/B).
