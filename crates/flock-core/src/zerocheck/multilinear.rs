@@ -4081,6 +4081,57 @@ mod tests {
                 assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
                 assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
                 assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+
+                // Exercise all four independently selected NT alignment
+                // leaves. Four consecutive F128 offsets cover every 16-byte
+                // residue modulo 64 regardless of the allocator's base.
+                for (a_zmm, b_zmm) in [
+                    (false, false),
+                    (false, true),
+                    (true, false),
+                    (true, true),
+                ] {
+                    let out_len = 2 * lo_size;
+                    let mut a_backing = vec![F128::ONE; out_len + 4];
+                    let mut b_backing = vec![F128::ONE; out_len + 4];
+                    let a_offset = (0..4)
+                        .find(|&i| {
+                            let aligned = (unsafe { a_backing.as_ptr().add(i) } as usize)
+                                .is_multiple_of(64);
+                            aligned == a_zmm
+                        })
+                        .unwrap();
+                    let b_offset = (0..4)
+                        .find(|&i| {
+                            let aligned = (unsafe { b_backing.as_ptr().add(i) } as usize)
+                                .is_multiple_of(64);
+                            aligned == b_zmm
+                        })
+                        .unwrap();
+                    let a_nt = &mut a_backing[a_offset..a_offset + out_len];
+                    let b_nt = &mut b_backing[b_offset..b_offset + out_len];
+                    // SAFETY: same checked geometry and exact w-pair table;
+                    // the chosen slices explicitly cover each alignment mode.
+                    let out_nt = unsafe {
+                        kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                            &a_in,
+                            &b_in,
+                            a_nt,
+                            b_nt,
+                            rho_a,
+                            rho_b,
+                            &eq_lo,
+                            Some(&wtab),
+                            true,
+                        )
+                    };
+                    assert_eq!(a_s, a_nt, "NT a lo_size={lo_size} az={a_zmm} bz={b_zmm}");
+                    assert_eq!(b_s, b_nt, "NT b lo_size={lo_size} az={a_zmm} bz={b_zmm}");
+                    assert_eq!(
+                        out_s, out_nt,
+                        "NT sums lo_size={lo_size} az={a_zmm} bz={b_zmm}"
+                    );
+                }
             }
         }
     }
