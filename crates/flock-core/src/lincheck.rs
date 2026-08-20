@@ -125,7 +125,7 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-mod kernels;
+pub(crate) mod kernels;
 
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;

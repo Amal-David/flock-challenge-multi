@@ -512,38 +512,36 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::pcs::ranked_direct_fold4_enabled(),
                 "identity-C reuse requires ranked DirectFold4"
             );
-            // The two halves are independent (round one has no Fiat-Shamir
-            // dependency inside it), so run them concurrently rather than
-            // back to back: each alone reaches only ~35 GB/s, while the pair
-            // interleaved recovers the fused kernel's stream-level
-            // parallelism over the same total bytes.
+            // Fuse identity-C's block-major read into the AB window walk.
+            // At this shape every AB window names four consecutive packed
+            // witness words and their complete C outer weight, so one sweep
+            // produces AB plus the C inner fold and deletes the competing
+            // row-strided witness pass.
             let t_r1 = std::time::Instant::now();
-            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, t_c_ms)) = rayon::join(
-                || {
-                    let t = std::time::Instant::now();
-                    let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                        ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
-                    );
-                    (ab, t.elapsed().as_secs_f64() * 1e3)
-                },
-                || {
-                    let t = std::time::Instant::now();
-                    let (c, s_hat_v_c, quad, fold4) =
-                        crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
-                            c_identity_z,
-                            m,
-                            padding.k_log,
-                            k_skip,
-                            padding.useful_bits_per_block,
-                            &r,
-                            inv_table,
-                        );
-                    (c, s_hat_v_c, quad, fold4, t.elapsed().as_secs_f64() * 1e3)
-                },
+            let (ab, c_inner) = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                ab_inner,
+                a_packed,
+                b_packed,
+                c_identity_z,
+                m,
+                padding.k_log,
+                k_skip,
+                &r,
+                inv_table,
+                padding,
             );
+            let t_sweep_ms = t_r1.elapsed().as_secs_f64() * 1e3;
+            let (c, s_hat_v_c, quad, fold4) =
+                crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_inner(
+                    &c_inner,
+                    padding.k_log,
+                    k_skip,
+                    &r,
+                    inv_table,
+                );
             if zc_timing {
                 eprintln!(
-                    "[zc-timing] round1 AB {t_ab_ms:.2} ms || identity-C fold {t_c_ms:.2} ms -> {:.2} ms",
+                    "[zc-timing] round1 fused AB+identity-C {t_sweep_ms:.2} ms -> {:.2} ms",
                     t_r1.elapsed().as_secs_f64() * 1e3
                 );
             }

@@ -1334,3 +1334,47 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
         }
     }
 }
+
+/// AVX-512 masked-XOR expansion of four packed 128-bit witness words into
+/// 512 F128 accumulator lanes. One ZMM covers four output lanes; a four-bit
+/// input nibble expands to the eight qword mask bits selecting both halves of
+/// each F128. The output remains hot in the worker's private 256 KiB buffer.
+#[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn accumulate_identity_c_words_x86_avx512(
+    words: &[F128; 4],
+    weight: F128,
+    out: &mut [F128; 512],
+) {
+    use core::arch::x86_64::*;
+    const MASKS: [u8; 16] = [
+        0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf,
+        0xf0, 0xf3, 0xfc, 0xff,
+    ];
+    // SAFETY: 128 ZMM loads/stores cover exactly 512 F128 lanes. Every mask
+    // selects a complete (lo, hi) qword pair for one packed witness bit.
+    unsafe {
+        let w = _mm512_set_epi64(
+            weight.hi as i64,
+            weight.lo as i64,
+            weight.hi as i64,
+            weight.lo as i64,
+            weight.hi as i64,
+            weight.lo as i64,
+            weight.hi as i64,
+            weight.lo as i64,
+        );
+        let dst = out.as_mut_ptr().cast::<__m512i>();
+        for (word_idx, word) in words.iter().enumerate() {
+            for (half_idx, half) in [word.lo, word.hi].into_iter().enumerate() {
+                for nibble in 0..16usize {
+                    let mask = MASKS[((half >> (4 * nibble)) & 0xf) as usize];
+                    let z = dst.add(word_idx * 32 + half_idx * 16 + nibble);
+                    let cur = _mm512_loadu_si512(z);
+                    _mm512_storeu_si512(z, _mm512_mask_xor_epi64(cur, mask, cur, w));
+                }
+            }
+        }
+    }
+}

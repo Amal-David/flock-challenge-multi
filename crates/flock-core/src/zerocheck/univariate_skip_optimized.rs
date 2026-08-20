@@ -2387,17 +2387,161 @@ pub(crate) struct WorkerStateAbOnly {
     plane_banks: Vec<u8>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
+    local_c_inner: Vec<F128>,
+    local_c_planes: Vec<u8>,
+    c_planes_seeded: bool,
 }
 
 impl WorkerStateAbOnly {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(k: usize, c_gfni: bool) -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
+            local_c_inner: if c_gfni {
+                Vec::new()
+            } else {
+                vec![F128::ZERO; k]
+            },
+            local_c_planes: if c_gfni {
+                vec![0u8; k * 16]
+            } else {
+                Vec::new()
+            },
+            c_planes_seeded: false,
         }
     }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn accumulate_identity_c_tile_gfni(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    useful_bits: usize,
+    block_base: usize,
+    eq64: &[F128],
+    out_planes: &mut [u8],
+    seed_zero: bool,
+) {
+    debug_assert_eq!(eq64.len(), 64);
+    debug_assert_eq!(out_planes.len(), chunks_per_block * 128 * 16);
+    let useful_chunks = useful_bits.div_ceil(128);
+    let mut mats = [0u64; 128];
+    for t in 0..8 {
+        crate::lincheck::kernels::fold_mats_from_basis(
+            (&eq64[8 * t..8 * (t + 1)]).try_into().expect("eight C weights"),
+            &mut mats[16 * t..16 * (t + 1)],
+        );
+    }
+
+    // Four adjacent packed columns share one 64-byte cache line in every
+    // witness row. Gather all four per visit before moving to the next row,
+    // then drain four GFNI column slabs from the staging tile.
+    let mut transposed = [0u8; 4096];
+    let full_chunks = useful_bits / 128;
+    let mut q = 0usize;
+    while q + 4 <= full_chunks {
+        for t in 0..8 {
+            // Match the standalone fold's two-visit look-ahead. Each hint
+            // names the line this stripe will consume at q+8; the current
+            // VBMI transpose/GFNI drain supplies its miss latency.
+            let qn = q + 8;
+            if qn <= full_chunks && qn < chunks_per_block {
+                unsafe {
+                    for r in 0..8 {
+                        core::arch::x86_64::_mm_prefetch(
+                            z_packed
+                                .as_ptr()
+                                .add((block_base + 8 * t + r) * chunks_per_block + qn)
+                                .cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+            // SAFETY: the 8-row stripe and q..q+4 are within this 64-block
+            // tile and each column slab owns 1024 bytes.
+            unsafe {
+                crate::lincheck::kernels::gather_transpose_stripe4_x86(
+                    z_packed
+                        .as_ptr()
+                        .add((block_base + 8 * t) * chunks_per_block + q),
+                    chunks_per_block,
+                    transposed.as_mut_ptr().add(t * 128),
+                    1024,
+                );
+            }
+        }
+        for c in 0..4 {
+            // SAFETY: each slab contains eight 128-byte stripes; the plane
+            // destination covers both 64-column blocks of this packed word.
+            unsafe {
+                crate::lincheck::kernels::gfni_fold_tile(
+                    transposed.as_ptr().add(c * 1024),
+                    128,
+                    2,
+                    &mats,
+                    out_planes.as_mut_ptr().add(2 * (q + c) * 1024),
+                    seed_zero,
+                );
+            }
+        }
+        q += 4;
+    }
+    while q < useful_chunks {
+        let chunk_bits = (useful_bits - q * 128).min(128);
+        for t in 0..8 {
+            // SAFETY: identical row/column addresses to the scalar fold;
+            // transposed owns one 128-byte stripe per t.
+            unsafe {
+                crate::lincheck::kernels::gather_transpose_stripe_x86(
+                    z_packed
+                        .as_ptr()
+                        .add((block_base + 8 * t) * chunks_per_block + q),
+                    chunks_per_block,
+                    transposed.as_mut_ptr().add(t * 128),
+                );
+            }
+        }
+        // SAFETY: the ragged chunk touches ceil(chunk_bits/64) complete
+        // plane banks; padded witness bits beyond useful_bits are zero.
+        unsafe {
+            crate::lincheck::kernels::gfni_fold_tile(
+                transposed.as_ptr(),
+                128,
+                chunk_bits.div_ceil(64),
+                &mats,
+                out_planes.as_mut_ptr().add(2 * q * 1024),
+                seed_zero,
+            );
+        }
+        q += 1;
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+)))]
+#[allow(clippy::too_many_arguments)]
+fn accumulate_identity_c_tile_gfni(
+    _z_packed: &[F128],
+    _chunks_per_block: usize,
+    _useful_bits: usize,
+    _block_base: usize,
+    _eq64: &[F128],
+    _out_planes: &mut [u8],
+    _seed_zero: bool,
+) {
+    unreachable!("GFNI identity-C tile called without its target features")
 }
 
 /// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
@@ -2414,6 +2558,11 @@ fn process_one_x_hi_ab_only(
     eq_hi_val: F128,
     convert: &[F128],
     eq_fold: Option<(&[F128], &[u64], usize)>,
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    eq_c_outer: &[F128],
+    useful_c_bits: usize,
+    c_gfni: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
@@ -2474,6 +2623,28 @@ fn process_one_x_hi_ab_only(
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+
+            // Ranked identity-C fusion. The AB outer index carries one more
+            // low bit than the block-major C fold: `x_outer >> 1` is the
+            // witness block and bit zero selects one of its two 8192-bit
+            // halves. A b_med window is four consecutive packed F128 words
+            // and 512 consecutive output columns. Accumulate the already-
+            // complete outer equality weight directly into the worker's
+            // private 256 KiB C table, deleting the separate witness pass.
+            if !c_gfni {
+                let block = x_outer >> 1;
+                let q = ((x_outer & 1) << 6) + b_med * 4;
+                let words: &[F128; 4] = z_packed
+                    [block * chunks_per_block + q..block * chunks_per_block + q + 4]
+                    .try_into()
+                    .expect("one identity-C window is four packed words");
+                let inner_base = ((x_outer & 1) << 13) + b_med * 512;
+                let out: &mut [F128; 512] = (&mut state.local_c_inner
+                    [inner_base..inner_base + 512])
+                    .try_into()
+                    .expect("one identity-C window is 512 inner lanes");
+                kernels::accumulate_identity_c_words(words, eq_c_outer[block], out);
+            }
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -2522,6 +2693,26 @@ fn process_one_x_hi_ab_only(
                 &mut state.partial_ab,
             );
         }
+
+        // At the ranked split, 128 consecutive AB windows are exactly both
+        // 8192-bit halves of 64 consecutive witness blocks. Fold that tile
+        // now, between AB bursts, using the same GFNI plane accumulator as
+        // the standalone lincheck sweep. This preserves its 64-row register
+        // reduction and avoids the 128x write amplification of expanding one
+        // packed row at a time.
+        if c_gfni && (x_outer_lo + 1) % 128 == 0 {
+            let block_base = (x_outer >> 1) + 1 - 64;
+            accumulate_identity_c_tile_gfni(
+                z_packed,
+                chunks_per_block,
+                useful_c_bits,
+                block_base,
+                &eq_c_outer[block_base..block_base + 64],
+                &mut state.local_c_planes,
+                !state.c_planes_seeded,
+            );
+            state.c_planes_seeded = true;
+        }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
         // Plane-major → F128 through the same vectorized kernel the C drain
@@ -2553,12 +2744,14 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     ab_inner: &mut Round1AbInner,
     a_packed: &[u8],
     b_packed: &[u8],
+    z_packed: &[F128],
     m: usize,
+    k_log: usize,
     k_skip: usize,
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> Vec<F128> {
+) -> (Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
@@ -2566,6 +2759,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
     assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(k_log, k_skip + N_INNER + 1, "fused identity-C fixes one retained outer bit");
+    let k = 1usize << k_log;
+    let chunks_per_block = k / 128;
+    assert_eq!(z_packed.len(), (1usize << (m - k_log)) * chunks_per_block);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
@@ -2577,6 +2774,21 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let eq_c_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    let c_gfni = big_lo_size >= 128 && big_lo_size % 128 == 0;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    let c_gfni = false;
     let ab_inner_bytes = ab_inner.as_bytes();
     #[cfg(all(
         target_arch = "x86_64",
@@ -2591,9 +2803,9 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
         (eq_bot, mats, bank_bits)
     });
-    let res_ab = (0..hi_size)
+    let (res_ab, mut c_inner, c_planes) = (0..hi_size)
         .into_par_iter()
-        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+        .fold(|| WorkerStateAbOnly::new(k, c_gfni), |mut state, x_hi| {
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -2621,21 +2833,58 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 eq.hi[x_hi],
                 convert,
                 eq_fold_arg,
+                z_packed,
+                chunks_per_block,
+                &eq_c_outer,
+                padding.useful_bits_per_block,
+                c_gfni,
                 &mut state,
             );
             state
         })
-        .map(|s| s.local_res_ab)
+        .map(|s| (s.local_res_ab, s.local_c_inner, s.local_c_planes))
         .reduce(
-            || [F128::ZERO; ELL],
-            |mut ab1, ab2| {
+            || {
+                (
+                    [F128::ZERO; ELL],
+                    if c_gfni {
+                        Vec::new()
+                    } else {
+                        vec![F128::ZERO; k]
+                    },
+                    if c_gfni {
+                        vec![0u8; k * 16]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            },
+            |(mut ab1, mut c1, mut p1), (ab2, c2, p2)| {
                 for i in 0..ELL {
                     ab1[i] += ab2[i];
                 }
-                ab1
+                for (left, right) in c1.iter_mut().zip(c2) {
+                    *left += right;
+                }
+                for (left, right) in p1.iter_mut().zip(p2) {
+                    *left ^= right;
+                }
+                (ab1, c1, p1)
             },
         );
-    res_ab.to_vec()
+    if c_gfni {
+        c_inner = vec![F128::ZERO; k];
+        for (bank, lanes) in c_planes
+            .chunks_exact(16 * ELL)
+            .zip(c_inner.chunks_exact_mut(ELL))
+        {
+            kernels::c_plane_bank_to_f128(
+                bank.try_into().expect("one 16-plane identity-C bank"),
+                lanes.try_into().expect("one 64-lane identity-C block"),
+            );
+        }
+    }
+    (res_ab.to_vec(), c_inner)
 }
 
 /// Derive the exact legacy round-one C message and its RingSwitch capture
@@ -2669,6 +2918,24 @@ pub fn round1_c_fold4_from_block_major_z(
     let c_inner = crate::lincheck::partial_fold_packed_z_block_major_padded(
         z_packed, m, k_log, useful_bits, &eq_outer,
     );
+
+    round1_c_fold4_from_inner(&c_inner, k_log, k_skip, r, inv_table)
+}
+
+/// Finish the identity-C round-one message from its length-`2^k_log` inner
+/// fold. Kept separate so the ranked fused AB/C sweep can feed the same exact
+/// RingSwitch tail without re-reading the block-major witness.
+pub(crate) fn round1_c_fold4_from_inner(
+    c_inner: &[F128],
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(c_inner.len(), 1usize << k_log);
+    assert_eq!(k_skip, K_SKIP);
+    assert!(k_log >= k_skip + 5);
+    assert_eq!(inv_table.k, k_skip);
 
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
@@ -3791,11 +4058,24 @@ mod tests {
             let mut precomputed_ab_only = precompute_round1_ab_inner_packed_padded(
                 &a_p, &b_p, m, K_SKIP, &table, &padding,
             );
-            let ab_new = round1_shift_reduce_ab_packed_padded_with_precomputed(
-                &mut precomputed_ab_only, &a_p, &b_p, m, K_SKIP, &r, &table, &padding,
+            let (ab_new, c_inner_new) = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &mut precomputed_ab_only,
+                &a_p,
+                &b_p,
+                &c_words,
+                m,
+                K_LOG,
+                K_SKIP,
+                &r,
+                &table,
+                &padding,
             );
-            let (c_new, s_hat_new, quad_new, fold4_new) = round1_c_fold4_from_block_major_z(
-                &c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table,
+            let (c_new, s_hat_new, quad_new, fold4_new) = round1_c_fold4_from_inner(
+                &c_inner_new,
+                K_LOG,
+                K_SKIP,
+                &r,
+                &table,
             );
 
             assert_eq!(ab_new, ab_ref, "AB-only mismatch at m={m} useful={useful_bits}");

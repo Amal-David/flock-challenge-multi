@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{F128, F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -101,6 +101,39 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
         )
     )))]
     portable::bit_transpose_64bytes_scalar(input, output);
+}
+
+/// Accumulate four packed witness words into 512 consecutive identity-C
+/// columns. Bit `i` selects whether `weight` is XORed into output lane `i`.
+/// This is the direct block-major equivalent of folding those columns at one
+/// outer equality-table entry.
+#[inline]
+pub(super) fn accumulate_identity_c_words(
+    words: &[F128; 4],
+    weight: F128,
+    out: &mut [F128; 512],
+) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    // SAFETY: the cfg gate supplies AVX-512F and the fixed arrays cover all
+    // four input words and 512 output lanes.
+    unsafe {
+        x86_64::accumulate_identity_c_words_x86_avx512(words, weight, out);
+        return;
+    }
+
+    #[allow(unreachable_code)]
+    for (word_idx, word) in words.iter().enumerate() {
+        for bit in 0..128 {
+            let set = if bit < 64 {
+                (word.lo >> bit) & 1
+            } else {
+                (word.hi >> (bit - 64)) & 1
+            };
+            if set != 0 {
+                out[word_idx * 128 + bit] += weight;
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
