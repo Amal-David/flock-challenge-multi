@@ -4162,6 +4162,21 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_MDF8_PF=1` restores DirectFold8 b-side `fold_one_slot` with no
+/// software prefetch of the next 8 MiB f-slab. Same-binary A/B: a prefetch is
+/// a hint, so both arms are bit-identical. This is the promoted DF4 schedule
+/// (`FLOCK_NO_MDF4_PF`) on the DF8 materializer that did not exist when DF4
+/// prefetch landed — not a retry of killed NTT deep-pf / fused-4 first-touch.
+/// Ranked DF8: 64 blocks × 8 MiB; one T1 line per 4-slot iteration covers
+/// 256 KiB of the next slab (same L2-pollution bound as DF4; two lines
+/// evicted the 64 KiB composed table there).
+#[cfg(target_arch = "x86_64")]
+fn mdf8_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF8_PF").is_none());
+    *ON
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -5504,6 +5519,10 @@ fn materialize_direct_fold8(
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
+    #[cfg(target_arch = "x86_64")]
+    let n_blocks = out_len / block_len;
+    #[cfg(target_arch = "x86_64")]
+    let pf_on = mdf8_pf_enabled();
     let stats = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -5524,6 +5543,25 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
+                // Next-block f-slab for the b-side prefetch window. Null when
+                // this is the last block or the kill switch is set. The slab
+                // is `64 * block_len` field elements = 8 MiB at the ranked
+                // shape; `block + 1 < n_blocks` keeps the pointer inside
+                // `packed_witness`.
+                #[cfg(target_arch = "x86_64")]
+                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                    // SAFETY: bounds argued above; the pointer is never
+                    // dereferenced, only passed to `_mm_prefetch`.
+                    let p = unsafe { packed_witness.as_ptr().add(start + 64 * block_len) };
+                    (
+                        p.cast::<u8>(),
+                        64 * block_len * core::mem::size_of::<F128>(),
+                    )
+                } else {
+                    (core::ptr::null::<u8>(), 0usize)
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut pf_at = 0usize;
                 // Deferred-reduction 16-bank fold followed by one nested
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
@@ -5558,19 +5596,78 @@ fn materialize_direct_fold8(
                     first_claim.eq_hi[block],
                     scratch,
                 );
-                for slot in 0..block_len {
+                // Four-wide assign/add is the DF4 b-side stride: four
+                // independent `fold_one_slot` results, XOR-associative so
+                // the scalar 1-slot loop is bit-identical. One T1 line of
+                // the next f-slab per iteration (same depth as MDF4_PF).
+                let mut s = 0usize;
+                while s + 3 < block_len {
+                    #[cfg(target_arch = "x86_64")]
+                    if !pf_base.is_null() && pf_at < pf_span {
+                        // SAFETY: `pf_at < pf_span` keeps the address inside
+                        // the next block's slab. Prefetch has no
+                        // architectural effect.
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                pf_base.add(pf_at).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T1,
+                            );
+                        }
+                        pf_at += 64;
+                    }
+                    let d0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[s], scratch);
+                    let d1 = super::ring_switch::fold_one_slot(first_claim.eq_lo[s + 1], scratch);
+                    let d2 = super::ring_switch::fold_one_slot(first_claim.eq_lo[s + 2], scratch);
+                    let d3 = super::ring_switch::fold_one_slot(first_claim.eq_lo[s + 3], scratch);
+                    if has_ordinary {
+                        b_out[s] += d0;
+                        b_out[s + 1] += d1;
+                        b_out[s + 2] += d2;
+                        b_out[s + 3] += d3;
+                    } else {
+                        b_out[s] = d0;
+                        b_out[s + 1] = d1;
+                        b_out[s + 2] = d2;
+                        b_out[s + 3] = d3;
+                    }
+                    s += 4;
+                }
+                while s < block_len {
                     let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + b_out[slot]
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[s], scratch);
+                    b_out[s] = if has_ordinary {
+                        direct + b_out[s]
                     } else {
                         direct
                     };
+                    s += 1;
                 }
                 for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                     super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                    let mut s = 0usize;
+                    while s + 3 < block_len {
+                        #[cfg(target_arch = "x86_64")]
+                        if !pf_base.is_null() && pf_at < pf_span {
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    pf_base.add(pf_at).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_at += 64;
+                        }
+                        b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], scratch);
+                        b_out[s + 1] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], scratch);
+                        b_out[s + 2] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], scratch);
+                        b_out[s + 3] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], scratch);
+                        s += 4;
+                    }
+                    while s < block_len {
+                        b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], scratch);
+                        s += 1;
                     }
                 }
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -6915,7 +7012,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 n_next,
                 ood_count(i + 2),
                 sc_prover.f().len(),
-                direct_fold4_mode,
+                // L1 already passes `direct_fold4_mode || direct_fold8_mode`.
+                // Ranked production enters recursive open through DF8, so
+                // `direct_fold4_mode` is false and the promoted deep lazy-OOD
+                // path (n=16/13/10/7) never fired. Same condition as L1.
+                direct_fold4_mode || direct_fold8_mode,
             );
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);

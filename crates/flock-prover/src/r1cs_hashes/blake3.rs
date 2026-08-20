@@ -641,6 +641,16 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 // positions (cv_bit/m_bit/etc.).
 // ---------------------------------------------------------------------------
 
+/// `FLOCK_NO_LC_FOLD_ALPHA_SPINE=1` restores the O(n²) prefix XORs inside
+/// [`scatter_add_carry_rows`]. Default: one reverse suffix scan, because
+/// F128 add is XOR so `comb[j] += XOR_{i>j} ea_i` equals the nested
+/// `for j in 0..i` loops. Ranked env is cleared.
+fn fold_alpha_spine_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FOLD_ALPHA_SPINE").is_none());
+    *ON
+}
+
 #[inline]
 fn scatter_add_carry_rows(
     comb: &mut [F128],
@@ -650,22 +660,51 @@ fn scatter_add_carry_rows(
     y: &Word,
     carry_base: usize,
 ) -> Word {
+    if !fold_alpha_spine_enabled() {
+        for i in 0..CARRY_BITS_PER_ADD {
+            let row = carry_base + i;
+            let e = eq_inner[row];
+            let ea = alpha * e;
+            for &slot in x.bits[i].iter() {
+                comb[slot] += ea;
+            }
+            for j in 0..i {
+                comb[carry_base + j] += ea;
+            }
+            for &slot in y.bits[i].iter() {
+                comb[slot] += e;
+            }
+            for j in 0..i {
+                comb[carry_base + j] += e;
+            }
+        }
+        return Word::add_sum(x, y, carry_base);
+    }
+    // Irregular scatters stay in the i-loop. The consecutive carry spine
+    // `for j in 0..i { comb[carry_base+j] += ea_i; += e_i }` is the suffix
+    // XOR `comb[j] += XOR_{i>j} (ea_i + e_i)`.
+    let mut ea_i = [F128::ZERO; CARRY_BITS_PER_ADD];
+    let mut e_i = [F128::ZERO; CARRY_BITS_PER_ADD];
     for i in 0..CARRY_BITS_PER_ADD {
         let row = carry_base + i;
         let e = eq_inner[row];
         let ea = alpha * e;
+        ea_i[i] = ea;
+        e_i[i] = e;
         for &slot in x.bits[i].iter() {
             comb[slot] += ea;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += ea;
         }
         for &slot in y.bits[i].iter() {
             comb[slot] += e;
         }
-        for j in 0..i {
-            comb[carry_base + j] += e;
-        }
+    }
+    let mut acc_ea = F128::ZERO;
+    let mut acc_e = F128::ZERO;
+    for i in (0..CARRY_BITS_PER_ADD).rev() {
+        comb[carry_base + i] += acc_ea;
+        comb[carry_base + i] += acc_e;
+        acc_ea += ea_i[i];
+        acc_e += e_i[i];
     }
     Word::add_sum(x, y, carry_base)
 }
