@@ -2179,11 +2179,60 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
     }
 }
 
+/// Additive-NTT twiddle at `(layer, 0)` is the empty span sum, i.e. `F128::ZERO`.
+/// Then `s = a + b`, `a' = s`, `b' = 0·s + b = b`: XOR the top half, leave bot.
+/// `FLOCK_NO_TNT_ZERO_TWIDDLE=1` restores the general multiply in the same binary.
+#[inline]
+fn tnt_zero_twiddle_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_none());
+    *ON
+}
+
+/// `top[i] ^= bot[i]`. Bot is not written: the t=0 butterfly leaves it unchanged.
+#[inline]
+fn xor_assign_top(top: &mut [F128], bot: &[F128]) {
+    debug_assert_eq!(top.len(), bot.len());
+    #[cfg(all(target_feature = "avx512f"))]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: avx512f is cfg-guaranteed; slices have equal length.
+        unsafe {
+            let lanes = top.len() & !3;
+            let mut i = 0;
+            while i < lanes {
+                let va = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+                let vb = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                _mm512_storeu_si512(
+                    top.as_mut_ptr().add(i).cast::<__m512i>(),
+                    _mm512_xor_si512(va, vb),
+                );
+                i += 4;
+            }
+            while i < top.len() {
+                top[i] += bot[i];
+                i += 1;
+            }
+        }
+        return;
+    }
+    #[cfg(not(all(target_feature = "avx512f")))]
+    {
+        for (a_ref, &b) in top.iter_mut().zip(bot.iter()) {
+            *a_ref += b;
+        }
+    }
+}
+
 /// Scalar/vector transpose butterfly on two equal-length halves:
 /// `s = a + b; a' = s; b' = t·s + b`. Thin cfg wrapper so the schedulers
-/// below stay readable.
+/// below stay readable. Twiddle zero skips the multiply (bot is unchanged).
 #[inline(always)]
 fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
+    if tnt_zero_twiddle_enabled() && t == F128::ZERO {
+        xor_assign_top(top_h, bot);
+        return;
+    }
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
     // SAFETY: target features cfg-guaranteed; halves are equal-length.
     unsafe {
@@ -10299,6 +10348,44 @@ mod tests {
         assert!(!selected(20, 218, 8, false, true, false));
         assert!(!selected(20, 218, 8, true, false, false));
         assert!(!selected(20, 218, 8, true, true, true));
+    }
+
+    /// Additive-NTT `twiddle(layer, 0)` is the empty span sum.
+    #[test]
+    fn twiddle_block_zero_is_field_zero() {
+        for log_d in 4..=12 {
+            let ntt = AdditiveNttF128::standard(log_d);
+            for layer in 0..log_d {
+                assert_eq!(
+                    ntt.twiddle(layer, 0),
+                    F128::ZERO,
+                    "log_d={log_d} layer={layer}"
+                );
+            }
+        }
+    }
+
+    /// t=0 butterfly is XOR-top / bot-unchanged, matching the general form.
+    #[test]
+    fn zero_twiddle_transpose_matches_general_multiply() {
+        use crate::challenger::Challenger;
+        let mut ch = crate::challenger::RandomChallenger::new(0x7E80_71DD);
+        for &n in &[1usize, 2, 3, 4, 7, 8, 15, 16, 64, 255, 256, 1024] {
+            let mut top: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let bot: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let mut want_top = top.clone();
+            let mut want_bot = bot.clone();
+            for r in 0..n {
+                let s = want_top[r] + want_bot[r];
+                want_top[r] = s;
+                want_bot[r] = F128::ZERO * s + want_bot[r];
+            }
+            let mut got_bot = bot.clone();
+            transpose_butterfly(&mut top, &mut got_bot, F128::ZERO);
+            assert_eq!(top, want_top, "n={n} top");
+            assert_eq!(got_bot, want_bot, "n={n} bot");
+            assert_eq!(got_bot, bot, "n={n} bot must be unchanged");
+        }
     }
 
     /// The fused parallel densify must be BYTE-identical to the incumbent
