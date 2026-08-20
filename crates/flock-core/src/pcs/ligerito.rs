@@ -5454,6 +5454,20 @@ fn direct_fold8_final_generators(
     generators
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_b_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD8_B_GFNI").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5484,6 +5498,23 @@ fn materialize_direct_fold8(
         }
         weight
     });
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let b_gfni_candidate =
+        direct_fold8_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let b_gfni_candidate = false;
 
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
@@ -5496,10 +5527,33 @@ fn materialize_direct_fold8(
     let out_len = packed_witness.len() / 64;
     let block_len = claims[0].eq_lo.len();
     assert!(block_len.is_multiple_of(4));
+    // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
+    // geometries on the scalar path instead of reading through a short tail.
+    let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
     assert_eq!(out_len, block_len * claims[0].eq_hi.len());
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                (
+                    claim.eq_lo.iter().map(|x| x.lo).collect(),
+                    claim.eq_lo.iter().map(|x| x.hi).collect(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
@@ -5511,12 +5565,21 @@ fn materialize_direct_fold8(
         .map_init(
             || {
                 (
-                    vec![F128::ZERO; super::ring_switch::FOLD_TABLE_TOTAL],
+                    vec![
+                        F128::ZERO;
+                        if b_gfni_on {
+                            0
+                        } else {
+                            super::ring_switch::FOLD_TABLE_TOTAL
+                        }
+                    ],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
                     vec![F128::ZERO; 4 * SUB],
+                    vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
                 )
             },
-            |(scratch, mid16, mid4), (block, (b_out, f_out))| {
+            |(scratch, mid16, mid4, gfni_tmp), (block, (b_out, f_out))| {
+                let _ = &gfni_tmp;
                 let start = 64 * block * block_len;
                 let f_in = &packed_witness[start..start + 64 * block_len];
                 let b_in: &[F128] = if has_ordinary {
@@ -5551,26 +5614,74 @@ fn materialize_direct_fold8(
                     slot += n;
                 }
 
-                let (first_claim, rest_claims) = claims.split_first().unwrap();
-                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-                super::ring_switch::compose_block_table(
-                    first_table,
-                    first_claim.eq_hi[block],
-                    scratch,
-                );
-                for slot in 0..block_len {
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + b_out[slot]
-                    } else {
-                        direct
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                if b_gfni_on {
+                    use crate::zerocheck::multilinear::kernels::x86_64::{
+                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
+                    let (claim0, claim1) = (&claims[0], &claims[1]);
+                    let cols0 = super::ring_switch::compose_block_cols(
+                        &direct_tables[0], claim0.eq_hi[block],
+                    );
+                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let cols1 = super::ring_switch::compose_block_cols(
+                        &direct_tables[1], claim1.eq_hi[block],
+                    );
+                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    for slot in (0..block_len).step_by(64) {
+                        // SAFETY: each packed-u64 row half supplies 512 bytes;
+                        // both output buffers cover 64 F128s; cfg features hold.
+                        unsafe {
+                            gfni_fold64_four_maps_staged(
+                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_lo,
+                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_hi,
+                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_lo,
+                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_hi,
+                                b_out.as_mut_ptr().add(slot),
+                                gfni_tmp.as_mut_ptr().cast(),
+                            );
+                        }
+                    }
                 }
-                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-                    super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                if !b_gfni_on {
+                    let (first_claim, rest_claims) = claims.split_first().unwrap();
+                    let (first_table, _) = direct_tables.split_first().unwrap();
+                    super::ring_switch::compose_block_table(
+                        first_table,
+                        first_claim.eq_hi[block],
+                        scratch,
+                    );
+                    for slot in 0..block_len {
+                        let direct =
+                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                        b_out[slot] = if has_ordinary {
+                            direct + b_out[slot]
+                        } else {
+                            direct
+                        };
+                    }
+                    for (claim, table) in rest_claims.iter().zip(direct_tables.iter().skip(1)) {
+                        super::ring_switch::compose_block_table(
+                            table,
+                            claim.eq_hi[block],
+                            scratch,
+                        );
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                        }
                     }
                 }
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -11014,6 +11125,72 @@ mod tests {
         let ok =
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch);
         assert!(ok, "basis-based verifier rejected valid proof");
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_four_map_gfni_matches_fold_one_slot_sum() {
+        use crate::zerocheck::multilinear::kernels::x86_64::{
+            build_row_fold_mats, gfni_fold64_four_maps_staged,
+        };
+        let mut state = 0xB6F1_6408_5EED_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let tables: Vec<Vec<F128>> = (0..4)
+            .map(|_| {
+                let generators: Vec<F128> = (0..128)
+                    .map(|_| F128 {
+                        lo: next(),
+                        hi: next(),
+                    })
+                    .collect();
+                super::super::ring_switch::build_fold_byte_table(&generators)
+            })
+            .collect();
+        let values: Vec<Vec<u64>> = (0..4)
+            .map(|_| (0..64).map(|_| next()).collect())
+            .collect();
+        let mats: Vec<[u64; 128]> = tables
+            .iter()
+            .map(|table| build_row_fold_mats(&table[..8 * 256]))
+            .collect();
+        let mut got = vec![F128::ZERO; 64];
+        let mut planes = vec![F128::ZERO; 64];
+        // SAFETY: four exact 512-byte inputs, complete matrices, 64 outputs,
+        // sixteen-ZMM scratch, and cfg-guaranteed target features.
+        unsafe {
+            gfni_fold64_four_maps_staged(
+                values[0].as_ptr().cast::<u8>(),
+                &mats[0],
+                values[1].as_ptr().cast::<u8>(),
+                &mats[1],
+                values[2].as_ptr().cast::<u8>(),
+                &mats[2],
+                values[3].as_ptr().cast::<u8>(),
+                &mats[3],
+                got.as_mut_ptr(),
+                planes.as_mut_ptr().cast(),
+            );
+        }
+        for i in 0..64 {
+            let expect = (0..4).fold(F128::ZERO, |acc, map| {
+                acc + super::super::ring_switch::fold_one_slot(
+                    F128::new(values[map][i], 0),
+                    &tables[map],
+                )
+            });
+            assert_eq!(got[i], expect);
+        }
     }
 
     #[test]

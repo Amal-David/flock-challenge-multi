@@ -1951,9 +1951,8 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 /// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
 /// per block, amortized by the caller over ≥ 2048 fold evaluations.
 #[inline(always)]
-pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
+pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
-    debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
     // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
     let mut cols = [F128::ZERO; 128];
     let mut w = e_hi; // X^0 · e_hi
@@ -1961,6 +1960,13 @@ pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
         *c = fold_one_slot(w, base);
         w = crate::field::mul_by_x(w);
     }
+    cols
+}
+
+#[inline(always)]
+pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
+    debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
+    let cols = compose_block_cols(base, e_hi);
     // Expand each 8-column group into its 256-entry subset-sum table. Every
     // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
     // may be uninitialized on entry.
@@ -4852,6 +4858,32 @@ mod tests {
                     acc += fold_weight[d] * fold_one_slot(low_eq[d] * x, &base);
                 }
                 assert_eq!(fold_one_slot(x, &got), acc, "trial {trial} slot");
+            }
+        }
+    }
+
+    /// The GFNI materializer consumes the composed map's 128 columns
+    /// directly; expanding them remains an exact oracle for that shortcut.
+    #[test]
+    fn compose_block_cols_match_expanded_table() {
+        let mut rng = Rng::new(0xC011_5F01_D8);
+        for trial in 0..4 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_direct_fold8_table_from_generators(&generators);
+            let e_hi = rng.f128();
+            let cols = compose_block_cols(&base, e_hi);
+            let mut expanded = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+            compose_block_table(&base, e_hi, &mut expanded);
+            for (bit, &col) in cols.iter().enumerate() {
+                assert_eq!(expanded[(bit / 8) * 256 + (1 << (bit % 8))], col);
+            }
+            for _ in 0..32 {
+                let x = rng.f128();
+                assert_eq!(
+                    fold_one_slot(x, &expanded),
+                    fold_one_slot(x * e_hi, &base),
+                    "trial {trial}"
+                );
             }
         }
     }

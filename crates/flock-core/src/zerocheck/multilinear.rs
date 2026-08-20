@@ -43,7 +43,7 @@ use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
-mod kernels;
+pub(crate) mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
