@@ -1732,6 +1732,8 @@ fn generate_round1_inner_octa(
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    // Process-invariant selector: one read per proof, never per octa.
+    let wide_nt = blake3_witgen8::wide_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     let win_plan = flock_core::zerocheck::univariate_skip_optimized::
         prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
@@ -1844,6 +1846,7 @@ fn generate_round1_inner_octa(
                             proj,
                             elide,
                             z_nt,
+                            wide_nt,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same
