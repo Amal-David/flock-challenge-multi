@@ -569,6 +569,23 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool>(
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
+        // First-touch the 16 rows this group will demand-load at lane 0.
+        // Ranked seed-top calls this with `sixteenth = 4`, so those rows sit
+        // exactly 4 KiB apart (num_ntts = 64 F128 = 1 KiB/row). The SPR
+        // streamer does not track that stride, and the 15 twiddle broadcasts
+        // below currently run before any of those loads. Sixteen T0 hints
+        // occupy the line-fill buffers during that setup; a prefetch has no
+        // architectural effect, so the butterflies stay bit-identical.
+        // The deep pass is the DRAM-cold reader of the NT-published 1 GiB
+        // codeword — the same 16-row geometry, just a colder first touch.
+        if f4_first_touch_pf_enabled() && active_lanes != 0 {
+            for i in 0..16 {
+                core::arch::x86_64::_mm_prefetch(
+                    ptr.add((i * sixteenth + r) * num_ntts).cast::<i8>(),
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
         // steps of savings.
@@ -698,6 +715,15 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 fn low_twiddle_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
+}
+
+/// `FLOCK_NO_NTT_F4_PF=1` restores the fused-four kernel with no first-touch
+/// prefetch of its 16 strided rows (exact same-binary A/B). Ranked env is
+/// cleared, so the hint is the scored path.
+#[inline]
+fn f4_first_touch_pf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_F4_PF").is_none())
 }
 
 /// # Safety
