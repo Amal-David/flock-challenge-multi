@@ -454,6 +454,22 @@ unsafe fn xor4_lanes(v: __m512i) -> __m128i {
     _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
 }
 
+/// XOR the four 128-bit lanes of `v` and replicate the result to every lane.
+/// Two 128-lane shuffles avoid extracting to GPRs, so two independent wide
+/// accumulators can be packed and reduced together below.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor4_lanes_replicated(v: __m512i) -> __m512i {
+    // [a,b,c,d] ^ [c,d,a,b], then swap adjacent 128-bit lanes. Every lane
+    // becomes a^b^c^d. SAFETY: caller carries avx512f.
+    let halves = _mm512_xor_si512(v, _mm512_shuffle_i32x4::<0x4e>(v, v));
+    _mm512_xor_si512(
+        halves,
+        _mm512_shuffle_i32x4::<0xb1>(halves, halves),
+    )
+}
+
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[derive(Clone, Copy)]
@@ -497,6 +513,32 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// [`Self::mul_acc`] with an instruction-free compiler scheduling fence.
+    ///
+    /// This is useful only in very long fully-unrolled product chains. LLVM
+    /// otherwise reassociates the XORs and keeps dozens of CLMUL results live,
+    /// spilling them despite ample registers for the three true accumulators.
+    /// The empty asm makes the updated accumulators observable after each
+    /// product while generating no machine instruction and touching no memory.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_ordered(&mut self, x: __m512i, y: __m512i) {
+        // SAFETY: caller carries avx512f + vpclmulqdq.
+        unsafe {
+            self.mul_acc(x, y);
+            core::arch::asm!(
+                "/* {lo} {hi} {mid} */",
+                lo = inout(zmm_reg) self.lo,
+                hi = inout(zmm_reg) self.hi,
+                mid = inout(zmm_reg) self.mid,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.
@@ -508,6 +550,32 @@ impl WideGhashX4 {
     pub unsafe fn reduce_lanes(self) -> __m512i {
         // SAFETY: caller carries avx512f+vpclmulqdq.
         unsafe { ghash_reduce_acc_x4(self.lo, self.mid, self.hi) }
+    }
+
+    /// Horizontally fold two four-lane accumulators, pack their results into
+    /// lanes 0 and 1, and reduce both in one vector reduction. Lanes 2 and 3
+    /// contain harmless duplicates and are not stored by the caller.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn fold2_reduce(a: Self, b: Self) -> __m512i {
+        // SAFETY: caller carries avx512f+vpclmulqdq.
+        unsafe {
+            let a_lo = xor4_lanes_replicated(a.lo);
+            let b_lo = xor4_lanes_replicated(b.lo);
+            let a_mid = xor4_lanes_replicated(a.mid);
+            let b_mid = xor4_lanes_replicated(b.mid);
+            let a_hi = xor4_lanes_replicated(a.hi);
+            let b_hi = xor4_lanes_replicated(b.hi);
+            // Select qwords 2..3 (the second F128 lane) from b. Every input
+            // is replicated, so the low two lanes become [a,b].
+            let lo = _mm512_mask_blend_epi64(0x0c, a_lo, b_lo);
+            let mid = _mm512_mask_blend_epi64(0x0c, a_mid, b_mid);
+            let hi = _mm512_mask_blend_epi64(0x0c, a_hi, b_hi);
+            ghash_reduce_acc_x4(lo, mid, hi)
+        }
     }
 
     /// Horizontally XOR the 4 lanes and assemble a scalar `F256Unreduced`
