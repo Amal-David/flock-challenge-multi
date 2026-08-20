@@ -941,6 +941,38 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// Test latch: force gather-from-`z_packed` in the same process as the
+/// memcpy-slab arm (env kill-switches resolve once).
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+pub(crate) static LC_STRIPE_SLAB_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_LC_STRIPE_SLAB=1` restores gather4 directly from DRAM-strided
+/// `z_packed`. Default: per tile, memcpy each of the 64 live 2 KiB rows into
+/// a 128 KiB sequential slab (8 stripes × 8 rows × `chunks_per_block`
+/// F128), then run the incumbent gather4 + 8-stripe `gfni_fold_tile` from
+/// that slab. F128 values are copied, not remapped; the 8-stripe GFNI burst
+/// is unchanged. Ranked env is cleared, so the fast path is the default.
+///
+/// This is not the killed 1-stripe GFNI (`gfni_fold_one_stripe`): that paid
+/// 8× plane store/reload. The slab is the DRAM ingest; the fold stays the
+/// 8-stripe register burst.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_stripe_slab_enabled() -> bool {
+    #[cfg(all(test, target_feature = "gfni"))]
+    if LC_STRIPE_SLAB_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_STRIPE_SLAB").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
@@ -1079,6 +1111,20 @@ fn fold_block_major_gfni(
             // (never inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let pf_far = lc_zfold_pf_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let stripe_slab = lc_stripe_slab_enabled();
+            // 64 live rows × chunks_per_block F128. Ranked: 64 × 128 × 16 B
+            // = 128 KiB, filled once per tile. Empty when the kill-switch
+            // is on so we never touch it.
+            #[cfg(target_feature = "avx512vbmi")]
+            let mut slab: Vec<F128> = if stripe_slab {
+                vec![
+                    F128 { lo: 0, hi: 0 };
+                    DIRECT_FOLD_TILE_STRIPES * 8 * chunks_per_block
+                ]
+            } else {
+                Vec::new()
+            };
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1099,6 +1145,20 @@ fn fold_block_major_gfni(
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                 }
+                // Sequential DRAM ingest of this tile's 64 rows. Each row
+                // is 2 KiB contiguous; the gather below then hits L1.
+                #[cfg(target_feature = "avx512vbmi")]
+                if stripe_slab {
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let outer_base = 8 * (stripe_base + t);
+                        for r in 0..8 {
+                            let src = (outer_base + r) * chunks_per_block;
+                            let dst = (t * 8 + r) * chunks_per_block;
+                            slab[dst..dst + chunks_per_block]
+                                .copy_from_slice(&z_packed[src..src + chunks_per_block]);
+                        }
+                    }
+                }
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
                 // The row stride is 2048 bytes, so a tile's 64 live rows
@@ -1112,7 +1172,12 @@ fn fold_block_major_gfni(
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
                             let outer_base = 8 * (stripe_base + t);
-                            if pf_far {
+                            let (gather_base, row0) = if stripe_slab {
+                                (slab.as_ptr(), t * 8)
+                            } else {
+                                (z_packed.as_ptr(), outer_base)
+                            };
+                            if pf_far && !stripe_slab {
                                 // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
                                 // on: the lines this stripe demand-loads two
                                 // grouped visits from now. Issued here, the
@@ -1135,7 +1200,7 @@ fn fold_block_major_gfni(
                                         }
                                     }
                                 }
-                            } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                            } else if !stripe_slab && t + 1 < DIRECT_FOLD_TILE_STRIPES {
                                 let next_base = 8 * (stripe_base + t + 1);
                                 // One line per row covers all four columns.
                                 unsafe {
@@ -1150,13 +1215,13 @@ fn fold_block_major_gfni(
                                     }
                                 }
                             }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q + c for c in 0..4 are the indices four
-                            // single gathers would read; each column slab is
-                            // 1024 writable bytes of `transposed`.
+                            // SAFETY: rows row0+r at `gather_base` with
+                            // stride chunks_per_block are either the DRAM
+                            // z rows or the just-copied slab rows; each
+                            // column slab is 1024 writable bytes.
                             unsafe {
                                 kernels::gather_transpose_stripe4_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                    gather_base.add(row0 * chunks_per_block + q),
                                     chunks_per_block,
                                     transposed.as_mut_ptr().add(t * 128),
                                     1024,
@@ -1187,13 +1252,19 @@ fn fold_block_major_gfni(
                         let outer_base = 8 * (stripe_base + t);
                         #[cfg(target_feature = "avx512vbmi")]
                         if gather_tr_fused {
+                            let (gather_base, row0) = if stripe_slab {
+                                (slab.as_ptr(), t * 8)
+                            } else {
+                                (z_packed.as_ptr(), outer_base)
+                            };
                             // The next stripe is eight row-strided F128 loads,
                             // a pattern the sequential hardware prefetchers do
                             // not discover. Pull it into L1 while VBMI/GFNI
                             // consumes this stripe. Do not cross a tile: with
                             // dynamic scheduling its successor may belong to a
-                            // different worker.
-                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                            // different worker. Skip on the slab path: the
+                            // memcpy already ingested the tile.
+                            if !stripe_slab && t + 1 < DIRECT_FOLD_TILE_STRIPES {
                                 let next_base = 8 * (stripe_base + t + 1);
                                 unsafe {
                                     for r in 0..8 {
@@ -1207,12 +1278,11 @@ fn fold_block_major_gfni(
                                     }
                                 }
                             }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q are the exact indices the scalar gather
-                            // reads; output is 128 bytes of `transposed`.
+                            // SAFETY: rows row0+r at gather_base are the
+                            // same F128s the scalar gather would read.
                             unsafe {
                                 kernels::gather_transpose_stripe_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                    gather_base.add(row0 * chunks_per_block + q),
                                     chunks_per_block,
                                     transposed.as_mut_ptr().add(t * 128),
                                 );
@@ -3195,6 +3265,68 @@ mod tests {
                     "forced-off arm m={m} k_log={k_log} useful={useful_bits}"
                 );
             }
+        }
+    }
+
+    /// Memcpy-slab gather (keep 8-stripe GFNI) must match DRAM gather.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn stripe_slab_memcpy_matches_direct_gather() {
+        let cases: &[(usize, usize, usize)] = &[
+            (16, 8, 241),
+            (18, 12, 3_801),
+            (20, 14, 15_409),
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let mut rng = Rng::new(0x51AB_0002 + (m * 17 + k_log) as u64);
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+            let z_block_major: Vec<F128> = z
+                .chunks_exact(128)
+                .map(|bits| {
+                    let mut packed = F128::ZERO;
+                    for (b, &set) in bits.iter().enumerate() {
+                        if set {
+                            if b < 64 {
+                                packed.lo |= 1u64 << b;
+                            } else {
+                                packed.hi |= 1u64 << (b - 64);
+                            }
+                        }
+                    }
+                    packed
+                })
+                .collect();
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+            let want = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            LC_STRIPE_SLAB_FORCED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+            let got_off = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            LC_STRIPE_SLAB_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                want, got_off,
+                "memcpy-slab vs direct gather m={m} k_log={k_log} useful={useful_bits}"
+            );
         }
     }
 

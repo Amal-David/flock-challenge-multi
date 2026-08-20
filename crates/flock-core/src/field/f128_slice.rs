@@ -251,6 +251,43 @@ mod tests {
         }
     }
 
+    /// Selected `add_scaled` equals `dst[i] += scale * addend[i]`, including
+    /// the four-lane AVX-512 body and a non-multiple-of-4 scalar tail.
+    #[test]
+    fn add_scaled_matches_scalar() {
+        let mut state = 0x0ADD_5CA1_ED00u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 7, 8, 15, 64, 257] {
+            let scale = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let addend: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut got: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut want = got.clone();
+            add_scaled(&mut got, &addend, scale);
+            for i in 0..n {
+                want[i] += scale * addend[i];
+            }
+            assert_eq!(got, want, "n={n}");
+        }
+    }
+
     /// Selected fold4_nested matches the scalar nested pair-fold, including a
     /// non-multiple-of-4 tail, and matches two `fold_pairs` (r0 then r1).
     #[test]
