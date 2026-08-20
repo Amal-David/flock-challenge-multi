@@ -5118,6 +5118,64 @@ fn ranked_l1_lazy_ood_eq_selected(
         && config.log_inv_rates.first() == Some(&1)
 }
 
+/// Exact ranked-production selector for retaining a deep-level (L2..L5) OOD
+/// equality as a tensor product — the same mechanism as the ranked L1
+/// selector above, at the smaller recursion-ladder dimensions 16/13/10/7.
+/// Every other profile, dimension, sample count, direct-fold mode, platform,
+/// and either kill switch (the L1 master `FLOCK_NO_LIG_LAZY_OOD_EQ` or the
+/// deep-level `FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP`) keep the dense-table path.
+#[inline]
+fn ranked_deep_lazy_ood_eq_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    n_level: usize,
+    level_ood_count: usize,
+    current_len: usize,
+    direct_fold4_mode: bool,
+) -> bool {
+    ranked_deep_lazy_ood_eq_selected(
+        config,
+        log_n,
+        n_level,
+        level_ood_count,
+        current_len,
+        direct_fold4_mode,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
+            || std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP").is_some(),
+    )
+}
+
+#[inline]
+fn ranked_deep_lazy_ood_eq_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    n_level: usize,
+    level_ood_count: usize,
+    current_len: usize,
+    direct_fold4_mode: bool,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && direct_fold4_mode
+        && log_n == 25
+        // The ranked ladder folds 3 variables per level below n_1 = 19; the
+        // L1 dimension itself belongs to the L1 selector above.
+        && matches!(n_level, 16 | 13 | 10 | 7)
+        && current_len == (1usize << n_level)
+        && level_ood_count == 1
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.log_inv_rates.first() == Some(&1)
+}
+
 enum PendingOodEq {
     Introduced {
         eq_lo: Vec<F128>,
@@ -6284,16 +6342,39 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
         {
             let _t = std::time::Instant::now();
+            let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
+                config,
+                log_n,
+                n_next,
+                ood_count(i + 2),
+                sc_prover.f().len(),
+                direct_fold4_mode,
+            );
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table_split(&z);
-                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                // The exact ranked deep levels retain eq(z[1..], ·) as
+                // 2^min(11, n−1) low × high factors, exactly as the L1 block
+                // above; the correction rides the level's first fold. Every
+                // rollback and other geometry builds the incumbent dense
+                // table.
+                let (intro, y) = if lazy_deep_ood {
+                    sc_prover
+                        .introduce_new_ood_factorized(&z)
+                        .expect("ranked factorized deep OOD introduction shape changed")
+                } else {
+                    let eq_z = build_eq_table_split(&z);
+                    sc_prover.introduce_new_with_eval(eq_z)
+                };
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
                 challenger.observe_f128(intro.u_2);
                 let beta = challenger.sample_f128();
-                sc_prover.glue(beta);
+                if lazy_deep_ood {
+                    sc_prover.glue_factorized_ood(beta);
+                } else {
+                    sc_prover.glue(beta);
+                }
             }
             if trace {
                 t_ood += _t.elapsed();
@@ -9501,6 +9582,143 @@ mod tests {
         assert!(!selected(25, 19, 1, 1 << 19, false, true, false));
         assert!(!selected(25, 19, 1, 1 << 19, true, false, false));
         assert!(!selected(25, 19, 1, 1 << 19, true, true, true));
+    }
+
+    /// The deep-level (L2..L5) factorized introduction must reproduce the
+    /// dense equality table's transcript coefficients and claimed evaluation
+    /// at every ranked ladder dimension — and the identity must have teeth:
+    /// corrupting one retained factor changes the result.
+    #[test]
+    fn deep_factorized_ood_intro_matches_dense() {
+        use crate::challenger::Challenger;
+        for &d in &[7usize, 10, 13, 16] {
+            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_00D0 ^ d as u64);
+            let z = ch.sample_f128_vec(d);
+            let f: Vec<F128> = (0..(1usize << d)).map(|_| ch.sample_f128()).collect();
+            let dense = build_eq_table(&z);
+            let want = round_msg_and_eval_lsb(&f, &dense);
+            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
+            let mut eq_lo = build_eq_table(&z[1..1 + split]);
+            let eq_hi = build_eq_table(&z[1 + split..]);
+            let got = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
+            assert_eq!(got, want, "deep factorized OOD introduction d={d}");
+            // Negative control: one corrupted low weight must not still match.
+            eq_lo[1] += F128::ONE;
+            let bad = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
+            assert_ne!(bad, want, "corrupted low factor went undetected d={d}");
+        }
+    }
+
+    /// The retained-equality fold correction must match the dense glue at
+    /// every ranked deep shape — covering the serial small-round path
+    /// (d = 7, 10: `eq_hi` collapses to one entry), the parallel path at its
+    /// minimum size (d = 13: exactly two CHUNK slices), and the L2 shape
+    /// (d = 16). Negative control: one corrupted high weight must be caught.
+    #[test]
+    fn deep_lazy_ood_corrected_fold_matches_dense_glue() {
+        use crate::challenger::Challenger;
+        for &d in &[7usize, 10, 13, 16] {
+            let n = 1usize << d;
+            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_F01D ^ d as u64);
+            let z = ch.sample_f128_vec(d);
+            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let beta = ch.sample_f128();
+            let r = ch.sample_f128();
+
+            let dense_eq = build_eq_table(&z);
+            let mut dense_basis = b.clone();
+            crate::field::f128_slice::add_scaled(&mut dense_basis, &dense_eq, beta);
+            let (want_f, want_b, want_msg) = fold_and_msg_lsb(&f, &dense_basis, r, None);
+
+            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
+            let eq_lo = build_eq_table(&z[1..1 + split]);
+            let mut eq_hi = build_eq_table(&z[1 + split..]);
+            let gamma = beta * (F128::ONE + z[0] + r);
+            let (got_f, got_b, got_msg) =
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
+            assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
+            assert_eq!(got_msg, want_msg, "next-round message d={d}");
+
+            // Negative control: one corrupted high weight must not still match.
+            eq_hi[0] += F128::ONE;
+            let (_, bad_b, _) =
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
+        }
+    }
+
+    /// Exercise the prover state machine at the deep shapes across the
+    /// operation that sits between a level's OOD glue and its consuming fold:
+    /// the level's ordinary induced-basis introduce/glue. Covers both the
+    /// serial (d = 10) and parallel (d = 16) fold paths.
+    #[test]
+    fn deep_lazy_ood_state_machine_matches_dense_across_ordinary_glue() {
+        use crate::challenger::Challenger;
+        for &d in &[10usize, 16] {
+            let n = 1usize << d;
+            let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_57A7 ^ d as u64);
+            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let z = ch.sample_f128_vec(d);
+            let ordinary: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let ordinary_claim = ch.sample_f128();
+            let beta = ch.sample_f128();
+            let alpha = ch.sample_f128();
+            let r = ch.sample_f128();
+            let target = ch.sample_f128();
+
+            let (mut dense, dense_start) = SumcheckProver::new(f.clone(), b.clone(), target);
+            let (mut lazy, lazy_start) = SumcheckProver::new(f, b, target);
+            assert_eq!(lazy_start, dense_start);
+
+            let (dense_intro, dense_y) =
+                dense.introduce_new_with_eval(build_eq_table(&z));
+            let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
+            assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
+            dense.glue(beta);
+            lazy.glue_factorized_ood(beta);
+
+            let dense_ordinary = dense.introduce_new(ordinary.clone(), ordinary_claim);
+            let lazy_ordinary = lazy.introduce_new(ordinary, ordinary_claim);
+            assert_eq!(lazy_ordinary, dense_ordinary);
+            dense.glue(alpha);
+            lazy.glue(alpha);
+
+            assert_eq!(lazy.fold(r), dense.fold(r), "d={d}");
+            assert_eq!(&*lazy.f, &*dense.f, "d={d}");
+            assert_eq!(&*lazy.combined_basis, &*dense.combined_basis, "d={d}");
+            assert_eq!(lazy.t_r, dense.t_r, "d={d}");
+            assert_eq!(lazy.transcript, dense.transcript, "d={d}");
+        }
+    }
+
+    #[test]
+    fn ranked_deep_lazy_ood_selector_is_exact() {
+        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
+            "../../configs/ligerito/m32_fast.toml"
+        ))
+        .unwrap();
+        let (config, _) = security.to_prover_verifier_configs().unwrap();
+        let selected = |log_n, nl, count, len, direct, platform, disabled| {
+            ranked_deep_lazy_ood_eq_selected(
+                &config, log_n, nl, count, len, direct, platform, disabled,
+            )
+        };
+        for &nl in &[16usize, 13, 10, 7] {
+            assert!(selected(25, nl, 1, 1 << nl, true, true, false));
+            assert!(!selected(24, nl, 1, 1 << nl, true, true, false));
+            assert!(!selected(25, nl, 2, 1 << nl, true, true, false));
+            assert!(!selected(25, nl, 1, 1 << (nl - 1), true, true, false));
+            assert!(!selected(25, nl, 1, 1 << nl, false, true, false));
+            assert!(!selected(25, nl, 1, 1 << nl, true, false, false));
+            assert!(!selected(25, nl, 1, 1 << nl, true, true, true));
+        }
+        // Off-ladder dimensions stay dense; 19 belongs to the L1 selector.
+        assert!(!selected(25, 19, 1, 1 << 19, true, true, false));
+        assert!(!selected(25, 15, 1, 1 << 15, true, true, false));
+        assert!(!selected(25, 4, 1, 1 << 4, true, true, false));
     }
 
     /// The cache-blocked transpose schedule must be BYTE-identical to the
