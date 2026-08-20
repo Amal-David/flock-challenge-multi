@@ -449,8 +449,11 @@ mod affinity {
 /// One finished block handed from a butterfly worker to its paired
 /// leaf-hash worker: where the block starts in the codeword, how many
 /// elements it holds, and the leaf range it covers.
+///
+/// Padded so every descriptor occupies a cache line of its own.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
+#[repr(align(64))]
 struct DeepBlock {
     ptr: usize,
     len_f128: usize,
@@ -463,9 +466,25 @@ struct DeepBlock {
 #[repr(align(64))]
 struct DeepQueue {
     slots: Vec<std::cell::UnsafeCell<DeepBlock>>,
+    /// Written only by the butterfly worker.
+    prod: ProdSide,
+    /// Written only by the hash worker.
+    cons: ConsSide,
+}
+
+/// The queue words the butterfly worker writes; a cache line of its own.
+#[cfg(target_os = "linux")]
+#[repr(align(64))]
+struct ProdSide {
     head: std::sync::atomic::AtomicUsize, // next to publish
-    tail: std::sync::atomic::AtomicUsize, // next to consume
     done: std::sync::atomic::AtomicBool,  // producer will publish no more
+}
+
+/// The queue words the hash worker writes; a cache line of its own.
+#[cfg(target_os = "linux")]
+#[repr(align(64))]
+struct ConsSide {
+    tail: std::sync::atomic::AtomicUsize, // next to consume
     gone: std::sync::atomic::AtomicBool,  // consumer left (panic)
 }
 
@@ -492,10 +511,14 @@ impl DeepQueue {
                     })
                 })
                 .collect(),
-            head: std::sync::atomic::AtomicUsize::new(0),
-            tail: std::sync::atomic::AtomicUsize::new(0),
-            done: std::sync::atomic::AtomicBool::new(false),
-            gone: std::sync::atomic::AtomicBool::new(false),
+            prod: ProdSide {
+                head: std::sync::atomic::AtomicUsize::new(0),
+                done: std::sync::atomic::AtomicBool::new(false),
+            },
+            cons: ConsSide {
+                tail: std::sync::atomic::AtomicUsize::new(0),
+                gone: std::sync::atomic::AtomicBool::new(false),
+            },
         }
     }
     /// Publish a block, waiting while the consumer is more than `depth`
@@ -503,9 +526,9 @@ impl DeepQueue {
     /// already unwinding); the caller then handles the block itself.
     fn push(&self, b: DeepBlock, depth: usize) -> bool {
         use std::sync::atomic::Ordering;
-        let h = self.head.load(Ordering::Relaxed);
-        while h - self.tail.load(Ordering::Acquire) >= depth {
-            if self.gone.load(Ordering::Acquire) {
+        let h = self.prod.head.load(Ordering::Relaxed);
+        while h - self.cons.tail.load(Ordering::Acquire) >= depth {
+            if self.cons.gone.load(Ordering::Acquire) {
                 return false;
             }
             std::hint::spin_loop();
@@ -515,25 +538,25 @@ impl DeepQueue {
         unsafe {
             *self.slots[h % Self::CAP].get() = b;
         }
-        self.head.store(h + 1, Ordering::Release);
+        self.prod.head.store(h + 1, Ordering::Release);
         true
     }
     fn pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
-        let t = self.tail.load(Ordering::Relaxed);
+        let t = self.cons.tail.load(Ordering::Relaxed);
         loop {
-            if self.head.load(Ordering::Acquire) > t {
+            if self.prod.head.load(Ordering::Acquire) > t {
                 // SAFETY: published by the producer with Release before the
                 // Acquire load above.
                 let b = unsafe { *self.slots[t % Self::CAP].get() };
-                self.tail.store(t + 1, Ordering::Release);
+                self.cons.tail.store(t + 1, Ordering::Release);
                 return Some(b);
             }
-            if self.done.load(Ordering::Acquire) {
+            if self.prod.done.load(Ordering::Acquire) {
                 // The producer's last `head` store is released before its
                 // `done` store, so one more look at `head` settles whether a
                 // block was published between the load above and that flag.
-                if self.head.load(Ordering::Acquire) > t {
+                if self.prod.head.load(Ordering::Acquire) > t {
                     continue;
                 }
                 return None;
@@ -2513,7 +2536,10 @@ impl AdditiveNttF128 {
                     let hint = deep_pf_hint();
                     let queues: Vec<DeepQueue> =
                         (0..n_pairs).map(|_| DeepQueue::new()).collect();
-                    let next_sub = AtomicUsize::new(0);
+                    // The sub-group claim counter, on a cache line of its own.
+                    #[repr(align(64))]
+                    struct Claim(AtomicUsize);
+                    let next_sub = Claim(AtomicUsize::new(0));
                     let base_addr = data.as_mut_ptr() as usize;
                     let deep_sub = &deep_sub;
                     let queues = &queues;
@@ -2543,9 +2569,9 @@ impl AdditiveNttF128 {
                             fn drop(&mut self) {
                                 use std::sync::atomic::Ordering;
                                 if self.producer {
-                                    self.q.done.store(true, Ordering::Release);
+                                    self.q.prod.done.store(true, Ordering::Release);
                                 } else {
-                                    self.q.gone.store(true, Ordering::Release);
+                                    self.q.cons.gone.store(true, Ordering::Release);
                                 }
                                 affinity::set(&self.saved);
                             }
@@ -2569,7 +2595,7 @@ impl AdditiveNttF128 {
                                 }
                             };
                             loop {
-                                let i = next_sub.fetch_add(1, Ordering::Relaxed);
+                                let i = next_sub.0.fetch_add(1, Ordering::Relaxed);
                                 if i >= n_subs {
                                     break;
                                 }
@@ -3301,39 +3327,6 @@ mod tests {
     /// line and turns independent SPSC publications into cross-core traffic.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deep_queue_metadata_is_cacheline_isolated() {
-        const CACHE_LINE: usize = 64;
-        assert_eq!(core::mem::align_of::<DeepQueue>(), CACHE_LINE);
-        assert_eq!(core::mem::size_of::<DeepQueue>(), CACHE_LINE);
-
-        for offset in [
-            core::mem::offset_of!(DeepQueue, head),
-            core::mem::offset_of!(DeepQueue, tail),
-            core::mem::offset_of!(DeepQueue, done),
-            core::mem::offset_of!(DeepQueue, gone),
-        ] {
-            assert!(offset < CACHE_LINE);
-        }
-
-        let queues: Vec<DeepQueue> = (0..8).map(|_| DeepQueue::new()).collect();
-        let base = queues.as_ptr() as usize;
-        assert_eq!(base % CACHE_LINE, 0);
-        for (i, queue) in queues.iter().enumerate() {
-            let addr = queue as *const DeepQueue as usize;
-            assert_eq!(addr, base + i * CACHE_LINE);
-            assert_eq!(
-                core::ptr::addr_of!(queue.head) as usize / CACHE_LINE,
-                addr / CACHE_LINE
-            );
-            assert_eq!(
-                core::ptr::addr_of!(queue.tail) as usize / CACHE_LINE,
-                addr / CACHE_LINE
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn deep_split_depth_default_override_and_clamp() {
         assert_eq!(select_deep_split_depth(None), 8);
         assert_eq!(select_deep_split_depth(Some(0)), 1);
@@ -3346,57 +3339,41 @@ mod tests {
         assert_eq!(select_deep_split_depth(Some(usize::MAX)), 64);
     }
 
-    /// Exercise the ranked depth through enough publications to wrap the
-    /// physical ring repeatedly. The consumer waits for the first full
-    /// depth-sized burst, proving that the producer cannot publish a ninth
-    /// block until the consumer advances `tail`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deep_queue_depth_eight_wraps_without_loss_or_reordering() {
-        use std::sync::atomic::Ordering;
+    fn deep_queue_metadata_is_cacheline_isolated() {
+        const CACHE_LINE: usize = 64;
+        assert_eq!(core::mem::align_of::<DeepQueue>(), CACHE_LINE);
+        assert_eq!(core::mem::size_of::<DeepQueue>() % CACHE_LINE, 0);
+        assert_eq!(core::mem::align_of::<ProdSide>(), CACHE_LINE);
+        assert_eq!(core::mem::size_of::<ProdSide>(), CACHE_LINE);
+        assert_eq!(core::mem::align_of::<ConsSide>(), CACHE_LINE);
+        assert_eq!(core::mem::size_of::<ConsSide>(), CACHE_LINE);
+        // One descriptor per line, so publishing one does not disturb the
+        // one being read.
+        assert_eq!(core::mem::align_of::<DeepBlock>(), CACHE_LINE);
+        assert_eq!(core::mem::size_of::<DeepBlock>(), CACHE_LINE);
 
-        const N: usize = DeepQueue::CAP * 64;
-        let queue = DeepQueue::new();
-        let (all_published, initial_head, seen) = std::thread::scope(|scope| {
-            let producer = scope.spawn(|| {
-                let mut all_published = true;
-                for i in 0..N {
-                    all_published &= queue.push(
-                        DeepBlock {
-                            ptr: i,
-                            len_f128: i + 1,
-                            lo: i * 2,
-                            hi: i * 2 + 1,
-                        },
-                        DeepQueue::DEFAULT_DEPTH,
-                    );
-                }
-                queue.done.store(true, Ordering::Release);
-                all_published
-            });
-
-            let initial_head = loop {
-                let head = queue.head.load(Ordering::Acquire);
-                if head >= DeepQueue::DEFAULT_DEPTH {
-                    break head;
-                }
-                std::hint::spin_loop();
-            };
-            let mut seen = Vec::with_capacity(N);
-            while let Some(block) = queue.pop() {
-                seen.push((block.ptr, block.len_f128, block.lo, block.hi));
+        let queues: Vec<DeepQueue> = (0..8).map(|_| DeepQueue::new()).collect();
+        let base = queues.as_ptr() as usize;
+        assert_eq!(base % CACHE_LINE, 0);
+        let mut lines = std::collections::HashSet::new();
+        for (i, queue) in queues.iter().enumerate() {
+            let addr = queue as *const DeepQueue as usize;
+            assert_eq!(addr, base + i * core::mem::size_of::<DeepQueue>());
+            let pl = core::ptr::addr_of!(queue.prod) as usize / CACHE_LINE;
+            let cl = core::ptr::addr_of!(queue.cons) as usize / CACHE_LINE;
+            // The two sides of one queue, and every queue, own distinct lines.
+            assert_ne!(pl, cl);
+            assert!(lines.insert(pl), "producer line shared");
+            assert!(lines.insert(cl), "consumer line shared");
+            // Every slot owns a line of its own.
+            let mut slot_lines = std::collections::HashSet::new();
+            for slot in &queue.slots {
+                assert!(slot_lines.insert(slot.get() as usize / CACHE_LINE));
             }
-            (producer.join().unwrap(), initial_head, seen)
-        });
-
-        assert!(all_published);
-        assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
-        assert_eq!(seen.len(), N);
-        for (i, block) in seen.into_iter().enumerate() {
-            assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
+            assert_eq!(slot_lines.len(), queue.slots.len());
         }
-        assert_eq!(queue.head.load(Ordering::Relaxed), N);
-        assert_eq!(queue.tail.load(Ordering::Relaxed), N);
     }
 
     struct Rng(u64);

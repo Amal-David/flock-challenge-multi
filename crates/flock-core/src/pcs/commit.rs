@@ -357,14 +357,18 @@ fn finalize_commit(
                 0
             };
             // Publish this sub-group's depth; every sub-group must agree.
-            let seen = match local_levels.compare_exchange(
-                usize::MAX,
-                depth,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => depth,
-                Err(prev) => prev,
+            // Read first: only the block that finds it unset exchanges.
+            let seen = match local_levels.load(Ordering::Acquire) {
+                usize::MAX => match local_levels.compare_exchange(
+                    usize::MAX,
+                    depth,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => depth,
+                    Err(prev) => prev,
+                },
+                prev => prev,
             };
             if seen != depth {
                 local_levels.store(0, Ordering::Release);
