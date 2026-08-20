@@ -1075,10 +1075,16 @@ fn fold_block_major_gfni(
             // scalar path stays as the kill-switch arm.
             #[cfg(target_feature = "avx512vbmi")]
             let gather_tr_fused = lc_gather_tr_enabled();
+            // Both predicates are shape/process invariants. Resolve the
+            // grouped arm once per worker instead of once per tile.
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather4 = gather_tr_fused && lc_gather4_enabled();
             // Grouped-gather prefetch distance, resolved once per worker
             // (never inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let pf_far = lc_zfold_pf_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let full_chunks = useful_bits / 128;
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1095,6 +1101,30 @@ fn fold_block_major_gfni(
                     break;
                 };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                // i34's far prefetch covers q+8 onward, but the first grouped
+                // visit of every tile otherwise remains DRAM-cold. Stage its
+                // 64 row lines in L2 while the tile's GFNI matrices are built.
+                // T1 is deliberate: the 2 KiB row stride maps these lines to
+                // two L1 sets, so T0 would evict most of the 32 lines/set
+                // before the gather reaches them. L2 has room for the 4 KiB
+                // tile head and turns the first gather into L2 hits.
+                #[cfg(target_feature = "avx512vbmi")]
+                if pf_far && gather4 && full_chunks >= 4 {
+                    unsafe {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let outer_base = 8 * (stripe_base + t);
+                            for r in 0..8 {
+                                core::arch::x86_64::_mm_prefetch(
+                                    z_packed
+                                        .as_ptr()
+                                        .add((outer_base + r) * chunks_per_block)
+                                        .cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                        }
+                    }
+                }
                 for t in 0..DIRECT_FOLD_TILE_STRIPES {
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
@@ -1107,12 +1137,34 @@ fn fold_block_major_gfni(
                 // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
                 // the ragged final chunk takes the single-column arm below.
                 #[cfg(target_feature = "avx512vbmi")]
-                if gather_tr_fused && lc_gather4_enabled() {
-                    let full_chunks = useful_bits / 128;
+                if gather4 {
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {
                             let outer_base = 8 * (stripe_base + t);
                             if pf_far {
+                                // q=0 also primes this stripe's second line.
+                                // It is not consumed until the next grouped
+                                // visit, after all eight current stripes and
+                                // their GFNI fold, giving it the missing full
+                                // visit of lead time without a tile-wide T0
+                                // residency burst.
+                                if q == 0 && q + 8 <= full_chunks {
+                                    unsafe {
+                                        for r in 0..8 {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                z_packed
+                                                    .as_ptr()
+                                                    .add(
+                                                        (outer_base + r) * chunks_per_block
+                                                            + q
+                                                            + 4,
+                                                    )
+                                                    .cast::<i8>(),
+                                                core::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
                                 // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
                                 // on: the lines this stripe demand-loads two
                                 // grouped visits from now. Issued here, the
