@@ -226,6 +226,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && lo_size.is_multiple_of(32);
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
+        // Packed-row prefetch distance, resolved once per worker chunk
+        // (never inside the refill / message loops).
+        let pf_tiles = if zc_pkt_pf_far_enabled() {
+            ZC_PKT_PF_TILES
+        } else {
+            1
+        };
 
         // Residue-major refill (WRITE=false only — the chunk-store arm needs
         // row order): the prefold emits directly in the a_k/b_k register
@@ -261,20 +268,20 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
-                // The next refill's 512-byte packed bursts sit one tile
-                // ahead — ~4 iterations (>1000 uops) of pure compute away,
-                // a gap the hardware prefetcher does not bridge across the
-                // strided burst boundary. Pull both sides in now (prefetch
-                // is a hint: harmless past the end on the last tile).
+                // The packed bursts `pf_tiles` refills ahead — a gap the
+                // hardware prefetcher does not bridge across the strided
+                // burst boundary. Pull both sides in now (prefetch is a
+                // hint: `wrapping_add` keeps the past-the-end address on
+                // the last tiles well defined, and the hint is dropped).
                 if zc_pkt_pf_enabled() {
-                    let next = (g0 + 64) * 8;
+                    let next = (g0 + 64 * pf_tiles) * 8;
                     for l in 0..8 {
                         _mm_prefetch(
-                            a_pkt.add(next + 64 * l).cast::<i8>(),
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
                         _mm_prefetch(
-                            b_pkt.add(next + 64 * l).cast::<i8>(),
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
                     }
@@ -967,6 +974,38 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
+/// Look-ahead, in 64-row tiles, for the packed-row prefetch in the round-2
+/// and rounds-3+4 fold kernels. One tile is 512 bytes per side (64 rows ×
+/// 8 packed bytes) and is exactly one refill of the `fa`/`fb` fold caches.
+///
+/// The incumbent value was 1 — the tile the very next refill demand-loads.
+/// In the rounds-3+4 pass (`fold2_from_packed_lookahead_x86_avx512`) the
+/// refill runs on EVERY iteration, so one tile of look-ahead is one loop
+/// body: the prefetch is issued at 1d43xx, roughly half-way through a body
+/// that retires ~1 700 uops per iteration (1 049 inline instructions plus
+/// two `gfni_fold64_rows_masked_c4` calls), which leaves only the ~860
+/// post-prefetch instructions — ~500 cycles — between the hint and the
+/// demand load that needs it. That is the same order as a loaded DRAM miss
+/// on this box, so the miss is still partly in flight when the next refill
+/// asks for it.
+///
+/// Three tiles puts a full two extra iterations (~2 400 uops) behind the
+/// hint while keeping every tile covered — tile `T+3` is requested at
+/// iteration `T`, so each tile is still prefetched exactly once, just
+/// earlier. Nothing is added and nothing moves: the same sixteen
+/// `prefetcht0` instructions issue at the same point, only the address
+/// changes, and a prefetch has no architectural effect, so the folded
+/// values are bit-identical either way.
+const ZC_PKT_PF_TILES: usize = 3;
+
+/// `FLOCK_NO_ZC_PKT_PF_FAR=1` restores the incumbent one-tile look-ahead in
+/// both packed-row prefetches (exact same-binary A/B).
+pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PKT_PF_FAR").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_WTAB=1` disables the hoisted per-pass `(w, w·x⁶⁴)` pair
 /// table in the zerocheck message sweeps (exact same-binary A/B; the table
 /// holds the identical values the sweep otherwise derives per iteration).
@@ -1286,6 +1325,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
         let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        // Packed-row prefetch distance, resolved once per worker chunk
+        // (never inside the refill loop).
+        let pf_tiles = if zc_pkt_pf_far_enabled() {
+            ZC_PKT_PF_TILES
+        } else {
+            1
+        };
         let mut fa = [F128::ZERO; 64];
         let mut fb = [F128::ZERO; 64];
         while x_lo + 8 <= lo_size {
@@ -1320,18 +1366,18 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
                     }
-                    // Next tile's 512-byte bursts, one refill ahead of the
+                    // The 512-byte bursts `pf_tiles` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
                     // Same addresses on both refill arms.
                     if zc_pkt_pf_enabled() {
-                        let next = (4 * xg + 64) * 8;
+                        let next = (4 * xg + 64 * pf_tiles) * 8;
                         for l in 0..8 {
                             _mm_prefetch(
-                                a_pkt.add(next + 64 * l).cast::<i8>(),
+                                a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
                             _mm_prefetch(
-                                b_pkt.add(next + 64 * l).cast::<i8>(),
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
                         }

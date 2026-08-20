@@ -3782,6 +3782,54 @@ fn eval_fold4_lookahead3(
     }
 }
 
+/// `FLOCK_NO_MDF4_PF=1` restores the incumbent [`materialize_direct_fold4`],
+/// which issues no software prefetch at all. Exact same-binary A/B: a
+/// prefetch is a hint with no architectural effect, so both arms produce
+/// byte-identical proofs.
+///
+/// Round 3 of the open sumcheck is the single biggest loop in the phase
+/// (~10.2 ms of open's ~25.5 ms local, measured with `LIG_PROVE_TRACE`).
+/// Each rayon task does exactly two things, in sequence:
+///
+///   1. `fold16_banked` streams this block's 2 MiB f-side slab out of the
+///      512 MiB packed witness — pure DRAM, cold at the ranked shape.
+///   2. the per-claim `fold_one_slot` loops fold `eq_lo` through the 64 KiB
+///      composed table — 16 byte-indexed loads per slot out of L1/L2, and
+///      **no DRAM traffic whatsoever**.
+///
+/// The ranked-shape decomposition measured that split directly (256 tasks,
+/// `block_len = 8192`, `claims = 2`, 16 threads): f-side 6.47 ms wall,
+/// b-side 3.39 ms wall, msg-reduce 0.32 ms wall — 10.2 ms that is the SUM of
+/// a memory component and a compute component, with zero overlap. For the
+/// whole b-side the memory system has no request outstanding, and for the
+/// whole f-side the load ports the b-side needs are idle.
+///
+/// A 16-thread streaming probe on this box tops out at 67 GB/s over the same
+/// 4-streams-per-KiB pattern `fold16_banked` uses, and the f-side already
+/// runs at ~83 GB/s, so there is no headroom INSIDE the f-side. The win is
+/// to move misses into the b-side window that currently spends 3.4 ms idle
+/// on memory. This arm walks the head of the NEXT block's slab one 64-byte
+/// line per b-side iteration, so those lines are already in L2 when
+/// `fold16_banked` reaches them.
+///
+/// Distance and depth are both measured, not assumed. Depth: one line per
+/// iteration covers 256 KiB of the next 2 MiB slab; at two lines and above
+/// the walk evicts the b-side's own 64 KiB table and `eq_lo` stream out of
+/// L2 and the b-side loses more than the f-side gains (measured: 1 line
+/// f −0.62 ms / b +0.27 ms; 2 lines f −0.55 / b +0.5; 8 lines f −0.85 /
+/// b +2.9). Hint: `T1`, not `T0` — the slab belongs in L2, not in the 48 KiB
+/// L1 the composed table is already missing out of. Distance: the earliest
+/// line is asked for ~2·(block_len/4) iterations (~0.2 ms) before the demand
+/// load, and the latest ~0.05 ms before; both are far past a DRAM miss.
+///
+/// Read once per process, outside every loop.
+#[cfg(target_arch = "x86_64")]
+fn mdf4_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PF").is_none());
+    *ON
+}
+
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
 /// direct basis in ONE N→N/16 pass and emits the round-4 message. Both ranked
@@ -3841,6 +3889,12 @@ fn materialize_direct_fold4(
     } else {
         0
     };
+    // Grouped-gather prefetch state, resolved once for the whole
+    // materialization — never inside the block / claim / slot loops.
+    #[cfg(target_arch = "x86_64")]
+    let pf_on = mdf4_pf_enabled();
+    #[cfg(target_arch = "x86_64")]
+    let n_blocks = out_len / block_len;
     let (u_0, u_2) = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -3850,6 +3904,26 @@ fn materialize_direct_fold4(
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
+                // Head of the NEXT block's f-side slab, and how far into it
+                // the b-side loops below may walk. Null when there is no next
+                // block or the kill switch is set — the only check the loops
+                // make. `block + 1 < n_blocks` is exactly the condition that
+                // keeps the whole slab inside `packed_witness`:
+                // `16·(block+2)·block_len ≤ 16·n_blocks·block_len = len`.
+                #[cfg(target_arch = "x86_64")]
+                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                    // SAFETY: bounds argued above; `add` stays inside the
+                    // allocation and the pointer is never dereferenced.
+                    let p = unsafe { packed_witness.as_ptr().add(start + 16 * block_len) };
+                    (
+                        p.cast::<u8>(),
+                        16 * block_len * core::mem::size_of::<F128>(),
+                    )
+                } else {
+                    (core::ptr::null::<u8>(), 0usize)
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut pf_at = 0usize;
                 if deferred_reduce {
                     // ---- f: 16:1 in one deferred-reduction pass (one reduce
                     // per output lane; same field element as the nested form).
@@ -3919,6 +3993,21 @@ fn materialize_direct_fold4(
                     );
                     let mut s = 0usize;
                     while s + 3 < block_len {
+                        #[cfg(target_arch = "x86_64")]
+                        if !pf_base.is_null() && pf_at < pf_span {
+                            // SAFETY: `pf_at < pf_span` and the slab is
+                            // `pf_span` bytes, so the address is inside
+                            // `packed_witness`. Prefetch has no architectural
+                            // effect, so this arm is bit-identical to the
+                            // kill-switched one.
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    pf_base.add(pf_at).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_at += 64;
+                        }
                         b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
                         b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
                         b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
@@ -3934,6 +4023,21 @@ fn materialize_direct_fold4(
                     super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
                     let mut s = 0usize;
                     while s + 3 < block_len {
+                        #[cfg(target_arch = "x86_64")]
+                        if !pf_base.is_null() && pf_at < pf_span {
+                            // SAFETY: `pf_at < pf_span` and the slab is
+                            // `pf_span` bytes, so the address is inside
+                            // `packed_witness`. Prefetch has no architectural
+                            // effect, so this arm is bit-identical to the
+                            // kill-switched one.
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    pf_base.add(pf_at).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_at += 64;
+                        }
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         b_out[s + 1] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
                         b_out[s + 2] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
