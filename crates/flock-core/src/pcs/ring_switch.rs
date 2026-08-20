@@ -1734,7 +1734,7 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 /// bytes are scattered into one byte column of the 128 output elements. This
 /// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
 /// transposes while preserving the exact polynomial-basis layout.
-pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
+fn tensor_algebra_transpose_bytes(s_hat_v: &[F128]) -> [[u8; 16]; 1 << LOG_PACKING] {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
     let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
     for row_group in 0..16 {
@@ -1751,13 +1751,24 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
         }
     }
     out_bytes
+}
+
+#[inline]
+fn f128_from_transpose_bytes(bytes: [u8; 16]) -> F128 {
+    F128::new(
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+    )
+}
+
+fn tensor_algebra_transpose_array(s_hat_v: &[F128]) -> [F128; 1 << LOG_PACKING] {
+    tensor_algebra_transpose_bytes(s_hat_v).map(f128_from_transpose_bytes)
+}
+
+pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
+    tensor_algebra_transpose_bytes(s_hat_v)
         .into_iter()
-        .map(|bytes| {
-            F128::new(
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            )
-        })
+        .map(f128_from_transpose_bytes)
         .collect()
 }
 
@@ -2695,50 +2706,70 @@ fn direct_fold8_states_seq(
 /// Value-identical full-width form of [`direct_fold8_states_seq`]. The 64
 /// `d_low` doubling chains and the 64 bank transposes are mutually
 /// independent (each is a pure function of its own `low_eq[d]` / bank
-/// stripe), the bit-major gather writes disjoint 64-lane rows, and the
-/// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
+/// stripe). Four adjacent lanes share one worker and write their final
+/// bit-major positions directly, eliminating the 128 temporary row vectors
+/// and the second transpose/copy. The round-0 reduce is an XOR sum — no
+/// ordering choice here can change a byte.
 fn direct_fold8_states_par(
     fold8: &[F128],
     low_eq: &[F128; 64],
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    const LANES_PER_TASK: usize = 4;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
-                        row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                .collect()
-        },
-    );
     let mut w_state = vec![F128::ZERO; 64 * n_packed];
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    w_state
-        .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
-        .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
-            for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
-                a_row[lane] = a_rows[lane][bit];
-            }
-        });
+    let w_out = AtomicPtr::new(w_state.as_mut_ptr());
+    let a_out = AtomicPtr::new(a_state.as_mut_ptr());
+    rayon::join(
+        || {
+            (0..64 / LANES_PER_TASK)
+                .into_par_iter()
+                .for_each(|task| {
+                    let first_lane = task * LANES_PER_TASK;
+                    let mut basis_products: [F128; LANES_PER_TASK] =
+                        std::array::from_fn(|lane| low_eq[first_lane + lane]);
+                    let out = w_out.load(Ordering::Relaxed);
+                    for bit in 0..n_packed {
+                        for lane in 0..LANES_PER_TASK {
+                            // SAFETY: each task exclusively owns four lanes;
+                            // `bit * 64 + first_lane + lane` is in bounds and
+                            // cannot alias an index written by another task.
+                            unsafe {
+                                out.add(bit * 64 + first_lane + lane)
+                                    .write(fold_one_slot(basis_products[lane], table));
+                            }
+                            if bit + 1 < n_packed {
+                                basis_products[lane] =
+                                    crate::field::mul_by_x(basis_products[lane]);
+                            }
+                        }
+                    }
+                });
+        },
+        || {
+            (0..64 / LANES_PER_TASK)
+                .into_par_iter()
+                .for_each(|task| {
+                    let first_lane = task * LANES_PER_TASK;
+                    let out = a_out.load(Ordering::Relaxed);
+                    for lane in first_lane..first_lane + LANES_PER_TASK {
+                        let transposed = tensor_algebra_transpose_array(
+                            &fold8[lane * n_packed..(lane + 1) * n_packed],
+                        );
+                        for (bit, value) in transposed.into_iter().enumerate() {
+                            // SAFETY: this task exclusively owns `lane`, so
+                            // its bit-major destination stripe is disjoint
+                            // from all writes made by other tasks.
+                            unsafe { out.add(bit * 64 + lane).write(value) };
+                        }
+                    }
+                });
+        },
+    );
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }
