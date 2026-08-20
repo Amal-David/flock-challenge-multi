@@ -118,12 +118,34 @@ pub(crate) fn urm_pidx_enabled() -> bool {
     *ON
 }
 
-/// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
-/// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
-/// 64-bit reads split with shifts. Resolved once per process.
+/// Wide-read offset unpacking, **default OFF**. `FLOCK_URM_OFFW=1` re-enables
+/// the two-64-bit-reads-plus-shifts form; the default is now the eight
+/// separate 16-bit reads.
+///
+/// Why the default is inverted relative to the incumbent. A port-resolved
+/// issue budget of the round-1 projection, taken from the emitted
+/// `target-cpu=sapphirerapids` assembly, gives per (window, block):
+/// **281 scalar uops**, 158 vector ALU (52 p5-only, 19 p0-only, 87 flexible),
+/// 164 loads, 5 stores. Scalar shares p0/p1/p5/p6/p10 with the flexible
+/// vector work, so the joint ALU bound is `(52+19+87+281)/5 ≈ 88` cycles with
+/// **all five ALU ports busy**, while the 164 loads spread over three load
+/// ports come to ≈55 cycles. **The kernel is issue-bound, and the load ports
+/// have slack.**
+///
+/// The wide-read form spends ~12 scalar ALU uops per apply to save 6 loads —
+/// across 16 applies per window-block, roughly **192 scalar ALU uops bought
+/// with ~96 loads saved**. That trades the *binding* resource for the *slack*
+/// one, which is backwards on a machine whose L1d holds the table comfortably.
+/// It measures well on a host with a 32 KiB L1d (the two-image table is
+/// exactly 32 KiB there, so loads are over-priced) and should not on one with
+/// 48 KiB.
+///
+/// Value-identical either way: same offsets, same table addresses, same
+/// results — only how the eight `u16` are fetched changes. Resolved once per
+/// process.
 pub(crate) fn urm_offw_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFFW").is_none());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_URM_OFFW").is_some());
     *ON
 }
 
@@ -293,7 +315,8 @@ unsafe fn horner_2img_offw(
 /// [`horner_2img_offw`] with the eight offsets read separately as 16-bit
 /// values, out of line so the wide-read form does not carry its register
 /// allocation. Identical value and identical table addresses.
-/// `FLOCK_NO_URM_OFFW=1` restores it.
+/// **This is now the default**; `FLOCK_URM_OFFW=1` selects the wide-read form
+/// instead (see [`urm_offw_enabled`] for the issue-budget rationale).
 ///
 /// # Safety
 /// As for [`horner_2img_offw`].
