@@ -9655,11 +9655,11 @@ mod tests {
         assert_eq!(cfg.initial_k, 6);
         assert_eq!(cfg.hash, "sha256");
         assert_eq!(cfg.levels.len(), 5);
-        // Fast = JohnsonOod profile: 238 L0 queries per-round at 100 bits (no
+        // Fast = JohnsonOod profile: 218 L0 queries per-round at 100 bits (no
         // list union bound — single-codeword binding via the opening claim /
         // OOD samples), proximity-gap shortfall covered by fold-challenge grinding.
         assert_eq!(cfg.levels[0].regime, SoundnessRegime::JohnsonOod);
-        assert_eq!(cfg.levels[0].queries, 238);
+        assert_eq!(cfg.levels[0].queries, 218);
         assert_eq!(cfg.levels[0].grinding_bits, 0);
         assert!(cfg.levels[0].fold_grinding_bits > 0);
         assert_eq!(cfg.levels[0].ood_samples, 0); // L0: bound by eval claim
@@ -9668,7 +9668,7 @@ mod tests {
         let default = default_config(22, 6, 1).unwrap();
         assert_eq!(pv.log_inv_rates, default.log_inv_rates);
         assert_eq!(pv.recursive_ks, default.recursive_ks);
-        assert_eq!(pv.queries[0], 238);
+        assert_eq!(pv.queries[0], 218);
 
         // Slim mode: rates start at 1/4.
         let toml_str = include_str!("../../configs/ligerito/m29_slim.toml");
@@ -9785,8 +9785,8 @@ mod tests {
     fn ligerito_prover_config_for_lookup() {
         // m=29 fast: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Fast).expect("m29 fast must load");
-        assert_eq!(pv.queries[0], 238);
-        assert_eq!(pv.fold_grinding_bits[0], 12);
+        assert_eq!(pv.queries[0], 218);
+        assert_eq!(pv.fold_grinding_bits[0], 16);
 
         // m=29 slim: known → loads from TOML.
         let pv = prover_config_for(22, 6, LigeritoProfile::Slim).expect("m29 slim must load");

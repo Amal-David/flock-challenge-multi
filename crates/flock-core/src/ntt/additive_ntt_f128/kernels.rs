@@ -348,6 +348,67 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
         )
     }
 }
+/// `FLOCK_NO_NTT_ZERO_SPINE=1` restores the generic fused-four kernel for the
+/// table's zero spine. Read once per process; the ranked worker runs with a
+/// cleared environment, so the specialised leaf is the one scored.
+fn ntt_zero_spine_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_ZERO_SPINE").is_some());
+    *OFF
+}
+
+/// True when every slot of this fused-four group that sits on the additive-NTT
+/// table's zero spine is in fact field zero.
+///
+/// The test is on the VALUES, not on the shape: any group that does not match
+/// runs the incumbent kernel byte for byte, so a table or geometry change can
+/// only cost the specialisation, never correctness.
+pub(super) fn fused4_zero_spine(twiddles: &[F128; 15]) -> bool {
+    let z = |t: F128| t.hi == 0 && t.lo == 0;
+    z(twiddles[0]) && z(twiddles[1]) && z(twiddles[3]) && z(twiddles[7])
+        && !ntt_zero_spine_disabled()
+}
+
+/// [`butterfly_fused_4layer_row`] for a group whose spine slots are zero.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; in addition
+/// [`fused4_zero_spine`] must hold for `twiddles`.
+#[inline(never)]
+pub(super) unsafe fn butterfly_fused_4layer_row_zero_spine(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    debug_assert!(lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry, disjointness and zero-spine contract.
+    unsafe {
+        x86_64::butterfly_fused_4layer_row_zero_spine(
+            ptr, sixteenth, num_ntts, lanes, r, twiddles,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract; the portable kernel is value-exact
+    // for a zero twiddle without needing the specialisation.
+    unsafe {
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+    }
+}
+
 
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
@@ -665,6 +726,106 @@ mod low_twiddle_tests {
             let reference = run(false, false);
             for (o, i) in [(false, true), (true, false), (true, true)] {
                 assert_eq!(run(o, i), reference, "len={len} outer_low={o} inner_low={i}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod zero_spine_tests {
+    use super::*;
+    use crate::challenger::{Challenger, RandomChallenger};
+    use crate::ntt::additive_ntt_f128::AdditiveNttF128;
+
+    /// Portable mirror of the specialised kernel's loop order: the four spine
+    /// slots become `v ^= u` and every other slot keeps the generic butterfly,
+    /// in the incumbent's exact order. This is the index bookkeeping the AVX-512
+    /// body transcribes; keeping a portable twin lets it be checked on hosts
+    /// that cannot execute AVX-512.
+    fn fused4_zero_spine_reference(values: &mut [F128; 16], twiddles: &[F128; 15]) {
+        #[inline(always)]
+        fn bf(values: &mut [F128; 16], u: usize, v: usize, t: F128) {
+            let new_u = values[u] + values[v] * t;
+            values[v] += new_u;
+            values[u] = new_u;
+        }
+        #[inline(always)]
+        fn bz(values: &mut [F128; 16], u: usize, v: usize) {
+            let u_val = values[u];
+            values[v] += u_val;
+        }
+        for i in 0..8 {
+            bz(values, i, i + 8);
+        }
+        for i in 0..4 {
+            bz(values, i, i + 4);
+        }
+        for i in 0..4 {
+            bf(values, 8 + i, 8 + i + 4, twiddles[2]);
+        }
+        for i in 0..2 {
+            bz(values, i, i + 2);
+        }
+        for s in 1..4 {
+            for i in 0..2 {
+                bf(values, 4 * s + i, 4 * s + i + 2, twiddles[3 + s]);
+            }
+        }
+        bz(values, 0, 1);
+        for s in 1..8 {
+            bf(values, 2 * s, 2 * s + 1, twiddles[7 + s]);
+        }
+    }
+
+    /// The specialisation must reproduce the incumbent fused-four network
+    /// exactly whenever the spine slots are zero.
+    #[test]
+    fn zero_spine_specialisation_matches_generic() {
+        let mut ch = RandomChallenger::new(0x2E20_5F14_0BEE);
+        for _ in 0..256 {
+            let mut tw = [F128::ZERO; 15];
+            for (i, t) in tw.iter_mut().enumerate() {
+                if matches!(i, 0 | 1 | 3 | 7) {
+                    continue; // spine stays zero
+                }
+                *t = ch.sample_f128();
+            }
+            let base: [F128; 16] = std::array::from_fn(|_| ch.sample_f128());
+            let mut want = base;
+            portable::butterfly_fused_4layer(&mut want, &tw);
+            let mut got = base;
+            fused4_zero_spine_reference(&mut got, &tw);
+            assert_eq!(got, want);
+        }
+    }
+
+    /// A group that is NOT on the spine must be refused, so it keeps running
+    /// the incumbent kernel.
+    #[test]
+    fn zero_spine_predicate_is_value_based() {
+        let mut ch = RandomChallenger::new(0x5_01_11_E0_00_12_34);
+        let mut tw = [F128::ZERO; 15];
+        assert!(fused4_zero_spine(&tw));
+        for slot in [0usize, 1, 3, 7] {
+            let mut t = tw;
+            t[slot] = ch.sample_f128();
+            assert!(!fused4_zero_spine(&t), "slot {slot} must disqualify the group");
+        }
+        // A nonzero OFF-spine slot must not disqualify it.
+        tw[2] = ch.sample_f128();
+        assert!(fused4_zero_spine(&tw));
+    }
+
+    /// The premise: `twiddle(layer, 0)` is the empty-span sum, hence zero, at
+    /// every dimension and layer the ranked commit builds. If this ever stops
+    /// holding, the predicate above simply stops firing.
+    #[test]
+    fn table_zero_spine_holds_at_ranked_dimensions() {
+        for log_d in 9..=21usize {
+            let ntt = AdditiveNttF128::standard(log_d);
+            for layer in 0..log_d {
+                let t = ntt.twiddle(layer, 0);
+                assert!(t.hi == 0 && t.lo == 0, "log_d={log_d} layer={layer}");
             }
         }
     }

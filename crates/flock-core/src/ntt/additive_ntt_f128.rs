@@ -1711,6 +1711,21 @@ impl AdditiveNttF128 {
         let perm = |k: usize| if stage_perm { (k & 3) * 16 + (k >> 2) } else { k };
         let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
+        // One indirect call per row group replaces a per-group branch. Block 0
+        // of every layer sits on the additive-NTT table's zero spine, so 15 of
+        // its 32 fused-four products are multiplications by field zero; the
+        // specialised leaf deletes them. Blocks 1..8 keep the incumbent kernel,
+        // whose body this change leaves byte-identical. Resolved here, before
+        // the Rayon closure, so the hot task carries neither the predicate nor
+        // a duplicated call site.
+        type Fused4Leaf = unsafe fn(*mut F128, usize, usize, usize, usize, &[F128; 15]);
+        let fused4_leaf: [Fused4Leaf; 8] = std::array::from_fn(|block| {
+            if kernels::fused4_zero_spine(&tw4[block]) {
+                kernels::butterfly_fused_4layer_row_zero_spine as Fused4Leaf
+            } else {
+                kernels::butterfly_fused_4layer_row as Fused4Leaf
+            }
+        });
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
@@ -1777,9 +1792,10 @@ impl AdditiveNttF128 {
                 for block in 0..8 {
                     let region = bufp.add(block * 64 * row_len);
                     let tw = &tw4[block];
+                    let leaf = fused4_leaf[block];
                     for j in 0..4 {
                         let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                        kernels::butterfly_fused_4layer_row(
+                        leaf(
                             region.add(j * g4_base * row_len),
                             g4_stride,
                             row_len,

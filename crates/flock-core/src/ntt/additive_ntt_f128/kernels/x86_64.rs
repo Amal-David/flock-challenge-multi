@@ -518,6 +518,152 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool>(
     }
 }
 
+/// Zero-spine variant of [`butterfly_fused_4layer_row`].
+///
+/// `twiddle(layer, 0)` is the sum over the empty span, i.e. exactly field
+/// zero, so a fused-four group sitting on the table's zero spine has
+/// `twiddles[0] = twiddles[1] = twiddles[3] = twiddles[7] = 0`. For those
+/// slots the generic butterfly
+///
+/// ```text
+/// new_u = u + t * v ;  v' = v + new_u ;  u' = new_u
+/// ```
+///
+/// collapses at `t = 0` to `u' = u`, `v' = v + u` — one XOR, no product.
+/// That is 15 of the group's 32 multiplies deleted.
+///
+/// This is a SEPARATE out-of-line body on purpose. Adding a `const ZERO`
+/// parameter to `butterfly_fused_4layer_row_impl`, or a zero test inside its
+/// butterfly macro, makes LLVM reshape the incumbent hot body; that failure
+/// mode has already been measured on this tree (a global zero test in the
+/// Ligerito transpose butterfly cost -0.339% through hot-closure growth).
+/// The incumbent kernel below is left byte-identical and still serves every
+/// group that is not on the spine.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; in addition
+/// `twiddles[0]`, `twiddles[1]`, `twiddles[3]` and `twiddles[7]` must all be
+/// `F128::ZERO`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_zero_spine(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_4layer_row_zero_spine_impl::<false>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            )
+        } else {
+            butterfly_fused_4layer_row_zero_spine_impl::<true>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row_zero_spine`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_zero_spine_impl<const DIET: bool>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    use core::arch::x86_64::*;
+
+    debug_assert!(twiddles[0].hi == 0 && twiddles[0].lo == 0);
+    debug_assert!(twiddles[1].hi == 0 && twiddles[1].lo == 0);
+    debug_assert!(twiddles[3].hi == 0 && twiddles[3].lo == 0);
+    debug_assert!(twiddles[7].hi == 0 && twiddles[7].lo == 0);
+
+    // SAFETY: caller provides target features and pointer geometry.
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        // Only the eleven live twiddles are broadcast; the four spine slots
+        // are never multiplied by, so their setup CLMULs are deleted too.
+        let mut tw = [(zero, zero); 15];
+        for i in [2usize, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14] {
+            tw[i] = tw_x4::<false, DIET>(twiddles[i]);
+        }
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+        let lanes = active_lanes & !3;
+        let mut lane = 0;
+        while lane < lanes {
+            let mut values = [zero; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            macro_rules! butterfly {
+                ($u:expr, $v:expr, $twiddle:expr) => {{
+                    let new_u =
+                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    values[$u] = new_u;
+                }};
+            }
+            // `t == 0`: `u` is unchanged and `v ^= u`.
+            macro_rules! butterfly_zero {
+                ($u:expr, $v:expr) => {{
+                    values[$v] = _mm512_xor_si512(values[$v], values[$u]);
+                }};
+            }
+
+            for i in 0..8 {
+                butterfly_zero!(i, i + 8);
+            }
+            for i in 0..4 {
+                butterfly_zero!(i, i + 4);
+            }
+            for i in 0..4 {
+                butterfly!(8 + i, 8 + i + 4, tw[2]);
+            }
+            for i in 0..2 {
+                butterfly_zero!(i, i + 2);
+            }
+            for s in 1..4 {
+                let twiddle = tw[3 + s];
+                for i in 0..2 {
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            butterfly_zero!(0, 1);
+            for s in 1..8 {
+                let twiddle = tw[7 + s];
+                butterfly!(2 * s, 2 * s + 1, twiddle);
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+            lane += 4;
+        }
+
+        while lane < active_lanes {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
