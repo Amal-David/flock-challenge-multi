@@ -293,6 +293,70 @@ mod tests {
         }
     }
 
+    /// DirectFold8 ranked f-side: one whole-slab `fold16_banked` plus SUB=256
+    /// `fold4_nested` equals the original eight SUB-chopped fold16+fold4
+    /// couples. Independent 16-wide groups / 4-tuples; same F128s.
+    #[test]
+    fn fold16_then_fold4_whole_slab_matches_sub256() {
+        use super::*;
+        const SUB: usize = 256;
+        let mut state = 0xA5_C3_91_07_E2u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Ranked block_len=2048 is 8 SUBs; also hit a 2-SUB length and a
+        // short tail that is not a SUB multiple.
+        for block_len in [8usize, 512, 2048] {
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let (r4, r5) = (
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+            );
+            let src: Vec<F128> = (0..64 * block_len)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut whole_mid = vec![F128::ZERO; 4 * block_len];
+            let mut whole_out = vec![F128::ZERO; block_len];
+            fold16_banked(&src, &mut whole_mid, &w);
+            let mut slot = 0usize;
+            while slot < block_len {
+                let n = SUB.min(block_len - slot);
+                fold4_nested(
+                    &whole_mid[4 * slot..4 * (slot + n)],
+                    &mut whole_out[slot..slot + n],
+                    r4,
+                    r5,
+                );
+                slot += n;
+            }
+            let mut chopped_out = vec![F128::ZERO; block_len];
+            let mut slot = 0usize;
+            while slot < block_len {
+                let n = SUB.min(block_len - slot);
+                let mut mid = vec![F128::ZERO; 4 * n];
+                fold16_banked(&src[64 * slot..64 * (slot + n)], &mut mid, &w);
+                fold4_nested(&mid, &mut chopped_out[slot..slot + n], r4, r5);
+                slot += n;
+            }
+            assert_eq!(whole_out, chopped_out, "block_len={block_len}");
+        }
+    }
+
     /// AVX-512 (or portable) bind must match the scalar oracle at every
     /// ranked factor-state length plus a 4-element tail that misses the
     /// 8-output SIMD body.

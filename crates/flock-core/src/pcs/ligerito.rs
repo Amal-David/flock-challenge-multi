@@ -5860,6 +5860,18 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_FOLD8_F16_WHOLE=1` restores DirectFold8's original SUB-chopped
+/// `fold16_banked` (eight 256 KiB kernel entries per 2 MiB f-slab). Default
+/// ON reconstitutes fold4's whole-slab fold16 grain for the DRAM pass while
+/// keeping `fold4_nested` at 16 KiB SUBs. Byte-identical: `fold16_banked` is
+/// a map over independent 16-wide groups, so concatenating eight SUBs equals
+/// one whole-slab call. Ranked env never sets the kill switch.
+fn fold8_f16_whole_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_F16_WHOLE").is_none());
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5922,6 +5934,10 @@ fn materialize_direct_fold8(
     // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
     // geometries on the scalar path instead of reading through a short tail.
     let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
+    // Ranked DirectFold8 has no ordinary basis. Whole-slab fold16 is the
+    // fold4 grain; the kill switch and the ordinary-basis fallback keep
+    // the original 256-slot fold16 + fold4 couple.
+    let fold8_f16_whole = fold8_f16_whole_enabled() && !has_ordinary;
     assert_eq!(out_len, block_len * claims[0].eq_hi.len());
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
@@ -5975,7 +5991,10 @@ fn materialize_direct_fold8(
                         pooled,
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
-                    crate::scratch::LocalBuf::new(4 * SUB, pooled),
+                    crate::scratch::LocalBuf::new(
+                        if fold8_f16_whole { 4 * block_len } else { 4 * SUB },
+                        pooled,
+                    ),
                     crate::scratch::LocalBuf::new(if b_gfni_on { 64 } else { 0 }, pooled),
                 )
             },
@@ -5992,27 +6011,54 @@ fn materialize_direct_fold8(
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
                 // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
+                //
+                // Ranked f-side grain (fold8_f16_whole): one fold16_banked
+                // over the whole 2 MiB slab — the same DRAM schedule fold4
+                // already uses — then fold4_nested in 256-slot / 16 KiB SUBs
+                // so the r4/r5 pass stays L1-hot. DirectFold8 shipped with
+                // both passes chopped at SUB=256, which restarts fold16 eight
+                // times per slab and clips its internal T0 PF (512 F128 ahead,
+                // 1 KiB burst) at every 256 KiB edge. Unexpected ordinary
+                // basis and the kill switch keep that original couple.
+                if fold8_f16_whole {
+                    let m4_full = &mut mid4[..4 * block_len];
                     crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                        f_in, m4_full, &fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
                         crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                            &m4_full[4 * slot..4 * (slot + n)],
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
                         );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
-                        crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
-                        );
+                        slot += n;
                     }
-                    slot += n;
+                } else {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                        );
+                        crate::field::f128_slice::fold4_nested(
+                            m4, &mut f_out[slot..slot + n], r4, r5,
+                        );
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4, &mut b_out[slot..slot + n], r4, r5,
+                            );
+                        }
+                        slot += n;
+                    }
                 }
 
                 #[cfg(all(
