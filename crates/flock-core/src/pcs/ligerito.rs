@@ -3310,6 +3310,115 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
+/// Width of the cache-resident low equality factor retained by the ranked L1
+/// OOD path.  Its 18-variable tail is represented as 2^11 low weights and
+/// 2^7 high weights instead of one dense 2^18 table.
+const LAZY_OOD_EQ_SPLIT_LOW_LOG: usize = 11;
+
+/// Deferred-reduction AVX-512 sufficient statistics for a factorized LSB
+/// equality. Returns
+/// `a = sum f[2j] * w[j]` and
+/// `s = sum (f[2j] + f[2j+1]) * w[j]`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    // SAFETY: the caller guarantees the target features and two readable
+    // witness elements for every weight; loop bounds preserve both contracts.
+    unsafe {
+        debug_assert_eq!(f.len(), 2 * weights.len());
+        let mut a_acc = WideGhashX4::zero();
+        let mut s_acc = WideGhashX4::zero();
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+        let lanes = weights.len() & !3;
+        let mut j = 0usize;
+        while j < lanes {
+            let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
+            let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
+            let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
+            let even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let f0_sum = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let sum = _mm512_permutex2var_epi64(f0_sum, idx_even, f1_sum);
+            a_acc.mul_acc(even, w);
+            s_acc.mul_acc(sum, w);
+            j += 4;
+        }
+        let mut a = a_acc.fold().reduce();
+        let mut s = s_acc.fold().reduce();
+        while j < weights.len() {
+            a += f[2 * j] * weights[j];
+            s += (f[2 * j] + f[2 * j + 1]) * weights[j];
+            j += 1;
+        }
+        (a, s)
+    }
+}
+
+#[inline]
+fn factorized_eq_round0(f: &[F128], weights: &[F128]) -> (F128, F128) {
+    assert_eq!(f.len(), 2 * weights.len());
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    // SAFETY: the cfg gate supplies AVX-512 + VPCLMUL and the length contract
+    // above supplies two witness values per equality weight.
+    unsafe {
+        factorized_eq_round0_avx512(f, weights)
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        let mut a = F128::ZERO;
+        let mut s = F128::ZERO;
+        for (pair, &weight) in f.chunks_exact(2).zip(weights) {
+            a += pair[0] * weight;
+            s += (pair[0] + pair[1]) * weight;
+        }
+        (a, s)
+    }
+}
+
+/// Factorized equivalent of [`round_msg_and_eval_lsb`] for
+/// `b = eq([z_0, z_tail...], ·)`. The dense equality tail is the tensor
+/// product `eq_lo[i] * eq_hi[h]`; each low factor remains hot across the
+/// witness chunk it weights.
+fn round_msg_and_eval_lsb_factorized_eq(
+    f: &[F128],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    z_0: F128,
+) -> (SumcheckMessage, F128) {
+    use rayon::prelude::*;
+
+    assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
+    assert!(eq_hi.len().is_power_of_two());
+    let tail_len = eq_lo
+        .len()
+        .checked_mul(eq_hi.len())
+        .expect("factorized OOD tail overflow");
+    assert_eq!(f.len(), 2 * tail_len);
+
+    let (a, s) = f
+        .par_chunks(2 * eq_lo.len())
+        .zip(eq_hi.par_iter())
+        .map(|(chunk, &hi)| {
+            let (a, s) = factorized_eq_round0(chunk, eq_lo);
+            (a * hi, s * hi)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, s0), (a1, s1)| (a0 + a1, s0 + s1),
+        );
+    (
+        SumcheckMessage {
+            u_0: (F128::ONE + z_0) * a,
+            u_2: s,
+        },
+        a + z_0 * s,
+    )
+}
+
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
 /// Parallel for large arrays. Test oracle for the fused fold below; the
 /// production path uses `fold_and_msg_lsb` instead.
@@ -3534,11 +3643,31 @@ fn fold_and_msg_lsb(
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
+    fold_and_msg_lsb_inner(f, b, r, arena, None)
+}
+
+/// Core fold with an optional retained equality correction. The correction is
+/// already in the folded output domain:
+/// `nb[j] += gamma * eq_hi[j / eq_lo.len()] * eq_lo[j % eq_lo.len()]`.
+/// The ranked path fixes `eq_lo.len() == CHUNK`, so one high-factor scale is
+/// hoisted per Rayon task and the low table stays in L1.
+fn fold_and_msg_lsb_inner(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    arena: Option<&mut FoldArena>,
+    lazy_ood: Option<(&[F128], &[F128], F128)>,
+) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
+    if let Some((eq_lo, eq_hi, _)) = lazy_ood {
+        assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
+        assert!(eq_hi.len().is_power_of_two());
+        assert_eq!(half, eq_lo.len() * eq_hi.len());
+    }
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
         let mut nf = Vec::with_capacity(half);
@@ -3551,6 +3680,11 @@ fn fold_and_msg_lsb(
             let b1 = b[2 * j + 1];
             nf.push(f0 + r * (f0 + f1));
             nb.push(b0 + r * (b0 + b1));
+        }
+        if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
+            for (j, value) in nb.iter_mut().enumerate() {
+                *value += gamma * eq_hi[j / eq_lo.len()] * eq_lo[j % eq_lo.len()];
+            }
         }
         // Same AVX-512 message reduce used on the parallel path.
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -3591,7 +3725,9 @@ fn fold_and_msg_lsb(
     // local-diagnostics kill switch; the ranked worker's cleared environment
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    let use_nt = lazy_ood.is_none()
+        && half >= (1usize << 21)
+        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
     // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port;
     // this is the leftover L0-fold site (~960 MiB RFO across the four
@@ -3601,7 +3737,9 @@ fn fold_and_msg_lsb(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    let use_nt = lazy_ood.is_none()
+        && half >= (1usize << 21)
+        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -3609,7 +3747,7 @@ fn fold_and_msg_lsb(
     // (statically true under `-C target-cpu=native` on every Apple Silicon
     // target this ships to; other builds keep the previous leaf).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa = cfg!(target_feature = "sha3") && {
+    let use_soa = lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
         static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
         });
@@ -3645,6 +3783,9 @@ fn fold_and_msg_lsb(
         }
     };
     let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
+    if let Some((eq_lo, _, _)) = lazy_ood {
+        assert_eq!(eq_lo.len(), CHUNK, "ranked lazy OOD chunk width changed");
+    }
     let (u_0, u_2) = nf_s
         .par_chunks_mut(CHUNK)
         .zip(nb_s.par_chunks_mut(CHUNK))
@@ -3700,6 +3841,10 @@ fn fold_and_msg_lsb(
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
+                let scale = gamma * eq_hi[ci];
+                crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
+            }
             #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
             {
                 // SAFETY: target features cfg-guaranteed; fc/bc have equal
@@ -4921,6 +5066,73 @@ impl std::ops::DerefMut for FoldBuf {
     }
 }
 
+/// Exact ranked-production selector for retaining the L1 OOD equality as a
+/// tensor product. Every other profile, dimension, sample count, direct-fold
+/// mode, platform, and the explicit kill switch keep the dense-table path.
+#[inline]
+fn ranked_l1_lazy_ood_eq_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    n_1: usize,
+    l1_ood_count: usize,
+    current_len: usize,
+    direct_fold4_mode: bool,
+) -> bool {
+    ranked_l1_lazy_ood_eq_selected(
+        config,
+        log_n,
+        n_1,
+        l1_ood_count,
+        current_len,
+        direct_fold4_mode,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
+    )
+}
+
+#[inline]
+fn ranked_l1_lazy_ood_eq_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    n_1: usize,
+    l1_ood_count: usize,
+    current_len: usize,
+    direct_fold4_mode: bool,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && direct_fold4_mode
+        && log_n == 25
+        && n_1 == 19
+        && current_len == (1usize << 19)
+        && l1_ood_count == 1
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.log_inv_rates.first() == Some(&1)
+}
+
+enum PendingOodEq {
+    Introduced {
+        eq_lo: Vec<F128>,
+        eq_hi: Vec<F128>,
+        z_0: F128,
+        h_new: F128,
+    },
+    Glued {
+        eq_lo: Vec<F128>,
+        eq_hi: Vec<F128>,
+        z_0: F128,
+        beta: F128,
+    },
+}
+
 pub struct SumcheckProver {
     f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -4936,6 +5148,9 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
+    /// next fold consumes its glued correction.
+    pending_ood_eq: Option<PendingOodEq>,
 }
 
 impl SumcheckProver {
@@ -4948,6 +5163,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -4984,6 +5200,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
@@ -5004,6 +5221,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            pending_ood_eq: None,
         }
     }
 
@@ -5022,6 +5240,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            pending_ood_eq: None,
         }
     }
 
@@ -5029,8 +5248,36 @@ impl SumcheckProver {
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
-        let (nf, nb, msg) =
-            fold_and_msg_lsb(&self.f, &self.combined_basis, r, self.fold_arena.as_mut());
+        assert!(self.pending_glue.is_none(), "fold before ordinary glue");
+        let pending_ood = self.pending_ood_eq.take();
+        let (nf, nb, msg) = match pending_ood {
+            Some(PendingOodEq::Glued {
+                eq_lo,
+                eq_hi,
+                z_0,
+                beta,
+            }) => {
+                // Folding eq([z0, z_tail], ·) at LSB challenge r leaves
+                // (1 + z0 + r) * eq(z_tail, ·) in characteristic two.
+                let gamma = beta * (F128::ONE + z_0 + r);
+                fold_and_msg_lsb_inner(
+                    &self.f,
+                    &self.combined_basis,
+                    r,
+                    self.fold_arena.as_mut(),
+                    Some((&eq_lo, &eq_hi, gamma)),
+                )
+            }
+            Some(PendingOodEq::Introduced { .. }) => {
+                panic!("fold before factorized OOD glue")
+            }
+            None => fold_and_msg_lsb(
+                &self.f,
+                &self.combined_basis,
+                r,
+                self.fold_arena.as_mut(),
+            ),
+        };
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
         // pool (same ownership as the Drop impl) so the next round's
         // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
@@ -5076,6 +5323,67 @@ impl SumcheckProver {
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
         (msg, h_new)
+    }
+
+    /// Introduce `eq(z, ·)` without building its dense 2^19 table. The LSB
+    /// coordinate is kept separately and the remaining equality is split into
+    /// cache-resident low/high tensor factors.
+    fn introduce_new_ood_factorized(
+        &mut self,
+        z: &[F128],
+    ) -> Option<(SumcheckMessage, F128)> {
+        let expected_len = 1usize.checked_shl(z.len().try_into().ok()?);
+        if z.is_empty()
+            || expected_len != Some(self.f.len())
+            || self.pending_glue.is_some()
+            || self.pending_ood_eq.is_some()
+        {
+            return None;
+        }
+        let tail = &z[1..];
+        let split = tail.len().min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
+        let eq_lo = build_eq_table(&tail[..split]);
+        let eq_hi = build_eq_table(&tail[split..]);
+        let z_0 = z[0];
+        let (msg, h_new) =
+            round_msg_and_eval_lsb_factorized_eq(&self.f, &eq_lo, &eq_hi, z_0);
+        self.transcript.push(msg);
+        self.pending_ood_eq = Some(PendingOodEq::Introduced {
+            eq_lo,
+            eq_hi,
+            z_0,
+            h_new,
+        });
+        Some((msg, h_new))
+    }
+
+    /// Apply the transcript separation challenge while retaining the equality
+    /// factors for injection into the next fold.
+    fn glue_factorized_ood(&mut self, beta: F128) {
+        assert!(
+            self.pending_glue.is_none(),
+            "factorized OOD glue across ordinary pending glue"
+        );
+        let pending = self
+            .pending_ood_eq
+            .take()
+            .expect("factorized OOD glue without introduction");
+        let PendingOodEq::Introduced {
+            eq_lo,
+            eq_hi,
+            z_0,
+            h_new,
+        } = pending
+        else {
+            panic!("factorized OOD equality glued twice");
+        };
+        self.t_r += beta * h_new;
+        self.pending_ood_eq = Some(PendingOodEq::Glued {
+            eq_lo,
+            eq_hi,
+            z_0,
+            beta,
+        });
     }
 
     /// Combine the introduced basis into `combined_basis` with separation α.
@@ -5721,6 +6029,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     }
     challenger.observe_bytes(&wtns_1.root());
 
+    let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
+        config,
+        log_n,
+        n1,
+        ood_count(1),
+        sc_prover.f().len(),
+        direct_fold4_mode,
+    );
+
     // OOD binding for the L1 commit: each sample evaluates f1's multilinear
     // extension at a random transcript point z ∈ F^{n1}, sends the claimed
     // value, and folds the claim `Σ_x f1(x)·eq(z,x) = y` into the running
@@ -5730,17 +6047,27 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = std::time::Instant::now();
         for _ in 0..ood_count(1) {
             let z = challenger.sample_f128_vec(n1);
-            // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
-            // introduce round message (single pass over f1 + eq_z), instead of
-            // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table_split(&z);
-            let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+            // The exact ranked L1 path retains eq(z[1..], ·) as 2^11 × 2^7
+            // factors. Every rollback and other geometry builds the incumbent
+            // dense table.
+            let (intro, y) = if lazy_l1_ood {
+                sc_prover
+                    .introduce_new_ood_factorized(&z)
+                    .expect("ranked factorized OOD introduction shape changed")
+            } else {
+                let eq_z = build_eq_table_split(&z);
+                sc_prover.introduce_new_with_eval(eq_z)
+            };
             challenger.observe_f128(y);
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
             challenger.observe_f128(intro.u_2);
             let beta = challenger.sample_f128();
-            sc_prover.glue(beta);
+            if lazy_l1_ood {
+                sc_prover.glue_factorized_ood(beta);
+            } else {
+                sc_prover.glue(beta);
+            }
         }
         if trace {
             t_ood += _t.elapsed();
@@ -9057,6 +9384,123 @@ mod tests {
             let point: Vec<F128> = (0..d).map(|_| ch.sample_f128()).collect();
             assert_eq!(build_eq_table_split(&point), build_eq_table(&point), "d={d}");
         }
+    }
+
+    /// Retaining the OOD equality as low/high factors must reproduce both
+    /// transcript coefficients and the claimed multilinear evaluation from
+    /// the ordinary dense equality table, including the ranked d=19 shape.
+    #[test]
+    fn factorized_ood_intro_matches_dense() {
+        use crate::challenger::Challenger;
+        for &d in &[4usize, 12, 19] {
+            let mut ch = crate::challenger::RandomChallenger::new(0xFA17_00D0 ^ d as u64);
+            let z = ch.sample_f128_vec(d);
+            let f: Vec<F128> = (0..(1usize << d)).map(|_| ch.sample_f128()).collect();
+            let dense = build_eq_table(&z);
+            let want = round_msg_and_eval_lsb(&f, &dense);
+            let split = (d - 1).min(LAZY_OOD_EQ_SPLIT_LOW_LOG);
+            let eq_lo = build_eq_table(&z[1..1 + split]);
+            let eq_hi = build_eq_table(&z[1 + split..]);
+            let got = round_msg_and_eval_lsb_factorized_eq(&f, &eq_lo, &eq_hi, z[0]);
+            assert_eq!(got, want, "factorized OOD introduction d={d}");
+        }
+    }
+
+    /// Injecting the retained equality after folding the incumbent basis is
+    /// exactly the same state and next message as materializing/gluing the
+    /// full equality before that fold.
+    #[test]
+    fn lazy_ood_corrected_fold_matches_dense_glue() {
+        use crate::challenger::Challenger;
+        let d = 13usize;
+        let n = 1usize << d;
+        let mut ch = crate::challenger::RandomChallenger::new(0x1A2E_00D5);
+        let z = ch.sample_f128_vec(d);
+        let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+        let beta = ch.sample_f128();
+        let r = ch.sample_f128();
+
+        let dense_eq = build_eq_table(&z);
+        let mut dense_basis = b.clone();
+        crate::field::f128_slice::add_scaled(&mut dense_basis, &dense_eq, beta);
+        let (want_f, want_b, want_msg) = fold_and_msg_lsb(&f, &dense_basis, r, None);
+
+        let eq_lo = build_eq_table(&z[1..12]);
+        let eq_hi = build_eq_table(&z[12..]);
+        assert_eq!(eq_lo.len(), 2048);
+        let gamma = beta * (F128::ONE + z[0] + r);
+        let (got_f, got_b, got_msg) =
+            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+        assert_eq!(&*got_f, &*want_f);
+        assert_eq!(&*got_b, &*want_b);
+        assert_eq!(got_msg, want_msg);
+    }
+
+    /// Exercise the actual prover state machine across the operation that sits
+    /// between L1 OOD glue and its consuming fold: an ordinary induced-basis
+    /// introduce/glue. The retained equality must commute with that update and
+    /// leave the complete transcript, target, witness, and basis identical.
+    #[test]
+    fn lazy_ood_state_machine_matches_dense_across_ordinary_glue() {
+        use crate::challenger::Challenger;
+        let d = 13usize;
+        let n = 1usize << d;
+        let mut ch = crate::challenger::RandomChallenger::new(0x57A7_E00D);
+        let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+        let z = ch.sample_f128_vec(d);
+        let ordinary: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+        let ordinary_claim = ch.sample_f128();
+        let beta = ch.sample_f128();
+        let alpha = ch.sample_f128();
+        let r = ch.sample_f128();
+        let target = ch.sample_f128();
+
+        let (mut dense, dense_start) = SumcheckProver::new(f.clone(), b.clone(), target);
+        let (mut lazy, lazy_start) = SumcheckProver::new(f, b, target);
+        assert_eq!(lazy_start, dense_start);
+
+        let (dense_intro, dense_y) =
+            dense.introduce_new_with_eval(build_eq_table(&z));
+        let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
+        assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
+        dense.glue(beta);
+        lazy.glue_factorized_ood(beta);
+
+        let dense_ordinary = dense.introduce_new(ordinary.clone(), ordinary_claim);
+        let lazy_ordinary = lazy.introduce_new(ordinary, ordinary_claim);
+        assert_eq!(lazy_ordinary, dense_ordinary);
+        dense.glue(alpha);
+        lazy.glue(alpha);
+
+        assert_eq!(lazy.fold(r), dense.fold(r));
+        assert_eq!(&*lazy.f, &*dense.f);
+        assert_eq!(&*lazy.combined_basis, &*dense.combined_basis);
+        assert_eq!(lazy.t_r, dense.t_r);
+        assert_eq!(lazy.transcript, dense.transcript);
+    }
+
+    #[test]
+    fn ranked_lazy_ood_selector_is_exact() {
+        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
+            "../../configs/ligerito/m32_fast.toml"
+        ))
+        .unwrap();
+        let (config, _) = security.to_prover_verifier_configs().unwrap();
+        let selected = |log_n, n1, count, len, direct, platform, disabled| {
+            ranked_l1_lazy_ood_eq_selected(
+                &config, log_n, n1, count, len, direct, platform, disabled,
+            )
+        };
+        assert!(selected(25, 19, 1, 1 << 19, true, true, false));
+        assert!(!selected(24, 19, 1, 1 << 19, true, true, false));
+        assert!(!selected(25, 18, 1, 1 << 19, true, true, false));
+        assert!(!selected(25, 19, 2, 1 << 19, true, true, false));
+        assert!(!selected(25, 19, 1, 1 << 18, true, true, false));
+        assert!(!selected(25, 19, 1, 1 << 19, false, true, false));
+        assert!(!selected(25, 19, 1, 1 << 19, true, false, false));
+        assert!(!selected(25, 19, 1, 1 << 19, true, true, true));
     }
 
     /// The cache-blocked transpose schedule must be BYTE-identical to the

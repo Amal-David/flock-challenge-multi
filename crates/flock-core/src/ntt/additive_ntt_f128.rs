@@ -523,59 +523,6 @@ pub struct AdditiveNttF128 {
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
 
-/// Prefetch schedule for the seed-fused top pass's message gather.
-///
-/// Returns `(distance, lines_per_row)`; a zero distance emits no hints.
-/// `FLOCK_NO_NTT_SEED_PF=1` restores the un-hinted gather in the same binary,
-/// and `FLOCK_NTT_SEED_PF_DIST` / `_LINES` override the schedule
-/// (diagnostics). Read once per process — never from inside a loop.
-#[cfg(target_arch = "x86_64")]
-fn seed_pf_params() -> (usize, usize) {
-    static P: std::sync::LazyLock<(usize, usize)> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_SEED_PF").is_some() {
-            return (0, 0);
-        }
-        let g = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(d)
-        };
-        (
-            g("FLOCK_NTT_SEED_PF_DIST", 1),
-            g("FLOCK_NTT_SEED_PF_LINES", 8),
-        )
-    });
-    *P
-}
-
-/// Issue `lines` L1 line hints on each of the four message rows
-/// `i · block_size + row`, `i ∈ 0..4`.
-///
-/// # Safety
-/// The four rows must lie inside the message buffer.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn pf_msg_rows(
-    src: *const F128,
-    row: usize,
-    block_size: usize,
-    row_len: usize,
-    lines: usize,
-) {
-    use core::arch::x86_64::*;
-    // SAFETY: rows are in bounds per the contract; prefetch hints are
-    // architecturally side-effect free.
-    unsafe {
-        for i in 0..4 {
-            let p = src.add((i * block_size + row) * row_len) as *const i8;
-            for l in 0..lines {
-                _mm_prefetch::<_MM_HINT_T0>(p.add(l * 64));
-            }
-        }
-    }
-}
-
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
@@ -1310,14 +1257,6 @@ impl AdditiveNttF128 {
         *ON
     }
 
-    /// `FLOCK_NTT_STAGE_PERM=1` selects the interleaved staging order; the
-    /// default is the natural `[block][k]` order.
-    fn stage_perm_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_STAGE_PERM").is_some());
-        *ON
-    }
-
     /// Publish one staging row to the codeword with non-temporal stores.
     ///
     /// The destination is written once here and next touched by the deep
@@ -1427,28 +1366,6 @@ impl AdditiveNttF128 {
         // (see `publish_row_nt`); decided once per pass.
         #[cfg(target_arch = "x86_64")]
         let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
-        // Staging row order inside a block.
-        //
-        // The natural order is `k`, and the fused-four kernel then walks its
-        // sixteen rows with `sixteenth = 4`: sixteen lines EXACTLY 4 KiB apart,
-        // i.e. sixteen lines competing for ONE 12-way L1d set, on every one of
-        // its lane steps. Reordering the block's rows as
-        // `k ↦ (k mod 4)·16 + k/4` makes each fused-four group sixteen
-        // CONSECUTIVE staging rows (`sixteenth = 1`), which spreads those
-        // sixteen lines over four L1d sets, four ways each; the fused-two quads
-        // become `{m, 16+m, 32+m, 48+m}` — four lines in one set, still inside
-        // the twelve ways. Row `i` of every kernel group is the same element in
-        // the same order as before, so the transform is byte-identical; only
-        // the scratch address it lives at changes.
-        let stage_perm = Self::stage_perm_enabled();
-        // Message-gather hints, decided once per pass (see `seed_pf_params`).
-        #[cfg(target_arch = "x86_64")]
-        let (pf_dist, pf_lines) = seed_pf_params();
-        // Staging row for logical row `k` of a block, and the fused-four /
-        // fused-two group geometry that matches it.
-        let perm = |k: usize| if stage_perm { (k & 3) * 16 + (k >> 2) } else { k };
-        let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
-            if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
@@ -1461,40 +1378,13 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 let bufp = buf.as_mut_ptr();
                 // Seed: 64 row groups → staging rows [block][k].
-                //
-                // The four message rows a step reads are asked for a fixed
-                // number of steps ahead. The hints move no data of their own
-                // and change no value; `FLOCK_NO_NTT_SEED_PF=1` removes them.
-                #[cfg(target_arch = "x86_64")]
-                if pf_dist != 0 {
-                    for k in 0..pf_dist.min(64) {
-                        pf_msg_rows(
-                            src,
-                            r + k * sub_stride,
-                            block_size,
-                            row_len,
-                            pf_lines,
-                        );
-                    }
-                }
                 for k in 0..64 {
                     let r_s = r + k * sub_stride;
-                    let kp = perm(k);
-                    #[cfg(target_arch = "x86_64")]
-                    if pf_dist != 0 && k + pf_dist < 64 {
-                        pf_msg_rows(
-                            src,
-                            r_s + pf_dist * sub_stride,
-                            block_size,
-                            row_len,
-                            pf_lines,
-                        );
-                    }
                     kernels::butterfly_fused_2layer_row_from_sparse_geo(
                         src,
                         block_size,
                         r_s,
-                        bufp.add(kp * row_len),
+                        bufp.add(k * row_len),
                         64,
                         0,
                         row_len,
@@ -1504,7 +1394,7 @@ impl AdditiveNttF128 {
                         src,
                         block_size,
                         r_s,
-                        bufp.add((256 + kp) * row_len),
+                        bufp.add((256 + k) * row_len),
                         64,
                         0,
                         row_len,
@@ -1517,26 +1407,18 @@ impl AdditiveNttF128 {
                     let tw = &tw4[block];
                     for j in 0..4 {
                         let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                        kernels::butterfly_fused_4layer_row(
-                            region.add(j * g4_base * row_len),
-                            g4_stride,
-                            row_len,
-                            lanes4,
-                            0,
-                            tw,
-                        );
+                        kernels::butterfly_fused_4layer_row(region, 4, row_len, lanes4, j, tw);
                     }
                     for m in 0..16 {
                         let outer_block = block * 16 + m;
                         let t_outer = self.twiddle(LAYER + 4, outer_block);
                         let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
                         let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
-                        let p = region.add(perm(4 * m) * row_len);
-                        let step = g2_stride * row_len;
+                        let p = region.add(4 * m * row_len);
                         let a = std::slice::from_raw_parts_mut(p, lanes2);
-                        let b = std::slice::from_raw_parts_mut(p.add(step), lanes2);
-                        let c = std::slice::from_raw_parts_mut(p.add(2 * step), lanes2);
-                        let d = std::slice::from_raw_parts_mut(p.add(3 * step), lanes2);
+                        let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
+                        let c = std::slice::from_raw_parts_mut(p.add(2 * row_len), lanes2);
+                        let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
                         kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
                     }
                 }
@@ -1546,7 +1428,7 @@ impl AdditiveNttF128 {
                     for block in 0..8 {
                         for k in 0..64 {
                             Self::publish_row_nt(
-                                bufp.add((block * 64 + perm(k)) * row_len),
+                                bufp.add((block * 64 + k) * row_len),
                                 base.add(block * block_bytes + (r + k * sub_stride) * row_len),
                                 row_len,
                             );
@@ -1560,7 +1442,7 @@ impl AdditiveNttF128 {
                 for block in 0..8 {
                     for k in 0..64 {
                         core::ptr::copy_nonoverlapping(
-                            bufp.add((block * 64 + perm(k)) * row_len),
+                            bufp.add((block * 64 + k) * row_len),
                             base.add(block * block_bytes + (r + k * sub_stride) * row_len),
                             row_len,
                         );
@@ -1824,7 +1706,6 @@ impl AdditiveNttF128 {
                 // Checked above: layer == 3, top fusion on, n_top ≥ 9.
                 debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
                 self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
-                crate::gaptime::mark("ntt: seed+top fused pass done");
                 layer += 6;
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
