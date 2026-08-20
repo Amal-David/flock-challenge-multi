@@ -258,6 +258,47 @@ mod tests {
         }
     }
 
+    /// `fold64_banked` equals the incumbent DirectFold8 F-side composition
+    /// `fold16_banked` then `fold4_nested`, including vector body and tail.
+    #[test]
+    fn fold64_banked_matches_fold16_then_fold4() {
+        use super::*;
+        let mut state = 0x64f0_1d16_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let r4 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let r5 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let mut got = vec![F128::ZERO; n];
+            fold64_banked(&src, &mut got, &w, r4, r5);
+            let mut mid = vec![F128::ZERO; 4 * n];
+            fold16_banked(&src, &mut mid, &w);
+            let mut want = vec![F128::ZERO; n];
+            fold4_nested(&mid, &mut want, r4, r5);
+            assert_eq!(got, want, "n={n}");
+        }
+    }
+
     /// AVX-512 (or portable) bind must match the scalar oracle at every
     /// ranked factor-state length plus a 4-element tail that misses the
     /// 8-output SIMD body.
@@ -557,6 +598,72 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             *value = v;
         }
     }
+}
+
+/// Sixty-four-bank DirectFold8 F-side: `dst[t] = fold4(fold16(src[64t..], w), r4, r5)`.
+///
+/// Algebra is the incumbent composition (`fold16_banked` then `fold4_nested`).
+/// The AVX-512 kernel keeps the fold16 16×4-lane body and applies the fold4
+/// pairing to those four mids in registers, so the mid slab is never written.
+#[inline]
+pub(crate) fn fold64_banked(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold64 source must contain sixty-four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all sixty-four source elements per output.
+    unsafe {
+        x86_64::fold64_banked(src, dst, w, r4, r5);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            *value = fold64_one_slot_scalar(src, t, w, r4, r5);
+        }
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn fold64_one_slot_scalar(
+    src: &[F128],
+    t: usize,
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) -> F128 {
+    let base = 64 * t;
+    let mut mid = [F128::ZERO; 4];
+    for i in 0..4 {
+        let mut v = F128::ZERO;
+        let group = base + 16 * i;
+        for b in 0..16 {
+            v += w[b] * src[group + b];
+        }
+        mid[i] = v;
+    }
+    let low = mid[0] + r4 * (mid[0] + mid[1]);
+    let high = mid[2] + r4 * (mid[2] + mid[3]);
+    low + r5 * (low + high)
 }
 
 /// Bind one top-bit split in place: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.

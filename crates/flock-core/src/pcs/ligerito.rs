@@ -5661,6 +5661,18 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_FOLD64_PACKED=1` restores the incumbent DirectFold8 F-side
+/// (`fold16_banked` into a mid slab, then `fold4_nested`). Ranked default
+/// keeps the four fold16 mids in registers and applies the fold4 pairing
+/// there — same field element, no mid-slab round-trip. Unusual geometry
+/// (`has_ordinary`, or a kill) stays on the incumbent loop.
+fn direct_fold8_f_packed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD64_PACKED").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5691,6 +5703,7 @@ fn materialize_direct_fold8(
         }
         weight
     });
+    let packed_f = !has_ordinary && direct_fold8_f_packed_enabled();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5767,7 +5780,7 @@ fn materialize_direct_fold8(
                         }
                     ],
                     vec![F128::ZERO; if has_ordinary { 16 * SUB } else { 0 }],
-                    vec![F128::ZERO; 4 * SUB],
+                    vec![F128::ZERO; if packed_f { 0 } else { 4 * SUB }],
                     vec![F128::ZERO; if b_gfni_on { 64 } else { 0 }],
                 )
             },
@@ -5781,11 +5794,16 @@ fn materialize_direct_fold8(
                     &[]
                 };
                 // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
+                // fold4: 64 -> 4 -> 1. Ranked default fuses that pair in
+                // registers (`fold64_banked`) so the mid slab is never
+                // written; `FLOCK_NO_FOLD64_PACKED=1` keeps this loop.
+                if packed_f {
+                    crate::field::f128_slice::fold64_banked(
+                        f_in, f_out, &fold16_weight, r4, r5,
+                    );
+                }
                 let mut slot = 0usize;
-                while slot < block_len {
+                while !packed_f && slot < block_len {
                     let n = SUB.min(block_len - slot);
                     let m4 = &mut mid4[..4 * n];
                     crate::field::f128_slice::fold16_banked(
