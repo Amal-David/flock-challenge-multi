@@ -2683,6 +2683,118 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
     data
 }
 
+/// Dense `2^k` transpose for one sparse-prefix window. Collision fallback
+/// for the singleton shortcut; same AVX-512 butterfly the inlined
+/// `window_task` already used on this tip.
+#[inline]
+fn transpose_forward_ntt_window_dense(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    mut buf: Vec<F128>,
+) -> (usize, Vec<F128>) {
+    for s in 0..k {
+        let layer = log_d - 1 - s;
+        let bsh = 1usize << s;
+        let block_size = bsh << 1;
+        let nblocks = (1usize << k) / block_size;
+        for jb in 0..nblocks {
+            let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+            let base = jb * block_size;
+            let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
+            transpose_butterfly(top_h, bot, t);
+        }
+    }
+    (w, buf)
+}
+
+/// Expand one nonzero at local index `p` through the window's `k` transpose
+/// layers. Before layer `s`, only one `2^s` half can be live; either source
+/// orientation produces the same top half (`current`) and a bottom half
+/// scaled by `twiddle + bit_s`. Thus the work is `1+2+...+2^(k-1)` products,
+/// versus `k·2^(k-1)` for the zero-padded dense window.
+fn transpose_forward_ntt_window_singleton(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    p: usize,
+    value: F128,
+) -> (usize, Vec<F128>) {
+    assert!(k > 0 && k <= log_d);
+    assert!(p < 1usize << k);
+    let mut buf = vec![F128::ZERO; 1usize << k];
+    buf[0] = value;
+    let mut len = 1usize;
+    for s in 0..k {
+        let layer = log_d - 1 - s;
+        let jb = p >> (s + 1);
+        let mut scale = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+        if (p >> s) & 1 != 0 {
+            scale += F128::ONE;
+        }
+        let (current, rest) = buf[..2 * len].split_at_mut(len);
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        // SAFETY: target features are cfg-guaranteed and the two halves have
+        // equal length. `eq_expand_block_x4` storeu's the new half without
+        // loading it.
+        unsafe {
+            eq_expand_block_x4(&mut rest[..len], current, scale)
+        }
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        for (dst, &src) in rest[..len].iter_mut().zip(current.iter()) {
+            *dst = src * scale;
+        }
+        len <<= 1;
+    }
+    (w, buf)
+}
+
+fn ranked_induce_singleton_selected(
+    log_d: usize,
+    n_queries: usize,
+    k: usize,
+    fill: bool,
+    platform: bool,
+    disabled: bool,
+) -> bool {
+    platform
+        && !disabled
+        && fill
+        && k == 8
+        && matches!((log_d, n_queries), (20, 218) | (18, 106))
+}
+
+fn ranked_induce_singleton_enabled(log_d: usize, n_queries: usize, k: usize, fill: bool) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_LIG_INDUCE_SINGLETON").is_none()
+        });
+        ranked_induce_singleton_selected(log_d, n_queries, k, fill, true, !*ON)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = (log_d, n_queries, k, fill);
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InduceSingletonStats {
+    singleton_hits: usize,
+    collision_fallbacks: usize,
+}
+
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
@@ -2696,9 +2808,20 @@ fn transpose_forward_ntt_sparse(
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
+    transpose_forward_ntt_sparse_inner(ntt, positions, values, log_d, None).0
+}
+
+fn transpose_forward_ntt_sparse_inner(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    singleton_override: Option<bool>,
+) -> (Vec<F128>, InduceSingletonStats) {
     use rayon::prelude::*;
     use std::collections::HashMap;
     let n = 1usize << log_d;
+    assert_eq!(positions.len(), values.len());
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
@@ -2710,7 +2833,7 @@ fn transpose_forward_ntt_sparse(
         if log_d > 0 {
             transpose_forward_ntt(ntt, &mut data, log_d);
         }
-        return data;
+        return (data, InduceSingletonStats::default());
     }
 
     let wmask = (1usize << k) - 1;
@@ -2759,58 +2882,47 @@ fn transpose_forward_ntt_sparse(
         win_vec = windows.into_iter().collect();
     }
 
+    let singleton_on = singleton_override
+        .unwrap_or_else(|| ranked_induce_singleton_enabled(log_d, positions.len(), k, fill));
+    let singleton_stats = if singleton_on && fill {
+        InduceSingletonStats {
+            singleton_hits: runs.iter().filter(|(s, e)| e - s == 1).count(),
+            collision_fallbacks: runs.iter().filter(|(s, e)| e - s > 1).count(),
+        }
+    } else {
+        InduceSingletonStats::default()
+    };
+
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let window_task = |w: usize, mut buf: Vec<F128>| -> (usize, Vec<F128>) {
-        {
-            for s in 0..k {
-                let layer = log_d - 1 - s;
-                let bsh = 1usize << s; // pairing distance
-                let block_size = bsh << 1;
-                let nblocks = (1usize << k) / block_size;
-                for jb in 0..nblocks {
-                    // global block index = ((w<<k) + jb*block_size) >> (s+1).
-                    let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-                    let base = jb * block_size;
-                    let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                    // SAFETY: target features cfg-guaranteed; split halves
-                    // are equal-length.
-                    unsafe {
-                        transpose_butterfly_avx512(top_h, bot, t)
-                    }
-                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                    {
-                        for r in 0..bsh {
-                            let a = top_h[r];
-                            let b = bot[r];
-                            let sab = a + b;
-                            top_h[r] = sab;
-                            bot[r] = t * sab + b;
-                        }
-                    }
-                }
-            }
-            (w, buf)
-        }
-    };
     let processed: Vec<(usize, Vec<F128>)> = if fill {
         runs.par_iter()
             .map(|&(rs, re)| {
-                let w = positions[order[rs] as usize] >> k;
+                let first = order[rs] as usize;
+                let w = positions[first] >> k;
+                if singleton_on && re - rs == 1 {
+                    return transpose_forward_ntt_window_singleton(
+                        ntt,
+                        log_d,
+                        k,
+                        w,
+                        positions[first] & wmask,
+                        values[first],
+                    );
+                }
                 let mut buf = vec![F128::ZERO; 1 << k];
                 for &i in &order[rs..re] {
                     let i = i as usize;
                     buf[positions[i] & wmask] += values[i];
                 }
-                window_task(w, buf)
+                transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
             })
             .collect()
     } else {
         win_vec
             .into_par_iter()
-            .map(|(w, buf)| window_task(w, buf))
+            .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
             .collect()
     };
     let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
@@ -2851,7 +2963,7 @@ fn transpose_forward_ntt_sparse(
             mf = minor_faults() - mf0,
         );
     }
-    data
+    (data, singleton_stats)
 }
 
 // ===================================================================
@@ -10092,6 +10204,102 @@ mod tests {
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
+    }
+
+    /// Every possible local source position must expand to the incumbent
+    /// dense window, across low/high global window indices and ranked depths.
+    #[test]
+    fn singleton_window_matches_dense_for_every_position() {
+        use crate::challenger::Challenger;
+        const K: usize = 8;
+        for &log_d in &[12usize, 18, 20] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let last_w = (1usize << (log_d - K)) - 1;
+            for &w in &[0usize, 1, last_w] {
+                let mut ch = crate::challenger::RandomChallenger::new(
+                    0x51A6_1E70 ^ ((log_d * 257 + w) as u64),
+                );
+                for p in 0..(1usize << K) {
+                    let value = if p == 0 { F128::ONE } else { ch.sample_f128() };
+                    let mut dense = vec![F128::ZERO; 1usize << K];
+                    dense[p] = value;
+                    let want = transpose_forward_ntt_window_dense(&ntt, log_d, K, w, dense);
+                    let got =
+                        transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
+                    assert_eq!(got, want, "log_d={log_d} w={w} p={p}");
+                }
+            }
+        }
+    }
+
+    fn sparse_dense_oracle(log_d: usize, positions: &[usize], values: &[F128]) -> Vec<F128> {
+        let mut dense = vec![F128::ZERO; 1usize << log_d];
+        for (&p, &v) in positions.iter().zip(values) {
+            dense[p] += v;
+        }
+        let ntt = AdditiveNttF128::standard(log_d);
+        transpose_forward_ntt(&ntt, &mut dense, log_d);
+        dense
+    }
+
+    /// A window with multiple query positions must take the incumbent path;
+    /// the forced singleton mode must report no hits and one collision.
+    #[test]
+    fn singleton_sparse_collision_falls_back_exactly() {
+        use crate::challenger::Challenger;
+        let log_d = 12usize;
+        let w = 3usize;
+        let positions = vec![(w << 8) + 1, (w << 8) + 7, (w << 8) + 201];
+        let mut ch = crate::challenger::RandomChallenger::new(0xC011_1510);
+        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+        let ntt = AdditiveNttF128::standard(log_d);
+        let want = sparse_dense_oracle(log_d, &positions, &values);
+        let (got, stats) =
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true));
+        let (off, _) =
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(false));
+        assert_eq!(got, want);
+        assert_eq!(off, want);
+        assert_eq!(stats.singleton_hits, 0);
+        assert_eq!(stats.collision_fallbacks, 1);
+    }
+
+    /// Mixed singleton and collision windows exercise both branches in one
+    /// sparse transform and must still match the full dense transpose.
+    #[test]
+    fn singleton_sparse_mixed_windows_match_dense() {
+        use crate::challenger::Challenger;
+        let log_d = 12usize;
+        let positions = vec![
+            (1usize << 8) + 2,
+            (1usize << 8) + 91,
+            (5usize << 8) + 17,
+            (11usize << 8) + 233,
+        ];
+        let mut ch = crate::challenger::RandomChallenger::new(0x51A6_C011);
+        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+        let ntt = AdditiveNttF128::standard(log_d);
+        let want = sparse_dense_oracle(log_d, &positions, &values);
+        let (got, stats) =
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true));
+        assert_eq!(got, want);
+        assert_eq!(stats.singleton_hits, 2);
+        assert_eq!(stats.collision_fallbacks, 1);
+    }
+
+    #[test]
+    fn ranked_induce_singleton_selector_is_exact() {
+        let selected = |log_d, nq, k, fill, platform, disabled| {
+            ranked_induce_singleton_selected(log_d, nq, k, fill, platform, disabled)
+        };
+        assert!(selected(20, 218, 8, true, true, false));
+        assert!(selected(18, 106, 8, true, true, false));
+        assert!(!selected(20, 217, 8, true, true, false));
+        assert!(!selected(19, 218, 8, true, true, false));
+        assert!(!selected(20, 218, 7, true, true, false));
+        assert!(!selected(20, 218, 8, false, true, false));
+        assert!(!selected(20, 218, 8, true, false, false));
+        assert!(!selected(20, 218, 8, true, true, true));
     }
 
     /// The fused parallel densify must be BYTE-identical to the incumbent
