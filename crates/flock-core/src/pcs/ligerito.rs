@@ -5841,7 +5841,9 @@ fn direct_fold8_final_generators(
     claim: &super::ring_switch::DirectFold8Factors,
     challenge: F128,
 ) -> Vec<F128> {
-    let mut generators = vec![F128::ZERO; claim.w_state.len() / 2];
+    // `fold_pairs` writes every output slot; the recycled destination's old
+    // bytes are never observed.
+    let mut generators: Vec<F128> = crate::alloc_uninit_vec(claim.w_state.len() / 2);
     crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
     generators
 }

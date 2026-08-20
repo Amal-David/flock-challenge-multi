@@ -2687,7 +2687,9 @@ fn direct_fold8_states_seq(
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    // Every slot is assigned by the indexed gather below before `w_state`
+    // can be read. Avoid zeroing this recycled 128 KiB destination first.
+    let mut w_state: Vec<F128> = crate::alloc_uninit_vec(64 * n_packed);
     for d_low in 0..64 {
         let mut basis_product = low_eq[d_low];
         w_state[d_low] = fold_one_slot(basis_product, table);
@@ -2696,7 +2698,8 @@ fn direct_fold8_states_seq(
             w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
         }
     }
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    // As above, the gather writes the complete bit-major state.
+    let mut a_state: Vec<F128> = crate::alloc_uninit_vec(64 * n_packed);
     for e in 0..64 {
         let bank = &fold8[e * n_packed..(e + 1) * n_packed];
         for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
@@ -2742,8 +2745,9 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    // The indexed gather below assigns every lane of both destinations.
+    let mut w_state: Vec<F128> = crate::alloc_uninit_vec(64 * n_packed);
+    let mut a_state: Vec<F128> = crate::alloc_uninit_vec(64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
