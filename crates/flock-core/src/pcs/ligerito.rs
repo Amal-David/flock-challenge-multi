@@ -2139,25 +2139,46 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// `FLOCK_NO_OPEN_TNTT_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
+/// in the open Fᵀ butterfly. Ranked default is the 5-CLMUL split product the
+/// additive-NTT diet already uses for a loop-constant twiddle. Read once per
+/// process; the ranked worker's cleared env never sets the kill switch.
+fn tntt_diet_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_TNTT_DIET").is_none());
+    *ON
+}
+
 /// 4-lane AVX-512 transpose butterfly: `s = a ⊕ b; a' = s; b' = t·s ⊕ b`.
 ///
-/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one `ghash_mul_x4`
-/// per 4-lane group, XOR for the sum. Field-identical to the scalar loop
-/// (`ghash_mul_x4` is the canonical mod-p product, cross-checked against
-/// `ghash_mul_karatsuba_barrett` in the field tests).
+/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one 4-lane GHASH
+/// product per group, XOR for the sum. `DIET` selects
+/// [`ghash_mul_x4_split`](crate::field::gf2_128::x86_64::ghash_mul_x4_split)
+/// (5 CLMUL, `t·x^64` hoisted once per call) over the incumbent 6-CLMUL
+/// [`ghash_mul_x4`](crate::field::gf2_128::x86_64::ghash_mul_x4). Both are
+/// field-identical to the scalar loop (`t·v` is the canonical mod-p product,
+/// cross-checked against `ghash_mul_karatsuba_barrett` in the field tests).
+/// Monomorphized so the product form is not a loop-carried branch.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site). `top` and
 /// `bot` must have equal length.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+unsafe fn transpose_butterfly_avx512<const DIET: bool>(
+    top: &mut [F128],
+    bot: &mut [F128],
+    t: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        // Companion is only materialised when the split product reads it;
+        // otherwise it aliases `tb` and DCE drops the extra CLMUL.
+        let t_x64 = if DIET { ghash_shift64_x4(tb) } else { tb };
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2165,7 +2186,12 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let prod = if DIET {
+                ghash_mul_x4_split(vs, tb, t_x64)
+            } else {
+                ghash_mul_x4(tb, vs)
+            };
+            let nb = _mm512_xor_si512(vb, prod);
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -2187,7 +2213,11 @@ fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
     // SAFETY: target features cfg-guaranteed; halves are equal-length.
     unsafe {
-        transpose_butterfly_avx512(top_h, bot, t)
+        if tntt_diet_enabled() {
+            transpose_butterfly_avx512::<true>(top_h, bot, t)
+        } else {
+            transpose_butterfly_avx512::<false>(top_h, bot, t)
+        }
     }
     #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
     {
@@ -2725,22 +2755,7 @@ fn transpose_forward_ntt_sparse(
                     let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
                     let base = jb * block_size;
                     let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                    // SAFETY: target features cfg-guaranteed; split halves
-                    // are equal-length.
-                    unsafe {
-                        transpose_butterfly_avx512(top_h, bot, t)
-                    }
-                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                    {
-                        for r in 0..bsh {
-                            let a = top_h[r];
-                            let b = bot[r];
-                            let sab = a + b;
-                            top_h[r] = sab;
-                            bot[r] = t * sab + b;
-                        }
-                    }
+                    transpose_butterfly(top_h, bot, t);
                 }
             }
             (w, buf)
@@ -8976,6 +8991,32 @@ mod tests {
                 transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
+        }
+    }
+
+    /// 5-CLMUL split twiddle vs incumbent 6-CLMUL `ghash_mul_x4` on the open
+    /// Fᵀ butterfly: same field elements, including a ragged tail of length
+    /// not divisible by 4 (the scalar remainder arm).
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn transpose_butterfly_diet_matches_full_ghash() {
+        use crate::challenger::Challenger;
+        for &n in &[1usize, 2, 3, 4, 5, 7, 8, 16, 17, 64, 65, 128] {
+            let mut ch = crate::challenger::RandomChallenger::new(0xD1E7_u64 ^ n as u64);
+            let t = ch.sample_f128();
+            let top0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let bot0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let mut diet_top = top0.clone();
+            let mut diet_bot = bot0.clone();
+            let mut full_top = top0;
+            let mut full_bot = bot0;
+            // SAFETY: this test is cfg-gated on avx512f+vpclmulqdq.
+            unsafe {
+                transpose_butterfly_avx512::<true>(&mut diet_top, &mut diet_bot, t);
+                transpose_butterfly_avx512::<false>(&mut full_top, &mut full_bot, t);
+            }
+            assert_eq!(diet_top, full_top, "top n={n}");
+            assert_eq!(diet_bot, full_bot, "bot n={n}");
         }
     }
 
