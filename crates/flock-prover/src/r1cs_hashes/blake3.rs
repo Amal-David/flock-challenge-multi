@@ -1714,12 +1714,8 @@ fn generate_round1_inner_octa(
     const GROUP: usize = 16;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
-    // 64-byte lines backing one task's streaming projection staging pair.
-    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
-    // Streaming form of the fused projection: no whole-block window buffer.
-    let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -1732,13 +1728,10 @@ fn generate_round1_inner_octa(
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
-    let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
-        prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
-        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .zip(ab_inner.as_bytes_mut().par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
             || {
@@ -1749,18 +1742,11 @@ fn generate_round1_inner_octa(
                 // the dump writes every window byte before the projection
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
-                    WIN_LINES
-                } else {
-                    0
-                };
-                if want != 0 {
-                    v.reserve_exact(want);
+                if ab_nt {
+                    v.reserve_exact(WIN_LINES);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
                     // `reserve_exact` guaranteed the capacity.
-                    unsafe { v.set_len(want) };
+                    unsafe { v.set_len(WIN_LINES) };
                 }
                 v
             },
@@ -1769,17 +1755,11 @@ fn generate_round1_inner_octa(
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
-                let win_ab = if ab_nt && !ab_stream {
+                let win_ab = if ab_nt {
                     debug_assert_eq!(win.len(), WIN_LINES);
                     let wa = win.as_mut_ptr().cast::<u32>();
                     // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
                     Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
-                } else {
-                    None
-                };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
                 } else {
                     None
                 };
@@ -1816,32 +1796,12 @@ fn generate_round1_inner_octa(
                             }
                         };
                         let off = half * SIMD * F128_PER_BLOCK;
-                        // Streaming arm: the drain transforms each 64-byte
-                        // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
-                        let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
-                                }
-                            }
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
-                                inv_table,
-                                plan: win_plan,
-                            }
-                        });
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
                             win_ab,
-                            proj,
                             elide,
                             z_nt,
                         );
@@ -1876,7 +1836,7 @@ fn generate_round1_inner_octa(
                 // the dump loop above could not cover (unreachable at every
                 // power-of-two shape ≥ 8; kept so the two arms stay observably
                 // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
+                let j0 = if win_ab.is_some() {
                     (n_here / SIMD) * SIMD
                 } else {
                     0
@@ -2184,20 +2144,6 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_ab_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_NT").is_none());
-        *ON
-    }
-
-    /// `FLOCK_NO_WITGEN_AB_WINSTREAM=1` restores the whole-block a/b window
-    /// buffers: the fused dump fills two full per-task window copies of the
-    /// octa and the round-1 projection runs over them once the octa is
-    /// complete. With the switch off (the default) each drain step's eight
-    /// 64-byte round-1 medium windows are transformed as they are produced,
-    /// out of a small staging pair, and no whole-block window buffer exists.
-    /// Same ab_inner bytes either way; only meaningful under
-    /// `witgen_ab_nt_enabled`.
-    pub(crate) fn witgen_ab_winstream_enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_WINSTREAM").is_none());
         *ON
     }
 

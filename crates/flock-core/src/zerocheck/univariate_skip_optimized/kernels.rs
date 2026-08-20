@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -62,7 +62,9 @@ pub(super) struct BstaticPartials;
     target_feature = "avx512bw"
 )))]
 #[inline]
-pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&'static BstaticPartials> {
+pub(super) fn prepare_bstatic(
+    _inv_table: &InvNttTableByteSingleGf8,
+) -> Option<&'static BstaticPartials> {
     None
 }
 
@@ -71,49 +73,6 @@ pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&
 /// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
 /// verifies every planned row against the actual b word.
 pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
-
-/// Process-invariant mode switches for the x86 round-1 AB kernel. The
-/// streaming witness path resolves these once, rather than entering three
-/// `LazyLock` accessors for every 64-byte window.
-#[derive(Clone, Copy)]
-pub(super) struct ShiftReducePlan {
-    img2: bool,
-    pidx: bool,
-    offw: bool,
-}
-
-#[inline]
-pub(super) fn prepare_shift_reduce(
-    inv_table: &InvNttTableByteSingleGf8,
-) -> ShiftReducePlan {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        let img2 = x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
-        let pidx = img2 && x86_64::urm_pidx_enabled();
-        let offw = pidx && x86_64::urm_offw_enabled();
-        ShiftReducePlan { img2, pidx, offw }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    {
-        let _ = inv_table;
-        ShiftReducePlan {
-            img2: false,
-            pidx: false,
-            offw: false,
-        }
-    }
-}
 
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -252,89 +211,6 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
-/// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
-/// byte offset plus the global BLAKE3 medium-window index
-/// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
-/// on their own rather than a whole packed block. Bit-identical to
-/// [`shift_reduce_inner_ab`] on the same bytes with the same `blk`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab_at(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    byte_base: usize,
-    blk: usize,
-    out: &mut [u8; 64],
-    bstatic: Option<&'static BstaticPartials>,
-    prepared: ShiftReducePlan,
-    nt: u8,
-) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        // SAFETY: all required target features are enabled at compile time,
-        // and the caller vouches for 64 readable bytes at `byte_base`.
-        unsafe {
-            if let Some(partials) = bstatic {
-                // The outlined static-B dispatcher (`inline(never)`) is live
-                // only for windows 0, 1, 30, 31 — every other `blk` returns
-                // false without writing. The streaming producer still called
-                // it 28/32 of the time. Gate here so those windows stay on
-                // the prepared generic body with no extra call. Unexpected
-                // `blk` keeps the incumbent generic path.
-                if (blk <= 1 || blk == 30 || blk == 31)
-                    && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
-                        a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
-                    )
-                {
-                    return;
-                }
-            }
-            x86_64::shift_reduce_inner_ab_x86_avx512_prepared(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base,
-                0,
-                out,
-                nt,
-                prepared.img2,
-                prepared.pidx,
-                prepared.offw,
-            );
-        }
-    }
-
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    {
-        let _ = (blk, bstatic, prepared);
-        let mut a_col = [F8::ZERO; 64];
-        let mut b_col = [F8::ZERO; 64];
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            byte_base,
-            0,
-            out,
-            &mut a_col,
-            &mut b_col,
-            None,
-            nt,
-        );
-    }
-}
-
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
 /// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
@@ -370,6 +246,37 @@ pub(super) fn shift_reduce_inner_ab_x2(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ))]
+        {
+            // Ranked SPR path: pair consecutive b_med windows in one AVX-512
+            // kernel (same algebra as two `shift_reduce_inner_ab` calls).
+            // Leave the static-B specialized kernel on its sequential path —
+            // that plan is a different grain and only covers four blocks.
+            if bstatic.is_none() && x86_64::sr_avx512_x2_enabled() {
+                let _ = (a_col, b_col);
+                // SAFETY: `shift_reduce_inner_ab_x2` callers already prove
+                // both windows' packed spans and outputs; compile-time
+                // features match the kernel.
+                unsafe {
+                    x86_64::shift_reduce_inner_ab_x86_avx512_x2(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        out0,
+                        out1,
+                        nt,
+                    );
+                }
+                return;
+            }
+        }
         shift_reduce_inner_ab(
             a_packed,
             b_packed,
@@ -645,10 +552,14 @@ impl CBankNibbleLut {
         debug_assert_eq!(mask_tables.len(), 512);
         let (t_lo, t_hi) = mask_tables.split_at(256);
         let mut lut = Self {
-            lo_n0_lo: [0; 16], lo_n0_hi: [0; 16],
-            lo_n1_lo: [0; 16], lo_n1_hi: [0; 16],
-            hi_n0_lo: [0; 16], hi_n0_hi: [0; 16],
-            hi_n1_lo: [0; 16], hi_n1_hi: [0; 16],
+            lo_n0_lo: [0; 16],
+            lo_n0_hi: [0; 16],
+            lo_n1_lo: [0; 16],
+            lo_n1_hi: [0; 16],
+            hi_n0_lo: [0; 16],
+            hi_n0_hi: [0; 16],
+            hi_n1_lo: [0; 16],
+            hi_n1_hi: [0; 16],
         };
         for i in 0..16 {
             lut.lo_n0_lo[i] = t_lo[i].lo;
@@ -671,7 +582,10 @@ impl CBankNibbleLut {
 ))]
 pub(super) fn build_c_bank_nibble_luts(mask_tables: &[super::F128]) -> Vec<CBankNibbleLut> {
     debug_assert_eq!(mask_tables.len() % 512, 0);
-    mask_tables.chunks_exact(512).map(CBankNibbleLut::new).collect()
+    mask_tables
+        .chunks_exact(512)
+        .map(CBankNibbleLut::new)
+        .collect()
 }
 
 #[cfg(all(
@@ -690,13 +604,9 @@ pub(super) fn accumulate_c_banks_prebuilt(
     // SAFETY: cfg supplies the features and fixed arrays bound all accesses.
     unsafe {
         if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(
-                c_block, n_b_med, lut, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, lut, partial_c);
         } else {
-            x86_64::accumulate_c_banks_x86_avx512(
-                c_block, n_b_med, mask_tables, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512(c_block, n_b_med, mask_tables, partial_c);
         }
     }
 }
