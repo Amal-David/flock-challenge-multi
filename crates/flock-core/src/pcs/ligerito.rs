@@ -4547,6 +4547,63 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_MDF8_PF=1` restores the incumbent [`materialize_direct_fold8`],
+/// which issues no software prefetch. A prefetch is a hint with no
+/// architectural effect, so both arms produce byte-identical proofs.
+///
+/// DirectFold8 (`f654b6f`) became the ranked default after MDF4_PF
+/// (`65d6213`) landed on fold4. It kept the per-task f-then-b split
+/// (cold 2 MiB f-slab, then DRAM-idle b-side) but dropped the next-slab
+/// T1 walk. Ranked geometry is still 256 × 2 MiB f-slabs over the 512 MiB
+/// packed witness (`64 * block_len` F128s, `block_len = 2048`); only the
+/// b-side inner trip changed (fold4: 4-wide `fold_one_slot`; fold8: GFNI
+/// 64-slot fused 2-claim kernel, else 1-wide scalar).
+///
+/// This restores fold4's prefetch *rate*, not its loop trip count:
+/// one T1 line per 4 b-side slots per claim-pass, `_MM_HINT_T1`, next
+/// block's f-slab, null base on the last block or the kill switch.
+/// GFNI fuses both ranked claims into one 64-slot trip, so that rate is
+/// `(64/4)*2` lines per trip. Scalar fallback stays 1-wide and issues
+/// one line every 4 slots, same as fold4.
+#[cfg(target_arch = "x86_64")]
+fn mdf8_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF8_PF").is_none());
+    *ON
+}
+
+/// Fold4 MDF4_PF inner grain: one 64-byte T1 per 4 slots of one claim.
+#[cfg(target_arch = "x86_64")]
+const MDF4_PF_SLOTS_PER_LINE: usize = 4;
+/// Ranked DirectFold8 GFNI batch (see `gfni_fold64_four_maps_staged`).
+#[cfg(target_arch = "x86_64")]
+const MDF8_GFNI_SLOTS: usize = 64;
+/// `b_gfni_on` requires `claims.len() == 2`; both claims share one trip.
+#[cfg(target_arch = "x86_64")]
+const MDF8_GFNI_FUSED_CLAIMS: usize = 2;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn mdf8_pf_lines(pf_base: *const u8, pf_at: &mut usize, pf_span: usize, n_lines: usize) {
+    if pf_base.is_null() {
+        return;
+    }
+    let mut n = n_lines;
+    while n > 0 && *pf_at < pf_span {
+        // SAFETY: `*pf_at < pf_span` and the slab is `pf_span` bytes, so
+        // the address stays inside `packed_witness`. Prefetch has no
+        // architectural effect.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(
+                pf_base.add(*pf_at).cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T1,
+            );
+        }
+        *pf_at += 64;
+        n -= 1;
+    }
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -5947,6 +6004,13 @@ fn materialize_direct_fold8(
         Vec::new()
     };
 
+    // Next-slab T1 walk, resolved once — never inside the block / claim /
+    // slot loops. Same contract as MDF4_PF: null base on the last block
+    // or the kill switch is the only check the inner loops make.
+    #[cfg(target_arch = "x86_64")]
+    let pf_on = mdf8_pf_enabled();
+    #[cfg(target_arch = "x86_64")]
+    let n_blocks = out_len / block_len;
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
@@ -5988,6 +6052,23 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
+                // Head of the NEXT block's f-side slab. `block + 1 < n_blocks`
+                // keeps the whole slab inside `packed_witness`:
+                // `64·(block+2)·block_len ≤ 64·n_blocks·block_len = len`.
+                #[cfg(target_arch = "x86_64")]
+                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                    // SAFETY: bounds argued above; `add` stays inside the
+                    // allocation and the pointer is never dereferenced.
+                    let p = unsafe { packed_witness.as_ptr().add(start + 64 * block_len) };
+                    (
+                        p.cast::<u8>(),
+                        64 * block_len * core::mem::size_of::<F128>(),
+                    )
+                } else {
+                    (core::ptr::null::<u8>(), 0usize)
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut pf_at = 0usize;
                 // Deferred-reduction 16-bank fold followed by one nested
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
@@ -6039,6 +6120,16 @@ fn materialize_direct_fold8(
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
+                        // Fold4 issued 1 T1 line per 4-slot inner trip per
+                        // claim. This trip owns 64 slots of both ranked
+                        // claims, so the same rate is (64/4)*2 lines.
+                        #[cfg(target_arch = "x86_64")]
+                        mdf8_pf_lines(
+                            pf_base,
+                            &mut pf_at,
+                            pf_span,
+                            MDF8_GFNI_SLOTS / MDF4_PF_SLOTS_PER_LINE * MDF8_GFNI_FUSED_CLAIMS,
+                        );
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
@@ -6066,6 +6157,10 @@ fn materialize_direct_fold8(
                         scratch,
                     );
                     for slot in 0..block_len {
+                        #[cfg(target_arch = "x86_64")]
+                        if slot % MDF4_PF_SLOTS_PER_LINE == 0 {
+                            mdf8_pf_lines(pf_base, &mut pf_at, pf_span, 1);
+                        }
                         let direct =
                             super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                         b_out[slot] = if has_ordinary {
@@ -6081,6 +6176,10 @@ fn materialize_direct_fold8(
                             scratch,
                         );
                         for (slot, out) in b_out.iter_mut().enumerate() {
+                            #[cfg(target_arch = "x86_64")]
+                            if slot % MDF4_PF_SLOTS_PER_LINE == 0 {
+                                mdf8_pf_lines(pf_base, &mut pf_at, pf_span, 1);
+                            }
                             *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                         }
                     }
