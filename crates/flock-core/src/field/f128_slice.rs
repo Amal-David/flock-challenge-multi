@@ -66,6 +66,37 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Add one scaled field slice into another: `dst[i] += scale * addend[i]`.
+///
+/// The ranked lazy-OOD fold uses this after folding the incumbent basis and
+/// before reducing the next-round message.  Keeping the operation here lets
+/// the Sapphire Rapids build issue four independent VPCLMUL products at once;
+/// other builds retain the exact scalar field operation.
+#[inline]
+pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
+    assert_eq!(dst.len(), addend.len(), "scaled addend length changed");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees one readable addend per destination slot.
+    unsafe {
+        x86_64::add_scaled(dst, addend, scale);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (value, &extra) in dst.iter_mut().zip(addend) {
+        *value += scale * extra;
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where

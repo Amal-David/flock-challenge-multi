@@ -32,6 +32,36 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
     }
 }
 
+/// Four-lane `dst += scale * addend` for the lazy-OOD correction.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(dst.len(), addend.len());
+    // SAFETY: caller supplies target features and equal slice lengths.
+    unsafe {
+        let scale_x4 =
+            _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let lanes = dst.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
+            let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
+            let corrected = _mm512_xor_si512(current, ghash_mul_x4(scale_x4, extra));
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
+            i += 4;
+        }
+        while i < dst.len() {
+            dst[i] += scale * addend[i];
+            i += 1;
+        }
+    }
+}
+
 #[inline]
 fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: usize) {
     // Char-2 one-mul tail (SIMD body already uses even + r*(even+odd)).
