@@ -133,11 +133,29 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
     unsafe { _mm256_slli_epi32::<N>(v) }
 }
 
+/// `FLOCK_NO_WG_SHIFT=1` restores the multi-op merges in [`vsli_v8`] and
+/// [`xor_rotr8`] (exact same-binary A/B; only compiled on AVX-512VL builds —
+/// plain AVX2 builds carry the multi-op forms unconditionally).
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+fn wg_shift_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WG_SHIFT").is_none());
+    *ON
+}
+
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
+/// On AVX-512VL the or/and pair folds into one `vpternlogd` with immediate
+/// `0xF8` (the truth table of `x | (y & z)`, bit-identical with the shifted
+/// word as `x` and the mask as `z`). `FLOCK_NO_WG_SHIFT=1` restores the 3-op
+/// form.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
     unsafe {
         let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        #[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+        if wg_shift_enabled() {
+            return _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask);
+        }
         _mm256_or_si256(_mm256_slli_epi32::<N>(b), _mm256_and_si256(a, mask))
     }
 }
@@ -250,10 +268,16 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     (sum, left, right, carry)
 }
 
+/// `(x ^ y) >>> N`. On AVX-512VL the shift/shift/or rotate is one `vprord`.
+/// `FLOCK_NO_WG_SHIFT=1` restores the 3-op form.
 #[inline(always)]
 fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     debug_assert_eq!(N + M, 32);
     let v = xor_v8(x, y);
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512vl"))]
+    if wg_shift_enabled() {
+        return unsafe { _mm256_ror_epi32::<N>(v) };
+    }
     or_v8(shr_v8::<N>(v), shl_v8::<M>(v))
 }
 
@@ -292,6 +316,16 @@ fn wide_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_WG_TR8Z=1` restores independent 256-bit chunk transposes (and
+/// the per-row re-packing insert in [`stream_pair_v8`]) inside the paired NT
+/// drains. Exact same-binary A/B; only compiled on AVX-512F builds.
+#[cfg(target_feature = "avx512f")]
+fn wg_tr8z_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WG_TR8Z").is_none());
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -310,6 +344,15 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
         let mut g = g0;
         while g + 2 <= g1 {
             let w = 8 * g;
+            #[cfg(target_feature = "avx512f")]
+            if wg_tr8z_enabled() {
+                let t = tr8z_chunk_pair(stage, w);
+                for r in 0..8 {
+                    stream_zpair(dst.add(r * U32_PER_BLOCK + w), t[r]);
+                }
+                g += 2;
+                continue;
+            }
             let ta = tr8_chunk(stage, w);
             let tb = tr8_chunk(stage, w + 8);
             for r in 0..8 {
@@ -342,6 +385,93 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
             load_v8(stage.add(w + 6) as *const u32),
             load_v8(stage.add(w + 7) as *const u32),
         )
+    }
+}
+
+/// Dword gather tables for [`tr8z_chunk_pair`]'s two `vpermt2d` stages, and
+/// the lane immediates of its `vshufi32x4` stage. Shared with the scalar
+/// network model in the tests, which pins them on hosts where the AVX-512
+/// arm cannot execute.
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_IDX1_LO: [u32; 16] = [0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27];
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_IDX1_HI: [u32; 16] = [4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31];
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_IDX2_LO: [u32; 16] = [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23];
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_IDX2_HI: [u32; 16] = [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31];
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_SHUF_LO: i32 = 0x44; // 128-bit lanes [a.0, a.1, b.0, b.1]
+#[cfg(any(target_feature = "avx512f", test))]
+const TR8Z_SHUF_HI: i32 = 0xEE; // 128-bit lanes [a.2, a.3, b.2, b.3]
+
+/// [`tr8_chunk`] for a chunk PAIR in ZMM halves: one 512-bit shuffle network
+/// transposes chunks `w` and `w + 8` together, and
+/// `out[c] = [tr8_chunk(stage, w)[c] | tr8_chunk(stage, w + 8)[c]]` — the
+/// 64-byte line layout the paired drains publish, with no re-packing insert.
+/// 24 shuffle-port uops per pair against the 48 of two [`tr8_chunk`]s.
+///
+/// Lane algebra. Name the 16 stage words `M[0..16)` (both chunks' rows, 8
+/// dwords each); the natural 512-bit loads are `z[k] = [M[2k] | M[2k+1]]`
+/// and the target is `out[c][d] = M[d][c]`. Fan-in doubles per stage:
+///  * `vpermt2d` #1: `p[i]` lane `4c + r = M[4i + r][c]` — 4 rows × 4
+///    columns per register (`IDX1_LO` columns 0..4, `IDX1_HI` columns 4..8):
+///    rows `4i`/`4i+1` live in `z[2i]` at lanes `c`/`8+c`, rows `4i+2`/
+///    `4i+3` in `z[2i+1]` at `16+c`/`24+c`.
+///  * `vpermt2d` #2: `s` lane `8c' + d = M[d][c]` — one column per ZMM half
+///    over an 8-row half (`IDX2_LO` keeps each input's columns 0 and 1,
+///    `IDX2_HI` columns 2 and 3; the high-half rows come from the second
+///    operand at `16..`).
+///  * `vshufi32x4` concatenates a column's two 8-row halves (`SHUF_LO` /
+///    `SHUF_HI` pick a register's even / odd column).
+///
+/// # Safety
+/// AVX-512F required; `stage` must own the 16 V8 words at `w`.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8z_chunk_pair(stage: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe {
+        let z0 = _mm512_loadu_si512(stage.add(w).cast());
+        let z1 = _mm512_loadu_si512(stage.add(w + 2).cast());
+        let z2 = _mm512_loadu_si512(stage.add(w + 4).cast());
+        let z3 = _mm512_loadu_si512(stage.add(w + 6).cast());
+        let z4 = _mm512_loadu_si512(stage.add(w + 8).cast());
+        let z5 = _mm512_loadu_si512(stage.add(w + 10).cast());
+        let z6 = _mm512_loadu_si512(stage.add(w + 12).cast());
+        let z7 = _mm512_loadu_si512(stage.add(w + 14).cast());
+
+        let i1l = _mm512_loadu_si512(TR8Z_IDX1_LO.as_ptr().cast());
+        let i1h = _mm512_loadu_si512(TR8Z_IDX1_HI.as_ptr().cast());
+        let p0 = _mm512_permutex2var_epi32(z0, i1l, z1);
+        let q0 = _mm512_permutex2var_epi32(z0, i1h, z1);
+        let p1 = _mm512_permutex2var_epi32(z2, i1l, z3);
+        let q1 = _mm512_permutex2var_epi32(z2, i1h, z3);
+        let p2 = _mm512_permutex2var_epi32(z4, i1l, z5);
+        let q2 = _mm512_permutex2var_epi32(z4, i1h, z5);
+        let p3 = _mm512_permutex2var_epi32(z6, i1l, z7);
+        let q3 = _mm512_permutex2var_epi32(z6, i1h, z7);
+
+        let i2l = _mm512_loadu_si512(TR8Z_IDX2_LO.as_ptr().cast());
+        let i2h = _mm512_loadu_si512(TR8Z_IDX2_HI.as_ptr().cast());
+        let s0 = _mm512_permutex2var_epi32(p0, i2l, p1);
+        let s1 = _mm512_permutex2var_epi32(p0, i2h, p1);
+        let s2 = _mm512_permutex2var_epi32(q0, i2l, q1);
+        let s3 = _mm512_permutex2var_epi32(q0, i2h, q1);
+        let s4 = _mm512_permutex2var_epi32(p2, i2l, p3);
+        let s5 = _mm512_permutex2var_epi32(p2, i2h, p3);
+        let s6 = _mm512_permutex2var_epi32(q2, i2l, q3);
+        let s7 = _mm512_permutex2var_epi32(q2, i2h, q3);
+
+        [
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_LO>(s0, s4),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_HI>(s0, s4),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_LO>(s1, s5),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_HI>(s1, s5),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_LO>(s2, s6),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_HI>(s2, s6),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_LO>(s3, s7),
+            _mm512_shuffle_i32x4::<TR8Z_SHUF_HI>(s3, s7),
+        ]
     }
 }
 
@@ -384,6 +514,24 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
     }
 }
 
+/// [`stream_pair_v8`] for a pair already packed in one ZMM (its low/high
+/// 256-bit halves): identical bytes, without the re-packing insert.
+///
+/// # Safety
+/// Same alignment contract as [`stream_pair_v8`].
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn stream_zpair(p: *mut u32, z: __m512i) {
+    unsafe {
+        if wide_nt_enabled() && p as usize % 64 == 0 {
+            _mm512_stream_si512(p.cast::<__m512i>(), z);
+            return;
+        }
+        stream_v8(p, _mm512_castsi512_si256(z));
+        stream_v8(p.add(8), _mm512_extracti64x4_epi64::<1>(z));
+    }
+}
+
 /// Dual-destination twin of [`dump_range_nt`] for the a/b sides: one
 /// transpose feeds BOTH
 ///  * `dst` — the main witness buffer, published NON-TEMPORALLY over the
@@ -419,6 +567,38 @@ unsafe fn dump_range_nt_win(
         let mut g = 0usize;
         while g < DUMP_CHUNKS {
             let w = 8 * g;
+            let lo = g >= g0 && g < g1;
+            let hi = g + 1 >= g0 && g + 1 < g1;
+            #[cfg(target_feature = "avx512f")]
+            if wg_tr8z_enabled() {
+                let t = tr8z_chunk_pair(stage, w);
+                // Window first, as below; the pair is one contiguous 64-byte
+                // run per row, so one unaligned ZMM store covers it.
+                for r in 0..8 {
+                    _mm512_storeu_si512(win.add(r * U32_PER_BLOCK + w).cast(), t[r]);
+                }
+                if lo && hi {
+                    for r in 0..8 {
+                        stream_zpair(dst.add(r * U32_PER_BLOCK + w), t[r]);
+                    }
+                } else if lo {
+                    for r in 0..8 {
+                        stream_v8(
+                            dst.add(r * U32_PER_BLOCK + w),
+                            _mm512_castsi512_si256(t[r]),
+                        );
+                    }
+                } else if hi {
+                    for r in 0..8 {
+                        stream_v8(
+                            dst.add(r * U32_PER_BLOCK + w + 8),
+                            _mm512_extracti64x4_epi64::<1>(t[r]),
+                        );
+                    }
+                }
+                g += 2;
+                continue;
+            }
             let ta = tr8_chunk(stage, w);
             let tb = tr8_chunk(stage, w + 8);
             // Window first: plain stores to a 16 KiB L1-resident buffer, and
@@ -429,8 +609,6 @@ unsafe fn dump_range_nt_win(
                 store_v8(p, ta[r]);
                 store_v8(p.add(8), tb[r]);
             }
-            let lo = g >= g0 && g < g1;
-            let hi = g + 1 >= g0 && g + 1 < g1;
             if lo && hi {
                 for r in 0..8 {
                     stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r]);
@@ -776,6 +954,20 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 mod tests {
     use super::*;
 
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            (z ^ (z >> 31)) as u32
+        }
+    }
+
     #[test]
     fn witgen8_tr8_is_8x8_u32_transpose() {
         if !std::is_x86_feature_detected!("avx2") {
@@ -815,6 +1007,171 @@ mod tests {
                 _mm256_storeu_si256(a.as_mut_ptr().cast(), rows[i]);
                 _mm256_storeu_si256(b.as_mut_ptr().cast(), back[i]);
                 assert_eq!(a, b, "tr8² row {i}");
+            }
+        }
+    }
+
+    /// Scalar `vpermt2d` semantics: `idx` bit 4 selects the operand, bits
+    /// 0..4 the dword lane.
+    fn permt2d(a: &[u32; 16], idx: &[u32; 16], b: &[u32; 16]) -> [u32; 16] {
+        core::array::from_fn(|i| {
+            let sel = idx[i] as usize;
+            if sel & 16 != 0 { b[sel & 15] } else { a[sel & 15] }
+        })
+    }
+
+    /// Scalar `vshufi32x4` semantics: two output 128-bit lanes from each
+    /// operand, selected by consecutive immediate bit pairs.
+    fn shufi32x4(a: &[u32; 16], b: &[u32; 16], imm: i32) -> [u32; 16] {
+        let mut out = [0u32; 16];
+        for l in 0..4 {
+            let sel = ((imm >> (2 * l)) & 3) as usize;
+            let src = if l < 2 { a } else { b };
+            out[4 * l..4 * l + 4].copy_from_slice(&src[4 * sel..4 * sel + 4]);
+        }
+        out
+    }
+
+    /// [`tr8z_chunk_pair`]'s network, run through the scalar op models above
+    /// with the SAME index tables and lane immediates. Executable on any
+    /// host, so a wrong table entry or immediate is caught even where the
+    /// AVX-512 arm cannot run.
+    #[test]
+    fn witgen8_tr8z_network_model_is_pair_transpose() {
+        let mut rng = Rng::new(0x7852_0001);
+        for _ in 0..64 {
+            let m: [[u32; 8]; 16] = core::array::from_fn(|_| {
+                core::array::from_fn(|_| rng.next_u32())
+            });
+            let z: [[u32; 16]; 8] = core::array::from_fn(|k| {
+                core::array::from_fn(|d| if d < 8 { m[2 * k][d] } else { m[2 * k + 1][d - 8] })
+            });
+            let mut p = [[0u32; 16]; 4];
+            let mut q = [[0u32; 16]; 4];
+            for i in 0..4 {
+                p[i] = permt2d(&z[2 * i], &TR8Z_IDX1_LO, &z[2 * i + 1]);
+                q[i] = permt2d(&z[2 * i], &TR8Z_IDX1_HI, &z[2 * i + 1]);
+            }
+            let s = [
+                permt2d(&p[0], &TR8Z_IDX2_LO, &p[1]),
+                permt2d(&p[0], &TR8Z_IDX2_HI, &p[1]),
+                permt2d(&q[0], &TR8Z_IDX2_LO, &q[1]),
+                permt2d(&q[0], &TR8Z_IDX2_HI, &q[1]),
+                permt2d(&p[2], &TR8Z_IDX2_LO, &p[3]),
+                permt2d(&p[2], &TR8Z_IDX2_HI, &p[3]),
+                permt2d(&q[2], &TR8Z_IDX2_LO, &q[3]),
+                permt2d(&q[2], &TR8Z_IDX2_HI, &q[3]),
+            ];
+            for c in 0..8 {
+                let (a, b) = (&s[c / 2], &s[c / 2 + 4]);
+                let imm = if c % 2 == 0 { TR8Z_SHUF_LO } else { TR8Z_SHUF_HI };
+                let out = shufi32x4(a, b, imm);
+                for d in 0..16 {
+                    assert_eq!(out[d], m[d][c], "column {c} lane {d}");
+                }
+            }
+        }
+    }
+
+    /// The AVX-512 pair transpose against two independent [`tr8_chunk`]s on
+    /// randomized inputs — byte identity of both ZMM halves.
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn witgen8_tr8z_pair_matches_two_tr8() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        unsafe { tr8z_pair_check() }
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    unsafe fn tr8z_pair_check() {
+        unsafe {
+            let mut rng = Rng::new(0x7852_0002);
+            for _ in 0..64 {
+                let words: [u32; 128] = core::array::from_fn(|_| rng.next_u32());
+                let stage = words.as_ptr().cast::<V8>();
+                let ta = tr8_chunk(stage, 0);
+                let tb = tr8_chunk(stage, 8);
+                let t = tr8z_chunk_pair(stage, 0);
+                for r in 0..8 {
+                    let mut z = [0u32; 16];
+                    _mm512_storeu_si512(z.as_mut_ptr().cast(), t[r]);
+                    let mut lo = [0u32; 8];
+                    let mut hi = [0u32; 8];
+                    store_v8(lo.as_mut_ptr(), ta[r]);
+                    store_v8(hi.as_mut_ptr(), tb[r]);
+                    assert_eq!(z[..8], lo, "pair row {r} low half");
+                    assert_eq!(z[8..], hi, "pair row {r} high half");
+                }
+            }
+        }
+    }
+
+    /// 64-byte-aligned block-octa buffer so the ZMM stream arm is reachable.
+    #[repr(align(64))]
+    #[derive(Clone, Copy)]
+    struct Line([u32; 16]);
+
+    /// Both NT dump shapes against the temporal [`dump_range`] reference,
+    /// across the real elide geometries plus pair-misaligned boundaries
+    /// (which force the partial-pair stream arms). The window must carry all
+    /// of `0..DUMP_CHUNKS` whatever the `dst` range. On AVX-512 builds this
+    /// crosses the paired-ZMM arm against the untouched 256-bit transpose.
+    #[test]
+    fn witgen8_paired_nt_dumps_match_temporal_reference() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe { paired_nt_dump_check() }
+    }
+
+    unsafe fn paired_nt_dump_check() {
+        const WORDS: usize = 8 * U32_PER_BLOCK;
+        let mut rng = Rng::new(0x7852_0003);
+        let stage_words: Vec<u32> = (0..WORDS).map(|_| rng.next_u32()).collect();
+        let stage = stage_words.as_ptr().cast::<V8>();
+        let cases = [
+            (0, DUMP_CHUNKS),
+            (ELIDE_B_PREFIX_CHUNKS, DUMP_CHUNKS),
+            (0, ELIDE_ZERO_CHUNK),
+            (0, ELIDE_B_TAIL_CHUNK),
+            (ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK),
+            (3, DUMP_CHUNKS - 3),
+        ];
+        let mk = |seed: u64| -> Vec<Line> {
+            let mut r = Rng::new(seed);
+            (0..WORDS / 16)
+                .map(|_| Line(core::array::from_fn(|_| r.next_u32())))
+                .collect()
+        };
+        for (case, &(g0, g1)) in cases.iter().enumerate() {
+            // Identically seeded sentinels: chunks outside [g0, g1) must
+            // stay untouched on both sides.
+            let seed = 0x7852_1000 + case as u64;
+            let mut dst = mk(seed);
+            let mut reference = mk(seed);
+            let mut dst_w = mk(seed);
+            let mut win = mk(seed ^ 1);
+            let mut win_ref = mk(seed ^ 2);
+            unsafe {
+                dump_range_nt(stage, dst.as_mut_ptr().cast(), g0, g1);
+                dump_range_nt_win(
+                    stage,
+                    dst_w.as_mut_ptr().cast(),
+                    win.as_mut_ptr().cast(),
+                    g0,
+                    g1,
+                );
+                _mm_sfence();
+                dump_range(stage, reference.as_mut_ptr().cast(), g0, g1);
+                dump_range(stage, win_ref.as_mut_ptr().cast(), 0, DUMP_CHUNKS);
+                let words = |v: &Vec<Line>| -> Vec<u32> {
+                    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u32>(), WORDS).to_vec() }
+                };
+                assert_eq!(words(&dst), words(&reference), "nt dump, g0={g0} g1={g1}");
+                assert_eq!(words(&dst_w), words(&reference), "win dump dst, g0={g0} g1={g1}");
+                assert_eq!(words(&win), words(&win_ref), "win dump window, g0={g0} g1={g1}");
             }
         }
     }
