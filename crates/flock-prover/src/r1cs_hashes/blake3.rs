@@ -1728,6 +1728,7 @@ fn generate_round1_inner_octa(
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ring_project = ab_nt && witgen_simd::ring128_bmed_project_enabled();
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -1740,9 +1741,9 @@ fn generate_round1_inner_octa(
                 // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
                 // allocation (64-aligned via `AbWinLine`) and skips the fill;
                 // the dump writes every window byte before the projection
-                // reads any.
+                // reads any. RING128 streaming projection does not allocate.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                if ab_nt {
+                if ab_nt && !ring_project {
                     v.reserve_exact(WIN_LINES);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
                     // `reserve_exact` guaranteed the capacity.
@@ -1755,7 +1756,7 @@ fn generate_round1_inner_octa(
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
-                let win_ab = if ab_nt {
+                let win_ab = if ab_nt && !ring_project {
                     debug_assert_eq!(win.len(), WIN_LINES);
                     let wa = win.as_mut_ptr().cast::<u32>();
                     // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
@@ -1768,7 +1769,8 @@ fn generate_round1_inner_octa(
                 // contiguous 512-word blocks disjoint from every witness buffer.
                 // Last rayon chunk may be 8-wide. `elide` skips only
                 // token-verified constant chunks of a/b/z; the windows are
-                // always written in full.
+                // always written in full. Streaming `project` writes ab_inner
+                // directly from each 16-word drain band.
                 unsafe {
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
@@ -1796,6 +1798,24 @@ fn generate_round1_inner_octa(
                             }
                         };
                         let off = half * SIMD * F128_PER_BLOCK;
+                        let project = if ring_project {
+                            let mut skip_mask = 0u8;
+                            for j in 0..SIMD {
+                                if base + j < skip_blocks {
+                                    skip_mask |= 1 << j;
+                                }
+                            }
+                            Some(blake3_witgen8::Project8 {
+                                ab_inner: ab_out
+                                    .as_mut_ptr()
+                                    .add(half * SIMD * BYTES_PER_BLOCK),
+                                skip_mask,
+                                inv_table: inv_table as *const _,
+                                nt: abinner_nt,
+                            })
+                        } else {
+                            None
+                        };
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -1804,11 +1824,12 @@ fn generate_round1_inner_octa(
                             win_ab,
                             elide,
                             z_nt,
+                            project,
                         );
-                        // Fused arm: project THIS octa's eight blocks now, off
-                        // the just-written windows, while they are L1-hot. Same
-                        // ascending block order as the incumbent loop below, so
-                        // ab_inner's NT stream stays sequential per thread.
+                        // Incumbent fused arm: project THIS octa's eight blocks
+                        // now, off the just-written windows, while they are
+                        // L1-hot. Streaming RING128 projection already wrote
+                        // ab_inner inside the drain.
                         if let Some((win_a, win_b)) = win_ab {
                             for j in 0..SIMD {
                                 if base + j < skip_blocks {
@@ -1836,7 +1857,7 @@ fn generate_round1_inner_octa(
                 // the dump loop above could not cover (unreachable at every
                 // power-of-two shape ≥ 8; kept so the two arms stay observably
                 // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() {
+                let j0 = if win_ab.is_some() || ring_project {
                     (n_here / SIMD) * SIMD
                 } else {
                     0
@@ -2144,6 +2165,16 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_ab_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_NT").is_none());
+        *ON
+    }
+
+    /// `FLOCK_NO_RING128_BMED_PROJECT=1` restores the RING128 32 KiB fused
+    /// A/B window plus post-octa `precompute_round1_ab_inner_windows`. Default
+    /// streams each 16-word drain band into the round-1 `b_med` kernel and
+    /// does not allocate the window.
+    pub(crate) fn ring128_bmed_project_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_RING128_BMED_PROJECT").is_none());
         *ON
     }
 

@@ -380,6 +380,55 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
+        dispatch_bstatic_kernel(blk, a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+    }
+}
+
+/// Same as [`shift_reduce_inner_ab_x86_avx512_bstatic`] but the packed A/B
+/// inputs are already one 64-byte `b_med` band (byte offset 0). `w` and
+/// `b_med` still select the static-B plan block.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_band(
+    a_bmed: &[u8; 64],
+    b_bmed: &[u8; 64],
+    inv_table: &InvNttTableByteSingleGf8,
+    b_med: usize,
+    w: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) -> bool {
+    if w > 1 || b_med >= 16 {
+        return false;
+    }
+    let blk = w * 16 + b_med;
+    unsafe {
+        dispatch_bstatic_kernel(
+            blk,
+            a_bmed,
+            b_bmed,
+            inv_table,
+            0,
+            partials,
+            out,
+            nt,
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn dispatch_bstatic_kernel(
+    blk: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) -> bool {
+    unsafe {
         if blk == 31 {
             kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
         } else if blk == 30 {

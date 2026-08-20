@@ -22,6 +22,8 @@ use super::{
     USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
+use flock_core::ntt::InvNttTableByteSingleGf8;
+use flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_b_med;
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -179,6 +181,17 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 }
 
 const RING_WORDS: usize = 128;
+const BYTES_PER_BLOCK: usize = K / 8;
+const OUTER_BYTES: usize = 1024;
+
+/// Fused RING128 → round-1 `b_med` projection. Each 16-word drain band is
+/// one 64-byte packed sub-window; the 32 KiB A/B window is not allocated.
+pub(crate) struct Project8 {
+    pub ab_inner: *mut u8,
+    pub skip_mask: u8,
+    pub inv_table: *const InvNttTableByteSingleGf8,
+    pub nt: bool,
+}
 
 /// Rolling drain state shared by the three packed writers. The witness uses
 /// three reusable 128-word epochs instead of three full 512-word stages.
@@ -190,6 +203,7 @@ struct Drain8 {
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
+    project: Option<Project8>,
     elide: [bool; 3],
     z_nt: bool,
 }
@@ -426,9 +440,94 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
 }
 
 impl Drain8 {
+    /// Transpose and publish one 16-word (64-byte / one `b_med`) band.
+    /// `win`, when present, always receives the band even when the recyclable
+    /// main destination elides a constant range.
+    #[inline(always)]
+    unsafe fn publish_band(
+        stage: *const V8,
+        dst: *mut u32,
+        win: Option<*mut u32>,
+        base_word: usize,
+        ring_word: usize,
+        g0: usize,
+        g1: usize,
+        nt: bool,
+    ) -> ([V8; 8], [V8; 8]) {
+        unsafe {
+            debug_assert_eq!(base_word % 8, 0);
+            debug_assert_eq!(ring_word % 8, 0);
+            let lo_rows = tr8_chunk(stage, ring_word);
+            let hi_rows = tr8_chunk(stage, ring_word + 8);
+            let g = base_word / 8;
+            let lo_live = g >= g0 && g < g1;
+            let hi_live = g + 1 >= g0 && g + 1 < g1;
+            for r in 0..8 {
+                if let Some(w) = win {
+                    let p = w.add(r * U32_PER_BLOCK + base_word);
+                    store_v8(p, lo_rows[r]);
+                    store_v8(p.add(8), hi_rows[r]);
+                }
+                let p = dst.add(r * U32_PER_BLOCK + base_word);
+                match (nt, lo_live, hi_live) {
+                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
+                    (true, true, false) => stream_v8(p, lo_rows[r]),
+                    (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
+                    (false, true, true) => {
+                        store_v8(p, lo_rows[r]);
+                        store_v8(p.add(8), hi_rows[r]);
+                    }
+                    (false, true, false) => store_v8(p, lo_rows[r]),
+                    (false, false, true) => store_v8(p.add(8), hi_rows[r]),
+                    (_, false, false) => {}
+                }
+            }
+            (lo_rows, hi_rows)
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn project_band(
+        a_lo: [V8; 8],
+        a_hi: [V8; 8],
+        b_lo: [V8; 8],
+        b_hi: [V8; 8],
+        abs_word: usize,
+        p: &Project8,
+    ) {
+        unsafe {
+            debug_assert_eq!(abs_word % 16, 0);
+            let b_med_g = abs_word / 16;
+            let outer = b_med_g / 16;
+            let b_med = b_med_g % 16;
+            for r in 0..8 {
+                if p.skip_mask & (1 << r) != 0 {
+                    continue;
+                }
+                let mut a64 = [0u8; 64];
+                let mut b64 = [0u8; 64];
+                store_v8(a64.as_mut_ptr().cast::<u32>(), a_lo[r]);
+                store_v8(a64.as_mut_ptr().cast::<u32>().add(8), a_hi[r]);
+                store_v8(b64.as_mut_ptr().cast::<u32>(), b_lo[r]);
+                store_v8(b64.as_mut_ptr().cast::<u32>().add(8), b_hi[r]);
+                let out = p.ab_inner.add(r * BYTES_PER_BLOCK + outer * OUTER_BYTES + b_med * 64);
+                precompute_round1_ab_inner_b_med(
+                    &a64,
+                    &b64,
+                    &mut *(out as *mut [u8; 64]),
+                    &*p.inv_table,
+                    outer,
+                    b_med,
+                    p.nt,
+                );
+            }
+        }
+    }
+
     /// Transpose and publish `words` from the current ring epoch at absolute
     /// `base_word`. `win`, when present, always receives every word even when
     /// the recyclable main destination elides a constant range.
+    #[allow(dead_code)]
     #[inline(always)]
     unsafe fn publish_range(
         stage: *const V8,
@@ -446,32 +545,16 @@ impl Drain8 {
             debug_assert_eq!(ring_word % 8, 0);
             debug_assert_eq!(words % 16, 0);
             for off in (0..words).step_by(16) {
-                let lo_rows = tr8_chunk(stage, ring_word + off);
-                let hi_rows = tr8_chunk(stage, ring_word + off + 8);
-                let abs_word = base_word + off;
-                let g = abs_word / 8;
-                let lo_live = g >= g0 && g < g1;
-                let hi_live = g + 1 >= g0 && g + 1 < g1;
-                for r in 0..8 {
-                    if let Some(w) = win {
-                        let p = w.add(r * U32_PER_BLOCK + abs_word);
-                        store_v8(p, lo_rows[r]);
-                        store_v8(p.add(8), hi_rows[r]);
-                    }
-                    let p = dst.add(r * U32_PER_BLOCK + abs_word);
-                    match (nt, lo_live, hi_live) {
-                        (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
-                        (true, true, false) => stream_v8(p, lo_rows[r]),
-                        (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
-                        (false, true, true) => {
-                            store_v8(p, lo_rows[r]);
-                            store_v8(p.add(8), hi_rows[r]);
-                        }
-                        (false, true, false) => store_v8(p, lo_rows[r]),
-                        (false, false, true) => store_v8(p.add(8), hi_rows[r]),
-                        (_, false, false) => {}
-                    }
-                }
+                Self::publish_band(
+                    stage,
+                    dst,
+                    win,
+                    base_word + off,
+                    ring_word + off,
+                    g0,
+                    g1,
+                    nt,
+                );
             }
         }
     }
@@ -479,16 +562,21 @@ impl Drain8 {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
+            debug_assert_eq!(words % 16, 0);
             let z_g1 = if self.elide[0] {
                 ELIDE_ZERO_CHUNK
             } else {
                 DUMP_CHUNKS
             };
-            Self::publish_range(
-                self.zs, self.z, None, base_word, ring_word, words, 0, z_g1, self.z_nt,
-            );
-
-            match self.win_ab {
+            let fused = self.win_ab.is_some() || self.project.is_some();
+            // Streaming b_med projection owns the transposed A/B rows; the
+            // 32 KiB fused window is not written on that path.
+            let win = if self.project.is_some() {
+                None
+            } else {
+                self.win_ab
+            };
+            let (a_g1, b_g0, b_g1, a_nt, b_nt, win_a, win_b) = match win {
                 Some((win_a, win_b)) => {
                     let a_g1 = if self.elide[1] {
                         ELIDE_ZERO_CHUNK
@@ -505,12 +593,7 @@ impl Drain8 {
                     } else {
                         DUMP_CHUNKS
                     };
-                    Self::publish_range(
-                        self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
-                    );
-                    Self::publish_range(
-                        self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
-                    );
+                    (a_g1, b_g0, b_g1, true, true, Some(win_a), Some(win_b))
                 }
                 None => {
                     let a_g1 = if self.elide[1] {
@@ -528,12 +611,41 @@ impl Drain8 {
                     } else {
                         DUMP_CHUNKS
                     };
-                    Self::publish_range(
-                        self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
-                    );
-                    Self::publish_range(
-                        self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
-                    );
+                    // Ranked streaming-project path: fused NT into a/b, no window.
+                    let nt = fused;
+                    (
+                        a_g1,
+                        b_g0,
+                        b_g1,
+                        nt,
+                        nt,
+                        None,
+                        None,
+                    )
+                }
+            };
+            // Fused window-less NT must use the WIN tail bound (pair-aligned)
+            // so the last live 64-byte line is not left half-open.
+            let b_g1 = if fused && self.elide[2] && win.is_none() {
+                ELIDE_B_TAIL_CHUNK_WIN
+            } else {
+                b_g1
+            };
+
+            for off in (0..words).step_by(16) {
+                let abs = base_word + off;
+                let ring = ring_word + off;
+                let _z = Self::publish_band(
+                    self.zs, self.z, None, abs, ring, 0, z_g1, self.z_nt,
+                );
+                let (a_lo, a_hi) = Self::publish_band(
+                    self.ast, self.a, win_a, abs, ring, 0, a_g1, a_nt,
+                );
+                let (b_lo, b_hi) = Self::publish_band(
+                    self.bs, self.b, win_b, abs, ring, b_g0, b_g1, b_nt,
+                );
+                if let Some(ref p) = self.project {
+                    Self::project_band(a_lo, a_hi, b_lo, b_hi, abs, p);
                 }
             }
         }
@@ -657,12 +769,19 @@ unsafe fn dump_elide_win(
 /// blocks lands in the two window buffers, which the caller projects from
 /// instead of re-reading a/b. `None` is the incumbent temporal drain.
 ///
+/// `project = Some(..)` is the RING128 streaming-projection drain: fused NT
+/// into a/b (same as `win_ab = Some`) but each 16-word band is fed to the
+/// round-1 `b_med` kernel immediately, so the 32 KiB window is not written.
+/// Unexpected geometry keeps `project = None` and the incumbent window path.
+///
 /// # Safety
 /// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
 /// When `win_ab` is `Some`, both window pointers own 8 contiguous 512-word
 /// blocks too, disjoint from each other and from `z`/`a`/`b`; and the caller
 /// must `_mm_sfence()` on this thread after its last octa, before releasing
 /// a/b to another thread (same-thread reads are self-consistent regardless).
+/// When `project` is `Some`, `ab_inner` owns 8 contiguous 2048-byte blocks
+/// and `inv_table` remains valid for the duration of this call.
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: [&Compression; 8],
     z: *mut u32,
@@ -671,6 +790,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     win_ab: Option<(*mut u32, *mut u32)>,
     elide: [bool; 3],
     z_nt: bool,
+    project: Option<Project8>,
 ) {
     unsafe {
         let ptrs = [
@@ -782,6 +902,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             a,
             b,
             win_ab,
+            project,
             elide,
             z_nt,
         };

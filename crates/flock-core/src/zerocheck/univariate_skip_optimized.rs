@@ -857,6 +857,95 @@ pub fn precompute_round1_ab_inner_windows(
     }
 }
 
+/// Transform one 64-byte `b_med` sub-window (512 bits) of packed A/B.
+///
+/// RING128's fused octa drain publishes exactly 16 word-major V8s per band —
+/// 64 bytes per block, i.e. one `b_med`. This entry lets that drain feed the
+/// round-1 kernel from the already-transposed band instead of reassembling a
+/// 2 KiB packed block in a 32 KiB window.
+///
+/// `outer` is the BLAKE3 outer-window index (`0` or `1`); it is only the
+/// static-B plan hint. `b_med` is `0..16` within that outer window. The
+/// 64-byte inputs are placed at the kernel's natural `b_med * 64` offset so
+/// the AVX-512/GFNI static-B selector sees the same `(w, b_med)` it would in
+/// [`precompute_round1_ab_inner_windows`].
+///
+/// Bit-identical to extracting that 64-byte slice from a full-window call.
+#[inline(never)]
+pub fn precompute_round1_ab_inner_b_med(
+    a_bmed: &[u8; 64],
+    b_bmed: &[u8; 64],
+    out: &mut [u8; 64],
+    inv_table: &InvNttTableByteSingleGf8,
+    outer: usize,
+    b_med: usize,
+    nt_out: bool,
+) {
+    assert_eq!(inv_table.k, K_SKIP);
+    assert!(outer < 2, "BLAKE3 block has two 8192-bit outer windows");
+    assert!(
+        b_med < (1 << N_MEDIUM),
+        "b_med is 0..16 within one outer window"
+    );
+
+    let nt: u8 = if nt_out {
+        match out.as_ptr() as usize % 64 {
+            0 => 2,
+            r if r % 16 == 0 => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
+    let mut a_col = [F8::ZERO; ELL];
+    let mut b_col = [F8::ZERO; ELL];
+    let a_s: &[u8] = a_bmed;
+    let b_s: &[u8] = b_bmed;
+    let bstatic_ctx = kernels::prepare_bstatic(inv_table);
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        let _ = (a_col, b_col);
+        unsafe {
+            if let Some(partials) = bstatic_ctx {
+                if kernels::x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_band(
+                    a_bmed,
+                    b_bmed,
+                    inv_table,
+                    b_med,
+                    outer & 1,
+                    partials,
+                    out,
+                    nt,
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Generic kernel: the 64-byte band is at offset 0, so index b_med = 0.
+    // Static-B already used the real (outer, b_med) above.
+    kernels::shift_reduce_inner_ab(
+        a_s,
+        b_s,
+        inv_table,
+        0,
+        0,
+        out,
+        &mut a_col,
+        &mut b_col,
+        None,
+        nt,
+    );
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
