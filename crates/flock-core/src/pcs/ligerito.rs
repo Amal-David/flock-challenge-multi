@@ -2836,13 +2836,14 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
 /// Dense `2^k` transpose for one sparse-prefix window. This is the incumbent
 /// path and remains the exact collision fallback for the singleton shortcut.
 #[inline]
-fn transpose_forward_ntt_window_dense(
+fn transpose_forward_ntt_window_dense_in_place(
     ntt: &AdditiveNttF128,
     log_d: usize,
     k: usize,
     w: usize,
-    mut buf: Vec<F128>,
-) -> (usize, Vec<F128>) {
+    buf: &mut [F128],
+) {
+    assert_eq!(buf.len(), 1usize << k);
     for s in 0..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
@@ -2855,6 +2856,17 @@ fn transpose_forward_ntt_window_dense(
             transpose_butterfly(top_h, bot, t);
         }
     }
+}
+
+#[inline]
+fn transpose_forward_ntt_window_dense(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    mut buf: Vec<F128>,
+) -> (usize, Vec<F128>) {
+    transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, w, &mut buf);
     (w, buf)
 }
 
@@ -3002,6 +3014,129 @@ struct InduceSingletonStats {
     collision_fallbacks: usize,
 }
 
+/// Exact production selector for transforming sparse induce windows directly
+/// in their final dense storage. The older `k = 8` one-pass experiment only
+/// removed about 1.2 MiB of temporary-window traffic; the promoted wider
+/// singleton schedule makes the same boundary materially larger at `k = 12`
+/// and `k = 11`. Keep every other geometry on the established two-region
+/// path, including the kill-switch arms for either parent mechanism.
+fn induce_window_onepass_selected(
+    log_d: usize,
+    n_queries: usize,
+    k: usize,
+    singleton_on: bool,
+    fill: bool,
+    fused_densify: bool,
+    disabled: bool,
+) -> bool {
+    cfg!(target_arch = "x86_64")
+        && singleton_on
+        && fill
+        && fused_densify
+        && !disabled
+        && matches!((log_d, n_queries, k), (20, 218, 12) | (18, 106, 11))
+}
+
+fn induce_window_onepass_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_INDUCE_WINDOW_ONEPASS").is_none()
+    });
+    *ON
+}
+
+/// Expand sparse fill-runs directly into their final dense windows.
+///
+/// The output allocation starts uninitialized. Its `2^k`-element chunks form
+/// an exact partition and every arm is write-complete before returning:
+/// inactive windows are zero-filled; dense collision windows are zeroed and
+/// scattered before the incumbent in-place transform; singleton expansions
+/// write slot zero and then overwrite the next power-of-two half at each
+/// layer; multi-singletons do that for the first term directly in `dst` and
+/// XOR fully initialized scratch expansions into it. Consequently no byte is
+/// read before initialization and no temporary result-window Vec is needed.
+fn transform_sparse_windows_onepass(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    order: &[u32],
+    runs: &[(usize, usize)],
+    log_d: usize,
+    k: usize,
+    singleton_on: bool,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let n = 1usize << log_d;
+    let window_len = 1usize << k;
+    let nwin = n >> k;
+    let wmask = window_len - 1;
+    let multi_max = k / 2;
+    let mut run_slots = vec![None; nwin];
+    for &(rs, re) in runs {
+        let first = order[rs] as usize;
+        let w = positions[first] >> k;
+        debug_assert!(w < nwin);
+        debug_assert!(run_slots[w].is_none(), "window {w} grouped twice");
+        run_slots[w] = Some((rs, re));
+    }
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(window_len)
+        .enumerate()
+        .zip(run_slots.into_par_iter())
+        .for_each_init(
+            Vec::<F128>::new,
+            |scratch, ((w, dst), run)| match run {
+                None => dst.fill(F128::ZERO),
+                Some((rs, re)) => {
+                    let first = order[rs] as usize;
+                    debug_assert_eq!(positions[first] >> k, w);
+                    let nnz = re - rs;
+                    if singleton_on && nnz <= multi_max {
+                        expand_singleton_into(
+                            ntt,
+                            log_d,
+                            k,
+                            w,
+                            positions[first] & wmask,
+                            values[first],
+                            dst,
+                        );
+                        if nnz > 1 {
+                            if scratch.len() < window_len {
+                                *scratch = take_singleton_buf(k);
+                            }
+                            let scratch = &mut scratch[..window_len];
+                            for &i in &order[rs + 1..re] {
+                                let i = i as usize;
+                                expand_singleton_into(
+                                    ntt,
+                                    log_d,
+                                    k,
+                                    w,
+                                    positions[i] & wmask,
+                                    values[i],
+                                    scratch,
+                                );
+                                for (d, &s) in dst.iter_mut().zip(scratch.iter()) {
+                                    *d += s;
+                                }
+                            }
+                        }
+                    } else {
+                        dst.fill(F128::ZERO);
+                        for &i in &order[rs..re] {
+                            let i = i as usize;
+                            dst[positions[i] & wmask] += values[i];
+                        }
+                        transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, w, dst);
+                    }
+                }
+            },
+        );
+    data
+}
+
 /// Sparse-prefix variant of [`transpose_forward_ntt`]: exploits that the input
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
@@ -3132,7 +3267,31 @@ fn transpose_forward_ntt_sparse_inner(
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
+    let fused_densify = induce_fused_densify_enabled();
+    let onepass_shape = induce_window_onepass_selected(
+        log_d,
+        positions.len(),
+        k,
+        singleton_on,
+        fill,
+        fused_densify,
+        false,
+    );
+    let onepass_on = onepass_shape && induce_window_onepass_enabled();
+    let mut onepass_data = None;
+    let processed: Vec<(usize, Vec<F128>)> = if onepass_on {
+        onepass_data = Some(transform_sparse_windows_onepass(
+            ntt,
+            positions,
+            values,
+            &order,
+            &runs,
+            log_d,
+            k,
+            singleton_on,
+        ));
+        Vec::new()
+    } else if fill {
         runs.par_iter()
             .map_init(
                 Vec::<F128>::new,
@@ -3205,7 +3364,11 @@ fn transpose_forward_ntt_sparse_inner(
     let ot = open_timing();
     let _ta = std::time::Instant::now();
     let mf0 = if ot { minor_faults() } else { 0 };
-    let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
+    let (mut data, alloc_ms, dens_ms) = if let Some(data) = onepass_data {
+        // Allocation, first-touch, active transforms and densification were
+        // completed by the single final-window region timed in `win_ms`.
+        (data, 0.0, 0.0)
+    } else if fused_densify {
         // FUSED: one parallel pass writes every window exactly once, from an
         // UNINITIALIZED buffer. See `densify_windows_fused`.
         let slots = window_slots(n >> k, processed);
@@ -10767,6 +10930,122 @@ mod tests {
         assert_eq!(induce_window_k(20, 1, 1, true), 12);
         // Very high query counts push k back DOWN.
         assert_eq!(induce_window_k(20, 100_000, 16, true), 8);
+    }
+
+    #[test]
+    fn induce_window_onepass_selector_is_exact() {
+        let selected = |log_d, nq, k, singleton, fill, densify, disabled| {
+            induce_window_onepass_selected(
+                log_d, nq, k, singleton, fill, densify, disabled,
+            )
+        };
+        assert!(selected(20, 218, 12, true, true, true, false));
+        assert!(selected(18, 106, 11, true, true, true, false));
+        assert!(!selected(20, 218, 11, true, true, true, false));
+        assert!(!selected(18, 106, 12, true, true, true, false));
+        assert!(!selected(20, 217, 12, true, true, true, false));
+        assert!(!selected(19, 218, 12, true, true, true, false));
+        assert!(!selected(20, 218, 12, false, true, true, false));
+        assert!(!selected(20, 218, 12, true, false, true, false));
+        assert!(!selected(20, 218, 12, true, true, false, false));
+        assert!(!selected(20, 218, 12, true, true, true, true));
+    }
+
+    /// Direct final-window expansion must cover inactive, singleton,
+    /// multi-singleton and dense-collision windows without reading the
+    /// uninitialized output. Compare the complete transpose so the subsequent
+    /// blocked tail also validates the final storage layout.
+    #[test]
+    fn induce_window_onepass_mixed_matches_dense() {
+        use crate::challenger::Challenger;
+        const LOG_D: usize = 14;
+        const K: usize = 8;
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut ch = crate::challenger::RandomChallenger::new(0x0A11_D1EC7);
+        let mut entries: Vec<(usize, F128)> = Vec::new();
+        for &(w, nnz) in &[(1usize, 1usize), (7, 2), (19, K / 2), (41, K / 2 + 1)] {
+            for j in 0..nnz {
+                let p = (j * 47 + w * 13 + 5) & ((1usize << K) - 1);
+                entries.push(((w << K) + p, ch.sample_f128()));
+            }
+        }
+        entries.rotate_left(3);
+        let (positions, values): (Vec<usize>, Vec<F128>) = entries.into_iter().unzip();
+        let mut order: Vec<u32> = (0..positions.len() as u32).collect();
+        order.sort_by_key(|&i| positions[i as usize] >> K);
+        let mut runs = Vec::new();
+        let mut s = 0usize;
+        while s < order.len() {
+            let w = positions[order[s] as usize] >> K;
+            let mut e = s + 1;
+            while e < order.len() && positions[order[e] as usize] >> K == w {
+                e += 1;
+            }
+            runs.push((s, e));
+            s = e;
+        }
+
+        let mut got = transform_sparse_windows_onepass(
+            &ntt,
+            &positions,
+            &values,
+            &order,
+            &runs,
+            LOG_D,
+            K,
+            true,
+        );
+        transpose_forward_ntt_dense_layers(&ntt, &mut got, LOG_D - K);
+        assert_eq!(got, sparse_dense_oracle(LOG_D, &positions, &values));
+    }
+
+    /// Exercise the integrated selector at both production widths. Each case
+    /// deliberately contains inactive, singleton, multi-singleton and one
+    /// past-threshold dense window while retaining the exact ranked query
+    /// count that selects the one-pass arm.
+    #[test]
+    fn induce_window_onepass_ranked_k12_k11_matches_dense() {
+        use crate::challenger::Challenger;
+
+        for &(log_d, k, n_queries) in &[(20usize, 12usize, 218usize), (18, 11, 106)] {
+            let multi_max = k / 2;
+            let mut positions = Vec::with_capacity(n_queries);
+            // Window 0: one step past the multi threshold (dense fallback).
+            for j in 0..=multi_max {
+                positions.push(j * 3 + 1);
+            }
+            // Window 1: exact threshold; window 2: two-term multi expansion.
+            for j in 0..multi_max {
+                positions.push((1usize << k) + j * 5 + 2);
+            }
+            positions.push((2usize << k) + 7);
+            positions.push((2usize << k) + 191);
+            // Remaining entries occupy distinct windows; plenty of inactive
+            // windows remain at both production geometries.
+            let mut w = 3usize;
+            while positions.len() < n_queries {
+                positions.push((w << k) + ((w * 37 + 11) & ((1usize << k) - 1)));
+                w += 1;
+            }
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0xD1EC_7A11 ^ ((log_d * 257 + k) as u64),
+            );
+            let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let want = sparse_dense_oracle(log_d, &positions, &values);
+            let (got, stats) = transpose_forward_ntt_sparse_inner(
+                &ntt,
+                &positions,
+                &values,
+                log_d,
+                Some(true),
+                Some(k),
+            );
+            assert_eq!(got, want, "log_d={log_d} k={k}");
+            assert_eq!(stats.singleton_hits, n_queries - (multi_max + 1) - multi_max - 2);
+            assert_eq!(stats.multi_hits, 2);
+            assert_eq!(stats.collision_fallbacks, 1);
+        }
     }
 
     /// Multi-singleton XOR expansion vs the dense window across the
