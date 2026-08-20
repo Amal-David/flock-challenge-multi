@@ -2233,6 +2233,24 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
+/// Ranked after-round-zero capture wrapper. Keeping the one-shot clone behind
+/// this non-inlined call prevents LLVM from peeling the entire transcript loop
+/// around `t == 0`; only this tiny wrapper carries the runtime first-round bit.
+#[inline(never)]
+fn sumcheck_bind_both_and_eval_next_capture(
+    comb: &mut Vec<F128>,
+    z: &mut Vec<F128>,
+    r: F128,
+    capture: bool,
+    captured: &mut Option<Vec<F128>>,
+) -> (F128, F128) {
+    let next = sumcheck_bind_both_and_eval_next(comb, z, r);
+    if capture {
+        *captured = Some(z.clone());
+    }
+    next
+}
+
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
@@ -2241,6 +2259,14 @@ enum PackedZ<'a> {
     LincheckStripe(&'a [u8]),
     BlockMajor(&'a [F128]),
 }
+
+// Compile-time capture policies keep the ordinary no-capture and
+// pre-sumcheck bodies independent from the ranked after-round-zero variant.
+// In particular, the latter's loop-side clone must not add a runtime mode
+// branch or Option state to the incumbent monomorphizations.
+const CAPTURE_NONE: u8 = 0;
+const CAPTURE_PRE_SUMCHECK: u8 = 1;
+const CAPTURE_AFTER_FIRST_BIND: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Last-ρ leftover z-fold (wait-not-join)
@@ -2445,7 +2471,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _) = prove_padded_inner::<CAPTURE_NONE, Ch>(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2453,7 +2479,6 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
         challenger,
     );
     (proof, claim)
@@ -2478,7 +2503,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured) = prove_padded_inner::<CAPTURE_PRE_SUMCHECK, Ch>(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2486,7 +2511,6 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
         challenger,
     );
     (
@@ -2510,7 +2534,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured) = prove_padded_inner::<CAPTURE_PRE_SUMCHECK, Ch>(
         PackedZ::BlockMajor(z_packed),
         m,
         k_log,
@@ -2518,7 +2542,6 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
         challenger,
     );
     (
@@ -2528,8 +2551,48 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     )
 }
 
+/// Ranked direct-Fold8 counterpart of
+/// [`prove_padded_capture_z_vec_block_major`]. The clone is delayed until
+/// round zero has bound the top inner-rest coordinate; for the strict ranked
+/// eight-round shape the result is the direct-Fold8 statistic without a
+/// second fold.
 #[allow(clippy::too_many_arguments)]
-fn prove_padded_inner<Ch: Challenger>(
+pub fn prove_padded_capture_fold8_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    assert_eq!(
+        k_log - k_skip,
+        8,
+        "direct Fold8 capture needs eight inner-rest rounds"
+    );
+    let (proof, claim, captured) =
+        prove_padded_inner::<CAPTURE_AFTER_FIRST_BIND, Ch>(
+            PackedZ::BlockMajor(z_packed),
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            circuit,
+            x_ab,
+            challenger,
+        );
+    (
+        proof,
+        claim,
+        captured.expect("after-first-bind capture must produce Fold8 statistic"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn prove_padded_inner<const CAPTURE: u8, Ch: Challenger>(
     z_packed: PackedZ<'_>,
     m: usize,
     k_log: usize,
@@ -2537,9 +2600,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+    debug_assert!(CAPTURE <= CAPTURE_AFTER_FIRST_BIND);
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -2676,7 +2739,7 @@ fn prove_padded_inner<Ch: Challenger>(
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    let mut captured_z_vec: Option<Vec<F128>> = if CAPTURE == CAPTURE_PRE_SUMCHECK {
         Some(z_vec.clone())
     } else {
         None
@@ -2707,7 +2770,17 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = if CAPTURE == CAPTURE_AFTER_FIRST_BIND {
+                    sumcheck_bind_both_and_eval_next_capture(
+                        &mut comb_vec,
+                        &mut z_vec,
+                        r,
+                        t == 0,
+                        &mut captured_z_vec,
+                    )
+                } else {
+                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
+                };
                 e1 = ne1;
                 einf = neinf;
             } else {
