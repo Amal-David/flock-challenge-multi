@@ -50,9 +50,9 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_f128(n) {
         return v;
     }
-    let v = crate::alloc_uninit_vec::<F128>(n);
-    void_pending_tag(v.as_ptr());
-    v
+    // alloc_uninit_vec already voids pending provenance for the freshly
+    // handed-out address; do not repeat the mirror scan here.
+    crate::alloc_uninit_vec::<F128>(n)
 }
 
 /// Pool-only variant of [`take_f128`]: returns `None` instead of falling
@@ -76,9 +76,8 @@ pub fn take_f128_tagged(n: usize, tag: u64) -> (Vec<F128>, bool) {
     if let Some(r) = try_take_f128_tagged(n, tag) {
         return r;
     }
-    let v = crate::alloc_uninit_vec::<F128>(n);
-    void_pending_tag(v.as_ptr());
-    (v, false)
+    // alloc_uninit_vec owns new-allocation provenance invalidation.
+    (crate::alloc_uninit_vec::<F128>(n), false)
 }
 
 fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
@@ -139,8 +138,10 @@ static PENDING_TAGS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 const PENDING_CAP: usize = 8;
 /// Lock-free mirror of the armed pointers (`0` = empty slot), so
 /// [`void_pending_tag`] — which runs on every buffer hand-out, including
-/// every [`crate::alloc_uninit_vec`] — costs `PENDING_CAP` relaxed loads and
-/// takes the mutex only on an actual hit.
+/// every [`crate::alloc_uninit_vec`] — costs one relaxed load when the
+/// registry is empty, scans the remaining slots only while something is
+/// armed, and takes the mutex only on an actual hit. Since the registry is a
+/// compact vector, slot zero is also its empty/non-empty sentinel.
 static PENDING_PTRS: [AtomicUsize; PENDING_CAP] =
     [const { AtomicUsize::new(0) }; PENDING_CAP];
 
@@ -170,7 +171,12 @@ fn sync_pending_mirror(pending: &[(usize, u64)]) {
 /// `round1_inner_closed_form_source_matches_slice` fails.
 pub(crate) fn void_pending_tag(ptr: *const F128) {
     let key = ptr as usize;
-    if !PENDING_PTRS
+    let first = PENDING_PTRS[0].load(Ordering::Relaxed);
+    if first == 0 {
+        return;
+    }
+    if first != key
+        && !PENDING_PTRS[1..]
         .iter()
         .any(|slot| slot.load(Ordering::Relaxed) == key)
     {
