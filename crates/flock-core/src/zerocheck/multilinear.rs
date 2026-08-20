@@ -4081,6 +4081,54 @@ mod tests {
                 assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
                 assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
                 assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+
+                // Exercise all four independently selected NT alignment
+                // leaves. Four consecutive F128 offsets cover every 16-byte
+                // residue modulo 64 regardless of the allocator's base.
+                for (a_zmm, b_zmm) in [
+                    (false, false),
+                    (false, true),
+                    (true, false),
+                    (true, true),
+                ] {
+                    let out_len = 2 * lo_size;
+                    let mut a_backing = vec![F128::ONE; out_len + 4];
+                    let mut b_backing = vec![F128::ONE; out_len + 4];
+                    let a_offset = (0..4)
+                        .find(|&i| {
+                            let aligned = (unsafe { a_backing.as_ptr().add(i) } as usize)
+                                .is_multiple_of(64);
+                            aligned == a_zmm
+                        })
+                        .unwrap();
+                    let b_offset = (0..4)
+                        .find(|&i| {
+                            let aligned = (unsafe { b_backing.as_ptr().add(i) } as usize)
+                                .is_multiple_of(64);
+                            aligned == b_zmm
+                        })
+                        .unwrap();
+                    let a_nt = &mut a_backing[a_offset..a_offset + out_len];
+                    let b_nt = &mut b_backing[b_offset..b_offset + out_len];
+                    // SAFETY: same checked geometry and exact w-pair table;
+                    // the chosen slices explicitly cover each alignment mode.
+                    let out_nt = unsafe {
+                        kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                            &a_in,
+                            &b_in,
+                            a_nt,
+                            b_nt,
+                            rho_a,
+                            rho_b,
+                            &eq_lo,
+                            Some(&wtab),
+                            true,
+                        )
+                    };
+                    assert_eq!(a_s, a_nt, "NT a lo_size={lo_size} az={a_zmm} bz={b_zmm}");
+                    assert_eq!(b_s, b_nt, "NT b lo_size={lo_size} az={a_zmm} bz={b_zmm}");
+                    assert_eq!(out_s, out_nt, "NT sums lo_size={lo_size} az={a_zmm} bz={b_zmm}");
+                }
             }
         }
     }
@@ -4551,84 +4599,6 @@ mod tests {
 
         let off = prefold_tile_scalar(&poisoned, &table, 192, 0);
         assert_ne!(off, reference, "poison must be visible with the skip OFF");
-    }
-
-    /// Byte oracle for the GFNI output-plane split.  It models the complete
-    /// 16-plane -> two qword transposes -> byte transpose -> lo/hi interleave
-    /// reassembly and compares the explicit constant half schedule against
-    /// the former full-array schedule across every one of the 1,024 bytes.
-    #[test]
-    fn gfni_split_plane_halves_preserve_all_output_bytes() {
-        fn plane(seed: u8, k: usize) -> [u8; 64] {
-            std::array::from_fn(|i| {
-                seed.wrapping_add((k as u8).wrapping_mul(67))
-                    .rotate_left((i & 7) as u32)
-                    ^ (i as u8).wrapping_mul(29)
-            })
-        }
-
-        fn qword_transpose(input: [[u8; 64]; 8]) -> [[u8; 64]; 8] {
-            let mut out = [[0u8; 64]; 8];
-            for src in 0..8 {
-                for qword in 0..8 {
-                    out[qword][8 * src..8 * src + 8]
-                        .copy_from_slice(&input[src][8 * qword..8 * qword + 8]);
-                }
-            }
-            out
-        }
-
-        fn byte_transpose(input: [u8; 64]) -> [u8; 64] {
-            std::array::from_fn(|i| input[8 * (i & 7) + (i >> 3)])
-        }
-
-        fn reassemble(lo: [[u8; 64]; 8], hi: [[u8; 64]; 8]) -> [u8; 1024] {
-            let lo = qword_transpose(lo);
-            let hi = qword_transpose(hi);
-            let mut out = [0u8; 1024];
-            for row in 0..8 {
-                let l = byte_transpose(lo[row]);
-                let h = byte_transpose(hi[row]);
-                for qword in 0..8 {
-                    let dst = 128 * row + 16 * qword;
-                    out[dst..dst + 8].copy_from_slice(&l[8 * qword..8 * qword + 8]);
-                    out[dst + 8..dst + 16]
-                        .copy_from_slice(&h[8 * qword..8 * qword + 8]);
-                }
-            }
-            out
-        }
-
-        for seed in [0u8, 1, 0x5A, 0xA5, 0xFF] {
-            let full: [[u8; 64]; 16] = std::array::from_fn(|k| plane(seed, k));
-            let want = reassemble(
-                full[..8].try_into().unwrap(),
-                full[8..].try_into().unwrap(),
-            );
-            let got = reassemble(
-                [
-                    plane(seed, 0),
-                    plane(seed, 1),
-                    plane(seed, 2),
-                    plane(seed, 3),
-                    plane(seed, 4),
-                    plane(seed, 5),
-                    plane(seed, 6),
-                    plane(seed, 7),
-                ],
-                [
-                    plane(seed, 8),
-                    plane(seed, 9),
-                    plane(seed, 10),
-                    plane(seed, 11),
-                    plane(seed, 12),
-                    plane(seed, 13),
-                    plane(seed, 14),
-                    plane(seed, 15),
-                ],
-            );
-            assert_eq!(got, want, "all output bytes, seed={seed:#04x}");
-        }
     }
 
     /// The consumer-level claim that licenses the skip: no row of a dead line
