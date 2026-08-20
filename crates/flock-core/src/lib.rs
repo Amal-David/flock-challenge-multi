@@ -265,12 +265,6 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
         v.set_len(n);
     }
     advise_hugepages(v.as_mut_ptr().cast::<u8>(), n * core::mem::size_of::<T>());
-    // A fresh allocation may land on the address of a buffer that was
-    // released by a plain `drop` while a scratch provenance tag was still
-    // armed for it. This address now belongs to a new object, so that tag is
-    // void — drop it before the new buffer can inherit it at its own
-    // release. Lock-free (a short atomic scan) when nothing is armed.
-    crate::scratch::void_pending_tag(v.as_ptr().cast::<crate::field::F128>());
     v
 }
 

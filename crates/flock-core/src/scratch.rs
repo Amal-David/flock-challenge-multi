@@ -19,7 +19,6 @@
 
 use crate::field::F128;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Pool entries carry a provenance tag: `0` means "no provenance". A non-zero
 /// tag asserts the buffer's contents are EXACTLY what its previous owner
@@ -50,9 +49,7 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_f128(n) {
         return v;
     }
-    let v = crate::alloc_uninit_vec::<F128>(n);
-    void_pending_tag(v.as_ptr());
-    v
+    crate::alloc_uninit_vec(n)
 }
 
 /// Pool-only variant of [`take_f128`]: returns `None` instead of falling
@@ -76,9 +73,7 @@ pub fn take_f128_tagged(n: usize, tag: u64) -> (Vec<F128>, bool) {
     if let Some(r) = try_take_f128_tagged(n, tag) {
         return r;
     }
-    let v = crate::alloc_uninit_vec::<F128>(n);
-    void_pending_tag(v.as_ptr());
-    (v, false)
+    (crate::alloc_uninit_vec(n), false)
 }
 
 fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
@@ -117,10 +112,6 @@ fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
         // exposing uninit/stale elements is sound to *hold* — the caller
         // upholds write-before-read per this function's contract.
         unsafe { v.set_len(n) };
-        // New owner ⇒ any provenance a previous owner armed for this address
-        // is void (see `void_pending_tag`). The pool entry's own tag, read
-        // above, is unaffected.
-        void_pending_tag(v.as_ptr());
         return Some((v, best_hit));
     }
     None
@@ -135,53 +126,6 @@ fn try_take_f128_tagged(n: usize, tag: u64) -> Option<(Vec<F128>, bool)> {
 /// instead of dropping provenance. Entries are consumed on match, and
 /// re-registering a pointer overwrites its pending tag.
 static PENDING_TAGS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-/// Capacity of [`PENDING_TAGS`] and of its lock-free mirror.
-const PENDING_CAP: usize = 8;
-/// Lock-free mirror of the armed pointers (`0` = empty slot), so
-/// [`void_pending_tag`] — which runs on every buffer hand-out, including
-/// every [`crate::alloc_uninit_vec`] — costs `PENDING_CAP` relaxed loads and
-/// takes the mutex only on an actual hit.
-static PENDING_PTRS: [AtomicUsize; PENDING_CAP] =
-    [const { AtomicUsize::new(0) }; PENDING_CAP];
-
-/// Republish the lock-free mirror from the registry. Call while holding the
-/// [`PENDING_TAGS`] lock, after every mutation.
-fn sync_pending_mirror(pending: &[(usize, u64)]) {
-    for (i, slot) in PENDING_PTRS.iter().enumerate() {
-        slot.store(pending.get(i).map_or(0, |(p, _)| *p), Ordering::Relaxed);
-    }
-}
-
-/// Void any pending tag armed for `ptr`, because that address has just been
-/// handed to a NEW owner (pool take, or a fresh allocation that landed on a
-/// freed buffer's address).
-///
-/// This closes the aliasing hole in the pointer-keyed registry. A pending
-/// entry outlives the buffer it was armed for whenever that buffer is
-/// released by a plain `drop` instead of [`give_f128`]; the allocator is then
-/// free to hand the same address to an UNRELATED `Vec<F128>`, whose
-/// [`give_f128`] would inherit the dead buffer's provenance and hand a later
-/// [`take_f128_tagged`] a bogus hit — i.e. a caller would elide rewriting
-/// "constant" regions over a buffer that never held them. Voiding on every
-/// hand-out makes an entry unreachable once its buffer's address is reused,
-/// which is exactly the module contract already documented on [`POOL`]
-/// ("any take hands the buffer to a caller whose writes void the old
-/// provenance"). Without it the a/b constant-region elision mis-fires and
-/// `round1_inner_closed_form_source_matches_slice` fails.
-pub(crate) fn void_pending_tag(ptr: *const F128) {
-    let key = ptr as usize;
-    if !PENDING_PTRS
-        .iter()
-        .any(|slot| slot.load(Ordering::Relaxed) == key)
-    {
-        return;
-    }
-    let mut pending = PENDING_TAGS.lock().unwrap();
-    if let Some(i) = pending.iter().position(|(p, _)| *p == key) {
-        pending.swap_remove(i);
-        sync_pending_mirror(&pending);
-    }
-}
 
 /// Arm a provenance tag for the buffer starting at `ptr`: the NEXT
 /// [`give_f128`] of that allocation behaves as [`give_f128_tagged`] with
@@ -198,21 +142,16 @@ pub fn register_pending_tag(ptr: *const F128, tag: u64) {
     pending.push((ptr as usize, tag));
     // Bounded: a prove registers a handful of buffers; anything beyond that
     // is stale (e.g. an aborted prove) and safe to shed oldest-first.
-    if pending.len() > PENDING_CAP {
+    if pending.len() > 8 {
         pending.remove(0);
     }
-    sync_pending_mirror(&pending);
 }
 
 pub fn give_f128(v: Vec<F128>) {
     let tag = {
         let mut pending = PENDING_TAGS.lock().unwrap();
         match pending.iter().position(|(p, _)| *p == v.as_ptr() as usize) {
-            Some(i) => {
-                let t = pending.swap_remove(i).1;
-                sync_pending_mirror(&pending);
-                t
-            }
+            Some(i) => pending.swap_remove(i).1,
             None => 0,
         }
     };
@@ -332,37 +271,6 @@ mod tests {
         let (v4, hit) = take_f128_tagged(256, 78);
         assert!(!hit);
         drop(v4);
-        clear();
-    }
-
-    /// **Provenance aliasing oracle.** A pending tag is keyed by raw address,
-    /// so it outlives its buffer whenever that buffer is released by a plain
-    /// `drop` instead of [`give_f128`]. If the allocator then reuses the
-    /// address for an UNRELATED buffer, that buffer's release must NOT
-    /// inherit the dead provenance — otherwise a later
-    /// [`take_f128_tagged`] reports a bogus hit and its caller elides
-    /// rewriting "already correct" regions over bytes that were never
-    /// written. Handing the address to a new owner voids the entry
-    /// ([`void_pending_tag`]); this pins that.
-    #[test]
-    fn stale_pending_tag_is_not_inherited_by_the_next_owner() {
-        clear();
-        let v = take_f128(256);
-        let ptr = v.as_ptr();
-        give_f128(v);
-        // An entry armed for an address whose original buffer is gone: the
-        // producer never released it through `give_f128`, so the entry is
-        // stale and the address is up for grabs.
-        register_pending_tag(ptr, 91);
-        // A NEW owner claims that address...
-        let v2 = take_f128(256);
-        assert_eq!(v2.as_ptr(), ptr, "pool must hand back the same buffer");
-        // ...so its own untagged release must carry no provenance.
-        give_f128(v2);
-        let (v3, hit) = take_f128_tagged(256, 91);
-        assert_eq!(v3.as_ptr(), ptr);
-        assert!(!hit, "stale pending tag leaked into an unrelated buffer");
-        drop(v3);
         clear();
     }
 

@@ -1473,27 +1473,13 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
-        // BLOCKER REMOVED: a/b's constant lines used to be re-read L1-hot by
-        // the round-1 window precompute right after the dump, so eliding their
-        // stores turned warm reads into cold misses (measured +1 ms) — the
-        // elision was self-defeating and stayed z-only. The fused drain
-        // (`ab_nt`) rebuilds those bytes into the per-octa L1 window buffers
-        // from the same transpose registers and projects from THERE, so the
-        // main a/b buffers are write-only in this phase and the re-read that
-        // blocked the elision no longer exists. With the blocker gone the
-        // elision is a pure store deletion: a's zero tail (chunks 62..64) and
-        // b's MAX prefix (chunks 0..4) + fixed lin-id/out_hi/zero suffix
-        // (chunks 60..64) are content-independent, so a provenance hit means
-        // those bytes are already in the buffer and re-storing them writes
-        // them with themselves. 320 B/block × 2^18 blocks = 84 MB of NT store
-        // traffic (1.31 M 512-bit stores) deleted per prove.
-        //
-        // Gated on `ab_nt`: under `FLOCK_NO_WITGEN_AB_NT=1` the projection
-        // re-reads a/b, the original blocker is back, and a/b elision must
-        // stay off. `FLOCK_NO_WITGEN_AB_CONST_ELIDE=1` restores the previous
-        // z-only behaviour on the fused arm (exact same-binary A/B).
+        // z-ONLY elision: a/b's constant lines were re-read L1-hot by the
+        // round-1 window precompute right after the dump, so eliding their
+        // stores converted warm reads into cold misses (measured +1 ms). The
+        // fused drain moves that re-read to the per-octa window buffers, so
+        // a/b elision is no longer self-defeating — but it stays off here,
+        // unchanged, because enabling it is a separate measurement.
         let elide_on = witgen_simd::const_elide_enabled();
-        let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
         generate_round1_inner_octa(
             blocks,
             skip_blocks,
@@ -1503,7 +1489,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut ab_inner,
             &inv_table,
             &padding,
-            [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
+            [z_tok && elide_on, false, false],
             ab_nt,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
@@ -2114,23 +2100,6 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_z_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
-        *ON
-    }
-
-    /// `FLOCK_NO_WITGEN_AB_CONST_ELIDE=1` restores the z-only constant-region
-    /// elision on the fused drain: a/b are dumped in full again. With the
-    /// switch off (the default) a's zero tail and b's MAX prefix + fixed
-    /// suffix are skipped whenever the pool provenance token proves the
-    /// buffer still holds a previous completed witgen of this layout — those
-    /// regions are content-independent, so the skip only ever declines to
-    /// rewrite bytes with themselves, and the fused window buffers still
-    /// carry every chunk so the round-1 projection input is unchanged.
-    /// Only meaningful together with the fused drain: without it the
-    /// projection re-reads a/b and the skipped lines go cold (the measured
-    /// +1 ms that closed this lane the first time).
-    pub(crate) fn witgen_ab_const_elide_enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_CONST_ELIDE").is_none());
         *ON
     }
 
