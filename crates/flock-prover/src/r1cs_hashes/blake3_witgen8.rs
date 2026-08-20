@@ -178,16 +178,56 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
+const RING_WORDS: usize = 128;
+
+/// Rolling drain state shared by the three packed writers. The witness uses
+/// three reusable 128-word epochs instead of three full 512-word stages.
+struct Drain8 {
+    zs: *mut V8,
+    ast: *mut V8,
+    bs: *mut V8,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    win_ab: Option<(*mut u32, *mut u32)>,
+    elide: [bool; 3],
+    z_nt: bool,
+}
+
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
 struct W8 {
     pending: V8,
     stage: *mut V8,
+    drain: *mut Drain8,
+    flush: bool,
 }
 
 impl W8 {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8) -> Self {
-        Self { pending, stage }
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8, flush: bool) -> Self {
+        Self {
+            pending,
+            stage,
+            drain,
+            flush,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
+        unsafe {
+            store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+                // Words 0..15 cannot be published until the final chaining
+                // value is known.  The first rolling epoch therefore starts
+                // at word 16; later epochs cover their complete 128 words.
+                if WORD + 1 == RING_WORDS {
+                    (*self.drain).drain_range(16, 16, RING_WORDS - 16);
+                } else {
+                    (*self.drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -205,7 +245,7 @@ impl W8 {
         unsafe {
             if USED == 0 {
                 if WIDTH == 32 {
-                    store_v8(self.stage.add(WORD) as *mut u32, v);
+                    self.write_word::<WORD>(v);
                     self.pending = dup_u32(0);
                 } else {
                     self.pending = v;
@@ -214,7 +254,7 @@ impl W8 {
                 self.pending = vsli_v8::<USED>(self.pending, v);
             } else {
                 let out = vsli_v8::<USED>(self.pending, v);
-                store_v8(self.stage.add(WORD) as *mut u32, out);
+                self.write_word::<WORD>(out);
                 if USED + WIDTH == 32 {
                     self.pending = dup_u32(0);
                 } else {
@@ -227,7 +267,7 @@ impl W8 {
     #[inline(always)]
     unsafe fn finish(&mut self) {
         unsafe {
-            store_v8(self.stage.add(LAST_WORD) as *mut u32, self.pending);
+            self.write_word::<LAST_WORD>(self.pending);
         }
     }
 }
@@ -382,6 +422,121 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8) {
         }
         stream_v8(p, va);
         stream_v8(p.add(8), vb);
+    }
+}
+
+impl Drain8 {
+    /// Transpose and publish `words` from the current ring epoch at absolute
+    /// `base_word`. `win`, when present, always receives every word even when
+    /// the recyclable main destination elides a constant range.
+    #[inline(always)]
+    unsafe fn publish_range(
+        stage: *const V8,
+        dst: *mut u32,
+        win: Option<*mut u32>,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+        g0: usize,
+        g1: usize,
+        nt: bool,
+    ) {
+        unsafe {
+            debug_assert_eq!(base_word % 8, 0);
+            debug_assert_eq!(ring_word % 8, 0);
+            debug_assert_eq!(words % 16, 0);
+            for off in (0..words).step_by(16) {
+                let lo_rows = tr8_chunk(stage, ring_word + off);
+                let hi_rows = tr8_chunk(stage, ring_word + off + 8);
+                let abs_word = base_word + off;
+                let g = abs_word / 8;
+                let lo_live = g >= g0 && g < g1;
+                let hi_live = g + 1 >= g0 && g + 1 < g1;
+                for r in 0..8 {
+                    if let Some(w) = win {
+                        let p = w.add(r * U32_PER_BLOCK + abs_word);
+                        store_v8(p, lo_rows[r]);
+                        store_v8(p.add(8), hi_rows[r]);
+                    }
+                    let p = dst.add(r * U32_PER_BLOCK + abs_word);
+                    match (nt, lo_live, hi_live) {
+                        (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
+                        (true, true, false) => stream_v8(p, lo_rows[r]),
+                        (true, false, true) => stream_v8(p.add(8), hi_rows[r]),
+                        (false, true, true) => {
+                            store_v8(p, lo_rows[r]);
+                            store_v8(p.add(8), hi_rows[r]);
+                        }
+                        (false, true, false) => store_v8(p, lo_rows[r]),
+                        (false, false, true) => store_v8(p.add(8), hi_rows[r]),
+                        (_, false, false) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            Self::publish_range(
+                self.zs, self.z, None, base_word, ring_word, words, 0, z_g1, self.z_nt,
+            );
+
+            match self.win_ab {
+                Some((win_a, win_b)) => {
+                    let a_g1 = if self.elide[1] {
+                        ELIDE_ZERO_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    let b_g0 = if self.elide[2] {
+                        ELIDE_B_PREFIX_CHUNKS
+                    } else {
+                        0
+                    };
+                    let b_g1 = if self.elide[2] {
+                        ELIDE_B_TAIL_CHUNK_WIN
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    Self::publish_range(
+                        self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
+                    );
+                    Self::publish_range(
+                        self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
+                    );
+                }
+                None => {
+                    let a_g1 = if self.elide[1] {
+                        ELIDE_ZERO_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    let b_g0 = if self.elide[2] {
+                        ELIDE_B_PREFIX_CHUNKS
+                    } else {
+                        0
+                    };
+                    let b_g1 = if self.elide[2] {
+                        ELIDE_B_TAIL_CHUNK
+                    } else {
+                        DUMP_CHUNKS
+                    };
+                    Self::publish_range(
+                        self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
+                    );
+                    Self::publish_range(
+                        self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -612,43 +767,52 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         ];
 
         let zero = dup_u32(0);
-        let mut zs = core::mem::MaybeUninit::<[V8; U32_PER_BLOCK]>::uninit();
-        let mut ast = core::mem::MaybeUninit::<[V8; U32_PER_BLOCK]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; U32_PER_BLOCK]>::uninit();
+        let mut zs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
         let zs = zs.as_mut_ptr().cast::<V8>();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 
-        for w in 0..8usize {
-            store_v8(zs.add(w) as *mut u32, cv_v[w]);
-            store_v8(ast.add(w) as *mut u32, cv_v[w]);
-        }
+        let mut drain = Drain8 {
+            zs,
+            ast,
+            bs,
+            z,
+            a,
+            b,
+            win_ab,
+            elide,
+            z_nt,
+        };
         let maxv = dup_u32(u32::MAX);
-        for w in 0..36usize {
-            store_v8(bs.add(w) as *mut u32, maxv);
-        }
         let one = dup_u32(1);
         let chain: [V8; 20] = [
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
             m[13], m[14], m[15], tlo, thi, blen, flags,
         ];
-        store_v8(
-            zs.add(16) as *mut u32,
-            or_v8(one, shl_v8::<1>(chain[0])),
-        );
-        for k in 1..20usize {
-            let w = or_v8(shr_v8::<31>(chain[k - 1]), shl_v8::<1>(chain[k]));
-            store_v8(zs.add(16 + k) as *mut u32, w);
-        }
-        for w in 16..36usize {
-            let v = load_v8(zs.add(w) as *const u32);
-            store_v8(ast.add(w) as *mut u32, v);
+        // Words 16..35 are available before the rounds. Retain them in the
+        // first rolling epoch; the writer publishes words 16..127 together
+        // when it completes word 127.
+        for k in 0..20usize {
+            let v = if k == 0 {
+                or_v8(one, shl_v8::<1>(chain[0]))
+            } else {
+                or_v8(shr_v8::<31>(chain[k - 1]), shl_v8::<1>(chain[k]))
+            };
+            let w = 16 + k;
+            store_v8(zs.add(w & (RING_WORDS - 1)) as *mut u32, v);
+            store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
+            store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
 
         let pending_bit = shr_v8::<31>(flags);
-        let mut wz = W8::at(zs, pending_bit);
-        let mut wa = W8::at(ast, pending_bit);
-        let mut wb = W8::at(bs, one);
+        let drain_ptr = &mut drain as *mut Drain8;
+        let mut wz = W8::at(zs, pending_bit, drain_ptr, false);
+        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        // B is pushed after z and a at every site; it alone triggers a band
+        // drain once all three rings contain the completed word.
+        let mut wb = W8::at(bs, one, drain_ptr, true);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -743,33 +907,30 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         const {
             assert!(U32_PER_BLOCK - ZF == 30);
         }
-        for w in 0..30usize {
-            store_v8(zs.add(ZF + w) as *mut u32, zero);
-            store_v8(ast.add(ZF + w) as *mut u32, zero);
-            store_v8(bs.add(ZF + w) as *mut u32, zero);
+        // finish() completed word 481. Complete the final rolling epoch with
+        // the all-zero tail, then publish words 384..511 in one long sweep.
+        for w in ZF..U32_PER_BLOCK {
+            let i = w & (RING_WORDS - 1);
+            store_v8(zs.add(i) as *mut u32, zero);
+            store_v8(ast.add(i) as *mut u32, zero);
+            store_v8(bs.add(i) as *mut u32, zero);
         }
+        drain.drain_range(384, 0, RING_WORDS);
 
+        // Band 0 is the one intentional deferral: words 0..7 are the input
+        // CV, while words 8..15 depend on the final compression state. Build
+        // the complete cache line now, then publish it through the exact same
+        // elide/NT/window policy as every rolling band.
         for w in 0..8usize {
             let lo = xor_v8(state[w], state[w + 8]);
+            store_v8(zs.add(w) as *mut u32, cv_v[w]);
+            store_v8(ast.add(w) as *mut u32, cv_v[w]);
+            store_v8(bs.add(w) as *mut u32, maxv);
             store_v8(zs.add(8 + w) as *mut u32, lo);
             store_v8(ast.add(8 + w) as *mut u32, lo);
+            store_v8(bs.add(8 + w) as *mut u32, maxv);
         }
-
-        dump_elide(zs, z, elide[0], false, ELIDE_ZERO_CHUNK, z_nt);
-        match win_ab {
-            // FUSED: the projection reads the windows, so a/b are write-only
-            // here — stream them and delete their write-allocate RFO.
-            Some((win_a, win_b)) => {
-                dump_elide_win(ast, a, win_a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide_win(bs, b, win_b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK_WIN);
-            }
-            // Incumbent: a/b stay temporal because the caller re-reads them
-            // L1-hot for the round-1 window precompute in this very task.
-            None => {
-                dump_elide(ast, a, elide[1], false, ELIDE_ZERO_CHUNK, false);
-                dump_elide(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK, false);
-            }
-        }
+        drain.drain_range(0, 0, 16);
     }
 }
 
