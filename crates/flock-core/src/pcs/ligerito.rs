@@ -2540,6 +2540,16 @@ pub(crate) fn induce_sched_enabled() -> bool {
     *ON
 }
 
+/// Ranked default routes ordinary induced-basis glue through the four-lane
+/// AVX-512 `add_scaled` already used by lazy-OOD correction.
+/// `FLOCK_NO_OPEN_GLUE_X4=1` restores the per-element scalar `+= α·v` loop.
+/// Read once per process; default ON (the ranked worker clears its env).
+fn glue_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_GLUE_X4").is_none());
+    *ON
+}
+
 /// Crossover constant `C` in the [`induce_sumcheck_poly_auto`] dispatch rule
 /// `n_queries > C · 2^log_inv_rate · log_block`.
 ///
@@ -5388,6 +5398,13 @@ impl SumcheckProver {
 
     /// Combine the introduced basis into `combined_basis` with separation α.
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    ///
+    /// The AVX-512 arm is the same four-lane `ghash_mul_x4` body already used
+    /// by lazy-OOD fold correction: each destination still receives
+    /// `acc ⊕ (α · v)`, just four independent VPCLMUL products per iteration
+    /// instead of one scalar GHASH multiply. Rayon chunking stays at
+    /// `PAR_THRESHOLD` elements so the ranked 2^19 L1 glue still spreads
+    /// across the sixteen SPR cores.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
         let (b_new, h_new) = self
@@ -5396,7 +5413,18 @@ impl SumcheckProver {
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
+        if glue_x4_enabled() {
+            if self.combined_basis.len() < PAR_THRESHOLD {
+                crate::field::f128_slice::add_scaled(&mut self.combined_basis, &b_new, alpha);
+            } else {
+                self.combined_basis
+                    .par_chunks_mut(PAR_THRESHOLD)
+                    .zip(b_new.par_chunks(PAR_THRESHOLD))
+                    .for_each(|(acc, src)| {
+                        crate::field::f128_slice::add_scaled(acc, src, alpha);
+                    });
+            }
+        } else if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
@@ -9479,6 +9507,40 @@ mod tests {
         assert_eq!(&*lazy.combined_basis, &*dense.combined_basis);
         assert_eq!(lazy.t_r, dense.t_r);
         assert_eq!(lazy.transcript, dense.transcript);
+    }
+
+    /// Ordinary `glue` must equal the algebraic spec `acc += α·v` at serial
+    /// lengths, the 4-lane body+tail, the parallel threshold, and a larger
+    /// parallel length.
+    #[test]
+    fn glue_matches_pointwise_scaled_add() {
+        use crate::challenger::Challenger;
+        for d in [2usize, 3, 6, 12, 13] {
+            let n = 1usize << d;
+            let mut ch = crate::challenger::RandomChallenger::new(0x61_0E_0000 + d as u64);
+            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let h: F128 = f
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| x * y)
+                .fold(F128::ZERO, |a, v| a + v);
+            let b2: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let h2 = ch.sample_f128();
+            let alpha = ch.sample_f128();
+
+            let mut want = b.clone();
+            for (acc, &v) in want.iter_mut().zip(b2.iter()) {
+                *acc += alpha * v;
+            }
+            let want_t = h + alpha * h2;
+
+            let (mut prover, _) = SumcheckProver::new(f, b, h);
+            prover.introduce_new(b2, h2);
+            prover.glue(alpha);
+            assert_eq!(&*prover.combined_basis, &*want, "basis d={d}");
+            assert_eq!(prover.t_r, want_t, "t_r d={d}");
+        }
     }
 
     #[test]
