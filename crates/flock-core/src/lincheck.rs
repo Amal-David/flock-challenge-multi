@@ -390,6 +390,113 @@ impl CscCircuit {
     }
 }
 
+/// Row-index width of a CSC gather stream. Both widths index the same table
+/// and produce the same XOR order; only the bytes read per nonzero differ.
+trait CscRowIdx: Copy {
+    fn idx(self) -> usize;
+}
+impl CscRowIdx for u16 {
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
+impl CscRowIdx for u32 {
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+/// Ranked default breaks the CSC gather's single dependent accumulator chain
+/// into four independent partial sums, combined at column end.
+///
+/// The incumbent `sa += eq_inner[r]` chain runs at XOR *latency*: every add
+/// waits on the previous one, so at most one gather load is resolving at a
+/// time even though the load ports could keep several in flight against the
+/// L2-resident eq table. Four accumulators let four loads and four XORs be in
+/// flight, and the combine is exact: GF(2^128) addition is XOR, which is
+/// associative and commutative, so ANY grouping of the same multiset of
+/// operands is the same field element — this is not a floating-point-style
+/// reassociation. Both matrices' streams (A₀ ~15.2M + B₀ ~5.8M nonzeros at the
+/// ranked BLAKE3 shape) go through it.
+///
+/// `FLOCK_NO_LC_CSC_ACC=1` restores the exact single-accumulator loop, which
+/// is also the test oracle. Read once per process; default ON.
+fn csc_acc_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CSC_ACC").is_none());
+    *ON
+}
+
+/// XOR-sum `eq_inner[r]` over one column's row-index slice.
+///
+/// The `x86_64` arm keeps the four accumulators in XMM registers: `F128` is
+/// `repr(C, align(16))`, so each table entry is exactly one 128-bit load and
+/// one `PXOR` instead of the two GPR XORs the scalar form emits per nonzero.
+/// SSE2 is baseline on `x86_64`, so this needs no feature gate. (The in-tree
+/// `kernels::xor_bytes_avx512` does not apply here: it streams two CONTIGUOUS
+/// buffers, whereas this is a random-index gather out of a 256 KiB table —
+/// the loads cannot be widened past one element, only overlapped.)
+///
+/// # Safety
+/// Every `r` in `rows` must satisfy `r.idx() < eq_inner.len()`.
+#[inline]
+unsafe fn csc_gather_xor<I: CscRowIdx>(rows: &[I], eq_inner: &[F128]) -> F128 {
+    // SAFETY (all arms): the caller guarantees every index is in bounds.
+    unsafe {
+        if !csc_acc_enabled() {
+            let mut s = F128::ZERO;
+            for &r in rows {
+                s += *eq_inner.get_unchecked(r.idx());
+            }
+            return s;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::*;
+            let base = eq_inner.as_ptr();
+            let mut a0 = _mm_setzero_si128();
+            let mut a1 = _mm_setzero_si128();
+            let mut a2 = _mm_setzero_si128();
+            let mut a3 = _mm_setzero_si128();
+            let mut chunks = rows.chunks_exact(4);
+            for c in &mut chunks {
+                a0 = _mm_xor_si128(a0, _mm_loadu_si128(base.add(c[0].idx()) as *const __m128i));
+                a1 = _mm_xor_si128(a1, _mm_loadu_si128(base.add(c[1].idx()) as *const __m128i));
+                a2 = _mm_xor_si128(a2, _mm_loadu_si128(base.add(c[2].idx()) as *const __m128i));
+                a3 = _mm_xor_si128(a3, _mm_loadu_si128(base.add(c[3].idx()) as *const __m128i));
+            }
+            let mut acc = _mm_xor_si128(_mm_xor_si128(a0, a1), _mm_xor_si128(a2, a3));
+            for &r in chunks.remainder() {
+                acc = _mm_xor_si128(acc, _mm_loadu_si128(base.add(r.idx()) as *const __m128i));
+            }
+            let mut out = F128::ZERO;
+            _mm_storeu_si128(&mut out as *mut F128 as *mut __m128i, acc);
+            out
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let (mut s0, mut s1, mut s2, mut s3) =
+                (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO);
+            let mut chunks = rows.chunks_exact(4);
+            for c in &mut chunks {
+                s0 += *eq_inner.get_unchecked(c[0].idx());
+                s1 += *eq_inner.get_unchecked(c[1].idx());
+                s2 += *eq_inner.get_unchecked(c[2].idx());
+                s3 += *eq_inner.get_unchecked(c[3].idx());
+            }
+            let mut acc = (s0 + s1) + (s2 + s3);
+            for &r in chunks.remainder() {
+                acc += *eq_inner.get_unchecked(r.idx());
+            }
+            acc
+        }
+    }
+}
+
 impl LincheckCircuit for CscCircuit {
     fn n_cols(&self) -> usize {
         self.n_cols
@@ -407,32 +514,40 @@ impl LincheckCircuit for CscCircuit {
             // u16 index stream: identical row order, identical XOR order,
             // half the bytes read per nonzero.
             return self.map_cols(|c| {
-                let mut sa = F128::ZERO;
-                for &r in &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
-                {
-                    // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
-                    sa += *unsafe { eq_inner.get_unchecked(r as usize) };
-                }
-                let mut sb = F128::ZERO;
-                for &r in &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
-                {
-                    // SAFETY: as above.
-                    sb += *unsafe { eq_inner.get_unchecked(r as usize) };
-                }
+                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+                let sa = unsafe {
+                    csc_gather_xor(
+                        &self.a_rows16
+                            [self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize],
+                        eq_inner,
+                    )
+                };
+                // SAFETY: as above.
+                let sb = unsafe {
+                    csc_gather_xor(
+                        &self.b_rows16
+                            [self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize],
+                        eq_inner,
+                    )
+                };
                 alpha * sa + sb
             });
         }
         self.map_cols(|c| {
-            let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
-                sa += *unsafe { eq_inner.get_unchecked(r as usize) };
-            }
-            let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                // SAFETY: as above.
-                sb += *unsafe { eq_inner.get_unchecked(r as usize) };
-            }
+            // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+            let sa = unsafe {
+                csc_gather_xor(
+                    &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize],
+                    eq_inner,
+                )
+            };
+            // SAFETY: as above.
+            let sb = unsafe {
+                csc_gather_xor(
+                    &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize],
+                    eq_inner,
+                )
+            };
             alpha * sa + sb
         })
     }
@@ -3130,6 +3245,56 @@ mod tests {
     /// The u16-narrowed CSC row indices produce exactly the same
     /// `fold_alpha_batched` output as the u32 arrays (oracle A/B for
     /// `FLOCK_NO_LC_CSC_U16`), for both the sequential and the rayon branch.
+    /// The four-accumulator CSC gather must equal the single-accumulator
+    /// chain it replaced (the kill-switch arm) for BOTH index widths, at every
+    /// length class around the 4-wide unroll — empty columns, lengths below
+    /// one chunk, exact multiples, and every remainder. XOR is associative and
+    /// commutative, so this is an exact identity, not a tolerance.
+    /// Negative control: one perturbed table entry must change the result.
+    #[test]
+    fn csc_gather_xor_matches_sequential_chain() {
+        let mut rng = Rng::new(0xC5C_ACC0);
+        let n_rows = 512usize;
+        let mut eq: Vec<F128> = (0..n_rows).map(|_| rng.f128()).collect();
+        // Cover 0..=17 (empty, sub-chunk, exact multiples, every remainder)
+        // plus lengths past a page of indices.
+        let mut lens: Vec<usize> = (0..=17).collect();
+        lens.extend_from_slice(&[63, 64, 65, 1021]);
+        for len in lens {
+            let rows32: Vec<u32> =
+                (0..len).map(|_| (rng.next_u64() as usize % n_rows) as u32).collect();
+            let rows16: Vec<u16> = rows32.iter().map(|&r| r as u16).collect();
+
+            // Oracle: the exact sequential chain the kill switch restores.
+            let mut want = F128::ZERO;
+            for &r in &rows32 {
+                want += eq[r as usize];
+            }
+
+            // SAFETY: every index was reduced mod n_rows = eq.len().
+            let got32 = unsafe { csc_gather_xor(&rows32, &eq) };
+            let got16 = unsafe { csc_gather_xor(&rows16, &eq) };
+            assert_eq!(got32, want, "u32 gather len={len}");
+            assert_eq!(got16, want, "u16 gather len={len}");
+
+            // Negative control: perturbing a table entry this column reads
+            // must change the sum (skip empty columns, which read nothing).
+            if len > 0 {
+                let touched = rows32[len / 2] as usize;
+                eq[touched] += F128::ONE;
+                // SAFETY: indices unchanged, still in bounds.
+                let bad = unsafe { csc_gather_xor(&rows32, &eq) };
+                let flips = rows32.iter().filter(|&&r| r as usize == touched).count();
+                if flips % 2 == 1 {
+                    assert_ne!(bad, want, "perturbed entry went undetected len={len}");
+                }
+                eq[touched] += F128::ONE;
+                // SAFETY: as above.
+                assert_eq!(unsafe { csc_gather_xor(&rows32, &eq) }, want, "revert len={len}");
+            }
+        }
+    }
+
     #[test]
     fn csc_u16_rows_match_u32_rows() {
         for &(k, nnz) in &[(64usize, 500usize), (1 << 12, 40_000), (1 << 13, 90_000)] {

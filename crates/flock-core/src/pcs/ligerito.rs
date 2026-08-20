@@ -2858,12 +2858,13 @@ fn transpose_forward_ntt_window_dense(
     (w, buf)
 }
 
-/// Ranked default skips the singleton window buffer's zero-fill (every slot
-/// is written exactly once before any read — see the buffer comment in
-/// [`transpose_forward_ntt_window_singleton`]). Identical output bytes: the
-/// zeroed slots were never read. `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores
-/// the incumbent `vec![F128::ZERO; _]` for exact same-binary A/B. Read once
-/// per process; default ON.
+/// Ranked default skips the singleton window buffers' zero-fill (every slot
+/// is written exactly once before any read — see [`expand_singleton_into`]'s
+/// write-completeness contract; [`take_singleton_buf`] is the allocator).
+/// Identical output bytes: the zeroed slots were never read.
+/// `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores the incumbent
+/// `vec![F128::ZERO; _]` for exact same-binary A/B. Read once per process;
+/// default ON.
 fn singleton_uninit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_LIG_SINGLETON_UNINIT").is_none()
@@ -2871,33 +2872,45 @@ fn singleton_uninit_enabled() -> bool {
     *ON
 }
 
+/// One `2^k`-slot window buffer for the singleton/multi-singleton shortcut.
+/// [`expand_singleton_into`] is write-complete, so the buffer may start
+/// uninitialized; `FLOCK_NO_LIG_SINGLETON_UNINIT=1`
+/// ([`singleton_uninit_enabled`]) restores the incumbent zero-fill for exact
+/// same-binary A/B — output bytes are identical either way (the zeroed slots
+/// were never read).
+fn take_singleton_buf(k: usize) -> Vec<F128> {
+    if singleton_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(1usize << k)
+    } else {
+        vec![F128::ZERO; 1usize << k]
+    }
+}
+
 /// Expand one nonzero at local index `p` through the window's `k` transpose
-/// layers. Before layer `s`, only one `2^s` half can be live; either source
-/// orientation produces the same top half (`current`) and a bottom half
-/// scaled by `twiddle + bit_s`. Thus the work is `1+2+...+2^(k-1)` products,
-/// versus `k·2^(k-1)` for the zero-padded dense window.
-fn transpose_forward_ntt_window_singleton(
+/// layers, into `out` (length `2^k`). Before layer `s`, only one `2^s` half
+/// can be live; either source orientation produces the same top half
+/// (`current`) and a bottom half scaled by `twiddle + bit_s`. Thus the work
+/// is `1+2+...+2^(k-1)` products, versus `k·2^(k-1)` for the zero-padded
+/// dense window.
+///
+/// **Write-complete**: `out[0]` is stored first and step `s` writes
+/// `out[2^s..2^(s+1)]` (both the AVX-512 and scalar arms store the product
+/// without reading the destination), so over `s ∈ 0..k` every slot of `out`
+/// is written exactly once. `out` may therefore be UNINITIALIZED
+/// ([`crate::alloc_uninit_vec`]'s write-before-read contract).
+fn expand_singleton_into(
     ntt: &AdditiveNttF128,
     log_d: usize,
     k: usize,
     w: usize,
     p: usize,
     value: F128,
-) -> (usize, Vec<F128>) {
+    out: &mut [F128],
+) {
     assert!(k > 0 && k <= log_d);
     assert!(p < 1usize << k);
-    // Every slot is written exactly once before any read: slot 0 here, and
-    // step `s` writes exactly `buf[2^s..2^(s+1)]` (both expansion arms below
-    // WRITE the product — they never load/accumulate the destination), so
-    // the zero-fill is dead work: 4 KiB of kernel memset per window at the
-    // ranked `k = 8`, ~213 active windows per L0 induce.
-    // `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores the zeroing for A/B.
-    let mut buf = if singleton_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(1usize << k)
-    } else {
-        vec![F128::ZERO; 1usize << k]
-    };
-    buf[0] = value;
+    assert_eq!(out.len(), 1usize << k);
+    out[0] = value;
     let mut len = 1usize;
     for s in 0..k {
         let layer = log_d - 1 - s;
@@ -2906,13 +2919,12 @@ fn transpose_forward_ntt_window_singleton(
         if (p >> s) & 1 != 0 {
             scale += F128::ONE;
         }
-        let (current, rest) = buf[..2 * len].split_at_mut(len);
+        let (current, rest) = out[..2 * len].split_at_mut(len);
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
         // SAFETY: target features are cfg-guaranteed and the two halves have
-        // equal length. The kernel WRITES the product into `rest` (never
-        // loads it), which both upholds `alloc_uninit_vec`'s
-        // write-before-read contract and avoids the load/XOR/store an
-        // `add_scaled` into zeroed memory would pay.
+        // equal length. The kernel writes `out[i] = lo[i]·e` without reading
+        // the destination, so it is exactly the write-complete store this
+        // expansion needs (the destination half may be uninitialized).
         unsafe {
             eq_expand_block_x4(&mut rest[..len], current, scale)
         }
@@ -2922,50 +2934,95 @@ fn transpose_forward_ntt_window_singleton(
         }
         len <<= 1;
     }
+}
+
+/// One-nonzero window as a `(w, buf)` task result (the shape the densify
+/// scatter consumes); allocation is uninitialized — [`expand_singleton_into`]
+/// writes every slot. Test oracle harness; production expands in place
+/// through [`expand_singleton_into`] inside the runs scan.
+#[cfg(test)]
+fn transpose_forward_ntt_window_singleton(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    p: usize,
+    value: F128,
+) -> (usize, Vec<F128>) {
+    let mut buf = take_singleton_buf(k);
+    expand_singleton_into(ntt, log_d, k, w, p, value, &mut buf);
     (w, buf)
 }
 
-fn ranked_induce_singleton_selected(
-    log_d: usize,
-    n_queries: usize,
-    k: usize,
-    fill: bool,
-    platform: bool,
-    disabled: bool,
-) -> bool {
-    platform
-        && !disabled
-        && fill
-        && k == 8
-        && matches!((log_d, n_queries), (20, 218) | (18, 106))
+/// `FLOCK_NO_LIG_INDUCE_SINGLETON=1` disables the sparse-induce singleton /
+/// multi-singleton window shortcut — and, through [`induce_window_k`], drops
+/// the window width back to the dense-era `k = 8` — restoring the incumbent
+/// dense-window path byte-for-byte. This is the whole-mechanism A/B switch:
+/// the wider `k` and the `nnz ≤ k/2` shortcut are an atomic pair (either
+/// alone is a loss), so they ride one gate. Resolved once per process.
+///
+/// There is no shape whitelist and no platform gate: the per-window
+/// `nnz ≤ k/2` test IS the selector (a strict per-window cost comparison —
+/// `nnz·(2^k−1) ≤ k·2^(k−1)` products exactly when `nnz ≤ k/2` — so the
+/// shortcut is never costlier than the dense window it replaces, on the
+/// scalar arm included).
+fn lig_induce_singleton_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_INDUCE_SINGLETON").is_none());
+    *ON
 }
 
-fn ranked_induce_singleton_enabled(log_d: usize, n_queries: usize, k: usize, fill: bool) -> bool {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_LIG_INDUCE_SINGLETON").is_none()
+/// `FLOCK_LIG_INDUCE_K=<n>` — diagnostics-only window-width override for k
+/// sweeps on the box (clamped to `1..=log_d` at use). Never set by the ranked
+/// worker's cleared env; the shipped selector is [`induce_window_k`].
+fn lig_induce_k_override() -> Option<usize> {
+    static V: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LIG_INDUCE_K").ok().and_then(|s| s.parse().ok())
         });
-        ranked_induce_singleton_selected(log_d, n_queries, k, fill, true, !*ON)
+    *V
     }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
-    {
-        let _ = (log_d, n_queries, k, fill);
-        false
+
+/// Per-task window-buffer memory cap: `2^12` F128 = 64 KiB (× 2 with the
+/// multi-singleton scratch = 128 KiB per task, × 16 threads = 2 MiB live).
+const INDUCE_K_MAX_MEM: usize = 12;
+
+/// Window width `k` for the sparse-prefix transpose.
+///
+/// Small domains (`log_d < 12`) and empty query sets take the scatter + full
+/// dense transform (`k = 0`). Without the singleton shortcut every active
+/// window pays the dense `k·2^(k−1)` products, which grow faster with `k`
+/// than the saved dense sweep layers shrink — the dense-window optimum stays
+/// at the incumbent `k = 8`. With the shortcut the window cost is
+/// `nnz·(2^k−1)` (query-count-proportional), so the optimum moves: pick the
+/// `k ∈ 8..=hi` minimizing the op-count model
+///   `Q·(2^k − 1) + (log_d − k)·2^(log_d−1)`
+/// (window expansions, conservatively priced as if every query were alone in
+/// its window, plus the remaining dense sweep). `hi` clamps to
+/// [`INDUCE_K_MAX_MEM`] and to the parallelism bound `k_par` that keeps
+/// `≥ 4` windows per thread for the densify, and never drops below the
+/// incumbent 8. Verified optima: `(20, 218, 16t) → 12`, `(18, 106, 16t) → 11`.
+fn induce_window_k(log_d: usize, n_queries: usize, threads: usize, singleton: bool) -> usize {
+    if log_d < 12 || n_queries == 0 {
+        return 0;
     }
+    if !singleton {
+        return 8usize.min(log_d);
+    }
+    let k_par = log_d.saturating_sub(ceil_log2(threads.max(1)) + 2);
+    let hi = INDUCE_K_MAX_MEM.min(k_par).min(log_d).max(8);
+    let cost = |k: usize| -> u128 {
+        (n_queries as u128) * ((1u128 << k) - 1) + (((log_d - k) as u128) << (log_d - 1))
+    };
+    (8..=hi).min_by_key(|&k| cost(k)).unwrap_or(8)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct InduceSingletonStats {
+    /// Windows expanded through the one-nonzero shortcut.
     singleton_hits: usize,
+    /// Windows with `2 ≤ nnz ≤ k/2`, expanded per-nonzero and XOR-summed.
+    multi_hits: usize,
+    /// Windows past the `nnz ≤ k/2` cost boundary — incumbent dense path.
     collision_fallbacks: usize,
 }
 
@@ -2982,7 +3039,7 @@ fn transpose_forward_ntt_sparse(
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
-    transpose_forward_ntt_sparse_inner(ntt, positions, values, log_d, None).0
+    transpose_forward_ntt_sparse_inner(ntt, positions, values, log_d, None, None).0
 }
 
 fn transpose_forward_ntt_sparse_inner(
@@ -2991,13 +3048,36 @@ fn transpose_forward_ntt_sparse_inner(
     values: &[F128],
     log_d: usize,
     singleton_override: Option<bool>,
+    k_override: Option<usize>,
 ) -> (Vec<F128>, InduceSingletonStats) {
     use rayon::prelude::*;
     use std::collections::HashMap;
     let n = 1usize << log_d;
     assert_eq!(positions.len(), values.len());
-    // No prefix for small domains — just scatter + full dense transpose.
-    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
+    // The singleton/multi-singleton shortcut needs the fill-era runs grouping
+    // (per-window nonzero counts up front); both are hoisted above the window
+    // width choice because the optimum k depends on whether the shortcut is
+    // live — dense windows at k = 12 are a net LOSS, so k must fall back to 8
+    // whenever the shortcut is off (that makes FLOCK_NO_LIG_INDUCE_SINGLETON
+    // the whole-mechanism switch).
+    let fill = open_fill_enabled();
+    let singleton_on = fill && singleton_override.unwrap_or_else(lig_induce_singleton_enabled);
+    // No prefix for small domains or empty query sets — scatter + full dense
+    // transform. `k_override` (tests) / FLOCK_LIG_INDUCE_K (diagnostics)
+    // force the width, clamped to the domain.
+    let k = if log_d < 12 || positions.is_empty() {
+        0
+    } else {
+        match k_override.or_else(lig_induce_k_override) {
+            Some(v) => v.clamp(1, log_d),
+            None => induce_window_k(
+                log_d,
+                positions.len(),
+                rayon::current_num_threads(),
+                singleton_on,
+            ),
+        }
+    };
 
     if k == 0 {
         let mut data = vec![F128::ZERO; n];
@@ -3028,7 +3108,6 @@ fn transpose_forward_ntt_sparse_inner(
     // would accumulate in their original order. The window ORDER in the output
     // vector is irrelevant — `window_slots` scatters by window index (the
     // incumbent's `HashMap` iteration order was already nondeterministic).
-    let fill = open_fill_enabled();
     let mut win_vec: Vec<(usize, Vec<F128>)> = Vec::new();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut order: Vec<u32> = Vec::new();
@@ -3056,12 +3135,20 @@ fn transpose_forward_ntt_sparse_inner(
         win_vec = windows.into_iter().collect();
     }
 
-    let singleton_on = singleton_override
-        .unwrap_or_else(|| ranked_induce_singleton_enabled(log_d, positions.len(), k, fill));
+    // The `nnz ≤ k/2` threshold is the exact per-window cost boundary:
+    // `nnz` expansions cost `nnz·(2^k − 1)` products vs the dense window's
+    // `k·2^(k−1)`, and `nnz ≤ k·2^(k−1)/(2^k − 1)` reduces to the integer
+    // test `nnz ≤ k/2` for every k. The shortcut is therefore never costlier
+    // than the dense window it replaces.
+    let multi_max = k / 2;
     let singleton_stats = if singleton_on && fill {
         InduceSingletonStats {
             singleton_hits: runs.iter().filter(|(s, e)| e - s == 1).count(),
-            collision_fallbacks: runs.iter().filter(|(s, e)| e - s > 1).count(),
+            multi_hits: runs
+                .iter()
+                .filter(|(s, e)| e - s > 1 && e - s <= multi_max)
+                .count(),
+            collision_fallbacks: runs.iter().filter(|(s, e)| e - s > multi_max).count(),
         }
     } else {
         InduceSingletonStats::default()
@@ -3072,26 +3159,66 @@ fn transpose_forward_ntt_sparse_inner(
     let _tw = std::time::Instant::now();
     let processed: Vec<(usize, Vec<F128>)> = if fill {
         runs.par_iter()
-            .map(|&(rs, re)| {
+            .map_init(
+                // Per-thread scratch for the secondary multi-singleton
+                // expansions; grown once, reused across the thread's windows.
+                Vec::<F128>::new,
+                |scratch, &(rs, re)| {
                 let first = order[rs] as usize;
                 let w = positions[first] >> k;
-                if singleton_on && re - rs == 1 {
-                    return transpose_forward_ntt_window_singleton(
+                    let nnz = re - rs;
+                    if singleton_on && nnz <= multi_max {
+                        // Every nonzero expands separately; the sums XOR
+                        // together. F2-linearity makes this byte-identical to
+                        // the dense window: the transpose layers are linear
+                        // over F2, so T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ), and F128
+                        // addition is XOR (order irrelevant, no reductions).
+                        //
+                        // SEPARATE buffers are required — step s of an
+                        // expansion reads its own prefix, so two expansions
+                        // cannot accumulate in one buffer.
+                        let mut buf = take_singleton_buf(k);
+                        expand_singleton_into(
                         ntt,
                         log_d,
                         k,
                         w,
                         positions[first] & wmask,
                         values[first],
+                            &mut buf,
                     );
+                        if nnz > 1 {
+                            if scratch.len() < 1usize << k {
+                                *scratch = take_singleton_buf(k);
                 }
+                            let scratch = &mut scratch[..1usize << k];
+                            for &i in &order[rs + 1..re] {
+                                let i = i as usize;
+                                expand_singleton_into(
+                                    ntt,
+                                    log_d,
+                                    k,
+                                    w,
+                                    positions[i] & wmask,
+                                    values[i],
+                                    scratch,
+                                );
+                                crate::field::f128_slice::xor_into(&mut buf, scratch);
+                            }
+                        }
+                        return (w, buf);
+                    }
+                    // Past the cost boundary: incumbent dense window
+                    // (needs the zeroed allocation — only the nonzero slots
+                    // are scattered).
                 let mut buf = vec![F128::ZERO; 1 << k];
                 for &i in &order[rs..re] {
                     let i = i as usize;
                     buf[positions[i] & wmask] += values[i];
                 }
                 transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-            })
+                },
+            )
             .collect()
     } else {
         win_vec
@@ -10470,6 +10597,9 @@ mod tests {
             // Level-1-shaped: rate 1/4 with many queries — the case the
             // retuned crossover now sends down the Fᵀ-NTT arm.
             (14, 2, 3, 106),
+            // Wide-window coverage through the auto selector: log_block 17
+            // with 150 queries picks k = 9..10 depending on pool width.
+            (16, 1, 3, 150),
             (8, 3, 3, 71),
             (5, 5, 3, 43),
             (0, 2, 1, 3),
@@ -10547,27 +10677,48 @@ mod tests {
         }
     }
 
-    /// Every possible local source position must expand to the incumbent
-    /// dense window, across low/high global window indices and ranked depths.
+    /// The singleton expansion must equal the incumbent dense window across
+    /// every admissible width `k ∈ 8..=12`, low/high global window indices
+    /// and ranked depths. Positions: exhaustive at k ≤ 9; boundary plus a
+    /// prime-strided sample at k ≥ 10 (the expansion treats every bit of `p`
+    /// through the same code path, so the strided sample covers all
+    /// bit-shapes while keeping the dense oracle affordable).
     #[test]
     fn singleton_window_matches_dense_for_every_position() {
         use crate::challenger::Challenger;
-        const K: usize = 8;
+        for k in 8usize..=12 {
         for &log_d in &[12usize, 18, 20] {
+                if k > log_d {
+                    continue;
+                }
             let ntt = AdditiveNttF128::standard(log_d);
-            let last_w = (1usize << (log_d - K)) - 1;
+                let last_w = (1usize << (log_d - k)) - 1;
             for &w in &[0usize, 1, last_w] {
+                    if w > last_w {
+                        continue; // k == log_d leaves a single window
+                    }
                 let mut ch = crate::challenger::RandomChallenger::new(
-                    0x51A6_1E70 ^ ((log_d * 257 + w) as u64),
+                        0x51A6_1E70 ^ ((log_d * 257 + w * 31 + k) as u64),
                 );
-                for p in 0..(1usize << K) {
+                    let wlen = 1usize << k;
+                    let positions: Vec<usize> = if k <= 9 {
+                        (0..wlen).collect()
+                    } else {
+                        let mut v = vec![0usize, 1, wlen / 2, wlen - 2, wlen - 1];
+                        v.extend((0..wlen).step_by(97));
+                        v.sort_unstable();
+                        v.dedup();
+                        v
+                    };
+                    for p in positions {
                     let value = if p == 0 { F128::ONE } else { ch.sample_f128() };
-                    let mut dense = vec![F128::ZERO; 1usize << K];
+                        let mut dense = vec![F128::ZERO; wlen];
                     dense[p] = value;
-                    let want = transpose_forward_ntt_window_dense(&ntt, log_d, K, w, dense);
+                        let want = transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
                     let got =
-                        transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
-                    assert_eq!(got, want, "log_d={log_d} w={w} p={p}");
+                            transpose_forward_ntt_window_singleton(&ntt, log_d, k, w, p, value);
+                        assert_eq!(got, want, "log_d={log_d} k={k} w={w} p={p}");
+                    }
                 }
             }
         }
@@ -10583,64 +10734,310 @@ mod tests {
         dense
     }
 
-    /// A window with multiple query positions must take the incumbent path;
-    /// the forced singleton mode must report no hits and one collision.
+    /// A 3-nonzero window at k = 8 sits inside the `nnz ≤ k/2` boundary, so
+    /// the shortcut takes the MULTI path (per-nonzero expansion + XOR) and
+    /// must match the dense oracle; a 5-nonzero window is past the boundary
+    /// and must take the incumbent dense fallback. Both byte-identical to
+    /// the forced-off arm.
     #[test]
     fn singleton_sparse_collision_falls_back_exactly() {
         use crate::challenger::Challenger;
-        let log_d = 12usize;
+        let log_d = 12usize; // induce_window_k pins k = 8 here (hi clamps to 8)
         let w = 3usize;
+        // nnz = 3 ≤ 8/2: multi path.
         let positions = vec![(w << 8) + 1, (w << 8) + 7, (w << 8) + 201];
         let mut ch = crate::challenger::RandomChallenger::new(0xC011_1510);
         let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_d);
         let want = sparse_dense_oracle(log_d, &positions, &values);
         let (got, stats) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true));
-        let (off, _) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(false));
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true), None);
+        let (off, off_stats) =
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(false), None);
         assert_eq!(got, want);
         assert_eq!(off, want);
         assert_eq!(stats.singleton_hits, 0);
+        assert_eq!(stats.multi_hits, 1);
+        assert_eq!(stats.collision_fallbacks, 0);
+        assert_eq!(off_stats, InduceSingletonStats::default());
+
+        // nnz = 5 > 8/2: past the cost boundary — dense fallback.
+        let positions = vec![
+            (w << 8),
+            (w << 8) + 7,
+            (w << 8) + 63,
+            (w << 8) + 201,
+            (w << 8) + 255,
+        ];
+        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+        let want = sparse_dense_oracle(log_d, &positions, &values);
+        let (got, stats) =
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true), None);
+        assert_eq!(got, want);
+        assert_eq!(stats.singleton_hits, 0);
+        assert_eq!(stats.multi_hits, 0);
         assert_eq!(stats.collision_fallbacks, 1);
     }
 
-    /// Mixed singleton and collision windows exercise both branches in one
-    /// sparse transform and must still match the full dense transpose.
+    /// Singleton, multi-singleton and dense-fallback windows exercised in ONE
+    /// sparse transform must still match the full dense transpose.
     #[test]
     fn singleton_sparse_mixed_windows_match_dense() {
         use crate::challenger::Challenger;
-        let log_d = 12usize;
+        let log_d = 12usize; // k = 8
         let positions = vec![
+            // Window 1: nnz = 2 (multi path).
             (1usize << 8) + 2,
             (1usize << 8) + 91,
+            // Windows 5, 11: singletons.
             (5usize << 8) + 17,
             (11usize << 8) + 233,
+            // Window 7: nnz = 5 > k/2 (dense fallback).
+            (7usize << 8),
+            (7usize << 8) + 30,
+            (7usize << 8) + 77,
+            (7usize << 8) + 128,
+            (7usize << 8) + 255,
         ];
         let mut ch = crate::challenger::RandomChallenger::new(0x51A6_C011);
         let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_d);
         let want = sparse_dense_oracle(log_d, &positions, &values);
         let (got, stats) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true));
+            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true), None);
         assert_eq!(got, want);
         assert_eq!(stats.singleton_hits, 2);
+        assert_eq!(stats.multi_hits, 1);
         assert_eq!(stats.collision_fallbacks, 1);
     }
 
+    /// The cost-model window selector must reproduce the documented optima
+    /// and clamps (this replaces the deleted shape whitelist — the selector
+    /// plus the per-window `nnz ≤ k/2` test IS the dispatch now).
     #[test]
-    fn ranked_induce_singleton_selector_is_exact() {
-        let selected = |log_d, nq, k, fill, platform, disabled| {
-            ranked_induce_singleton_selected(log_d, nq, k, fill, platform, disabled)
+    fn induce_window_k_selects_documented_optima() {
+        // Ranked L0 (log_d = 20, 218 queries, 16 threads): k = 12.
+        assert_eq!(induce_window_k(20, 218, 16, true), 12);
+        // Ranked L1 induce (log_d = 18, 106 queries): k = 11.
+        assert_eq!(induce_window_k(18, 106, 16, true), 11);
+        // Shortcut off: the dense-window optimum stays at the incumbent 8.
+        assert_eq!(induce_window_k(20, 218, 16, false), 8);
+        assert_eq!(induce_window_k(18, 106, 16, false), 8);
+        assert_eq!(induce_window_k(12, 218, 16, false), 8);
+        // Small domains and empty query sets: no sparse prefix.
+        assert_eq!(induce_window_k(11, 218, 16, true), 0);
+        assert_eq!(induce_window_k(11, 218, 16, false), 0);
+        assert_eq!(induce_window_k(20, 0, 16, true), 0);
+        // Parallelism clamp binds between 8 and 12: 256 threads at the L0
+        // shape caps k_par = 20 − (8 + 2) = 10, and the model's optimum
+        // within 8..=10 is 10.
+        assert_eq!(induce_window_k(20, 218, 256, true), 10);
+        // k_par below 8 floors at the incumbent 8 (never worse parallelism
+        // than the dense-era width).
+        assert_eq!(induce_window_k(12, 106, 16, true), 8);
+        assert_eq!(induce_window_k(20, 218, 4096, true), 8);
+        // Memory cap binds: at Q = 1 with a lax parallelism bound (1 thread,
+        // k_par = 18) the model alone would pick k = 18; INDUCE_K_MAX_MEM
+        // holds it at 12.
+        assert_eq!(induce_window_k(20, 1, 1, true), 12);
+        // Very high query counts push k back DOWN (window expansions
+        // dominate the saved dense layers).
+        assert_eq!(induce_window_k(20, 100_000, 16, true), 8);
+    }
+
+    const WINDOW_POISON: F128 = F128 {
+        lo: 0xDEAD_BEEF_FEED_FACE,
+        hi: 0xBAAD_F00D_C0DE_D00D,
         };
-        assert!(selected(20, 218, 8, true, true, false));
-        assert!(selected(18, 106, 8, true, true, false));
-        assert!(!selected(20, 217, 8, true, true, false));
-        assert!(!selected(19, 218, 8, true, true, false));
-        assert!(!selected(20, 218, 7, true, true, false));
-        assert!(!selected(20, 218, 8, false, true, false));
-        assert!(!selected(20, 218, 8, true, false, false));
-        assert!(!selected(20, 218, 8, true, true, true));
+
+    /// T1 — the multi-singleton XOR expansion vs the dense window across the
+    /// `nnz ≤ k/2` threshold, INCLUDING one step past it (forced multi at
+    /// `nnz = k/2 + 1`): the shortcut is F2-linear
+    /// (`T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ)`; F128 addition is XOR), so it must
+    /// match the dense window for ANY nnz — the threshold is a cost boundary,
+    /// not a correctness one. Buffers are poison-prefilled, so the expansion's
+    /// write-completeness rides along.
+    #[test]
+    fn multi_singleton_matches_dense_across_threshold() {
+        use crate::challenger::Challenger;
+        let log_d = 14usize;
+        for &k in &[8usize, 10, 12] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let wlen = 1usize << k;
+            let last_w = (1usize << (log_d - k)) - 1;
+            for &w in &[0usize, last_w] {
+                let mut ch = crate::challenger::RandomChallenger::new(
+                    0x0117_15EE ^ ((k * 8191 + w) as u64),
+                );
+                for nnz in 1..=(k / 2 + 1) {
+                    // Distinct in-window positions, boundaries first.
+                    let mut ps: Vec<usize> = vec![0, wlen - 1];
+                    ps.truncate(nnz);
+                    while ps.len() < nnz {
+                        let p = (ch.sample_f128().lo as usize) % wlen;
+                        if !ps.contains(&p) {
+                            ps.push(p);
+                        }
+                    }
+                    let vs: Vec<F128> = ps.iter().map(|_| ch.sample_f128()).collect();
+                    // Dense window oracle on the scattered input.
+                    let mut dense = vec![F128::ZERO; wlen];
+                    for (&p, &v) in ps.iter().zip(&vs) {
+                        dense[p] += v;
+                    }
+                    let (_, want) =
+                        transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
+                    // Forced multi expansion (bypasses the cost threshold).
+                    let mut buf = vec![WINDOW_POISON; wlen];
+                    expand_singleton_into(&ntt, log_d, k, w, ps[0], vs[0], &mut buf);
+                    let mut scratch = vec![WINDOW_POISON; wlen];
+                    for i in 1..nnz {
+                        expand_singleton_into(&ntt, log_d, k, w, ps[i], vs[i], &mut scratch);
+                        crate::field::f128_slice::xor_into(&mut buf, &scratch);
+                    }
+                    assert_eq!(buf, want, "k={k} w={w} nnz={nnz}");
+                }
+            }
+        }
+    }
+
+    /// T3 — end-to-end sparse-vs-dense at every admissible width (forced
+    /// through the test k override) for ranked-relevant depths, over
+    /// adversarial query sets: random spread, all queries in one window,
+    /// window-boundary positions (`p & wmask ∈ {0, 2^k−1}` for both the
+    /// incumbent and the widest window), Q = 1 and Q = 0.
+    #[test]
+    fn sparse_transpose_matches_dense_at_every_forced_k() {
+        use crate::challenger::Challenger;
+        for &log_d in &[12usize, 16, 18, 20] {
+            let n = 1usize << log_d;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut ch = crate::challenger::RandomChallenger::new(0x7357_0A11 ^ log_d as u64);
+            let mut sets: Vec<(&str, Vec<usize>)> = Vec::new();
+            let mut random: Vec<usize> = Vec::new();
+            while random.len() < 218.min(n / 4) {
+                let p = (ch.sample_f128().lo as usize) % n;
+                if !random.contains(&p) {
+                    random.push(p);
+                }
+            }
+            sets.push(("random", random));
+            // Everything inside the LAST widest (2^12-aligned) window.
+            let span = 1usize << 12.min(log_d);
+            let base = n - span;
+            sets.push(("one-window", (0..40.min(span)).map(|i| base + i).collect()));
+            // Window boundary positions for k = 8 and k = 12 geometries.
+            let mut boundary: Vec<usize> = Vec::new();
+            for j in 0..(n >> 12).min(4) {
+                boundary.push(j << 12);
+                boundary.push(((j + 1) << 12) - 1);
+            }
+            for j in 0..(n >> 8).min(4) {
+                boundary.push(j << 8);
+                boundary.push(((j + 1) << 8) - 1);
+            }
+            boundary.sort_unstable();
+            boundary.dedup();
+            sets.push(("boundary", boundary));
+            sets.push(("q1", vec![n - 1]));
+            sets.push(("q0", Vec::new()));
+            for (name, positions) in sets {
+                let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+                let want = sparse_dense_oracle(log_d, &positions, &values);
+                for k in 8..=12.min(log_d) {
+                    let (got, _) = transpose_forward_ntt_sparse_inner(
+                        &ntt,
+                        &positions,
+                        &values,
+                        log_d,
+                        None,
+                        Some(k),
+                    );
+                    assert_eq!(got, want, "log_d={log_d} k={k} set={name}");
+                }
+            }
+        }
+    }
+
+    /// T4 — forced-ON vs forced-OFF singleton override must be byte-identical
+    /// (and equal to the dense oracle) at every forced width, and the stats
+    /// must partition the active windows exactly.
+    #[test]
+    fn singleton_override_byte_identity_per_k() {
+        use crate::challenger::Challenger;
+        let log_d = 16usize;
+        let n = 1usize << log_d;
+        let mut ch = crate::challenger::RandomChallenger::new(0x0FF0_0FF0);
+        let mut positions: Vec<usize> = Vec::new();
+        while positions.len() < 60 {
+            let p = (ch.sample_f128().lo as usize) % n;
+            if !positions.contains(&p) {
+                positions.push(p);
+            }
+        }
+        // A deliberately heavy window (7 nonzeros in one k=12 span) so every
+        // k in the sweep sees a dense fallback too.
+        let heavy = (n - (1usize << 12)) + 5;
+        for d in 0..7usize {
+            let p = heavy + d * 13;
+            if !positions.contains(&p) {
+                positions.push(p);
+            }
+        }
+        let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
+        let ntt = AdditiveNttF128::standard(log_d);
+        let want = sparse_dense_oracle(log_d, &positions, &values);
+        for k in 8usize..=12 {
+            let (on, s_on) = transpose_forward_ntt_sparse_inner(
+                &ntt, &positions, &values, log_d, Some(true), Some(k),
+            );
+            let (off, s_off) = transpose_forward_ntt_sparse_inner(
+                &ntt, &positions, &values, log_d, Some(false), Some(k),
+            );
+            assert_eq!(on, want, "forced-on mismatch k={k}");
+            assert_eq!(off, want, "forced-off mismatch k={k}");
+            assert_eq!(s_off, InduceSingletonStats::default());
+            let mut wins: Vec<usize> = positions.iter().map(|&p| p >> k).collect();
+            wins.sort_unstable();
+            wins.dedup();
+            assert_eq!(
+                s_on.singleton_hits + s_on.multi_hits + s_on.collision_fallbacks,
+                wins.len(),
+                "stats must partition the active windows (k={k})"
+            );
+        }
+    }
+
+    /// T5 — the singleton expansion's write-before-read contract, directly: a
+    /// poison-prefilled buffer must equal the dense window afterwards and
+    /// carry no surviving poison sentinel (every slot written).
+    #[test]
+    fn expand_singleton_writes_every_slot() {
+        use crate::challenger::Challenger;
+        let log_d = 14usize;
+        for &k in &[8usize, 10, 12] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let wlen = 1usize << k;
+            let w = (1usize << (log_d - k)) - 1;
+            let mut ch = crate::challenger::RandomChallenger::new(0x9015_0000 ^ k as u64);
+            let mut ps = vec![0usize, 1, wlen / 2, wlen - 1];
+            ps.extend((0..wlen).step_by(211));
+            ps.sort_unstable();
+            ps.dedup();
+            for p in ps {
+                let value = ch.sample_f128();
+                let mut dense = vec![F128::ZERO; wlen];
+                dense[p] = value;
+                let (_, want) = transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
+                let mut buf = vec![WINDOW_POISON; wlen];
+                expand_singleton_into(&ntt, log_d, k, w, p, value, &mut buf);
+                assert_eq!(buf, want, "k={k} p={p}");
+                assert!(
+                    !buf.contains(&WINDOW_POISON),
+                    "poison survived the expansion (k={k} p={p})"
+                );
+            }
+        }
     }
 
     /// The fused parallel densify must be BYTE-identical to the incumbent
@@ -10652,7 +11049,17 @@ mod tests {
     #[test]
     fn densify_windows_fused_matches_two_pass() {
         use crate::challenger::Challenger;
-        for &(log_d, k) in &[(12usize, 8usize), (16, 8), (20, 8), (13, 8)] {
+        for &(log_d, k) in &[
+            (12usize, 8usize),
+            (16, 8),
+            (20, 8),
+            (13, 8),
+            // Retuned widths: ranked L0 (k=12), L1 (k=11), and mid clamps.
+            (20, 12),
+            (18, 11),
+            (16, 10),
+            (13, 9),
+        ] {
             let n = 1usize << log_d;
             let nwin = n >> k;
             for &active in &[0usize, 1, 214.min(nwin), nwin] {
