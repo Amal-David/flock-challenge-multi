@@ -867,6 +867,10 @@ pub const ROUND1_AB_WINDOWS_PER_BLOCK: usize = 2 * (1 << N_MEDIUM);
 pub struct Round1AbWindowPlan {
     bstatic: Option<&'static kernels::BstaticPartials>,
     kernel: kernels::ShiftReducePlan,
+    /// 512-byte GFNI matrix block for the fused octa kernel
+    /// ([`round1_ab_inner_octa`]), or `None` when that mechanism is off or
+    /// unavailable.
+    gfni: Option<&'static [[u64; 8]; 8]>,
     nt: u8,
 }
 
@@ -892,7 +896,97 @@ pub fn prepare_round1_ab_window_plan(
     Round1AbWindowPlan {
         bstatic: kernels::prepare_bstatic(inv_table),
         kernel: kernels::prepare_shift_reduce(inv_table),
+        gfni: kernels::gfni_extend::prepare_extend_mats(inv_table),
         nt,
+    }
+}
+
+impl Round1AbWindowPlan {
+    /// The fused GFNI matrix block for window `blk`, or `None` when that
+    /// window should stay on [`round1_ab_inner_window`].
+    ///
+    /// Windows where the static-B kernel is live (0, 1, 30, 31) are left to
+    /// it by default: for those the b operand is structurally known, so
+    /// static-B skips roughly half the applies — window 31's eight K-rows are
+    /// all zero and it writes a precomputed image. It still pays table
+    /// traffic where the fused kernel reads 64 bytes of matrices, so which
+    /// wins on those four is genuinely open; `FLOCK_GFNI_OCTA_ALL=1` hands
+    /// them to the fused kernel for the same-binary A/B. The default preserves
+    /// the mechanism already in the scored lineage.
+    ///
+    /// The reservation is conditional on static-B actually being resolved: if
+    /// `prepare_bstatic` returned `None` the per-window path would fall
+    /// through to the generic table kernel, which the fused kernel beats
+    /// everywhere, so there is nothing to reserve.
+    #[inline]
+    fn octa_window(&self, blk: usize) -> Option<&'static [[u64; 8]; 8]> {
+        if self.bstatic.is_some()
+            && kernels::bstatic_live_window(blk)
+            && !kernels::gfni_extend::gfni_octa_all()
+        {
+            return None;
+        }
+        self.gfni
+    }
+}
+
+/// Transform the EIGHT medium windows a drain step stages, in one call.
+///
+/// `a_stage`/`b_stage` hold `8 × 64` contiguous packed bytes — window `j` at
+/// bytes `64j..64j+64` — and window `j`'s 64 transformed bytes land at
+/// `out_base + j * out_stride`. Bit `j` of `live` selects it.
+///
+/// Returns `false` and writes nothing when this window is not the fused
+/// kernel's — the mechanism is off, the target lacks AVX-512/GFNI, or `blk` is
+/// one of the four windows reserved for the static-B kernel (see
+/// `Round1AbWindowPlan::octa_window`). The caller then runs
+/// [`round1_ab_inner_window`] per window, which is always correct.
+///
+/// Byte-identical to eight [`round1_ab_inner_window`] calls on the same bytes.
+/// The store policy — including the non-temporal contract, under which the
+/// caller MUST issue [`abinner_publish_fence`] on the producing thread before
+/// the task ends — is the one prepared in `plan`, unchanged.
+///
+/// # Safety
+/// `a_stage` and `b_stage` must each point to `8 * 64` readable bytes, and
+/// `out_base + j * out_stride` must be 64 writable bytes for every `j` whose
+/// `live` bit is set.
+#[inline]
+pub unsafe fn round1_ab_inner_octa(
+    a_stage: *const u8,
+    b_stage: *const u8,
+    out_base: *mut u8,
+    out_stride: usize,
+    blk: usize,
+    live: u32,
+    plan: Round1AbWindowPlan,
+) -> bool {
+    match plan.octa_window(blk) {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        Some(mats) => {
+            // SAFETY: forwarded contract.
+            unsafe {
+                kernels::gfni_extend::round1_ab_inner_octa_gfni(
+                    a_stage, b_stage, out_base, out_stride, live, mats, plan.nt,
+                );
+            }
+            true
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        Some(_) => false,
+        None => false,
     }
 }
 

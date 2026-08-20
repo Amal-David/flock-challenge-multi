@@ -24,7 +24,7 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window,
+    Round1AbWindowPlan, round1_ab_inner_octa, round1_ab_inner_window,
 };
 
 const REC_C0: usize = 0;
@@ -231,6 +231,25 @@ impl StreamProj<'_> {
     unsafe fn project(&self, blk: usize) {
         unsafe {
             let (sa, sb) = self.sides();
+            // The staging pair already holds the eight blocks' windows
+            // contiguously — 8 × 64 bytes a side — which is exactly the fused
+            // GFNI kernel's batch, with rows in exactly the order it expects.
+            // One call replaces the eight-window loop; `plan` carries the same
+            // store policy, so the non-temporal contract is unchanged (the
+            // per-task `abinner_publish_fence` below still applies). Declines
+            // for the four static-B windows and whenever the mechanism is off,
+            // and then the incumbent loop below runs unchanged.
+            if round1_ab_inner_octa(
+                sa.cast::<u8>(),
+                sb.cast::<u8>(),
+                self.out.add(blk * 64),
+                BYTES_PER_BLOCK,
+                blk,
+                self.live,
+                self.plan,
+            ) {
+                return;
+            }
             for j in 0..8usize {
                 if self.live & (1 << j) == 0 {
                     continue;

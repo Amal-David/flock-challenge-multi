@@ -2,6 +2,10 @@ use super::{InvNttTableByteSingleGf8, F8};
 
 mod portable;
 
+/// Prototype: GFNI bit-matrix inverse-NTT/LDE extension, 64 rows per batch.
+/// Not wired into the production leaf — see the module docs.
+pub(crate) mod gfni_extend;
+
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(super) use portable::bit_transpose_64bytes_scalar;
 #[cfg(all(
@@ -252,6 +256,20 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// The medium windows for which the static-B kernel is live: every other
+/// `blk` makes its outlined dispatcher return false without writing.
+///
+/// Single-sourced because two callers depend on the same four indices — the
+/// dispatcher gate in [`shift_reduce_inner_ab_at`], and
+/// `Round1AbWindowPlan::octa_window`, which must leave exactly these windows
+/// to static-B. Static-B is not a faster route to the same work: for these
+/// the b operand is structurally known, so it does strictly LESS work (window
+/// 31's eight K-rows are all zero), which no general kernel can match.
+#[inline]
+pub(super) fn bstatic_live_window(blk: usize) -> bool {
+    blk <= 1 || blk == 30 || blk == 31
+}
+
 /// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
 /// byte offset plus the global BLAKE3 medium-window index
 /// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
@@ -287,7 +305,7 @@ pub(super) fn shift_reduce_inner_ab_at(
                 // it 28/32 of the time. Gate here so those windows stay on
                 // the prepared generic body with no extra call. Unexpected
                 // `blk` keeps the incumbent generic path.
-                if (blk <= 1 || blk == 30 || blk == 31)
+                if bstatic_live_window(blk)
                     && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
                         a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
                     )
