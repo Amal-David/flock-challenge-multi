@@ -315,6 +315,12 @@ fn finalize_commit(
     // upper-level build runs — those levels are simply rewritten, so a partial
     // local fold is never wrong, only wasted.
     let subtree_parents = subtree_parents_enabled();
+    let regroup_subtree_parents = subtree_parent_regroup_enabled(
+        n_leaves,
+        num_ntts,
+        leaf_size,
+        kind,
+    );
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
@@ -346,10 +352,20 @@ fn finalize_commit(
             if !subtree_parents {
                 return;
             }
-            let len = range.len();
+            // The deep block-fused schedule retires sixteen 128-leaf blocks
+            // per 2048-leaf subgroup. Keep hashing each block's leaves at
+            // retirement for producer/consumer overlap, but fold parents
+            // only when the subgroup's final FIFO block arrives. At that
+            // point all 2048 leaf CVs are ready, so one depth-11 fold fills
+            // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
+            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
+            else {
+                return;
+            };
+            let len = parent_range.len();
             let depth = if len.is_power_of_two()
                 && len >= 2
-                && range.start % len == 0
+                && parent_range.start % len == 0
                 && n_leaves % len == 0
             {
                 len.trailing_zeros() as usize
@@ -375,12 +391,12 @@ fn finalize_commit(
             // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
             // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
             // nodes [start >> j, (start + len) >> j) of it.
-            let mut lvl_read_off = range.start; // level 0 = leaves
+            let mut lvl_read_off = parent_range.start; // level 0 = leaves
             let mut lvl_read_len = len;
             for j in 1..=depth {
                 let nodes_j = n_leaves >> j;
                 let base_j = 2 * n_leaves - 2 * nodes_j;
-                let write_off = base_j + (range.start >> j);
+                let write_off = base_j + (parent_range.start >> j);
                 let write_len = len >> j;
                 // SAFETY: the read range is this worker's own just-written
                 // nodes of level j−1 (leaves for j = 1); the write range is
@@ -642,6 +658,62 @@ pub(crate) fn subtree_parents_enabled() -> bool {
         std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none()
     });
     *ON
+}
+
+const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
+const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
+
+/// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
+/// every 2048-leaf subgroup. Regroup only that exact production shape; every
+/// recursive, portable, alternate-hash, and diagnostic geometry keeps the
+/// established callback-local fold.
+#[inline]
+fn subtree_parent_regroup_selected(
+    n_leaves: usize,
+    num_ntts: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    disabled: bool,
+) -> bool {
+    !disabled
+        && n_leaves == (1 << 20)
+        && num_ntts == 64
+        && leaf_size == 1024
+        && kind == HashKind::Blake3
+}
+
+fn subtree_parent_regroup_enabled(
+    n_leaves: usize,
+    num_ntts: usize,
+    leaf_size: usize,
+    kind: HashKind,
+) -> bool {
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some()
+    });
+    subtree_parent_regroup_selected(n_leaves, num_ntts, leaf_size, kind, *DISABLED)
+}
+
+/// Select the leaf range whose local parents may now be folded.
+///
+/// `None` means this is an intermediate block: its leaf CVs are complete, but
+/// parent folding waits for the subgroup's final FIFO block. Any unexpected
+/// callback geometry retains the incumbent per-range behavior.
+#[inline]
+fn local_parent_fold_range(
+    range: &core::ops::Range<usize>,
+    regroup: bool,
+) -> Option<core::ops::Range<usize>> {
+    if !regroup
+        || range.len() != RANKED_PARENT_BLOCK_LEAVES
+        || !range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
+    {
+        return Some(range.clone());
+    }
+    if !range.end.is_multiple_of(RANKED_PARENT_SUBGROUP_LEAVES) {
+        return None;
+    }
+    Some(range.end - RANKED_PARENT_SUBGROUP_LEAVES..range.end)
 }
 
 /// `FLOCK_NO_LIG_FUSED_COMMIT=1` restores the Ligerito recursive commits'
@@ -1146,6 +1218,149 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
+    /// The exact ranked selector is narrow, and regrouping sixteen retired
+    /// blocks into one 2048-leaf parent fold reproduces every flat-tree node.
+    #[test]
+    fn subtree_parent_regroup_matches_full_tree_node_for_node() {
+        use super::*;
+
+        assert!(subtree_parent_regroup_selected(
+            1 << 20,
+            64,
+            1024,
+            HashKind::Blake3,
+            false,
+        ));
+        for selected in [
+            subtree_parent_regroup_selected(
+                (1 << 20) - 1,
+                64,
+                1024,
+                HashKind::Blake3,
+                false,
+            ),
+            subtree_parent_regroup_selected(
+                1 << 20,
+                32,
+                1024,
+                HashKind::Blake3,
+                false,
+            ),
+            subtree_parent_regroup_selected(
+                1 << 20,
+                64,
+                512,
+                HashKind::Blake3,
+                false,
+            ),
+            subtree_parent_regroup_selected(
+                1 << 20,
+                64,
+                1024,
+                HashKind::Sha256,
+                false,
+            ),
+            subtree_parent_regroup_selected(
+                1 << 20,
+                64,
+                1024,
+                HashKind::Blake3,
+                true,
+            ),
+        ] {
+            assert!(!selected);
+        }
+
+        let first = 0..RANKED_PARENT_BLOCK_LEAVES;
+        assert_eq!(local_parent_fold_range(&first, false), Some(first.clone()));
+        assert_eq!(local_parent_fold_range(&first, true), None);
+        let final_first = RANKED_PARENT_SUBGROUP_LEAVES - RANKED_PARENT_BLOCK_LEAVES
+            ..RANKED_PARENT_SUBGROUP_LEAVES;
+        assert_eq!(
+            local_parent_fold_range(&final_first, true),
+            Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
+        );
+        let unexpected = 0..256;
+        assert_eq!(
+            local_parent_fold_range(&unexpected, true),
+            Some(unexpected),
+        );
+
+        const N_LEAVES: usize = 2 * RANKED_PARENT_SUBGROUP_LEAVES;
+        const LEAF_SIZE: usize = 1024;
+        let mut bytes = vec![0u8; N_LEAVES * LEAF_SIZE];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i as u64)
+                .wrapping_mul(0x9E37_79B9)
+                .rotate_left((i & 31) as u32) as u8;
+        }
+        let oracle = merkle::merkle_tree(&bytes, N_LEAVES, HashKind::Blake3);
+        let mut tree = vec![[0u8; 32]; 2 * N_LEAVES - 1];
+        let mut parent_ranges = Vec::new();
+
+        for start in (0..N_LEAVES).step_by(RANKED_PARENT_BLOCK_LEAVES) {
+            let range = start..start + RANKED_PARENT_BLOCK_LEAVES;
+            merkle::hash_leaves_serial(
+                &bytes[range.start * LEAF_SIZE..range.end * LEAF_SIZE],
+                LEAF_SIZE,
+                &mut tree[range.clone()],
+                HashKind::Blake3,
+            );
+            let Some(parent_range) = local_parent_fold_range(&range, true) else {
+                continue;
+            };
+            parent_ranges.push(parent_range.clone());
+            let depth = parent_range.len().trailing_zeros() as usize;
+            let mut lvl_read_off = parent_range.start;
+            let mut lvl_read_len = parent_range.len();
+            for j in 1..=depth {
+                let nodes_j = N_LEAVES >> j;
+                let base_j = 2 * N_LEAVES - 2 * nodes_j;
+                let write_off = base_j + (parent_range.start >> j);
+                let write_len = parent_range.len() >> j;
+                let (before_write, write_and_after) = tree.split_at_mut(write_off);
+                merkle::hash_pairs_level_serial(
+                    &before_write[lvl_read_off..lvl_read_off + lvl_read_len],
+                    &mut write_and_after[..write_len],
+                    HashKind::Blake3,
+                );
+                lvl_read_off = write_off;
+                lvl_read_len = write_len;
+            }
+        }
+        assert_eq!(
+            parent_ranges,
+            [
+                0..RANKED_PARENT_SUBGROUP_LEAVES,
+                RANKED_PARENT_SUBGROUP_LEAVES..N_LEAVES,
+            ],
+        );
+        let platform_calls = |mut nodes: usize| {
+            let mut calls = 0;
+            while nodes > 1 {
+                nodes >>= 1;
+                calls += nodes.div_ceil(16);
+            }
+            calls
+        };
+        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES)
+            + platform_calls(8_192);
+        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES)
+            + platform_calls(512);
+        assert_eq!(
+            (old_calls, new_calls, old_calls - new_calls),
+            (90_627, 67_107, 23_520),
+        );
+
+        build_upper_levels(
+            &mut tree,
+            N_LEAVES,
+            N_LEAVES >> RANKED_PARENT_SUBGROUP_LEAVES.trailing_zeros(),
+            HashKind::Blake3,
+        );
+        assert_eq!(tree, oracle);
+    }
+
     /// The fused recursive-commit route (encode → per-sub-group serial leaves
     /// + local subtree parents → upper levels) must produce the identical
     /// codeword AND identical flat Merkle tree (every node) as the incumbent
