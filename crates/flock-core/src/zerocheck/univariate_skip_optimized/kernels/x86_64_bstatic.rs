@@ -345,6 +345,27 @@ unsafe fn kernel<const BLK: usize>(
     }
 }
 
+/// `FLOCK_NO_BSTATIC_ALL=1` restores the incumbent four-block dispatch
+/// (blocks 0, 1, 30 and 31) in the same binary, for an exact A/B.
+///
+/// [`BSTATIC_PLAN`] censuses all thirty-two ranked `(w, b_med)` blocks, but
+/// the dispatch only ever instantiated the four whose plans are wholly
+/// non-generic. The other twenty-eight carry 88 `ROW_STATIC` rows between
+/// them — planned, verified and then thrown away, because a plan with any
+/// generic row returned `false` and took the full eight-row apply. Each such
+/// row replaces an eight-load table apply of the b operand with one aligned
+/// image load plus at most six table rows.
+///
+/// The plan is a hint, never an assumption: every planned row still checks
+/// `(b_word & mask) == expected` and falls back to the generic row on a miss,
+/// so the output is bit-identical to the incumbent for ANY witness.
+fn bstatic_all_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_BSTATIC_ALL").is_none());
+    *ON
+}
+
+
 /// Dispatch one `(w, b_med)` window through its specialised plan. Returns
 /// `false` when the position has no live plan or its b words miss the plan;
 /// the caller must then run the incumbent kernel (nothing has been written).
@@ -380,16 +401,55 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic(
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
-        if blk == 31 {
-            kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
-        } else if blk == 30 {
-            kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
-        } else if blk <= 1 {
+        if !bstatic_all_enabled() {
+            // Incumbent dispatch: only the four blocks whose plans are
+            // wholly non-generic. Every other block paid the full eight-row
+            // apply even though its plan was censused.
+            return if blk == 31 {
+                kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            } else if blk == 30 {
+                kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            } else if blk <= 1 {
+                kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            } else {
+                false
+            };
+        }
+        match blk {
             // Blocks 0 and 1 carry the identical plan (all-ones b on every
             // row), so they share one body and one set of partial images.
-            kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
-        } else {
-            false
+            0 | 1 => kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            2 => kernel::<2>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            3 => kernel::<3>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            4 => kernel::<4>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            5 => kernel::<5>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            6 => kernel::<6>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            7 => kernel::<7>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            8 => kernel::<8>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            9 => kernel::<9>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            10 => kernel::<10>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            11 => kernel::<11>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            12 => kernel::<12>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            13 => kernel::<13>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            14 => kernel::<14>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            15 => kernel::<15>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            16 => kernel::<16>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            17 => kernel::<17>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            18 => kernel::<18>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            19 => kernel::<19>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            20 => kernel::<20>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            21 => kernel::<21>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            22 => kernel::<22>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            23 => kernel::<23>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            24 => kernel::<24>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            25 => kernel::<25>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            26 => kernel::<26>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            27 => kernel::<27>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            28 => kernel::<28>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            29 => kernel::<29>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            30 => kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            31 => kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt),
+            _ => false,
         }
     }
 }
