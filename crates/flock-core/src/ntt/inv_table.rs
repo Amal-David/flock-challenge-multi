@@ -475,6 +475,18 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
+    /// The base and σ₈ image pointers together. A caller that runs many
+    /// applies against the same table resolves this once instead of
+    /// re-deriving both pointers from `self` for every apply.
+    ///
+    /// # Safety
+    /// As for [`Self::half_swapped_data_ptr`]: the σ₈ image must be present.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[inline]
+    pub fn image_ptrs(&self) -> (*const u8, *const u8) {
+        (self.data_ptr(), self.half_swapped_data_ptr())
+    }
+
     /// Wide-read twin of
     /// [`Self::apply_x86_avx512_register_2img_off_unchecked`]. Identical value
     /// and identical table addresses; the eight pre-scaled `u16` offsets are
@@ -490,16 +502,35 @@ impl InvNttTableByteSingleGf8 {
         &self,
         off: *const u16,
     ) -> core::arch::x86_64::__m512i {
-        use core::arch::x86_64::*;
         debug_assert_eq!(self.ell, 64);
         debug_assert_eq!(self.n_chunks, 8);
         debug_assert!(self.has_second_image());
-        let base = self.data_ptr();
-        let base8 = self.half_swapped_data_ptr();
-        // SAFETY: eight readable pre-scaled offsets per the contract, i.e. two
-        // readable 64-bit words. Each extracted field is one of those offsets,
-        // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
-        // 64 readable bytes per row.
+        let (base, base8) = self.image_ptrs();
+        // SAFETY: forwarded from this function's contract.
+        unsafe { apply_x86_avx512_register_2img_offw_at(base, base8, off) }
+    }
+}
+
+/// [`InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_offw_unchecked`]
+/// against table images the caller already resolved. Identical value and
+/// identical table addresses.
+///
+/// # Safety
+/// As for that method, with `base`/`base8` the table's base and σ₈ image.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
+    base: *const u8,
+    base8: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: eight readable pre-scaled offsets per the contract, i.e. two
+    // readable 64-bit words. Each extracted field is one of those offsets,
+    // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
+    // 64 readable bytes per row.
+    {
         unsafe {
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
@@ -527,7 +558,9 @@ impl InvNttTableByteSingleGf8 {
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
         }
     }
+}
 
+impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
     pub fn apply_triple(

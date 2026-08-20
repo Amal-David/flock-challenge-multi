@@ -24,7 +24,7 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window,
+    Round1AbWindowPlan, round1_ab_inner_window_with_images, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -231,8 +231,15 @@ impl StreamProj<'_> {
     unsafe fn project(&self, blk: usize) {
         unsafe {
             let (sa, sb) = self.sides();
+            // Both of these are the same for all eight blocks of this window:
+            // the window's static-B eligibility, and the table images the
+            // kernel addresses. Resolve them here rather than inside every
+            // block's transform.
+            let plan = self.plan.for_window(blk);
+            let imgs = round1_ab_table_images(self.inv_table, plan);
+            let live = self.live;
             for j in 0..8usize {
-                if self.live & (1 << j) == 0 {
+                if live & (1 << j) == 0 {
                     continue;
                 }
                 let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
@@ -241,7 +248,15 @@ impl StreamProj<'_> {
                     .out
                     .add(j * BYTES_PER_BLOCK + blk * 64)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan);
+                round1_ab_inner_window_with_images(
+                    a_win,
+                    b_win,
+                    out,
+                    blk,
+                    self.inv_table,
+                    plan,
+                    imgs,
+                );
             }
         }
     }
@@ -601,14 +616,13 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            let z_g1 = if self.elide[0] {
-                ELIDE_ZERO_CHUNK
-            } else {
-                DUMP_CHUNKS
-            };
-            let (a_g1, b_g0, b_g1) = self.ab_ranges();
-
             if let Some(proj) = &self.proj {
+                let z_g1 = if self.elide[0] {
+                    ELIDE_ZERO_CHUNK
+                } else {
+                    DUMP_CHUNKS
+                };
+                let (a_g1, b_g0, b_g1) = self.ab_ranges();
                 let (sa, sb) = proj.sides();
                 for off in (0..words).step_by(STEP_WORDS) {
                     let abs_word = base_word + off;
@@ -640,6 +654,22 @@ impl Drain8<'_> {
                 }
                 return;
             }
+            self.drain_range_buffered(base_word, ring_word, words);
+        }
+    }
+
+    /// The two non-streaming drains — the `win_ab` window fusion and the plain
+    /// temporal publish. Out of line so the streaming drain above keeps a
+    /// register allocation of its own.
+    #[inline(never)]
+    unsafe fn drain_range_buffered(&mut self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
 
             Self::publish_range(
                 self.zs, self.z, None, base_word, ring_word, words, 0, z_g1, self.z_nt,

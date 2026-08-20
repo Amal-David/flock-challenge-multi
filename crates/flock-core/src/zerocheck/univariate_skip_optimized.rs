@@ -870,6 +870,46 @@ pub struct Round1AbWindowPlan {
     nt: u8,
 }
 
+impl Round1AbWindowPlan {
+    /// This plan specialised to one medium-window index: the static-B partials
+    /// are dropped for every window whose plan is not live, so a producer that
+    /// transforms several blocks at the same window index resolves the
+    /// window's static-B eligibility once instead of once per block.
+    #[inline]
+    pub fn for_window(self, blk: usize) -> Self {
+        Self {
+            bstatic: if kernels::bstatic_window_live(blk) {
+                self.bstatic
+            } else {
+                None
+            },
+            ..self
+        }
+    }
+}
+
+/// The inverse-NTT table images the round-1 AB kernel addresses under `plan`,
+/// resolved once for a run of windows over one table rather than re-derived
+/// from the table struct inside every window's applies.
+#[derive(Clone, Copy)]
+pub struct Round1AbTableImages(*const u8, *const u8);
+
+/// Resolve [`Round1AbTableImages`] for `inv_table` under `plan`.
+pub fn round1_ab_table_images(
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+) -> Round1AbTableImages {
+    // The σ₈ image only exists on the architectures that build it, and only a
+    // kernel that reads it asks for the pointers.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if plan.kernel.uses_images() {
+        let (base, base8) = inv_table.image_ptrs();
+        return Round1AbTableImages(base, base8);
+    }
+    let _ = (inv_table, plan);
+    Round1AbTableImages(core::ptr::null(), core::ptr::null())
+}
+
 /// Resolve the round-1 window plan for `inv_table` and the output allocation.
 /// Every window destination is 64 bytes and every caller offset is a multiple
 /// of 64, so the output's streaming-store mode is invariant for the complete
@@ -917,6 +957,30 @@ pub fn round1_ab_inner_window(
     inv_table: &InvNttTableByteSingleGf8,
     plan: Round1AbWindowPlan,
 ) {
+    let imgs = round1_ab_table_images(inv_table, plan);
+    // SAFETY: `imgs` was just resolved from this `inv_table` and `plan`.
+    unsafe {
+        round1_ab_inner_window_with_images(a_window, b_window, out, blk, inv_table, plan, imgs);
+    }
+}
+
+/// [`round1_ab_inner_window`] with the table images already resolved. Same
+/// bytes; the images are process-invariant, so a producer that transforms many
+/// windows over one table resolves them once and passes them in.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window`], and `imgs` must be
+/// [`round1_ab_table_images`] of this `inv_table` and `plan`.
+#[inline]
+pub unsafe fn round1_ab_inner_window_with_images(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    blk: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
     kernels::shift_reduce_inner_ab_at(
         a_window,
         b_window,
@@ -927,6 +991,7 @@ pub fn round1_ab_inner_window(
         plan.bstatic,
         plan.kernel,
         plan.nt,
+        (imgs.0, imgs.1),
     );
 }
 

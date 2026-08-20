@@ -66,6 +66,15 @@ pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&
     None
 }
 
+/// The BLAKE3 medium-window indices whose static-B plan can be live. The
+/// outlined static-B dispatcher returns `false` without writing for every
+/// other window, so a caller that transforms many blocks at one window index
+/// resolves this once instead of entering the dispatcher per block.
+#[inline]
+pub(super) fn bstatic_window_live(blk: usize) -> bool {
+    blk <= 1 || blk == 30 || blk == 31
+}
+
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
 /// the 8192-bit window being transformed plus the resolved partial images.
 /// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
@@ -80,6 +89,15 @@ pub(super) struct ShiftReducePlan {
     img2: bool,
     pidx: bool,
     offw: bool,
+}
+
+impl ShiftReducePlan {
+    /// True when the kernel body addresses the table through the σ₈ second
+    /// image, i.e. when the resolved image pointers are the ones it reads.
+    #[inline]
+    pub(super) fn uses_images(self) -> bool {
+        self.img2
+    }
 }
 
 #[inline]
@@ -269,6 +287,7 @@ pub(super) fn shift_reduce_inner_ab_at(
     bstatic: Option<&'static BstaticPartials>,
     prepared: ShiftReducePlan,
     nt: u8,
+    imgs: (*const u8, *const u8),
 ) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -287,7 +306,7 @@ pub(super) fn shift_reduce_inner_ab_at(
                 // it 28/32 of the time. Gate here so those windows stay on
                 // the prepared generic body with no extra call. Unexpected
                 // `blk` keeps the incumbent generic path.
-                if (blk <= 1 || blk == 30 || blk == 31)
+                if bstatic_window_live(blk)
                     && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
                         a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
                     )
@@ -306,6 +325,7 @@ pub(super) fn shift_reduce_inner_ab_at(
                 prepared.img2,
                 prepared.pidx,
                 prepared.offw,
+                imgs,
             );
         }
     }
@@ -317,7 +337,7 @@ pub(super) fn shift_reduce_inner_ab_at(
         target_feature = "avx512bw"
     )))]
     {
-        let _ = (blk, bstatic, prepared);
+        let _ = (blk, bstatic, prepared, imgs);
         let mut a_col = [F8::ZERO; 64];
         let mut b_col = [F8::ZERO; 64];
         shift_reduce_inner_ab(
