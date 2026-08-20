@@ -24,7 +24,8 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window_with_images, round1_ab_table_images,
+    Round1AbWindowPlan, round1_ab_inner_window_ranked, round1_ab_inner_window_with_images,
+    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -238,6 +239,57 @@ impl StreamProj<'_> {
             let plan = self.plan.for_window(blk);
             let imgs = round1_ab_table_images(self.inv_table, plan);
             let live = self.live;
+            // The kernel's remaining runtime switches — static-B dispatcher,
+            // apply mode, output store class — are the same for all eight
+            // blocks of one window, so test them ONCE for the octa. Twenty-eight
+            // window indices in thirty-two take the ranked arm, whose body
+            // carries none of the tests. `FLOCK_NO_URM_WINDOW_RUN=1` sends
+            // every window down the incumbent per-block dispatch below (exact
+            // same-binary A/B).
+            if !plan.ranked_run() {
+                self.project_general(blk, plan, imgs);
+                return;
+            }
+            // Walk the SET bits rather than testing all eight: same ascending
+            // block order, one `tzcnt`/`blsr` pair instead of a mask test and
+            // branch per candidate — and, because the trip count is no longer
+            // a literal eight, LLVM keeps the loop rolled and spends its
+            // inlining budget on one copy of the kernel body instead of
+            // declining eight.
+            let mut m = live;
+            while m != 0 {
+                let j = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + blk * 64)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_ranked(a_win, b_win, out, self.inv_table, imgs);
+            }
+        }
+    }
+
+    /// [`Self::project`]'s incumbent arm: the general per-block entry, which
+    /// re-tests the plan's static-B eligibility, apply mode and store class
+    /// inside every block's call. Reached by the four static-B window indices,
+    /// and by everything under `FLOCK_NO_URM_WINDOW_RUN=1`. Out of line so the
+    /// ranked arm — twenty-eight windows in thirty-two — gets the inliner's
+    /// budget for the kernel body instead of this one.
+    ///
+    /// # Safety
+    /// As for [`Self::project`]; `plan`/`imgs` are that window's.
+    #[inline(never)]
+    unsafe fn project_general(
+        &self,
+        blk: usize,
+        plan: Round1AbWindowPlan,
+        imgs: flock_core::zerocheck::univariate_skip_optimized::Round1AbTableImages,
+    ) {
+        unsafe {
+            let (sa, sb) = self.sides();
+            let live = self.live;
             for j in 0..8usize {
                 if live & (1 << j) == 0 {
                     continue;
@@ -276,7 +328,9 @@ struct Drain8<'t> {
     proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
-    wide_nt: bool,
+    /// Per-destination NT width: 0 = XMM, 1 = YMM, 2 = ZMM pairs.
+    /// Resolved once per proof from the process selector and base alignment.
+    wide_nt: [u8; 3],
 }
 
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
@@ -412,10 +466,27 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
 }
 
 /// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
-fn wide_nt_enabled() -> bool {
+pub(crate) fn wide_nt_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
     *ON
+}
+
+/// Resolve one destination's non-temporal store width once per proof. Every
+/// production row stride, rayon chunk, octa offset, and drain step preserves
+/// the full buffer base's 64/32-byte alignment, so no inner layer needs to
+/// retest it.
+#[inline(always)]
+pub(crate) fn nt_store_width(dst: *mut u32, enabled: bool) -> u8 {
+    if !enabled {
+        0
+    } else if dst as usize % 64 == 0 {
+        2
+    } else if dst as usize % 32 == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
@@ -430,7 +501,7 @@ fn wide_nt_enabled() -> bool {
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
 /// task; same-thread reads are self-consistent regardless).
 #[inline(always)]
-unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
+unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: u8) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
         let mut g = g0;
@@ -471,16 +542,16 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
     }
 }
 
-/// Publish one 32-byte transposed run non-temporally.
+/// Publish one 32-byte transposed run non-temporally. `wide_nt != 0` selects
+/// one YMM store; zero keeps the historical two-XMM form.
 ///
 /// # Safety
-/// Caller guarantees 16-byte alignment of `p`; the YMM arm additionally
-/// requires 32-byte alignment (true for every in-loop pointer when `dst` is
-/// 32-aligned and `w` is a multiple of 8).
+/// Caller guarantees 16-byte alignment of `p`; when `wide_nt != 0`, `p` must
+/// be 32-byte aligned.
 #[inline(always)]
-unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
+unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: u8) {
     unsafe {
-        if wide_nt && p as usize % 32 == 0 {
+        if wide_nt != 0 {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -491,15 +562,16 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
 
 /// Publish a chunk PAIR — two consecutive 32-byte runs, i.e. one 64-byte
 /// cache line when `p` is line-aligned — non-temporally, closing the line's
-/// write-combining buffer in one shot where the ISA allows it.
+/// write-combining buffer in one shot where the ISA allows it. Width 2 uses
+/// one ZMM store; width 1 uses two YMM stores; zero uses four XMM stores.
 ///
 /// # Safety
-/// Same alignment contract as [`stream_v8`], for both `p` and `p.add(8)`.
+/// As for [`stream_v8`]; when `wide_nt == 2`, `p` must be 64-byte aligned.
 #[inline(always)]
-unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
+unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: u8) {
     unsafe {
         #[cfg(target_feature = "avx512f")]
-        if wide_nt && p as usize % 64 == 0 {
+        if wide_nt == 2 {
             let z = _mm512_castsi256_si512(va);
             let z = _mm512_inserti64x4::<1>(z, vb);
             _mm512_stream_si512(p.cast::<__m512i>(), z);
@@ -526,7 +598,7 @@ impl Drain8<'_> {
         g0: usize,
         g1: usize,
         nt: bool,
-        wide_nt: bool,
+        wide_nt: u8,
     ) {
         unsafe {
             let lo_rows = tr8_chunk(stage, ring_word);
@@ -572,7 +644,7 @@ impl Drain8<'_> {
         g0: usize,
         g1: usize,
         nt: bool,
-        wide_nt: bool,
+        wide_nt: u8,
     ) {
         unsafe {
             debug_assert_eq!(base_word % 8, 0);
@@ -617,10 +689,66 @@ impl Drain8<'_> {
         (a_g1, b_g0, b_g1)
     }
 
+    /// Ranked line-aligned twin of the streaming drain. Width 2 is invariant
+    /// for all three full allocations, so the inlined row publishers contain
+    /// no width dispatch at all. The caller selects this once per drain range.
+    #[inline(never)]
+    unsafe fn drain_range_wide(
+        &self,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+        proj: &StreamProj<'_>,
+    ) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
+            let (sa, sb) = proj.sides();
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+                Self::publish_step(
+                    self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, 2,
+                );
+                Self::publish_step(
+                    self.ast,
+                    self.a,
+                    Some((sa, STEP_WORDS)),
+                    abs_word,
+                    rw,
+                    0,
+                    a_g1,
+                    true,
+                    2,
+                );
+                Self::publish_step(
+                    self.bs,
+                    self.b,
+                    Some((sb, STEP_WORDS)),
+                    abs_word,
+                    rw,
+                    b_g0,
+                    b_g1,
+                    true,
+                    2,
+                );
+                proj.project(abs_word / STEP_WORDS);
+            }
+        }
+    }
+
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
             if let Some(proj) = &self.proj {
+                if self.wide_nt == [2; 3] {
+                    self.drain_range_wide(base_word, ring_word, words, proj);
+                    return;
+                }
                 let z_g1 = if self.elide[0] {
                     ELIDE_ZERO_CHUNK
                 } else {
@@ -632,7 +760,7 @@ impl Drain8<'_> {
                     let abs_word = base_word + off;
                     let rw = ring_word + off;
                     Self::publish_step(
-                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, self.wide_nt,
+                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, self.wide_nt[0],
                     );
                     Self::publish_step(
                         self.ast,
@@ -643,7 +771,7 @@ impl Drain8<'_> {
                         0,
                         a_g1,
                         true,
-                        self.wide_nt,
+                        self.wide_nt[1],
                     );
                     Self::publish_step(
                         self.bs,
@@ -654,7 +782,7 @@ impl Drain8<'_> {
                         b_g0,
                         b_g1,
                         true,
-                        self.wide_nt,
+                        self.wide_nt[2],
                     );
                     proj.project(abs_word / STEP_WORDS);
                 }
@@ -687,28 +815,28 @@ impl Drain8<'_> {
                 0,
                 z_g1,
                 self.z_nt,
-                self.wide_nt,
+                self.wide_nt[0],
             );
 
             match self.win_ab {
                 Some((win_a, win_b)) => {
                     Self::publish_range(
                         self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
-                        self.wide_nt,
+                        self.wide_nt[1],
                     );
                     Self::publish_range(
                         self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
-                        self.wide_nt,
+                        self.wide_nt[2],
                     );
                 }
                 None => {
                     Self::publish_range(
                         self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
-                        self.wide_nt,
+                        self.wide_nt[1],
                     );
                     Self::publish_range(
                         self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
-                        self.wide_nt,
+                        self.wide_nt[2],
                     );
                 }
             }
@@ -745,7 +873,7 @@ unsafe fn dump_range_nt_win(
     win: *mut u32,
     g0: usize,
     g1: usize,
-    wide_nt: bool,
+    wide_nt: u8,
 ) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
@@ -790,7 +918,7 @@ unsafe fn dump_elide(
     elide_prefix: bool,
     tail_chunk: usize,
     nt: bool,
-    wide_nt: bool,
+    wide_nt: u8,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -817,7 +945,7 @@ unsafe fn dump_elide_win(
     elide_tail: bool,
     elide_prefix: bool,
     tail_chunk: usize,
-    wide_nt: bool,
+    wide_nt: u8,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -860,6 +988,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     proj: Option<StreamProj<'_>>,
     elide: [bool; 3],
     z_nt: bool,
+    wide_nt: [u8; 3],
 ) {
     unsafe {
         let ptrs = [
@@ -974,7 +1103,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             z_nt,
-            wide_nt: wide_nt_enabled(),
+            wide_nt,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
