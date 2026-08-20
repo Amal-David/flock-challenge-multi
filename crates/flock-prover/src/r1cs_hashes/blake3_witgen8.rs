@@ -231,6 +231,7 @@ impl StreamProj<'_> {
     unsafe fn project(&self, blk: usize) {
         unsafe {
             let (sa, sb) = self.sides();
+            let plan = self.plan.for_block(blk);
             for j in 0..8usize {
                 if self.live & (1 << j) == 0 {
                     continue;
@@ -241,7 +242,7 @@ impl StreamProj<'_> {
                     .out
                     .add(j * BYTES_PER_BLOCK + blk * 64)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan);
+                round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, plan);
             }
         }
     }

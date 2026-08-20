@@ -870,6 +870,20 @@ pub struct Round1AbWindowPlan {
     nt: u8,
 }
 
+impl Round1AbWindowPlan {
+    /// Static-B has measured live bodies only for BLAKE3 windows 0, 1, 30,
+    /// and 31. Resolve that eligibility once for the eight blocks sharing a
+    /// streaming projection step; every other block would return `false`
+    /// from the static dispatcher without inspecting its input.
+    #[inline]
+    pub fn for_block(mut self, blk: usize) -> Self {
+        if !matches!(blk, 0 | 1 | 30 | 31) {
+            self.bstatic = None;
+        }
+        self
+    }
+}
+
 /// Resolve the round-1 window plan for `inv_table` and the output allocation.
 /// Every window destination is 64 bytes and every caller offset is a multiple
 /// of 64, so the output's streaming-store mode is invariant for the complete

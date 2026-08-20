@@ -281,17 +281,9 @@ pub(super) fn shift_reduce_inner_ab_at(
         // and the caller vouches for 64 readable bytes at `byte_base`.
         unsafe {
             if let Some(partials) = bstatic {
-                // The outlined static-B dispatcher (`inline(never)`) is live
-                // only for windows 0, 1, 30, 31 — every other `blk` returns
-                // false without writing. The streaming producer still called
-                // it 28/32 of the time. Gate here so those windows stay on
-                // the prepared generic body with no extra call. Unexpected
-                // `blk` keeps the incumbent generic path.
-                if (blk <= 1 || blk == 30 || blk == 31)
-                    && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
-                        a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
-                    )
-                {
+                if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
+                    a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
+                ) {
                     return;
                 }
             }
