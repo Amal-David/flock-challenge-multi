@@ -2540,6 +2540,15 @@ pub(crate) fn induce_sched_enabled() -> bool {
     *ON
 }
 
+/// Ranked default routes ordinary induced-basis glue through the four-lane
+/// AVX-512 `add_scaled` helper. `FLOCK_NO_OPEN_GLUE_X4=1` restores the
+/// pointwise scalar loop. Read once per process; default ON.
+fn glue_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_GLUE_X4").is_none());
+    *ON
+}
+
 /// Crossover constant `C` in the [`induce_sumcheck_poly_auto`] dispatch rule
 /// `n_queries > C · 2^log_inv_rate · log_block`.
 ///
@@ -5639,7 +5648,18 @@ impl SumcheckProver {
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
+        if glue_x4_enabled() {
+            if self.combined_basis.len() < PAR_THRESHOLD {
+                crate::field::f128_slice::add_scaled(&mut self.combined_basis, &b_new, alpha);
+            } else {
+                self.combined_basis
+                    .par_chunks_mut(PAR_THRESHOLD)
+                    .zip(b_new.par_chunks(PAR_THRESHOLD))
+                    .for_each(|(acc, src)| {
+                        crate::field::f128_slice::add_scaled(acc, src, alpha);
+                    });
+            }
+        } else if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
             }
