@@ -281,8 +281,17 @@ const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
 
-/// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
-/// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
+/// The official x86 runner is compiled for Sapphire Rapids, so make the
+/// already-required AVX-512 platform a compile-time constant there. Besides
+/// skipping detection, this lets each const-generic `hash_many` call erase the
+/// portable/SSE/AVX2 match arms. Other targets retain dynamic detection.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn blake3_platform() -> blake3::platform::Platform {
+    blake3::platform::Platform::AVX512
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 fn blake3_platform() -> blake3::platform::Platform {
     use std::sync::OnceLock;
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
