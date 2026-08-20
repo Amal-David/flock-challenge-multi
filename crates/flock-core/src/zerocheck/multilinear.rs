@@ -2449,6 +2449,25 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
+    // Hoist the `(w, w*x^64)` pairs once for the whole plain cascade, just as
+    // the packed composed-fold paths do. The AVX-512 kernel otherwise derives
+    // the companion on every high chunk's accumulator dependency chain.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
 
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -2467,7 +2486,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, None,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg,
                 )
             };
             #[cfg(not(all(
@@ -4025,7 +4044,105 @@ mod tests {
             assert_eq!(a_s, a_v, "a lo_size={lo_size}");
             assert_eq!(b_s, b_v, "b lo_size={lo_size}");
             assert_eq!(out_s, out_v, "sums lo_size={lo_size}");
+
+            if lo_size.is_multiple_of(8) {
+                let wtab = build_w_pair_table(&eq_lo);
+                let mut a_w = vec![F128::ONE; 2 * lo_size];
+                let mut b_w = vec![F128::ONE; 2 * lo_size];
+                // SAFETY: same checked geometry; `wtab` comes from this
+                // invocation's exact `eq_lo` slice.
+                let out_w = unsafe {
+                    kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                        &a_in,
+                        &b_in,
+                        &mut a_w,
+                        &mut b_w,
+                        rho_a,
+                        rho_b,
+                        &eq_lo,
+                        Some(&wtab),
+                    )
+                };
+                assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
+                assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
+                assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+            }
         }
+    }
+
+    /// Local cost-model probe for the exact ranked cascade geometry. This does
+    /// not claim Sapphire Rapids kernel timing: it measures the portable work
+    /// ledger on hosts where AVX-512 execution is unavailable. Run explicitly
+    /// with `--ignored --nocapture` in an optimized test build.
+    #[test]
+    #[ignore]
+    fn w_pair_table_hoist_cost_model() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const LO_SIZE: usize = 1 << 10;
+        const HI_SIZE: usize = 1 << 11;
+        const SAMPLES: usize = 9;
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|i| F128::new(i as u64 * 0x9E37_79B9 + 1, (i as u64).rotate_left(29) + 3))
+            .collect();
+        let x64 = F128::new(0, 1);
+
+        let incumbent = || {
+            let mut acc = F128::ZERO;
+            for _ in 0..HI_SIZE {
+                for g in 0..LO_SIZE / 8 {
+                    for k in 0..4 {
+                        let w = black_box(eq_lo[8 * g + 2 * k + 1]);
+                        acc += w;
+                        acc += black_box(w * x64);
+                    }
+                }
+            }
+            black_box(acc)
+        };
+        let candidate = || {
+            let mut t = crate::alloc_uninit_f128_vec(LO_SIZE);
+            for g in 0..LO_SIZE / 8 {
+                for k in 0..4 {
+                    let w = black_box(eq_lo[8 * g + 2 * k + 1]);
+                    t[8 * g + k] = w;
+                    t[8 * g + 4 + k] = black_box(w * x64);
+                }
+            }
+            let mut acc = F128::ZERO;
+            for _ in 0..HI_SIZE {
+                for &v in &t {
+                    acc += black_box(v);
+                }
+            }
+            black_box(acc)
+        };
+
+        black_box(incumbent());
+        black_box(candidate());
+        let mut incumbent_ns = Vec::with_capacity(SAMPLES);
+        let mut candidate_ns = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                let t0 = Instant::now();
+                black_box(incumbent());
+                incumbent_ns.push(t0.elapsed().as_nanos());
+                let t0 = Instant::now();
+                black_box(candidate());
+                candidate_ns.push(t0.elapsed().as_nanos());
+            } else {
+                let t0 = Instant::now();
+                black_box(candidate());
+                candidate_ns.push(t0.elapsed().as_nanos());
+                let t0 = Instant::now();
+                black_box(incumbent());
+                incumbent_ns.push(t0.elapsed().as_nanos());
+            }
+        }
+        eprintln!("incumbent_ns={incumbent_ns:?}");
+        eprintln!("candidate_ns={candidate_ns:?}");
+        assert_eq!(black_box(incumbent()), black_box(candidate()));
     }
 
     /// The no-materialize route equals the materializing lookahead route:
