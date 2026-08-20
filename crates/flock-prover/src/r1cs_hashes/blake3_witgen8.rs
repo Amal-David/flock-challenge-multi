@@ -22,6 +22,7 @@ use super::{
     USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
+use core::mem::MaybeUninit;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     Round1AbWindowPlan, round1_ab_inner_window,
@@ -201,13 +202,15 @@ const _RING_GEOMETRY: () = {
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
-/// step is one 64-byte round-1 medium window per block, so the transform runs
-/// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
-/// of off two full-block window buffers.
+/// step is one 64-byte round-1 medium window per block. Ranked default feeds
+/// `tr8` rows straight into [`round1_ab_inner_window`] (no staging pair).
+/// `FLOCK_NO_STREAM_STAGE_ELIDE=1` restores the `STREAM_STAGE_WORDS` store
+/// then outlined reload.
 ///
 /// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
-/// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks. Bit `j` of `live` selects block `j`.
+/// block rows each) and is 64-byte aligned, or is null when the elide path
+/// is live. `out` owns this octa's eight `BYTES_PER_BLOCK` ab_inner blocks.
+/// Bit `j` of `live` selects block `j`.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
@@ -242,6 +245,43 @@ impl StreamProj<'_> {
                     .add(j * BYTES_PER_BLOCK + blk * 64)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window(a_win, b_win, out, blk, self.inv_table, self.plan);
+            }
+        }
+    }
+
+    /// Same windows as [`Self::project`], packed from the `tr8` rows the drain
+    /// just produced. `a_lo[j] || a_hi[j]` is block `j`'s 16-word a window
+    /// (identical to a `store_v8` pair into `stage` at stride `STEP_WORDS`).
+    /// Does not touch `stage`.
+    #[inline(always)]
+    unsafe fn project_from_rows(
+        &self,
+        a_lo: &[V8; 8],
+        a_hi: &[V8; 8],
+        b_lo: &[V8; 8],
+        b_hi: &[V8; 8],
+        blk: usize,
+    ) {
+        unsafe {
+            for j in 0..8usize {
+                if self.live & (1 << j) == 0 {
+                    continue;
+                }
+                let mut a_win = MaybeUninit::<[u8; 64]>::uninit();
+                let mut b_win = MaybeUninit::<[u8; 64]>::uninit();
+                let ap = a_win.as_mut_ptr().cast::<u32>();
+                let bp = b_win.as_mut_ptr().cast::<u32>();
+                store_v8(ap, a_lo[j]);
+                store_v8(ap.add(8), a_hi[j]);
+                store_v8(bp, b_lo[j]);
+                store_v8(bp.add(8), b_hi[j]);
+                let a_win = a_win.assume_init();
+                let b_win = b_win.assume_init();
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + blk * 64)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window(&a_win, &b_win, out, blk, self.inv_table, self.plan);
             }
         }
     }
@@ -402,6 +442,15 @@ fn wide_nt_enabled() -> bool {
     *ON
 }
 
+/// Ranked default skips the 1 KiB STREAM_STAGE store/reload: `tr8` rows feed
+/// [`round1_ab_inner_window`] directly. `FLOCK_NO_STREAM_STAGE_ELIDE=1`
+/// restores carry-into-stage then the outlined [`StreamProj::project`].
+pub(crate) fn stream_stage_elide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_STREAM_STAGE_ELIDE").is_none());
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -514,15 +563,35 @@ impl Drain8<'_> {
         unsafe {
             let lo_rows = tr8_chunk(stage, ring_word);
             let hi_rows = tr8_chunk(stage, ring_word + 8);
-            let g = abs_word / 8;
-            let lo_live = g >= g0 && g < g1;
-            let hi_live = g + 1 >= g0 && g + 1 < g1;
-            for r in 0..8 {
-                if let Some((base, row_stride)) = carry {
+            if let Some((base, row_stride)) = carry {
+                for r in 0..8 {
                     let p = base.add(r * row_stride);
                     store_v8(p, lo_rows[r]);
                     store_v8(p.add(8), hi_rows[r]);
                 }
+            }
+            Self::store_step_main(dst, abs_word, &lo_rows, &hi_rows, g0, g1, nt);
+        }
+    }
+
+    /// NT/temporal publish of one 16-word step into the recyclable main
+    /// destination. Elided chunks are skipped here; the caller still holds
+    /// the `tr8` rows for projection when the main store is a no-op.
+    #[inline(always)]
+    unsafe fn store_step_main(
+        dst: *mut u32,
+        abs_word: usize,
+        lo_rows: &[V8; 8],
+        hi_rows: &[V8; 8],
+        g0: usize,
+        g1: usize,
+        nt: bool,
+    ) {
+        unsafe {
+            let g = abs_word / 8;
+            let lo_live = g >= g0 && g < g1;
+            let hi_live = g + 1 >= g0 && g + 1 < g1;
+            for r in 0..8 {
                 let p = dst.add(r * U32_PER_BLOCK + abs_word);
                 match (nt, lo_live, hi_live) {
                     (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r]),
@@ -609,6 +678,28 @@ impl Drain8<'_> {
             let (a_g1, b_g0, b_g1) = self.ab_ranges();
 
             if let Some(proj) = &self.proj {
+                if stream_stage_elide_enabled() {
+                    // Designed RING32/winstream grain: tr8 rows are the
+                    // windows. Do not store them to STREAM_STAGE and reload.
+                    // Main a/b still NT-publish; projection reads the rows.
+                    for off in (0..words).step_by(STEP_WORDS) {
+                        let abs_word = base_word + off;
+                        let rw = ring_word + off;
+                        Self::publish_step(
+                            self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt,
+                        );
+                        let a_lo = tr8_chunk(self.ast, rw);
+                        let a_hi = tr8_chunk(self.ast, rw + 8);
+                        Self::store_step_main(self.a, abs_word, &a_lo, &a_hi, 0, a_g1, true);
+                        let b_lo = tr8_chunk(self.bs, rw);
+                        let b_hi = tr8_chunk(self.bs, rw + 8);
+                        Self::store_step_main(self.b, abs_word, &b_lo, &b_hi, b_g0, b_g1, true);
+                        proj.project_from_rows(
+                            &a_lo, &a_hi, &b_lo, &b_hi, abs_word / STEP_WORDS,
+                        );
+                    }
+                    return;
+                }
                 let (sa, sb) = proj.sides();
                 for off in (0..words).step_by(STEP_WORDS) {
                     let abs_word = base_word + off;
@@ -787,7 +878,8 @@ unsafe fn dump_elide_win(
 /// `proj = Some(..)` selects the STREAMING form of the same fusion: a/b are
 /// published non-temporally exactly as under `win_ab`, and each drain step's
 /// eight 64-byte round-1 medium windows are transformed straight into the
-/// caller's ab_inner blocks out of a small staging pair, so no full-block
+/// caller's ab_inner blocks from the `tr8` rows (ranked default) or out of a
+/// small staging pair (`FLOCK_NO_STREAM_STAGE_ELIDE=1`). No full-block
 /// window buffer exists. `win_ab` and `proj` are mutually exclusive.
 ///
 /// # Safety

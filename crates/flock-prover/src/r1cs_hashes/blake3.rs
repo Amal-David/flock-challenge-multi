@@ -1750,7 +1750,11 @@ fn generate_round1_inner_octa(
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
                 let want = if ab_stream {
-                    STAGE_LINES
+                    if blake3_witgen8::stream_stage_elide_enabled() {
+                        0
+                    } else {
+                        STAGE_LINES
+                    }
                 } else if ab_nt {
                     WIN_LINES
                 } else {
@@ -1778,8 +1782,15 @@ fn generate_round1_inner_octa(
                     None
                 };
                 let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
+                    if win.is_empty() {
+                        // Elide path: no STREAM_STAGE. Null is never deref'd
+                        // while `stream_stage_elide_enabled` is live; Some
+                        // keeps the octa skip of the incumbent a/b re-read.
+                        Some(core::ptr::null_mut())
+                    } else {
+                        debug_assert_eq!(win.len(), STAGE_LINES);
+                        Some(win.as_mut_ptr().cast::<u32>())
+                    }
                 } else {
                     None
                 };

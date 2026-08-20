@@ -230,98 +230,20 @@ pub(crate) fn prefold_dead_line_mask_gated(
 /// formula, with the nodes being the F_8 elements `0..2^k_skip` embedded into
 /// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
 ///
-/// See [`lagrange_weights_on_nodes`] for how the weights are formed.
+/// O(2^{2·k_skip}) field multiplies — one-time cost.
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
-    lagrange_weights_on_nodes(k_skip, z, 0)
-}
-
-/// Cached `1 / ∏_{j ≠ i} (s_i + s_j)` for one φ_8 node set, indexed by
-/// `k_skip`. The denominators depend only on the nodes, so a node set's
-/// inverses are computed once per process and shared by every fold point.
-/// `node_base` is the node set's first index into `PHI_8_TABLE` (`0` for the
-/// S domain, `2^k_skip` for Λ).
-fn lagrange_denominator_inv(k_skip: usize, node_base: usize) -> &'static [F128] {
-    static CACHE: [[std::sync::OnceLock<Vec<F128>>; 9]; 2] =
-        [const { [const { std::sync::OnceLock::new() }; 9] }; 2];
-    let domain = usize::from(node_base != 0);
-    CACHE[domain][k_skip].get_or_init(|| {
-        let ell = 1usize << k_skip;
-        let mut out = vec![F128::ZERO; ell];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let si = PHI_8_TABLE[node_base + i];
-            let mut den = F128::ONE;
-            for j in 0..ell {
-                if j == i {
-                    continue;
-                }
-                den *= si + PHI_8_TABLE[node_base + j];
-            }
-            *slot = den.inv();
-        }
-        out
-    })
-}
-
-/// `FLOCK_NO_LAGRANGE_BATCH_INV=1` restores the per-node numerator product
-/// and per-node denominator inversion for the Lagrange weights. The ranked
-/// worker's cleared environment never sets it.
-#[inline]
-fn lagrange_batch_inv_off() -> bool {
-    static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LAGRANGE_BATCH_INV").is_some());
-    *OFF
-}
-
-/// Lagrange weights at `z` over the φ_8 node set starting at `node_base`.
-///
-/// `L_i(z) = ∏_{j ≠ i} (z + s_j) / ∏_{j ≠ i} (s_i + s_j)`. The numerators are
-/// all cofactors of the same product `P(z) = ∏_j (z + s_j)`, so one batch
-/// inversion of the `z + s_i` terms yields every cofactor as `P · (z + s_i)⁻¹`,
-/// and the denominators come from the cached node-set table. When `z` lands
-/// exactly on a node the cofactor form is unavailable and the per-node
-/// products are used instead.
-fn lagrange_weights_on_nodes(k_skip: usize, z: F128, node_base: usize) -> Vec<F128> {
-    let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
-
-    if !lagrange_batch_inv_off() {
-        let mut terms = vec![F128::ZERO; ell];
-        let mut on_node = false;
-        for (i, slot) in terms.iter_mut().enumerate() {
-            let t = z + PHI_8_TABLE[node_base + i];
-            on_node |= t.is_zero();
-            *slot = t;
-        }
-        if !on_node {
-            let den_inv = lagrange_denominator_inv(k_skip, node_base);
-            // Montgomery batch inverse: prefix[i] = ∏_{j < i} terms[j].
-            let mut prefix = vec![F128::ZERO; ell];
-            let mut acc = F128::ONE;
-            for (i, slot) in prefix.iter_mut().enumerate() {
-                *slot = acc;
-                acc *= terms[i];
-            }
-            let total = acc;
-            let mut suffix = total.inv();
-            for i in (0..ell).rev() {
-                weights[i] = total * (prefix[i] * suffix) * den_inv[i];
-                suffix *= terms[i];
-            }
-            return weights;
-        }
-    }
-
     for i in 0..ell {
-        let si = PHI_8_TABLE[node_base + i];
+        let si = PHI_8_TABLE[i];
         let mut num = F128::ONE;
         let mut den = F128::ONE;
         for j in 0..ell {
             if j == i {
                 continue;
             }
-            let sj = PHI_8_TABLE[node_base + j];
+            let sj = PHI_8_TABLE[j];
             num *= z + sj;
             den *= si + sj;
         }
@@ -339,7 +261,22 @@ fn lagrange_weights_on_nodes(k_skip: usize, z: F128, node_base: usize) -> Vec<F1
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
-    lagrange_weights_on_nodes(k_skip, z, ell)
+    let mut weights = vec![F128::ZERO; ell];
+    for i in 0..ell {
+        let si = PHI_8_TABLE[ell + i];
+        let mut num = F128::ONE;
+        let mut den = F128::ONE;
+        for j in 0..ell {
+            if j == i {
+                continue;
+            }
+            let sj = PHI_8_TABLE[ell + j];
+            num *= z + sj;
+            den *= si + sj;
+        }
+        weights[i] = num * den.inv();
+    }
+    weights
 }
 
 /// Interpolate a degree-`< 2^k_skip` polynomial at z, given its `2^k_skip`
@@ -2804,78 +2741,6 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Independent restatement of the Lagrange weight formula:
-    /// `L_i(z) = ∏_{j≠i} (z + s_j) / ∏_{j≠i} (s_i + s_j)` over the φ_8 node
-    /// set beginning at `node_base`.
-    fn lagrange_weights_reference(k_skip: usize, z: F128, node_base: usize) -> Vec<F128> {
-        let ell = 1usize << k_skip;
-        let mut weights = vec![F128::ZERO; ell];
-        for i in 0..ell {
-            let si = PHI_8_TABLE[node_base + i];
-            let mut num = F128::ONE;
-            let mut den = F128::ONE;
-            for j in 0..ell {
-                if j == i {
-                    continue;
-                }
-                let sj = PHI_8_TABLE[node_base + j];
-                num *= z + sj;
-                den *= si + sj;
-            }
-            weights[i] = num * den.inv();
-        }
-        weights
-    }
-
-    /// **Lagrange weight oracle**: the shipped cofactor route must equal the
-    /// per-node product-and-invert formula exactly, on both the S and Λ node
-    /// sets, for every `k_skip` the protocol can present.
-    #[test]
-    fn lagrange_weights_match_per_node_formula() {
-        let mut rng = Rng::new(0x1EAF_0F17);
-        for k_skip in 0..=6usize {
-            let ell = 1usize << k_skip;
-            for _ in 0..8 {
-                let z = rng.f128();
-                assert_eq!(
-                    lagrange_weights_naive(k_skip, z),
-                    lagrange_weights_reference(k_skip, z, 0),
-                    "S domain k_skip={k_skip}"
-                );
-                assert_eq!(
-                    lagrange_weights_lambda_naive(k_skip, z),
-                    lagrange_weights_reference(k_skip, z, ell),
-                    "lambda domain k_skip={k_skip}"
-                );
-            }
-        }
-    }
-
-    /// **On-node degeneracy**: a fold point sitting exactly on a node must
-    /// still produce that node's indicator vector.
-    #[test]
-    fn lagrange_weights_on_a_node_are_the_indicator() {
-        for k_skip in 0..=6usize {
-            let ell = 1usize << k_skip;
-            for m in 0..ell {
-                let z = PHI_8_TABLE[m];
-                let w = lagrange_weights_naive(k_skip, z);
-                assert_eq!(w, lagrange_weights_reference(k_skip, z, 0));
-                for (i, wi) in w.iter().enumerate() {
-                    let expect = if i == m { F128::ONE } else { F128::ZERO };
-                    assert_eq!(*wi, expect, "k_skip={k_skip} node={m} i={i}");
-                }
-                let zl = PHI_8_TABLE[ell + m];
-                let wl = lagrange_weights_lambda_naive(k_skip, zl);
-                assert_eq!(wl, lagrange_weights_reference(k_skip, zl, ell));
-                for (i, wi) in wl.iter().enumerate() {
-                    let expect = if i == m { F128::ONE } else { F128::ZERO };
-                    assert_eq!(*wi, expect, "lambda k_skip={k_skip} node={m} i={i}");
-                }
-            }
-        }
-    }
 
     struct Rng(u64);
     impl Rng {
