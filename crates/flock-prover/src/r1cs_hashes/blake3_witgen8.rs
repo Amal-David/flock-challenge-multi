@@ -570,12 +570,131 @@ impl<'t> W8<'t> {
     }
 }
 
+/// Fused twin of [`W8`]: packs the A and B sides of one push site together.
+/// Every witness push writes both sides at the same word position with the
+/// same width (A gets the value, B gets its carry partner or `maxv`), so the
+/// two writers share one dispatch, one epoch-boundary check, and one
+/// `drain_range` trigger instead of running two independent packing state
+/// machines. The `pushf8!` sites are unchanged in value: each side's packed
+/// bytes are bit-identical to the unfused pair (same `vsli`/`shr` sequence,
+/// same word stores), only the control flow is shared.
+///
+/// The ranked BLAKE3 prologue seeds the two sides' pendings differently
+/// (A: the pending seed bit, B: `one`), so both initial pendings are
+/// parameters.
+struct W8x2<'t> {
+    pending_a: V8,
+    pending_b: V8,
+    stage_a: *mut V8,
+    stage_b: *mut V8,
+    drain: *mut Drain8<'t>,
+    flush: bool,
+}
+
+impl<'t> W8x2<'t> {
+    #[inline(always)]
+    fn at(
+        stage_a: *mut V8,
+        pending_a: V8,
+        stage_b: *mut V8,
+        pending_b: V8,
+        drain: *mut Drain8<'t>,
+        flush: bool,
+    ) -> Self {
+        Self {
+            pending_a,
+            pending_b,
+            stage_a,
+            stage_b,
+            drain,
+            flush,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn write_word2<const WORD: usize>(&mut self, va: V8, vb: V8) {
+        unsafe {
+            store_v8(self.stage_a.add(WORD & (RING_WORDS - 1)) as *mut u32, va);
+            store_v8(self.stage_b.add(WORD & (RING_WORDS - 1)) as *mut u32, vb);
+            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+                // Same epoch geometry as [`W8::write_word`]: B's writer is the
+                // flusher, and the drain transposes BOTH rings.
+                if WORD + 1 == RING_WORDS {
+                    (*self.drain).drain_range(16, 16, RING_WORDS - 16);
+                } else {
+                    (*self.drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push2<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
+        &mut self,
+        va: V8,
+        vb: V8,
+    ) {
+        const {
+            assert!(USED >= 0 && USED < 32);
+            assert!(WIDTH == 31 || WIDTH == 32);
+            assert!(BACK >= 1 && BACK < 32);
+            assert!(WORD < U32_PER_BLOCK);
+        }
+        debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+        unsafe {
+            if USED == 0 {
+                if WIDTH == 32 {
+                    self.write_word2::<WORD>(va, vb);
+                    self.pending_a = dup_u32(0);
+                    self.pending_b = dup_u32(0);
+                } else {
+                    self.pending_a = va;
+                    self.pending_b = vb;
+                }
+            } else if USED + WIDTH < 32 {
+                self.pending_a = vsli_v8::<USED>(self.pending_a, va);
+                self.pending_b = vsli_v8::<USED>(self.pending_b, vb);
+            } else {
+                let out_a = vsli_v8::<USED>(self.pending_a, va);
+                let out_b = vsli_v8::<USED>(self.pending_b, vb);
+                self.write_word2::<WORD>(out_a, out_b);
+                if USED + WIDTH == 32 {
+                    self.pending_a = dup_u32(0);
+                    self.pending_b = dup_u32(0);
+                } else {
+                    self.pending_a = shr_v8::<BACK>(va);
+                    self.pending_b = shr_v8::<BACK>(vb);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish2(&mut self) {
+        unsafe {
+            self.write_word2::<LAST_WORD>(self.pending_a, self.pending_b);
+        }
+    }
+}
+
 macro_rules! pushf8 {
     ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
         $w.push::<{ ($pos % 32) as i32 }, $width, {
             let u = ($pos % 32) as i32;
             if u == 0 { 1 } else { 32 - u }
         }, { $pos / 32 }>($v);
+    }};
+}
+
+/// Fused twin of [`pushf8!`]: pushes the A and B values of one site together
+/// through a [`W8x2`]. Same const arguments for both sides — every site
+/// pushes both sides at the same position with the same width.
+macro_rules! pushf8x2 {
+    ($w:ident, $pos:expr, $width:literal, $va:expr, $vb:expr) => {{
+        $w.push2::<{ ($pos % 32) as i32 }, $width, {
+            let u = ($pos % 32) as i32;
+            if u == 0 { 1 } else { 32 - u }
+        }, { $pos / 32 }>($va, $vb);
     }};
 }
 
@@ -1518,40 +1637,33 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = shr_v8::<31>(flags);
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
-        // B is pushed after A at every site; it alone triggers a band drain
+        // Fused A/B writer: every site pushes both sides at the same position
+        // with the same width, so one packing state machine serves both. A's
+        // pending starts as the seed bit; B's as `one`; B triggers the drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, one, drain_ptr, true);
+        let mut w2 = W8x2::at(ast, pending_bit, bs, one, drain_ptr, true);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
                 let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0, r0);
                 let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
                 let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
                 let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3, r3);
                 let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
                 let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn, maxv);
+                pushf8x2!(w2, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2, maxv);
                 state[$la] = a2;
                 state[$lb] = bn;
                 state[$lc] = c2s;
@@ -1587,8 +1699,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         macro_rules! oh {
             ($w:literal) => {{
                 let hv = xor_v8(state[$w + 8], cv_v[$w]);
-                pushf8!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
-                pushf8!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+                pushf8x2!(w2, OUT_HI_BASE + 32 * $w, 32, hv, maxv);
             }};
         }
         oh!(0);
@@ -1599,8 +1710,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         oh!(5);
         oh!(6);
         oh!(7);
-        wa.finish();
-        wb.finish();
+        w2.finish2();
 
         const ZF: usize = USEFUL_BITS.div_ceil(32);
         const {
