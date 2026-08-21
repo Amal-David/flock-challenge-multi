@@ -98,6 +98,38 @@ impl ShiftReducePlan {
     pub(super) fn uses_images(self) -> bool {
         self.img2
     }
+
+    /// True when the apply resolves to the pre-scaled two-image form with the
+    /// wide offset reads — the mode
+    /// [`shift_reduce_inner_ab_at_ranked`] hard-codes.
+    #[inline]
+    pub(super) fn is_pidx_offw(self) -> bool {
+        self.img2 && self.pidx && self.offw
+    }
+}
+
+/// `FLOCK_NO_URM_WINDOW_RUN=1` restores the per-block mode dispatch in the
+/// round-1 AB window run. Resolved once per buffer, into the window plan.
+#[inline]
+pub(super) fn window_run_enabled() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        x86_64::urm_window_run_enabled()
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        false
+    }
 }
 
 #[inline]
@@ -353,6 +385,84 @@ pub(super) fn shift_reduce_inner_ab_at(
             nt,
         );
     }
+}
+
+/// [`shift_reduce_inner_ab_at`] with every mode switch a literal rather than a
+/// runtime flag: no static-B dispatcher, the pre-scaled two-image apply with
+/// wide offset reads, and the ZMM-stream output class. The caller establishes
+/// that the plan resolves exactly this way
+/// ([`super::Round1AbWindowPlan::ranked_run`]) once for a whole run of blocks,
+/// so the per-block body carries none of the tests — the same computation, one
+/// dispatch instead of one per block.
+///
+/// Only exists where that mode does; every other build keeps the general
+/// entry, and `ranked_run` is `false` there.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_at`], and the caller's plan must satisfy
+/// `ranked_run()` (so `imgs` are the σ₈-carrying table's images and the
+/// destination is 64-byte aligned).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[inline(always)]
+pub(super) unsafe fn shift_reduce_inner_ab_at_ranked(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    let _ = inv_table;
+    // SAFETY: forwarded from this function's contract; the literals are the
+    // values `shift_reduce_inner_ab_at` would have read out of the plan, and
+    // `nt == 2` is exactly the 64-byte alignment `store_out64` demands of the
+    // ZMM stream.
+    unsafe {
+        x86_64::shift_reduce_inner_ab_x86_avx512_ranked(
+            a_packed.as_ptr(),
+            b_packed.as_ptr(),
+            out,
+            imgs,
+        );
+    }
+}
+
+/// [`shift_reduce_inner_ab_at_ranked`] where that mode does not exist. Never
+/// reached (`ranked_run()` is `false` on these builds); kept so the seam
+/// compiles and stays correct if it ever were.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_at`].
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+)))]
+#[inline]
+pub(super) unsafe fn shift_reduce_inner_ab_at_ranked(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    shift_reduce_inner_ab_at(
+        a_packed,
+        b_packed,
+        inv_table,
+        0,
+        0,
+        out,
+        None,
+        prepare_shift_reduce(inv_table),
+        2,
+        imgs,
+    );
 }
 
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one

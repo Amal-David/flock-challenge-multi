@@ -868,6 +868,7 @@ pub struct Round1AbWindowPlan {
     bstatic: Option<&'static kernels::BstaticPartials>,
     kernel: kernels::ShiftReducePlan,
     nt: u8,
+    run: bool,
 }
 
 impl Round1AbWindowPlan {
@@ -885,6 +886,21 @@ impl Round1AbWindowPlan {
             },
             ..self
         }
+    }
+
+    /// True when every runtime switch inside the per-window kernel resolves
+    /// the same way for this plan — no static-B dispatcher, the pre-scaled
+    /// two-image apply with wide offset reads, the ZMM-stream output class —
+    /// so a producer transforming a run of blocks at one window index may test
+    /// it once and then call [`round1_ab_inner_window_ranked`] per block with
+    /// the switches gone. `false` keeps every caller on the general entry.
+    ///
+    /// Call on a plan already narrowed by [`Self::for_window`]; on the raw
+    /// buffer plan it merely reports the four static-B windows as not ranked.
+    /// `FLOCK_NO_URM_WINDOW_RUN=1` forces `false`.
+    #[inline]
+    pub fn ranked_run(self) -> bool {
+        self.run && self.bstatic.is_none() && self.nt == 2 && self.kernel.is_pidx_offw()
     }
 }
 
@@ -933,6 +949,7 @@ pub fn prepare_round1_ab_window_plan(
         bstatic: kernels::prepare_bstatic(inv_table),
         kernel: kernels::prepare_shift_reduce(inv_table),
         nt,
+        run: kernels::window_run_enabled(),
     }
 }
 
@@ -993,6 +1010,38 @@ pub unsafe fn round1_ab_inner_window_with_images(
         plan.nt,
         (imgs.0, imgs.1),
     );
+}
+
+/// [`round1_ab_inner_window_with_images`] with every mode switch supplied as a
+/// literal instead of a runtime flag: no static-B plan, the pre-scaled
+/// two-image apply with wide offset reads, and the ZMM-stream output class.
+/// Only callable when [`Round1AbWindowPlan::ranked_run`] says the plan resolves
+/// to exactly that, in which case the bytes are the ones the general entry
+/// would write; the point is that a producer transforming a run of blocks at
+/// one window index tests the plan ONCE for the run rather than re-testing it
+/// inside every block's call.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_with_images`], and `plan.ranked_run()` must
+/// hold for the plan `imgs` was resolved from.
+#[inline(always)]
+pub unsafe fn round1_ab_inner_window_ranked(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    inv_table: &InvNttTableByteSingleGf8,
+    imgs: Round1AbTableImages,
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::shift_reduce_inner_ab_at_ranked(
+            a_window,
+            b_window,
+            inv_table,
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
 }
 
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
@@ -3264,6 +3313,71 @@ mod tests {
         let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
         let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
         InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    }
+
+    /// **Ranked window entry oracle.** For every window index whose plan
+    /// satisfies `ranked_run()`, the switch-free
+    /// [`round1_ab_inner_window_ranked`] must write exactly what the general
+    /// [`round1_ab_inner_window_with_images`] writes. Runs over a whole
+    /// BLAKE3 block's worth of window indices with pseudorandom a/b bytes, so
+    /// it also covers the four static-B indices (where `ranked_run()` is
+    /// false and the test only asserts that).
+    #[test]
+    fn round1_ab_inner_window_ranked_matches_general() {
+        #[repr(C, align(64))]
+        struct Buf([u8; 64]);
+        let inv_table = make_inv_table();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut a = Buf([0u8; 64]);
+        let mut b = Buf([0u8; 64]);
+        let mut got = Buf([0u8; 64]);
+        let mut want = Buf([0u8; 64]);
+        // A 64-aligned, NT destination is what makes the plan resolve to the
+        // ZMM-stream class the ranked entry hard-codes.
+        let plan = prepare_round1_ab_window_plan(&inv_table, &got.0, true);
+        let mut ranked_seen = 0usize;
+        for blk in 0..ROUND1_AB_WINDOWS_PER_BLOCK {
+            for i in 0..64 {
+                a.0[i] = (next() >> (8 * (i % 8))) as u8;
+                b.0[i] = (next() >> (8 * (i % 8))) as u8;
+            }
+            let wp = plan.for_window(blk);
+            let imgs = round1_ab_table_images(&inv_table, wp);
+            // SAFETY: three 64-byte, 64-aligned buffers; `imgs` came from this
+            // table and plan.
+            unsafe {
+                round1_ab_inner_window_with_images(
+                    &a.0, &b.0, &mut want.0, blk, &inv_table, wp, imgs,
+                );
+                if wp.ranked_run() {
+                    ranked_seen += 1;
+                    round1_ab_inner_window_ranked(&a.0, &b.0, &mut got.0, &inv_table, imgs);
+                } else {
+                    round1_ab_inner_window_with_images(
+                        &a.0, &b.0, &mut got.0, blk, &inv_table, wp, imgs,
+                    );
+                }
+            }
+            abinner_publish_fence();
+            assert_eq!(got.0, want.0, "window {blk}");
+        }
+        // On the x86 AVX-512/GFNI build every non-static-B window must have
+        // taken the ranked entry; elsewhere `ranked_run()` is always false and
+        // this test degenerates to a self-comparison.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ))]
+        assert_eq!(ranked_seen, ROUND1_AB_WINDOWS_PER_BLOCK - 4);
+        let _ = ranked_seen;
     }
 
     #[test]

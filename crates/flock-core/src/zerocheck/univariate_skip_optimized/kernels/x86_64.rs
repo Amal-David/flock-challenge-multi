@@ -118,6 +118,16 @@ pub(crate) fn urm_pidx_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_WINDOW_RUN=1` restores the per-block dispatch in the round-1
+/// AB window run: the static-B eligibility of the window, the apply mode and
+/// the output store class are then re-decided inside every one of the octa's
+/// eight blocks instead of once for the run. Resolved once per process.
+pub(crate) fn urm_window_run_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_WINDOW_RUN").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
 /// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
 /// 64-bit reads split with shifts. Resolved once per process.
@@ -244,6 +254,60 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
             horner_2img_off_narrow(inv_table, op)
         };
         store_out64(out, acc, nt);
+    }
+}
+
+/// [`shift_reduce_inner_ab_x86_avx512_pidx`] with the ranked mode's three
+/// switches as literals — wide offset reads, the ZMM-stream output class, and
+/// the window base already folded into the pointers. Identical instructions to
+/// the general entry once its flags resolve that way; the caller establishes
+/// them once for a whole run of blocks
+/// (`super::super::Round1AbWindowPlan::ranked_run`).
+///
+/// Plain `#[inline(always)]` and no `#[target_feature]` — the module only
+/// compiles when gfni/avx512f/bw are baseline features of the build, and the
+/// two cannot be combined (rust#145574). That matters here beyond taste: the
+/// general entry is `#[inline]`-only, so a producer that added a SECOND
+/// specialised call site to it made LLVM outline the body from every caller
+/// including the incumbent one — a call plus four stack-argument pushes per
+/// 64-byte window. Keeping the specialisation always-inlinable is what makes
+/// the hoist pay instead of cost.
+///
+/// # Safety
+/// 64 readable bytes at `a_window` and `b_window`, 64 writable and 64-byte
+/// ALIGNED at `out`, and `imgs` the table's base and σ₈ image pointers.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_ranked(
+    a_window: *const u8,
+    b_window: *const u8,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+
+    #[repr(align(64))]
+    struct Off([u16; 128]);
+
+    // SAFETY: per the contract, 64 readable bytes on each side; `off` is a
+    // fully written 128-u16 stack buffer and `out` one aligned ZMM register.
+    unsafe {
+        let mut off = core::mem::MaybeUninit::<Off>::uninit();
+        let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a_window));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a_window.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b_window));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b_window.add(32)));
+        let acc = horner_2img_offw(imgs, op);
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }
 }
 
