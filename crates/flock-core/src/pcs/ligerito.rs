@@ -4141,6 +4141,64 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+/// Completes the NT publishes issued by one Rayon folder on the worker that
+/// executed them. Rayon creates `map_init` state inside each producer folder
+/// and drops it before that folder's result is returned to the reducer, so the
+/// fence precedes both result publication and every later read of the output.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+struct OpenNtFenceGuard(bool);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl OpenNtFenceGuard {
+    #[inline(always)]
+    fn new(enabled: bool) -> Self {
+        Self(enabled)
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl Drop for OpenNtFenceGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: sfence is always available on x86_64 and runs on the
+            // same worker that issued this folder's MOVNTDQ stores.
+            unsafe { core::arch::x86_64::_mm_sfence() };
+        }
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+struct OpenNtFenceGuard;
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+impl OpenNtFenceGuard {
+    #[inline(always)]
+    fn new(_enabled: bool) -> Self {
+        Self
+    }
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
@@ -4154,7 +4212,9 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
 /// `<= stage_f.len()`. `f`/`b` contain `2 * (base + fc.len())` elements.
-/// `stage_*` are write-before-read scratch owned by this worker.
+/// `stage_*` are write-before-read scratch owned by this worker. The caller
+/// must execute `_mm_sfence()` on this same worker after its final NT leaf and
+/// before the folder result is published or any output can be read.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4190,7 +4250,6 @@ unsafe fn fold_and_msg_chunk_nt_x86(
         unsafe {
             publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
             publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
-            core::arch::x86_64::_mm_sfence();
         }
     } else {
         fc.copy_from_slice(&stage_f[..len]);
@@ -4312,6 +4371,18 @@ fn fold_and_msg_lsb_inner(
     let use_nt = lazy_ood.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let use_task_nt_fence = use_nt;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let use_task_nt_fence = false;
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4362,7 +4433,9 @@ fn fold_and_msg_lsb_inner(
         .par_chunks_mut(CHUNK)
         .zip(nb_s.par_chunks_mut(CHUNK))
         .enumerate()
-        .map(|(ci, (fc, bc))| {
+        .map_init(
+            || OpenNtFenceGuard::new(use_task_nt_fence),
+            |_nt_fence, (ci, (fc, bc))| {
             let base = ci * CHUNK;
             #[cfg(all(
                 target_arch = "x86_64",
@@ -4440,7 +4513,8 @@ fn fold_and_msg_lsb_inner(
                 }
                 (u0, u2)
             }
-        })
+            },
+        )
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
@@ -9666,6 +9740,9 @@ mod tests {
                     &mut stage_b,
                 )
             };
+            // Production batches this on the issuing Rayon worker; this
+            // direct leaf oracle reads the NT output immediately.
+            unsafe { core::arch::x86_64::_mm_sfence() };
             assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
             assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
             assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
