@@ -4110,3 +4110,5 @@ mod tests {
         ));
     }
 }
+
+// Refire-4 draw marker 07:4x CDT (comment-only; proof bytes unchanged).
