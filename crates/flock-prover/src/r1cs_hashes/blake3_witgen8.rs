@@ -24,7 +24,8 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbWindowPlan, round1_ab_inner_window_with_images, round1_ab_table_images,
+    Round1AbTableImages, Round1AbWindowPlan, round1_ab_inner_window_with_images,
+    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -230,15 +231,52 @@ impl StreamProj<'_> {
     #[inline(never)]
     unsafe fn project(&self, blk: usize) {
         unsafe {
+            let (plan, imgs) = self.window_prep(blk);
+            self.project_blocks(blk, plan, imgs, None);
+        }
+    }
+
+    /// The window's per-block invariants: its static-B eligibility and the
+    /// table images the kernel addresses. Both are the same for all eight
+    /// blocks, so a producer that walks the eight blocks in several pieces
+    /// resolves them ONCE and hands them to every piece.
+    #[inline(always)]
+    fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
+        let p = self.plan.for_window(blk);
+        (p, round1_ab_table_images(self.inv_table, p))
+    }
+
+    /// [`Self::project`] with the window invariants already resolved, and with
+    /// an optional set of drain rows to publish AS the eight blocks are
+    /// transformed. `rows` is what makes the streaming stores spread: they are
+    /// emitted three per block instead of twenty-four per step, and because
+    /// the publisher lives inside the transform loop it costs no extra call
+    /// and no second copy of the kernel body.
+    ///
+    /// # Safety
+    /// As for [`Self::project`], and `plan`/`imgs` must be this window's
+    /// [`Self::window_prep`]; `rows`, when present, must describe the drain
+    /// step that produced this window's staging.
+    #[inline(never)]
+    unsafe fn project_blocks(
+        &self,
+        blk: usize,
+        plan: Round1AbWindowPlan,
+        imgs: Round1AbTableImages,
+        rows: Option<StepRows>,
+    ) {
+        unsafe {
             let (sa, sb) = self.sides();
-            // Both of these are the same for all eight blocks of this window:
-            // the window's static-B eligibility, and the table images the
-            // kernel addresses. Resolve them here rather than inside every
-            // block's transform.
-            let plan = self.plan.for_window(blk);
-            let imgs = round1_ab_table_images(self.inv_table, plan);
             let live = self.live;
             for j in 0..8usize {
+                // ONE block transformed per THREE lines published: the drain's
+                // streaming stores land ~1/8 of a window apart instead of all
+                // together. Publishing block `j`'s rows before transforming it
+                // is deliberate — the two touch disjoint memory, and this way
+                // the eight-block loop below is untouched.
+                if let Some(rows) = rows {
+                    rows.publish(j, sa, sb);
+                }
                 if live & (1 << j) == 0 {
                     continue;
                 }
@@ -277,6 +315,7 @@ struct Drain8<'t> {
     elide: [bool; 3],
     z_nt: bool,
     wide_nt: bool,
+    spread: bool,
 }
 
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
@@ -418,6 +457,14 @@ fn wide_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_SPREAD_NT=1` restores the bunched drain step (three eight-row
+/// runs of streaming stores, then the whole window's projection).
+fn spread_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -507,6 +554,102 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
         }
         stream_v8(p, va, wide_nt);
         stream_v8(p.add(8), vb, wide_nt);
+    }
+}
+
+/// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
+/// (its high run), under the same `nt`/liveness policy — and therefore with
+/// the same bytes at the same addresses — as [`Drain8::publish_step`]'s body.
+///
+/// # Safety
+/// As for [`stream_pair_v8`] and [`store_v8`].
+#[inline(always)]
+unsafe fn emit_pair(
+    p: *mut u32,
+    lo: V8,
+    hi: V8,
+    lo_live: bool,
+    hi_live: bool,
+    nt: bool,
+    wide_nt: bool,
+) {
+    unsafe {
+        match (nt, lo_live, hi_live) {
+            (true, true, true) => stream_pair_v8(p, lo, hi, wide_nt),
+            (true, true, false) => stream_v8(p, lo, wide_nt),
+            (true, false, true) => stream_v8(p.add(8), hi, wide_nt),
+            (false, true, true) => {
+                store_v8(p, lo);
+                store_v8(p.add(8), hi);
+            }
+            (false, true, false) => store_v8(p, lo),
+            (false, false, true) => store_v8(p.add(8), hi),
+            (_, false, false) => {}
+        }
+    }
+}
+
+/// One drain step's three destination rows, staged for publication BETWEEN
+/// block transforms by [`StreamProj::project_blocks`].
+///
+/// Nothing here is kept in registers across the transform: a's and b's bytes
+/// are already in the projection's own staging (they are its input), and z's
+/// sixteen transposed rows are in the drain's frame, which is where the
+/// bunched arm spills them anyway. The publisher therefore re-reads each row
+/// from L1 and the spread costs no extra spill traffic.
+#[derive(Clone, Copy)]
+struct StepRows {
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    z_lo: *const V8,
+    z_hi: *const V8,
+    /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
+    /// bit 6 z non-temporal, bit 7 wide streaming stores.
+    flags: u8,
+}
+
+impl StepRows {
+    /// Publish block `j`'s three rows.
+    ///
+    /// # Safety
+    /// `self` describes one live drain step and `j < 8`.
+    #[inline(always)]
+    unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
+        unsafe {
+            let f = self.flags;
+            let wide = f & 0x80 != 0;
+            let o = j * U32_PER_BLOCK;
+            emit_pair(
+                self.z.add(o),
+                *self.z_lo.add(j),
+                *self.z_hi.add(j),
+                f & 1 != 0,
+                f & 2 != 0,
+                f & 0x40 != 0,
+                wide,
+            );
+            let p = sa.add(j * STEP_WORDS);
+            emit_pair(
+                self.a.add(o),
+                load_v8(p),
+                load_v8(p.add(8)),
+                f & 4 != 0,
+                f & 8 != 0,
+                true,
+                wide,
+            );
+            let p = sb.add(j * STEP_WORDS);
+            emit_pair(
+                self.b.add(o),
+                load_v8(p),
+                load_v8(p.add(8)),
+                f & 0x10 != 0,
+                f & 0x20 != 0,
+                true,
+                wide,
+            );
+        }
     }
 }
 
@@ -621,6 +764,12 @@ impl Drain8<'_> {
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
             if let Some(proj) = &self.proj {
+                // The live schedule. Everything below it is the bunched
+                // incumbent, kept for `FLOCK_NO_SPREAD_NT=1`.
+                if self.spread {
+                    self.drain_range_spread(proj, base_word, ring_word, words);
+                    return;
+                }
                 let z_g1 = if self.elide[0] {
                     ELIDE_ZERO_CHUNK
                 } else {
@@ -661,6 +810,105 @@ impl Drain8<'_> {
                 return;
             }
             self.drain_range_buffered(base_word, ring_word, words);
+        }
+    }
+
+    /// Same bytes as the bunched arm of [`Self::drain_range`], published on a
+    /// different SCHEDULE.
+    ///
+    /// The bunched form emits all twenty-four of a step's 64-byte streaming
+    /// stores back to back — eight rows 2048 bytes apart, three destinations —
+    /// and then runs ~1000 core-cycles of projection with none. Twenty-four
+    /// lines in ~70 core-cycles is ~8x this core's sustained non-temporal
+    /// write rate, so the write-combining buffers saturate, the streaming
+    /// store at the head of the store buffer cannot retire, and allocation
+    /// stalls behind it (`resource_stalls.sb`).
+    ///
+    /// Here nothing is published until the staging is complete, and then the
+    /// window's eight block transforms publish their OWN three rows as they
+    /// go. Identical addresses, identical bytes, three lines per block instead
+    /// of twenty-four per step — and still exactly one call per step, so the
+    /// spread costs no extra call or spill traffic.
+    #[inline(never)]
+    unsafe fn drain_range_spread(
+        &self,
+        proj: &StreamProj<'_>,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
+            let (sa, sb) = proj.sides();
+            let mut base = 0u8;
+            if self.z_nt {
+                base |= 0x40;
+            }
+            if self.wide_nt {
+                base |= 0x80;
+            }
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+
+                // Transpose all three sides first. a and b go straight into
+                // the projection's staging — which is both its input AND the
+                // bytes the main buffers get, so nothing is published yet.
+                let z_lo = tr8_chunk(self.zs, rw);
+                let z_hi = tr8_chunk(self.zs, rw + 8);
+                let a_lo = tr8_chunk(self.ast, rw);
+                let a_hi = tr8_chunk(self.ast, rw + 8);
+                for r in 0..8 {
+                    let p = sa.add(r * STEP_WORDS);
+                    store_v8(p, a_lo[r]);
+                    store_v8(p.add(8), a_hi[r]);
+                }
+                let b_lo = tr8_chunk(self.bs, rw);
+                let b_hi = tr8_chunk(self.bs, rw + 8);
+                for r in 0..8 {
+                    let p = sb.add(r * STEP_WORDS);
+                    store_v8(p, b_lo[r]);
+                    store_v8(p.add(8), b_hi[r]);
+                }
+
+                let g = abs_word / 8;
+                let mut flags = base;
+                if g < z_g1 {
+                    flags |= 1;
+                }
+                if g + 1 < z_g1 {
+                    flags |= 2;
+                }
+                if g < a_g1 {
+                    flags |= 4;
+                }
+                if g + 1 < a_g1 {
+                    flags |= 8;
+                }
+                if g >= b_g0 && g < b_g1 {
+                    flags |= 0x10;
+                }
+                if g + 1 >= b_g0 && g + 1 < b_g1 {
+                    flags |= 0x20;
+                }
+                let rows = StepRows {
+                    z: self.z.add(abs_word),
+                    a: self.a.add(abs_word),
+                    b: self.b.add(abs_word),
+                    z_lo: z_lo.as_ptr(),
+                    z_hi: z_hi.as_ptr(),
+                    flags,
+                };
+
+                let blk = abs_word / STEP_WORDS;
+                let (plan, imgs) = proj.window_prep(blk);
+                proj.project_blocks(blk, plan, imgs, Some(rows));
+            }
         }
     }
 
@@ -975,6 +1223,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             elide,
             z_nt,
             wide_nt: wide_nt_enabled(),
+            spread: spread_nt_enabled(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
