@@ -127,6 +127,16 @@ pub(crate) fn urm_offw_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_SHRX=1` restores the four widening immediate shifts that
+/// split the two 64-bit offset words of every apply, instead of the 32-bit
+/// halving + `shrx` form (14 GPR ops per apply instead of 10). Identical
+/// value and identical table addresses. Resolved once per process.
+pub(crate) fn urm_shrx_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_SHRX").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -211,6 +221,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     out: &mut [u8; 64],
     nt: u8,
     offw: bool,
+    shrx: bool,
     imgs: (*const u8, *const u8),
 ) {
     use core::arch::x86_64::*;
@@ -239,6 +250,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
 
         let acc = if offw {
+            let _ = shrx;
             horner_2img_offw(imgs, op)
         } else {
             horner_2img_off_narrow(inv_table, op)
@@ -269,6 +281,44 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     target_feature = "avx512bw"
 ))]
 unsafe fn horner_2img_offw(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at_shrx(imgs.0, imgs.1, o)
+        };
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
+        for k in (0..7usize).rev() {
+            let av = apply(op.add(k * 8));
+            let bv = apply(op.add(64 + k * 8));
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        acc
+    }
+}
+
+/// [`horner_2img_offw`] with the eight `u16` offsets split out of the two
+/// 64-bit words by four widening immediate shifts (the incumbent form), out
+/// of line so it does not carry its register allocation into the hot body.
+/// Identical value and identical table addresses.
+/// `FLOCK_NO_URM_SHRX=1` restores it.
+///
+/// # Safety
+/// As for [`horner_2img_offw`].
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+unsafe fn horner_2img_offw_imm(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
@@ -349,6 +399,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     let img2 = urm_apply_2img_enabled() && inv_table.has_second_image();
     let pidx = img2 && urm_pidx_enabled();
     let offw = pidx && urm_offw_enabled();
+    let shrx = offw && urm_shrx_enabled();
     let imgs = if img2 {
         inv_table.image_ptrs()
     } else {
@@ -368,6 +419,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
             img2,
             pidx,
             offw,
+            shrx,
             imgs,
         );
     }
@@ -395,6 +447,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
     img2: bool,
     pidx: bool,
     offw: bool,
+    shrx: bool,
     imgs: (*const u8, *const u8),
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -416,6 +469,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
                 out,
                 nt,
                 offw,
+                shrx,
                 imgs,
             );
         }
