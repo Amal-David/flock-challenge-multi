@@ -474,11 +474,11 @@ impl StreamProj<'_> {
     }
 }
 
-/// Rolling drain state shared by the three packed writers. The witness uses
-/// three reusable `RING_WORDS`-word epochs instead of three full 512-word
-/// stages.
+/// Rolling drain state shared by the A/B packed writers. The witness uses two
+/// reusable `RING_WORDS`-word epochs instead of full 512-word stages; B's
+/// writer flushes after A has written the epoch, and Z is derived from the
+/// transposed A/B rows during that flush.
 struct Drain8<'t> {
-    zs: *mut V8,
     ast: *mut V8,
     bs: *mut V8,
     z: *mut u32,
@@ -874,40 +874,81 @@ impl Drain8<'_> {
         }
     }
 
-    /// Transpose and publish `words` from the current ring epoch at absolute
-    /// `base_word`. `win`, when present, always receives every word even when
-    /// the recyclable main destination elides a constant range.
+    /// Publish one B step and derive the matching Z rows from the already
+    /// transposed A rows. Every R1CS row satisfies `z = a & b`; `tr8` is a
+    /// bit permutation, so the identity is unchanged after transposition.
+    ///
+    /// `a_rows` is the row-major carry written by the immediately preceding
+    /// A `publish_step`. Keeping only B's sixteen results live preserves the
+    /// paired 64-byte NT stores without holding all A and B rows in registers.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_range(
-        stage: *const V8,
-        dst: *mut u32,
-        win: Option<*mut u32>,
-        base_word: usize,
+    unsafe fn publish_b_with_derived_z(
+        b_stage: *const V8,
+        b_dst: *mut u32,
+        b_carry: Option<(*mut u32, usize)>,
+        a_rows: (*const u32, usize),
+        z_dst: *mut u32,
+        abs_word: usize,
         ring_word: usize,
-        words: usize,
-        g0: usize,
-        g1: usize,
-        nt: bool,
+        z_g1: usize,
+        b_g0: usize,
+        b_g1: usize,
+        b_nt: bool,
+        z_nt: bool,
         wide_nt: bool,
     ) {
         unsafe {
-            debug_assert_eq!(base_word % 8, 0);
-            debug_assert_eq!(ring_word % 8, 0);
-            debug_assert_eq!(words % 16, 0);
-            for off in (0..words).step_by(STEP_WORDS) {
-                let abs_word = base_word + off;
-                Self::publish_step(
-                    stage,
-                    dst,
-                    win.map(|w| (w.add(abs_word), U32_PER_BLOCK)),
-                    abs_word,
-                    ring_word + off,
-                    g0,
-                    g1,
-                    nt,
-                    wide_nt,
-                );
+            let b_lo_rows = tr8_chunk(b_stage, ring_word);
+            let b_hi_rows = tr8_chunk(b_stage, ring_word + 8);
+            let g = abs_word / 8;
+            let z_lo_live = g < z_g1;
+            let z_hi_live = g + 1 < z_g1;
+            let b_lo_live = g >= b_g0 && g < b_g1;
+            let b_hi_live = g + 1 >= b_g0 && g + 1 < b_g1;
+
+            for r in 0..8 {
+                let ap = a_rows.0.add(r * a_rows.1);
+                let a_lo = load_v8(ap);
+                let a_hi = load_v8(ap.add(8));
+                let z_lo = and_v8(a_lo, b_lo_rows[r]);
+                let z_hi = and_v8(a_hi, b_hi_rows[r]);
+
+                if let Some((base, row_stride)) = b_carry {
+                    let p = base.add(r * row_stride);
+                    store_v8(p, b_lo_rows[r]);
+                    store_v8(p.add(8), b_hi_rows[r]);
+                }
+
+                let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
+                match (b_nt, b_lo_live, b_hi_live) {
+                    (true, true, true) => {
+                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
+                    }
+                    (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
+                    (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
+                    (false, true, true) => {
+                        store_v8(bp, b_lo_rows[r]);
+                        store_v8(bp.add(8), b_hi_rows[r]);
+                    }
+                    (false, true, false) => store_v8(bp, b_lo_rows[r]),
+                    (false, false, true) => store_v8(bp.add(8), b_hi_rows[r]),
+                    (_, false, false) => {}
+                }
+
+                let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
+                match (z_nt, z_lo_live, z_hi_live) {
+                    (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
+                    (true, true, false) => stream_v8(zp, z_lo, wide_nt),
+                    (true, false, true) => stream_v8(zp.add(8), z_hi, wide_nt),
+                    (false, true, true) => {
+                        store_v8(zp, z_lo);
+                        store_v8(zp.add(8), z_hi);
+                    }
+                    (false, true, false) => store_v8(zp, z_lo),
+                    (false, false, true) => store_v8(zp.add(8), z_hi),
+                    (_, false, false) => {}
+                }
             }
         }
     }
@@ -955,9 +996,6 @@ impl Drain8<'_> {
                     let abs_word = base_word + off;
                     let rw = ring_word + off;
                     Self::publish_step(
-                        self.zs, self.z, None, abs_word, rw, 0, z_g1, self.z_nt, self.wide_nt,
-                    );
-                    Self::publish_step(
                         self.ast,
                         self.a,
                         Some((sa, STEP_WORDS)),
@@ -968,15 +1006,19 @@ impl Drain8<'_> {
                         true,
                         self.wide_nt,
                     );
-                    Self::publish_step(
+                    Self::publish_b_with_derived_z(
                         self.bs,
                         self.b,
                         Some((sb, STEP_WORDS)),
+                        (sa, STEP_WORDS),
+                        self.z,
                         abs_word,
                         rw,
+                        z_g1,
                         b_g0,
                         b_g1,
                         true,
+                        self.z_nt,
                         self.wide_nt,
                     );
                     proj.project(abs_word / STEP_WORDS);
@@ -1030,11 +1072,12 @@ impl Drain8<'_> {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
 
-                // Transpose all three sides first. a and b go straight into
-                // the projection's staging — which is both its input AND the
-                // bytes the main buffers get, so nothing is published yet.
-                let z_lo = tr8_chunk(self.zs, rw);
-                let z_hi = tr8_chunk(self.zs, rw + 8);
+                // Transpose the two ring sides first. a and b go straight
+                // into the projection's staging — which is both its input AND
+                // the bytes the main buffers get, so nothing is published yet.
+                // Every packed row satisfies `z = a & b` and `tr8` is a bit
+                // permutation, so the Z rows are derived from the transposed
+                // A/B rows instead of transposing a third Z ring.
                 let a_lo = tr8_chunk(self.ast, rw);
                 let a_hi = tr8_chunk(self.ast, rw + 8);
                 for r in 0..8 {
@@ -1049,6 +1092,8 @@ impl Drain8<'_> {
                     store_v8(p, b_lo[r]);
                     store_v8(p.add(8), b_hi[r]);
                 }
+                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
+                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
 
                 let g = abs_word / 8;
                 let mut flags = base;
@@ -1098,40 +1143,72 @@ impl Drain8<'_> {
                 DUMP_CHUNKS
             };
             let (a_g1, b_g0, b_g1) = self.ab_ranges();
-
-            Self::publish_range(
-                self.zs,
-                self.z,
-                None,
-                base_word,
-                ring_word,
-                words,
-                0,
-                z_g1,
-                self.z_nt,
-                self.wide_nt,
-            );
-
             match self.win_ab {
                 Some((win_a, win_b)) => {
-                    Self::publish_range(
-                        self.ast, self.a, Some(win_a), base_word, ring_word, words, 0, a_g1, true,
-                        self.wide_nt,
-                    );
-                    Self::publish_range(
-                        self.bs, self.b, Some(win_b), base_word, ring_word, words, b_g0, b_g1, true,
-                        self.wide_nt,
-                    );
+                    for off in (0..words).step_by(STEP_WORDS) {
+                        let abs_word = base_word + off;
+                        let rw = ring_word + off;
+                        Self::publish_step(
+                            self.ast,
+                            self.a,
+                            Some((win_a.add(abs_word), U32_PER_BLOCK)),
+                            abs_word,
+                            rw,
+                            0,
+                            a_g1,
+                            true,
+                            self.wide_nt,
+                        );
+                        Self::publish_b_with_derived_z(
+                            self.bs,
+                            self.b,
+                            Some((win_b.add(abs_word), U32_PER_BLOCK)),
+                            (win_a.add(abs_word), U32_PER_BLOCK),
+                            self.z,
+                            abs_word,
+                            rw,
+                            z_g1,
+                            b_g0,
+                            b_g1,
+                            true,
+                            self.z_nt,
+                            self.wide_nt,
+                        );
+                    }
                 }
                 None => {
-                    Self::publish_range(
-                        self.ast, self.a, None, base_word, ring_word, words, 0, a_g1, false,
-                        self.wide_nt,
-                    );
-                    Self::publish_range(
-                        self.bs, self.b, None, base_word, ring_word, words, b_g0, b_g1, false,
-                        self.wide_nt,
-                    );
+                    let mut a_rows = core::mem::MaybeUninit::<[V8; STEP_WORDS]>::uninit();
+                    let a_rows = a_rows.as_mut_ptr().cast::<u32>();
+                    for off in (0..words).step_by(STEP_WORDS) {
+                        let abs_word = base_word + off;
+                        let rw = ring_word + off;
+                        Self::publish_step(
+                            self.ast,
+                            self.a,
+                            Some((a_rows, STEP_WORDS)),
+                            abs_word,
+                            rw,
+                            0,
+                            a_g1,
+                            false,
+                            self.wide_nt,
+                        );
+                        Self::publish_b_with_derived_z(
+                            self.bs,
+                            self.b,
+                            None,
+                            (a_rows, STEP_WORDS),
+                            self.z,
+                            abs_word,
+                            rw,
+                            z_g1,
+                            b_g0,
+                            b_g1,
+                            false,
+                            self.z_nt,
+                            self.wide_nt,
+                        );
+                    }
                 }
             }
         }
@@ -1393,15 +1470,12 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         ];
 
         let zero = dup_u32(0);
-        let mut zs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
         let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
         let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let zs = zs.as_mut_ptr().cast::<V8>();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 
         let mut drain = Drain8 {
-            zs,
             ast,
             bs,
             z,
@@ -1430,7 +1504,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 or_v8(shr_v8::<31>(chain[k - 1]), shl_v8::<1>(chain[k]))
             };
             let w = 16 + k;
-            store_v8(zs.add(w & (RING_WORDS - 1)) as *mut u32, v);
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
@@ -1445,47 +1518,38 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = shr_v8::<31>(flags);
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wz = W8::at(zs, pending_bit, drain_ptr, false);
         let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
-        // B is pushed after z and a at every site; it alone triggers a band
-        // drain once all three rings contain the completed word.
+        // B is pushed after A at every site; it alone triggers a band drain
+        // once both rings contain the completed word. Z is derived there.
         let mut wb = W8::at(bs, one, drain_ptr, true);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
-                let (t0, l0, r0, c0) = add_carry_parts_v8(state[$la], state[$lb]);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C0, 31, c0);
+                let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                let (a1, l1, r1, c1) = add_carry_parts_v8(t0, m[$mx]);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
+                let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
-                let (c1s, l2, r2, c2) = add_carry_parts_v8(state[$lc], d1);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
+                let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
-                let (t1, l3, r3, c3) = add_carry_parts_v8(a1, b1);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
+                let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                let (a2, l4, r4, c4) = add_carry_parts_v8(t1, m[$my]);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
+                let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
-                let (c2s, l5, r5, c5) = add_carry_parts_v8(c1s, d2);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
+                let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                pushf8!(wz, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
                 state[$la] = a2;
@@ -1523,7 +1587,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         macro_rules! oh {
             ($w:literal) => {{
                 let hv = xor_v8(state[$w + 8], cv_v[$w]);
-                pushf8!(wz, OUT_HI_BASE + 32 * $w, 32, hv);
                 pushf8!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
                 pushf8!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
             }};
@@ -1536,7 +1599,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         oh!(5);
         oh!(6);
         oh!(7);
-        wz.finish();
         wa.finish();
         wb.finish();
 
@@ -1548,7 +1610,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         // the all-zero tail, then publish words 384..511 in one long sweep.
         for w in ZF..U32_PER_BLOCK {
             let i = w & (RING_WORDS - 1);
-            store_v8(zs.add(i) as *mut u32, zero);
             store_v8(ast.add(i) as *mut u32, zero);
             store_v8(bs.add(i) as *mut u32, zero);
         }
@@ -1560,10 +1621,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         // elide/NT/window policy as every rolling band.
         for w in 0..8usize {
             let lo = xor_v8(state[w], state[w + 8]);
-            store_v8(zs.add(w) as *mut u32, cv_v[w]);
             store_v8(ast.add(w) as *mut u32, cv_v[w]);
             store_v8(bs.add(w) as *mut u32, maxv);
-            store_v8(zs.add(8 + w) as *mut u32, lo);
             store_v8(ast.add(8 + w) as *mut u32, lo);
             store_v8(bs.add(8 + w) as *mut u32, maxv);
         }
@@ -1611,6 +1670,49 @@ mod tests {
                     assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
                     assert_eq!(block_len[lane], expected.3);
                     assert_eq!(flags[lane], expected.4);
+                }
+            }
+        }
+    }
+
+    /// Independent algebra/codegen oracle for the production Z derivation.
+    /// The direct path packs `a & b` and then transposes; the new path
+    /// transposes A/B separately and ANDs corresponding row vectors.
+    #[test]
+    fn derived_z_after_tr8_matches_direct_z() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            for case in 0..66usize {
+                let mut a = [[0u32; 8]; 8];
+                let mut b = [[0u32; 8]; 8];
+                for i in 0..8 {
+                    for j in 0..8 {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        a[i][j] = if case == 0 { u32::MAX } else { state as u32 };
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        b[i][j] = if case == 1 { u32::MAX } else { state as u32 };
+                    }
+                }
+                let av: [V8; 8] = core::array::from_fn(|i| load_v8(a[i].as_ptr()));
+                let bv: [V8; 8] = core::array::from_fn(|i| load_v8(b[i].as_ptr()));
+                let zv: [V8; 8] = core::array::from_fn(|i| and_v8(av[i], bv[i]));
+                let direct = tr8(zv[0], zv[1], zv[2], zv[3], zv[4], zv[5], zv[6], zv[7]);
+                let at = tr8(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]);
+                let bt = tr8(bv[0], bv[1], bv[2], bv[3], bv[4], bv[5], bv[6], bv[7]);
+                for row in 0..8 {
+                    let derived = and_v8(at[row], bt[row]);
+                    let mut direct_words = [0u32; 8];
+                    let mut derived_words = [0u32; 8];
+                    store_v8(direct_words.as_mut_ptr(), direct[row]);
+                    store_v8(derived_words.as_mut_ptr(), derived);
+                    assert_eq!(derived_words, direct_words, "case={case} row={row}");
                 }
             }
         }
