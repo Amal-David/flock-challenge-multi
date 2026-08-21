@@ -114,28 +114,28 @@ pub fn small_challenges_ghash() -> [F128; 3] {
 /// The four F_128 medium challenges `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})`.
 /// Caller must place these at `r[k_skip+3..k_skip+7]` for the naive
 /// cross-check.
+///
+/// These are protocol constants, materialized in GHASH limb order so proving
+/// does not repeat four 128-bit Fermat inversions. The structural test below
+/// re-derives them from this formula.
 pub fn medium_challenges_ghash() -> [F128; 4] {
-    let g1 = F128 {
-        lo: 1u64 << 1,
-        hi: 0,
-    }; // γ^1
-    let g2 = F128 {
-        lo: 1u64 << 2,
-        hi: 0,
-    }; // γ^2
-    let g4 = F128 {
-        lo: 1u64 << 4,
-        hi: 0,
-    }; // γ^4
-    let g8 = F128 {
-        lo: 1u64 << 8,
-        hi: 0,
-    }; // γ^8
     [
-        g1 * (F128::ONE + g1).inv(),
-        g2 * (F128::ONE + g2).inv(),
-        g4 * (F128::ONE + g4).inv(),
-        g8 * (F128::ONE + g8).inv(),
+        F128 {
+            lo: 0xffff_ffff_ffff_ff83,
+            hi: 0xffff_ffff_ffff_ffff,
+        },
+        F128 {
+            lo: 0x5555_5555_5555_557f,
+            hi: 0x5555_5555_5555_5555,
+        },
+        F128 {
+            lo: 0xeeee_eeee_eeee_ee9a,
+            hi: 0xeeee_eeee_eeee_eeee,
+        },
+        F128 {
+            lo: 0xd3d3_d3d3_d3d3_d3b9,
+            hi: 0xd3d3_d3d3_d3d3_d3d3,
+        },
     ]
 }
 
@@ -3436,11 +3436,14 @@ mod tests {
     #[test]
     fn small_and_medium_challenges_sanity() {
         // Reach into the constants and verify their structural identities.
-        // Medium: β_i · (1 + γ^{2^{i-1}}) == γ^{2^{i-1}}.
+        // Medium: independently re-derive every materialized β_i through
+        // the original Fermat-inverse formula, then check the defining field
+        // identity as a second oracle.
         let med = medium_challenges_ghash();
         let powers = [1u64 << 1, 1u64 << 2, 1u64 << 4, 1u64 << 8];
         for (i, &p) in powers.iter().enumerate() {
             let g = F128 { lo: p, hi: 0 };
+            assert_eq!(med[i], g * (F128::ONE + g).inv(), "β_{i} literal");
             assert_eq!(med[i] * (F128::ONE + g), g, "β_{i} identity");
         }
 
