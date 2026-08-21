@@ -239,6 +239,75 @@ pub(crate) fn pre_encode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
 }
 
+struct PreEncodeJob {
+    commitment: Commitment,
+    zerocheck: flock_core::zerocheck::ZerocheckProof,
+    lincheck: flock_core::lincheck::LincheckProof,
+    done: std::sync::mpsc::Sender<()>,
+}
+
+/// Completion token for one prefix submitted to the process-lifetime helper.
+pub(crate) struct PreEncodeWait(std::sync::mpsc::Receiver<()>);
+
+impl PreEncodeWait {
+    pub(crate) fn wait(self) {
+        // A disconnected channel means the helper failed before publishing;
+        // `to_bytes` then misses the stash and takes its byte-identical full
+        // encode fallback.
+        let _ = self.0.recv();
+    }
+}
+
+fn pre_encode_worker() -> Option<&'static std::sync::mpsc::Sender<PreEncodeJob>> {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<PreEncodeJob>>> =
+        std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (send, recv) = std::sync::mpsc::channel::<PreEncodeJob>();
+            std::thread::Builder::new()
+                .name("flock-preencode".to_owned())
+                .spawn(move || {
+                    while let Ok(job) = recv.recv() {
+                        stash_pre_encoded_prefix(
+                            &job.commitment,
+                            &job.zerocheck,
+                            &job.lincheck,
+                        );
+                        let _ = job.done.send(());
+                    }
+                })
+                .ok()
+                .map(|_| send)
+        })
+        .as_ref()
+}
+
+/// Queue one prefix on the process-lifetime helper. The ranked worker's
+/// untimed warm-up starts the helper; its measured prove reuses the same OS
+/// thread instead of creating and tearing down another one. Disabled mode,
+/// thread-creation failure, or a worker panic all return/mature as a miss so
+/// publish safely falls back to the incumbent full encode.
+pub(crate) fn pre_encode_prefix_async(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+) -> Option<PreEncodeWait> {
+    if !pre_encode_enabled() {
+        return None;
+    }
+    let worker = pre_encode_worker()?;
+    let (done, wait) = std::sync::mpsc::channel();
+    worker
+        .send(PreEncodeJob {
+            commitment: commitment.clone(),
+            zerocheck: zerocheck.clone(),
+            lincheck: lincheck.clone(),
+            done,
+        })
+        .ok()?;
+    Some(PreEncodeWait(wait))
+}
+
 /// Encode and stash the publish prefix for a prove whose commitment /
 /// zerocheck / lincheck are final. Called by the prover on a detached helper
 /// thread concurrently with the PCS open (tens of µs of alloc + encode
