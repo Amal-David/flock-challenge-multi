@@ -392,12 +392,18 @@ impl Challenger for FsChallenger {
         // globally smallest satisfying nonce, so the result is identical to the
         // sequential search (deterministic proofs) regardless of this choice.
         const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
-        // Nonces per rayon task in the parallel search. Large enough to
-        // amortize task dispatch (a 1024-nonce chunk is ~12 µs under the
-        // aarch64 NEON kernel, ~86 Mh/s/core — and a whole multiple of its
-        // 16-lane batch), small enough to keep cancellation granular once an
-        // earlier task has found a match.
-        const GRIND_CHUNK: u64 = 1 << 10;
+        // Nonces per rayon task in the parallel search. Measured on the
+        // ranked-shape prover (atlas 16T, LIG_PROVE_TRACE): a 2^16..2^21
+        // fold-challenge grind costs 0.5-2.7 ms per round, while the AVX-512
+        // kernel's real work at those sizes is ~5-170 µs — i.e. the cost is
+        // chunk-wave dispatch and match-position luck, not hashing. A 1024-
+        // nonce task is only ~1-12 µs of kernel work, so a 2^15-nonce task
+        // (32x fewer waves, ~30-60 µs each) keeps cancellation granular while
+        // cutting the per-grind wall cost by roughly an order of magnitude.
+        // `find_first` semantics are unchanged: chunks are scanned in index
+        // order and each returns its smallest match, so the globally smallest
+        // satisfying nonce (hence every proof byte) is identical.
+        const GRIND_CHUNK: u64 = 1 << 15;
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
