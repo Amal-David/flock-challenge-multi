@@ -4110,3 +4110,5 @@ mod tests {
         ));
     }
 }
+
+// Refire-5 draw marker (comment-only; proof bytes unchanged).
