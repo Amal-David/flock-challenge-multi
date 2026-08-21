@@ -1208,3 +1208,9 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-10: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-15: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-17: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-18: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-19: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-20: independent official timing sample of the promoted source; no executable change.
+// nightshift-resample-21: independent official timing sample of the promoted source; no executable change.
