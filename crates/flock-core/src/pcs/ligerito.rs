@@ -1783,6 +1783,38 @@ pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     sks_vks
 }
 
+struct StandardSksVksTables {
+    values: Vec<F128>,
+    inverses: Vec<F128>,
+}
+
+static STANDARD_SKS_VKS_TABLES: [std::sync::OnceLock<StandardSksVksTables>; 64] =
+    [const { std::sync::OnceLock::new() }; 64];
+
+#[inline]
+fn invert_sks_vks(sks_vks: &[F128]) -> Vec<F128> {
+    sks_vks
+        .iter()
+        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+        .collect()
+}
+
+/// Return the standard-basis values and their inverses for `log_n`.
+///
+/// Both tables depend only on `log_n`. The ranked worker runs a full untimed
+/// proof before publishing readiness, so its measured proofs take only the
+/// `OnceLock` read path at the dense recursion levels.
+fn standard_sks_vks_tables(log_n: usize) -> &'static StandardSksVksTables {
+    STANDARD_SKS_VKS_TABLES
+        .get(log_n)
+        .expect("standard basis only supports log_n < 64")
+        .get_or_init(|| {
+            let values = eval_sk_at_vks(log_n);
+            let inverses = invert_sks_vks(&values);
+            StandardSksVksTables { values, inverses }
+        })
+}
+
 /// Write into `basis` the **normalized** LCH novel-basis polynomials
 /// `X̂_j(x) = Π_{k: bit_k(j)=1} Ŵ_k(x)` for `j ∈ [0, 2^log_n)`, each scaled by
 /// `alpha`. `Ŵ_k = s_k / s_k(v_k)` is normalized to match Flock's NTT twiddles.
@@ -2041,6 +2073,28 @@ pub(crate) fn induce_sumcheck_poly(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
+    let inv_sks_vks = invert_sks_vks(sks_vks);
+    induce_sumcheck_poly_with_inverses(
+        log_msg_cols,
+        sks_vks,
+        &inv_sks_vks,
+        opened_rows,
+        v_challenges,
+        queries,
+        alpha,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn induce_sumcheck_poly_with_inverses(
+    log_msg_cols: usize,
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    opened_rows: &[Vec<F128>],
+    v_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+) -> (Vec<F128>, F128) {
     use rayon::prelude::*;
     let n = 1usize << log_msg_cols;
     let n_queries = queries.len();
@@ -2066,12 +2120,6 @@ pub(crate) fn induce_sumcheck_poly(
         debug_assert!(table.len() >= n_queries);
         table.into_iter().take(n_queries).collect()
     };
-
-    // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -2109,7 +2157,7 @@ pub(crate) fn induce_sumcheck_poly(
                     &mut sks_at_x,
                     &mut local_basis,
                     sks_vks,
-                    &inv_sks_vks,
+                    inv_sks_vks,
                     q_field,
                     ap,
                 );
@@ -2727,6 +2775,16 @@ fn induce_lazy_sks_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_INDUCE_SKS_CACHE=1` restores rebuilding the standard dense-arm
+/// basis values and their inverses on every proof. The cache contains protocol
+/// constants indexed only by `log_msg_cols`; custom tables still take the
+/// uncached [`induce_sumcheck_poly`] path.
+fn induce_sks_cache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_INDUCE_SKS_CACHE").is_none());
+    *ON
+}
+
 /// Crossover constant `C` in the [`induce_sumcheck_poly_auto`] dispatch rule
 /// `n_queries > C · 2^log_inv_rate · log_block`.
 ///
@@ -2766,22 +2824,39 @@ pub(crate) fn induce_sumcheck_poly_auto(
             alpha,
         )
     } else {
-        let computed;
-        let sks_vks = match sks_vks {
-            Some(table) => table,
-            None => {
-                computed = eval_sk_at_vks(log_msg_cols);
-                &computed
+        match sks_vks {
+            Some(table) => induce_sumcheck_poly(
+                log_msg_cols,
+                table,
+                opened_rows,
+                v_challenges,
+                queries,
+                alpha,
+            ),
+            None if induce_sks_cache_enabled() => {
+                let tables = standard_sks_vks_tables(log_msg_cols);
+                induce_sumcheck_poly_with_inverses(
+                    log_msg_cols,
+                    &tables.values,
+                    &tables.inverses,
+                    opened_rows,
+                    v_challenges,
+                    queries,
+                    alpha,
+                )
             }
-        };
-        induce_sumcheck_poly(
-            log_msg_cols,
-            sks_vks,
-            opened_rows,
-            v_challenges,
-            queries,
-            alpha,
-        )
+            None => {
+                let computed = eval_sk_at_vks(log_msg_cols);
+                induce_sumcheck_poly(
+                    log_msg_cols,
+                    &computed,
+                    opened_rows,
+                    v_challenges,
+                    queries,
+                    alpha,
+                )
+            }
+        }
     }
 }
 
@@ -9191,6 +9266,47 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_sks_vks_cache_matches_dynamic_under_race() {
+        // Use a slot outside the shipped profiles so this test owns the first
+        // initialization even when the test runner executes the suite in
+        // parallel. All workers are released together to exercise OnceLock's
+        // racing initializer/readers.
+        const RACE_LOG_N: usize = 31;
+        const N_THREADS: usize = 16;
+        let barrier = std::sync::Barrier::new(N_THREADS);
+        let pointers = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(N_THREADS);
+            for _ in 0..N_THREADS {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    standard_sks_vks_tables(RACE_LOG_N) as *const StandardSksVksTables as usize
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("cache worker must not panic"))
+                .collect::<Vec<_>>()
+        });
+        assert!(pointers.iter().all(|&pointer| pointer == pointers[0]));
+
+        for &log_n in &[0usize, 1, 7, 10, RACE_LOG_N] {
+            let cached = standard_sks_vks_tables(log_n);
+            let dynamic = eval_sk_at_vks(log_n);
+            let dynamic_inverses = invert_sks_vks(&dynamic);
+            assert_eq!(cached.values.as_slice(), dynamic.as_slice());
+            assert_eq!(cached.inverses.as_slice(), dynamic_inverses.as_slice());
+            for (&value, &inverse) in cached.values.iter().zip(&cached.inverses) {
+                if value.is_zero() {
+                    assert_eq!(inverse, F128::ZERO);
+                } else {
+                    assert_eq!(value * inverse, F128::ONE);
+                }
+            }
+        }
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
