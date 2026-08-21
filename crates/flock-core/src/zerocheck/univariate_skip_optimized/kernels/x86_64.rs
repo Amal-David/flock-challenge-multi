@@ -118,6 +118,16 @@ pub(crate) fn urm_pidx_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_OFF_ARENA=1` restores the incumbent in-kernel offset
+/// prologue in the shift-reduce AB kernel (and disables the producer-side
+/// fused offset arena that feeds the split consume body). Resolved once per
+/// process.
+pub(crate) fn urm_off_arena_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFF_ARENA").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
 /// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
 /// 64-bit reads split with shifts. Resolved once per process.
@@ -243,6 +253,68 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         } else {
             horner_2img_off_narrow(inv_table, op)
         };
+        store_out64(out, acc, nt);
+    }
+}
+
+/// The pre-scaled-offset PROLOGUE of
+/// [`shift_reduce_inner_ab_x86_avx512_pidx`] alone: widen the window's
+/// 128 a/b bytes to `u16` and multiply by the row stride 64, into a
+/// caller-owned 128-`u16` block. Identical stores to the incumbent body's
+/// stack staging; splitting it out lets a producer build several blocks'
+/// offsets BEFORE any consume, so the consuming loads never sit in the
+/// shadow of their own ZMM stores.
+///
+/// # Safety
+/// 64 readable bytes at `a0` and `b0`; `op` is 64-byte aligned with 128
+/// writable `u16`s.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8, op: *mut u16) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        let scale = |p: *const u8| {
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
+        };
+        _mm512_store_si512(op as *mut __m512i, scale(a0));
+        _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
+        _mm512_store_si512(op.add(64) as *mut __m512i, scale(b0));
+        _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
+    }
+}
+
+/// The CONSUME half of [`shift_reduce_inner_ab_x86_avx512_pidx`] (two-image
+/// wide-read Horner + terminal store), fed from offsets prebuilt by
+/// [`shift_reduce_ab_offsets_build`]. Bit-identical output: identical table
+/// addresses, identical arithmetic, identical store class.
+///
+/// # Safety
+/// `op` holds this window-block's 128 pre-scaled offsets; `imgs` are the
+/// table's base and σ₈ image pointers; `out`/`nt` as for [`store_out64`].
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
+    op: *const u16,
+    out: &mut [u8; 64],
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        let acc = horner_2img_offw(imgs, op);
         store_out64(out, acc, nt);
     }
 }

@@ -593,7 +593,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0>(
+            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -603,7 +603,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 0,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0>(
+            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -636,7 +636,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H>(
+            butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -646,7 +646,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 pf_r,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H>(
+            butterfly_fused_4layer_row_impl::<true, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -659,11 +659,72 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     }
 }
 
+/// Shape-monomorphized [`butterfly_fused_4layer_row_pf`] for the recurring
+/// deep-pass geometries: `S16` (`sixteenth`) and `NN` (`num_ntts`) become
+/// compile-time constants, so the sixteen strided row addresses collapse to
+/// one base register plus constant displacements. The generic kernel's
+/// register pressure forces those sixteen pointers to the stack and reloads
+/// them every lane step (a fifth of its cycle samples on the production
+/// profile); the shaped form deletes that traffic without touching the
+/// butterfly body — same kernel, same element order, bit-identical stores.
+/// `H = 0` runs un-hinted and ignores `pf_r`.
+///
 /// # Safety
-/// Same contract as [`butterfly_fused_4layer_row`].
+/// Same contract as [`butterfly_fused_4layer_row_pf`], with
+/// `sixteenth == S16` and `num_ntts == NN`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
+    const S16: usize,
+    const NN: usize,
+    const H: u8,
+>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract; S16/NN substitute equal runtime
+    // values in the same impl body (a distinct monomorphization).
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+                ptr,
+                S16,
+                NN,
+                active_lanes,
+                r,
+                twiddles,
+                pf_r,
+            )
+        } else {
+            butterfly_fused_4layer_row_impl::<true, H, S16, NN>(
+                ptr,
+                S16,
+                NN,
+                active_lanes,
+                r,
+                twiddles,
+                pf_r,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]. `S16`/`NN` are either 0
+/// (use the runtime `sixteenth`/`num_ntts`) or the exact runtime values (the
+/// shaped wrappers): distinct constants force a distinct monomorphization, so
+/// the shaped forms get compile-time address arithmetic even though the
+/// ninety-line body is never inlined into its wrapper.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
+unsafe fn butterfly_fused_4layer_row_impl<
+    const DIET: bool,
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
@@ -673,6 +734,12 @@ unsafe fn butterfly_fused_4layer_row_impl<const DIET: bool, const H: u8>(
     pf_r: usize,
 ) {
     use core::arch::x86_64::*;
+
+    // Shape substitution: a compile-time constant when the wrapper pins one
+    // (S16/NN nonzero), the runtime argument otherwise. The wrappers only
+    // pin values equal to the runtime shape, so this is the identity.
+    let sixteenth = if S16 != 0 { S16 } else { sixteenth };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
@@ -793,18 +860,53 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // precondition for `twiddles[1..]` by inspection of the values.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
-            (true, false) => {
-                butterfly_fused_3layer_rows_impl::<false, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (true, true) => {
-                butterfly_fused_3layer_rows_impl::<false, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, false) => {
-                butterfly_fused_3layer_rows_impl::<true, false>(ptr, num_ntts, dense_lanes, twiddles)
-            }
-            (false, true) => {
-                butterfly_fused_3layer_rows_impl::<true, true>(ptr, num_ntts, dense_lanes, twiddles)
-            }
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            ),
+        }
+    }
+}
+
+/// Shape-monomorphized [`butterfly_fused_3layer_rows`] (`num_ntts == NN`):
+/// the eight consecutive row addresses become base-plus-constant
+/// displacements. Same body, same element order, bit-identical stores.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_rows`], with `num_ntts == NN`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
+    ptr: *mut F128,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
+    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
+    // precondition for `twiddles[1..]` by inspection of the values, and NN
+    // substitutes an equal runtime value in the same impl body.
+    unsafe {
+        match (mul_diet_disabled(), low_inner) {
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN>(
+                ptr, NN, dense_lanes, twiddles,
+            ),
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN>(
+                ptr, NN, dense_lanes, twiddles,
+            ),
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN>(
+                ptr, NN, dense_lanes, twiddles,
+            ),
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, NN>(
+                ptr, NN, dense_lanes, twiddles,
+            ),
         }
     }
 }
@@ -820,16 +922,26 @@ fn low_twiddle_fused3_disabled() -> bool {
 }
 
 /// # Safety
-/// Same contract as [`butterfly_fused_3layer_rows`].
+/// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
+/// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
+/// a distinct constant forces a distinct monomorphization with compile-time
+/// row addressing.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_3layer_rows_impl<const DIET: bool, const LOW_INNER: bool>(
+unsafe fn butterfly_fused_3layer_rows_impl<
+    const DIET: bool,
+    const LOW_INNER: bool,
+    const NNC: usize,
+>(
     ptr: *mut F128,
     num_ntts: usize,
     dense_lanes: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::x86_64::*;
+
+    // Shape substitution (identity: the wrapper only pins the runtime value).
+    let num_ntts = if NNC != 0 { NNC } else { num_ntts };
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
@@ -1042,16 +1154,16 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false>(
+                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true>(
+                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false>(
+                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true>(
+                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
                             got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
                         ),
                     }
@@ -1322,7 +1434,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0>(
+                        butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -1332,7 +1444,7 @@ mod diet_tests {
                             0,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0>(
+                        butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,

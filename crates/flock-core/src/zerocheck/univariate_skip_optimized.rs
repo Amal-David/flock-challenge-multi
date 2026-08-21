@@ -995,6 +995,98 @@ pub unsafe fn round1_ab_inner_window_with_images(
     );
 }
 
+/// `u16` count of one window-block's pre-scaled offset block for
+/// [`round1_ab_inner_window_from_offsets`].
+pub const ROUND1_AB_OFF_WORDS: usize = 128;
+
+impl Round1AbWindowPlan {
+    /// True when [`round1_ab_inner_window_from_offsets`] may replace
+    /// [`round1_ab_inner_window_with_images`] for window `blk` under this
+    /// plan (the x86 pidx+offw body on a non-static-B window). The split
+    /// form is bit-identical there.
+    #[inline]
+    pub fn offsets_eligible(&self, blk: usize) -> bool {
+        kernels::shift_reduce_offsets_eligible(self.kernel, self.bstatic.is_some(), blk)
+    }
+}
+
+/// Build one window-block's [`ROUND1_AB_OFF_WORDS`] pre-scaled `u16` offsets
+/// from its packed a/b window bytes — the prologue of the pidx kernel, split
+/// out so a producer can build several blocks' offsets before consuming any.
+///
+/// # Safety
+/// `off` must be 64-byte aligned. Only meaningful when a plan's
+/// [`Round1AbWindowPlan::offsets_eligible`] holds (x86 AVX-512+GFNI builds).
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_window_offsets(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    off: &mut [u16; ROUND1_AB_OFF_WORDS],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_ab_offsets_build(
+            a_window.as_ptr(),
+            b_window.as_ptr(),
+            off.as_mut_ptr(),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
+}
+
+/// [`round1_ab_inner_window_with_images`] fed from offsets prebuilt by
+/// [`round1_ab_window_offsets`]. Bit-identical bytes whenever
+/// `plan.offsets_eligible(blk)` — identical table addresses, arithmetic and
+/// store class; the only difference is WHEN the offset stores happen.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_with_images`], with `off` built from this
+/// window-block's a/b bytes and `plan.offsets_eligible(blk)` true.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off(
+            off.as_ptr(),
+            out,
+            plan.nt,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
