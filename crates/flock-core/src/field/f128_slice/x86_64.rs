@@ -145,7 +145,7 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
 /// is folding, in F128 elements. `FLOCK_NO_FOLD16_PF=1` removes the hints
 /// (they move no data of their own and change no value, so the fold is
 /// byte-identical either way); `FLOCK_FOLD16_PF=<n>` overrides the distance.
-const FOLD16_PF_AHEAD: usize = 512;
+const FOLD16_PF_AHEAD: usize = 2048;
 
 fn fold16_pf_ahead() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
