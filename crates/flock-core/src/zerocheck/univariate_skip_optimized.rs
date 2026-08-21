@@ -2573,6 +2573,22 @@ fn zc_r1ab_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_FIRST_WRITE=1` restores the per-band plane-bank clear
+/// and load/XOR first visit. The default arm is used only when every padding
+/// window is live, which proves that `w_idx == 0` overwrites each bank before
+/// any later visit or the band-end collapse can read it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1ab_first_write_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_FIRST_WRITE").is_none());
+    *ON
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2606,15 +2622,22 @@ fn process_one_x_hi_ab_only(
     eq_hi_val: F128,
     convert: &[F128],
     eq_fold: Option<(&[F128], &[u64], usize)>,
+    plane_first_write: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
+    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
     if let Some((eq_bot, _, _)) = eq_fold {
         let plane_len = eq_bot.len() * 16 * ELL;
         if state.plane_banks.len() != plane_len {
-            state.plane_banks.clear();
-            state.plane_banks.resize(plane_len, 0);
-        } else {
+            state.plane_banks = if plane_first_write {
+                // Every byte is overwritten by the `w_idx == 0` visits below
+                // before the vector is read; see the function-level guard.
+                crate::alloc_uninit_vec(plane_len)
+            } else {
+                vec![0u8; plane_len]
+            };
+        } else if !plane_first_write {
             state.plane_banks.fill(0);
         }
     }
@@ -2709,12 +2732,21 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            kernels::accumulate_convert_ab_nomul_gfni(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                mats_w,
-                bank,
-            );
+            if plane_first_write && w_idx == 0 {
+                kernels::write_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            } else {
+                kernels::accumulate_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            }
         } else {
             kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,
@@ -2842,6 +2874,22 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
         (eq_bot, mats, bank_bits)
     });
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let plane_first_write = eq_fold_state.is_some()
+        && zc_r1ab_first_write_enabled()
+        && b_med_counts.iter().all(|&count| count != 0);
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let plane_first_write = false;
     let res_ab = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
@@ -2872,6 +2920,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 eq.hi[x_hi],
                 convert,
                 eq_fold_arg,
+                plane_first_write,
                 &mut state,
             );
             state
@@ -3151,6 +3200,54 @@ mod tests {
                 seq,
                 "corrupted scale went undetected n_w={n_w}"
             );
+        }
+    }
+
+    /// A first-visit bank overwrite must equal the incumbent accumulate into
+    /// a zeroed bank for every supported medium-row count. Poisoning the
+    /// destination catches any accidental read or partial write.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn ab_eq_fold_first_write_matches_zeroed_accumulate() {
+        let mut word = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            word
+        };
+        let mut chunk_ab_bytes = [[0u8; ELL]; 1 << N_MEDIUM];
+        for row in &mut chunk_ab_bytes {
+            for byte in row {
+                *byte = next() as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for matrix in &mut mats {
+            *matrix = next();
+        }
+
+        for n_b_med in 1..=1 << N_MEDIUM {
+            let mut incumbent = [0u8; 16 * ELL];
+            let mut first_write = [0xA5u8; 16 * ELL];
+            kernels::accumulate_convert_ab_nomul_gfni(
+                &chunk_ab_bytes,
+                n_b_med,
+                &mats,
+                &mut incumbent,
+            );
+            kernels::write_convert_ab_nomul_gfni(
+                &chunk_ab_bytes,
+                n_b_med,
+                &mats,
+                &mut first_write,
+            );
+            assert_eq!(first_write, incumbent, "n_b_med={n_b_med}");
         }
     }
 

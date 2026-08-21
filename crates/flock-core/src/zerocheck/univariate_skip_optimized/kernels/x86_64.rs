@@ -1297,6 +1297,60 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
+    // SAFETY: forwarded unchanged to the shared target-feature body; this
+    // arm preserves and XOR-accumulates the bank's existing planes.
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_impl::<false>(
+            chunk_ab_bytes,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// First-visit twin of [`accumulate_convert_ab_nomul_x86_gfni`]. The caller
+/// proves that every plane in `bank_planes` is dead, so the sixteen output
+/// chains start from register zero and overwrite all 1 KiB without loading it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    // SAFETY: forwarded unchanged to the shared target-feature body; the
+    // caller's write-before-read proof permits the overwrite specialization.
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+            chunk_ab_bytes,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     // SAFETY: the fixed-size input/plane arrays contain every 64-byte load
@@ -1309,7 +1363,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
             let mut bm = 0;
             // Two GFNI products fold into the accumulator per VPTERNLOGQ
             // (imm 0x96 = a ^ b ^ c); sixteen independent plane chains keep
