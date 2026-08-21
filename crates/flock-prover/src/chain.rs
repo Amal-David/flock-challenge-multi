@@ -697,3 +697,4 @@ mod tests {
         assert_eq!(res, Err(ChainError::SumcheckFinal));
     }
 }
+// refire-21: comment-only resample of d02e467 (f988484 promoted 1391175.32)
