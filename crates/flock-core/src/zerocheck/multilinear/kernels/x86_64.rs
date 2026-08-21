@@ -1059,6 +1059,18 @@ pub(crate) fn zc_r2_bcast_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R34_BCAST=1` restores the plane network of the composed
+/// rounds-3+4 prefold (`gfni_fold64_rows_masked_c4`) in place of the
+/// broadcast factorisation (`gfni_fold64_rows_masked_c4_bcast`). Exact
+/// same-binary A/B: the two emit byte-identical caches from the same 128
+/// affine products, only the data movement differs (76 port-5 shuffles and
+/// 76 XOR-class ops per call against 32 and 64).
+pub(crate) fn zc_r34_bcast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R34_BCAST").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
 /// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
 /// same-binary A/B; prefetch is architecturally invisible).
@@ -1500,6 +1512,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
         let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        // Resolved once per worker chunk, never inside the refill loop.
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let c4_bcast = use_c4 && zc_r34_bcast_enabled();
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1528,18 +1543,33 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     );
                     if use_c4 {
                         let c = cfold.unwrap();
-                        gfni_fold64_rows_masked_c4(
-                            a_pkt.add(4 * xg * 8),
-                            c,
-                            fa.as_mut_ptr(),
-                            dead,
-                        );
-                        gfni_fold64_rows_masked_c4(
-                            b_pkt.add(4 * xg * 8),
-                            c,
-                            fb.as_mut_ptr(),
-                            dead,
-                        );
+                        if c4_bcast {
+                            gfni_fold64_rows_masked_c4_bcast(
+                                a_pkt.add(4 * xg * 8),
+                                c,
+                                fa.as_mut_ptr(),
+                                dead,
+                            );
+                            gfni_fold64_rows_masked_c4_bcast(
+                                b_pkt.add(4 * xg * 8),
+                                c,
+                                fb.as_mut_ptr(),
+                                dead,
+                            );
+                        } else {
+                            gfni_fold64_rows_masked_c4(
+                                a_pkt.add(4 * xg * 8),
+                                c,
+                                fa.as_mut_ptr(),
+                                dead,
+                            );
+                            gfni_fold64_rows_masked_c4(
+                                b_pkt.add(4 * xg * 8),
+                                c,
+                                fb.as_mut_ptr(),
+                                dead,
+                            );
+                        }
                     } else {
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
@@ -2285,10 +2315,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     }
 }
 
-/// Per-residue matrix set for [`gfni_fold64_rows_masked_c4`].
-///
-/// Entry `j * 16 + k` is the ZMM of eight 8×8 GF(2) matrices the batch feeds
-/// `vgf2p8affineqb` for input chunk `j`, output byte `k`; qword `i` carries
 /// 64-byte-aligned backing for the per-worker prefold caches `fa`/`fb`:
 /// every refill store and every consume load of these buffers is ZMM-wide,
 /// and `[F128; 64]`'s natural 16-byte alignment lets those 64-byte accesses
@@ -2297,14 +2323,30 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
 #[repr(C, align(64))]
 struct FoldCache([F128; 64]);
 
-/// the matrix of residue `i / 2` (the layout [`SIGMA_C4`] produces).
+/// Per-residue matrix set for [`gfni_fold64_rows_masked_c4`], in both of the
+/// layouts the two factorisations of that map consume.
+///
+/// `.0` is the **plane** layout: entry `j * 16 + k` is the ZMM of eight 8×8
+/// GF(2) matrices the batch feeds `vgf2p8affineqb` for input chunk `j`,
+/// output byte `k`, with qword `i` carrying the matrix of residue `i / 2`
+/// (the layout [`SIGMA_C4`] produces) — matrix along the qwords, row along
+/// the bytes of a materialised chunk plane.
+///
+/// `.1` is the **broadcast** layout of the same 512 matrices with the two
+/// axes exchanged: entry `32 * h + 8 * a + j` is the ZMM whose qword `k`
+/// carries the matrix of residue `a`, input chunk `j`, output byte
+/// `8 * h + k`. Folded against a broadcast octet of eight same-residue rows
+/// it yields output-byte index along the qwords and row along the bytes, so
+/// neither the chunk planes nor the output byte planes are ever built. Only
+/// 64 of the 128 entries exist because the residue no longer has to be
+/// replicated down the qwords — 4 KiB of matrices per call instead of 8.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[repr(C, align(64))]
-pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128]);
+pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128], pub(crate) [[u64; 8]; 64]);
 
 /// [`build_row_fold_mats`] for the table scaled by `c`.
 ///
@@ -2355,12 +2397,23 @@ fn build_row_fold_mats_scaled(data: &[F128], c: F128) -> [u64; 128] {
 #[allow(dead_code)]
 pub(crate) fn build_cfold_mats(data: &[F128], coeffs: [F128; 4]) -> CFoldMats {
     let per: [[u64; 128]; 4] = std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]));
-    let mut out = CFoldMats([[0u64; 8]; 128]);
+    let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
     for idx in 0..128 {
         for i in 0..8 {
             // Qword `i` of the affine operand serves qword `i` of the plane,
             // whose eight rows all carry residue `i / 2` after `SIGMA_C4`.
             out.0[idx][i] = per[i / 2][idx];
+        }
+    }
+    // Broadcast layout: one ZMM per (output-byte half `h`, residue `a`,
+    // input chunk `j`), qword `k` = the matrix of output byte `8 * h + k`.
+    for a in 0..4 {
+        for j in 0..8 {
+            for h in 0..2 {
+                for k in 0..8 {
+                    out.1[32 * h + 8 * a + j][k] = per[a][16 * j + 8 * h + k];
+                }
+            }
         }
     }
     out
@@ -2544,6 +2597,189 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
         _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
         _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
+    }
+}
+
+/// [`gfni_fold64_rows_masked_c4`] through the **broadcast factorisation** of
+/// the same composed map — byte-identical output, 32 port-5 shuffles and 64
+/// XOR-class ops per call instead of 76 and 76.
+///
+/// The map is `out[t] = XOR_a coeffs[a] · fold(row 4·t + a)`, i.e. one fixed
+/// GF(2)-linear `L_a : GF(2)^64 → GF(2)^128` per residue `a = r mod 4`,
+/// applied to sixteen rows each, with the four residues XOR-reduced. Every
+/// affine of the plane form uses a matrix that varies **down the qwords**
+/// (residue) and is constant across the bytes (row), which is exactly what
+/// forces the eight chunk planes to be materialised — two 8×8 qword
+/// transposes and the [`SIGMA_C4`] regroup, 40 shuffles — and then forces
+/// the residue reduction to be paid separately in the plane domain (24 more
+/// shuffles and 12 XOR-class ops).
+///
+/// But `vgf2p8affineqb` selects its matrix per **qword** and its operand per
+/// **byte**. Broadcast the octet `(chunk j of the eight rows 32h+4t+a)` —
+/// eight rows that all share residue `a`, so they all want the same matrix
+/// set — into all eight qwords, and fold it against the ZMM
+/// `.1[32·h' + 8·a + j]` whose qword `k` already holds `M[a][j][8h'+k]`: one
+/// instruction yields that chunk's contribution to eight output bytes, with
+/// **output-byte index along the qwords and row along the bytes**. Neither
+/// the chunk planes nor the output byte planes are ever built, and the four
+/// residues land in the *same* accumulator, so the reduction is absorbed
+/// into the one XOR tree that has to run anyway and costs nothing at all.
+///
+/// The price is that a same-residue octet spans four input lines (each holds
+/// only two rows of each residue), so the free `_tr`-style single `vpermb`
+/// becomes a two-level qword gather: 16 `vpermt2q` + 8 `vpermb` in. Per call
+/// the ledger is 128 `vgf2p8affineqb` (port 0, the algebraic floor: 64 rows ×
+/// 8 chunks × 16 output bytes / 64 byte-products per affine), 32 port-5
+/// shuffles, and 64 `vpternlogq`/`vpxorq` (either port) — 224 uops with an
+/// optimal split of 128/96, against 280 with an optimal split of 140/140.
+///
+/// Emitted: 16 `vpermt2q` + 8 `vpermb` + 8 stores in, then 2 × (32
+/// `vpbroadcastq` load-port broadcasts, 64 `vgf2p8affineqb`, 32 XOR-class),
+/// then 4 `vpermb`/`vpermt2q` and 4 stores out.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_c4`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees 64 readable bytes at
+    // `rows.add(64 * i)` for every line not marked dead and 16 writable
+    // `F128`s at `out`; the scratch is a local 512-byte array written and
+    // read in full; every shuffle index is in range and the cfg gate
+    // supplies each intrinsic.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        }
+
+        // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        // 64-byte aligned so each ZMM spill is one line and each broadcast
+        // read of it is one load uop.
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = Octs([0u64; 64]);
+        let op = octs.0.as_mut_ptr();
+
+        // ---- gather, both halves, BEFORE any affine ------------------------
+        // One half = rows 32h..32h+32 = super-rows 8h..8h+8, whose four
+        // residue octets are gathered from exactly these four lines: each
+        // line holds only two rows of each residue, so a same-residue octet
+        // spans four of them and the `_tr`-style single `vpermb` becomes a
+        // two-level qword gather. Both halves are gathered up front so all
+        // eight input lines die before the affine passes open and the live
+        // set there is eight broadcasts plus four accumulators.
+        let gather = |h: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+            // Stage-1: qwords `{a, a + 4}` of two lines, the only two rows of
+            // residue `a` each line holds.
+            let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+            let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+            // Stage-2: the two 256-bit halves of a residue pair.
+            let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+            let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+            let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+            let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+            let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+            let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+            let base = op.add(32 * h);
+            // `oct[a].qword[j]` = chunk `j` of rows 32h+4t+a, t = 0..8.
+            let oct = |a: usize, v: __m512i| {
+                _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, _mm512_permutexvar_epi8(bt, v))
+            };
+            oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
+            oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
+            oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
+            oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+        };
+        gather(0, z[0], z[1], z[2], z[3]);
+        gather(1, z[4], z[5], z[6], z[7]);
+
+        // OPAQUE READ POINTER, AND IT IS LOAD-BEARING. Left transparent,
+        // LLVM forwards the eight stores straight back into the sixty-four
+        // qword reads and lowers every broadcast as `vpermq zmm, zmm, zmm` —
+        // a PORT-5 register broadcast — which puts 64 shuffles back on the
+        // port this factorisation exists to unload, and spills the live set
+        // on top. Hiding the address forces the round trip, so each
+        // broadcast is `vpbroadcastq zmm, m64` on the load ports (2/3/10)
+        // and costs nothing on port 5.
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = m.1.as_ptr() as *const u64;
+        let dst = out as *mut __m512i;
+
+        // ---- affine + reduce, one half at a time ---------------------------
+        let pass = |h: usize| {
+            // OPAQUE MATRIX BASE, per pass. The two passes read the same 64
+            // matrix ZMMs, so a transparent base lets LLVM common them up,
+            // hold all 64 live across both passes, and spill the whole 4 KiB
+            // table to the stack — 86 spill stores per call and every affine
+            // demoted to a register operand. Per-pass opacity keeps each
+            // affine's matrix as its own `m512` memory operand, which is
+            // free: the load rides the affine's own uop pair.
+            let mp = core::hint::black_box(mp);
+            // Residue `a`, output-byte half `hh`: eight affines reduce to the
+            // pair `(v2, v3)`, and the running pair absorbs it in one more
+            // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
+            // 32-input tree, with the four-residue reduction inside it.
+            let mut accp = [_mm512_setzero_si512(); 2];
+            let mut accq = [_mm512_setzero_si512(); 2];
+            for a in 0..4usize {
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(32 * h + 8 * a + j) as i64));
+                for hh in 0..2usize {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(
+                                mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i,
+                            ),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    if a == 0 {
+                        accp[hh] = v2;
+                        accq[hh] = v3;
+                    } else {
+                        accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
+                        accq[hh] = v3;
+                    }
+                }
+            }
+            // `r{0,1}.byte[8k + t]` = output byte `8·hh + k` of super-row
+            // 8h+t; the byte transpose turns that into qword `t` = one half
+            // of `out[8h + t]`, and the interleave rebuilds the `F128`s.
+            let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+            let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+            let a0 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[0], accq[0]));
+            let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
+            _mm512_storeu_si512(dst.add(2 * h), _mm512_permutex2var_epi64(a0, il_lo, a1));
+            _mm512_storeu_si512(dst.add(2 * h + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+        };
+        pass(0);
+        pass(1);
     }
 }
 
