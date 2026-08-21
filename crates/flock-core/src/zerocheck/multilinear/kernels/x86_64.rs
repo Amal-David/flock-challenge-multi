@@ -215,6 +215,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Regfold arm selector, resolved once per worker chunk (never
+        // inside the refill / message loops).
+        let regfold_ok = zc_regfold_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
@@ -320,7 +323,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
-            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && regfold_ok {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
                     // Residue-major cache: a_k for this window is the
@@ -1468,6 +1471,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Regfold arm selector, resolved once per worker chunk (never
+        // inside the refill / message loops).
+        let regfold_ok = zc_regfold_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
@@ -1482,7 +1488,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // constant multiplies per output (14 CLMUL per sixteen rows) and the
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
-        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        let use_c4 = use_batch && cfold.is_some() && regfold_ok;
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1574,7 +1580,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
                     _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
-            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| regfold_ok) {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
                     let ap = fa.as_ptr();
