@@ -1210,3 +1210,6 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-24: independent official timing sample of the promoted source; no executable change.
+
+// newjordan-x86-refire-11: independent official timing sample of the promoted
+// source; no executable change. (drawn against a3b828b frontier)
