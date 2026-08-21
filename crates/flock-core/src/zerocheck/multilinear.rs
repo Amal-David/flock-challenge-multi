@@ -2023,12 +2023,16 @@ const ZC_SERIAL_TAIL_MAX_OUT_LOG: usize = 17;
 
 /// `FLOCK_NO_ZC_SERIAL_TAIL=1` keeps every generic tail round on rayon;
 /// `FLOCK_ZC_SERIAL_TAIL_LOG=<n>` moves the crossover (`n = 0` also disables).
-/// The ranked worker's cleared environment never sets either.
+/// The ranked worker's cleared environment never sets either — so the shipped
+/// default is ON (log 17): the scored-shape Zen5 AVX-512 proxy A/B measured
+/// -1.8%..-3.4% window (8+5 interleaved pairs, proof sha 1623d8e5a5c4
+/// byte-identical across arms) — the smallest tail rounds are rayon-entry
+/// overhead once their output is below the region cost.
 fn zc_serial_tail_max_out() -> usize {
     static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        // Default OFF (see zc_tail_chunk_min_out_log); FLOCK_ZC_SERIAL_TAIL=1 opts in.
+        // Default ON; FLOCK_NO_ZC_SERIAL_TAIL=1 or FLOCK_ZC_SERIAL_TAIL=0 opts out.
         if std::env::var_os("FLOCK_NO_ZC_SERIAL_TAIL").is_some()
-            || std::env::var_os("FLOCK_ZC_SERIAL_TAIL").is_none()
+            || std::env::var("FLOCK_ZC_SERIAL_TAIL").ok().as_deref() == Some("0")
         {
             return 0;
         }
