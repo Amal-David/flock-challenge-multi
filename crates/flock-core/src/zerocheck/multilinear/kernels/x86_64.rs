@@ -250,6 +250,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && lo_size.is_multiple_of(8)
             && zc_regfold_enabled()
             && zc_r2_tr_enabled();
+        // Resolved once per worker chunk, never inside the refill loop.
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let tr_bcast = tr_emit && zc_r2_bcast_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -265,7 +268,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                 );
-                if tr_emit {
+                if tr_bcast {
+                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                } else if tr_emit {
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 } else {
@@ -1039,6 +1045,17 @@ pub(crate) fn zc_fold_defer_enabled() -> bool {
 pub(crate) fn zc_r2_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_TR_EMIT").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_ZC_R2_BCAST=1` restores the transpose-network residue-major
+/// prefold (`gfni_fold64_regs_sigma`) in place of the broadcast
+/// factorisation (`gfni_fold64_regs_sigma_bcast`). Exact same-binary A/B:
+/// the two emit byte-identical caches, only the shuffle count differs
+/// (120 port-5 shuffles per call against 56).
+pub(crate) fn zc_r2_bcast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_BCAST").is_none());
     *ON
 }
 
@@ -2241,6 +2258,33 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     }
 }
 
+/// [`gfni_fold64_rows_masked_tr`] through the broadcast factorisation of the
+/// same map — byte-identical cache, 56 port-5 shuffles per call instead of
+/// 120. See [`gfni_fold64_regs_sigma_bcast`].
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr`].
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: as for `gfni_fold64_rows_masked_tr`.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        }
+        gfni_fold64_regs_sigma_bcast(z, mats, out);
+    }
+}
+
 /// Per-residue matrix set for [`gfni_fold64_rows_masked_c4`].
 ///
 /// Entry `j * 16 + k` is the ZMM of eight 8×8 GF(2) matrices the batch feeds
@@ -2678,6 +2722,115 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
                 out_ptr.add(1),
                 _mm512_permutex2var_epi64(lo, il_hi, hi),
             );
+        }
+    }
+}
+
+/// [`gfni_fold64_regs_sigma`] factored through eight qword **broadcasts**
+/// instead of two byte/qword transpose networks — the same map, the same
+/// 128 `vgf2p8affineqb`, the same output bytes, for 56 port-5 shuffles
+/// instead of 120.
+///
+/// `vgf2p8affineqb` picks its 8×8 bit matrix **per qword** and its operand
+/// **per byte**, so a register whose every qword is the same octet
+/// `(chunk j of rows 8i..8i+7)` folded against the ZMM
+/// `mats[16j+8h .. 16j+8h+8]` yields, in one instruction,
+/// `M[j][8h+k] · chunk_j(row 8i+q)` at byte `8k+q` — output byte index
+/// along the qwords, row along the bytes. XORing the eight chunks gives
+/// `out-byte 8h+k of row 8i+q` at byte `8k+q` directly, so the eight
+/// **input** chunk planes and the sixteen **output** byte planes are never
+/// materialised and both 24-shuffle qword transposes disappear.
+///
+/// The broadcast octets are the qwords of the same `BT` byte transpose the
+/// plane form already computes; they are spilled once to a 512-byte
+/// register-aligned scratch and re-read by `vpbroadcastq zmm, m64`, which
+/// issues on the load ports (2/3/10) and never on port 5.
+///
+/// Per call: 8 `vpermb` in, 128 affine + 48 `vpternlogq` + 16 `vpxorq`
+/// (unchanged), then 16 `vpermb` + 32 `vpermt2q`-class out. The two output
+/// stages fuse the row-major reassembly with the residue-major regroup, so
+/// the layout is byte-identical to [`gfni_fold64_rows_masked_tr`]:
+/// `out[16·k + t] = fold(row 4·t + k)`.
+///
+/// # Safety
+/// As [`gfni_fold64_regs_sigma`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_regs_sigma_bcast(
+    z: [core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees 64 writable F128s at `out`; the
+    // scratch is a local 512-byte array written and read in full; every
+    // shuffle index is in range and the cfg gate supplies each intrinsic.
+    unsafe {
+        // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        // 64-byte aligned so each ZMM spill is one line and each broadcast
+        // read of it is one load uop.
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = Octs([0u64; 64]);
+        let op = octs.0.as_mut_ptr();
+        for (i, zi) in z.iter().enumerate() {
+            _mm512_storeu_si512(op.add(8 * i) as *mut __m512i, _mm512_permutexvar_epi8(bt, *zi));
+        }
+        let mp = mats.as_ptr();
+        // Stage-1 qword gathers: pack `(lo,hi)` qword pairs of two residues.
+        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
+        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
+        // Stage-2: the two 256-bit halves of the residue pair.
+        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        for g in 0..4 {
+            let mut a01 = [_mm512_setzero_si512(); 2];
+            let mut a23 = [_mm512_setzero_si512(); 2];
+            for half in 0..2 {
+                let i = 2 * g + half;
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*op.add(8 * i + j) as i64));
+                // `h = 0` -> output bytes 0..8, `h = 1` -> 8..16.
+                let plane = |h: usize| {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(mp.add(16 * j + 8 * h) as *const __m512i),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    _mm512_xor_si512(v2, v3)
+                };
+                // qword q of `l`/`hh` = output bytes 0..8 / 8..16 of row 8i+q.
+                let l = _mm512_permutexvar_epi8(bt, plane(0));
+                let hh = _mm512_permutexvar_epi8(bt, plane(1));
+                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+            }
+            // Residue-major ZMM (k, g) holds rows 16g + 4·lane + k and lands
+            // at F128 index 16k + 4g — the `_tr` layout, byte for byte.
+            // F128 index 16k + 4g == ZMM index 4k + g.
+            let dst = (out as *mut __m512i).add(g);
+            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
         }
     }
 }

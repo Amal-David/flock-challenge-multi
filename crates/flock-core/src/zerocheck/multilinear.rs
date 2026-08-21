@@ -5023,6 +5023,30 @@ mod tests {
             kernels::x86_64::gfni_fold64_rows_masked(poisoned.as_ptr(), &mats, off.as_mut_ptr(), 0);
         }
         assert_eq!(got, want, "masked prefold must be byte-identical");
+        // The residue-major emit and its broadcast factorisation compute the
+        // same map: `out[16k + t] = fold(row 4t + k)`, byte for byte, from
+        // the same inputs and the same 128 affine products.
+        let mut tr = [F128::ZERO; 64];
+        let mut trb = [F128::ZERO; 64];
+        // SAFETY: as above.
+        unsafe {
+            kernels::x86_64::gfni_fold64_rows_masked_tr(
+                poisoned.as_ptr(),
+                &mats,
+                tr.as_mut_ptr(),
+                0b1000_0000,
+            );
+            kernels::x86_64::gfni_fold64_rows_masked_tr_bcast(
+                poisoned.as_ptr(),
+                &mats,
+                trb.as_mut_ptr(),
+                0b1000_0000,
+            );
+        }
+        assert_eq!(trb, tr, "broadcast factorisation must be byte-identical");
+        for r in 0..64 {
+            assert_eq!(tr[16 * (r % 4) + r / 4], want[r], "residue-major slot, row {r}");
+        }
         assert_ne!(off, want, "poison must be visible with the skip OFF");
         for r in 0..64 {
             assert_eq!(
