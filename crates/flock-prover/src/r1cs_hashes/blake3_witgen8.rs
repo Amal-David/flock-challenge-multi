@@ -776,8 +776,6 @@ struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    z_lo: *const V8,
-    z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -785,6 +783,14 @@ struct StepRows {
 
 impl StepRows {
     /// Publish block `j`'s three rows.
+    ///
+    /// Z is derived inline: every packed row satisfies `z = a & b`, and `tr8`
+    /// is a bit permutation, so the transposed Z rows are the AND of the
+    /// transposed A/B rows already staged at `sa`/`sb` (whose loads this
+    /// publish performs anyway for the A/B stores). This is the spread-path
+    /// twin of [`Drain8::publish_b_with_derived_z`]: the AND work the
+    /// producer used to do into a per-step stack array now happens in the
+    /// consumer from L1-resident staging, deleting the stack materialization.
     ///
     /// # Safety
     /// `self` describes one live drain step and `j < 8`.
@@ -794,30 +800,34 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
             emit_pair(
                 self.z.add(o),
-                *self.z_lo.add(j),
-                *self.z_hi.add(j),
+                and_v8(a_lo, b_lo),
+                and_v8(a_hi, b_hi),
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1077,7 +1087,9 @@ impl Drain8<'_> {
                 // the bytes the main buffers get, so nothing is published yet.
                 // Every packed row satisfies `z = a & b` and `tr8` is a bit
                 // permutation, so the Z rows are derived from the transposed
-                // A/B rows instead of transposing a third Z ring.
+                // A/B rows instead of transposing a third Z ring. The
+                // derivation itself happens in [`StepRows::publish`], from the
+                // staging rows this step is about to publish.
                 let a_lo = tr8_chunk(self.ast, rw);
                 let a_hi = tr8_chunk(self.ast, rw + 8);
                 for r in 0..8 {
@@ -1092,8 +1104,6 @@ impl Drain8<'_> {
                     store_v8(p, b_lo[r]);
                     store_v8(p.add(8), b_hi[r]);
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
 
                 let g = abs_word / 8;
                 let mut flags = base;
@@ -1119,8 +1129,6 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    z_lo: z_lo.as_ptr(),
-                    z_hi: z_hi.as_ptr(),
                     flags,
                 };
 
