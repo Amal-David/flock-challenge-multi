@@ -1575,6 +1575,16 @@ impl AdditiveNttF128 {
         *ON
     }
 
+    /// `FLOCK_NO_NTT_SCATTER_SPREAD=1` restores the bunched scatter — every
+    /// staging row published after all eight blocks have transformed — in the
+    /// same binary (exact same-binary A/B); the ranked worker's cleared env
+    /// never sets it.
+    fn scatter_spread_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_SPREAD").is_none());
+        *ON
+    }
+
     /// `FLOCK_NO_NTT_STAGE_PERM=1` restores the natural `[block][k]` staging
     /// order in the same binary (exact same-binary A/B); the ranked worker's
     /// cleared env never sets it.
@@ -1693,6 +1703,15 @@ impl AdditiveNttF128 {
         // (see `publish_row_nt`); decided once per pass.
         #[cfg(target_arch = "x86_64")]
         let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
+        // Publish each block's rows AS they are finalized rather than sweeping
+        // all 512 staging rows at the end. The bunched scatter issues no store
+        // for the whole layer-3..9 stretch and then 512 rows (4096 lines) back
+        // to back; interleaving lets the memory system drain during the
+        // butterflies and the ALUs work during the stores, and it reads each
+        // row from L1 — where the kernel just wrote it — instead of re-reading
+        // 256 KiB of staging that has since aged into L2.
+        #[cfg(target_arch = "x86_64")]
+        let spread_scatter = publish_nt && Self::scatter_spread_enabled();
         // Staging row order inside a block.
         //
         // The natural order is `k`, and the fused-four kernel then walks its
@@ -1825,7 +1844,38 @@ impl AdditiveNttF128 {
                         let c = std::slice::from_raw_parts_mut(p.add(2 * step), lanes2);
                         let d = std::slice::from_raw_parts_mut(p.add(3 * step), lanes2);
                         kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+                        // Publish the four rows this step just finalized, while
+                        // they are still the lines the kernel above wrote.
+                        //
+                        // This step is the LAST writer of its four rows: the
+                        // fused-two quads partition the block's sixty-four rows
+                        // (disjoint over `m`), and the fused-four groups above
+                        // have all completed. In both staging orders the quad
+                        // is exactly logical `k = 4m..4m+4` — with the
+                        // permutation, `perm(4m) = m` and `g2_stride = 16` give
+                        // staging rows `{m, m+16, m+32, m+48}`, which are
+                        // `perm(4m+t)`; without it the quad is `4m..4m+4`
+                        // directly. Same bytes to the same addresses either way.
+                        #[cfg(target_arch = "x86_64")]
+                        if spread_scatter {
+                            for k in 4 * m..4 * m + 4 {
+                                Self::publish_row_nt(
+                                    region.add(perm(k) * row_len),
+                                    base.add(
+                                        block * block_bytes + (r + k * sub_stride) * row_len,
+                                    ),
+                                    row_len,
+                                );
+                            }
+                        }
                     }
+                }
+                // Drain the WC buffers before this task returns; the rayon
+                // join below is the reader's happens-before edge.
+                #[cfg(target_arch = "x86_64")]
+                if spread_scatter {
+                    core::arch::x86_64::_mm_sfence();
+                    return;
                 }
                 // Scatter: staging [block][k] → codeword row block·B + r + k·S.
                 #[cfg(target_arch = "x86_64")]
