@@ -436,29 +436,8 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         target_feature = "vpclmulqdq"
     ))]
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry and disjointness contract. The shaped arms only fire when the
-    // constants equal the runtime shape, so they are value-identical.
+    // geometry and disjointness contract.
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                1 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                _ => {}
-            }
-        }
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
 
@@ -497,24 +476,8 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
         target_feature = "vpclmulqdq"
     ))]
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry and disjointness contract. The shaped arms only fire when the
-    // constants equal the runtime shape, so they are value-identical.
+    // geometry and disjointness contract.
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
-                    );
-                }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
-                    );
-                }
-                _ => {}
-            }
-        }
         x86_64::butterfly_fused_4layer_row_pf::<H>(
             ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
         );
@@ -556,13 +519,8 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         target_feature = "vpclmulqdq"
     ))]
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry, disjointness and zero-tail contract. The shaped arm only
-    // fires when the constant equals the runtime shape (value-identical).
+    // geometry, disjointness and zero-tail contract.
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
-            return;
-        }
         x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
     }
 

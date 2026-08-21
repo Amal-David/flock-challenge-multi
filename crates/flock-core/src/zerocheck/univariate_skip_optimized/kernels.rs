@@ -270,41 +270,6 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
-/// True when [`shift_reduce_inner_ab_at`] with this `prepared` plan and
-/// `bstatic` presence would take the pre-scaled-offset (pidx + offw) x86
-/// body for window `blk` — i.e. when the caller may replace that call with
-/// the split offsets-build / offsets-consume pair and get identical bytes.
-#[inline]
-#[allow(unused_variables)]
-pub(super) fn shift_reduce_offsets_eligible(
-    prepared: ShiftReducePlan,
-    bstatic: bool,
-    blk: usize,
-) -> bool {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        prepared.img2
-            && prepared.pidx
-            && prepared.offw
-            && x86_64::urm_off_arena_enabled()
-            && !(bstatic && bstatic_window_live(blk))
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "gfni",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    {
-        false
-    }
-}
-
 /// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
 /// byte offset plus the global BLAKE3 medium-window index
 /// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
