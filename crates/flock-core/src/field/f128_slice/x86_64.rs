@@ -200,7 +200,7 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                     let p = src.as_ptr().add(ahead).cast::<i8>();
                     let mut l = 0usize;
                     while l < 1024 {
-                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        _mm_prefetch::<_MM_HINT_NTA>(p.add(l));
                         l += 64;
                     }
                 }
