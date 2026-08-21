@@ -1208,3 +1208,19 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-10: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-02: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-03: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-04: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-05: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-06: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-07: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-08: independent official timing sample of the promoted source; no executable change.
+
+// jonathan308-x86-resample-09: independent official timing sample of the promoted source; no executable change.
