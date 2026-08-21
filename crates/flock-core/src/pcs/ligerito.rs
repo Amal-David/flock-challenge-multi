@@ -7396,9 +7396,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         if i == r - 1 {
-            let yr = sc_prover.f().to_vec();
-            for v in &yr {
-                challenger.observe_f128(*v);
+            // The residual `yr` is both fed to the challenger in transcript
+            // order and carried into the final proof. Build it in one pass
+            // (copy + observe fused) instead of cloning first and re-reading
+            // the clone — identical values, identical transcript order, one
+            // fewer full-vector memory pass.
+            let mut yr = Vec::with_capacity(sc_prover.f().len());
+            for &v in sc_prover.f() {
+                challenger.observe_f128(v);
+                yr.push(v);
             }
             // PoW grinding for the last level before sampling its queries.
             let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
@@ -8774,9 +8780,10 @@ fn recursive_prover_inner<Ch: Challenger>(
                 t_total.elapsed()
             );
             // Last iter: send residual yr + open wtns_prev.
-            let yr = sc_prover.f().to_vec();
-            for v in &yr {
-                challenger.observe_f128(*v);
+            let mut yr = Vec::with_capacity(sc_prover.f().len());
+            for &v in sc_prover.f() {
+                challenger.observe_f128(v);
+                yr.push(v);
             }
             // wtns_prev's rate (= log_inv_rates[i+1] for wtns_{i+1}).
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
