@@ -2680,6 +2680,9 @@ fn build_eq_table_split(point: &[F128]) -> Vec<F128> {
     let hi = build_eq_table(&point[h..]);
     debug_assert_eq!(lo.len(), 1usize << h);
     debug_assert_eq!(hi.len(), 1usize << log_blocks);
+    #[cfg(target_arch = "x86_64")]
+    let mut out = crate::scratch::take_f128(1usize << d);
+    #[cfg(not(target_arch = "x86_64"))]
     let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
     let x4 = eq_split_x4_enabled();
@@ -6429,6 +6432,12 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if pcs_intro_recycle_enabled() {
+                crate::scratch::give_f128(b_new);
+            }
+        }
     }
 
     pub fn f(&self) -> &[F128] {
@@ -6438,6 +6447,16 @@ impl SumcheckProver {
     pub fn transcript(&self) -> &[SumcheckMessage] {
         &self.transcript
     }
+}
+
+/// `FLOCK_NO_PCS_INTRO_RECYCLE=1` disables returning the consumed introduced
+/// basis buffer `b_new` to the process scratch pool in [`SumcheckProver::glue`],
+/// falling back to standard allocator drop.
+#[cfg(target_arch = "x86_64")]
+fn pcs_intro_recycle_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PCS_INTRO_RECYCLE").is_none());
+    *ON
 }
 
 // ===================================================================
@@ -13221,4 +13240,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn glue_recycles_consumed_introduced_basis_into_scratch_pool() {
+        crate::scratch::clear();
+        let len = 1024;
+        let f = vec![F128::ONE; len];
+        let b1 = vec![F128 { lo: 2, hi: 0 }; len];
+        let (mut prover, _) = SumcheckProver::new(f, b1, F128::ZERO);
+        let b_new = crate::scratch::take_f128(len);
+        let ptr = b_new.as_ptr();
+        prover.introduce_new(b_new, F128 { lo: 42, hi: 0 });
+        prover.glue(F128 { lo: 3, hi: 0 });
+        #[cfg(target_arch = "x86_64")]
+        {
+            let reused = crate::scratch::take_f128(len);
+            assert_eq!(
+                reused.as_ptr(),
+                ptr,
+                "SumcheckProver::glue must recycle b_new into the scratch pool"
+            );
+            crate::scratch::give_f128(reused);
+        }
+        crate::scratch::clear();
+    }
 }
