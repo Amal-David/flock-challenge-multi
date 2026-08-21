@@ -1209,10 +1209,10 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
 
-// zarar-x86-resample-29: independent official timing sample of the promoted source; no executable change.
+// zarar-x86-resample-30: independent official timing sample of the promoted source; no executable change.
 
-// newjordan-x86-refire-29: independent official timing sample of the promoted
-// source; no executable change. (drawn against fbe181b frontier, 1410759.47)
+// newjordan-x86-refire-31: independent official timing sample of the promoted
+// source; no executable change. (drawn against 059ef89 frontier, 1419394.78)
 
 // newjordan-x86-refire-11: independent official timing sample of the promoted
 // source; no executable change. (drawn against a3b828b frontier)
@@ -1220,4 +1220,6 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // newjordan-x86-refire-19: independent official timing sample of the
 // promoted source; no executable change. (drawn against ebdd5d5 frontier)
 
-// zarar-x86-resample-29: independent official timing sample of the promoted source; no executable change.
+// zarar-x86-resample-30: independent official timing sample of the promoted source; no executable change.
+
+// newjordan-x86-refire-31: comment-only resample of 059ef89 (frontier 1,419,394.78).
