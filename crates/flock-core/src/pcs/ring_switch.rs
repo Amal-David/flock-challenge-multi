@@ -3283,11 +3283,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //        already has γ_k baked in — pcs combine just adds.
     let t = std::time::Instant::now();
 
-    struct ClaimWork {
+    struct ClaimWork<'a> {
         s_hat_v: Vec<F128>,
-        s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
-        s_hat_v_fold8: Option<Vec<F128>>,
+        // These retained statistics stay owned by the caller through this
+        // scoped per-claim tail. Borrowing them deletes a second allocation
+        // and copy before their one-shot direct-factor consumption.
+        s_hat_v_quad: Option<&'a [F128]>,
+        s_hat_v_fold4: Option<&'a [F128]>,
+        s_hat_v_fold8: Option<&'a [F128]>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
@@ -3302,20 +3305,17 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 4 * n_packed);
         let s_hat_v_fold4 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 16 * n_packed);
         let s_hat_v_fold8 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 64 * n_packed);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
