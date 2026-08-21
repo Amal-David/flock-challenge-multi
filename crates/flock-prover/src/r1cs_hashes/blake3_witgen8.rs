@@ -794,6 +794,18 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            // The steady-state drain steps publish every half with wide
+            // non-temporal stores. Bypass the general liveness/store-mode
+            // matrix for that overwhelmingly common case; boundary steps
+            // retain the exact generic path below.
+            if f == u8::MAX {
+                stream_pair_v8(self.z.add(o), *self.z_lo.add(j), *self.z_hi.add(j), true);
+                let p = sa.add(j * STEP_WORDS);
+                stream_pair_v8(self.a.add(o), load_v8(p), load_v8(p.add(8)), true);
+                let p = sb.add(j * STEP_WORDS);
+                stream_pair_v8(self.b.add(o), load_v8(p), load_v8(p.add(8)), true);
+                return;
+            }
             emit_pair(
                 self.z.add(o),
                 *self.z_lo.add(j),
