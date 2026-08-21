@@ -1202,3 +1202,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // gin-x86-spawn-free-resample-02: second independent timing sample of the target-dead thread deletion.
 
 // zarar-x86-resample-03: independent official timing sample of the promoted source; no executable change.
+
+// zarar-x86-resample-07: independent official timing sample of the promoted source; no executable change.
