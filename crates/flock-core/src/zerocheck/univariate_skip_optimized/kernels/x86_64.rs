@@ -1053,6 +1053,12 @@ mod tests {
         accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
         accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble, F128,
     };
+    #[cfg(target_feature = "gfni")]
+    use super::{
+        accumulate_convert_ab_nomul_x86_gfni,
+        accumulate_convert_ab_nomul_x86_gfni_dynamic,
+        accumulate_convert_ab_nomul_x86_gfni_fixed,
+    };
 
     #[test]
     fn accumulate_c_banks_avx512_matches_scalar() {
@@ -1191,6 +1197,79 @@ mod tests {
             assert_eq!(nibble, gpr, "n_b_med={n_b_med}");
         }
     }
+
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn accumulate_convert_ab_gfni_fixed_rows_match_dynamic() {
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for (row, bytes) in chunk_ab_bytes.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0x9d)
+                    ^ (lane as u8).wrapping_mul(0x53)
+                    ^ ((row * 17 + lane * 29) >> 3) as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for (i, matrix) in mats.iter_mut().enumerate() {
+            *matrix = (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i & 63) as u32)
+                ^ 0xd6e8_feb8_6659_fd93;
+        }
+        let mut seed = [0u8; 16 * 64];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0xa7) ^ (i >> 2) as u8;
+        }
+
+        for n_b_med in 0..=16 {
+            let mut dynamic = seed;
+            let mut dispatched = seed;
+            // SAFETY: this test is compiled only with the kernel's complete
+            // target feature set and every buffer has its exact fixed size.
+            unsafe {
+                accumulate_convert_ab_nomul_x86_gfni_dynamic(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &mats,
+                    &mut dynamic,
+                );
+                accumulate_convert_ab_nomul_x86_gfni(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &mats,
+                    &mut dispatched,
+                );
+            }
+            assert_eq!(dispatched, dynamic, "dispatch n_b_med={n_b_med}");
+        }
+
+        for n_b_med in [15usize, 16] {
+            let mut dynamic = seed;
+            let mut fixed = seed;
+            unsafe {
+                accumulate_convert_ab_nomul_x86_gfni_dynamic(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &mats,
+                    &mut dynamic,
+                );
+                if n_b_med == 15 {
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut fixed,
+                    );
+                } else {
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut fixed,
+                    );
+                }
+            }
+            assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1209,8 +1288,10 @@ mod tests {
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
+#[cold]
+#[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
-pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
     mats: &[u64; 256],
@@ -1253,6 +1334,97 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
                 acc = _mm512_xor_si512(acc, g);
             }
             _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+/// Ranked fixed-row body. BLAKE3's two padding classes contain exactly
+/// fifteen and sixteen live medium rows; making that count a monomorphized
+/// constant removes LLVM's per-plane bounds ladder from the GFNI battery.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    // SAFETY: the fixed arrays cover every row/plane load and store. `N` is
+    // one of the two ranked live-row counts and the cfg gate supplies GFNI.
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in 0..N {
+            rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut bm = 0;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    // SAFETY: each callee has this entry point's fixed-array and feature
+    // contract. Counts outside the ranked pair retain the incumbent body.
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            ),
         }
     }
 }
