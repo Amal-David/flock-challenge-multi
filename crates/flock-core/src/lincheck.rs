@@ -1089,6 +1089,10 @@ fn fold_block_major_gfni(
             // scalar path stays as the kill-switch arm.
             #[cfg(target_feature = "avx512vbmi")]
             let gather_tr_fused = lc_gather_tr_enabled();
+            // Grouped four-column gather arm selector, resolved once per
+            // worker (never inside the tile / chunk / stripe loops).
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather4_ok = lc_gather4_enabled();
             // Grouped-gather prefetch distance, resolved once per worker
             // (never inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
@@ -1129,7 +1133,7 @@ fn fold_block_major_gfni(
                 // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
                 // the ragged final chunk takes the single-column arm below.
                 #[cfg(target_feature = "avx512vbmi")]
-                if gather_tr_fused && lc_gather4_enabled() {
+                if gather_tr_fused && gather4_ok {
                     let full_chunks = useful_bits / 128;
                     while q + 4 <= full_chunks {
                         for t in 0..DIRECT_FOLD_TILE_STRIPES {

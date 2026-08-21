@@ -1208,3 +1208,4 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-10: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
+// nightshift-hoist-refire-16: re-sample of the hoist tree when the runner window recovers; comment only.
