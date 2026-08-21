@@ -1208,3 +1208,11 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-10: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-14: independent official timing sample of the promoted source; no executable change.
+
+// refdraw-probe-01: byte-identical frontier re-draw probe; no executable change.
+
+// refdraw-probe-02: second independent official timing sample of the promoted source; no executable change.
+
+// refdraw-probe-03: third independent official timing sample of the promoted source; no executable change.
+
+// refdraw-probe-04: fourth independent official timing sample of the promoted source; no executable change.
