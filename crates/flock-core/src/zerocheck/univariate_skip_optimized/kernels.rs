@@ -89,6 +89,7 @@ pub(super) struct ShiftReducePlan {
     img2: bool,
     pidx: bool,
     offw: bool,
+    shrx: bool,
 }
 
 impl ShiftReducePlan {
@@ -114,7 +115,13 @@ pub(super) fn prepare_shift_reduce(
         let img2 = x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
         let pidx = img2 && x86_64::urm_pidx_enabled();
         let offw = pidx && x86_64::urm_offw_enabled();
-        ShiftReducePlan { img2, pidx, offw }
+        let shrx = offw && x86_64::urm_shrx_enabled();
+        ShiftReducePlan {
+            img2,
+            pidx,
+            offw,
+            shrx,
+        }
     }
 
     #[cfg(not(all(
@@ -129,6 +136,7 @@ pub(super) fn prepare_shift_reduce(
             img2: false,
             pidx: false,
             offw: false,
+            shrx: false,
         }
     }
 }
@@ -325,6 +333,7 @@ pub(super) fn shift_reduce_inner_ab_at(
                 prepared.img2,
                 prepared.pidx,
                 prepared.offw,
+                prepared.shrx,
                 imgs,
             );
         }

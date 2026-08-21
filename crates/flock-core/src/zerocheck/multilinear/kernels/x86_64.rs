@@ -244,11 +244,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Gated to shapes the 8-pair batch loop consumes exhaustively: the
         // scalar tail (and the regfold-off arm) index the cache BY ROW and
         // must never see the residue-major layout.
+        // Kill-switch state is process-constant: read it ONCE here, never
+        // inside the pair loop below (a `LazyLock` deref in the body is an
+        // extra load + test + branch per iteration on the binding scalar
+        // ports, and it blocks LLVM from hoisting/unrolling around it).
+        let regfold = zc_regfold_enabled();
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_emit = !WRITE
             && use_batch
             && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
+            && regfold
             && zc_r2_tr_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
@@ -320,7 +325,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
-            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && regfold {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
                     // Residue-major cache: a_k for this window is the
@@ -1482,7 +1487,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // constant multiplies per output (14 CLMUL per sixteen rows) and the
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
-        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        // Read the kill switch ONCE per call (see the round-2 twin): the
+        // `cache.filter` in the tile loop below used to deref this
+        // `LazyLock` on every iteration.
+        let regfold = zc_regfold_enabled();
+        let use_c4 = use_batch && cfold.is_some() && regfold;
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1574,7 +1583,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
                     _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
-            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| regfold) {
                     debug_assert_eq!(cache_base, 4 * xg);
                     let _ = cache_base;
                     let ap = fa.as_ptr();
