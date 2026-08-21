@@ -488,7 +488,9 @@ struct Drain8<'t> {
     proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
-    wide_nt: bool,
+    z_w: NtWidth,
+    a_w: NtWidth,
+    b_w: NtWidth,
     spread: bool,
 }
 
@@ -631,6 +633,40 @@ fn wide_nt_enabled() -> bool {
     *ON
 }
 
+/// NT store width for one destination buffer, resolved once per buffer from
+/// its base address instead of re-derived from every row pointer:
+///
+/// ```text
+/// 0 = historical two-XMM stores per 32-byte run (base not 32-aligned, or
+///     the `FLOCK_NO_WIDE_NT=1` kill switch)
+/// 1 = one YMM store per 32-byte run (base 32-aligned, not 64-aligned)
+/// 2 = one YMM store per single run; a line-aligned pair uses one ZMM store
+///     (base 64-aligned)
+/// ```
+///
+/// Every drain row pointer is `base + 64k` (pairs) or `base + 32k` (singles)
+/// — see the stride invariants in [`Drain8`] — so the per-row alignment tests
+/// the historical form ran are loop-invariant per destination. Classifying
+/// once per buffer preserves the exact instruction width the per-row tests
+/// would have selected for every pointer (and the XMM fallback for a
+/// 16-byte-only allocation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NtWidth(u8);
+
+impl NtWidth {
+    #[inline(always)]
+    fn classify(base: *const u32, enabled: bool) -> Self {
+        if !enabled {
+            return NtWidth(0);
+        }
+        match base as usize % 64 {
+            0 => NtWidth(2),
+            r if r % 32 == 0 => NtWidth(1),
+            _ => NtWidth(0),
+        }
+    }
+}
+
 /// `FLOCK_NO_SPREAD_NT=1` restores the bunched drain step (three eight-row
 /// runs of streaming stores, then the whole window's projection).
 fn spread_nt_enabled() -> bool {
@@ -651,24 +687,24 @@ fn spread_nt_enabled() -> bool {
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
 /// task; same-thread reads are self-consistent regardless).
 #[inline(always)]
-unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
+unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, w: NtWidth) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
         let mut g = g0;
         while g + 2 <= g1 {
-            let w = 8 * g;
-            let ta = tr8_chunk(stage, w);
-            let tb = tr8_chunk(stage, w + 8);
+            let w8 = 8 * g;
+            let ta = tr8_chunk(stage, w8);
+            let tb = tr8_chunk(stage, w8 + 8);
             for r in 0..8 {
-                stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r], wide_nt);
+                stream_pair_v8(dst.add(r * U32_PER_BLOCK + w8), ta[r], tb[r], w);
             }
             g += 2;
         }
         if g < g1 {
-            let w = 8 * g;
-            let t = tr8_chunk(stage, w);
+            let w8 = 8 * g;
+            let t = tr8_chunk(stage, w8);
             for r in 0..8 {
-                stream_v8(dst.add(r * U32_PER_BLOCK + w), t[r], wide_nt);
+                stream_v8(dst.add(r * U32_PER_BLOCK + w8), t[r], w);
             }
         }
     }
@@ -695,13 +731,13 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 /// Publish one 32-byte transposed run non-temporally.
 ///
 /// # Safety
-/// Caller guarantees 16-byte alignment of `p`; the YMM arm additionally
-/// requires 32-byte alignment (true for every in-loop pointer when `dst` is
-/// 32-aligned and `w` is a multiple of 8).
+/// Caller guarantees 16-byte alignment of `p`; width 1/2 additionally require
+/// 32-byte alignment (true for every in-loop pointer when the destination
+/// base carries that width — see [`NtWidth::classify`]).
 #[inline(always)]
-unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
+unsafe fn stream_v8(p: *mut u32, v: V8, w: NtWidth) {
     unsafe {
-        if wide_nt && p as usize % 32 == 0 {
+        if w.0 >= 1 {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -717,17 +753,17 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
 /// # Safety
 /// Same alignment contract as [`stream_v8`], for both `p` and `p.add(8)`.
 #[inline(always)]
-unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
+unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, w: NtWidth) {
     unsafe {
         #[cfg(target_feature = "avx512f")]
-        if wide_nt && p as usize % 64 == 0 {
+        if w.0 == 2 {
             let z = _mm512_castsi256_si512(va);
             let z = _mm512_inserti64x4::<1>(z, vb);
             _mm512_stream_si512(p.cast::<__m512i>(), z);
             return;
         }
-        stream_v8(p, va, wide_nt);
-        stream_v8(p.add(8), vb, wide_nt);
+        stream_v8(p, va, w);
+        stream_v8(p.add(8), vb, w);
     }
 }
 
@@ -745,13 +781,13 @@ unsafe fn emit_pair(
     lo_live: bool,
     hi_live: bool,
     nt: bool,
-    wide_nt: bool,
+    w: NtWidth,
 ) {
     unsafe {
         match (nt, lo_live, hi_live) {
-            (true, true, true) => stream_pair_v8(p, lo, hi, wide_nt),
-            (true, true, false) => stream_v8(p, lo, wide_nt),
-            (true, false, true) => stream_v8(p.add(8), hi, wide_nt),
+            (true, true, true) => stream_pair_v8(p, lo, hi, w),
+            (true, true, false) => stream_v8(p, lo, w),
+            (true, false, true) => stream_v8(p.add(8), hi, w),
             (false, true, true) => {
                 store_v8(p, lo);
                 store_v8(p.add(8), hi);
@@ -779,8 +815,12 @@ struct StepRows {
     z_lo: *const V8,
     z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
-    /// bit 6 z non-temporal, bit 7 wide streaming stores.
+    /// bit 6 z non-temporal.
     flags: u8,
+    /// Per-destination NT store width (see [`NtWidth`]).
+    z_w: NtWidth,
+    a_w: NtWidth,
+    b_w: NtWidth,
 }
 
 impl StepRows {
@@ -792,7 +832,6 @@ impl StepRows {
     unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
             let f = self.flags;
-            let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
             emit_pair(
                 self.z.add(o),
@@ -801,7 +840,7 @@ impl StepRows {
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
-                wide,
+                self.z_w,
             );
             let p = sa.add(j * STEP_WORDS);
             emit_pair(
@@ -811,7 +850,7 @@ impl StepRows {
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
-                wide,
+                self.a_w,
             );
             let p = sb.add(j * STEP_WORDS);
             emit_pair(
@@ -821,7 +860,7 @@ impl StepRows {
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
-                wide,
+                self.b_w,
             );
         }
     }
@@ -843,7 +882,7 @@ impl Drain8<'_> {
         g0: usize,
         g1: usize,
         nt: bool,
-        wide_nt: bool,
+        w: NtWidth,
     ) {
         unsafe {
             let lo_rows = tr8_chunk(stage, ring_word);
@@ -859,9 +898,9 @@ impl Drain8<'_> {
                 }
                 let p = dst.add(r * U32_PER_BLOCK + abs_word);
                 match (nt, lo_live, hi_live) {
-                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], wide_nt),
-                    (true, true, false) => stream_v8(p, lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(p.add(8), hi_rows[r], wide_nt),
+                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], w),
+                    (true, true, false) => stream_v8(p, lo_rows[r], w),
+                    (true, false, true) => stream_v8(p.add(8), hi_rows[r], w),
                     (false, true, true) => {
                         store_v8(p, lo_rows[r]);
                         store_v8(p.add(8), hi_rows[r]);
@@ -896,7 +935,8 @@ impl Drain8<'_> {
         b_g1: usize,
         b_nt: bool,
         z_nt: bool,
-        wide_nt: bool,
+        b_w: NtWidth,
+        z_w: NtWidth,
     ) {
         unsafe {
             let b_lo_rows = tr8_chunk(b_stage, ring_word);
@@ -923,10 +963,10 @@ impl Drain8<'_> {
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
                     (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
+                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], b_w)
                     }
-                    (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
+                    (true, true, false) => stream_v8(bp, b_lo_rows[r], b_w),
+                    (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], b_w),
                     (false, true, true) => {
                         store_v8(bp, b_lo_rows[r]);
                         store_v8(bp.add(8), b_hi_rows[r]);
@@ -938,9 +978,9 @@ impl Drain8<'_> {
 
                 let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (z_nt, z_lo_live, z_hi_live) {
-                    (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
-                    (true, true, false) => stream_v8(zp, z_lo, wide_nt),
-                    (true, false, true) => stream_v8(zp.add(8), z_hi, wide_nt),
+                    (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, z_w),
+                    (true, true, false) => stream_v8(zp, z_lo, z_w),
+                    (true, false, true) => stream_v8(zp.add(8), z_hi, z_w),
                     (false, true, true) => {
                         store_v8(zp, z_lo);
                         store_v8(zp.add(8), z_hi);
@@ -1004,7 +1044,7 @@ impl Drain8<'_> {
                         0,
                         a_g1,
                         true,
-                        self.wide_nt,
+                        self.a_w,
                     );
                     Self::publish_b_with_derived_z(
                         self.bs,
@@ -1019,7 +1059,8 @@ impl Drain8<'_> {
                         b_g1,
                         true,
                         self.z_nt,
-                        self.wide_nt,
+                        self.b_w,
+                        self.z_w,
                     );
                     proj.project(abs_word / STEP_WORDS);
                 }
@@ -1064,9 +1105,6 @@ impl Drain8<'_> {
             let mut base = 0u8;
             if self.z_nt {
                 base |= 0x40;
-            }
-            if self.wide_nt {
-                base |= 0x80;
             }
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
@@ -1122,6 +1160,9 @@ impl Drain8<'_> {
                     z_lo: z_lo.as_ptr(),
                     z_hi: z_hi.as_ptr(),
                     flags,
+                    z_w: self.z_w,
+                    a_w: self.a_w,
+                    b_w: self.b_w,
                 };
 
                 let blk = abs_word / STEP_WORDS;
@@ -1157,7 +1198,7 @@ impl Drain8<'_> {
                             0,
                             a_g1,
                             true,
-                            self.wide_nt,
+                            self.a_w,
                         );
                         Self::publish_b_with_derived_z(
                             self.bs,
@@ -1172,7 +1213,8 @@ impl Drain8<'_> {
                             b_g1,
                             true,
                             self.z_nt,
-                            self.wide_nt,
+                            self.b_w,
+                            self.z_w,
                         );
                     }
                 }
@@ -1191,7 +1233,7 @@ impl Drain8<'_> {
                             0,
                             a_g1,
                             false,
-                            self.wide_nt,
+                            self.a_w,
                         );
                         Self::publish_b_with_derived_z(
                             self.bs,
@@ -1206,7 +1248,8 @@ impl Drain8<'_> {
                             b_g1,
                             false,
                             self.z_nt,
-                            self.wide_nt,
+                            self.b_w,
+                            self.z_w,
                         );
                     }
                 }
@@ -1244,20 +1287,20 @@ unsafe fn dump_range_nt_win(
     win: *mut u32,
     g0: usize,
     g1: usize,
-    wide_nt: bool,
+    w: NtWidth,
 ) {
     unsafe {
         debug_assert_eq!(dst as usize % 16, 0);
         let mut g = 0usize;
         while g < DUMP_CHUNKS {
-            let w = 8 * g;
-            let ta = tr8_chunk(stage, w);
-            let tb = tr8_chunk(stage, w + 8);
+            let w8 = 8 * g;
+            let ta = tr8_chunk(stage, w8);
+            let tb = tr8_chunk(stage, w8 + 8);
             // Window first: plain stores to a 16 KiB L1-resident buffer, and
             // grouping them ahead of the streams keeps each row's write-
             // combining buffer open across consecutive NT stores.
             for r in 0..8 {
-                let p = win.add(r * U32_PER_BLOCK + w);
+                let p = win.add(r * U32_PER_BLOCK + w8);
                 store_v8(p, ta[r]);
                 store_v8(p.add(8), tb[r]);
             }
@@ -1265,15 +1308,15 @@ unsafe fn dump_range_nt_win(
             let hi = g + 1 >= g0 && g + 1 < g1;
             if lo && hi {
                 for r in 0..8 {
-                    stream_pair_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], tb[r], wide_nt);
+                    stream_pair_v8(dst.add(r * U32_PER_BLOCK + w8), ta[r], tb[r], w);
                 }
             } else if lo {
                 for r in 0..8 {
-                    stream_v8(dst.add(r * U32_PER_BLOCK + w), ta[r], wide_nt);
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w8), ta[r], w);
                 }
             } else if hi {
                 for r in 0..8 {
-                    stream_v8(dst.add(r * U32_PER_BLOCK + w + 8), tb[r], wide_nt);
+                    stream_v8(dst.add(r * U32_PER_BLOCK + w8 + 8), tb[r], w);
                 }
             }
             g += 2;
@@ -1289,7 +1332,7 @@ unsafe fn dump_elide(
     elide_prefix: bool,
     tail_chunk: usize,
     nt: bool,
-    wide_nt: bool,
+    w: NtWidth,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -1299,7 +1342,7 @@ unsafe fn dump_elide(
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
     unsafe {
         if nt {
-            dump_range_nt(stage, dst, g0, g1, wide_nt)
+            dump_range_nt(stage, dst, g0, g1, w)
         } else {
             dump_range(stage, dst, g0, g1)
         }
@@ -1316,7 +1359,7 @@ unsafe fn dump_elide_win(
     elide_tail: bool,
     elide_prefix: bool,
     tail_chunk: usize,
-    wide_nt: bool,
+    w: NtWidth,
 ) {
     let g0 = if elide_prefix {
         ELIDE_B_PREFIX_CHUNKS
@@ -1324,7 +1367,7 @@ unsafe fn dump_elide_win(
         0
     };
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
-    unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
+    unsafe { dump_range_nt_win(stage, dst, win, g0, g1, w) }
 }
 
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
@@ -1475,6 +1518,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 
+        let wide = wide_nt_enabled();
         let mut drain = Drain8 {
             ast,
             bs,
@@ -1485,7 +1529,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             z_nt,
-            wide_nt: wide_nt_enabled(),
+            z_w: NtWidth::classify(z, wide),
+            a_w: NtWidth::classify(a, wide),
+            b_w: NtWidth::classify(b, wide),
             spread: spread_nt_enabled(),
         };
         let maxv = dup_u32(u32::MAX);
