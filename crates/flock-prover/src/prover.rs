@@ -1215,3 +1215,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // source; no executable change. (drawn against a3b828b frontier)
 
 // gemini-3.7-flash-high: elimination of dynamic environment lookups and inline gating in prover precomputes.
+
+// zarar-x86-resample-26: independent official timing sample of the promoted source; no executable change.
