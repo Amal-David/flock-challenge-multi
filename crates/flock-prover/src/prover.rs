@@ -33,7 +33,7 @@ use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
-#[inline(always)]
+#[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(target_arch = "x86_64")
         && r1cs.m == 32
@@ -41,7 +41,8 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
 }
 
-#[inline(always)]
+
+#[inline]
 fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_c_enabled()
 }
@@ -49,7 +50,7 @@ fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
 /// Direct-fold4 (sixteen-bank) precompute: needs the ranked direct-AB shape,
 /// the shared `ranked_direct_fold4_enabled()` latch, and a round-1 C capture
 /// that actually produced the fold4 tensor.
-#[inline(always)]
+#[inline]
 fn ranked_direct_fold4_precompute_enabled(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
@@ -69,7 +70,7 @@ fn ranked_direct_fold4_precompute_enabled(
 /// The fold4 capture is checked by shape rather than by a `CapturedSHatVC`,
 /// because this gate runs *before* round one produces one; the stripe path
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
-#[inline(always)]
+#[inline]
 fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_ab_precompute_enabled(r1cs)
         && pcs::ranked_direct_fold4_enabled()
@@ -85,7 +86,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
 
 /// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
 /// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
-#[inline(always)]
+#[inline]
 fn ranked_direct_fold8_precompute_enabled(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
@@ -100,7 +101,6 @@ fn ranked_direct_fold8_precompute_enabled(
 /// AB claim precompute from lincheck's pre-sumcheck `z_vec`: sixty-four banks
 /// when fold8 is live, sixteen banks on fold4, four banks on direct-C, and the
 /// canonical 128-vector otherwise.
-#[inline(always)]
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
@@ -132,7 +132,7 @@ fn precompute_ab_s_hat_v(
 /// takes the canonical transcript-visible statistic. Falls back through
 /// narrower captures by presence, so a producer shape miss (e.g. no lincheck
 /// stripe) degrades to a still-correct route instead of panicking.
-#[inline(always)]
+#[inline]
 fn pre_c_slot<'a>(
     r1cs: &BlockR1cs,
     captured: &'a zerocheck::CapturedSHatVC,
@@ -1214,4 +1214,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // newjordan-x86-refire-11: independent official timing sample of the promoted
 // source; no executable change. (drawn against a3b828b frontier)
 
-// gemini-3.7-flash-high: elimination of dynamic environment lookups and inline gating in prover precomputes.
+// newjordan-x86-refire-19: independent official timing sample of the
+// promoted source; no executable change. (drawn against ebdd5d5 frontier)
