@@ -767,17 +767,14 @@ unsafe fn emit_pair(
 /// block transforms by [`StreamProj::project_blocks`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// are already in the projection's own staging (they are its input). The
+/// publisher loads each A/B row once, derives Z from those live values, and
+/// emits all three destinations without staging a separate set of Z rows.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    z_lo: *const V8,
-    z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -794,30 +791,34 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
             emit_pair(
                 self.z.add(o),
-                *self.z_lo.add(j),
-                *self.z_hi.add(j),
+                and_v8(a_lo, b_lo),
+                and_v8(a_hi, b_hi),
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1092,9 +1093,6 @@ impl Drain8<'_> {
                     store_v8(p, b_lo[r]);
                     store_v8(p.add(8), b_hi[r]);
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
-
                 let g = abs_word / 8;
                 let mut flags = base;
                 if g < z_g1 {
@@ -1119,8 +1117,6 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    z_lo: z_lo.as_ptr(),
-                    z_hi: z_hi.as_ptr(),
                     flags,
                 };
 
