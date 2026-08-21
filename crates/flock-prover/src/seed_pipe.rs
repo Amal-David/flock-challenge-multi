@@ -93,9 +93,9 @@ pub const BENCH_DOMAIN: &[u8] = b"flock-bench-v0";
 /// this build and this machine.
 const WARMUP_SEED: u64 = 0x00C0_FFEE_BEEF_D15C;
 
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(crate) const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 /// `cv[8] + message[16] + counter[1]` draws per generated compression.
-const DRAWS_PER_BLOCK: usize = 25;
+pub(crate) const DRAWS_PER_BLOCK: usize = 25;
 const ZERO_COMPRESSION: Compression = ([0; 8], [0; 16], 0, 0, 0);
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,180 @@ const _ELIDE_GEOMETRY: () = {
 
 type V8 = __m256i;
 
+/// Input form for one eight-compression witness kernel invocation.
+///
+/// The ranked speculative path carries the generator's closed form all the
+/// way here. Producing the 25 draws directly as eight SIMD lanes avoids
+/// materializing and immediately transposing an 896-byte `[Compression; 8]`.
+/// Slice callers retain the original borrowed-input route verbatim.
+pub(crate) enum OctaInputs<'a> {
+    Blocks([&'a Compression; 8]),
+    Closed { init: u64, base: usize },
+}
+
+struct PreparedInputs {
+    cv: [V8; 8],
+    message: [V8; 16],
+    counter_lo: V8,
+    counter_hi: V8,
+    block_len: V8,
+    flags: V8,
+}
+
+/// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
+/// handles the low limbs; the two cross-products supply bits 32..63. The
+/// high×high term is above bit 63 and is discarded, exactly like
+/// `u64::wrapping_mul`.
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn mullo_u64x4(a: __m256i, b: u64) -> __m256i {
+    unsafe {
+        let b_lo = _mm256_set1_epi64x(u64::from(b as u32) as i64);
+        let b_hi = _mm256_set1_epi64x((b >> 32) as i64);
+        let lo = _mm256_mul_epu32(a, b_lo);
+        let a_hi = _mm256_srli_epi64::<32>(a);
+        let cross_lo = _mm256_mul_epu32(a, b_hi);
+        let cross_hi = _mm256_mul_epu32(a_hi, b_lo);
+        let cross = _mm256_add_epi64(cross_lo, cross_hi);
+        _mm256_add_epi64(lo, _mm256_slli_epi64::<32>(cross))
+    }
+}
+
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn mix_u64x4(mut z: __m256i) -> __m256i {
+    unsafe {
+        z = _mm256_xor_si256(z, _mm256_srli_epi64::<30>(z));
+        z = mullo_u64x4(z, 0xBF58_476D_1CE4_E5B9);
+        z = _mm256_xor_si256(z, _mm256_srli_epi64::<27>(z));
+        z = mullo_u64x4(z, 0x94D0_49BB_1331_11EB);
+        _mm256_xor_si256(z, _mm256_srli_epi64::<31>(z))
+    }
+}
+
+/// Pack the low u32 of eight u64 lanes into one `V8`, preserving block order.
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn pack_low_u32x8(lo: __m256i, hi: __m256i) -> V8 {
+    unsafe {
+        let indices = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        let lo = _mm256_permutevar8x32_epi32(lo, indices);
+        let hi = _mm256_permutevar8x32_epi32(hi, indices);
+        _mm256_permute2x128_si256::<0x20>(lo, hi)
+    }
+}
+
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
+    unsafe {
+        let golden = _mm256_set1_epi64x(crate::seed_pipe::GOLDEN as i64);
+        states[0] = _mm256_add_epi64(states[0], golden);
+        states[1] = _mm256_add_epi64(states[1], golden);
+        pack_low_u32x8(mix_u64x4(states[0]), mix_u64x4(states[1]))
+    }
+}
+
+/// Generate the exact protected-wrapper inputs for blocks `base..base+8`
+/// directly in the word-major form consumed by the witness kernel. AVX2
+/// targets use two four-lane SplitMix states and the low-limb multiplication
+/// above; Sapphire Rapids uses the eight-lane AVX-512DQ implementation below.
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+    unsafe {
+        let stride = crate::seed_pipe::GOLDEN
+            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
+        let mut states = [
+            _mm256_setr_epi64x(
+                first as i64,
+                first.wrapping_add(stride) as i64,
+                first.wrapping_add(stride.wrapping_mul(2)) as i64,
+                first.wrapping_add(stride.wrapping_mul(3)) as i64,
+            ),
+            _mm256_setr_epi64x(
+                first.wrapping_add(stride.wrapping_mul(4)) as i64,
+                first.wrapping_add(stride.wrapping_mul(5)) as i64,
+                first.wrapping_add(stride.wrapping_mul(6)) as i64,
+                first.wrapping_add(stride.wrapping_mul(7)) as i64,
+            ),
+        ];
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut states));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut states));
+        let counter_lo = next_generator_draw(&mut states);
+        PreparedInputs {
+            cv,
+            message,
+            counter_lo,
+            counter_hi: _mm256_setzero_si256(),
+            block_len: _mm256_set1_epi32(64),
+            flags: _mm256_set1_epi32(11),
+        }
+    }
+}
+
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
+    unsafe {
+        z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
+        z = _mm512_mullo_epi64(
+            z,
+            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
+        );
+        z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
+        z = _mm512_mullo_epi64(
+            z,
+            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
+        );
+        _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
+    }
+}
+
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
+    unsafe {
+        *state = _mm512_add_epi64(
+            *state,
+            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
+        );
+        _mm512_cvtepi64_epi32(mix_u64x8(*state))
+    }
+}
+
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+    unsafe {
+        let stride = crate::seed_pipe::GOLDEN
+            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
+        let mut state = _mm512_setr_epi64(
+            first as i64,
+            first.wrapping_add(stride) as i64,
+            first.wrapping_add(stride.wrapping_mul(2)) as i64,
+            first.wrapping_add(stride.wrapping_mul(3)) as i64,
+            first.wrapping_add(stride.wrapping_mul(4)) as i64,
+            first.wrapping_add(stride.wrapping_mul(5)) as i64,
+            first.wrapping_add(stride.wrapping_mul(6)) as i64,
+            first.wrapping_add(stride.wrapping_mul(7)) as i64,
+        );
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
+        let counter_lo = next_generator_draw(&mut state);
+        PreparedInputs {
+            cv,
+            message,
+            counter_lo,
+            counter_hi: _mm256_setzero_si256(),
+            block_len: _mm256_set1_epi32(64),
+            flags: _mm256_set1_epi32(11),
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn load_v8(p: *const u32) -> V8 {
     unsafe { _mm256_loadu_si256(p.cast::<__m256i>()) }
@@ -1100,7 +1274,7 @@ unsafe fn dump_elide_win(
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
-    inputs: [&Compression; 8],
+    inputs: OctaInputs<'_>,
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
@@ -1110,79 +1284,94 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z_nt: bool,
 ) {
     unsafe {
-        let ptrs = [
-            inputs[0].0.as_ptr(),
-            inputs[1].0.as_ptr(),
-            inputs[2].0.as_ptr(),
-            inputs[3].0.as_ptr(),
-            inputs[4].0.as_ptr(),
-            inputs[5].0.as_ptr(),
-            inputs[6].0.as_ptr(),
-            inputs[7].0.as_ptr(),
-        ];
-        let cv_rows = [
-            load_v8(ptrs[0]),
-            load_v8(ptrs[1]),
-            load_v8(ptrs[2]),
-            load_v8(ptrs[3]),
-            load_v8(ptrs[4]),
-            load_v8(ptrs[5]),
-            load_v8(ptrs[6]),
-            load_v8(ptrs[7]),
-        ];
-        let cv_v = tr8(
-            cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
-            cv_rows[6], cv_rows[7],
-        );
+        let prepared = match inputs {
+            OctaInputs::Blocks(inputs) => {
+                let ptrs = [
+                    inputs[0].0.as_ptr(),
+                    inputs[1].0.as_ptr(),
+                    inputs[2].0.as_ptr(),
+                    inputs[3].0.as_ptr(),
+                    inputs[4].0.as_ptr(),
+                    inputs[5].0.as_ptr(),
+                    inputs[6].0.as_ptr(),
+                    inputs[7].0.as_ptr(),
+                ];
+                let cv_rows = [
+                    load_v8(ptrs[0]),
+                    load_v8(ptrs[1]),
+                    load_v8(ptrs[2]),
+                    load_v8(ptrs[3]),
+                    load_v8(ptrs[4]),
+                    load_v8(ptrs[5]),
+                    load_v8(ptrs[6]),
+                    load_v8(ptrs[7]),
+                ];
+                let cv = tr8(
+                    cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
+                    cv_rows[6], cv_rows[7],
+                );
 
-        let mptrs = [
-            inputs[0].1.as_ptr(),
-            inputs[1].1.as_ptr(),
-            inputs[2].1.as_ptr(),
-            inputs[3].1.as_ptr(),
-            inputs[4].1.as_ptr(),
-            inputs[5].1.as_ptr(),
-            inputs[6].1.as_ptr(),
-            inputs[7].1.as_ptr(),
-        ];
-        let m_lo = tr8(
-            load_v8(mptrs[0]),
-            load_v8(mptrs[1]),
-            load_v8(mptrs[2]),
-            load_v8(mptrs[3]),
-            load_v8(mptrs[4]),
-            load_v8(mptrs[5]),
-            load_v8(mptrs[6]),
-            load_v8(mptrs[7]),
-        );
-        let m_hi = tr8(
-            load_v8(mptrs[0].add(8)),
-            load_v8(mptrs[1].add(8)),
-            load_v8(mptrs[2].add(8)),
-            load_v8(mptrs[3].add(8)),
-            load_v8(mptrs[4].add(8)),
-            load_v8(mptrs[5].add(8)),
-            load_v8(mptrs[6].add(8)),
-            load_v8(mptrs[7].add(8)),
-        );
-        let mut m = [dup_u32(0); 16];
-        m[..8].copy_from_slice(&m_lo);
-        m[8..].copy_from_slice(&m_hi);
+                let mptrs = [
+                    inputs[0].1.as_ptr(),
+                    inputs[1].1.as_ptr(),
+                    inputs[2].1.as_ptr(),
+                    inputs[3].1.as_ptr(),
+                    inputs[4].1.as_ptr(),
+                    inputs[5].1.as_ptr(),
+                    inputs[6].1.as_ptr(),
+                    inputs[7].1.as_ptr(),
+                ];
+                let m_lo = tr8(
+                    load_v8(mptrs[0]),
+                    load_v8(mptrs[1]),
+                    load_v8(mptrs[2]),
+                    load_v8(mptrs[3]),
+                    load_v8(mptrs[4]),
+                    load_v8(mptrs[5]),
+                    load_v8(mptrs[6]),
+                    load_v8(mptrs[7]),
+                );
+                let m_hi = tr8(
+                    load_v8(mptrs[0].add(8)),
+                    load_v8(mptrs[1].add(8)),
+                    load_v8(mptrs[2].add(8)),
+                    load_v8(mptrs[3].add(8)),
+                    load_v8(mptrs[4].add(8)),
+                    load_v8(mptrs[5].add(8)),
+                    load_v8(mptrs[6].add(8)),
+                    load_v8(mptrs[7].add(8)),
+                );
+                let mut message = [dup_u32(0); 16];
+                message[..8].copy_from_slice(&m_lo);
+                message[8..].copy_from_slice(&m_hi);
 
-        let mut tlo_a = [0u32; 8];
-        let mut thi_a = [0u32; 8];
-        let mut bl_a = [0u32; 8];
-        let mut fl_a = [0u32; 8];
-        for j in 0..8 {
-            tlo_a[j] = inputs[j].2 as u32;
-            thi_a[j] = (inputs[j].2 >> 32) as u32;
-            bl_a[j] = inputs[j].3;
-            fl_a[j] = inputs[j].4;
-        }
-        let tlo = load_v8(tlo_a.as_ptr());
-        let thi = load_v8(thi_a.as_ptr());
-        let blen = load_v8(bl_a.as_ptr());
-        let flags = load_v8(fl_a.as_ptr());
+                let mut tlo_a = [0u32; 8];
+                let mut thi_a = [0u32; 8];
+                let mut bl_a = [0u32; 8];
+                let mut fl_a = [0u32; 8];
+                for j in 0..8 {
+                    tlo_a[j] = inputs[j].2 as u32;
+                    thi_a[j] = (inputs[j].2 >> 32) as u32;
+                    bl_a[j] = inputs[j].3;
+                    fl_a[j] = inputs[j].4;
+                }
+                PreparedInputs {
+                    cv,
+                    message,
+                    counter_lo: load_v8(tlo_a.as_ptr()),
+                    counter_hi: load_v8(thi_a.as_ptr()),
+                    block_len: load_v8(bl_a.as_ptr()),
+                    flags: load_v8(fl_a.as_ptr()),
+                }
+            }
+            OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+        };
+        let cv_v = prepared.cv;
+        let m = prepared.message;
+        let tlo = prepared.counter_lo;
+        let thi = prepared.counter_hi;
+        let blen = prepared.block_len;
+        let flags = prepared.flags;
 
         let mut state: [V8; 16] = [
             cv_v[0],
@@ -1385,6 +1574,47 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe fn lanes(v: V8) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), v) };
+        out
+    }
+
+    #[test]
+    fn closed_octa_inputs_match_scalar_generator() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            for (init, base) in [
+                (0u64, 0usize),
+                (0x0123_4567_89AB_CDEF, 17),
+                (u64::MAX - 31, (1 << 18) - 8),
+            ] {
+                let got = prepare_closed_inputs(init, base);
+                let cv: [[u32; 8]; 8] = got.cv.map(|v| lanes(v));
+                let message: [[u32; 8]; 16] = got.message.map(|v| lanes(v));
+                let counter_lo = lanes(got.counter_lo);
+                let counter_hi = lanes(got.counter_hi);
+                let block_len = lanes(got.block_len);
+                let flags = lanes(got.flags);
+                for lane in 0..8 {
+                    let expected = crate::seed_pipe::gen_block(init, base + lane);
+                    for word in 0..8 {
+                        assert_eq!(cv[word][lane], expected.0[word]);
+                    }
+                    for word in 0..16 {
+                        assert_eq!(message[word][lane], expected.1[word]);
+                    }
+                    assert_eq!(counter_lo[lane], expected.2 as u32);
+                    assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
+                    assert_eq!(block_len[lane], expected.3);
+                    assert_eq!(flags[lane], expected.4);
+                }
+            }
+        }
+    }
 
     #[test]
     fn witgen8_tr8_is_8x8_u32_transpose() {

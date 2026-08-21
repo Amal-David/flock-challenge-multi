@@ -1792,16 +1792,22 @@ fn generate_round1_inner_octa(
                 unsafe {
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
-                        // Lead 2: the closed-form arm evaluates the eight blocks
-                        // into 896 B of L1-resident stack staging on the very
-                        // worker that is about to hash them, instead of loading
-                        // them from a 28 MiB materialized vector. The `Slice` arm
-                        // is byte-for-byte the incumbent — it still borrows in
-                        // place, no copy introduced.
+                        // Lead 2: a full closed-form octa carries only init/base
+                        // into the witness kernel, which generates all 25 draws
+                        // directly in word-major SIMD lanes. Slice input still
+                        // borrows in place; only a ragged closed octa uses the
+                        // scalar staging needed to preserve padding semantics.
                         let staged: [Compression; SIMD];
-                        let octa: [&Compression; SIMD] = match blocks {
+                        let octa = match blocks {
                             crate::seed_pipe::BlockSource::Slice(s) => {
-                                std::array::from_fn(|j| s.get(base + j).unwrap_or(padding))
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    s.get(base + j).unwrap_or(padding)
+                                }))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len }
+                                if base + SIMD <= len =>
+                            {
+                                blake3_witgen8::OctaInputs::Closed { init, base }
                             }
                             crate::seed_pipe::BlockSource::Closed { init, len } => {
                                 staged = std::array::from_fn(|j| {
@@ -1812,7 +1818,9 @@ fn generate_round1_inner_octa(
                                         *padding
                                     }
                                 });
-                                std::array::from_fn(|j| &staged[j])
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    &staged[j]
+                                }))
                             }
                         };
                         let off = half * SIMD * F128_PER_BLOCK;
