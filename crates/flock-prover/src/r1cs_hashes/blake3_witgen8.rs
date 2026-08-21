@@ -24,7 +24,8 @@ use super::{
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    Round1AbTableImages, Round1AbWindowPlan, round1_ab_inner_window_with_images,
+    ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
+    round1_ab_inner_window_from_offsets, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
 
@@ -269,6 +270,21 @@ unsafe fn store_v8(p: *mut u32, v: V8) {
     unsafe { _mm256_storeu_si256(p.cast::<__m256i>(), v) }
 }
 
+/// Widen one staged 64-byte window side (its two transposed V8 rows, still in
+/// registers) to the pre-scaled `u16` offset half the split shift-reduce
+/// kernel consumes: `byte * 64` per lane, two ZMM stores. Identical values to
+/// the kernel's own prologue — the source is the register the staging store
+/// was made from instead of a reload of that store.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn widen_off_half(lo: V8, hi: V8, op: *mut u16) {
+    unsafe {
+        let w = |v: V8| _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(v));
+        _mm512_store_si512(op.cast::<__m512i>(), w(lo));
+        _mm512_store_si512(op.add(32).cast::<__m512i>(), w(hi));
+    }
+}
+
 #[inline(always)]
 fn dup_u32(x: u32) -> V8 {
     unsafe { _mm256_set1_epi32(x as i32) }
@@ -406,7 +422,7 @@ impl StreamProj<'_> {
     unsafe fn project(&self, blk: usize) {
         unsafe {
             let (plan, imgs) = self.window_prep(blk);
-            self.project_blocks(blk, plan, imgs, None);
+            self.project_blocks(blk, plan, imgs, None, None);
         }
     }
 
@@ -430,7 +446,11 @@ impl StreamProj<'_> {
     /// # Safety
     /// As for [`Self::project`], and `plan`/`imgs` must be this window's
     /// [`Self::window_prep`]; `rows`, when present, must describe the drain
-    /// step that produced this window's staging.
+    /// step that produced this window's staging. `off`, when present, must
+    /// point to the eight blocks' prebuilt offset arena
+    /// (`8 * ROUND1_AB_OFF_WORDS` u16s, 64-byte aligned, block-major) for
+    /// this window's staging bytes, and `plan.offsets_eligible(blk)` must
+    /// hold.
     #[inline(never)]
     unsafe fn project_blocks(
         &self,
@@ -438,10 +458,37 @@ impl StreamProj<'_> {
         plan: Round1AbWindowPlan,
         imgs: Round1AbTableImages,
         rows: Option<StepRows>,
+        off: Option<*const u16>,
     ) {
         unsafe {
             let (sa, sb) = self.sides();
             let live = self.live;
+            // Producer-fused offsets: the drain built the arena straight from
+            // its transpose registers, so the staging is never reloaded here.
+            // Publish scheduling identical to the loops below.
+            if let Some(op) = off {
+                debug_assert!(plan.offsets_eligible(blk));
+                for j in 0..8usize {
+                    if let Some(rows) = rows {
+                        rows.publish(j, sa, sb);
+                    }
+                    if live & (1 << j) == 0 {
+                        continue;
+                    }
+                    let out = &mut *self
+                        .out
+                        .add(j * BYTES_PER_BLOCK + blk * 64)
+                        .cast::<[u8; 64]>();
+                    round1_ab_inner_window_from_offsets(
+                        &*op.add(j * ROUND1_AB_OFF_WORDS)
+                            .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                        out,
+                        plan,
+                        imgs,
+                    );
+                }
+                return;
+            }
             for j in 0..8usize {
                 // ONE block transformed per THREE lines published: the drain's
                 // streaming stores land ~1/8 of a window apart instead of all
@@ -1071,6 +1118,18 @@ impl Drain8<'_> {
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
+                let blk = abs_word / STEP_WORDS;
+                let (plan, imgs) = proj.window_prep(blk);
+                // Fused offset arena: while the transposed rows are still in
+                // registers, also widen them to the split kernel's pre-scaled
+                // `u16` offsets. The kernel then consumes the arena and never
+                // reloads the staging, and no consuming load executes in the
+                // shadow of its own offset stores.
+                let use_off = plan.offsets_eligible(blk);
+                #[repr(align(64))]
+                struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
+                let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+                let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
 
                 // Transpose the two ring sides first. a and b go straight
                 // into the projection's staging — which is both its input AND
@@ -1084,6 +1143,10 @@ impl Drain8<'_> {
                     let p = sa.add(r * STEP_WORDS);
                     store_v8(p, a_lo[r]);
                     store_v8(p.add(8), a_hi[r]);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                    if use_off {
+                        widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
+                    }
                 }
                 let b_lo = tr8_chunk(self.bs, rw);
                 let b_hi = tr8_chunk(self.bs, rw + 8);
@@ -1091,6 +1154,14 @@ impl Drain8<'_> {
                     let p = sb.add(r * STEP_WORDS);
                     store_v8(p, b_lo[r]);
                     store_v8(p.add(8), b_hi[r]);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                    if use_off {
+                        widen_off_half(
+                            b_lo[r],
+                            b_hi[r],
+                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
+                        );
+                    }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
                 let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
@@ -1124,9 +1195,13 @@ impl Drain8<'_> {
                     flags,
                 };
 
-                let blk = abs_word / STEP_WORDS;
-                let (plan, imgs) = proj.window_prep(blk);
-                proj.project_blocks(blk, plan, imgs, Some(rows));
+                proj.project_blocks(
+                    blk,
+                    plan,
+                    imgs,
+                    Some(rows),
+                    if use_off { Some(op as *const u16) } else { None },
+                );
             }
         }
     }
