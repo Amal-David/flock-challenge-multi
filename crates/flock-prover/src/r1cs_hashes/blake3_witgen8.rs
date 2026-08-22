@@ -339,6 +339,21 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
+        // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
+        // Bit-identical; the carry-packing is the hot half of the witness
+        // G-functions, and on the ranked runner the ternlog saves one op per
+        // push (~16 per G, ~900 per 8-block call). The mask is a compile-time
+        // constant here (N is literal), so it folds into the ternlog's memory
+        // operand or a constant broadcast; no register pressure change.
+        unsafe {
+            let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+            _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
     unsafe {
         let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
         _mm256_or_si256(_mm256_slli_epi32::<N>(b), _mm256_and_si256(a, mask))
@@ -640,7 +655,31 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
 fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     debug_assert_eq!(N + M, 32);
     let v = xor_v8(x, y);
-    or_v8(shr_v8::<N>(v), shl_v8::<M>(v))
+    ror_v8::<N>(v)
+}
+
+/// Rotate-right by N on AVX-512 (single `vprold`, EVEX.256) -- three ops on
+/// AVX2. Bit-identical either way; the witness phase is ALU-bound so the
+/// uop cut matters on the ranked runner. The EVEX form needs `avx512f`.
+#[inline(always)]
+fn ror_v8<const N: i32>(v: V8) -> V8 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        // SAFETY: target feature checked at compile time.
+        unsafe { _mm256_ror_epi32::<N>(v) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    {
+        // N is a monomorphized literal (16/12/8/7 in the G-functions), so the
+        // match folds to the single shift+or pair at compile time.
+        match N {
+            16 => or_v8(shr_v8::<16>(v), shl_v8::<16>(v)),
+            12 => or_v8(shr_v8::<12>(v), shl_v8::<20>(v)),
+            8 => or_v8(shr_v8::<8>(v), shl_v8::<24>(v)),
+            7 => or_v8(shr_v8::<7>(v), shl_v8::<25>(v)),
+            _ => panic!("unexpected rotate count {N}"),
+        }
+    }
 }
 
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
