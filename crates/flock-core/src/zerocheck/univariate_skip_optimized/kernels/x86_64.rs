@@ -581,7 +581,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_const_x4, ghash_mul_const_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -590,7 +590,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
-        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let (eq, eq_x64) = ghash_const_x4(eq_lo_val);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -601,7 +601,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_ab = ghash_mul_const_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq, eq_x64);
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -681,7 +681,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{ghash_const_x4, ghash_mul_const_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
@@ -722,7 +722,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     // table half. Eq scaling and partial XOR cover four F128s per store.
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
-        let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let (eq, eq_x64) = ghash_const_x4(eq_lo_val);
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -761,8 +761,8 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let scaled0 = ghash_mul_const_x4(aos0, eq, eq_x64);
+                let scaled1 = ghash_mul_const_x4(aos1, eq, eq_x64);
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
