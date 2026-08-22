@@ -67,13 +67,19 @@ fn ranked_direct_fold4_precompute_enabled(
 /// relies on ranked BLAKE3's block geometry and honest padding, and every miss
 /// keeps the incumbent producer.
 ///
+/// Independent of [`ranked_direct_ab_precompute_enabled`]: that latch is
+/// x86_64-only because the open-path Direct-AB consumer kernels are. The
+/// identity-C producer is portable (`lincheck::fold_block_major_one_shot` +
+/// ring-switch tensor widening) and is the ranked algorithm; pinning it to
+/// x86 left Apple-silicon local loops on the fused C-drain URM. Open still
+/// consumes `s_hat_v_c` on non-x86 because Direct-AB stays gated.
+///
 /// The fold4 capture is checked by shape rather than by a `CapturedSHatVC`,
 /// because this gate runs *before* round one produces one; the stripe path
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
 #[inline]
 fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_ab_precompute_enabled(r1cs)
-        && pcs::ranked_direct_fold4_enabled()
+    pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
         && r1cs.m == 32
         && r1cs.k_log == 14

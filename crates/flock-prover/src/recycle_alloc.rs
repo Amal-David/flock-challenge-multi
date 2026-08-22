@@ -77,43 +77,39 @@ fn align64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ALIGN64").is_none())
 }
 
-/// Every large prover buffer historically landed `16 mod 64` (glibc mmap
-/// chunk header), which the hot kernels pay for three ways: every wide
-/// load/store on these buffers is a cache-line split, non-temporal 64-byte
-/// writes straddle two lines (partial write-combining flushes are DRAM
-/// read-modify-writes), and single-uop ZMM streaming stores are illegal.
-/// For the recyclable class, over-allocate by `ALIGN_SLACK` and return
-/// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
-/// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
-/// never collide with the freelist link word at `aligned + 0`.
-const ALIGN_SLACK: usize = 64;
+/// Large prover buffers used to land `16 mod 64` (glibc mmap chunk header):
+/// split cache-line loads, NT 64-byte stores that straddle two lines, and
+/// illegal single-uop ZMM streaming stores. We now ask System for a 16 KiB
+/// page-aligned block of a page-rounded size and hand that pointer through
+/// unchanged (it is a multiple of 64, so the NT/ZMM constraints still hold).
+///
+/// 16 KiB is Apple Silicon's VM page and Metal's `newBufferWithBytesNoCopy`
+/// requirement. Without it, `gpu::merkle::begin` refuses every wrap
+/// (`alignment/coverage`) and the ranked Apple worker hashes Merkle leaves
+/// and URM windows on CPU. Linux x86 is unchanged algorithmically; page
+/// alignment is a strict strengthening of the old 64-byte contract.
+const PAGE: usize = 16 * 1024;
 
 #[inline]
 fn adjusted(layout: &Layout) -> Layout {
-    // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
-    // caller could have constructed, and 16 is a power of two.
-    Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
+    // SAFETY of unwrap: rounding a recyclable size (≥ 32 KiB) up to 16 KiB
+    // cannot overflow isize, and PAGE is a power of two.
+    let size = layout.size().next_multiple_of(PAGE);
+    Layout::from_size_align(size, PAGE).unwrap()
 }
 
 #[inline]
 unsafe fn align_up(base: *mut u8) -> *mut u8 {
-    if base.is_null() {
-        return base;
-    }
-    let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
-    // over-allocated, and aligned - 8 >= base.
-    unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
-    aligned
+    // System already returned a PAGE-aligned block (see `adjusted`). The
+    // user pointer *is* the System pointer so Metal no-copy wraps succeed.
+    debug_assert!(base.is_null() || (base as usize).is_multiple_of(PAGE));
+    base
 }
 
 #[inline]
 unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
-    // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
-    // intact (freelist links live at ptr + 0 and never touch it).
-    let off = unsafe { *(ptr.sub(8) as *const usize) };
-    debug_assert!((8..=ALIGN_SLACK).contains(&off));
-    unsafe { ptr.sub(off) }
+    debug_assert!((ptr as usize).is_multiple_of(PAGE));
+    ptr
 }
 
 #[inline]
@@ -145,10 +141,9 @@ pub struct RecycleAlloc;
 
 // SAFETY: every recycled block came from this allocator with the exact same
 // size class. With align64 on, every recyclable-class block System sees uses
-// the `adjusted` layout on both alloc and dealloc, and the user pointer is
-// recovered to its System base via the offset word `align_up` stored.
-// glibc/mimalloc and the macOS allocator provide at least 16-byte alignment
-// at these sizes; layouts requiring larger alignment bypass the recycler.
+// the `adjusted` (page-aligned, page-rounded) layout on both alloc and
+// dealloc, and the user pointer *is* that System pointer. Layouts requiring
+// alignment above MAX_ALIGN bypass the recycler.
 unsafe impl GlobalAlloc for RecycleAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if recyclable(&layout) {
@@ -157,7 +152,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 return p;
             }
             if align64_enabled() {
-                // SAFETY: adjusted() reserves the slack align_up consumes.
+                // SAFETY: adjusted() is a valid PAGE-aligned layout; align_up
+                // is identity on that pointer.
                 return unsafe { align_up(System.alloc(adjusted(&layout))) };
             }
         }
@@ -172,9 +168,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 return p;
             }
             if align64_enabled() {
-                // The user range [aligned, aligned + size) is inside the
-                // zeroed System block; the offset word sits before it.
-                // SAFETY: as for alloc.
+                // SAFETY: as for alloc. The user range is the whole zeroed
+                // System block (no prefix offset word).
                 return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
             }
         }
@@ -188,8 +183,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: every recyclable-class pointer this allocator
-                // handed out with align64 on came from align_up; recover the
-                // System base and the adjusted layout it was allocated with.
+                // handed out with align64 on is the System pointer from
+                // `adjusted`; dealloc with that same layout.
                 unsafe {
                     return System.dealloc(align_base(ptr), adjusted(&layout));
                 }
@@ -203,7 +198,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 mod tests {
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
-    /// freelist, and grown through realloc — returns a 64-aligned pointer
+    /// freelist, and grown through realloc — returns a 16 KiB-aligned pointer
     /// with intact contents. (The switch-off arm can't be covered in the
     /// same process: the latch resolves once.)
     #[test]
@@ -212,12 +207,15 @@ mod tests {
             let n = 32 * 1024 + 4096 * i + 128;
             let v = vec![7u8; n];
             assert_eq!(v.as_ptr() as usize % 64, 0, "fresh alloc n={n}");
+            assert_eq!(v.as_ptr() as usize % 16384, 0, "page-aligned fresh n={n}");
             drop(v);
             let v2 = vec![9u8; n];
             assert_eq!(v2.as_ptr() as usize % 64, 0, "recycled alloc n={n}");
+            assert_eq!(v2.as_ptr() as usize % 16384, 0, "page-aligned recycled n={n}");
             assert!(v2.iter().all(|&b| b == 9), "contents survive recycle n={n}");
             let z = vec![0u8; n + 64];
             assert_eq!(z.as_ptr() as usize % 64, 0, "alloc_zeroed n={}", n + 64);
+            assert_eq!(z.as_ptr() as usize % 16384, 0, "page-aligned zeroed n={}", n + 64);
             assert!(z.iter().all(|&b| b == 0), "zeroed contents n={}", n + 64);
         }
         // Growth path: realloc = alloc + copy + dealloc through this
@@ -226,6 +224,7 @@ mod tests {
         g.extend(std::iter::repeat_n(0xA5u8, 48 * 1024));
         g.extend(std::iter::repeat_n(0x5Au8, 128 * 1024));
         assert_eq!(g.as_ptr() as usize % 64, 0, "grown alloc");
+        assert_eq!(g.as_ptr() as usize % 16384, 0, "page-aligned grown alloc");
         assert!(g[..48 * 1024].iter().all(|&b| b == 0xA5));
         assert!(g[48 * 1024..].iter().all(|&b| b == 0x5A));
     }
