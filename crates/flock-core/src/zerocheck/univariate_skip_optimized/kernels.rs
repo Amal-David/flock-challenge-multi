@@ -305,6 +305,124 @@ pub(super) fn shift_reduce_offsets_eligible(
     }
 }
 
+/// True when the packed burst-build / burst-consume split may replace the
+/// in-kernel pidx+offw body for a run of windows in
+/// `shift_reduce_transpose_windows` (x86 AVX-512+GFNI with offw + arena on,
+/// no static-B, and `FLOCK_NO_URM_R1_SPLIT` unset). Bit-identical bytes when
+/// it holds: the split builds the same pre-scaled `u16` offsets from the
+/// same 64+64 a/b bytes and the consume is the same Horner + store class.
+#[inline]
+#[allow(unused_variables)]
+pub(super) fn shift_reduce_split_eligible(bstatic: bool) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        x86_64::urm_r1_split_enabled()
+            && x86_64::urm_apply_2img_enabled()
+            && x86_64::urm_pidx_enabled()
+            && x86_64::urm_offw_enabled()
+            && x86_64::urm_off_arena_enabled()
+            && !bstatic
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        false
+    }
+}
+
+/// Split-build half for the packed path: widen window `b_med`'s 64+64 a/b
+/// bytes at `chunk_byte_base` to the kernel's 128 pre-scaled `u16` offsets,
+/// into `op` (64-byte aligned, 128 writable `u16`s). Only meaningful when
+/// [`shift_reduce_split_eligible`] holds.
+///
+/// # Safety
+/// Forwarded from the caller's packed-input bounds (64 readable bytes at
+/// `chunk_byte_base + b_med * N_CHUNKS * 8` in both buffers) and `op`'s
+/// alignment/size contract.
+#[inline]
+#[allow(unused_variables)]
+pub(super) unsafe fn shift_reduce_offsets_build_packed(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    chunk_byte_base: usize,
+    b_med: usize,
+    op: *mut u16,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        let byte_base_b = chunk_byte_base + b_med * super::N_CHUNKS * 8;
+        x86_64::shift_reduce_ab_offsets_build(
+            a_packed.as_ptr().add(byte_base_b),
+            b_packed.as_ptr().add(byte_base_b),
+            op,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (a_packed, b_packed, chunk_byte_base, b_med, op);
+        unreachable!("packed split is x86 AVX-512+GFNI only; gate on shift_reduce_split_eligible");
+    }
+}
+
+/// Split-consume half for the packed path: the two-image wide-read Horner +
+/// terminal store of the pidx body, fed from offsets prebuilt by
+/// [`shift_reduce_offsets_build_packed`]. Bit-identical output to the
+/// in-kernel pidx+offw body — same table addresses, arithmetic and store
+/// class.
+///
+/// # Safety
+/// `op` holds this window's 128 pre-scaled offsets; `imgs` are the table's
+/// base and σ₈ image pointers; `out`/`nt` as for [`shift_reduce_inner_ab`].
+#[inline]
+#[allow(unused_variables)]
+pub(super) unsafe fn shift_reduce_inner_ab_from_offsets(
+    op: *const u16,
+    out: &mut [u8; 64],
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        x86_64::shift_reduce_inner_ab_x86_avx512_from_off(op, out, nt, imgs);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (op, out, nt, imgs);
+        unreachable!("packed split is x86 AVX-512+GFNI only; gate on shift_reduce_split_eligible");
+    }
+}
+
 /// Single-window twin of [`shift_reduce_inner_ab`] addressed by an absolute
 /// byte offset plus the global BLAKE3 medium-window index
 /// `blk = w * 16 + b_med`, for callers that hold one 64-byte window's bytes
