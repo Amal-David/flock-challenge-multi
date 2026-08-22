@@ -272,6 +272,34 @@ impl FsChallenger {
         self.absorb(&v.hi.to_le_bytes());
     }
 
+    /// Bulk-absorb a slice of F128 values as ONE contiguous byte stream
+    /// (lo LE bytes then hi LE bytes, per element, in order) — byte-identical
+    /// to looping [`Self::absorb_f128`] over the slice, since the streaming
+    /// hash state depends only on the concatenated byte stream. Fed to
+    /// `absorb` in large chunks (≥ 4 KiB) so huge slices don't need one giant
+    /// buffer; `absorb` updates `n_absorbed` identically either way.
+    fn absorb_f128_slice_bulk(&mut self, values: &[F128]) {
+        const CHUNK_ELEMS: usize = 4096 / 16; // ≥ 4 KiB of serialized bytes
+        let mut buf = [0u8; CHUNK_ELEMS * 16];
+        for chunk in values.chunks(CHUNK_ELEMS) {
+            for (dst, v) in buf.chunks_mut(16).zip(chunk) {
+                dst[..8].copy_from_slice(&v.lo.to_le_bytes());
+                dst[8..].copy_from_slice(&v.hi.to_le_bytes());
+            }
+            let nbytes = chunk.len() * 16;
+            self.absorb(&buf[..nbytes]);
+        }
+    }
+
+    /// The original per-element absorb path (two 8-byte `update` calls per
+    /// element through the hasher). Kept as the reference implementation for
+    /// the byte-identity test; not exported.
+    fn absorb_f128_slice_per_element(&mut self, values: &[F128]) {
+        for v in values {
+            self.absorb_f128(*v);
+        }
+    }
+
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
     /// state without mutating it.
     ///
@@ -335,9 +363,7 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
-        for v in values {
-            self.absorb_f128(*v);
-        }
+        self.absorb_f128_slice_bulk(values);
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
@@ -1410,6 +1436,46 @@ mod tests {
                 for _ in 0..4 {
                     assert_eq!(prover.sample_f128(), verifier.sample_f128());
                 }
+            }
+        }
+    }
+
+    /// Bulk-absorb of an F128 slice must be byte-identical to the old
+    /// per-element loop: same digest AND same `n_absorbed`, on both hash
+    /// backends, across lengths either side of the 4 KiB chunk boundary
+    /// (256 elements).
+    #[test]
+    fn fs_challenger_bulk_absorb_matches_per_element() {
+        // Deterministic pseudo-random values.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            F128 {
+                lo: seed,
+                hi: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            }
+        };
+        for len in [0usize, 1, 2, 63, 64, 65, 255, 256, 257, 1000] {
+            let values: Vec<F128> = (0..len).map(|_| next()).collect();
+            for kind in KINDS {
+                let mut bulk = FsChallenger::with_hash(b"bulk-test", kind);
+                bulk.observe_label(b"bulk-identity");
+                bulk.observe_f128_slice(&values);
+
+                let mut scalar = FsChallenger::with_hash(b"bulk-test", kind);
+                scalar.observe_label(b"bulk-identity");
+                scalar.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                scalar.absorb(&(values.len() as u64).to_le_bytes());
+                scalar.absorb_f128_slice_per_element(&values);
+
+                assert_eq!(
+                    bulk.state_digest(),
+                    scalar.state_digest(),
+                    "digest mismatch at len={len} kind={kind:?}"
+                );
+                assert_eq!(bulk.n_absorbed, scalar.n_absorbed, "n_absorbed at len={len}");
             }
         }
     }
