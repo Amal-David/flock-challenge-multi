@@ -662,6 +662,86 @@ fn shift_reduce_transpose_windows(
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
 ) {
+    // Packed burst split: build every window's pre-scaled `u16` offsets up
+    // front (all 64+64-byte a/b reads issue back-to-back), then consume all.
+    // The in-kernel pidx+offw body builds then consumes per window, so every
+    // window's consume loads sit behind its own offset stores AND the
+    // sibling window's build; splitting breaks that store-to-load dependency
+    // across the whole run. Bit-identical bytes: the split builds the same
+    // offsets from the same a/b bytes and the consume is the same Horner +
+    // same store class (see `shift_reduce_split_eligible`).
+    if kernels::shift_reduce_split_eligible(bstatic.is_some()) {
+        let plan = Round1AbWindowPlan {
+            bstatic: None,
+            kernel: kernels::prepare_shift_reduce(inv_table),
+            nt: 0,
+        };
+        let Round1AbTableImages(im0, im1) = round1_ab_table_images(inv_table, plan);
+        // Two-slot software pipeline: while window `w`'s consume runs its
+        // table gathers, window `w + 1`'s 64+64 a/b bytes are being read and
+        // widened up front, so no consume waits on a sibling window's offset
+        // stores or DRAM loads. (The full-burst arena variant measured −1.7%
+        // on atlas — 4 KiB of offsets contended with the L1-hot table — so
+        // only two windows' offsets are live here.)
+        #[repr(align(64))]
+        struct OffArena([u16; 2 * ROUND1_AB_OFF_WORDS]);
+        let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+        // SAFETY: `op` points into the aligned arena; the build loop below
+        // writes only slots 0 and 1, each fully inside it.
+        let op = unsafe { core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) } as *mut u16;
+        // SAFETY: the packed buffers are readable at every window's
+        // `byte_base_b` — the same contract the incumbent kernel's pidx
+        // prologue relies on (see the wrapper docs).
+        unsafe {
+            if n_b_med > 0 {
+                kernels::shift_reduce_offsets_build_packed(
+                    a_packed,
+                    b_packed,
+                    chunk_byte_base,
+                    0,
+                    op,
+                );
+            }
+        }
+        for w in 0..n_b_med {
+            let next = w + 1;
+            // Issue the next window's build BEFORE this window's consume so
+            // the load latencies overlap the gathers.
+            if next < n_b_med {
+                // SAFETY: as above; slot `next % 2` is free (window `w`'s
+                // consume reads slot `w % 2`; for `w % 2 == next % 2` the
+                // previous consume of that slot already completed).
+                unsafe {
+                    kernels::shift_reduce_offsets_build_packed(
+                        a_packed,
+                        b_packed,
+                        chunk_byte_base,
+                        next,
+                        op.add((next % 2) * ROUND1_AB_OFF_WORDS),
+                    );
+                }
+            }
+            let byte_base_b = chunk_byte_base + w * N_CHUNKS * 8;
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            // SAFETY: window `w`'s offsets were fully written (prebuild for
+            // w == 0, or the previous iteration's `next == w` build).
+            unsafe {
+                kernels::shift_reduce_inner_ab_from_offsets(
+                    op.add((w % 2) * ROUND1_AB_OFF_WORDS),
+                    &mut chunk_ab_bytes[w],
+                    // Fold-time staging arrays are re-read L1-hot
+                    // immediately: always temporal.
+                    0,
+                    (im0, im1),
+                );
+            }
+            bit_transpose_64bytes(c_in, &mut chunk_c_bytes[w]);
+        }
+        return;
+    }
+
     let mut b_med = 0;
     while b_med + 1 < n_b_med {
         let (lo, hi) = chunk_ab_bytes.split_at_mut(b_med + 1);
@@ -3911,6 +3991,83 @@ mod tests {
                     "avx512/gfni (nt={nt}) disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
                 );
             }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    #[test]
+    fn x86_avx512_split_offsets_matches_in_kernel_pidx() {
+        // The packed burst split (build-then-consume) must reproduce the
+        // in-kernel pidx+offw body byte for byte: same offsets from the same
+        // a/b bytes, same Horner, same store class.
+        let mut rng = Rng::new(0xB175_1A57);
+        let m = 14;
+        let table = make_inv_table();
+        let a_bits = rng.bits(1 << m);
+        let b_bits = rng.bits(1 << m);
+        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
+        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+
+        // AVX-512/GFNI builds must select the pidx+offw+2img path for the
+        // test to exercise the split; otherwise the comparison is vacuous.
+        assert!(kernels::shift_reduce_split_eligible(false));
+
+        #[repr(align(64))]
+        struct OffArena([u16; ROUND1_AB_OFF_WORDS]);
+        for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7), (4096, 15)] {
+            let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
+            if needed > a_packed.len() {
+                continue;
+            }
+            let mut out_incumbent = [0u8; 64];
+            // SAFETY: same contract as the incumbent kernel's callers.
+            unsafe {
+                shift_reduce_inner_ab_x86_avx512(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_incumbent,
+                    0,
+                );
+            }
+            let plan = Round1AbWindowPlan {
+                bstatic: None,
+                kernel: kernels::prepare_shift_reduce(&table),
+                nt: 0,
+            };
+            let Round1AbTableImages(im0, im1) = round1_ab_table_images(&table, plan);
+            let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+            // SAFETY: `op` points into the aligned arena.
+            let op = unsafe { core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) } as *mut u16;
+            let mut out_split = [0u8; 64];
+            // SAFETY: the split build/consume contract holds (see the
+            // wrappers); both writes are bounded by the arena / `out_split`.
+            unsafe {
+                kernels::shift_reduce_offsets_build_packed(
+                    &a_packed,
+                    &b_packed,
+                    chunk_byte_base,
+                    b_med,
+                    op,
+                );
+                kernels::shift_reduce_inner_ab_from_offsets(
+                    op,
+                    &mut out_split,
+                    0,
+                    (im0, im1),
+                );
+            }
+            assert_eq!(
+                out_incumbent, out_split,
+                "split build/consume disagrees with in-kernel pidx at (base={chunk_byte_base}, b_med={b_med})"
+            );
         }
     }
 
