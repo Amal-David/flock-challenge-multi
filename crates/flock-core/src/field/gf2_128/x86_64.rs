@@ -520,13 +520,24 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+        // Karatsuba accumulate: the cross term x.hi*y.lo ^ x.lo*y.hi equals
+        // (x.lo^x.hi)*(y.lo^y.hi) ^ x.lo*y.lo ^ x.hi*y.hi. The lo/hi products
+        // are computed anyway, so the two cross CLMULs collapse to one CLMUL
+        // plus XORs of already-live values: 3 CLMUL + 3 XOR vs 4 CLMUL + 3 XOR
+        // per accumulate. On the port-5 (shuffle/CLMUL) bound runner this
+        // frees a scarce p5 slot for a p015 XOR. Field-identical: the
+        // accumulator lanes hold the same unreduced (lo, mid, hi) triple.
+        let idx = _mm512_setr_epi64(2, 3, 0, 1, 6, 7, 4, 5);
+        let sx = _mm512_xor_si512(x, _mm512_permutexvar_epi64(idx, x));
+        let sy = _mm512_xor_si512(y, _mm512_permutexvar_epi64(idx, y));
+        let lo_p = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let hi_p = _mm512_clmulepi64_epi128::<0x11>(x, y);
         let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
+            _mm512_clmulepi64_epi128::<0x00>(sx, sy),
+            _mm512_xor_si512(lo_p, hi_p),
         );
+        self.lo = _mm512_xor_si512(self.lo, lo_p);
+        self.hi = _mm512_xor_si512(self.hi, hi_p);
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
