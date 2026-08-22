@@ -118,10 +118,11 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
-            // dominant mode for the bulk parallel F128 work) than binius, which
-            // only wins the latency microbench. (M-series picked binius.)
-            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
+            // A/B probe: binius (4 schoolbook + 2 reduction CLMUL, fewer
+            // logicals, lower latency chain) vs karatsuba+barrett (5 CLMUL,
+            // more logicals). Incumbent tuned on Zen4 throughput; SPR/Zen3
+            // may prefer binius. Field-identical; proofs byte-identical.
+            unsafe { x86_64::ghash_mul_binius(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
