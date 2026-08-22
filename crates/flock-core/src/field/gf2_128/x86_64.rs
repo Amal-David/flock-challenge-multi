@@ -396,6 +396,23 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// Broadcast `t` to four lanes plus its [`ghash_shift64_x4`] companion.
+/// Hoist once per loop-constant multiplier; the lane loop uses
+/// [`ghash_mul_x4_split`].
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_const_x4(t: F128) -> (__m512i, __m512i) {
+    // SAFETY: caller carries the features.
+    unsafe {
+        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        (tb, ghash_shift64_x4(tb))
+    }
+}
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many
