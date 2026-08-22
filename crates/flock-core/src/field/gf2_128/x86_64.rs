@@ -145,6 +145,37 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     }
 }
 
+/// Karatsuba 3 CLMUL product + shift-only `ghash_reduce` (the shared sparse
+/// `x^7+x^2+x+1` fold) = **3 CLMUL total**, two fewer than the incumbent
+/// 5-CLMUL `ghash_mul_karatsuba_vec` and the fewest of any general variant in
+/// this module. The reduction leaves the vector unit entirely: `ghash_reduce`
+/// runs ~14 GPR shifts/XORs that spread across the SPR ALU ports (0/1/5/6/10)
+/// instead of adding port-5 CLMUL/VPSLLDQ pressure, and its critical path
+/// (one shift-XOR chain after the products) is shorter than the incumbent's
+/// two extract → CLMUL(0x87) → XOR stages. Field-identical: this is the same
+/// reducer the shipped `ghash_mul_low_rhs` and `ghash_mul_schoolbook` use.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
+/// attribute.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_karatsuba_shift(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        let p0 = pmull(a.lo, b.lo);
+        let p1 = pmull(a.hi, b.hi);
+        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        // cross = pm ^ p0 ^ p1 is the x^64 coefficient of the 256-bit product.
+        let cross = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
+        super::ghash_reduce(
+            lane0(p0),
+            lane1(p0) ^ lane0(cross),
+            lane1(cross) ^ lane0(p1),
+            lane1(p1),
+        )
+    }
+}
+
 /// Karatsuba 3 CLMUL — middle term depends on XOR of inputs. Port of
 /// `aarch64::ghash_mul_karatsuba`.
 ///
