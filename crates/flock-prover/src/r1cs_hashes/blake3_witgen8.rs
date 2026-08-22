@@ -640,7 +640,31 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
 fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     debug_assert_eq!(N + M, 32);
     let v = xor_v8(x, y);
-    or_v8(shr_v8::<N>(v), shl_v8::<M>(v))
+    ror_v8::<N>(v)
+}
+
+/// Rotate-right by N on AVX-512 (single `vprold`, EVEX.256) -- three ops on
+/// AVX2. Bit-identical either way; the witness phase is ALU-bound so the
+/// uop cut matters on the ranked runner. The EVEX form needs `avx512f`.
+#[inline(always)]
+fn ror_v8<const N: i32>(v: V8) -> V8 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        // SAFETY: target feature checked at compile time.
+        unsafe { _mm256_ror_epi32::<N>(v) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    {
+        // N is a monomorphized literal (16/12/8/7 in the G-functions), so the
+        // match folds to the single shift+or pair at compile time.
+        match N {
+            16 => or_v8(shr_v8::<16>(v), shl_v8::<16>(v)),
+            12 => or_v8(shr_v8::<12>(v), shl_v8::<20>(v)),
+            8 => or_v8(shr_v8::<8>(v), shl_v8::<24>(v)),
+            7 => or_v8(shr_v8::<7>(v), shl_v8::<25>(v)),
+            _ => panic!("unexpected rotate count {N}"),
+        }
+    }
 }
 
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
