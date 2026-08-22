@@ -511,6 +511,110 @@ impl InvNttTableByteSingleGf8 {
     }
 }
 
+/// `x >> 16`, zero-extended to 64 bits, as ONE `shrx r32, r32, r32`.
+///
+/// The offset-extraction of the round-1 AB apply splits two 64-bit words into
+/// eight `u16` fields. Written as `(w >> 16) as u16`, LLVM emits a
+/// `mov r32, r32` + `shr r32, imm` PAIR for every odd field, because the
+/// immediate-shift form is destructive and the source word is still live.
+/// BMI2's three-operand `shrx` is non-destructive, and its 32-bit form
+/// zero-fills bits 16..31 and zeroes the whole upper half, so the field
+/// arrives masked for free. LLVM will not select it from a constant shift
+/// amount (it folds the count back into an immediate `shr`), and it will not
+/// select the 32-bit form from `((w as u32) >> n)` either — it materialises
+/// the `u32` first. Spelling the one instruction out is the only way to get
+/// it, and the shift amount is loop-invariant so LICM hoists its register.
+/// Value-identical: `shrx` with count 16 is exactly `x >> 16`.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn shr16_zext(x: u32) -> u64 {
+    let r: u64;
+    // SAFETY: a pure register-to-register BMI2 shift. No memory, no stack,
+    // no flags. The `:e` operand modifier selects the 32-bit encoding, which
+    // zeroes bits 32..63 of the destination, so the `u64` output is exactly
+    // the zero-extended `u32` result.
+    unsafe {
+        core::arch::asm!(
+            "shrx {r:e}, {x:e}, {n:e}",
+            r = lateout(reg) r,
+            x = in(reg) x,
+            n = in(reg) 16u32,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    r
+}
+
+/// Portable twin of [`shr16_zext`] for x86-64 builds without BMI2.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
+#[inline(always)]
+fn shr16_zext(x: u32) -> u64 {
+    (x >> 16) as u64
+}
+
+/// [`apply_x86_avx512_register_2img_offw_at`] with the eight `u16` fields
+/// split out of the two 64-bit words by 32-bit halving plus [`shr16_zext`]
+/// instead of by four widening immediate shifts. IDENTICAL VALUE AND
+/// IDENTICAL TABLE ADDRESSES — field `i` is still bits `16i..16i+16` of the
+/// pair, and each still addresses the same image — but the per-apply GPR
+/// account drops from 14 ops to 10:
+///
+/// ```text
+///   immediate form, per 64-bit word w  (7 ops)   halving form (5 ops)
+///     movzx f0, w                                  movzx f0, w
+///     mov t, w ; shr t, 16                         shrx  f1, w, n16
+///     mov t, w ; shr t, 32 ; movzx f2, t           shr   w, 32
+///     shr w, 48                                    movzx f2, w
+///                                                  shrx  f3, w, n16
+/// ```
+///
+/// `FLOCK_NO_URM_SHRX=1` restores the immediate form.
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_2img_offw_at`].
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at_shrx(
+    base: *const u8,
+    base8: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: eight readable pre-scaled offsets per the contract, i.e. two
+    // readable 64-bit words. Each extracted field is one of those offsets,
+    // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
+    // 64 readable bytes per row.
+    unsafe {
+        let w0 = (off as *const u64).read_unaligned();
+        let w1 = (off.add(4) as *const u64).read_unaligned();
+        let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        let lo0 = w0 as u32;
+        let hi0 = (w0 >> 32) as u32;
+        let lo1 = w1 as u32;
+        let hi1 = (w1 >> 32) as u32;
+        let u0 = _mm512_xor_si512(
+            row(base, lo0 as u16 as usize),
+            row(base8, shr16_zext(lo0) as usize),
+        );
+        let u1 = _mm512_xor_si512(
+            row(base, hi0 as u16 as usize),
+            row(base8, shr16_zext(hi0) as usize),
+        );
+        let u2 = _mm512_xor_si512(
+            row(base, lo1 as u16 as usize),
+            row(base8, shr16_zext(lo1) as usize),
+        );
+        let u3 = _mm512_xor_si512(
+            row(base, hi1 as u16 as usize),
+            row(base8, shr16_zext(hi1) as usize),
+        );
+        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
 /// [`InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_offw_unchecked`]
 /// against table images the caller already resolved. Identical value and
 /// identical table addresses.

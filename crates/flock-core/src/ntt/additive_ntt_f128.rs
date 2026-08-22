@@ -1890,21 +1890,16 @@ impl AdditiveNttF128 {
             }
         };
 
-        const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // (all lanes) before the layer loops read any of them, so the
         // 512 KiB zero-fill per init was dead work — rayon runs the
         // initializer once per JOB, not per worker.
-        if sub_stride < PARALLEL_TASK_THRESHOLD {
-            let mut buf = staging_block(512, row_len);
-            for r in 0..sub_stride {
-                task(&mut buf, r);
-            }
-        } else {
-            (0..sub_stride)
-                .into_par_iter()
-                .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
-        }
+        //
+        // SHAPE: `task` has exactly one use, so it is emitted inside the
+        // rayon leaf rather than as its own symbol behind a dispatcher.
+        (0..sub_stride)
+            .into_par_iter()
+            .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
     }
 
     /// Scalar reference for the interleaved forward NTT.

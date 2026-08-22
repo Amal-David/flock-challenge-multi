@@ -2757,23 +2757,54 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 // pair `(v2, v3)`, and the running pair absorbs it in one more
                 // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
                 // 32-input tree, with the four-residue reduction inside it.
+                //
+                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
+                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
+                // the eight affine results of `(a, hh)` are born and consumed
+                // inside one four-op window while the eight broadcasts of residue
+                // `a` and both accumulator pairs are still live, and the register
+                // allocator spills: the emitted body pays four stack stores and
+                // seven reloads per call that the map never asks for. Materialising
+                // all sixteen results of the residue first widens the window the
+                // scheduler has to place the reduction in without widening the peak
+                // live set, and the schedule that comes out has exactly the twelve
+                // stores the map needs — the eight octets and the four outputs —
+                // and no fills at all: 381 emitted instructions against 392, 2,605
+                // bytes against 2,700, and 151.1 core-cycles per call against 156.5
+                // measured on both threads of one physical core (n = 8, rotated),
+                // which is the regime the sixteen-thread prover runs this kernel in.
+                //
+                // THE UOP MAP AND THE PORT SPLIT ARE UNTOUCHED: 128 affines, 32
+                // port-5 shuffles, 64 XOR-class, 64 broadcasts, and the same
+                // measured 140-141 port-0 / 93 port-5 uops per call. The port-0
+                // residual above the 128 affine floor is NOT a scheduling artefact
+                // and does not move for any source-level reordering — it is what
+                // the allocator does to a two-port uop whose operands are the
+                // affines immediately ahead of it. Measured on straight-line probes
+                // of this exact instruction mix: independent XOR-class ops split
+                // 128.6 / 97.0, i.e. optimally, and the same ops made to consume
+                // the affines in front of them split 132.8 / 93.4 — the leak is the
+                // dependence, not the order.
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
                     let b: [__m512i; 8] =
                         core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64));
-                    for hh in 0..2usize {
-                        let aff = |j: usize| {
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
                             _mm512_gf2p8affine_epi64_epi8::<0>(
                                 b[j],
                                 _mm512_loadu_si512(
                                     mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i,
                                 ),
                             )
-                        };
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
                         if a == 0 {
                             accp[hh] = v2;
                             accq[hh] = v3;

@@ -5072,6 +5072,36 @@ mod tests {
                 );
             }
             assert_eq!(c4b, c4, "c4 broadcast factorisation, dead={dead:#010b}");
+            // ... and both against the scalar composed fold of the very same
+            // dead-masked rows, so every (residue, output-byte half) slot of the
+            // factorisation is pinned under EVERY mask and not only at
+            // `dead = 0`. The broadcast form folds both output-byte halves of a
+            // residue before it reduces either, so a half that came out of the
+            // wrong accumulator would still agree with `_c4` on nothing at all —
+            // but only this check tells the two halves apart from the outside.
+            let mut zeroed = poisoned.clone();
+            for i in 0..8usize {
+                if dead & (1u8 << i) != 0 {
+                    for byte in zeroed[64 * i..64 * (i + 1)].iter_mut() {
+                        *byte = 0;
+                    }
+                }
+            }
+            let mut want_d = [F128::ZERO; 64];
+            // SAFETY: as above; 512 readable bytes, 64 writable F128s.
+            unsafe {
+                kernels::x86_64::gfni_fold64_rows(zeroed.as_ptr(), &mats, want_d.as_mut_ptr());
+            }
+            for t in 0..16 {
+                let mut want_t = F128::ZERO;
+                for (a, c) in coeffs.iter().enumerate() {
+                    want_t = want_t + *c * want_d[4 * t + a];
+                }
+                assert_eq!(
+                    c4b[t], want_t,
+                    "composed broadcast fold vs scalar, dead={dead:#010b}, group {t}"
+                );
+            }
         }
         // ... and both against the scalar composed fold on live rows.
         let mut c4 = [F128::ZERO; 64];
