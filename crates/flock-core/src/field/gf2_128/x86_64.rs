@@ -396,6 +396,43 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// Broadcast `t` to four lanes plus its [`ghash_shift64_x4`] companion.
+/// Hoist this once per loop-constant multiplier; the lane loop then uses
+/// [`ghash_mul_const_x4`].
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_const_x4(t: F128) -> (__m512i, __m512i) {
+    // SAFETY: caller carries the features.
+    unsafe {
+        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        (tb, ghash_shift64_x4(tb))
+    }
+}
+
+/// `t · v` for a loop-constant `t` prepared by [`ghash_const_x4`].
+/// Field-identical to [`ghash_mul_x4`]`(t, v)`: 5 CLMUL (split) instead of 6,
+/// because the companion was paid once outside the loop.
+///
+/// This is a thin alias of [`ghash_mul_x4_split`]. A runtime kill switch
+/// here (OnceLock + `env::var_os` per product) was measured on SPR as
+/// `38145be`: value-exact, p10 *faster*, median **−49 µs / −0.03%**. NTT
+/// already ships the same split with a *const-generic* `DIET` so LLVM sees
+/// only one product in the lane loop; keep that shape.
+///
+/// # Safety
+/// As [`ghash_mul_x4_split`]; `t_x64` must be `t · x^64 mod p` in every lane.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_const_x4(v: __m512i, t: __m512i, t_x64: __m512i) -> __m512i {
+    // SAFETY: forwarded; same contract as `ghash_mul_x4_split`.
+    unsafe { ghash_mul_x4_split(v, t, t_x64) }
+}
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many

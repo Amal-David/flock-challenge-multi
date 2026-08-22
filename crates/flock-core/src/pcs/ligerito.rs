@@ -2182,12 +2182,12 @@ pub(crate) fn induce_sumcheck_poly(
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_const_x4, ghash_mul_const_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
-        let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let (tb, tb_x64) = ghash_const_x4(t);
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2195,7 +2195,7 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let nb = _mm512_xor_si512(vb, ghash_mul_const_x4(vs, tb, tb_x64));
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -2632,18 +2632,18 @@ fn eq_split_x4_enabled() -> bool {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_const_x4, ghash_mul_const_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(out.len(), lo.len());
     // SAFETY: caller carries the target features; the slices are equal-length
     // and every offset below stays inside both.
     unsafe {
-        let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
+        let (eb, eb_x64) = ghash_const_x4(e);
         let lanes = out.len() & !3;
         let mut i = 0usize;
         while i < lanes {
             let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, ghash_mul_x4(eb, v));
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, ghash_mul_const_x4(v, eb, eb_x64));
             i += 4;
         }
         while i < out.len() {
@@ -4081,13 +4081,13 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_const_x4, ghash_mul_const_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(acc.len(), src.len());
     // SAFETY: caller carries the target features; the slices are equal-length
     // and every offset below stays inside both.
     unsafe {
-        let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+        let (ab, ab_x64) = ghash_const_x4(alpha);
         let lanes = acc.len() & !3;
         let mut i = 0usize;
         while i < lanes {
@@ -4095,7 +4095,7 @@ unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
             let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
             _mm512_storeu_si512(
                 acc.as_mut_ptr().add(i) as *mut __m512i,
-                _mm512_xor_si512(a, ghash_mul_x4(ab, v)),
+                _mm512_xor_si512(a, ghash_mul_const_x4(v, ab, ab_x64)),
             );
             i += 4;
         }

@@ -394,6 +394,31 @@ mod tests {
         }
     }
 
+    /// Split-twiddle identity used by AVX-512 `ghash_mul_const_x4`:
+    /// t*v = t*v_lo + (t*x^64)*v_hi. Runs on every ISA so the ARM local
+    /// loop can still prove the algebra before an x86 submit.
+    #[test]
+    fn split_twiddle_product_matches_mul() {
+        let x64 = F128 { lo: 0, hi: 1 };
+        let mut rng = Rng::new(0x5F11);
+        for _ in 0..512 {
+            let t = rng.next_f128();
+            let v = rng.next_f128();
+            let companion = t * x64;
+            let vlo = F128 { lo: v.lo, hi: 0 };
+            let vhi = F128 { lo: v.hi, hi: 0 };
+            assert_eq!(t * vlo + companion * vhi, t * v, "t={t:?} v={v:?}");
+        }
+        for t in [F128::ZERO, F128::ONE, F128 { lo: 0, hi: 1 }, F128 { lo: u64::MAX, hi: u64::MAX }] {
+            for v in [F128::ZERO, F128::ONE, F128 { lo: 1, hi: 0 }, F128 { lo: 0, hi: 1 }] {
+                let companion = t * x64;
+                let vlo = F128 { lo: v.lo, hi: 0 };
+                let vhi = F128 { lo: v.hi, hi: 0 };
+                assert_eq!(t * vlo + companion * vhi, t * v, "deg t={t:?} v={v:?}");
+            }
+        }
+    }
+
     #[test]
     fn ghash_reduction_smoking_gun() {
         // The defining identity of the GHASH polynomial:
@@ -547,7 +572,43 @@ mod tests {
             }
         }
     }
-
+    /// Hoisted-companion [`x86_64::ghash_mul_const_x4`] must match
+    /// [`x86_64::ghash_mul_x4`] and scalar `Mul`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ghash_mul_const_x4_matches_x4_and_scalar() {
+        use core::arch::x86_64::*;
+        let mut rng = Rng::new(0xC0A5_7EED);
+        for _ in 0..256 {
+            let t = rng.next_f128();
+            let vs = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            // SAFETY: avx512f+vpclmulqdq cfg-gated.
+            let (got_const, got_x4): ([F128; 4], [F128; 4]) = unsafe {
+                let (tb, t64) = x86_64::ghash_const_x4(t);
+                let y = _mm512_loadu_si512(vs.as_ptr() as *const __m512i);
+                let c = x86_64::ghash_mul_const_x4(y, tb, t64);
+                let x = x86_64::ghash_mul_x4(tb, y);
+                let mut out_c = [F128::ZERO; 4];
+                let mut out_x = [F128::ZERO; 4];
+                _mm512_storeu_si512(out_c.as_mut_ptr() as *mut __m512i, c);
+                _mm512_storeu_si512(out_x.as_mut_ptr() as *mut __m512i, x);
+                (out_c, out_x)
+            };
+            for lane in 0..4 {
+                assert_eq!(got_const[lane], got_x4[lane], "const != x4 lane {lane}");
+                assert_eq!(got_const[lane], vs[lane] * t, "const != scalar lane {lane}");
+            }
+        }
+    }
     /// The 4-lane deferred-reduction accumulator must equal the scalar
     /// XOR-of-`mul_unreduced` it replaces, both before and after `reduce()`.
     #[cfg(all(
