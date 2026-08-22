@@ -112,6 +112,39 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
+/// Karatsuba 3 CLMUL product + binius 2-stage vector reduction (2 CLMUL,
+/// only 2 lane extracts) = 5 CLMUL total, one fewer than the 6-CLMUL binius
+/// schoolbook with the same fully-vector reduction shape. Field-identical.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        let p0 = pmull(a.lo, b.lo);
+        let p1 = pmull(a.hi, b.hi);
+        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        // cross = pm ^ p0 ^ p1 is the x^64 coefficient (binius's t1).
+        let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
+        let mut t0 = p0;
+
+        // First reduce: t1 = t1 + x^64 · t2 (mod p), with t2 = p1.
+        let t2_shifted = _mm_slli_si128::<8>(p1); // {0, p1.lo}
+        t1 = _mm_xor_si128(t1, t2_shifted);
+        let t2_red = pmull(lane1(p1), 0x87);
+        t1 = _mm_xor_si128(t1, t2_red);
+
+        // Second reduce: t0 = t0 + x^64 · t1 (mod p).
+        let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
+        t0 = _mm_xor_si128(t0, t1_shifted);
+        let t1_red = pmull(lane1(t1), 0x87);
+        t0 = _mm_xor_si128(t0, t1_red);
+
+        F128 {
+            lo: lane0(t0),
+            hi: lane1(t0),
+        }
+    }
+}
+
 /// Karatsuba 3 CLMUL — middle term depends on XOR of inputs. Port of
 /// `aarch64::ghash_mul_karatsuba`.
 ///
