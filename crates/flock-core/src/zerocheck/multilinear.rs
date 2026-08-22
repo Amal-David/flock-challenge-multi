@@ -5047,6 +5047,58 @@ mod tests {
         for r in 0..64 {
             assert_eq!(tr[16 * (r % 4) + r / 4], want[r], "residue-major slot, row {r}");
         }
+        // The composed rounds-3+4 fold and its broadcast factorisation
+        // compute the same map, `out[t] = XOR_a c_a · fold(row 4t + a)`,
+        // from the same 128 affine products — byte for byte, under every
+        // dead-line mask (both substitute the same zeros).
+        let coeffs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+        let cm = kernels::x86_64::build_cfold_mats(&table.data, coeffs);
+        for dead in [0u8, 0b1000_0000, 0b1010_0101, 0b0000_0001, 0b1111_1110] {
+            let mut c4 = [F128::ZERO; 64];
+            let mut c4b = [F128::ZERO; 64];
+            // SAFETY: as above; both kernels write sixteen F128s.
+            unsafe {
+                kernels::x86_64::gfni_fold64_rows_masked_c4(
+                    poisoned.as_ptr(),
+                    &cm,
+                    c4.as_mut_ptr(),
+                    dead,
+                );
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                    poisoned.as_ptr(),
+                    &cm,
+                    c4b.as_mut_ptr(),
+                    dead,
+                );
+            }
+            assert_eq!(c4b, c4, "c4 broadcast factorisation, dead={dead:#010b}");
+        }
+        // ... and both against the scalar composed fold on live rows.
+        let mut c4 = [F128::ZERO; 64];
+        let mut c4b = [F128::ZERO; 64];
+        // SAFETY: as above.
+        unsafe {
+            kernels::x86_64::gfni_fold64_rows_masked_c4(
+                clean.as_ptr(),
+                &cm,
+                c4.as_mut_ptr(),
+                0,
+            );
+            kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                clean.as_ptr(),
+                &cm,
+                c4b.as_mut_ptr(),
+                0,
+            );
+        }
+        for t in 0..16 {
+            let mut want_t = F128::ZERO;
+            for (a, c) in coeffs.iter().enumerate() {
+                want_t = want_t + *c * want[4 * t + a];
+            }
+            assert_eq!(c4[t], want_t, "composed rounds-3+4 fold, group {t}");
+            assert_eq!(c4b[t], want_t, "composed broadcast fold, group {t}");
+        }
         assert_ne!(off, want, "poison must be visible with the skip OFF");
         for r in 0..64 {
             assert_eq!(

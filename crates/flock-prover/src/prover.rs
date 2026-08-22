@@ -1221,3 +1221,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // promoted source; no executable change. (drawn against ebdd5d5 frontier)
 
 // zarar-x86-resample-29: independent official timing sample of the promoted source; no executable change.
+
+// zarar-x86-c4-redraw-01: second official timing sample of the composed-rounds broadcast factorisation.
