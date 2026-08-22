@@ -128,6 +128,17 @@ pub(crate) fn urm_off_arena_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_R1_SPLIT=1` restores the in-kernel pidx prologue in the
+/// round-1 shift_reduce transpose path (disables the packed burst-build
+/// offset arena, keeping the per-window in-kernel build). Resolved once per
+/// process; the arena is the same pre-scaled values the prologue would
+/// build, so output bytes are identical either way.
+pub(crate) fn urm_r1_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_R1_SPLIT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
 /// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
 /// 64-bit reads split with shifts. Resolved once per process.
