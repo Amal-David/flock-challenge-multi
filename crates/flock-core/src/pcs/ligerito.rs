@@ -6024,7 +6024,7 @@ fn materialize_direct_fold8(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_bcast,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
@@ -6042,7 +6042,7 @@ fn materialize_direct_fold8(
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
-                            gfni_fold64_four_maps_staged(
+                            gfni_fold64_four_maps_bcast(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
                                 &mats0_lo,
                                 rows0.1.as_ptr().add(slot).cast::<u8>(),
@@ -11953,6 +11953,274 @@ mod tests {
             });
             assert_eq!(got[i], expect);
         }
+    }
+
+
+    // ---- Arch-independent simulation of `gfni_fold64_four_maps_bcast` ----
+    //
+    // Layout of the shared `[u64; 128]` matrix block produced by
+    // `build_row_fold_mats` / `build_row_fold_mats_from_cols` (derived from
+    // source, byte by byte):
+    //
+    //   mats[j * 16 + c]     = 8x8 GF(2) matrix taking input chunk j to
+    //                          output bytes 0..8,  output byte c;
+    //   mats[j * 16 + c + 8] = same for output bytes 8..16.
+    //
+    // Within such a qword, byte position i holds GFNI matrix row i after the
+    // builder's `.swap_bytes()` ("GFNI stores output row i at byte 7-i").
+    // The STAGED kernel consumes exactly this: plane p[j] holds chunk j of
+    // every row at byte position n, and
+    // `_mm512_gf2p8affine_epi64_epi8::<0>(p[j], set1(mats[16*j+k]))`
+    // produces output byte k of every row in one shot.
+    //
+    // The BROADCAST kernel needs, per (chunk c, output-byte half hh), a ZMM
+    // whose qword k carries the matrix mapping chunk c to output byte
+    // 8*hh + k, folded against a qword-broadcast octet of eight rows'
+    // chunk-c bytes. That operand is NOT contiguous in the existing layout;
+    // the zero-shuffle emulation is an indexed gather over it.
+
+    /// Emulate `_mm512_gf2p8affine_epi64_epi8::<0>(bcast_qword, mat_qword)`
+    /// on ONE byte lane: `in_byte` is the broadcast data byte, `mat_qword`
+    /// the GFNI matrix qword. Bit convention (per the Intel pseudocode,
+    /// confirmed numerically by this test): dst bit j =
+    /// parity(mat_qword.byte[7-j] & in_byte).
+    fn gfni_affine_byte(in_byte: u8, mat_qword: u64) -> u8 {
+        let mbytes = mat_qword.to_le_bytes();
+        let mut out = 0u8;
+        for j in 0..8 {
+            if (mbytes[7 - j] & in_byte).count_ones() & 1 == 1 {
+                out |= 1 << j;
+            }
+        }
+        out
+    }
+
+    /// Scalar stand-in for the kernel's `vpermb` byte transpose (`BT`):
+    /// output byte `8*r + j` = input byte `8*j + r`.
+    fn bt_transpose64(input: &[u8; 64]) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        for n in 0..64 {
+            out[n] = input[8 * (n % 8) + n / 8];
+        }
+        out
+    }
+
+    #[test]
+    fn gfni_bcast_indexing_sim_matches_fold_one_slot() {
+        let mut state = 0xB6F1_6408_5EED_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let tables: Vec<Vec<F128>> = (0..4)
+            .map(|_| {
+                let generators: Vec<F128> = (0..128)
+                    .map(|_| F128 {
+                        lo: next(),
+                        hi: next(),
+                    })
+                    .collect();
+                super::super::ring_switch::build_fold_byte_table(&generators)
+            })
+            .collect();
+        let values: Vec<Vec<u64>> = (0..4)
+            .map(|_| (0..64).map(|_| next()).collect())
+            .collect();
+
+        // On non-x86 hosts the x86_64 kernel module is cfg'd out; mirror its
+        // producer here so the arch-independent simulation still runs. This
+        // must stay bit-identical to `build_row_fold_mats_from_cols`.
+        fn build_row_fold_mats_local(data: &[F128]) -> [u64; 128] {
+            let cols: [F128; 64] = std::array::from_fn(|i| {
+                let byte = i / 8;
+                let bit = i % 8;
+                data[byte * 256 + (1 << bit)]
+            });
+            let mut mats = [0u64; 128];
+            for j in 0..8 {
+                let basis = &cols[j * 8..j * 8 + 8];
+                let lo_lanes: [u64; 8] = std::array::from_fn(|b| basis[b].lo);
+                let hi_lanes: [u64; 8] = std::array::from_fn(|b| basis[b].hi);
+                let mut lo_bytes = [0u8; 64];
+                let mut hi_bytes = [0u8; 64];
+                for (r, lane) in lo_lanes.iter().enumerate() {
+                    for c in 0..8usize {
+                        for b in 0..8usize {
+                            // out byte c*8+b bit r = lane_r.byte_c.bit_b
+                            if (lane >> (8 * c + b)) & 1 == 1 {
+                                lo_bytes[c * 8 + b] |= 1 << r;
+                            }
+                        }
+                    }
+                }
+                for (r, lane) in hi_lanes.iter().enumerate() {
+                    for c in 0..8usize {
+                        for b in 0..8usize {
+                            if (lane >> (8 * c + b)) & 1 == 1 {
+                                hi_bytes[c * 8 + b] |= 1 << r;
+                            }
+                        }
+                    }
+                }
+                for c in 0..8 {
+                    let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+                    let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+                    // GFNI stores output row i at byte 7-i.
+                    mats[j * 16 + c] = u64::from_le_bytes(lo).swap_bytes();
+                    mats[j * 16 + c + 8] = u64::from_le_bytes(hi).swap_bytes();
+                }
+            }
+            mats
+        }
+        let mats: Vec<[u64; 128]> = tables
+            .iter()
+            .map(|table| build_row_fold_mats_local(&table[..8 * 256]))
+            .collect();
+
+        // Simulated pipeline, per map and per 64-byte line `oct` (rows
+        // 8*oct .. 8*oct+8) — exactly what the fixed bcast kernel does:
+        //
+        // 1. BT stage: byte-transpose the line so byte `8*t + c` holds
+        //    chunk `c` of row `t`; qword `c` of the transposed line is then
+        //    the broadcast operand `b(c)` the affine needs. (The broken
+        //    kernel skipped this stage entirely: `rows.add(8*c)` on
+        //    row-major packed u64s reads ALL EIGHT CHUNKS OF ROW `c`, not
+        //    chunk `c` of eight rows — the divergence SDE caught.)
+        // 2. Affine operand for output-byte half `hh`, qword `k` =
+        //    `mats[16*c + 8*hh + k]` = the matrix taking chunk `c` to
+        //    output byte `8*hh + k`.
+        // 3. Emit: byte `t` of the accumulated plane belongs to row `t`;
+        //    undo the BT and interleave lo/hi halves into F128s.
+        for map in 0..4 {
+            for oct in 0..8usize {
+                let mut line = [0u8; 64];
+                for t in 0..8usize {
+                    line[8 * t..8 * t + 8]
+                        .copy_from_slice(&values[map][8 * oct + t].to_le_bytes());
+                }
+                let tr = bt_transpose64(&line);
+                let b = |c: usize| u64::from_le_bytes(tr[8 * c..8 * c + 8].try_into().unwrap());
+                let mut acc = [[0u64; 8]; 2];
+                for hh in 0..2usize {
+                    for k in 0..8usize {
+                        let mut lane = [0u8; 8];
+                        for t in 0..8usize {
+                            let mut byte = 0u8;
+                            for c in 0..8usize {
+                                byte ^= gfni_affine_byte(
+                                    ((b(c) >> (8 * t)) & 0xFF) as u8,
+                                    mats[map][16 * c + 8 * hh + k],
+                                );
+                            }
+                            lane[t] = byte;
+                        }
+                        // qword k byte t = output byte 8*hh+k of row t
+                        acc[hh][k] = u64::from_le_bytes(lane);
+                    }
+                }
+                // Emit: acc[hh] qword k byte t = output byte 8*hh + k of
+                // row t; the BT + interleave reassemble the F128s.
+                for t in 0..8usize {
+                    let mut out = F128::ZERO;
+                    for k in 0..8usize {
+                        let lo_byte = (acc[0][k] >> (8 * t)) & 0xFF;
+                        let hi_byte = (acc[1][k] >> (8 * t)) & 0xFF;
+                        out.lo |= lo_byte << (8 * k);
+                        out.hi |= hi_byte << (8 * k);
+                    }
+                    let expect = super::super::ring_switch::fold_one_slot(
+                        F128::new(values[map][8 * oct + t], 0),
+                        &tables[map],
+                    );
+                    assert_eq!(out, expect, "sim diverges: map {map} oct {oct} row {t}");
+                }
+            }
+        }
+    }
+    /// Twin of the staged identity test for the broadcast port: the bcast
+    /// kernel must match both the staged kernel and the scalar slot-fold sum
+    /// on the same inputs.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_four_map_gfni_bcast_matches_staged_and_scalar() {
+        use crate::zerocheck::multilinear::kernels::x86_64::{
+            build_row_fold_mats, gfni_fold64_four_maps_bcast, gfni_fold64_four_maps_staged,
+        };
+        let mut state = 0xB6F1_6408_5EED_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let tables: Vec<Vec<F128>> = (0..4)
+            .map(|_| {
+                let generators: Vec<F128> = (0..128)
+                    .map(|_| F128 {
+                        lo: next(),
+                        hi: next(),
+                    })
+                    .collect();
+                super::super::ring_switch::build_fold_byte_table(&generators)
+            })
+            .collect();
+        let values: Vec<Vec<u64>> = (0..4)
+            .map(|_| (0..64).map(|_| next()).collect())
+            .collect();
+        let mats: Vec<[u64; 128]> = tables
+            .iter()
+            .map(|table| build_row_fold_mats(&table[..8 * 256]))
+            .collect();
+        let mut got_staged = vec![F128::ZERO; 64];
+        let mut got_bcast = vec![F128::ZERO; 64];
+        let mut planes = vec![F128::ZERO; 64];
+        // SAFETY: four exact 512-byte inputs, complete matrices, 64 outputs,
+        // sixteen-ZMM scratch, and cfg-guaranteed target features.
+        unsafe {
+            gfni_fold64_four_maps_staged(
+                values[0].as_ptr().cast::<u8>(),
+                &mats[0],
+                values[1].as_ptr().cast::<u8>(),
+                &mats[1],
+                values[2].as_ptr().cast::<u8>(),
+                &mats[2],
+                values[3].as_ptr().cast::<u8>(),
+                &mats[3],
+                got_staged.as_mut_ptr(),
+                planes.as_mut_ptr().cast(),
+            );
+            gfni_fold64_four_maps_bcast(
+                values[0].as_ptr().cast::<u8>(),
+                &mats[0],
+                values[1].as_ptr().cast::<u8>(),
+                &mats[1],
+                values[2].as_ptr().cast::<u8>(),
+                &mats[2],
+                values[3].as_ptr().cast::<u8>(),
+                &mats[3],
+                got_bcast.as_mut_ptr(),
+                planes.as_mut_ptr().cast(),
+            );
+        }
+        for i in 0..64 {
+            let expect = (0..4).fold(F128::ZERO, |acc, map| {
+                acc + super::super::ring_switch::fold_one_slot(
+                    F128::new(values[map][i], 0),
+                    &tables[map],
+                )
+            });
+            assert_eq!(got_staged[i], expect, "staged diverges at {i}");
+            assert_eq!(got_bcast[i], expect, "bcast diverges at {i}");
+        }
+        assert_eq!(got_staged, got_bcast);
     }
 
     #[test]
