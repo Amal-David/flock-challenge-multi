@@ -252,6 +252,47 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
 }
 
+/// `FLOCK_NO_NTT_SCATTER_ZMM=1` restores XMM-only NT publish (no peel-to-ZMM).
+#[cfg(target_arch = "x86_64")]
+fn scatter_zmm_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_ZMM").is_none())
+}
+
+/// Peel 0..3 XMM NT stores so `dst` is 64-byte aligned, then ZMM-stream the
+/// body. Bit-identical to an XMM-only walk of the same bytes.
+///
+/// # Safety
+/// As for [`AdditiveNttF128::publish_row_nt`]; caller is in an `avx512f`
+/// context and `dst` is 16-byte aligned.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn publish_row_nt_zmm(src: *const F128, dst: *mut F128, row_len: usize) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let s = src as *const __m128i;
+        let d = dst as *mut __m128i;
+        let mis = dst as usize % 64;
+        let peel = if mis == 0 { 0 } else { (64 - mis) / 16 };
+        let peel = peel.min(row_len);
+        for i in 0..peel {
+            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+        }
+        let mut i = peel;
+        while i + 4 <= row_len {
+            _mm512_stream_si512(
+                d.add(i).cast::<__m512i>(),
+                _mm512_loadu_si512(s.add(i).cast::<__m512i>()),
+            );
+            i += 4;
+        }
+        while i < row_len {
+            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+            i += 1;
+        }
+    }
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -1624,11 +1665,14 @@ impl AdditiveNttF128 {
     /// pass, a separate rayon region that starts only after the whole
     /// codeword is published — at the ranked shape that is 1 GiB, DRAM-cold
     /// by then regardless — so plain stores' write-allocate is one pure
-    /// hidden DRAM read per output line (~1 GiB of RFO per proof). XMM
-    /// streams, not ZMM: large pool allocations land 16 mod 64, so a
-    /// 64-byte-alignment gate would silently never fire (measured trap on
-    /// this lineage); every F128 element offset preserves the base's 16-byte
-    /// alignment, which the caller checks once per pass.
+    /// hidden DRAM read per output line (~1 GiB of RFO per proof).
+    ///
+    /// Pool pointers often land 16 mod 64, so a "ZMM only if dst % 64 == 0"
+    /// gate never fires and the whole 1 KiB row becomes 64 XMM streams.
+    /// Peel 0..3 XMM stores until the cursor is line-aligned, then one ZMM
+    /// stream per remaining line. Same bytes; `FLOCK_NO_NTT_SCATTER_ZMM=1`
+    /// restores the XMM-only loop. Every F128 offset keeps the base's
+    /// 16-byte alignment, which the caller checks once per pass.
     ///
     /// # Safety
     /// `src`/`dst` must cover `row_len` F128s; `dst` must be 16-byte aligned.
@@ -1636,25 +1680,12 @@ impl AdditiveNttF128 {
     #[inline]
     unsafe fn publish_row_nt(src: *const F128, dst: *mut F128, row_len: usize) {
         use core::arch::x86_64::*;
-        // SAFETY: bounds per the contract; SSE2 is x86_64 baseline; the
-        // 16-byte store alignment is the caller's checked precondition. The
-        // 64-aligned arm (the allocator's recyclable class is 64-aligned on
-        // this lineage) publishes whole lines as single-uop ZMM streams —
-        // same bytes, a quarter of the store uops, no straddled lines.
+        // SAFETY: bounds per the contract; SSE2 is x86_64 baseline; 16-byte
+        // store alignment is the caller's checked precondition.
         unsafe {
             #[cfg(target_feature = "avx512f")]
-            if dst as usize % 64 == 0 {
-                let s = src as *const __m512i;
-                let d = dst as *mut __m512i;
-                for i in 0..row_len / 4 {
-                    _mm512_stream_si512(d.add(i), _mm512_loadu_si512(s.add(i)));
-                }
-                let done = (row_len / 4) * 4;
-                let s = src as *const __m128i;
-                let d = dst as *mut __m128i;
-                for i in done..row_len {
-                    _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
-                }
+            if scatter_zmm_enabled() {
+                publish_row_nt_zmm(src, dst, row_len);
                 return;
             }
             let s = src as *const __m128i;
