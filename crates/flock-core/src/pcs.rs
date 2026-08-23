@@ -1088,18 +1088,25 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         };
         #[cfg(not(target_arch = "aarch64"))]
         let (prime, lookahead) = if use_direct_ab {
-            let (prime, lookahead) = fused_fast_combine_lookahead(
-                &mut b_combined,
-                packed_witness,
-                &rs_deferred,
-                b,
-            );
+            // x86_64: default is the staged non-temporal publish port of the
+            // promoted aarch64 combine — same table-read order, same values,
+            // NT stores skip the ~512 MiB write-allocate RFO read.
+            // `FLOCK_NO_BCOMB_NT=1` restores the incumbent plain-store kernels
+            // verbatim as its oracle.
+            let nt = std::env::var_os("FLOCK_NO_BCOMB_NT").is_none();
+            let (prime, lookahead) = if nt {
+                fused_fast_combine_lookahead_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+            } else {
+                fused_fast_combine_lookahead(&mut b_combined, packed_witness, &rs_deferred, b)
+            };
             (prime, Some(lookahead))
         } else {
-            (
-                fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b),
-                None,
-            )
+            let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
+                fused_fast_combine_staged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+            } else {
+                fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b)
+            };
+            (prime, None)
         };
         #[cfg(target_arch = "aarch64")]
         let lookahead = None;
@@ -1404,6 +1411,219 @@ fn fused_fast_combine_lookahead(
             }
             ((u0, u2), c)
         })
+        .reduce(
+            || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
+            |((x0, x2), mut xc), ((y0, y2), yc)| {
+                for (x, y) in xc.iter_mut().zip(yc) {
+                    *x += y;
+                }
+                ((x0 + y0, x2 + y2), xc)
+            },
+        )
+}
+
+/// x86_64 publish of two adjacent F128s (32 B) as two non-temporal 16-byte
+/// stores (`movntdq`, `_mm_stream_si128`) — the destination line's
+/// write-allocate RFO read is skipped. Same contract as the aarch64
+/// `store_nt_f128_pair`: only the store targeting differs from ordinary
+/// stores, so values (and the transcript) are unchanged.
+///
+/// # Safety
+/// `dst` must be valid for 32 bytes of writes and 16-byte aligned.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn store_nt_f128_pair(dst: *mut F128, v0: F128, v1: F128) {
+    // SAFETY: F128 is repr(C, align(16)) {lo, hi} little-endian — the same
+    // 16 bytes each SSE2 128-bit store publishes. SSE2 is baseline x86_64.
+    unsafe {
+        let p = dst.cast::<core::arch::x86_64::__m128i>();
+        core::arch::x86_64::_mm_stream_si128(
+            p,
+            core::arch::x86_64::_mm_set_epi64x(v0.hi as i64, v0.lo as i64),
+        );
+        core::arch::x86_64::_mm_stream_si128(
+            p.add(1),
+            core::arch::x86_64::_mm_set_epi64x(v1.hi as i64, v1.lo as i64),
+        );
+    }
+}
+
+/// Minimum `b = eq_lo.len()` for [`fused_fast_combine_merged_nt`] on aarch64;
+/// see that function's docs.
+#[cfg(target_arch = "aarch64")]
+const MERGE_MIN_BLOCK: usize = 2048;
+
+/// [`fused_fast_combine`] with staged accumulation + non-temporal publish,
+/// x86_64 port of the promoted aarch64 kernel. The leading claims'
+/// first pass accumulates into a reused per-task stage buffer instead of
+/// touching cold `b_combined` pool lines; the final pairwise loop forms the
+/// final `(s0, s1)` in registers and publishes them with two 16-byte
+/// non-temporal stores per pair — every store to a `b_combined` line is
+/// non-temporal (blocks are line-aligned), skipping the write-allocate RFO
+/// read of the ranked-shape ~512 MiB basis. `b_combined` is next read only
+/// at fold round 0, fully DRAM-cold, so no SLC free-hits are lost.
+///
+/// Table-read ORDER and all arithmetic are exactly [`fused_fast_combine`]'s —
+/// only the store targets change — so the result and transcript are identical.
+#[cfg(target_arch = "x86_64")]
+fn fused_fast_combine_staged_nt(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map_init(
+            // Per-task stage, reused across this task's blocks. Uninit is
+            // safe: when `last > 0` claim 0 writes every slot before any
+            // read; when `last == 0` the stage is never touched.
+            || crate::alloc_uninit_f128_vec(b),
+            |stage, (hi, out_block)| {
+                let last = rs_deferred.len() - 1;
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred[..last].iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if ci == 0 {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    }
+                }
+
+                let (eq_lo, eq_hi, table, _) = rs_deferred[last];
+                let e_hi = eq_hi[hi];
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let out_ptr = out_block.as_mut_ptr();
+                for t in 0..(b / 2) {
+                    let i0 = 2 * t;
+                    let i1 = i0 + 1;
+                    let v0 = ring_switch::fold_one_slot(eq_lo[i0] * e_hi, table);
+                    let v1 = ring_switch::fold_one_slot(eq_lo[i1] * e_hi, table);
+                    let (s0, s1) = if last == 0 {
+                        (v0, v1)
+                    } else {
+                        (stage[i0] + v0, stage[i1] + v1)
+                    };
+                    // SAFETY: i1 < b = out_block.len(), so out_ptr + i0 is
+                    // valid for 32 bytes; out_block is a par_chunks_mut(b)
+                    // block of a 16-aligned F128 buffer with b even, so the
+                    // address is 16-byte aligned.
+                    unsafe { store_nt_f128_pair(out_ptr.add(i0), s0, s1) };
+                    let a0 = packed_witness[base + i0];
+                    let a1 = packed_witness[base + i1];
+                    u0 += a0 * s0;
+                    u2 += (a0 + a1) * (s0 + s1);
+                }
+                (u0, u2)
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+}
+
+/// Direct-AB variant of [`fused_fast_combine_staged_nt`]: same staged
+/// accumulation and non-temporal publish, plus the round-one lookahead
+/// quadratics computed from the same register values as
+/// [`fused_fast_combine_lookahead`] — value-identical output.
+#[cfg(target_arch = "x86_64")]
+fn fused_fast_combine_lookahead_nt(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> ((F128, F128), [F128; 6]) {
+    use rayon::prelude::*;
+    debug_assert!(b >= 4 && b.is_multiple_of(4));
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map_init(
+            || crate::alloc_uninit_f128_vec(b),
+            |stage, (hi, out_block)| {
+                let last = rs_deferred.len() - 1;
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred[..last].iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if ci == 0 {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    }
+                }
+
+                let (eq_lo, eq_hi, table, _) = rs_deferred[last];
+                let e_hi = eq_hi[hi];
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut c = [F128::ZERO; 6];
+                let out_ptr = out_block.as_mut_ptr();
+                for t in 0..(b / 4) {
+                    let i = 4 * t;
+                    let v0 = ring_switch::fold_one_slot(eq_lo[i] * e_hi, table);
+                    let v1 = ring_switch::fold_one_slot(eq_lo[i + 1] * e_hi, table);
+                    let v2 = ring_switch::fold_one_slot(eq_lo[i + 2] * e_hi, table);
+                    let v3 = ring_switch::fold_one_slot(eq_lo[i + 3] * e_hi, table);
+                    let (b0, b1, b2, b3) = if last == 0 {
+                        (v0, v1, v2, v3)
+                    } else {
+                        (
+                            stage[i] + v0,
+                            stage[i + 1] + v1,
+                            stage[i + 2] + v2,
+                            stage[i + 3] + v3,
+                        )
+                    };
+                    // SAFETY: i + 3 < b = out_block.len(); blocks are
+                    // 16-aligned F128 pairs, so both pair addresses are
+                    // 16-byte aligned.
+                    unsafe {
+                        store_nt_f128_pair(out_ptr.add(i), b0, b1);
+                        store_nt_f128_pair(out_ptr.add(i + 2), b2, b3);
+                    }
+
+                    let a0 = packed_witness[base + i];
+                    let a1 = packed_witness[base + i + 1];
+                    let a2 = packed_witness[base + i + 2];
+                    let a3 = packed_witness[base + i + 3];
+                    let sa0 = a0 + a1;
+                    let sb0 = b0 + b1;
+                    let sa1 = a2 + a3;
+                    let sb1 = b2 + b3;
+                    let p_even0 = a0 * b0;
+                    let p_sum0 = sa0 * sb0;
+                    u0 += p_even0 + a2 * b2;
+                    u2 += p_sum0 + sa1 * sb1;
+                    c[0] += p_even0;
+                    c[1] += a1 * b1 + p_even0 + p_sum0;
+                    c[2] += p_sum0;
+                    let e_a = a0 + a2;
+                    let e_b = b0 + b2;
+                    let se_a = sa0 + sa1;
+                    let se_b = sb0 + sb1;
+                    let p_even = e_a * e_b;
+                    let p_sum = se_a * se_b;
+                    let p_odd = (se_a + e_a) * (se_b + e_b);
+                    c[3] += p_even;
+                    c[4] += p_odd + p_even + p_sum;
+                    c[5] += p_sum;
+                }
+                ((u0, u2), c)
+            },
+        )
         .reduce(
             || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
             |((x0, x2), mut xc), ((y0, y2), yc)| {
