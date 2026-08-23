@@ -5860,6 +5860,25 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_MDF8_PF=1` restores the incumbent [`materialize_direct_fold8`],
+/// which issues no software prefetch. Exact same-binary A/B: a prefetch is a
+/// hint with no architectural effect, so both arms produce byte-identical
+/// proofs.
+///
+/// Ranked open uses this sixty-four-bank materializer, not fold4. Fold4
+/// already overlaps the next block's cold f-slab into the table-hot b-side
+/// (`mdf4_pf_enabled`); fold8 had the same idle-DRAM window on a 4× larger
+/// slab (64 banks × `block_len` F128s) and never issued the hint. One T1
+/// line per b-side step, same depth/hint that measured positive on fold4
+/// (deeper walks evicted the composed table). Read once per process.
+#[cfg(target_arch = "x86_64")]
+fn mdf8_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF8_PF").is_none());
+    *ON
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5950,6 +5969,12 @@ fn materialize_direct_fold8(
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
+    // Grouped-gather prefetch state, resolved once for the whole
+    // materialization — never inside the block / claim / slot loops.
+    #[cfg(target_arch = "x86_64")]
+    let pf_on = mdf8_pf_enabled();
+    #[cfg(target_arch = "x86_64")]
+    let n_blocks = out_len / block_len;
     let stats = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -5983,6 +6008,41 @@ fn materialize_direct_fold8(
                 let _ = &gfni_tmp;
                 let start = 64 * block * block_len;
                 let f_in = &packed_witness[start..start + 64 * block_len];
+                // Head of the NEXT block's f-side slab. Null when there is
+                // no next block or the kill switch is set. `block + 1 <
+                // n_blocks` keeps `64·(block+2)·block_len` inside
+                // `packed_witness`.
+                #[cfg(target_arch = "x86_64")]
+                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
+                    // SAFETY: bounds argued above; `add` stays inside the
+                    // allocation and the pointer is never dereferenced.
+                    let p = unsafe { packed_witness.as_ptr().add(start + 64 * block_len) };
+                    (
+                        p.cast::<u8>(),
+                        64 * block_len * core::mem::size_of::<F128>(),
+                    )
+                } else {
+                    (core::ptr::null::<u8>(), 0usize)
+                };
+                #[cfg(target_arch = "x86_64")]
+                let mut pf_at = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                let mut prefetch_next_f = || {
+                    if !pf_base.is_null() && pf_at < pf_span {
+                        // SAFETY: `pf_at < pf_span` and the slab is
+                        // `pf_span` bytes, so the address is inside
+                        // `packed_witness`. Prefetch has no architectural
+                        // effect, so this arm is bit-identical to the
+                        // kill-switched one.
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                pf_base.add(pf_at).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T1,
+                            );
+                        }
+                        pf_at += 64;
+                    }
+                };
                 let b_in: &[F128] = if has_ordinary {
                     &ordinary_basis[start..start + 64 * block_len]
                 } else {
@@ -6039,6 +6099,14 @@ fn materialize_direct_fold8(
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
+                        // Eight T1 lines per 64-slot GFNI batch. At ranked
+                        // `block_len = 8192` that covers 64 KiB of the next
+                        // 8 MiB f-slab — same "one line, don't evict the
+                        // table" budget as fold4, scaled to the wider step.
+                        #[cfg(target_arch = "x86_64")]
+                        for _ in 0..8 {
+                            prefetch_next_f();
+                        }
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
@@ -6066,6 +6134,10 @@ fn materialize_direct_fold8(
                         scratch,
                     );
                     for slot in 0..block_len {
+                        #[cfg(target_arch = "x86_64")]
+                        if slot.is_multiple_of(4) {
+                            prefetch_next_f();
+                        }
                         let direct =
                             super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                         b_out[slot] = if has_ordinary {
@@ -6081,6 +6153,10 @@ fn materialize_direct_fold8(
                             scratch,
                         );
                         for (slot, out) in b_out.iter_mut().enumerate() {
+                            #[cfg(target_arch = "x86_64")]
+                            if slot.is_multiple_of(4) {
+                                prefetch_next_f();
+                            }
                             *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                         }
                     }
