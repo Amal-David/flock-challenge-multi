@@ -10,6 +10,14 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// Hoisted ranked-direct view of [`mul_diet_disabled`].  Kept in this module
+/// so the environment variable and its process cache still have one source of
+/// truth for both the incumbent and planned publishers.
+#[inline]
+pub(super) fn mul_diet_enabled() -> bool {
+    !mul_diet_disabled()
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -270,62 +278,14 @@ unsafe fn stream_f128x4<const ALIGNED_ZMM: bool>(
     }
 }
 
-/// Direct-publish twin of [`butterfly_fused_2layer_gen`].
-///
-/// The arithmetic and dispatch are identical, but computed active lanes are
-/// streamed to four disjoint codeword rows and never stored back to scratch.
-/// The ranked odd-row optimization deliberately omits the known-zero scratch
-/// suffix; that suffix is published from a zero register, without reloading it.
-///
 /// # Safety
-/// Contract forwarded from the architecture dispatch wrapper. When
-/// `OUTER_LOW`, `t_outer.hi == 0`; when `INNER_LOW`, both inner twiddles have a
-/// zero high limb.
+/// Contract forwarded from the plan-driven architecture dispatch wrapper.
+/// When `OUTER_LOW`, `t_outer.hi == 0`; when `INNER_LOW`, both inner twiddles
+/// have a zero high limb.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
-    const OUTER_LOW: bool,
-    const INNER_LOW: bool,
-    const ALIGNED_ZMM: bool,
->(
-    src: *const F128,
-    src_step: usize,
-    dst_a: *mut F128,
-    dst_b: *mut F128,
-    dst_c: *mut F128,
-    dst_d: *mut F128,
-    lanes: usize,
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
-    // SAFETY: forwarded caller contract. Match the incumbent's process-cached
-    // multiply selection exactly; it remains outside the lane loop.
-    unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_publish_nt_impl::<
-                OUTER_LOW,
-                INNER_LOW,
-                false,
-                ALIGNED_ZMM,
-            >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            )
-        } else {
-            butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, true, ALIGNED_ZMM>(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            )
-        }
-    }
-}
-
-/// # Safety
-/// Same contract as [`butterfly_fused_2layer_publish_nt_gen`].
-#[allow(clippy::too_many_arguments)]
-#[inline]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_publish_nt_impl<
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_impl<
     const OUTER_LOW: bool,
     const INNER_LOW: bool,
     const DIET: bool,
@@ -1349,13 +1309,17 @@ mod diet_tests {
         // SAFETY: source rows are 64 elements, destinations are disjoint,
         // 16-byte aligned and cover 64 elements, and the two allocations do not
         // overlap. The task-level production caller owns the same sfence.
+        let selector = (if OUTER_LOW {
+            super::super::DIRECT_OUTER_LOW
+        } else {
+            0
+        }) | (if INNER_LOW {
+            super::super::DIRECT_INNER_LOW
+        } else {
+            0
+        });
         unsafe {
-            butterfly_fused_2layer_publish_nt_impl::<
-                OUTER_LOW,
-                INNER_LOW,
-                DIET,
-                ALIGNED_ZMM,
-            >(
+            super::super::butterfly_fused_2layer_publish_nt_planned::<DIET, ALIGNED_ZMM>(
                 src.as_ptr(),
                 64,
                 dst_a,
@@ -1366,6 +1330,7 @@ mod diet_tests {
                 t_outer,
                 t_inner_a,
                 t_inner_b,
+                selector,
             );
             _mm_sfence();
             for (row, out) in [dst_a, dst_b, dst_c, dst_d].into_iter().enumerate() {
@@ -1378,9 +1343,10 @@ mod diet_tests {
         }
     }
 
-    /// Direct NT publication is byte-identical to the incumbent final fused2
-    /// store, including the contractual-zero 60..64 suffix and every 16-byte-aligned
-    /// pool-base residue, for all low-twiddle and mul-diet specializations.
+    /// Plan-selector direct NT publication is byte-identical to the incumbent
+    /// final fused2 store, including the contractual-zero 60..64 suffix and
+    /// every 16-byte-aligned pool-base residue, for all four low selectors,
+    /// both mul-diet specializations, and both alignment classes.
     #[test]
     fn direct_publish_matches_in_place_fused2() {
         // SAFETY: this module and test binary exist only when the target has

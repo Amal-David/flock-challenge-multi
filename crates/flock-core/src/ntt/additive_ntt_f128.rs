@@ -829,6 +829,58 @@ const fn direct_fused2_publish_shape(log_d: usize, num_ntts: usize, odd_tail: us
     log_d == 20 && num_ntts == 64 && (odd_tail == 0 || odd_tail == 4)
 }
 
+/// The final fused-two quads' immutable twiddles and preclassified low-product
+/// specializations.  The exact ranked direct publisher shares one 8×16 plan
+/// across all Rayon tasks instead of repeating three table lookups, three
+/// high-limb tests, and two process-switch reads for every quad.
+///
+/// Keep the 48-byte twiddle triples separate from the byte selectors.  An AoS
+/// entry would round to 64 bytes because [`F128`] is 16-byte aligned, making
+/// every worker scan 8 KiB instead of this plan's tightly packed 6,272 bytes.
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+const FINAL_TWIDDLE_PLAN_LEN: usize = 8 * 16;
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+struct FinalTwiddlePlan {
+    twiddles: [[F128; 3]; FINAL_TWIDDLE_PLAN_LEN],
+    low_selectors: [u8; FINAL_TWIDDLE_PLAN_LEN],
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+const FINAL_TWIDDLE_PLAN_BYTES: usize =
+    FINAL_TWIDDLE_PLAN_LEN * (3 * core::mem::size_of::<F128>() + core::mem::size_of::<u8>());
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+const _: () = assert!(core::mem::size_of::<FinalTwiddlePlan>() == FINAL_TWIDDLE_PLAN_BYTES);
+
 /// Physical staging row that holds logical row `k` in a seed+top block.
 #[inline]
 const fn seed_top_stage_row(k: usize, permuted: bool) -> usize {
@@ -931,6 +983,36 @@ unsafe fn pf_msg_rows(
 }
 
 impl AdditiveNttF128 {
+    /// Build the immutable layer-7/8 plan consumed by the exact ranked direct
+    /// publisher. `low_enabled` is passed explicitly so tests can exercise
+    /// both selector modes without mutating the process-cached environment.
+    #[cfg(any(
+        test,
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    ))]
+    fn final_twiddle_plan(&self, low_enabled: bool) -> FinalTwiddlePlan {
+        const FINAL_OUTER_LAYER: usize = 7;
+        const FINAL_INNER_LAYER: usize = 8;
+        let twiddles = std::array::from_fn(|outer_block| {
+            let outer = self.twiddle(FINAL_OUTER_LAYER, outer_block);
+            let inner_a = self.twiddle(FINAL_INNER_LAYER, 2 * outer_block);
+            let inner_b = self.twiddle(FINAL_INNER_LAYER, 2 * outer_block + 1);
+            [outer, inner_a, inner_b]
+        });
+        let low_selectors = std::array::from_fn(|q| {
+            let [outer, inner_a, inner_b] = twiddles[q];
+            kernels::direct_publish_low_selector(outer, inner_a, inner_b, low_enabled)
+        });
+        FinalTwiddlePlan {
+            twiddles,
+            low_selectors,
+        }
+    }
+
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
         let evals = Arc::new(generate_evals_from_subspace(basis));
@@ -1739,8 +1821,7 @@ impl AdditiveNttF128 {
     ))]
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    unsafe fn seed_top_direct_fused2_publish<const ALIGNED_ZMM: bool>(
-        &self,
+    unsafe fn seed_top_direct_fused2_publish<const DIET: bool, const ALIGNED_ZMM: bool>(
         bufp: *mut F128,
         base: *mut F128,
         row_len: usize,
@@ -1751,6 +1832,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        final_twiddles: &FinalTwiddlePlan,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -1766,6 +1848,8 @@ impl AdditiveNttF128 {
         // final consumer of its four staging rows; the 16 quads partition the
         // block's 64 logical rows, and the 8 blocks partition the task's 512.
         unsafe {
+            let mut final_twiddle = final_twiddles.twiddles.as_ptr();
+            let mut low_selector = final_twiddles.low_selectors.as_ptr();
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 let tw = &tw4[block];
@@ -1781,10 +1865,13 @@ impl AdditiveNttF128 {
                     );
                 }
                 for m in 0..16 {
-                    let outer_block = block * 16 + m;
-                    let t_outer = self.twiddle(3 + 4, outer_block);
-                    let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                    let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+                    // The pointer walks the shared 8×16 plan exactly once in
+                    // block-major order.  It removes bounds checks and the
+                    // twiddle table's Option/index path from the quad loop.
+                    let [outer, inner_a, inner_b] = *final_twiddle;
+                    let selector = *low_selector;
+                    final_twiddle = final_twiddle.add(1);
+                    low_selector = low_selector.add(1);
                     let k = 4 * m;
                     let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                     let step = g2_stride * row_len;
@@ -1793,7 +1880,7 @@ impl AdditiveNttF128 {
                             seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len,
                         )
                     };
-                    kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
+                    kernels::butterfly_fused_2layer_publish_nt_planned::<DIET, ALIGNED_ZMM>(
                         p,
                         step,
                         dst(k),
@@ -1801,9 +1888,10 @@ impl AdditiveNttF128 {
                         dst(k + 2),
                         dst(k + 3),
                         lanes2,
-                        t_outer,
-                        t_inner_a,
-                        t_inner_b,
+                        outer,
+                        inner_a,
+                        inner_b,
+                        selector,
                     );
                 }
             }
@@ -1886,6 +1974,25 @@ impl AdditiveNttF128 {
             target_feature = "vpclmulqdq"
         ))]
         let direct_publish_zmm = direct_publish && base_addr % 64 == 0;
+        // The final layer-7/8 twiddles are invariant across every `r` task.
+        // Build and classify them once, then share a stack-resident read-only
+        // plan through the synchronous Rayon closure. `then` keeps all plan
+        // construction/table work off non-direct and custom geometries.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let final_twiddle_plan: Option<FinalTwiddlePlan> = direct_publish.then(|| {
+            let low_enabled = kernels::direct_publish_low_twiddle_enabled();
+            self.final_twiddle_plan(low_enabled)
+        });
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let direct_mul_diet = direct_publish && kernels::direct_publish_mul_diet_enabled();
         // Staging row order inside a block.
         //
         // The natural order is `k`, and the fused-four kernel then walks its
@@ -1997,11 +2104,15 @@ impl AdditiveNttF128 {
                     target_feature = "vpclmulqdq"
                 ))]
                 if direct_publish {
+                    let final_twiddles = final_twiddle_plan
+                        .as_ref()
+                        .expect("direct publisher requires its final-twiddle plan");
                     // The alignment arm is selected once around the complete
-                    // 8×16-quad loop. Every 64-element destination row has a
-                    // 1024-byte stride, so it preserves the base residue.
-                    if direct_publish_zmm {
-                        self.seed_top_direct_fused2_publish::<true>(
+                    // 8×16-quad loop, as is the process-wide multiply form.
+                    // Every 64-element destination row has a 1024-byte stride,
+                    // so it preserves the base residue.
+                    match (direct_mul_diet, direct_publish_zmm) {
+                        (true, true) => Self::seed_top_direct_fused2_publish::<true, true>(
                             bufp,
                             base,
                             row_len,
@@ -2012,9 +2123,9 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
-                        );
-                    } else {
-                        self.seed_top_direct_fused2_publish::<false>(
+                            final_twiddles,
+                        ),
+                        (true, false) => Self::seed_top_direct_fused2_publish::<true, false>(
                             bufp,
                             base,
                             row_len,
@@ -2025,7 +2136,34 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
-                        );
+                            final_twiddles,
+                        ),
+                        (false, true) => Self::seed_top_direct_fused2_publish::<false, true>(
+                            bufp,
+                            base,
+                            row_len,
+                            block_size,
+                            sub_stride,
+                            r,
+                            lanes2,
+                            lanes4_tail,
+                            stage_perm,
+                            &tw4,
+                            final_twiddles,
+                        ),
+                        (false, false) => Self::seed_top_direct_fused2_publish::<false, false>(
+                            bufp,
+                            base,
+                            row_len,
+                            block_size,
+                            sub_stride,
+                            r,
+                            lanes2,
+                            lanes4_tail,
+                            stage_perm,
+                            &tw4,
+                            final_twiddles,
+                        ),
                     }
                     // All 512 rows are published. Drain once for this r task;
                     // the rayon join below is the deep pass's happens-before.
@@ -4628,6 +4766,81 @@ mod tests {
         assert!(!direct_fused2_publish_shape(19, 64, 4));
         assert!(!direct_fused2_publish_shape(20, 32, 4));
         assert!(!direct_fused2_publish_shape(20, 64, 8));
+    }
+
+    /// The plan's two-bit classifier exactly matches the incumbent outer/inner
+    /// high-limb decisions, and the control switch forces the fully general
+    /// selector without changing any twiddle value.
+    #[test]
+    fn direct_fused2_low_selector_truth_table() {
+        let low = F128 { lo: 7, hi: 0 };
+        let high = F128 { lo: 7, hi: 9 };
+        use kernels::{DIRECT_INNER_LOW, DIRECT_OUTER_LOW, direct_publish_low_selector};
+
+        assert_eq!(direct_publish_low_selector(high, high, high, true), 0);
+        assert_eq!(
+            direct_publish_low_selector(low, high, high, true),
+            DIRECT_OUTER_LOW,
+        );
+        assert_eq!(
+            direct_publish_low_selector(high, low, low, true),
+            DIRECT_INNER_LOW,
+        );
+        assert_eq!(
+            direct_publish_low_selector(low, low, low, true),
+            DIRECT_OUTER_LOW | DIRECT_INNER_LOW,
+        );
+        // Either high inner limb disables the pair specialization.
+        assert_eq!(direct_publish_low_selector(high, low, high, true), 0);
+        assert_eq!(direct_publish_low_selector(high, high, low, true), 0);
+        for (outer, inner_a, inner_b) in [
+            (low, low, low),
+            (low, high, high),
+            (high, low, low),
+            (high, high, high),
+        ] {
+            assert_eq!(
+                direct_publish_low_selector(outer, inner_a, inner_b, false),
+                0,
+            );
+        }
+    }
+
+    /// Every shared-plan slot is the same layer-7/8 triple the incumbent
+    /// quad loop queried. Cover both the memoized standard table and an
+    /// explicit independent custom basis, plus both low-selector modes.
+    #[test]
+    fn direct_fused2_final_twiddle_plan_matches_lookup() {
+        let custom_basis: Vec<F128> = (0..20)
+            .map(|i| F128 {
+                lo: 1u64 << (i + 1),
+                hi: 0,
+            })
+            .collect();
+        for ntt in [AdditiveNttF128::standard(20), AdditiveNttF128::new(&custom_basis)] {
+            for low_enabled in [false, true] {
+                let plan = ntt.final_twiddle_plan(low_enabled);
+                assert_eq!(core::mem::size_of_val(&plan), FINAL_TWIDDLE_PLAN_BYTES);
+                for (q, entry) in plan.twiddles.iter().enumerate() {
+                    let outer = ntt.twiddle(7, q);
+                    let inner_a = ntt.twiddle(8, 2 * q);
+                    let inner_b = ntt.twiddle(8, 2 * q + 1);
+                    assert_eq!(entry[0], outer, "outer q={q}");
+                    assert_eq!(entry[1], inner_a, "inner-a q={q}");
+                    assert_eq!(entry[2], inner_b, "inner-b q={q}");
+                    assert_eq!(
+                        plan.low_selectors[q],
+                        kernels::direct_publish_low_selector(
+                            outer,
+                            inner_a,
+                            inner_b,
+                            low_enabled,
+                        ),
+                        "selector q={q}",
+                    );
+                }
+            }
+        }
     }
 
     /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs

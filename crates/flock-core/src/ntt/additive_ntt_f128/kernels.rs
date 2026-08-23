@@ -80,6 +80,67 @@ fn low_twiddle_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some())
 }
 
+/// Resolve the process-wide low-twiddle switch once for the ranked direct
+/// publisher's shared final-twiddle plan.  The ordinary kernels deliberately
+/// retain their incumbent per-call dispatch; only the exact direct path
+/// hoists it above all Rayon tasks.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn direct_publish_low_twiddle_enabled() -> bool {
+    !low_twiddle_disabled()
+}
+
+/// Two-bit selector used by one entry of the ranked final-twiddle plan.
+pub(super) const DIRECT_OUTER_LOW: u8 = 1;
+pub(super) const DIRECT_INNER_LOW: u8 = 2;
+
+/// Classify a final fused-two twiddle triple once, while the shared plan is
+/// built.  Bit 0 selects the low outer multiply and bit 1 selects the low
+/// inner pair.  `low_enabled=false` is the exact same-binary control selected
+/// by `FLOCK_NO_LOW_TWIDDLE=1`.
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+#[inline]
+pub(super) const fn direct_publish_low_selector(
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    low_enabled: bool,
+) -> u8 {
+    if !low_enabled {
+        return 0;
+    }
+    (if t_outer.hi == 0 { DIRECT_OUTER_LOW } else { 0 })
+        | (if t_inner_a.hi == 0 && t_inner_b.hi == 0 {
+            DIRECT_INNER_LOW
+        } else {
+            0
+        })
+}
+
+/// Resolve the process-wide split-product switch once for the ranked direct
+/// publisher.  The returned value is dispatched at task scope and becomes a
+/// `DIET` const parameter inside every quad kernel.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn direct_publish_mul_diet_enabled() -> bool {
+    x86_64::mul_diet_enabled()
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn butterfly_fused_2layer(
@@ -149,25 +210,29 @@ pub(super) fn butterfly_fused_2layer(
 /// Final fused-two-layer butterfly whose four rows are published directly to
 /// four non-temporal codeword destinations instead of written back to scratch.
 ///
-/// This is deliberately x86 AVX-512-only: the caller retains the incumbent
-/// in-place butterfly plus scatter on every other target and geometry.
+/// `selector` and `DIET` were resolved once before the Rayon pass.  Thus this
+/// leaf performs no environment/`OnceLock` reads and no twiddle-high tests;
+/// the only runtime dispatch left is the entry's two-bit specialization.
 ///
 /// # Safety
 ///
 /// `src` must expose four readable 64-element rows at `src + i * src_step`.
 /// `dst_a` through `dst_d` must each expose 64 writable, 16-byte-aligned
 /// elements, be mutually disjoint, and not overlap `src`. `lanes` must be 60
-/// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
-/// fallback only requires 16-byte alignment. The cfg gate guarantees the
-/// required target features.
+/// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned.
+/// `selector` must come from [`direct_publish_low_selector`] for the supplied
+/// twiddles. The cfg gate guarantees the required target features.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
-#[inline]
-pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
+#[inline(always)]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_planned<
+    const DIET: bool,
+    const ALIGNED_ZMM: bool,
+>(
     src: *const F128,
     src_step: usize,
     dst_a: *mut F128,
@@ -178,52 +243,46 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     t_outer: F128,
     t_inner_a: F128,
     t_inner_b: F128,
+    selector: u8,
 ) {
-    debug_assert!(lanes == 60 || lanes == 64);
-    debug_assert_eq!(dst_a as usize % 16, 0);
-    debug_assert_eq!(dst_b as usize % 16, 0);
-    debug_assert_eq!(dst_c as usize % 16, 0);
-    debug_assert_eq!(dst_d as usize % 16, 0);
-    debug_assert!(!ALIGNED_ZMM || dst_a as usize % 64 == 0);
-    debug_assert!(!ALIGNED_ZMM || dst_b as usize % 64 == 0);
-    debug_assert!(!ALIGNED_ZMM || dst_c as usize % 64 == 0);
-    debug_assert!(!ALIGNED_ZMM || dst_d as usize % 64 == 0);
+    debug_assert!(selector <= DIRECT_OUTER_LOW | DIRECT_INNER_LOW);
+    debug_assert!(selector & DIRECT_OUTER_LOW == 0 || t_outer.hi == 0);
+    debug_assert!(
+        selector & DIRECT_INNER_LOW == 0 || (t_inner_a.hi == 0 && t_inner_b.hi == 0)
+    );
 
-    // Match `butterfly_fused_2layer` exactly: both low-twiddle decisions are
-    // made once outside the lane loop, and the x86 leaf makes the same
-    // process-cached mul-diet choice.
-    let off = low_twiddle_disabled();
-    let outer_low = t_outer.hi == 0 && !off;
-    let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0 && !off;
-
-    // SAFETY: forwarded caller contract; the flags are exactly the
-    // zero-high-limb preconditions of the selected specializations.
+    // SAFETY: forwarded caller contract.  The selector's low-limb
+    // preconditions are checked above and DIET/alignment are task-scope consts.
     unsafe {
-        match (outer_low, inner_low) {
-            (false, false) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
+        match selector {
+            0 => x86_64::butterfly_fused_2layer_publish_nt_impl::<
                 false,
                 false,
+                DIET,
                 ALIGNED_ZMM,
             >(
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
             ),
-            (false, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                false,
+            DIRECT_OUTER_LOW => x86_64::butterfly_fused_2layer_publish_nt_impl::<
                 true,
+                false,
+                DIET,
                 ALIGNED_ZMM,
             >(
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
             ),
-            (true, false) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                true,
+            DIRECT_INNER_LOW => x86_64::butterfly_fused_2layer_publish_nt_impl::<
                 false,
+                true,
+                DIET,
                 ALIGNED_ZMM,
             >(
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
             ),
-            (true, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
+            _ => x86_64::butterfly_fused_2layer_publish_nt_impl::<
                 true,
                 true,
+                DIET,
                 ALIGNED_ZMM,
             >(
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
