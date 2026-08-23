@@ -137,6 +137,15 @@ pub(crate) fn urm_offw_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_X2=1` restores two sequential single-window kernels from
+/// [`super::shift_reduce_inner_ab_x2`]. Ranked default interleaves the two
+/// Horner chains (the aarch64 fused-x2 leftover). Resolved once per process.
+pub(crate) fn urm_x2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_X2").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -257,6 +266,60 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     }
 }
 
+/// Paired-window [`shift_reduce_inner_ab_x86_avx512_pidx`]: two offset
+/// prologues then one interleaved Horner. Bit-identical to two sequential
+/// pidx calls. Ranked `img2 && pidx && offw` only.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_pidx`] on windows `b_med` and
+/// `b_med + 1`; both 64-byte packed windows must be readable.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) {
+    #[repr(align(64))]
+    struct Off([u16; 128]);
+
+    // SAFETY: two windows of 64 packed a/b bytes; `off0`/`off1` are fully
+    // written 128-u16 stack blocks; both `out` are one writable ZMM.
+    unsafe {
+        let a0 = a_packed.as_ptr().add(chunk_byte_base + b_med * N_CHUNKS * 8);
+        let b0 = b_packed.as_ptr().add(chunk_byte_base + b_med * N_CHUNKS * 8);
+        let a1 = a_packed
+            .as_ptr()
+            .add(chunk_byte_base + (b_med + 1) * N_CHUNKS * 8);
+        let b1 = b_packed
+            .as_ptr()
+            .add(chunk_byte_base + (b_med + 1) * N_CHUNKS * 8);
+
+        let mut off0 = core::mem::MaybeUninit::<Off>::uninit();
+        let mut off1 = core::mem::MaybeUninit::<Off>::uninit();
+        let op0 = core::ptr::addr_of_mut!((*off0.as_mut_ptr()).0) as *mut u16;
+        let op1 = core::ptr::addr_of_mut!((*off1.as_mut_ptr()).0) as *mut u16;
+        shift_reduce_ab_offsets_build(a0, b0, op0);
+        shift_reduce_ab_offsets_build(a1, b1, op1);
+
+        let (acc0, acc1) = horner_2img_offw_x2(imgs, op0, op1);
+        store_out64(out0, acc0, nt);
+        store_out64(out1, acc1, nt);
+        let _ = (off0, off1);
+    }
+}
+
 /// The pre-scaled-offset PROLOGUE of
 /// [`shift_reduce_inner_ab_x86_avx512_pidx`] alone: widen the window's
 /// 128 a/b bytes to `u16` and multiply by the row stride 64, into a
@@ -359,6 +422,72 @@ unsafe fn horner_2img_offw(
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
         }
         acc
+    }
+}
+
+/// Two independent [`horner_2img_offw`] chains, interleaved so each K-row's
+/// four table applies (a0, b0, a1, b1) issue before either Horner step.
+/// Accumulators are two ZMM registers — not a dual 16-bank fold. Bytes equal
+/// two sequential [`horner_2img_offw`] calls.
+///
+/// # Safety
+/// As for [`horner_2img_offw`], twice, on disjoint offset blocks.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw_x2(
+    imgs: (*const u8, *const u8),
+    op0: *const u16,
+    op1: *const u16,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    // Compile-time-only fence (zero instructions): the two Horner accs are
+    // `inout(zmm_reg)` and memory is clobbered, so LLVM cannot merge all
+    // eight K-row apply streams into one region and spill — the aarch64 x2
+    // wavefront's `pin_accs` leftover. First official x2 (−0.08%) omitted
+    // this and the 7-iteration loop hid the per-K segment.
+    #[inline(always)]
+    unsafe fn pin_accs(a0: &mut __m512i, a1: &mut __m512i) {
+        unsafe {
+            core::arch::asm!(
+                "/* pin {0} {1} */",
+                inout(zmm_reg) *a0,
+                inout(zmm_reg) *a1,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    // SAFETY: forwarded from the caller's contract; the two offset blocks
+    // are distinct 128-u16 regions.
+    unsafe {
+        let apply = |op: *const u16, o: usize| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, op.add(o))
+        };
+        let xb = _mm512_set1_epi8(2);
+        let mut acc0 = _mm512_gf2p8mul_epi8(apply(op0, 7 * 8), apply(op0, 64 + 7 * 8));
+        let mut acc1 = _mm512_gf2p8mul_epi8(apply(op1, 7 * 8), apply(op1, 64 + 7 * 8));
+        pin_accs(&mut acc0, &mut acc1);
+        macro_rules! k_step {
+            ($k:literal) => {{
+                let y0 = _mm512_gf2p8mul_epi8(apply(op0, $k * 8), apply(op0, 64 + $k * 8));
+                let y1 = _mm512_gf2p8mul_epi8(apply(op1, $k * 8), apply(op1, 64 + $k * 8));
+                acc0 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc0, xb), y0);
+                acc1 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc1, xb), y1);
+                pin_accs(&mut acc0, &mut acc1);
+            }};
+        }
+        k_step!(6);
+        k_step!(5);
+        k_step!(4);
+        k_step!(3);
+        k_step!(2);
+        k_step!(1);
+        k_step!(0);
+        (acc0, acc1)
     }
 }
 

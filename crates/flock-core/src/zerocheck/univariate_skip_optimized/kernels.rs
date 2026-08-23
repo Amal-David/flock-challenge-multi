@@ -423,7 +423,77 @@ pub(super) fn shift_reduce_inner_ab_x2(
         );
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        let fused = x86_64::urm_x2_enabled()
+            && x86_64::urm_apply_2img_enabled()
+            && inv_table.has_second_image()
+            && x86_64::urm_pidx_enabled()
+            && x86_64::urm_offw_enabled();
+        let skip_bstatic = match bstatic {
+            Some((w, _)) => {
+                let blk = w * 16 + b_med;
+                !bstatic_window_live(blk) && !bstatic_window_live(blk + 1)
+            }
+            None => true,
+        };
+        if fused && skip_bstatic {
+            // SAFETY: gfni/avx512f/bw are compile-time; two consecutive
+            // 64-byte packed windows are readable (the pair loop's contract).
+            unsafe {
+                x86_64::shift_reduce_inner_ab_x86_avx512_pidx_x2(
+                    a_packed,
+                    b_packed,
+                    chunk_byte_base,
+                    b_med,
+                    out0,
+                    out1,
+                    nt,
+                    inv_table.image_ptrs(),
+                );
+            }
+            return;
+        }
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            a_col,
+            b_col,
+            bstatic,
+            nt,
+        );
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med + 1,
+            out1,
+            a_col,
+            b_col,
+            bstatic,
+            nt,
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )
+    )))]
     {
         shift_reduce_inner_ab(
             a_packed,
