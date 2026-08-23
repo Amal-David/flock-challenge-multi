@@ -149,6 +149,13 @@ pub(crate) mod topology_pool {
         }
         #[cfg(target_os = "linux")]
         {
+            // POOL-OFF draw: topology pool disabled so rayon builds its
+            // default pool from RAYON_NUM_THREADS (unpinned, 1 thread per
+            // vCPU). Local interleave A/B on the identical 2-SMT shape
+            // measured unpinned faster than pin16; runner arbitrates.
+            if true {
+                return None;
+            }
             if std::env::var_os("FLOCK_NO_TOPOLOGY_POOL").is_some() {
                 return None;
             }
