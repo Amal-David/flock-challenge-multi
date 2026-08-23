@@ -5996,11 +5996,12 @@ fn materialize_direct_fold8(
                 while slot < block_len {
                     let n = SUB.min(block_len - slot);
                     let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
+                    crate::field::f128_slice::fold16_then4_nested(
+                        &f_in[64 * slot..64 * (slot + n)],
+                        &mut f_out[slot..slot + n],
+                        &fold16_weight,
+                        r4,
+                        r5,
                     );
                     if has_ordinary {
                         let m16 = &mut mid16[..16 * n];

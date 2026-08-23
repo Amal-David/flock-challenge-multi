@@ -210,6 +210,60 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     }
 }
 
+/// `FLOCK_NO_FOLD16_THEN4=1` restores `fold16_banked` into a 4-wide mid
+/// then `fold4_nested`. Default ON keeps the four mid lanes in ZMMs.
+fn fold16_then4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_THEN4").is_none());
+    *ON
+}
+
+/// Sixteen-bank weighted fold followed by nested `r0`/`r1` pair-fold:
+/// `dst[t] = fold4(m[4t..4t+4], r0, r1)` where `m[s] = Σ_b w[b]·src[16s+b]`.
+///
+/// Ranked DirectFold8 f-side is 64→4→1. AVX-512 keeps the 4-wide mid in
+/// registers (no `mid4` store/reload). Same field element as the two-pass
+/// form.
+pub(crate) fn fold16_then4_nested(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r0: F128,
+    r1: F128,
+) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold16-then4 source must contain 64 elements for every destination slot"
+    );
+    if !fold16_then4_enabled() {
+        let mut mid = vec![F128::ZERO; 4 * dst.len()];
+        fold16_banked(src, &mut mid, w);
+        fold4_nested(&mid, dst, r0, r1);
+        return;
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::fold16_then4_nested(src, dst, w, r0, r1);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let mut mid = vec![F128::ZERO; 4 * dst.len()];
+        fold16_banked(src, &mut mid, w);
+        fold4_nested(&mid, dst, r0, r1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
@@ -290,6 +344,36 @@ mod tests {
             fold4_nested(&src4, &mut zeroed, r0, r1);
             fold4_nested(&src4, &mut dirty, r0, r1);
             assert_eq!(dirty, zeroed, "fold4_nested n={n}");
+        }
+    }
+
+    /// Fused 64→1 equals the two-pass 16-bank fold plus nested fold4,
+    /// including dest-stale and tail lengths.
+    #[test]
+    fn fold16_then4_nested_matches_two_pass() {
+        use super::*;
+        let mut state = 0xC0FF_EE42_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 4, 5, 8, 64, 256] {
+            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let r0 = F128 { lo: next(), hi: next() };
+            let r1 = F128 { lo: next(), hi: next() };
+            let src: Vec<F128> = (0..64 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut mid = vec![F128::ZERO; 4 * n];
+            let mut want = vec![F128::ZERO; n];
+            fold16_banked(&src, &mut mid, &w);
+            fold4_nested(&mid, &mut want, r0, r1);
+            let mut got = vec![F128::ZERO; n];
+            fold16_then4_nested(&src, &mut got, &w, r0, r1);
+            assert_eq!(got, want, "n={n}");
+            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            fold16_then4_nested(&src, &mut dirty, &w, r0, r1);
+            assert_eq!(dirty, want, "stale n={n}");
         }
     }
 
