@@ -139,6 +139,15 @@ pub(crate) fn bstatic_apply_2img_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_APPLY_2IMG").is_none())
 }
 
+/// `FLOCK_NO_BSTATIC_PIDX=1` keeps the fully-static a-side apply on
+/// `movzbl`+`shl $6` (the incumbent `apply_full_2img`). Ranked default uses
+/// the generic kernel's pre-scaled `u16` offsets (`offw`) so those shifts
+/// leave port 0/6. Resolved once per process.
+fn bstatic_pidx_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_PIDX").is_none())
+}
+
 /// `FLOCK_NO_FAST_SHIFT_REDUCE=1` restores the incumbent kernel (same-binary
 /// A/B); the ranked worker's cleared env never sets it.
 pub(crate) fn fast_shift_reduce_enabled() -> bool {
@@ -268,17 +277,42 @@ unsafe fn all_static_acc<const IMG2: bool>(
     a_base: *const u8,
     parts: *const u8,
 ) -> __m512i {
-    // SAFETY: forwarded from the caller's contract.
+    #[repr(align(64))]
+    struct Off([u16; 64]);
+    // SAFETY: forwarded from the caller's contract. The pidx arm writes 64
+    // `u16` offsets (byte·64) covering the eight packed a-rows, then the
+    // existing 2-image offw apply reads eight of them per K-row — identical
+    // table addresses to `apply_full_2img`.
     unsafe {
         let mut acc = _mm512_setzero_si512();
-        for k in 0..8usize {
-            let av = if IMG2 {
-                apply_full_2img(table, table8, a_base.add(k * N_CHUNKS))
-            } else {
-                apply_full(table, a_base.add(k * N_CHUNKS))
+        if IMG2 && bstatic_pidx_enabled() {
+            let mut off = core::mem::MaybeUninit::<Off>::uninit();
+            let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
+            let scale = |p: *const u8| {
+                _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
             };
-            let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
-            acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
+            _mm512_store_si512(op as *mut __m512i, scale(a_base));
+            _mm512_store_si512(op.add(32) as *mut __m512i, scale(a_base.add(32)));
+            for k in 0..8usize {
+                let av = crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(
+                    table,
+                    table8,
+                    op.add(k * 8),
+                );
+                let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
+                acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
+            }
+            let _ = off;
+        } else {
+            for k in 0..8usize {
+                let av = if IMG2 {
+                    apply_full_2img(table, table8, a_base.add(k * N_CHUNKS))
+                } else {
+                    apply_full(table, a_base.add(k * N_CHUNKS))
+                };
+                let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
+                acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
+            }
         }
         acc
     }
