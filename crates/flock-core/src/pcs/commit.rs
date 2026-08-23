@@ -664,9 +664,11 @@ const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
 const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
 
 /// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
-/// every 2048-leaf subgroup. Regroup only that exact production shape; every
-/// recursive, portable, alternate-hash, and diagnostic geometry keeps the
-/// established callback-local fold.
+/// every 2048-leaf subgroup. Regroup that production geometry for both PCS
+/// hashes: the fold is hash-agnostic (same child ranges, same tree layout)
+/// and the ranked fast configs actually commit under SHA-256. Recursive,
+/// portable, and diagnostic geometries keep the established callback-local
+/// fold. `FLOCK_NO_MERKLE_SUBTREE_REGROUP=1` restores per-block folding.
 #[inline]
 fn subtree_parent_regroup_selected(
     n_leaves: usize,
@@ -679,7 +681,7 @@ fn subtree_parent_regroup_selected(
         && n_leaves == (1 << 20)
         && num_ntts == 64
         && leaf_size == 1024
-        && kind == HashKind::Blake3
+        && matches!(kind, HashKind::Blake3 | HashKind::Sha256)
 }
 
 fn subtree_parent_regroup_enabled(
@@ -1231,6 +1233,13 @@ mod tests {
             HashKind::Blake3,
             false,
         ));
+        assert!(subtree_parent_regroup_selected(
+            1 << 20,
+            64,
+            1024,
+            HashKind::Sha256,
+            false,
+        ));
         for selected in [
             subtree_parent_regroup_selected(
                 (1 << 20) - 1,
@@ -1251,13 +1260,6 @@ mod tests {
                 64,
                 512,
                 HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Sha256,
                 false,
             ),
             subtree_parent_regroup_selected(
