@@ -266,6 +266,16 @@ fn ntt_direct_fused2_publish_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_STAGE_TAIL=1` restores writing all `num_ntts` seed
+/// staging lanes on odd rows. Default: odd-`r` seed stores stop at
+/// `row_lanes` (ranked: 60 of 64). The four-lane suffix is padding-zero;
+/// fused-four already uses the same bound, and fused-two publish streams
+/// register zeros for it. Not a codeword NT skip.
+fn ntt_seed_stage_tail_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_STAGE_TAIL").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -1910,6 +1920,13 @@ impl AdditiveNttF128 {
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            // Odd-r seed stores: same live prefix fused-four already reads.
+            // Even r and the kill switch keep the dense 64-lane write.
+            let seed_lanes = if ntt_seed_stage_tail_disabled() {
+                row_len
+            } else {
+                row_lanes(r, row_len, odd_tail)
+            };
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
             // `msg`; codeword rows `block·B + r + k·S` are inside `data`;
             // distinct `r` select pairwise-disjoint codeword row sets, so no two
@@ -1965,6 +1982,7 @@ impl AdditiveNttF128 {
                             64,
                             0,
                             row_len,
+                            seed_lanes,
                             seed_right,
                         );
                     } else {
@@ -1976,6 +1994,7 @@ impl AdditiveNttF128 {
                             64,
                             0,
                             row_len,
+                            seed_lanes,
                             seed_right,
                             pf_next,
                         );
@@ -1988,6 +2007,7 @@ impl AdditiveNttF128 {
                         64,
                         0,
                         row_len,
+                        seed_lanes,
                         &seed_dense,
                     );
                 }

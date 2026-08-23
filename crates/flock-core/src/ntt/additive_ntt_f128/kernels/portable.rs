@@ -99,7 +99,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     // SAFETY: forwarded caller contract; identical geometry on both sides.
     unsafe {
         butterfly_fused_2layer_row_from_geo(
-            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+            src, quarter, r, dst, quarter, r, num_ntts, num_ntts, twiddles,
         )
     }
 }
@@ -119,11 +119,13 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     twiddles: &[F128; 3],
 ) {
     let [t_outer, t_inner_a, t_inner_b] = *twiddles;
     unsafe {
-        for lane in 0..num_ntts {
+        debug_assert!(active_lanes <= num_ntts);
+        for lane in 0..active_lanes {
             let mut a = *src.add(src_r * num_ntts + lane);
             let mut b = *src.add((src_quarter + src_r) * num_ntts + lane);
             let mut c = *src.add((2 * src_quarter + src_r) * num_ntts + lane);
@@ -178,6 +180,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
             quarter,
             r,
             num_ntts,
+            num_ntts,
             right_twiddle,
         )
     }
@@ -197,10 +200,12 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
 ) {
     unsafe {
-        for lane in 0..num_ntts {
+        debug_assert!(active_lanes <= num_ntts);
+        for lane in 0..active_lanes {
             let a = *src.add(src_r * num_ntts + lane);
             let mut b = *src.add((src_quarter + src_r) * num_ntts + lane);
             let mut c = *src.add((2 * src_quarter + src_r) * num_ntts + lane);

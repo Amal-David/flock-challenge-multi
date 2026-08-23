@@ -292,6 +292,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     twiddles: &[F128; 3],
 ) {
     #[cfg(all(
@@ -302,7 +303,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: cfg gate guarantees the required target features.
     unsafe {
         x86_64::butterfly_fused_2layer_row_from_geo(
-            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, active_lanes, twiddles,
         );
     }
 
@@ -314,7 +315,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_2layer_row_from_geo(
-            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, active_lanes, twiddles,
         );
     }
 }
@@ -338,6 +339,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
 ) {
     #[cfg(all(
@@ -355,6 +357,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
             dst_quarter,
             dst_r,
             num_ntts,
+            active_lanes,
             right_twiddle,
         );
     }
@@ -374,6 +377,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
             dst_quarter,
             dst_r,
             num_ntts,
+            active_lanes,
             right_twiddle,
         )
     }
@@ -401,6 +405,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     pf_src: *const F128,
 ) {
@@ -419,6 +424,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
             dst_quarter,
             dst_r,
             num_ntts,
+            active_lanes,
             right_twiddle,
             pf_src,
         );
@@ -440,6 +446,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
             dst_quarter,
             dst_r,
             num_ntts,
+            active_lanes,
             right_twiddle,
         )
     }

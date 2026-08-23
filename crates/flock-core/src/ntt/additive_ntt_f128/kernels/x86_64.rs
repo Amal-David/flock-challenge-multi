@@ -420,7 +420,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     // SAFETY: forwarded caller contract; identical geometry on both sides.
     unsafe {
         butterfly_fused_2layer_row_from_geo(
-            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+            src, quarter, r, dst, quarter, r, num_ntts, num_ntts, twiddles,
         )
     }
 }
@@ -441,17 +441,18 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     twiddles: &[F128; 3],
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
             butterfly_fused_2layer_row_from_geo_impl::<false>(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, active_lanes, twiddles,
             )
         } else {
             butterfly_fused_2layer_row_from_geo_impl::<true>(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, active_lanes, twiddles,
             )
         }
     }
@@ -470,6 +471,7 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     twiddles: &[F128; 3],
 ) {
     use core::arch::x86_64::*;
@@ -483,7 +485,8 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
         let inner_b = tw_x4::<false, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
-        let lanes = num_ntts & !3;
+        debug_assert!(active_lanes <= num_ntts);
+        let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
             let mut va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
@@ -511,7 +514,7 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
             _mm512_storeu_si512(dst_row(3).add(lane) as *mut __m512i, vd);
             lane += 4;
         }
-        while lane < num_ntts {
+        while lane < active_lanes {
             let mut a = *src_row(0).add(lane);
             let mut b = *src_row(1).add(lane);
             let mut c = *src_row(2).add(lane);
@@ -564,6 +567,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
             quarter,
             r,
             num_ntts,
+            num_ntts,
             right_twiddle,
         )
     }
@@ -584,6 +588,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
 ) {
     // SAFETY: forwarded caller contract.
@@ -597,6 +602,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 dst_quarter,
                 dst_r,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 core::ptr::null(),
             )
@@ -609,6 +615,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 dst_quarter,
                 dst_r,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 core::ptr::null(),
             )
@@ -634,6 +641,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     pf_src: *const F128,
 ) {
@@ -648,6 +656,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 dst_quarter,
                 dst_r,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 pf_src,
             )
@@ -660,6 +669,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 dst_quarter,
                 dst_r,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 pf_src,
             )
@@ -680,6 +690,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
     dst_quarter: usize,
     dst_r: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     pf_src: *const F128,
 ) {
@@ -692,7 +703,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
-        let lanes = num_ntts & !3;
+        debug_assert!(active_lanes <= num_ntts);
+        let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
             if PF {
@@ -721,7 +733,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
             _mm512_storeu_si512(dst_row(3).add(lane) as *mut __m512i, vd);
             lane += 4;
         }
-        while lane < num_ntts {
+        while lane < active_lanes {
             let a = *src_row(0).add(lane);
             let mut b = *src_row(1).add(lane);
             let mut c = *src_row(2).add(lane);
@@ -1679,6 +1691,7 @@ mod diet_tests {
                             1,
                             0,
                             len,
+                            len,
                             &tw3,
                         );
                     } else {
@@ -1689,6 +1702,7 @@ mod diet_tests {
                             dst.as_mut_ptr(),
                             1,
                             0,
+                            len,
                             len,
                             &tw3,
                         );
@@ -1712,6 +1726,7 @@ mod diet_tests {
                             1,
                             0,
                             len,
+                            len,
                             right,
                             core::ptr::null(),
                         );
@@ -1723,6 +1738,7 @@ mod diet_tests {
                             dst.as_mut_ptr(),
                             1,
                             0,
+                            len,
                             len,
                             right,
                             core::ptr::null(),
