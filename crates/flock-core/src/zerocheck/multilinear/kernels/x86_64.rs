@@ -735,6 +735,13 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     debug_assert_eq!(a_out.len(), 2 * lo_size);
     debug_assert!(lo_size.is_multiple_of(2));
 
+    // Resolve the ZMM stream-store alignment once per worker chunk. Every
+    // vectorized tile advances by sixteen F128s (256 bytes), so aligned slice
+    // bases keep all of the tile's stores aligned. Direct callers with merely
+    // F128 alignment retain the unaligned temporal-store path.
+    let nt_out = nt_out
+        && ((a_out.as_ptr() as usize | b_out.as_ptr() as usize) & 63 == 0);
+
     #[inline(always)]
     unsafe fn fold_regs(
         lo: __m512i,
@@ -864,14 +871,14 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let ap = a_out.as_mut_ptr().add(output);
             let bp = b_out.as_mut_ptr().add(output);
             if nt_out {
-                stream_zmm_as_xmm4(ap, oa0);
-                stream_zmm_as_xmm4(ap.add(4), oa1);
-                stream_zmm_as_xmm4(ap.add(8), oa2);
-                stream_zmm_as_xmm4(ap.add(12), oa3);
-                stream_zmm_as_xmm4(bp, ob0);
-                stream_zmm_as_xmm4(bp.add(4), ob1);
-                stream_zmm_as_xmm4(bp.add(8), ob2);
-                stream_zmm_as_xmm4(bp.add(12), ob3);
+                stream_zmm_aligned64(ap, oa0);
+                stream_zmm_aligned64(ap.add(4), oa1);
+                stream_zmm_aligned64(ap.add(8), oa2);
+                stream_zmm_aligned64(ap.add(12), oa3);
+                stream_zmm_aligned64(bp, ob0);
+                stream_zmm_aligned64(bp.add(4), ob1);
+                stream_zmm_aligned64(bp.add(8), ob2);
+                stream_zmm_aligned64(bp.add(12), ob3);
             } else {
                 _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
                 _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
@@ -1224,32 +1231,18 @@ unsafe fn fold16_to_4_deferred(
     }
 }
 
-/// Store one ZMM as four XMM non-temporal quarters. Large pool allocations
-/// land 16 mod 64, so a 64-byte-aligned ZMM stream is unreachable; `F128`
-/// is `repr(C, align(16))`, so every `Vec<F128>` base — and every F128
-/// element offset from it — is 16-byte aligned by the allocation layout
-/// (a language guarantee, not malloc folklore).
+/// Store one ZMM with a single aligned non-temporal write.
 ///
 /// # Safety
-/// `p` must be 16-byte aligned and cover 4 F128s; avx512f is required (the
+/// `p` must be 64-byte aligned and cover 4 F128s; avx512f is required (the
 /// module gate supplies it, and the explicit cfg keeps that visible here).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
-unsafe fn stream_zmm_as_xmm4(p: *mut F128, v: core::arch::x86_64::__m512i) {
+unsafe fn stream_zmm_aligned64(p: *mut F128, v: core::arch::x86_64::__m512i) {
     use core::arch::x86_64::*;
-    // SAFETY: alignment per the contract; features per the cfg above. At
-    // 64-alignment (the allocator's recyclable class on this lineage) one
-    // single-uop ZMM stream publishes the whole line.
+    // SAFETY: alignment per the contract; features per the cfg above.
     unsafe {
-        if p as usize % 64 == 0 {
-            _mm512_stream_si512(p as *mut __m512i, v);
-            return;
-        }
-        let d = p as *mut __m128i;
-        _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
-        _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
-        _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
-        _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        _mm512_stream_si512(p as *mut __m512i, v);
     }
 }
 
@@ -1326,6 +1319,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     debug_assert_eq!(a_out.len(), 2 * lo_size);
     debug_assert_eq!(b_out.len(), 2 * lo_size);
     debug_assert!(lo_size.is_multiple_of(2));
+
+    // Resolve the ZMM stream-store alignment once per worker chunk. Every
+    // vectorized tile advances by sixteen F128s (256 bytes), so aligned slice
+    // bases keep all of the tile's stores aligned. Direct callers with merely
+    // F128 alignment retain the unaligned temporal-store path.
+    let nt_out = nt_out
+        && ((a_out.as_ptr() as usize | b_out.as_ptr() as usize) & 63 == 0);
 
     #[inline(always)]
     unsafe fn fold_regs(
@@ -1676,14 +1676,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             // the shapes the caller gates `nt_out` on. NT stores skip the
             // write-allocate RFO (~512 MiB/proof at the ranked shape).
             if nt_out {
-                stream_zmm_as_xmm4(ap, oa0);
-                stream_zmm_as_xmm4(ap.add(4), oa1);
-                stream_zmm_as_xmm4(ap.add(8), oa2);
-                stream_zmm_as_xmm4(ap.add(12), oa3);
-                stream_zmm_as_xmm4(bp, ob0);
-                stream_zmm_as_xmm4(bp.add(4), ob1);
-                stream_zmm_as_xmm4(bp.add(8), ob2);
-                stream_zmm_as_xmm4(bp.add(12), ob3);
+                stream_zmm_aligned64(ap, oa0);
+                stream_zmm_aligned64(ap.add(4), oa1);
+                stream_zmm_aligned64(ap.add(8), oa2);
+                stream_zmm_aligned64(ap.add(12), oa3);
+                stream_zmm_aligned64(bp, ob0);
+                stream_zmm_aligned64(bp.add(4), ob1);
+                stream_zmm_aligned64(bp.add(8), ob2);
+                stream_zmm_aligned64(bp.add(12), ob3);
             } else {
                 _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
                 _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
