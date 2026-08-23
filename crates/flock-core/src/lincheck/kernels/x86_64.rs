@@ -303,12 +303,33 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
 }
 
+/// `FLOCK_NO_LC_GFNI_PLANE2=1` restores the one-plane-at-a-time inner
+/// loop of [`gfni_fold_tile`]. Default ON folds two independent planes
+/// while the eight stripe rows stay live (same 8 affine + 4 ternlog per
+/// plane, more ILP). Resolved once per process, outside every tile.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_gfni_plane2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GFNI_PLANE2").is_none());
+    *ON
+}
+
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
 /// `seed_zero` replaces the first-tile `_mm512_loadu_si512` of a known-zero
 /// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
 /// later tiles still `loadu` the running acc. Bit-identical to loadu-of-zeros.
+///
+/// Default body walks planes in pairs so two accumulators share the eight
+/// live stripe rows. XOR of disjoint planes commutes, so the pair order
+/// does not change any byte. `FLOCK_NO_LC_GFNI_PLANE2=1` restores the
+/// single-plane loop. Not an extra monomorph of the whole tile (`n_blocks64`
+/// copies of this function lost −0.55%).
 ///
 /// # Safety
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
@@ -328,8 +349,52 @@ pub(crate) unsafe fn gfni_fold_tile(
     out_planes_ptr: *mut u8,
     seed_zero: bool,
 ) {
+    // SAFETY: caller upholds the pointer/length contract above. Dispatch is
+    // once per tile, not per plane: both copies are the same XOR terms.
+    unsafe {
+        if lc_gfni_plane2_enabled() {
+            gfni_fold_tile_plane2(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            );
+        } else {
+            gfni_fold_tile_plane1(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            );
+        }
+    }
+}
+
+/// Incumbent one-plane inner loop. Kill-switch / oracle twin of
+/// [`gfni_fold_tile_plane2`].
+///
+/// # Safety
+/// As for [`gfni_fold_tile`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_plane1(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
     use core::arch::x86_64::*;
-    // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
         for block in 0..n_blocks64 {
             let bs = block * 64;
@@ -359,6 +424,79 @@ pub(crate) unsafe fn gfni_fold_tile(
                     acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
                 }
                 _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
+/// Two-plane twin: byte_k and byte_k+1 share the eight live stripe rows.
+/// Same affine/ternlog count per plane; two independent accs.
+///
+/// # Safety
+/// As for [`gfni_fold_tile`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_plane2(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        for block in 0..n_blocks64 {
+            let bs = block * 64;
+            let mut rows = [_mm512_setzero_si512(); 8];
+            for (t, row) in rows.iter_mut().enumerate() {
+                *row = _mm512_loadu_si512(
+                    tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i
+                );
+            }
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in (0..16).step_by(2) {
+                let p0 = planes.add(byte_k * 64) as *mut __m512i;
+                let p1 = planes.add((byte_k + 1) * 64) as *mut __m512i;
+                let mut a0 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(p0 as *const __m512i)
+                };
+                let mut a1 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(p1 as *const __m512i)
+                };
+                for t in (0..8).step_by(2) {
+                    let r0 = rows[t];
+                    let r1 = rows[t + 1];
+                    let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r0,
+                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                    );
+                    let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r1,
+                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                    );
+                    a0 = _mm512_ternarylogic_epi64::<0x96>(a0, g00, g10);
+                    let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r0,
+                        _mm512_set1_epi64(mats[t * 16 + byte_k + 1] as i64),
+                    );
+                    let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r1,
+                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k + 1] as i64),
+                    );
+                    a1 = _mm512_ternarylogic_epi64::<0x96>(a1, g01, g11);
+                }
+                _mm512_storeu_si512(p0, a0);
+                _mm512_storeu_si512(p1, a1);
             }
         }
     }
