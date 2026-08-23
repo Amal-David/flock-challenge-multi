@@ -38,7 +38,9 @@
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+use crate::field::gf2_128::x86_64::{
+    WideGhashX4, f128x4_loadu, f128x4_set, f128x4_xor, ghash_mul_x4,
+};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
@@ -822,12 +824,16 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                         b_chunk[x1l] = b1[lane];
                     }
 
-                    let a1x4 = f128x4_loadu(a1.as_ptr());
-                    let b1x4 = f128x4_loadu(b1.as_ptr());
-                    let a_sum_x4 =
-                        f128x4_set(a0[0] + a1[0], a0[1] + a1[1], a0[2] + a1[2], a0[3] + a1[3]);
-                    let b_sum_x4 =
-                        f128x4_set(b0[0] + b1[0], b0[1] + b1[1], b0[2] + b1[2], b0[3] + b1[3]);
+                    // q-form: pack the four folded pairs in the vector file
+                    // and XOR-sum there. `f128x4_set` inserts XMM lanes
+                    // (no GPR pin); sums are `a0⊕a1` in ZMM, not four
+                    // scalar adds then `_mm512_set_epi64`.
+                    let a0x4 = f128x4_set(a0[0], a0[1], a0[2], a0[3]);
+                    let a1x4 = f128x4_set(a1[0], a1[1], a1[2], a1[3]);
+                    let b0x4 = f128x4_set(b0[0], b0[1], b0[2], b0[3]);
+                    let b1x4 = f128x4_set(b1[0], b1[1], b1[2], b1[3]);
+                    let a_sum_x4 = f128x4_xor(a0x4, a1x4);
+                    let b_sum_x4 = f128x4_xor(b0x4, b1x4);
                     let g1x4 = ghash_mul_x4(a1x4, b1x4);
                     let g_inf_x4 = ghash_mul_x4(a_sum_x4, b_sum_x4);
                     let eqx4 = f128x4_loadu(eq_lo[x_lo..].as_ptr());

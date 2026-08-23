@@ -461,17 +461,26 @@ pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
 #[inline]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
-    // Pure register assembly; avx512f cfg-gated.
-    _mm512_set_epi64(
-        d.hi as i64,
-        d.lo as i64,
-        c.hi as i64,
-        c.lo as i64,
-        b.hi as i64,
-        b.lo as i64,
-        a.hi as i64,
-        a.lo as i64,
-    )
+    // Insert 128-bit lanes from XMM, matching the aarch64 q-form leaf
+    // (keep field elements in the vector file; do not pin through GPRs).
+    // F128 is repr(C, align(16)) {lo, hi}, the same layout as __m128i.
+    let mut z = _mm512_castsi128_si512(core::mem::transmute::<F128, __m128i>(a));
+    z = _mm512_inserti32x4::<1>(z, core::mem::transmute::<F128, __m128i>(b));
+    z = _mm512_inserti32x4::<2>(z, core::mem::transmute::<F128, __m128i>(c));
+    z = _mm512_inserti32x4::<3>(z, core::mem::transmute::<F128, __m128i>(d));
+    z
+}
+
+/// Lane-wise XOR of two 4-lane packs. Characteristic-two sum without
+/// extracting to GPRs.
+///
+/// # Safety
+/// Requires `avx512f`, as guaranteed by the cfg gate.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn f128x4_xor(x: __m512i, y: __m512i) -> __m512i {
+    _mm512_xor_si512(x, y)
 }
 
 /// XOR the four 128-bit lanes of `v` into a single `__m128i`.
