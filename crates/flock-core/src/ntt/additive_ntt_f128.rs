@@ -1537,11 +1537,11 @@ impl AdditiveNttF128 {
                 }
                 // Layers layer..layer+4: fused-four on rows {4i + j}, i.e.
                 // sixteenth = 4 in staging-row units, r' = j.
-                let tw = &tw4[block];
+                let tw = unsafe { kernels::butterfly_fused_4layer_prepare(&tw4[block]) };
                 for j in 0..4 {
                     // The incumbent fused-four row group is r' = r + j·S.
                     let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(buf.as_mut_ptr(), 4, row_len, lanes4, j, tw);
+                    kernels::butterfly_fused_4layer_row(buf.as_mut_ptr(), 4, row_len, lanes4, j, &tw);
                 }
                 // Layers layer+4, layer+5: fused-two on quads {4m..4m+4};
                 // block index at layer+4 is block·16 + m.
@@ -1835,7 +1835,7 @@ impl AdditiveNttF128 {
                 // Layers 3..9 per block, in the staging block.
                 for block in 0..8 {
                     let region = bufp.add(block * 64 * row_len);
-                    let tw = &tw4[block];
+                    let tw = unsafe { kernels::butterfly_fused_4layer_prepare(&tw4[block]) };
                     for j in 0..4 {
                         let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
                         kernels::butterfly_fused_4layer_row(
@@ -1844,7 +1844,7 @@ impl AdditiveNttF128 {
                             row_len,
                             lanes4,
                             0,
-                            tw,
+                            &tw,
                         );
                     }
                     for m in 0..16 {
@@ -3227,6 +3227,7 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
     // `{i*sixteenth + r : i ∈ 0..16}`, so concurrent writes never alias.
     let base = block.as_mut_ptr() as usize;
+    let tw = unsafe { kernels::butterfly_fused_4layer_prepare(t) };
     if sixteenth < PARALLEL_ROW_THRESHOLD {
         for r in 0..sixteenth {
             // SAFETY: row group r writes disjoint rows of this block.
@@ -3237,7 +3238,7 @@ fn butterfly_interleaved_fused_4layer_par_rows(
                     num_ntts,
                     row_lanes(r, num_ntts, odd_tail),
                     r,
-                    t,
+                    &tw,
                 )
             };
         }
@@ -3251,7 +3252,7 @@ fn butterfly_interleaved_fused_4layer_par_rows(
                     num_ntts,
                     row_lanes(r, num_ntts, odd_tail),
                     r,
-                    t,
+                    &tw,
                 )
             };
         });
@@ -3273,6 +3274,7 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    let tw = unsafe { kernels::butterfly_fused_4layer_prepare(t) };
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line
@@ -3286,11 +3288,11 @@ fn butterfly_interleaved_fused_4layer_rows(
                 kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
             } else if hint == 1 {
                 kernels::butterfly_fused_4layer_row_pf::<1>(
-                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                    base, sixteenth, num_ntts, lanes, r, &tw, r + 1,
                 )
             } else {
                 kernels::butterfly_fused_4layer_row_pf::<2>(
-                    base, sixteenth, num_ntts, lanes, r, t, r + 1,
+                    base, sixteenth, num_ntts, lanes, r, &tw, r + 1,
                 )
             }
         };
@@ -3401,6 +3403,7 @@ mod tests {
                             // group r; groups run sequentially; pf_r stays
                             // inside the block.
                             unsafe {
+                                let twx = unsafe { kernels::butterfly_fused_4layer_prepare(&tw) };
                                 match hint {
                                     0 => kernels::butterfly_fused_4layer_row(
                                         data.as_mut_ptr(),
@@ -3408,7 +3411,7 @@ mod tests {
                                         NN,
                                         lanes,
                                         r,
-                                        &tw,
+                                        &twx,
                                     ),
                                     1 => kernels::butterfly_fused_4layer_row_pf::<1>(
                                         data.as_mut_ptr(),
@@ -3416,7 +3419,7 @@ mod tests {
                                         NN,
                                         lanes,
                                         r,
-                                        &tw,
+                                        &twx,
                                         (r + 1) % sixteenth,
                                     ),
                                     _ => kernels::butterfly_fused_4layer_row_pf::<2>(
@@ -3425,7 +3428,7 @@ mod tests {
                                         NN,
                                         lanes,
                                         r,
-                                        &tw,
+                                        &twx,
                                         (r + 1) % sixteenth,
                                     ),
                                 }
