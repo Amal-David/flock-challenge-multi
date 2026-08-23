@@ -529,32 +529,33 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // ~20 ms open instead of inside the measured publish tail. Tens of µs of
     // work; the fingerprint gate in `proof_io` makes a stale or missing
     // stash fall back to the incumbent full encode, byte-identically.
-    let stash = if crate::proof_io::pre_encode_enabled() {
-        let commitment_c = commitment.clone();
-        let zc_c = zc_proof.clone();
-        let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
-            crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
-        }))
-    } else {
-        None
-    };
-    let pcs_open = open_claims_with_precomputed_ligerito(
-        z_packed,
-        &prover_data,
-        &commitment,
-        &[ab.clone(), c.clone()],
-        &[pre_ab, pre_c],
-        &padding,
-        &lig_config,
-        challenger,
-    );
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
-    }
+    let pcs_open = std::thread::scope(|scope| {
+        let stash = crate::proof_io::pre_encode_enabled().then(|| {
+            scope.spawn(|| {
+                crate::proof_io::stash_pre_encoded_prefix(
+                    &commitment,
+                    &zc_proof,
+                    &lc_proof,
+                );
+            })
+        });
+        let pcs_open = open_claims_with_precomputed_ligerito(
+            z_packed,
+            &prover_data,
+            &commitment,
+            &[ab.clone(), c.clone()],
+            &[pre_ab, pre_c],
+            &padding,
+            &lig_config,
+            challenger,
+        );
+        if let Some(handle) = stash {
+            // Finished long ago (µs vs the ~20 ms open); joining before the
+            // scope exits preserves the publish-before-consume ordering.
+            let _ = handle.join();
+        }
+        pcs_open
+    });
     flock_core::gaptime::mark("open: returned");
 
     let proof = R1csProofLigerito {
