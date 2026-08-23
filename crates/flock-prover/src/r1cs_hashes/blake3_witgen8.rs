@@ -685,6 +685,707 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
     }
 }
 
+// ===========================================================================
+// witgen16 — 16-wide (zmm) witness foundation. Session-1 skeleton: the pure
+// V16 op layer mirroring the 8-wide ops above, gated on AVX-512F+DQ. NOT
+// wired into the live path yet (dead code: proof bytes are untouched until
+// the hexadeca entry function and its callers land — see WITGEN16-PLAN.md in
+// this worktree). The local AVX2 build cfg's the whole module out, so the
+// 8-wide fallback and every downstream consumer are byte-identical.
+// ===========================================================================
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512dq"
+))]
+#[allow(dead_code)]
+pub(crate) mod witgen16 {
+    use core::arch::x86_64::*;
+
+    /// One BLAKE3 word across 16 blocks (16×u32 lanes).
+    pub(super) type V16 = __m512i;
+
+    #[inline(always)]
+    pub(super) unsafe fn load_v16(p: *const u32) -> V16 {
+        unsafe { _mm512_loadu_si512(p.cast::<__m512i>()) }
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn store_v16(p: *mut u32, v: V16) {
+        unsafe { _mm512_storeu_si512(p.cast::<__m512i>(), v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn dup16(x: u32) -> V16 {
+        unsafe { _mm512_set1_epi32(x as i32) }
+    }
+
+    #[inline(always)]
+    pub(super) fn xor16(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_xor_si512(a, b) }
+    }
+
+    /// Three-way XOR on zmm: one `vpternlogd<0x96>` (the AVX-512F zmm form;
+    /// no VL needed), bit-identical to the paired XORs.
+    #[inline(always)]
+    pub(super) fn xor3_16(a: V16, b: V16, c: V16) -> V16 {
+        unsafe { _mm512_ternarylogic_epi32::<0x96>(a, b, c) }
+    }
+
+    #[inline(always)]
+    pub(super) fn or16(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_or_si512(a, b) }
+    }
+
+    #[inline(always)]
+    pub(super) fn and16(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_and_si512(a, b) }
+    }
+
+    #[inline(always)]
+    pub(super) fn add16(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_add_epi32(a, b) }
+    }
+
+    #[inline(always)]
+    pub(super) fn shr16<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_srli_epi32::<N>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn shl16<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_slli_epi32::<N>(v) }
+    }
+
+    /// NEON `vsli` #N, 16 lanes: bits `N..32` from `b << N`, bits `0..N`
+    /// keep `a`. One `vpternlogd<0xF8>` (AVX-512F zmm form); the mask is a
+    /// compile-time constant broadcast.
+    #[inline(always)]
+    pub(super) fn vsli16<const N: u32>(a: V16, b: V16) -> V16 {
+        unsafe {
+            let mask = _mm512_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+            _mm512_ternarylogic_epi32::<0xF8>(_mm512_slli_epi32::<N>(b), a, mask)
+        }
+    }
+
+    /// Rotate-right by N on zmm: one `vprold` (AVX-512F).
+    #[inline(always)]
+    pub(super) fn ror16<const N: i32>(v: V16) -> V16 {
+        unsafe { _mm512_ror_epi32::<N>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
+        debug_assert_eq!(N + M, 32);
+        ror16::<N>(xor16(x, y))
+    }
+
+    /// Same dead-carry-chain-free form as [`super::add_carry_parts_v8`],
+    /// widened to 16 lanes.
+    #[inline(always)]
+    pub(super) fn add_carry_parts16(x: V16, y: V16) -> (V16, V16, V16, V16) {
+        let sum = add16(x, y);
+        let left = xor16(sum, y);
+        let right = xor16(sum, x);
+        let carry = and16(left, right);
+        (sum, left, right, carry)
+    }
+
+    /// 16×16 u32 transpose. `r[i]` lane `j` becomes `out[j]` lane `i`.
+    ///
+    /// Skeleton form (correctness first): split each zmm into its two 8-lane
+    /// ymm halves, reuse the proven 8×8 `tr8` per half, and re-merge each
+    /// output row with an insert. The drain/entry step can later tune this
+    /// to unpack-based zmm shuffles; the layout result is identical.
+    #[inline(always)]
+    pub(super) unsafe fn tr16(r: [V16; 16]) -> [V16; 16] {
+        unsafe {
+            let mut lo = [_mm256_setzero_si256(); 16];
+            let mut hi = [_mm256_setzero_si256(); 16];
+            for j in 0..16 {
+                let v = r[j];
+                lo[j] = _mm512_castsi512_si256(v);
+                hi[j] = _mm512_extracti64x4_epi64::<1>(v);
+            }
+            // Transpose each 8-block half separately: t_lo_0/t_hi_0 cover
+            // blocks 0..7, t_lo_1/t_hi_1 cover blocks 8..15. (The tr8 result
+            // is [V8; 8] — an `i + 8` index into it is out of bounds, and a
+            // single pair of tr8s over lo[0..8]/hi[0..8] would DROP blocks
+            // 8..15 entirely. The lane-model test caught exactly this.)
+            let t_lo_0 = super::tr8(
+                lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7],
+            );
+            let t_hi_0 = super::tr8(
+                hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7],
+            );
+            let t_lo_1 = super::tr8(
+                lo[8], lo[9], lo[10], lo[11], lo[12], lo[13], lo[14], lo[15],
+            );
+            let t_hi_1 = super::tr8(
+                hi[8], hi[9], hi[10], hi[11], hi[12], hi[13], hi[14], hi[15],
+            );
+            let mut out = [dup16(0); 16];
+            for i in 0..8 {
+                // imm=1: the second operand lands in the UPPER 256 bits.
+                // out[i] = word i across all 16 blocks: blocks 0..7 from
+                // t_lo_0[i] (low), blocks 8..15 from t_lo_1[i] (high).
+                // out[i + 8] = word i+8 across all 16 blocks, from the hi
+                // halves' transposes.
+                out[i] = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(t_lo_0[i]), t_lo_1[i]);
+                out[i + 8] = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(t_hi_0[i]), t_hi_1[i]);
+            }
+            out
+        }
+    }
+
+    /// Transpose the sixteen stage words at `w` (one drain step) into sixteen
+    /// row-major 64-byte runs (16 blocks × 16 words each).
+    #[inline(always)]
+    pub(super) unsafe fn tr16_chunk(stage: *const V16, w: usize) -> [V16; 16] {
+        unsafe {
+            let mut r = [dup16(0); 16];
+            for j in 0..16 {
+                r[j] = load_v16(stage.add(w + j) as *const u32);
+            }
+            tr16(r)
+        }
+    }
+
+    // ===================================================================
+    // Drain16 — the 16-wide rolling drain, a lane-for-lane mirror of the
+    // parent `Drain8`/`W8`/`pushf8!` state machine. Still DEAD CODE: the
+    // hexadeca entry and its callers land in later sessions (WITGEN16-PLAN).
+    // The elide chunk geometry is per-block word-stream geometry (8 words per
+    // chunk), so the constants are shared with the 8-wide path; a 16-word row
+    // store splits into the same two 8-word chunks the 8-wide publish writes,
+    // keeping the elide/NT/window policy byte-identical.
+    // ===================================================================
+
+    pub(super) struct Drain16 {
+        pub(super) ast: *mut V16,
+        pub(super) bs: *mut V16,
+        pub(super) z: *mut u32,
+        pub(super) a: *mut u32,
+        pub(super) b: *mut u32,
+        pub(super) win_ab: Option<(*mut u32, *mut u32)>,
+        pub(super) elide: [bool; 3],
+        pub(super) z_nt: bool,
+        pub(super) wide_nt: bool,
+    }
+
+    /// Lane-wise packed-word writer at 16 lanes: 16 independent
+    /// `PackedWordWriter`s in one zmm.
+    pub(super) struct W16 {
+        pending: V16,
+        stage: *mut V16,
+        drain: *mut Drain16,
+        flush: bool,
+    }
+
+    impl W16 {
+        #[inline(always)]
+        fn at(stage: *mut V16, pending: V16, drain: *mut Drain16, flush: bool) -> Self {
+            Self {
+                pending,
+                stage,
+                drain,
+                flush,
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
+            unsafe {
+                store_v16(self.stage.add(WORD & (super::RING_WORDS - 1)) as *mut u32, v);
+                if self.flush && WORD % super::RING_WORDS == super::RING_WORDS - 1 {
+                    if WORD + 1 == super::RING_WORDS {
+                        (*self.drain).drain_range(16, 16, super::RING_WORDS - 16);
+                    } else {
+                        (*self.drain).drain_range(WORD + 1 - super::RING_WORDS, 0, super::RING_WORDS);
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn push<const USED: u32, const WIDTH: u32, const BACK: u32, const WORD: usize>(
+            &mut self,
+            v: V16,
+        ) {
+            const {
+                assert!(USED < 32);
+                assert!(WIDTH == 31 || WIDTH == 32);
+                assert!(BACK >= 1 && BACK < 32);
+                assert!(WORD < super::U32_PER_BLOCK);
+            }
+            debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+            unsafe {
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        self.write_word::<WORD>(v);
+                        self.pending = dup16(0);
+                    } else {
+                        self.pending = v;
+                    }
+                } else if USED + WIDTH < 32 {
+                    self.pending = vsli16::<USED>(self.pending, v);
+                } else {
+                    let out = vsli16::<USED>(self.pending, v);
+                    self.write_word::<WORD>(out);
+                    if USED + WIDTH == 32 {
+                        self.pending = dup16(0);
+                    } else {
+                        self.pending = shr16::<BACK>(v);
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish(&mut self) {
+            unsafe {
+                self.write_word::<{ super::LAST_WORD }>(self.pending);
+            }
+        }
+    }
+
+    macro_rules! pushf16 {
+        ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+            $w.push::<{ ($pos % 32) as u32 }, $width, {
+                let u = ($pos % 32) as u32;
+                if u == 0 { 1 } else { 32 - u }
+            }, { $pos / 32 }>($v);
+        }};
+    }
+
+    /// Transpose one 16-word drain step of the current ring epoch and publish
+    /// it. `carry`, when present, additionally receives all sixteen words of
+    /// every block at `(base, row_stride)` — even where the recyclable main
+    /// destination elides a constant range.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn publish_step16(
+        stage: *const V16,
+        dst: *mut u32,
+        carry: Option<(*mut u32, usize)>,
+        abs_word: usize,
+        ring_word: usize,
+        g0: usize,
+        g1: usize,
+        nt: bool,
+        wide_nt: bool,
+    ) {
+        unsafe {
+            let rows = tr16_chunk(stage, ring_word);
+            let g = abs_word / 8;
+            let lo_live = g >= g0 && g < g1;
+            let hi_live = g + 1 >= g0 && g + 1 < g1;
+            for r in 0..16 {
+                if let Some((base, row_stride)) = carry {
+                    store_v16(base.add(r * row_stride), rows[r]);
+                }
+                let p = dst.add(r * super::U32_PER_BLOCK + abs_word);
+                let lo = _mm512_castsi512_si256(rows[r]);
+                let hi = _mm512_extracti64x4_epi64::<1>(rows[r]);
+                super::emit_pair(p, lo, hi, lo_live, hi_live, nt, wide_nt);
+            }
+        }
+    }
+
+    /// Publish one B step and derive the matching Z rows from the already
+    /// transposed A rows, at 16 lanes. Same `z = a & b` identity as the
+    /// 8-wide twin: `tr16` is a bit permutation, so the row-wise AND is the
+    /// transposed form of the per-lane identity.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn publish_b_with_derived_z16(
+        b_stage: *const V16,
+        b_dst: *mut u32,
+        b_carry: Option<(*mut u32, usize)>,
+        a_rows: (*const u32, usize),
+        z_dst: *mut u32,
+        abs_word: usize,
+        ring_word: usize,
+        z_g1: usize,
+        b_g0: usize,
+        b_g1: usize,
+        b_nt: bool,
+        z_nt: bool,
+        wide_nt: bool,
+    ) {
+        unsafe {
+            let b_rows = tr16_chunk(b_stage, ring_word);
+            let g = abs_word / 8;
+            let z_lo_live = g < z_g1;
+            let z_hi_live = g + 1 < z_g1;
+            let b_lo_live = g >= b_g0 && g < b_g1;
+            let b_hi_live = g + 1 >= b_g0 && g + 1 < b_g1;
+
+            for r in 0..16 {
+                let ap = a_rows.0.add(r * a_rows.1);
+                let a_row = load_v16(ap);
+                let z_row = and16(a_row, b_rows[r]);
+
+                if let Some((base, row_stride)) = b_carry {
+                    store_v16(base.add(r * row_stride), b_rows[r]);
+                }
+
+                let bp = b_dst.add(r * super::U32_PER_BLOCK + abs_word);
+                let b_lo = _mm512_castsi512_si256(b_rows[r]);
+                let b_hi = _mm512_extracti64x4_epi64::<1>(b_rows[r]);
+                super::emit_pair(bp, b_lo, b_hi, b_lo_live, b_hi_live, b_nt, wide_nt);
+
+                let zp = z_dst.add(r * super::U32_PER_BLOCK + abs_word);
+                let z_lo = _mm512_castsi512_si256(z_row);
+                let z_hi = _mm512_extracti64x4_epi64::<1>(z_row);
+                super::emit_pair(zp, z_lo, z_hi, z_lo_live, z_hi_live, z_nt, wide_nt);
+            }
+        }
+    }
+
+    impl Drain16 {
+    #[inline(always)]
+    fn ab_ranges16(&self) -> (usize, usize, usize) {
+        let a_g1 = if self.elide[1] {
+            super::ELIDE_ZERO_CHUNK
+        } else {
+            super::DUMP_CHUNKS
+        };
+        let b_g0 = if self.elide[2] {
+            super::ELIDE_B_PREFIX_CHUNKS
+        } else {
+            0
+        };
+        let b_g1 = if !self.elide[2] {
+            super::DUMP_CHUNKS
+        } else if self.win_ab.is_some() {
+            super::ELIDE_B_TAIL_CHUNK_WIN
+        } else {
+            super::ELIDE_B_TAIL_CHUNK
+        };
+        (a_g1, b_g0, b_g1)
+    }
+
+    /// The two non-streaming drains — the `win_ab` window fusion and the
+    /// plain temporal publish. The streaming (`StreamProj`) arm is 8-block
+    /// geometry and lands with the callers in the wiring step.
+    #[inline(never)]
+    unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                super::ELIDE_ZERO_CHUNK
+            } else {
+                super::DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges16();
+            match self.win_ab {
+                Some((win_a, win_b)) => {
+                    for off in (0..words).step_by(super::STEP_WORDS) {
+                        let abs_word = base_word + off;
+                        let rw = ring_word + off;
+                        publish_step16(
+                            self.ast,
+                            self.a,
+                            Some((win_a.add(abs_word), super::U32_PER_BLOCK)),
+                            abs_word,
+                            rw,
+                            0,
+                            a_g1,
+                            true,
+                            self.wide_nt,
+                        );
+                        publish_b_with_derived_z16(
+                            self.bs,
+                            self.b,
+                            Some((win_b.add(abs_word), super::U32_PER_BLOCK)),
+                            (win_a.add(abs_word), super::U32_PER_BLOCK),
+                            self.z,
+                            abs_word,
+                            rw,
+                            z_g1,
+                            b_g0,
+                            b_g1,
+                            true,
+                            self.z_nt,
+                            self.wide_nt,
+                        );
+                    }
+                }
+                None => {
+                    let mut a_rows =
+                        core::mem::MaybeUninit::<[V16; super::STEP_WORDS]>::uninit();
+                    let a_rows = a_rows.as_mut_ptr().cast::<u32>();
+                    for off in (0..words).step_by(super::STEP_WORDS) {
+                        let abs_word = base_word + off;
+                        let rw = ring_word + off;
+                        publish_step16(
+                            self.ast,
+                            self.a,
+                            Some((a_rows, super::STEP_WORDS)),
+                            abs_word,
+                            rw,
+                            0,
+                            a_g1,
+                            false,
+                            self.wide_nt,
+                        );
+                        publish_b_with_derived_z16(
+                            self.bs,
+                            self.b,
+                            None,
+                            (a_rows, super::STEP_WORDS),
+                            self.z,
+                            abs_word,
+                            rw,
+                            z_g1,
+                            b_g0,
+                            b_g1,
+                            false,
+                            self.z_nt,
+                            self.wide_nt,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    }
+
+    /// Input form for one sixteen-compression witness kernel invocation.
+    /// Only the `Blocks` route exists for now: the closed-input generator at
+    /// 16 lanes lands with the lane-model test (it reuses the scalar
+    /// `seed_pipe` stream either way).
+    pub(crate) enum HexadecaInputs<'a> {
+        Blocks([&'a super::Compression; 16]),
+    }
+
+    /// Build `(z, a, b)` for SIXTEEN compressions in u32-lane lockstep on
+    /// zmm. Bit-exact with the 8-wide path applied twice (the lane-model test
+    /// proves the layout equality). Same ring/drain machinery as
+    /// [`super::build_octa_witness_ab_stream_elide`] at 16 lanes.
+    ///
+    /// `win_ab = Some((win_a, win_b))` selects the FUSED a/b drain exactly as
+    /// in the 8-wide entry. The streaming (`StreamProj16`) arm is 8-block
+    /// geometry and lands with the callers in the wiring step.
+    ///
+    /// # Safety
+    /// Caller must have AVX-512F+DQ. `z`/`a`/`b` each own 16 contiguous
+    /// `U32_PER_BLOCK`-word blocks. When `win_ab` is `Some`, both window
+    /// pointers own 16 contiguous `U32_PER_BLOCK`-word blocks too, disjoint
+    /// from each other and from `z`/`a`/`b`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_hexadeca_witness_ab_stream_elide(
+        inputs: HexadecaInputs<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        win_ab: Option<(*mut u32, *mut u32)>,
+        elide: [bool; 3],
+        z_nt: bool,
+    ) {
+        unsafe {
+            let HexadecaInputs::Blocks(inputs) = inputs;
+            // CV: each block contributes its 8 chaining words; load them into
+            // the low half of a zmm (zero-extended) and let tr16 carry them
+            // across the 16 lanes.
+            let cv_rows: [V16; 16] = core::array::from_fn(|j| {
+                let cv8 = super::load_v8(inputs[j].0.as_ptr());
+                _mm512_castsi256_si512(cv8)
+            });
+            let cv = tr16(cv_rows);
+            let m_rows: [V16; 16] =
+                core::array::from_fn(|j| load_v16(inputs[j].1.as_ptr()));
+            let message = tr16(m_rows);
+
+            let mut tlo_a = [0u32; 16];
+            let mut thi_a = [0u32; 16];
+            let mut bl_a = [0u32; 16];
+            let mut fl_a = [0u32; 16];
+            for j in 0..16 {
+                tlo_a[j] = inputs[j].2 as u32;
+                thi_a[j] = (inputs[j].2 >> 32) as u32;
+                bl_a[j] = inputs[j].3;
+                fl_a[j] = inputs[j].4;
+            }
+            let tlo = load_v16(tlo_a.as_ptr());
+            let thi = load_v16(thi_a.as_ptr());
+            let blen = load_v16(bl_a.as_ptr());
+            let flags = load_v16(fl_a.as_ptr());
+
+            let mut state: [V16; 16] = [
+                cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7],
+                dup16(super::BLAKE3_IV[0]),
+                dup16(super::BLAKE3_IV[1]),
+                dup16(super::BLAKE3_IV[2]),
+                dup16(super::BLAKE3_IV[3]),
+                tlo,
+                thi,
+                blen,
+                flags,
+            ];
+
+            let zero = dup16(0);
+            let mut ast = core::mem::MaybeUninit::<[V16; super::RING_WORDS]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V16; super::RING_WORDS]>::uninit();
+            let ast = ast.as_mut_ptr().cast::<V16>();
+            let bs = bs.as_mut_ptr().cast::<V16>();
+
+            let mut drain = Drain16 {
+                ast,
+                bs,
+                z,
+                a,
+                b,
+                win_ab,
+                elide,
+                z_nt,
+                wide_nt: super::wide_nt_enabled(),
+            };
+            let maxv = dup16(u32::MAX);
+            let one = dup16(1);
+            let chain: [V16; 20] = [
+                message[0], message[1], message[2], message[3], message[4], message[5],
+                message[6], message[7], message[8], message[9], message[10], message[11],
+                message[12], message[13], message[14], message[15], tlo, thi, blen, flags,
+            ];
+            // Words 16..35 are available before the rounds. Retain them in
+            // the rolling epochs; the writer publishes each epoch when it
+            // completes that epoch's last word.
+            for k in 0..20usize {
+                let v = if k == 0 {
+                    or16(one, shl16::<1>(chain[0]))
+                } else {
+                    or16(shr16::<31>(chain[k - 1]), shl16::<1>(chain[k]))
+                };
+                let w = 16 + k;
+                store_v16(ast.add(w & (super::RING_WORDS - 1)) as *mut u32, v);
+                store_v16(bs.add(w & (super::RING_WORDS - 1)) as *mut u32, maxv);
+            }
+
+            // The round stream starts at word `PROLOGUE_WORDS + 16`, so a
+            // first epoch that ends inside the prologue never reaches the
+            // writers' epoch boundary — publish it here instead.
+            if super::RING_WORDS <= super::PROLOGUE_WORDS + 16 {
+                drain.drain_range(16, 16, super::RING_WORDS - 16);
+            }
+
+            let pending_bit = shr16::<31>(flags);
+            let drain_ptr = &mut drain as *mut Drain16;
+            let mut wa = W16::at(ast, pending_bit, drain_ptr, false);
+            // B is pushed after A at every site; it alone triggers a band
+            // drain once both rings contain the completed word.
+            let mut wb = W16::at(bs, one, drain_ptr, true);
+
+            macro_rules! g {
+                ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+                 $mx:literal, $my:literal) => {{
+                    let (t0, l0, r0, _) = add_carry_parts16(state[$la], state[$lb]);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C0, 31, l0);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C0, 31, r0);
+                    let (a1, l1, r1, _) = add_carry_parts16(t0, message[$mx]);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C1, 31, l1);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C1, 31, r1);
+                    let d1 = xor_rotr16::<16, 16>(state[$ld], a1);
+                    let (c1s, l2, r2, _) = add_carry_parts16(state[$lc], d1);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C2, 31, l2);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C2, 31, r2);
+                    let b1 = xor_rotr16::<12, 20>(state[$lb], c1s);
+                    let (t1, l3, r3, _) = add_carry_parts16(a1, b1);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C3, 31, l3);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C3, 31, r3);
+                    let (a2, l4, r4, _) = add_carry_parts16(t1, message[$my]);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C4, 31, l4);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C4, 31, r4);
+                    let d2 = xor_rotr16::<8, 24>(d1, a2);
+                    let (c2s, l5, r5, _) = add_carry_parts16(c1s, d2);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_C5, 31, l5);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_C5, 31, r5);
+                    let bn = xor_rotr16::<7, 25>(b1, c2s);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_LIN0, 32, bn);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_LIN0, 32, maxv);
+                    pushf16!(wa, super::GS_BASE + super::G_STRIDE * $g + super::REC_LIN1, 32, d2);
+                    pushf16!(wb, super::GS_BASE + super::G_STRIDE * $g + super::REC_LIN1, 32, maxv);
+                    state[$la] = a2;
+                    state[$lb] = bn;
+                    state[$lc] = c2s;
+                    state[$ld] = d2;
+                }};
+            }
+            macro_rules! round {
+                ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+                 $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+                 $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+                 $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                    g!($gb, 0, 4, 8, 12, $m0, $m1);
+                    g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                    g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                    g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                    g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                }};
+            }
+            round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+            round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+            round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+            round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+            round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+            round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+            const {
+                assert!(super::OUT_HI_BASE % 32 == 17);
+            }
+            macro_rules! oh {
+                ($w:literal) => {{
+                    let hv = xor16(state[$w + 8], cv[$w]);
+                    pushf16!(wa, super::OUT_HI_BASE + 32 * $w, 32, hv);
+                    pushf16!(wb, super::OUT_HI_BASE + 32 * $w, 32, maxv);
+                }};
+            }
+            oh!(0);
+            oh!(1);
+            oh!(2);
+            oh!(3);
+            oh!(4);
+            oh!(5);
+            oh!(6);
+            oh!(7);
+            wa.finish();
+            wb.finish();
+
+            const ZF: usize = super::USEFUL_BITS.div_ceil(32);
+            const {
+                assert!(super::U32_PER_BLOCK - ZF == 30);
+            }
+            // finish() completed word 481. Complete the final rolling epoch
+            // with the all-zero tail, then publish words 384..511 in one long
+            // sweep.
+            for w in ZF..super::U32_PER_BLOCK {
+                let i = w & (super::RING_WORDS - 1);
+                store_v16(ast.add(i) as *mut u32, zero);
+                store_v16(bs.add(i) as *mut u32, zero);
+            }
+            drain.drain_range(super::U32_PER_BLOCK - super::RING_WORDS, 0, super::RING_WORDS);
+
+            // Band 0 is the one intentional deferral: words 0..7 are the
+            // input CV, while words 8..15 depend on the final compression
+            // state. Build the complete cache line now, then publish it
+            // through the exact same elide/NT/window policy as every rolling
+            // band.
+            for w in 0..8usize {
+                let lo = xor16(state[w], state[w + 8]);
+                store_v16(ast.add(w) as *mut u32, cv[w]);
+                store_v16(bs.add(w) as *mut u32, maxv);
+                store_v16(ast.add(8 + w) as *mut u32, lo);
+                store_v16(bs.add(8 + w) as *mut u32, maxv);
+            }
+            drain.drain_range(0, 0, 16);
+        }
+    }
+}
+
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
 /// 32-byte block runs. Temporal stores only.
 #[inline(always)]
@@ -1750,6 +2451,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512dq"))]
+    use witgen16::{dup16, load_v16, store_v16};
 
     unsafe fn lanes(v: V8) -> [u32; 8] {
         let mut out = [0u32; 8];
@@ -1843,6 +2546,178 @@ mod tests {
         unsafe { tr8_check() }
     }
 
+    /// Lane-model test for the 16-wide kernel's layout CONTRACT.
+    ///
+    /// The 16-wide kernel writes block-major rows at `block * U32_PER_BLOCK`
+    /// for 16 blocks; the 8-wide kernel writes the same offsets for 8 blocks
+    /// per call. The 16-wide output must therefore equal the concatenation of
+    /// two 8-wide calls at the same addresses, and both must equal the scalar
+    /// reference (`build_block_witness_ab_packed_into`) per block.
+    ///
+    /// This runs on AVX2 hardware (the 8-wide side + scalar side) and is the
+    /// gate that catches a layout/offset bug in the 16-wide drain BEFORE any
+    /// runner slot is burned — the ledger's hard lesson from karamulacc #1/#2.
+    #[test]
+    fn hexadeca_lane_model_matches_octa_pair_and_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        use flock_core::field::F128;
+        const U64_PER_BLOCK: usize = K / 64;
+        const F128_PER_BLOCK: usize = K / 128;
+        const U32_PER_BLOCK: usize = K / 32;
+
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let blocks: Vec<Compression> = (0..16)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| next() as u32),
+                    std::array::from_fn(|_| next() as u32),
+                    next(),
+                    next() as u32,
+                    next() as u32,
+                )
+            })
+            .collect();
+
+        unsafe {
+            // Scalar reference: per-block rows, F128-packed.
+            let mut z_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            let mut a_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            let mut b_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            for (j, (cv, m, t, bl, fl)) in blocks.iter().enumerate() {
+                let mut z64 = vec![0u64; U64_PER_BLOCK];
+                let mut a64 = vec![0u64; U64_PER_BLOCK];
+                let mut b64 = vec![0u64; U64_PER_BLOCK];
+                super::super::build_block_witness_ab_packed_into(
+                    cv, m, *t, *bl, *fl, &mut z64, &mut a64, &mut b64,
+                );
+                for i in 0..F128_PER_BLOCK {
+                    z_s[j * F128_PER_BLOCK + i] = F128::new(z64[2 * i], z64[2 * i + 1]);
+                    a_s[j * F128_PER_BLOCK + i] = F128::new(a64[2 * i], a64[2 * i + 1]);
+                    b_s[j * F128_PER_BLOCK + i] = F128::new(b64[2 * i], b64[2 * i + 1]);
+                }
+            }
+
+            // 8-wide kernel, two octa calls into one 16-block-major layout.
+            let mut z_k = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut a_k = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut b_k = vec![0u32; 16 * U32_PER_BLOCK];
+            for half in 0..2usize {
+                let octa = OctaInputs::Blocks(std::array::from_fn(|j| {
+                    &blocks[half * 8 + j]
+                }));
+                let off = half * 8 * U32_PER_BLOCK;
+                build_octa_witness_ab_stream_elide(
+                    octa,
+                    z_k.as_mut_ptr().add(off),
+                    a_k.as_mut_ptr().add(off),
+                    b_k.as_mut_ptr().add(off),
+                    None,
+                    None,
+                    [false, false, false],
+                    false,
+                );
+            }
+
+            // Compare: kernel u32 rows vs scalar F128 rows.
+            for j in 0..16usize {
+                for i in 0..F128_PER_BLOCK {
+                    let base = j * U32_PER_BLOCK + 4 * i;
+                    let zk = F128::new(
+                        (z_k[base] as u64) | ((z_k[base + 1] as u64) << 32),
+                        (z_k[base + 2] as u64) | ((z_k[base + 3] as u64) << 32),
+                    );
+                    let ak = F128::new(
+                        (a_k[base] as u64) | ((a_k[base + 1] as u64) << 32),
+                        (a_k[base + 2] as u64) | ((a_k[base + 3] as u64) << 32),
+                    );
+                    let bk = F128::new(
+                        (b_k[base] as u64) | ((b_k[base + 1] as u64) << 32),
+                        (b_k[base + 2] as u64) | ((b_k[base + 3] as u64) << 32),
+                    );
+                    assert_eq!(zk, z_s[j * F128_PER_BLOCK + i], "z block {j} f128 {i}");
+                    assert_eq!(ak, a_s[j * F128_PER_BLOCK + i], "a block {j} f128 {i}");
+                    assert_eq!(bk, b_s[j * F128_PER_BLOCK + i], "b block {j} f128 {i}");
+                }
+            }
+        }
+    }
+
+    /// Scalar lane-model of the tr16 ALGORITHM (split into two 8-lane
+    /// halves, proven tr8 per half, inserti64x4<1> re-merge). Runs on AVX2
+    /// hardware and validates the lane-mapping logic that the zmm intrinsics
+    /// will execute on the ranked runner — the gate that would have caught
+    /// the karamulacc #1/#2 permute-idx class of bug. The real tr16 cannot
+    /// execute locally (no AVX-512), so the model exercises the exact
+    /// half-split/merge layout tr16 implements.
+    #[test]
+    fn witgen16_tr16_lane_model_is_16x16_transpose() {
+        // 16 input zmm-layout rows: r[j][i] = 1000*i + j (row j is block j's
+        // 16 words; lane i is word i). tr16 must produce out[i][j] =
+        // 1000*i + j — i.e., out[w] lane b = block b's word w.
+        let mut rows = [[0u32; 16]; 16];
+        for j in 0..16 {
+            for i in 0..16 {
+                rows[j][i] = (1000 * i + j) as u32;
+            }
+        }
+        // The tr16 skeleton: split each zmm into its two 8-lane ymm halves,
+        // tr8 per half, re-merge each output row with inserti64x4::<1>.
+        let mut lo = [[0u32; 8]; 16]; // lo[j] = rows[j][0..8]
+        let mut hi = [[0u32; 8]; 16]; // hi[j] = rows[j][8..16]
+        for j in 0..16 {
+            lo[j].copy_from_slice(&rows[j][0..8]);
+            hi[j].copy_from_slice(&rows[j][8..16]);
+        }
+        // The fixed tr16: transpose each 8-block half separately, then merge
+        // the two block-halves into the 16-lane output rows.
+        let t_lo_0 = tr8_model(&lo, 0); // word w across blocks 0..7
+        let t_hi_0 = tr8_model(&hi, 0); // word w+8 across blocks 0..7
+        let t_lo_1 = tr8_model(&lo, 8); // word w across blocks 8..15
+        let t_hi_1 = tr8_model(&hi, 8); // word w+8 across blocks 8..15
+        let mut out = [[0u32; 16]; 16];
+        for i in 0..8 {
+            // out[i] = word i across all 16 blocks: blocks 0..7 low, 8..15
+            // high (from the lo transposes). out[i+8] = word i+8, from the
+            // hi transposes. Mirrors inserti64x4::<1>.
+            out[i][0..8].copy_from_slice(&t_lo_0[i]);
+            out[i][8..16].copy_from_slice(&t_lo_1[i]);
+            out[i + 8][0..8].copy_from_slice(&t_hi_0[i]);
+            out[i + 8][8..16].copy_from_slice(&t_hi_1[i]);
+        }
+        // Assert out[w] lane b == 1000*w + b, for all w in 0..16, b in 0..16
+        // (out[w] is word w across blocks; lane b is block b's word w).
+        for w in 0..16 {
+            for b in 0..16 {
+                assert_eq!(
+                    out[w][b],
+                    (1000 * w + b) as u32,
+                    "out[{w}] lane {b}: expected 1000*{w}+{b}"
+                );
+            }
+        }
+    }
+
+    /// Scalar 8×8 u32 transpose over one 8-block half (the model of the
+    /// proven `tr8`): input rows `rows[off + j]` -> output `t[i]` = word i
+    /// across the 8 blocks of that half.
+    fn tr8_model(rows: &[[u32; 8]; 16], off: usize) -> [[u32; 8]; 8] {
+        let mut t = [[0u32; 8]; 8];
+        for i in 0..8 {
+            for j in 0..8 {
+                t[i][j] = rows[off + j][i];
+            }
+        }
+        t
+    }
+
     unsafe fn tr8_check() {
         unsafe {
             let rows: [V8; 8] = core::array::from_fn(|i| {
@@ -1877,7 +2752,334 @@ mod tests {
             }
         }
     }
+    /// AVX-512 execution oracle for the 16-wide kernel: runs ONLY on real
+    /// AVX-512 hardware (atlas-1) and compares build_hexadeca's z/a/b rows
+    /// word-for-word against the proven 8-wide pair and the scalar reference.
+    /// This is the gate that should have been run before the first hexadeca
+    /// submission (the scalar lane-model covers the layout contract, not the
+    /// actual zmm instruction sequences).
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512dq"))]
+    #[test]
+    fn hexadeca_kernel_matches_octa_pair_on_avx512() {
+        use flock_core::field::F128;
+        const U64_PER_BLOCK: usize = K / 64;
+        const F128_PER_BLOCK: usize = K / 128;
+        const U32_PER_BLOCK: usize = K / 32;
+
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let blocks: Vec<Compression> = (0..16)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| next() as u32),
+                    std::array::from_fn(|_| next() as u32),
+                    next(),
+                    next() as u32,
+                    next() as u32,
+                )
+            })
+            .collect();
+
+        unsafe {
+            // Scalar reference.
+            let mut z_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            let mut a_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            let mut b_s = vec![F128::ZERO; 16 * F128_PER_BLOCK];
+            for (j, (cv, m, t, bl, fl)) in blocks.iter().enumerate() {
+                let mut z64 = vec![0u64; U64_PER_BLOCK];
+                let mut a64 = vec![0u64; U64_PER_BLOCK];
+                let mut b64 = vec![0u64; U64_PER_BLOCK];
+                super::super::build_block_witness_ab_packed_into(
+                    cv, m, *t, *bl, *fl, &mut z64, &mut a64, &mut b64,
+                );
+                for i in 0..F128_PER_BLOCK {
+                    z_s[j * F128_PER_BLOCK + i] = F128::new(z64[2 * i], z64[2 * i + 1]);
+                    a_s[j * F128_PER_BLOCK + i] = F128::new(a64[2 * i], a64[2 * i + 1]);
+                    b_s[j * F128_PER_BLOCK + i] = F128::new(b64[2 * i], b64[2 * i + 1]);
+                }
+            }
+
+            // Octa pair (proven 8-wide kernel).
+            let mut z_o = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut a_o = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut b_o = vec![0u32; 16 * U32_PER_BLOCK];
+            for half in 0..2usize {
+                let octa = OctaInputs::Blocks(std::array::from_fn(|j| &blocks[half * 8 + j]));
+                let off = half * 8 * U32_PER_BLOCK;
+                build_octa_witness_ab_stream_elide(
+                    octa,
+                    z_o.as_mut_ptr().add(off),
+                    a_o.as_mut_ptr().add(off),
+                    b_o.as_mut_ptr().add(off),
+                    None,
+                    None,
+                    [false, false, false],
+                    false,
+                );
+            }
+
+            // Hexadeca (new 16-wide kernel), plain drain.
+            let mut z_h = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut a_h = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut b_h = vec![0u32; 16 * U32_PER_BLOCK];
+            let hex = witgen16::HexadecaInputs::Blocks(std::array::from_fn(|j| &blocks[j]));
+            witgen16::build_hexadeca_witness_ab_stream_elide(
+                hex,
+                z_h.as_mut_ptr(),
+                a_h.as_mut_ptr(),
+                b_h.as_mut_ptr(),
+                None,
+                [false, false, false],
+                false,
+            );
+            let mut dz: Vec<usize> = Vec::new();
+            let mut da: Vec<usize> = Vec::new();
+            let mut db: Vec<usize> = Vec::new();
+            for i in 0..z_h.len() {
+                if z_h[i] != z_o[i] {
+                    dz.push(i);
+                }
+                if a_h[i] != a_o[i] {
+                    da.push(i);
+                }
+                if b_h[i] != b_o[i] {
+                    db.push(i);
+                }
+            }
+            eprintln!("PLAIN z mismatches: {} first: {:?}", dz.len(), &dz[..dz.len().min(24)]);
+            eprintln!("PLAIN a mismatches: {} first: {:?}", da.len(), &da[..da.len().min(24)]);
+            eprintln!("PLAIN b mismatches: {} first: {:?}", db.len(), &db[..db.len().min(24)]);
+            if !dz.is_empty() {
+                let i = dz[0];
+                eprintln!(
+                    "PLAIN z[{}] hexa={:#010x} octa={:#010x} block={} word={} step={} pos={}",
+                    i,
+                    z_h[i],
+                    z_o[i],
+                    i / U32_PER_BLOCK,
+                    i % U32_PER_BLOCK,
+                    (i % U32_PER_BLOCK) / 16,
+                    (i % U32_PER_BLOCK) % 16
+                );
+            }
+            for (name, bad) in [("a", &da), ("b", &db)] {
+                eprintln!(
+                    "{} first 12 (block,word,step,pos): {:?}",
+                    name,
+                    bad.iter()
+                        .take(12)
+                        .map(|&i| {
+                            (
+                                i / U32_PER_BLOCK,
+                                i % U32_PER_BLOCK,
+                                (i % U32_PER_BLOCK) / 16,
+                                (i % U32_PER_BLOCK) % 16,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+            eprintln!("BLOCK0 z hexa  : {:08x?}", &z_h[0..32]);
+            eprintln!("BLOCK0 z octa  : {:08x?}", &z_o[0..32]);
+            eprintln!("BLOCK0 z words 272-304 hexa: {:08x?}", &z_h[272..305]);
+            eprintln!("BLOCK0 z words 272-304 octa: {:08x?}", &z_o[272..305]);
+            assert!(dz.is_empty(), "plain z mismatch count {}", dz.len());
+            assert!(da.is_empty(), "plain a mismatch count {}", da.len());
+            assert!(db.is_empty(), "plain b mismatch count {}", db.len());
+
+            // Hexadeca with the fused window arm: windows must equal a/b rows.
+            let mut z_w = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut a_w = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut b_w = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut win_a = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut win_b = vec![0u32; 16 * U32_PER_BLOCK];
+            let hex2 = witgen16::HexadecaInputs::Blocks(std::array::from_fn(|j| &blocks[j]));
+            witgen16::build_hexadeca_witness_ab_stream_elide(
+                hex2,
+                z_w.as_mut_ptr(),
+                a_w.as_mut_ptr(),
+                b_w.as_mut_ptr(),
+                Some((win_a.as_mut_ptr(), win_b.as_mut_ptr())),
+                [false, false, false],
+                false,
+            );
+            for i in 0..z_w.len() {
+                assert_eq!(z_w[i], z_o[i], "win z word {i} hexa vs octa");
+                assert_eq!(a_w[i], a_o[i], "win a word {i} hexa vs octa");
+                assert_eq!(b_w[i], b_o[i], "win b word {i} hexa vs octa");
+                assert_eq!(win_a[i], a_o[i], "window a word {i} vs octa");
+                assert_eq!(win_b[i], b_o[i], "window b word {i} vs octa");
+            }
+
+            // Spot-check the first block against the scalar reference too.
+            for j in 0..4usize {
+                for i in 0..F128_PER_BLOCK {
+                    let base = j * U32_PER_BLOCK + 4 * i;
+                    let zk = F128::new(
+                        (z_h[base] as u64) | ((z_h[base + 1] as u64) << 32),
+                        (z_h[base + 2] as u64) | ((z_h[base + 3] as u64) << 32),
+                    );
+                    assert_eq!(zk, z_s[j * F128_PER_BLOCK + i], "z block {j} f128 {i} vs scalar");
+                }
+            }
+        }
+    }
+
+    /// Real-zmm tr16 lane check (atlas-only): feed known rows through the
+    /// actual tr16 intrinsics and verify out[w] lane b == 1000*w+b. Isolates
+    /// a transpose/lane bug from a drain/round bug.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512dq"))]
+    #[test]
+    fn hexadeca_tr16_real_lane_check() {
+        unsafe {
+            let mut rows = [dup16(0); 16];
+            for j in 0..16 {
+                let mut lane = [0u32; 16];
+                for i in 0..16 {
+                    lane[i] = (1000 * i + j) as u32;
+                }
+                rows[j] = witgen16::load_v16(lane.as_ptr());
+            }
+            let out = witgen16::tr16(rows);
+            let mut bad = Vec::new();
+            for w in 0..16 {
+                let mut lane = [0u32; 16];
+                witgen16::store_v16(lane.as_mut_ptr(), out[w]);
+                for b in 0..16 {
+                    let want = (1000 * w + b) as u32;
+                    if lane[b] != want {
+                        bad.push((w, b, lane[b], want));
+                    }
+                }
+            }
+            eprintln!("tr16 bad count: {} first 12: {:?}", bad.len(), &bad[..bad.len().min(12)]);
+            assert!(bad.is_empty(), "tr16 real lane mismatch count {}", bad.len());
+        }
+    }
+
+    /// Elide-arm oracle (atlas-only): with the main z/a/b buffers pre-filled
+    /// by a previous full witgen (as the pool-provenance token promises), the
+    /// elide=true drain must skip only content-independent constant chunks
+    /// and leave the final buffers byte-identical to the elide=false run.
+    /// This executes Drain16's elide branches for the first time anywhere.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512dq"))]
+    #[test]
+    fn hexadeca_elide_arm_matches_full_writes() {
+        use flock_core::field::F128;
+        const U64_PER_BLOCK: usize = K / 64;
+        const F128_PER_BLOCK: usize = K / 128;
+        const U32_PER_BLOCK: usize = K / 32;
+
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let blocks: Vec<Compression> = (0..16)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| next() as u32),
+                    std::array::from_fn(|_| next() as u32),
+                    next(),
+                    next() as u32,
+                    next() as u32,
+                )
+            })
+            .collect();
+
+        unsafe {
+            // Full (elide off) reference.
+            let mut zf = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut af = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut bf = vec![0u32; 16 * U32_PER_BLOCK];
+            let hexf = witgen16::HexadecaInputs::Blocks(std::array::from_fn(|j| &blocks[j]));
+            witgen16::build_hexadeca_witness_ab_stream_elide(
+                hexf,
+                zf.as_mut_ptr(),
+                af.as_mut_ptr(),
+                bf.as_mut_ptr(),
+                None,
+                [false, false, false],
+                false,
+            );
+
+            // Elide run over pre-filled buffers (same content as the token
+            // would verify: a previous full witgen of this exact layout).
+            let mut ze = zf.clone();
+            let mut ae = af.clone();
+            let mut be = bf.clone();
+            let hexe = witgen16::HexadecaInputs::Blocks(std::array::from_fn(|j| &blocks[j]));
+            witgen16::build_hexadeca_witness_ab_stream_elide(
+                hexe,
+                ze.as_mut_ptr(),
+                ae.as_mut_ptr(),
+                be.as_mut_ptr(),
+                None,
+                [true, true, true],
+                false,
+            );
+            let mut bad = Vec::new();
+            for i in 0..ze.len() {
+                if ze[i] != zf[i] {
+                    bad.push(("z", i, ze[i], zf[i]));
+                }
+                if ae[i] != af[i] {
+                    bad.push(("a", i, ae[i], af[i]));
+                }
+                if be[i] != bf[i] {
+                    bad.push(("b", i, be[i], bf[i]));
+                }
+            }
+            eprintln!("elide-arm bad count: {} first 12: {:?}", bad.len(), &bad[..bad.len().min(12)]);
+            assert!(bad.is_empty(), "elide arm mismatch count {}", bad.len());
+
+            // Fused + elide: windows must stay FULL and equal to the full
+            // a/b rows even while the main buffers elide constant chunks.
+            let mut zfe = zf.clone();
+            let mut afe = af.clone();
+            let mut bfe = bf.clone();
+            let mut wina = vec![0u32; 16 * U32_PER_BLOCK];
+            let mut winb = vec![0u32; 16 * U32_PER_BLOCK];
+            let hexfe = witgen16::HexadecaInputs::Blocks(std::array::from_fn(|j| &blocks[j]));
+            witgen16::build_hexadeca_witness_ab_stream_elide(
+                hexfe,
+                zfe.as_mut_ptr(),
+                afe.as_mut_ptr(),
+                bfe.as_mut_ptr(),
+                Some((wina.as_mut_ptr(), winb.as_mut_ptr())),
+                [true, true, true],
+                false,
+            );
+            let mut bad2 = Vec::new();
+            for i in 0..zfe.len() {
+                if zfe[i] != zf[i] {
+                    bad2.push(("z", i, zfe[i], zf[i]));
+                }
+                if afe[i] != af[i] {
+                    bad2.push(("a", i, afe[i], af[i]));
+                }
+                if bfe[i] != bf[i] {
+                    bad2.push(("b", i, bfe[i], bf[i]));
+                }
+                if wina[i] != af[i] {
+                    bad2.push(("wina", i, wina[i], af[i]));
+                }
+                if winb[i] != bf[i] {
+                    bad2.push(("winb", i, winb[i], bf[i]));
+                }
+            }
+            eprintln!("fused+elide bad count: {} first 12: {:?}", bad2.len(), &bad2[..bad2.len().min(12)]);
+            assert!(bad2.is_empty(), "fused+elide mismatch count {}", bad2.len());
+        }
+    }
+
 }
 // witfire-7 draw marker 10514
 // witfire-16 draw marker 2194
-// fire51: fresh draw on new bar 3852475 (rival NTT promotion)
