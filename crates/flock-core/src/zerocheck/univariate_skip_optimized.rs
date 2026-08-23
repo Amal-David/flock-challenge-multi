@@ -2681,6 +2681,20 @@ fn zc_r1ab_first_write_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_DIRECT=1` restores the copy of each 64-byte AB window
+/// into `WorkerStateAbOnly::chunk_ab_bytes` before the convert kernel, and
+/// keeps the copy-loop-shaped prefetch issue point.
+///
+/// Default: the convert kernel demand-loads those rows from `ab_inner`
+/// (stride 64, same bytes) and the look-ahead T0s ride the kernel's GFNI
+/// plane loop — one hint per plane, after the current window's 16 loadus.
+/// A prefetch has no architectural effect; lanes stay bit-identical.
+fn zc_r1ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_DIRECT").is_none());
+    *ON
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2746,6 +2760,11 @@ fn process_one_x_hi_ab_only(
     let ab_inner_ptr = ab_inner.as_ptr();
     #[cfg(target_arch = "x86_64")]
     let pf_spread = zc_r1ab_pf_spread_enabled();
+    // Convert-as-demand, resolved once per band (never inside the window loop).
+    #[cfg(target_arch = "x86_64")]
+    let direct = zc_r1ab_direct_enabled();
+    #[cfg(not(target_arch = "x86_64"))]
+    let direct = false;
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -2785,29 +2804,40 @@ fn process_one_x_hi_ab_only(
                 core::arch::x86_64::_MM_HINT_T0,
             );
         };
-        #[cfg(target_arch = "x86_64")]
-        if !pf_spread {
-            for b_med in 0..n_next {
-                pf_one(b_med);
-            }
-        }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+        if !direct {
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
+            if !pf_spread {
+                for b_med in 0..n_next {
+                    pf_one(b_med);
+                }
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
+            for b_med in 0..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread {
+                for b_med in n_b_med..n_next {
+                    pf_one(b_med);
+                }
             }
         }
+        debug_assert!(chunk_byte_base + n_b_med * 64 <= ab_inner.len());
+        let windows: &[[u8; 64]; 1 << N_MEDIUM] = if direct {
+            // SAFETY: `n_b_med` packed 64-byte rows start at `chunk_byte_base`
+            // (`N_CHUNKS * 8` stride). Convert kernels index only `0..n_b_med`.
+            unsafe { &*ab_inner.as_ptr().add(chunk_byte_base).cast() }
+        } else {
+            &state.chunk_ab_bytes
+        };
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2824,24 +2854,27 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
+            // Direct path: sixteen look-ahead T0s ride the GFNI plane loop
+            // so they do not share SPR LFBs with the current window's 16
+            // loadus. Kill-switch / copy path keeps the copy-loop issue
+            // point and passes a null hint into the kernel.
+            let (pf_ptr, pf_n) = if direct && n_next > 0 {
+                (ab_inner_ptr.wrapping_add(next_base), n_next)
+            } else {
+                (core::ptr::null(), 0)
+            };
             if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
+                kernels::write_convert_ab_nomul_gfni_pf(
+                    windows, n_b_med, mats_w, bank, pf_ptr, pf_n,
                 );
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
+                kernels::accumulate_convert_ab_nomul_gfni_pf(
+                    windows, n_b_med, mats_w, bank, pf_ptr, pf_n,
                 );
             }
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                windows,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -2857,7 +2890,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                windows,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
