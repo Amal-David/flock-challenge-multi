@@ -1471,6 +1471,51 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
+    // 16-wide (zmm) witness path: half the kernel calls and half the memory
+    // instructions of the 8-wide path at the same register pressure. Gated on
+    // AVX-512F so the AVX2 build compiles byte-identically; the lane-model
+    // tests in `blake3_witgen8` own the layout contract, the SPR full-lib
+    // compile owns the intrinsics.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    if use_simd && !use_nt && n_total >= 16 {
+        let elide_on = witgen_simd::const_elide_enabled();
+        generate_round1_inner_hexadeca(
+            blocks,
+            skip_blocks,
+            &mut z,
+            &mut a,
+            &mut b,
+            &mut ab_inner,
+            &inv_table,
+            &padding,
+            // First hexadeca wiring: a/b elision stays OFF (the projection
+            // reads a/b back, so the fused-window elision gate does not
+            // apply); z-elision is content-independent and stays on.
+            [z_tok && elide_on, false, false],
+            ab_nt,
+        );
+        // a/b now hold a completed witgen of this layout (elided chunks are
+        // token-verified to already match). Zerocheck reads them through
+        // shared `&[u8]` views only, so the buffers reach their release
+        // untouched — arm the provenance for the next prove's takes.
+        flock_core::scratch::register_pending_tag(
+            a.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+        );
+        flock_core::scratch::register_pending_tag(
+            b.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+        );
+        // z is read-only from here to its release inside the open's
+        // materialize (commit encode, zerocheck c-view, lincheck repack all
+        // take shared views), so its provenance survives to the next prove.
+        flock_core::scratch::register_pending_tag(
+            z.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+        );
+        return (z, a, b, ab_inner);
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if use_simd && !use_nt && n_total >= 8 {
         // BLOCKER REMOVED: a/b's constant lines used to be re-read L1-hot by
@@ -1917,7 +1962,147 @@ fn generate_round1_inner_octa(
             },
         );
 }
-
+/// Ranked 16-wide (zmm) witness builder — the AVX-512F widening of
+/// [`generate_round1_inner_octa`]. One `build_hexadeca_witness_ab_stream_elide`
+/// call per 16-block rayon chunk: half the kernel calls and half the memory
+/// instructions of the 8-wide path at the same register pressure.
+///
+/// FIRST-WIRING POSTURE: the dump uses the plain (window-less) drain and the
+/// round-1 projection reads a/b back, exactly the octa path's incumbent arm —
+/// the only new code the runner exercises is the 16-wide dump itself, whose
+/// layout contract the lane-model tests own. The `win_ab` fused drain
+/// (Drain16's window branch) stays dead until this dump is verified green,
+/// then lands as a follow-up slot.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_hexadeca(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+) {
+    use rayon::prelude::*;
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
+    const SIMD: usize = 16;
+    const GROUP: usize = 16;
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    // ab_inner's next reader is zerocheck round 1 — after the whole commit
+    // phase, DRAM-cold at the ranked shape — so the transform publishes it
+    // non-temporally (deletes the 512 MiB write-allocate RFO). z's next
+    // reader is the commit encode — the next phase, DRAM-class either way at
+    // 512 MiB — so its dump streams too. Contract: one sfence per rayon task,
+    // below, before the task's release.
+    let abinner_nt =
+        flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
+        prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
+    let _ = (ab_nt, win_plan);
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.par_chunks_mut(group_f128))
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each_init(
+            || (),
+            |(), (g, (((z_out, a_out), b_out), ab_out))| {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                // SAFETY: crate compiled with AVX-512F; each group owns 16
+                // contiguous 512-word blocks in z/a/b, disjoint from every
+                // witness buffer. `elide` skips only token-verified constant
+                // chunks of z (a/b elision is off in this first wiring).
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        // Slice input borrows in place; a closed group
+                        // materializes via the scalar generator (the hexadeca
+                        // entry has no Closed route), preserving padding
+                        // semantics exactly as the octa staging arm.
+                        let staged: [Compression; SIMD];
+                        let hexadeca = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                blake3_witgen8::witgen16::HexadecaInputs::Blocks(
+                                    std::array::from_fn(|j| s.get(base + j).unwrap_or(padding)),
+                                )
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len }
+                                if base + SIMD <= len =>
+                            {
+                                staged = std::array::from_fn(|j| {
+                                    crate::seed_pipe::gen_block(init, base + j)
+                                });
+                                blake3_witgen8::witgen16::HexadecaInputs::Blocks(
+                                    std::array::from_fn(|j| &staged[j]),
+                                )
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged = std::array::from_fn(|j| {
+                                    let idx = base + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                blake3_witgen8::witgen16::HexadecaInputs::Blocks(
+                                    std::array::from_fn(|j| &staged[j]),
+                                )
+                            }
+                        };
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        blake3_witgen8::witgen16::build_hexadeca_witness_ab_stream_elide(
+                            hexadeca,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            None,
+                            elide,
+                            z_nt,
+                        );
+                    }
+                }
+                // Incumbent projection: reads the just-dumped a/b back, in
+                // ascending block order, so ab_inner's NT stream stays
+                // sequential per thread. (The fused L1-window arm lands with
+                // the follow-up slot once this dump is verified green.)
+                for j in 0..n_here {
+                    let block_idx = GROUP * g + j;
+                    if block_idx >= skip_blocks {
+                        let a_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            )
+                        };
+                        let b_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                BYTES_PER_BLOCK,
+                            )
+                        };
+                        let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                        );
+                    }
+                }
+                // Last NT store of the task in every arm — z's stream included.
+                if abinner_nt || z_nt {
+                    flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                }
+            },
+        );
+}
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
 /// byte-stripe layout in the same parallel pass. Replaces the separate
 /// `pack_z_lincheck_from_packed` call entirely.
