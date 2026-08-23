@@ -237,6 +237,170 @@ unsafe fn butterfly_fused_2layer_impl<
     }
 }
 
+/// Stream one four-`F128` register to a merely 16-byte-aligned destination.
+///
+/// Large recyclable pool allocations may be 16 modulo 64, so an aligned ZMM
+/// stream is not generally available. Four XMM streams preserve the no-RFO
+/// publication contract for every permitted destination residue.
+///
+/// # Safety
+/// Requires `avx512f`; `dst` must cover four writable `F128`s and be 16-byte
+/// aligned. `ALIGNED_ZMM` additionally asserts 64-byte alignment.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn stream_f128x4<const ALIGNED_ZMM: bool>(
+    dst: *mut F128,
+    value: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller provides four writable elements and the alignment
+    // promised by the specialization.
+    unsafe {
+        if ALIGNED_ZMM {
+            debug_assert_eq!(dst as usize % 64, 0);
+            _mm512_stream_si512(dst as *mut __m512i, value);
+            return;
+        }
+        debug_assert_eq!(dst as usize % 16, 0);
+        let dst = dst as *mut __m128i;
+        _mm_stream_si128(dst, _mm512_extracti32x4_epi32::<0>(value));
+        _mm_stream_si128(dst.add(1), _mm512_extracti32x4_epi32::<1>(value));
+        _mm_stream_si128(dst.add(2), _mm512_extracti32x4_epi32::<2>(value));
+        _mm_stream_si128(dst.add(3), _mm512_extracti32x4_epi32::<3>(value));
+    }
+}
+
+/// Direct-publish twin of [`butterfly_fused_2layer_gen`].
+///
+/// The arithmetic and dispatch are identical, but computed active lanes are
+/// streamed to four disjoint codeword rows and never stored back to scratch.
+/// The ranked odd-row optimization deliberately omits the known-zero scratch
+/// suffix; that suffix is published from a zero register, without reloading it.
+///
+/// # Safety
+/// Contract forwarded from the architecture dispatch wrapper. When
+/// `OUTER_LOW`, `t_outer.hi == 0`; when `INNER_LOW`, both inner twiddles have a
+/// zero high limb.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    // SAFETY: forwarded caller contract. Match the incumbent's process-cached
+    // multiply selection exactly; it remains outside the lane loop.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_publish_nt_impl::<
+                OUTER_LOW,
+                INNER_LOW,
+                false,
+                ALIGNED_ZMM,
+            >(
+                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+            )
+        } else {
+            butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, true, ALIGNED_ZMM>(
+                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_publish_nt_gen`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_publish_nt_impl<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const DIET: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: the caller guarantees four readable scratch rows, four disjoint
+    // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
+    unsafe {
+        debug_assert!(lanes == 60 || lanes == 64);
+        debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+        debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
+        let a = src;
+        let b = src.add(src_step);
+        let c = src.add(2 * src_step);
+        let d = src.add(3 * src_step);
+        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+
+        let mut i = 0;
+        while i < lanes {
+            let mut va = _mm512_loadu_si512(a.add(i) as *const __m512i);
+            let mut vb = _mm512_loadu_si512(b.add(i) as *const __m512i);
+            let mut vc = _mm512_loadu_si512(c.add(i) as *const __m512i);
+            let mut vd = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
+            vc = _mm512_xor_si512(vc, new_a);
+            va = new_a;
+            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
+            vd = _mm512_xor_si512(vd, new_b);
+            vb = new_b;
+
+            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
+            vb = _mm512_xor_si512(vb, new_a);
+            va = new_a;
+            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
+            vd = _mm512_xor_si512(vd, new_c);
+            vc = new_c;
+
+            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
+            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
+            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
+            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+            i += 4;
+        }
+
+        // The exact-shape caller reaches i=60 only for odd_tail=4. That value is
+        // published from the R1CS padding descriptor, so lanes 60..64 are
+        // contractually zero. Publish a zero register: every destination byte
+        // is initialized, with no dependency or reload from the scratch suffix.
+        if i < 64 {
+            debug_assert_eq!(i, 60);
+            let zero = _mm512_setzero_si512();
+            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
+            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), zero);
+            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), zero);
+            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), zero);
+        }
+    }
+}
+
 /// Out-of-place fused two-layer forward butterfly (layers 1–2 seed).
 /// Same algebra as [`butterfly_fused_2layer`], loads from `src` and stores
 /// to `dst`. Source and destination must not overlap.
@@ -1098,6 +1262,152 @@ mod diet_tests {
                 st
             };
             F128 { lo: n(), hi: n() }
+        }
+    }
+
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    unsafe fn check_direct_publish_case<
+        const OUTER_LOW: bool,
+        const INNER_LOW: bool,
+        const DIET: bool,
+        const ALIGNED_ZMM: bool,
+    >(lanes: usize, residue: usize) {
+        use core::arch::x86_64::_mm_sfence;
+
+        let seed = 0xD1EC_7000
+            ^ ((OUTER_LOW as u64) << 1)
+            ^ ((INNER_LOW as u64) << 2)
+            ^ ((DIET as u64) << 3)
+            ^ ((lanes as u64) << 8)
+            ^ ((residue as u64) << 16);
+        let mut next = rng(seed);
+        let mut src: Vec<F128> = (0..4 * 64).map(|_| next()).collect();
+        // Poison the omitted scratch suffix. Production's corresponding values
+        // are zero; poison proves the direct kernel has no stale-scratch reload
+        // dependency and publishes the contractual zero value itself.
+        for row in 0..4 {
+            for lane in lanes..64 {
+                src[row * 64 + lane] = F128 {
+                    lo: 0xA11C_E000 + (row * 64 + lane) as u64,
+                    hi: 0x5A11_0000 + (row * 64 + lane) as u64,
+                };
+            }
+        }
+
+        let mut t_outer = next();
+        let mut t_inner_a = next();
+        let mut t_inner_b = next();
+        if OUTER_LOW {
+            t_outer.hi = 0;
+        } else {
+            t_outer.hi |= 1;
+        }
+        if INNER_LOW {
+            t_inner_a.hi = 0;
+            t_inner_b.hi = 0;
+        } else {
+            t_inner_a.hi |= 1;
+            t_inner_b.hi |= 1;
+        }
+
+        let mut want = src.clone();
+        let (a, rest) = want.split_at_mut(64);
+        let (b, rest) = rest.split_at_mut(64);
+        let (c, d) = rest.split_at_mut(64);
+        // SAFETY: four equal active prefixes; target features are carried by
+        // this helper and the const low-twiddle preconditions were established.
+        unsafe {
+            butterfly_fused_2layer_impl::<OUTER_LOW, INNER_LOW, DIET>(
+                &mut a[..lanes],
+                &mut b[..lanes],
+                &mut c[..lanes],
+                &mut d[..lanes],
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+        }
+        for row in 0..4 {
+            want[row * 64 + lanes..(row + 1) * 64].fill(F128::ZERO);
+        }
+
+        const DST_STRIDE: usize = 80;
+        let junk = F128 {
+            lo: 0xDEAD_DEAD_DEAD_DEAD,
+            hi: 0xBAD0_BAD0_BAD0_BAD0,
+        };
+        let mut dst = vec![junk; 4 * DST_STRIDE + 4];
+        let base = dst.as_mut_ptr();
+        let offset = (0..4)
+            .find(|&offset| unsafe { base.add(offset) as usize % 64 == residue })
+            .expect("four F128 offsets cover every 16-byte residue");
+        let dst_a = unsafe { base.add(offset) };
+        let dst_b = unsafe { base.add(offset + DST_STRIDE) };
+        let dst_c = unsafe { base.add(offset + 2 * DST_STRIDE) };
+        let dst_d = unsafe { base.add(offset + 3 * DST_STRIDE) };
+
+        // SAFETY: source rows are 64 elements, destinations are disjoint,
+        // 16-byte aligned and cover 64 elements, and the two allocations do not
+        // overlap. The task-level production caller owns the same sfence.
+        unsafe {
+            butterfly_fused_2layer_publish_nt_impl::<
+                OUTER_LOW,
+                INNER_LOW,
+                DIET,
+                ALIGNED_ZMM,
+            >(
+                src.as_ptr(),
+                64,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+            _mm_sfence();
+            for (row, out) in [dst_a, dst_b, dst_c, dst_d].into_iter().enumerate() {
+                assert_eq!(
+                    core::slice::from_raw_parts(out, 64),
+                    &want[row * 64..(row + 1) * 64],
+                    "lanes={lanes} residue={residue} row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET}",
+                );
+            }
+        }
+    }
+
+    /// Direct NT publication is byte-identical to the incumbent final fused2
+    /// store, including the contractual-zero 60..64 suffix and every 16-byte-aligned
+    /// pool-base residue, for all low-twiddle and mul-diet specializations.
+    #[test]
+    fn direct_publish_matches_in_place_fused2() {
+        // SAFETY: this module and test binary exist only when the target has
+        // AVX-512F + VPCLMULQDQ.
+        unsafe {
+            for lanes in [60, 64] {
+                for residue in [0, 16, 32, 48] {
+                    check_direct_publish_case::<false, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<false, false, true, false>(lanes, residue);
+                    check_direct_publish_case::<false, true, false, false>(lanes, residue);
+                    check_direct_publish_case::<false, true, true, false>(lanes, residue);
+                    check_direct_publish_case::<true, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, false, true, false>(lanes, residue);
+                    check_direct_publish_case::<true, true, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, true, true, false>(lanes, residue);
+                    if residue == 0 {
+                        check_direct_publish_case::<false, false, false, true>(lanes, residue);
+                        check_direct_publish_case::<false, false, true, true>(lanes, residue);
+                        check_direct_publish_case::<false, true, false, true>(lanes, residue);
+                        check_direct_publish_case::<false, true, true, true>(lanes, residue);
+                        check_direct_publish_case::<true, false, false, true>(lanes, residue);
+                        check_direct_publish_case::<true, false, true, true>(lanes, residue);
+                        check_direct_publish_case::<true, true, false, true>(lanes, residue);
+                        check_direct_publish_case::<true, true, true, true>(lanes, residue);
+                    }
+                }
+            }
         }
     }
 

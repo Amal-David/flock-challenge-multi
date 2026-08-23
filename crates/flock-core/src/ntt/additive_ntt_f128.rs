@@ -252,6 +252,20 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
 }
 
+/// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
+/// fused-two scratch stores followed by the separate non-temporal scatter.
+/// Read once per process, outside every row/quad loop.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_direct_fused2_publish_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -798,6 +812,47 @@ impl Drop for ZeroOddTailLanes {
 #[inline]
 fn row_lanes(r: usize, num_ntts: usize, odd_tail: usize) -> usize {
     if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts }
+}
+
+/// The direct final-fused-two publisher is intentionally confined to the one
+/// ranked shape whose source, destination and skipped-tail geometry is proven.
+#[inline]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+const fn direct_fused2_publish_shape(log_d: usize, num_ntts: usize, odd_tail: usize) -> bool {
+    log_d == 20 && num_ntts == 64 && (odd_tail == 0 || odd_tail == 4)
+}
+
+/// Physical staging row that holds logical row `k` in a seed+top block.
+#[inline]
+const fn seed_top_stage_row(k: usize, permuted: bool) -> usize {
+    if permuted { (k & 3) * 16 + (k >> 2) } else { k }
+}
+
+/// Global codeword row produced by one `(block, r, k)` seed+top task slot.
+#[inline]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+))]
+const fn seed_top_codeword_row(
+    block: usize,
+    r: usize,
+    k: usize,
+    block_size: usize,
+    sub_stride: usize,
+) -> usize {
+    block * block_size + r + k * sub_stride
 }
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
@@ -1665,6 +1720,96 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Complete layers 3..9 for one ranked `r` task and publish each final
+    /// fused-two quad directly from registers to its four codeword rows.
+    ///
+    /// Splitting this whole 8-block loop by `ALIGNED_ZMM` makes the allocation
+    /// alignment decision once per task, rather than once per quad or vector.
+    ///
+    /// # Safety
+    ///
+    /// Exact ranked geometry: `bufp` owns 512 initialized staging rows of 64
+    /// elements; `base` owns the disjoint 2^20×64 codeword; distinct concurrent
+    /// `r` tasks select disjoint destination rows. When `ALIGNED_ZMM`, `base`
+    /// must be 64-byte aligned; otherwise it must be 16-byte aligned.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn seed_top_direct_fused2_publish<const ALIGNED_ZMM: bool>(
+        &self,
+        bufp: *mut F128,
+        base: *mut F128,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes2: usize,
+        lanes4_tail: usize,
+        stage_perm: bool,
+        tw4: &[[F128; 15]],
+    ) {
+        debug_assert_eq!(row_len, 64);
+        debug_assert_eq!(block_size, 1 << 17);
+        debug_assert_eq!(sub_stride, 1 << 11);
+        debug_assert!(lanes2 == 60 || lanes2 == 64);
+        debug_assert!(lanes2 == 64 || lanes4_tail == 4);
+        debug_assert_eq!(base as usize % 16, 0);
+        debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
+        let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
+            if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
+
+        // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
+        // final consumer of its four staging rows; the 16 quads partition the
+        // block's 64 logical rows, and the 8 blocks partition the task's 512.
+        unsafe {
+            for block in 0..8 {
+                let region = bufp.add(block * 64 * row_len);
+                let tw = &tw4[block];
+                for j in 0..4 {
+                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                    kernels::butterfly_fused_4layer_row(
+                        region.add(j * g4_base * row_len),
+                        g4_stride,
+                        row_len,
+                        lanes4,
+                        0,
+                        tw,
+                    );
+                }
+                for m in 0..16 {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.twiddle(3 + 4, outer_block);
+                    let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
+                    let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+                    let k = 4 * m;
+                    let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
+                    let step = g2_stride * row_len;
+                    let dst = |k: usize| {
+                        base.add(
+                            seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len,
+                        )
+                    };
+                    kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
+                        p,
+                        step,
+                        dst(k),
+                        dst(k + 1),
+                        dst(k + 2),
+                        dst(k + 3),
+                        lanes2,
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                    );
+                }
+            }
+        }
+    }
+
     fn seed_top_fused8_pass(
         &self,
         msg: &[F128],
@@ -1727,6 +1872,20 @@ impl AdditiveNttF128 {
         // (see `publish_row_nt`); decided once per pass.
         #[cfg(target_arch = "x86_64")]
         let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let direct_publish = publish_nt
+            && direct_fused2_publish_shape(log_d, num_ntts, odd_tail)
+            && !ntt_direct_fused2_publish_disabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let direct_publish_zmm = direct_publish && base_addr % 64 == 0;
         // Staging row order inside a block.
         //
         // The natural order is `k`, and the fused-four kernel then walks its
@@ -1746,7 +1905,7 @@ impl AdditiveNttF128 {
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
-        let perm = |k: usize| if stage_perm { (k & 3) * 16 + (k >> 2) } else { k };
+        let perm = |k: usize| seed_top_stage_row(k, stage_perm);
         let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
         let task = |buf: &mut Vec<F128>, r: usize| {
@@ -1831,6 +1990,47 @@ impl AdditiveNttF128 {
                         row_len,
                         &seed_dense,
                     );
+                }
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if direct_publish {
+                    // The alignment arm is selected once around the complete
+                    // 8×16-quad loop. Every 64-element destination row has a
+                    // 1024-byte stride, so it preserves the base residue.
+                    if direct_publish_zmm {
+                        self.seed_top_direct_fused2_publish::<true>(
+                            bufp,
+                            base,
+                            row_len,
+                            block_size,
+                            sub_stride,
+                            r,
+                            lanes2,
+                            lanes4_tail,
+                            stage_perm,
+                            &tw4,
+                        );
+                    } else {
+                        self.seed_top_direct_fused2_publish::<false>(
+                            bufp,
+                            base,
+                            row_len,
+                            block_size,
+                            sub_stride,
+                            r,
+                            lanes2,
+                            lanes4_tail,
+                            stage_perm,
+                            &tw4,
+                        );
+                    }
+                    // All 512 rows are published. Drain once for this r task;
+                    // the rayon join below is the deep pass's happens-before.
+                    core::arch::x86_64::_mm_sfence();
+                    return;
                 }
                 // Layers 3..9 per block, in the staging block.
                 for block in 0..8 {
@@ -4368,6 +4568,66 @@ mod tests {
                 "top fusion mismatch at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
             );
         }
+    }
+
+    /// The ranked direct-publish address map must cover the 2^20 codeword
+    /// rows exactly once, and each final fused-two quad must map its four
+    /// physical staging rows back to logical `k = 4m..4m+4` in both staging
+    /// orders.
+    #[test]
+    fn direct_fused2_publish_mapping_is_exact() {
+        const BLOCK_SIZE: usize = 1 << 17;
+        const SUB_STRIDE: usize = BLOCK_SIZE / 64;
+        const ROWS: usize = 1 << 20;
+
+        for permuted in [false, true] {
+            let mut stage_seen = [false; 64];
+            for k in 0..64 {
+                let physical = seed_top_stage_row(k, permuted);
+                assert!(physical < 64);
+                assert!(!stage_seen[physical], "duplicate staging row {physical}");
+                stage_seen[physical] = true;
+            }
+            assert!(stage_seen.into_iter().all(|seen| seen));
+
+            let step = if permuted { 16 } else { 1 };
+            for m in 0..16 {
+                let first = seed_top_stage_row(4 * m, permuted);
+                for t in 0..4 {
+                    assert_eq!(first + t * step, seed_top_stage_row(4 * m + t, permuted));
+                }
+            }
+        }
+
+        let mut visited = vec![false; ROWS];
+        for block in 0..8 {
+            for r in 0..SUB_STRIDE {
+                for k in 0..64 {
+                    let row = seed_top_codeword_row(block, r, k, BLOCK_SIZE, SUB_STRIDE);
+                    assert!(row < ROWS);
+                    assert!(!visited[row], "codeword row {row} visited twice");
+                    visited[row] = true;
+                }
+            }
+        }
+        assert!(visited.into_iter().all(|seen| seen));
+        assert_eq!(seed_top_codeword_row(0, 0, 0, BLOCK_SIZE, SUB_STRIDE), 0);
+        assert_eq!(
+            seed_top_codeword_row(7, SUB_STRIDE - 1, 63, BLOCK_SIZE, SUB_STRIDE),
+            ROWS - 1
+        );
+    }
+
+    #[test]
+    fn direct_fused2_publish_shape_falls_back_safely() {
+        assert!(direct_fused2_publish_shape(20, 64, 0));
+        assert!(direct_fused2_publish_shape(20, 64, 4));
+        // Raw ranked tail when `FLOCK_NO_NTT_LANE_ROUND=1` has a scalar
+        // remainder and must retain the incumbent in-place+scatter schedule.
+        assert!(!direct_fused2_publish_shape(20, 64, 7));
+        assert!(!direct_fused2_publish_shape(19, 64, 4));
+        assert!(!direct_fused2_publish_shape(20, 32, 4));
+        assert!(!direct_fused2_publish_shape(20, 64, 8));
     }
 
     /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs
