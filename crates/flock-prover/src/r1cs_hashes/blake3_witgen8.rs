@@ -867,6 +867,10 @@ struct StepRows {
     b: *mut u32,
     z_lo: *const V8,
     z_hi: *const V8,
+    a_lo: *const V8,
+    a_hi: *const V8,
+    b_lo: *const V8,
+    b_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -878,7 +882,7 @@ impl StepRows {
     /// # Safety
     /// `self` describes one live drain step and `j < 8`.
     #[inline(always)]
-    unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
+    unsafe fn publish(&self, j: usize, _sa: *const u32, _sb: *const u32) {
         unsafe {
             let f = self.flags;
             let wide = f & 0x80 != 0;
@@ -892,21 +896,19 @@ impl StepRows {
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                *self.a_lo.add(j),
+                *self.a_hi.add(j),
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                *self.b_lo.add(j),
+                *self.b_hi.add(j),
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1181,28 +1183,29 @@ impl Drain8<'_> {
                 // A/B rows instead of transposing a third Z ring.
                 let a_lo = tr8_chunk(self.ast, rw);
                 let a_hi = tr8_chunk(self.ast, rw + 8);
+                let b_lo = tr8_chunk(self.bs, rw);
+                let b_hi = tr8_chunk(self.bs, rw + 8);
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                let stage_needed = !use_off;
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+                let stage_needed = true;
                 for r in 0..8 {
-                    let p = sa.add(r * STEP_WORDS);
-                    store_v8(p, a_lo[r]);
-                    store_v8(p.add(8), a_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
                         widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
-                    }
-                }
-                let b_lo = tr8_chunk(self.bs, rw);
-                let b_hi = tr8_chunk(self.bs, rw + 8);
-                for r in 0..8 {
-                    let p = sb.add(r * STEP_WORDS);
-                    store_v8(p, b_lo[r]);
-                    store_v8(p.add(8), b_hi[r]);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    if use_off {
                         widen_off_half(
                             b_lo[r],
                             b_hi[r],
                             op.add(r * ROUND1_AB_OFF_WORDS + 64),
                         );
+                    }
+                    if stage_needed {
+                        let pa = sa.add(r * STEP_WORDS);
+                        store_v8(pa, a_lo[r]);
+                        store_v8(pa.add(8), a_hi[r]);
+                        let pb = sb.add(r * STEP_WORDS);
+                        store_v8(pb, b_lo[r]);
+                        store_v8(pb.add(8), b_hi[r]);
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
@@ -1234,16 +1237,18 @@ impl Drain8<'_> {
                     b: self.b.add(abs_word),
                     z_lo: z_lo.as_ptr(),
                     z_hi: z_hi.as_ptr(),
+                    a_lo: a_lo.as_ptr(),
+                    a_hi: a_hi.as_ptr(),
+                    b_lo: b_lo.as_ptr(),
+                    b_hi: b_hi.as_ptr(),
                     flags,
                 };
 
-                proj.project_blocks(
-                    blk,
-                    plan,
-                    imgs,
-                    Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
-                );
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                let off = if use_off { Some(op as *const u16) } else { None };
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+                let off = None;
+                proj.project_blocks(blk, plan, imgs, Some(rows), off);
             }
         }
     }
