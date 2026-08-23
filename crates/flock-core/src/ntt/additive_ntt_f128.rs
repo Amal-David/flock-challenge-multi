@@ -696,6 +696,28 @@ fn staging_init_mode() -> StagingInit {
 ///
 /// `alloc_uninit_vec` additionally `madvise(MADV_HUGEPAGE)`s blocks ≥ 2 MiB,
 /// which the `vec![F128::ZERO; …]` it replaces did not.
+
+/// `FLOCK_NO_NTT_SCATTER_SFENCE_HOIST=1` restores a `_mm_sfence` after every
+/// seed-top NT scatter task. Default: one fence per worker when the TLS
+/// staging buffer drops (rayon join still orders the deep pass).
+#[cfg(target_arch = "x86_64")]
+fn scatter_sfence_hoist_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_SFENCE_HOIST").is_none())
+}
+
+#[cfg(target_arch = "x86_64")]
+struct SeedTopNtBuf {
+    buf: Vec<F128>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for SeedTopNtBuf {
+    fn drop(&mut self) {
+        unsafe { core::arch::x86_64::_mm_sfence() };
+    }
+}
+
 fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
     let n = rows * row_len;
     match staging_init_mode() {
@@ -1873,9 +1895,13 @@ impl AdditiveNttF128 {
                             );
                         }
                     }
-                    // Drain the WC buffers before this task returns; the
-                    // rayon join below is the reader's happens-before edge.
-                    core::arch::x86_64::_mm_sfence();
+                    // Drain WC buffers. Default: one sfence per worker via
+                    // `SeedTopNtBuf` Drop (rayon join is the reader's
+                    // happens-before). `FLOCK_NO_NTT_SCATTER_SFENCE_HOIST=1`
+                    // restores a fence before every task return.
+                    if !scatter_sfence_hoist_enabled() {
+                        core::arch::x86_64::_mm_sfence();
+                    }
                     return;
                 }
                 for block in 0..8 {
@@ -1895,10 +1921,28 @@ impl AdditiveNttF128 {
         // (all lanes) before the layer loops read any of them, so the
         // 512 KiB zero-fill per init was dead work — rayon runs the
         // initializer once per JOB, not per worker.
+        #[cfg(target_arch = "x86_64")]
+        let hoist = publish_nt && scatter_sfence_hoist_enabled();
+        #[cfg(not(target_arch = "x86_64"))]
+        let hoist = false;
         if sub_stride < PARALLEL_TASK_THRESHOLD {
             let mut buf = staging_block(512, row_len);
             for r in 0..sub_stride {
                 task(&mut buf, r);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if hoist {
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
+        } else if hoist {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (0..sub_stride).into_par_iter().for_each_init(
+                    || SeedTopNtBuf {
+                        buf: staging_block(512, row_len),
+                    },
+                    |wrap, r| task(&mut wrap.buf, r),
+                );
             }
         } else {
             (0..sub_stride)
