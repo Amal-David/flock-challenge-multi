@@ -2681,6 +2681,16 @@ fn zc_r1ab_first_write_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_DIRECT=1` restores the copy of each 64-byte AB window
+/// into `WorkerStateAbOnly::chunk_ab_bytes` before the convert kernel.
+/// Default: the kernel loads those rows from `ab_inner` (stride 64, same
+/// bytes). Prefetch still keys off `ab_inner`.
+fn zc_r1ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_DIRECT").is_none());
+    *ON
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
@@ -2791,6 +2801,10 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        let direct = zc_r1ab_direct_enabled();
+        #[cfg(not(target_arch = "x86_64"))]
+        let direct = false;
         for b_med in 0..n_b_med {
             // Spread delivery: one hint per copy step, so each hint is
             // issued next to one demand line rather than the whole block
@@ -2799,8 +2813,11 @@ fn process_one_x_hi_ab_only(
             if pf_spread && b_med < n_next {
                 pf_one(b_med);
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            if !direct {
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
         }
         #[cfg(target_arch = "x86_64")]
         if pf_spread {
@@ -2808,6 +2825,14 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
+        debug_assert!(chunk_byte_base + n_b_med * 64 <= ab_inner.len());
+        let windows: &[[u8; 64]; 1 << N_MEDIUM] = if direct {
+            // SAFETY: `n_b_med` packed 64-byte rows start at `chunk_byte_base`
+            // (`N_CHUNKS * 8` stride). Convert kernels index only `0..n_b_med`.
+            unsafe { &*ab_inner.as_ptr().add(chunk_byte_base).cast() }
+        } else {
+            &state.chunk_ab_bytes
+        };
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2825,23 +2850,13 @@ fn process_one_x_hi_ab_only(
                 .try_into()
                 .expect("one plane bank per low index");
             if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                kernels::write_convert_ab_nomul_gfni(windows, n_b_med, mats_w, bank);
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                kernels::accumulate_convert_ab_nomul_gfni(windows, n_b_med, mats_w, bank);
             }
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                windows,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -2857,7 +2872,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                windows,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
