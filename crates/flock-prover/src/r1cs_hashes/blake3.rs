@@ -4138,8 +4138,8 @@ mod tests {
     /// * `skip_blocks` — blocks below it get no projection at all; the fused
     ///   arm must skip exactly the same ones.
     ///
-    /// All four (elide, ab_nt) combinations must reproduce the plain
-    /// full-write temporal reference bit-for-bit.
+    /// All eight independent z/a/b elision masks, with both `ab_nt` values,
+    /// must reproduce the plain full-write temporal reference bit-for-bit.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn round1_inner_octa_ab_nt_matches_across_elide_and_skip() {
@@ -4214,16 +4214,21 @@ mod tests {
             let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], false, None);
             let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, None);
             let seed = (z_o, a_o, b_o);
-            for &elide_on in &[false, true] {
+            for elide_mask in 0u8..8 {
                 for &ab_nt in &[false, true] {
-                    if !elide_on && !ab_nt {
+                    if elide_mask == 0 && !ab_nt {
                         continue; // that IS the reference
                     }
-                    let elide = [elide_on; 3];
-                    let (z, a, b, ab) =
-                        run(&blocks, elide, ab_nt, if elide_on { Some(&seed) } else { None });
-                    let tag =
-                        format!("n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}");
+                    let elide = std::array::from_fn(|i| elide_mask & (1 << i) != 0);
+                    let (z, a, b, ab) = run(
+                        &blocks,
+                        elide,
+                        ab_nt,
+                        (elide_mask != 0).then_some(&seed),
+                    );
+                    let tag = format!(
+                        "n_total={n_total} skip={skip_blocks} elide={elide:?} ab_nt={ab_nt}"
+                    );
                     assert_eq!(z, z_r, "z mismatch, {tag}");
                     assert_eq!(a, a_r, "a mismatch, {tag}");
                     assert_eq!(b, b_r, "b mismatch, {tag}");

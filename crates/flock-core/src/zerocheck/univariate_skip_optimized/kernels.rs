@@ -164,6 +164,54 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+/// Publish one structurally-zero round-1 AB window with the same output-store
+/// class selected for the regular shift-reduce kernel.
+///
+/// # Safety
+/// `out` must belong to the allocation used to prepare `nt`, so the encoded
+/// 16- or 64-byte alignment remains valid for a non-temporal store.
+#[inline]
+unsafe fn store_zero_inner_ab(out: &mut [u8; 64], nt: u8) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract; the zero vector needs
+    // no source load or table access.
+    unsafe {
+        x86_64::store_out64(out, core::arch::x86_64::_mm512_setzero_si512(), nt);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        // Non-AVX-512 round-1 kernels ignore the prepared NT selector and use
+        // temporal output stores, so preserve that fallback policy here.
+        let _ = nt;
+        out.fill(0);
+    }
+}
+
+impl super::Round1AbWindowPlan {
+    /// Publish a structurally-zero window under this plan's already-resolved
+    /// temporal/non-temporal output policy.
+    ///
+    /// # Safety
+    /// `out` must be a 64-byte window inside the allocation used to prepare
+    /// this plan, preserving its encoded alignment class.
+    #[inline]
+    pub unsafe fn store_zero_window(self, out: &mut [u8; 64]) {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { store_zero_inner_ab(out, self.nt) }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],

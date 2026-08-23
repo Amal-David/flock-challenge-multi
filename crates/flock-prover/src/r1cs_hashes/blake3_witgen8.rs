@@ -398,12 +398,46 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
+/// First word of the final 64-byte round-1 medium window (block 31).
+const FINAL_WINDOW_WORD: usize = U32_PER_BLOCK - STEP_WORDS;
+const FINAL_WINDOW_BLOCK: usize = FINAL_WINDOW_WORD / STEP_WORDS;
+
+/// The block-31 fast path is deliberately pinned to the ranked BLAKE3
+/// geometry. A future circuit/layout change falls back to the incumbent full
+/// ring fill and two-step drain until its own structural-zero proof is added.
+#[inline(always)]
+const fn final_window_is_structural_zero(
+    useful_bits: usize,
+    last_word: usize,
+    words_per_block: usize,
+    ring_words: usize,
+    step_words: usize,
+) -> bool {
+    useful_bits == 15_409
+        && last_word == 481
+        && words_per_block == 512
+        && ring_words == 32
+        && step_words == 16
+}
+
+const FINAL_WINDOW_IS_STRUCTURAL_ZERO: bool = final_window_is_structural_zero(
+    USEFUL_BITS,
+    LAST_WORD,
+    U32_PER_BLOCK,
+    RING_WORDS,
+    STEP_WORDS,
+);
 const _RING_GEOMETRY: () = {
     assert!(RING_WORDS >= 32);
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
     // Every epoch boundary is a whole number of drain steps.
     assert!(RING_WORDS % STEP_WORDS == 0);
+    // These identities are required only by the ranked-geometry fast path.
+    // If any geometry constant drifts, the selector above becomes false and
+    // the incumbent full fill/drain remains available.
+    assert!(!FINAL_WINDOW_IS_STRUCTURAL_ZERO || FINAL_WINDOW_WORD == 496);
+    assert!(!FINAL_WINDOW_IS_STRUCTURAL_ZERO || FINAL_WINDOW_BLOCK == 31);
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
@@ -1398,6 +1432,218 @@ impl Drain8<'_> {
             }
         }
     }
+
+    /// Main-destination liveness for the structurally-zero final 16-word
+    /// window. Bit assignments match [`StepRows::flags`] without its store
+    /// policy bits: z-lo/hi, a-lo/hi, b-lo/hi.
+    #[inline(always)]
+    fn final_zero_liveness(&self) -> u8 {
+        let z_g1 = if self.elide[0] {
+            ELIDE_ZERO_CHUNK
+        } else {
+            DUMP_CHUNKS
+        };
+        let (a_g1, b_g0, b_g1) = self.ab_ranges();
+        let g = FINAL_WINDOW_WORD / 8;
+        let mut flags = 0u8;
+        if g < z_g1 {
+            flags |= 1;
+        }
+        if g + 1 < z_g1 {
+            flags |= 2;
+        }
+        if g < a_g1 {
+            flags |= 4;
+        }
+        if g + 1 < a_g1 {
+            flags |= 8;
+        }
+        if g >= b_g0 && g < b_g1 {
+            flags |= 0x10;
+        }
+        if g + 1 >= b_g0 && g + 1 < b_g1 {
+            flags |= 0x20;
+        }
+        flags
+    }
+
+    /// Publish the final zero window in the bunched destination order used by
+    /// the non-spread projection and buffered drains: all A rows first, then
+    /// each B row followed by its Z row. `carry` is the full temporal A/B
+    /// window copy used by the fused `win_ab` path.
+    #[inline(always)]
+    unsafe fn publish_final_zero_bunched(
+        &self,
+        zero: V8,
+        carry: Option<(*mut u32, *mut u32)>,
+        ab_nt: bool,
+        live: u8,
+    ) {
+        unsafe {
+            for j in 0..8usize {
+                let o = j * U32_PER_BLOCK + FINAL_WINDOW_WORD;
+                if let Some((win_a, _)) = carry {
+                    store_v8(win_a.add(o), zero);
+                    store_v8(win_a.add(o + 8), zero);
+                }
+                emit_pair(
+                    self.a.add(o),
+                    zero,
+                    zero,
+                    live & 4 != 0,
+                    live & 8 != 0,
+                    ab_nt,
+                    self.wide_nt,
+                );
+            }
+            for j in 0..8usize {
+                let o = j * U32_PER_BLOCK + FINAL_WINDOW_WORD;
+                if let Some((_, win_b)) = carry {
+                    store_v8(win_b.add(o), zero);
+                    store_v8(win_b.add(o + 8), zero);
+                }
+                emit_pair(
+                    self.b.add(o),
+                    zero,
+                    zero,
+                    live & 0x10 != 0,
+                    live & 0x20 != 0,
+                    ab_nt,
+                    self.wide_nt,
+                );
+                emit_pair(
+                    self.z.add(o),
+                    zero,
+                    zero,
+                    live & 1 != 0,
+                    live & 2 != 0,
+                    self.z_nt,
+                    self.wide_nt,
+                );
+            }
+        }
+    }
+
+    /// Publish one live block's zero ab_inner line using the store class
+    /// already encoded by the caller's [`Round1AbWindowPlan`].
+    #[inline(always)]
+    unsafe fn project_final_zero_block(
+        proj: &StreamProj<'_>,
+        plan: Round1AbWindowPlan,
+        j: usize,
+    ) {
+        unsafe {
+            let out = &mut *proj
+                .out
+                .add(j * BYTES_PER_BLOCK + FINAL_WINDOW_BLOCK * 64)
+                .cast::<[u8; 64]>();
+            plan.store_zero_window(out);
+        }
+    }
+
+    /// Structural-zero replacement for the generic block-31 transpose,
+    /// derived-Z, offset/table transform, and projection. Visible publication
+    /// retains each arm's destination order, liveness, store class, and the
+    /// caller-owned fence contract.
+    #[inline(never)]
+    unsafe fn drain_final_zero_window(&self) {
+        debug_assert!(FINAL_WINDOW_IS_STRUCTURAL_ZERO);
+        unsafe {
+            let zero = dup_u32(0);
+            let live = self.final_zero_liveness();
+            if let Some(proj) = &self.proj {
+                let plan = proj.plan.for_window(FINAL_WINDOW_BLOCK);
+                if self.spread {
+                    // Spread order is Z, A, B, then ab_inner for each block.
+                    for j in 0..8usize {
+                        let o = j * U32_PER_BLOCK + FINAL_WINDOW_WORD;
+                        emit_pair(
+                            self.z.add(o),
+                            zero,
+                            zero,
+                            live & 1 != 0,
+                            live & 2 != 0,
+                            self.z_nt,
+                            self.wide_nt,
+                        );
+                        emit_pair(
+                            self.a.add(o),
+                            zero,
+                            zero,
+                            live & 4 != 0,
+                            live & 8 != 0,
+                            true,
+                            self.wide_nt,
+                        );
+                        emit_pair(
+                            self.b.add(o),
+                            zero,
+                            zero,
+                            live & 0x10 != 0,
+                            live & 0x20 != 0,
+                            true,
+                            self.wide_nt,
+                        );
+                        if proj.live & (1 << j) != 0 {
+                            Self::project_final_zero_block(proj, plan, j);
+                        }
+                    }
+                } else {
+                    self.publish_final_zero_bunched(zero, None, true, live);
+                    for j in 0..8usize {
+                        if proj.live & (1 << j) != 0 {
+                            Self::project_final_zero_block(proj, plan, j);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Buffered fused windows keep their complete temporal A/B copy;
+            // the plain path has no carry and retains temporal main A/B stores.
+            self.publish_final_zero_bunched(zero, self.win_ab, self.win_ab.is_some(), live);
+        }
+    }
+
+    /// Complete and publish the final rolling epoch. `structural_zero` is a
+    /// compile-time constant in production; the explicit false arm preserves
+    /// the incumbent full fill/drain for any non-ranked geometry and is also
+    /// the byte-identity oracle used by tests.
+    #[inline(always)]
+    unsafe fn complete_final_epoch(&mut self, zero: V8, structural_zero: bool) {
+        const ZF: usize = USEFUL_BITS.div_ceil(32);
+        const {
+            assert!(!FINAL_WINDOW_IS_STRUCTURAL_ZERO || U32_PER_BLOCK - ZF == 30);
+            assert!(
+                !FINAL_WINDOW_IS_STRUCTURAL_ZERO
+                    || FINAL_WINDOW_WORD - STEP_WORDS == U32_PER_BLOCK - RING_WORDS
+            );
+        }
+        unsafe {
+            if structural_zero {
+                // finish() wrote word 481. Only words 482..495 are consumed by
+                // the remaining generic block-30 drain; block 31 is known zero.
+                for w in ZF..FINAL_WINDOW_WORD {
+                    let i = w & (RING_WORDS - 1);
+                    store_v8(self.ast.add(i) as *mut u32, zero);
+                    store_v8(self.bs.add(i) as *mut u32, zero);
+                }
+                self.drain_range(
+                    U32_PER_BLOCK - RING_WORDS,
+                    0,
+                    STEP_WORDS,
+                );
+                self.drain_final_zero_window();
+            } else {
+                for w in ZF..U32_PER_BLOCK {
+                    let i = w & (RING_WORDS - 1);
+                    store_v8(self.ast.add(i) as *mut u32, zero);
+                    store_v8(self.bs.add(i) as *mut u32, zero);
+                }
+                self.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+            }
+        }
+    }
 }
 
 /// Dual-destination twin of [`dump_range_nt`] for the a/b sides: one
@@ -1787,18 +2033,12 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         wa.finish();
         wb.finish();
 
-        const ZF: usize = USEFUL_BITS.div_ceil(32);
-        const {
-            assert!(U32_PER_BLOCK - ZF == 30);
-        }
-        // finish() completed word 481. Complete the final rolling epoch with
-        // the all-zero tail, then publish words 384..511 in one long sweep.
-        for w in ZF..U32_PER_BLOCK {
-            let i = w & (RING_WORDS - 1);
-            store_v8(ast.add(i) as *mut u32, zero);
-            store_v8(bs.add(i) as *mut u32, zero);
-        }
-        drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        // finish() completed word 481. The generic drain handles block 30
+        // (words 480..495); block 31 is structurally zero for A/B/Z and its
+        // round-1 projection, so the ranked geometry publishes it directly.
+        // The constant selector retains the incumbent full fill/drain for any
+        // future non-ranked layout.
+        drain.complete_final_epoch(zero, FINAL_WINDOW_IS_STRUCTURAL_ZERO);
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
@@ -1818,6 +2058,305 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(C, align(64))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct AlignedLine([u32; 16]);
+
+    #[derive(Clone, Copy, Debug)]
+    enum FinalTailMode {
+        Plain,
+        Window,
+        Projection { spread: bool },
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct FinalTailSnapshot {
+        z: Vec<AlignedLine>,
+        a: Vec<AlignedLine>,
+        b: Vec<AlignedLine>,
+        win_a: Option<Vec<AlignedLine>>,
+        win_b: Option<Vec<AlignedLine>>,
+        ab_inner: Option<Vec<AlignedLine>>,
+    }
+
+    const MAIN_LINES: usize = 8 * U32_PER_BLOCK / 16;
+    const AB_LINES: usize = 8 * BYTES_PER_BLOCK / 64;
+    const FINAL_LINE_IN_BLOCK: usize = FINAL_WINDOW_WORD / 16;
+    const Z_SENTINEL: u32 = 0xD1D1_D1D1;
+    const A_SENTINEL: u32 = 0xA2A2_A2A2;
+    const B_SENTINEL: u32 = 0xB3B3_B3B3;
+    const WIN_A_SENTINEL: u32 = 0x4A4A_4A4A;
+    const WIN_B_SENTINEL: u32 = 0x5B5B_5B5B;
+    const AB_SENTINEL: u32 = 0xC6C6_C6C6;
+
+    fn filled_lines(n: usize, value: u32) -> Vec<AlignedLine> {
+        vec![AlignedLine([value; 16]); n]
+    }
+
+    /// Execute only the final rolling epoch. The false arm is the exact
+    /// incumbent (zero words 482..511, drain blocks 30 and 31 generically);
+    /// the true arm leaves dirty words 496..511 unread and publishes the
+    /// proven-zero block 31 directly.
+    unsafe fn run_final_tail(
+        inv_table: &InvNttTableByteSingleGf8,
+        mode: FinalTailMode,
+        elide: [bool; 3],
+        proj_live: u32,
+        z_nt: bool,
+        wide_nt: bool,
+        abinner_nt: bool,
+        structural_zero: bool,
+    ) -> FinalTailSnapshot {
+        let mut ast: [V8; RING_WORDS] =
+            core::array::from_fn(|i| dup_u32(0x8100_0000u32.wrapping_add(i as u32)));
+        let mut bs: [V8; RING_WORDS] =
+            core::array::from_fn(|i| dup_u32(0x4200_0000u32.wrapping_add(3 * i as u32)));
+        // finish() owns words 480 and 481 at ring slots 0 and 1. Every later
+        // slot starts dirty, so equality with the generic zero-fill oracle
+        // proves that the specialized block-31 path never consumes it.
+        ast[0] = dup_u32(0x1357_9BDF);
+        ast[1] = dup_u32(0x2468_ACE0);
+        bs[0] = dup_u32(0x0F0F_F0F0);
+        bs[1] = dup_u32(0x55AA_AA55);
+
+        let mut z = filled_lines(MAIN_LINES, Z_SENTINEL);
+        let mut a = filled_lines(MAIN_LINES, A_SENTINEL);
+        let mut b = filled_lines(MAIN_LINES, B_SENTINEL);
+        let mut win_a = filled_lines(MAIN_LINES, WIN_A_SENTINEL);
+        let mut win_b = filled_lines(MAIN_LINES, WIN_B_SENTINEL);
+        let mut proj_stage = filled_lines(STREAM_STAGE_WORDS / 16, 0xE7E7_E7E7);
+        let mut ab_inner = filled_lines(AB_LINES, AB_SENTINEL);
+
+        let win_ab = match mode {
+            FinalTailMode::Window => Some((
+                win_a.as_mut_ptr().cast::<u32>(),
+                win_b.as_mut_ptr().cast::<u32>(),
+            )),
+            _ => None,
+        };
+        let proj = match mode {
+            FinalTailMode::Projection { .. } => {
+                let ab_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        ab_inner.as_ptr().cast::<u8>(),
+                        8 * BYTES_PER_BLOCK,
+                    )
+                };
+                let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                    inv_table,
+                    ab_bytes,
+                    abinner_nt,
+                );
+                Some(StreamProj {
+                    stage: proj_stage.as_mut_ptr().cast::<u32>(),
+                    out: ab_inner.as_mut_ptr().cast::<u8>(),
+                    live: proj_live,
+                    inv_table,
+                    plan,
+                })
+            }
+            _ => None,
+        };
+        let spread = matches!(mode, FinalTailMode::Projection { spread: true });
+        {
+            let mut drain = Drain8 {
+                ast: ast.as_mut_ptr(),
+                bs: bs.as_mut_ptr(),
+                z: z.as_mut_ptr().cast::<u32>(),
+                a: a.as_mut_ptr().cast::<u32>(),
+                b: b.as_mut_ptr().cast::<u32>(),
+                win_ab,
+                proj,
+                elide,
+                z_nt,
+                wide_nt,
+                spread,
+            };
+            unsafe { drain.complete_final_epoch(dup_u32(0), structural_zero) };
+        }
+        // Both arms may have used NT publication. The production caller owns
+        // this same fence contract; the oracle must fence before inspecting.
+        unsafe { _mm_sfence() };
+
+        FinalTailSnapshot {
+            z,
+            a,
+            b,
+            win_a: matches!(mode, FinalTailMode::Window).then_some(win_a),
+            win_b: matches!(mode, FinalTailMode::Window).then_some(win_b),
+            ab_inner: matches!(mode, FinalTailMode::Projection { .. }).then_some(ab_inner),
+        }
+    }
+
+    fn assert_final_tail_liveness(
+        got: &FinalTailSnapshot,
+        mode: FinalTailMode,
+        elide: [bool; 3],
+        proj_live: u32,
+        tag: &str,
+    ) {
+        let zero = AlignedLine([0; 16]);
+        for block in 0..8 {
+            let line = block * (U32_PER_BLOCK / 16) + FINAL_LINE_IN_BLOCK;
+            assert_eq!(
+                got.z[line],
+                if elide[0] {
+                    AlignedLine([Z_SENTINEL; 16])
+                } else {
+                    zero.clone()
+                },
+                "z final-line liveness: {tag} block={block}"
+            );
+            assert_eq!(
+                got.a[line],
+                if elide[1] {
+                    AlignedLine([A_SENTINEL; 16])
+                } else {
+                    zero.clone()
+                },
+                "a final-line liveness: {tag} block={block}"
+            );
+            assert_eq!(
+                got.b[line],
+                if elide[2] {
+                    AlignedLine([B_SENTINEL; 16])
+                } else {
+                    zero.clone()
+                },
+                "b final-line liveness: {tag} block={block}"
+            );
+            if let (Some(win_a), Some(win_b)) = (&got.win_a, &got.win_b) {
+                assert_eq!(win_a[line], zero, "win-a final line: {tag} block={block}");
+                assert_eq!(win_b[line], zero, "win-b final line: {tag} block={block}");
+            }
+            if let Some(ab_inner) = &got.ab_inner {
+                let ab_line = block * (BYTES_PER_BLOCK / 64) + FINAL_WINDOW_BLOCK;
+                assert_eq!(
+                    ab_inner[ab_line],
+                    if proj_live & (1 << block) != 0 {
+                        zero.clone()
+                    } else {
+                        AlignedLine([AB_SENTINEL; 16])
+                    },
+                    "ab_inner final-line liveness: {tag} block={block}"
+                );
+            }
+        }
+        match mode {
+            FinalTailMode::Plain => {
+                assert!(got.win_a.is_none() && got.ab_inner.is_none());
+            }
+            FinalTailMode::Window => {
+                assert!(got.win_a.is_some() && got.ab_inner.is_none());
+            }
+            FinalTailMode::Projection { .. } => {
+                assert!(got.win_a.is_none() && got.ab_inner.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn final_window_structural_zero_selector_is_exact() {
+        let ranked = (15_409, 481, 512, 32, 16);
+        assert!(final_window_is_structural_zero(
+            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4
+        ));
+        for candidate in [
+            (15_408, ranked.1, ranked.2, ranked.3, ranked.4),
+            (15_410, ranked.1, ranked.2, ranked.3, ranked.4),
+            (ranked.0, 480, ranked.2, ranked.3, ranked.4),
+            (ranked.0, 482, ranked.2, ranked.3, ranked.4),
+            (ranked.0, ranked.1, 1024, ranked.3, ranked.4),
+            (ranked.0, ranked.1, ranked.2, 64, ranked.4),
+            (ranked.0, ranked.1, ranked.2, ranked.3, 8),
+        ] {
+            assert!(
+                !final_window_is_structural_zero(
+                    candidate.0,
+                    candidate.1,
+                    candidate.2,
+                    candidate.3,
+                    candidate.4
+                ),
+                "selector accepted non-ranked geometry {candidate:?}"
+            );
+        }
+    }
+
+    /// Exhaustive tail oracle over all component-elision combinations, every
+    /// publisher shape, zero/mixed/full projection liveness, and temporal,
+    /// narrow-NT, and wide-NT policies. It compares the specialized block-31
+    /// path byte-for-byte with the incumbent full ring fill/drain, while the
+    /// unconsumed half-ring starts dirty.
+    #[test]
+    fn structural_zero_final_window_matches_generic_drain() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8::ZERO,
+        );
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let modes = [
+            FinalTailMode::Plain,
+            FinalTailMode::Window,
+            FinalTailMode::Projection { spread: false },
+            FinalTailMode::Projection { spread: true },
+        ];
+        // (z_nt, wide_nt, abinner_nt): temporal kill switch, narrow NT, and
+        // ranked wide NT. The main A/B publisher's mode follows shape.
+        let policies = [
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+        ];
+        unsafe {
+            for elide_mask in 0u8..8 {
+                let elide = core::array::from_fn(|i| elide_mask & (1 << i) != 0);
+                for mode in modes {
+                    let live_masks: &[u32] = match mode {
+                        FinalTailMode::Projection { .. } => &[0x00, 0x55, 0xFF],
+                        _ => &[0xFF],
+                    };
+                    for &proj_live in live_masks {
+                        for &(z_nt, wide_nt, abinner_nt) in &policies {
+                            let tag = format!(
+                                "mode={mode:?} elide={elide:?} live={proj_live:#04x} z_nt={z_nt} wide_nt={wide_nt} abinner_nt={abinner_nt}"
+                            );
+                            let incumbent = run_final_tail(
+                                &inv_table,
+                                mode,
+                                elide,
+                                proj_live,
+                                z_nt,
+                                wide_nt,
+                                abinner_nt,
+                                false,
+                            );
+                            let fast = run_final_tail(
+                                &inv_table,
+                                mode,
+                                elide,
+                                proj_live,
+                                z_nt,
+                                wide_nt,
+                                abinner_nt,
+                                true,
+                            );
+                            assert_eq!(fast, incumbent, "fast/generic byte mismatch: {tag}");
+                            assert_final_tail_liveness(&fast, mode, elide, proj_live, &tag);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     unsafe fn lanes(v: V8) -> [u32; 8] {
         let mut out = [0u32; 8];
