@@ -666,10 +666,10 @@ fn blake3_pow_scan_many(state_digest: &[u8; 32], start: u64, len: u64, bits: u32
 // What AVX-512 changes versus the NEON port: every lane rotation is a single
 // `vprord` (`_mm512_ror_epi32`), the accept test is one `vpshufb` byte
 // reverse plus one `vpcmpud` into a 16-bit mask, and a 16-wide state already
-// exposes 4 × 16 independent G lanes per half-round, so two interleaved
-// groups (32 nonces per iteration, dividing `GRIND_CHUNK` exactly) are enough
-// to keep the two 512-bit ALU ports busy without spilling the 2 × 16 + 16
-// live ZMM registers.
+// exposes four independent G chains per half-round. Two groups preserve a
+// 32-nonce iteration that divides `GRIND_CHUNK` exactly, but are compressed
+// serially: keeping only one 16-word state live avoids the spills caused by
+// interleaving both groups while retaining the same nonce and mask order.
 //
 // Like the NEON kernel it computes only digest word 0 (`v0 ^ v8`), which is
 // all the `bits ≤ 32` predicate reads, and hoists the nonce-independent
@@ -787,65 +787,37 @@ mod blake3_pow_avx512 {
         v[a] = add(add(v[a], b1), my);
     }
 
-    /// Independent 16-wide states interleaved per compression call.
+    /// Independent 16-wide states compressed serially per scan iteration.
     const GROUPS: usize = 2;
     /// Nonce lanes per scan iteration.
     const LANES: usize = 16 * GROUPS;
 
-    /// One BLAKE3 round on `GROUPS` independent 16-wide states.
+    /// One BLAKE3 round on one 16-wide state.
     #[inline(always)]
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn round_n(vs: &mut [[V; 16]; GROUPS], ms: &[Msg; GROUPS], s: &[usize; 16]) {
-        for k in 0..GROUPS {
-            g(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 1, 6, 11, 12, ms[k].w(s[10]), ms[k].w(s[11]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 3, 4, 9, 14, ms[k].w(s[14]), ms[k].w(s[15]));
-        }
+    unsafe fn round_one(v: &mut [V; 16], m: &Msg, s: &[usize; 16]) {
+        g(v, 0, 4, 8, 12, m.w(s[0]), m.w(s[1]));
+        g(v, 1, 5, 9, 13, m.w(s[2]), m.w(s[3]));
+        g(v, 2, 6, 10, 14, m.w(s[4]), m.w(s[5]));
+        g(v, 3, 7, 11, 15, m.w(s[6]), m.w(s[7]));
+        g(v, 0, 5, 10, 15, m.w(s[8]), m.w(s[9]));
+        g(v, 1, 6, 11, 12, m.w(s[10]), m.w(s[11]));
+        g(v, 2, 7, 8, 13, m.w(s[12]), m.w(s[13]));
+        g(v, 3, 4, 9, 14, m.w(s[14]), m.w(s[15]));
     }
 
     /// Final round (schedule row 6) pruned to what reaches `v0 ^ v8` — the
     /// same dead-G analysis as the NEON kernel.
     #[inline(always)]
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn round_final_n(vs: &mut [[V; 16]; GROUPS], ms: &[Msg; GROUPS]) {
+    unsafe fn round_final_one(v: &mut [V; 16], m: &Msg) {
         let s = &MSG_SCHEDULE[6];
-        for k in 0..GROUPS {
-            g_no_b(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
-        }
-        for k in 0..GROUPS {
-            g_no_b(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
-        }
-        for k in 0..GROUPS {
-            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
-        }
-        for k in 0..GROUPS {
-            g_a_only(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
-        }
-        for k in 0..GROUPS {
-            g_no_b(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
-        }
+        g_no_b(v, 0, 4, 8, 12, m.w(s[0]), m.w(s[1]));
+        g(v, 1, 5, 9, 13, m.w(s[2]), m.w(s[3]));
+        g_no_b(v, 2, 6, 10, 14, m.w(s[4]), m.w(s[5]));
+        g(v, 3, 7, 11, 15, m.w(s[6]), m.w(s[7]));
+        g_a_only(v, 0, 5, 10, 15, m.w(s[8]), m.w(s[9]));
+        g_no_b(v, 2, 7, 8, 13, m.w(s[12]), m.w(s[13]));
     }
 
     /// Round-0 constant prefix (column step + the three nonce-free
@@ -880,21 +852,30 @@ mod blake3_pow_avx512 {
         v
     }
 
-    /// Compress all groups from the round-0 prefix; digest word 0 per lane.
+    /// Compress one group from the round-0 prefix; digest word 0 per lane.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn compress_word0_one(prefix: &[V; 16], m: &Msg) -> V {
+        let mut v = *prefix;
+        g(&mut v, 0, 5, 10, 15, m.n_lo, m.n_hi);
+        round_one(&mut v, m, &MSG_SCHEDULE[1]);
+        round_one(&mut v, m, &MSG_SCHEDULE[2]);
+        round_one(&mut v, m, &MSG_SCHEDULE[3]);
+        round_one(&mut v, m, &MSG_SCHEDULE[4]);
+        round_one(&mut v, m, &MSG_SCHEDULE[5]);
+        round_final_one(&mut v, m);
+        xor(v[0], v[8])
+    }
+
+    /// Compress all groups serially so only one 16-wide state is live at a
+    /// time while preserving the 32-nonce scan iteration and mask order.
     #[inline(always)]
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn compress_word0(prefix: &[V; 16], ms: &[Msg; GROUPS]) -> [V; GROUPS] {
-        let mut vs = [*prefix; GROUPS];
-        for k in 0..GROUPS {
-            g(&mut vs[k], 0, 5, 10, 15, ms[k].n_lo, ms[k].n_hi);
-        }
-        round_n(&mut vs, ms, &MSG_SCHEDULE[1]);
-        round_n(&mut vs, ms, &MSG_SCHEDULE[2]);
-        round_n(&mut vs, ms, &MSG_SCHEDULE[3]);
-        round_n(&mut vs, ms, &MSG_SCHEDULE[4]);
-        round_n(&mut vs, ms, &MSG_SCHEDULE[5]);
-        round_final_n(&mut vs, ms);
-        std::array::from_fn(|k| xor(vs[k][0], vs[k][8]))
+        [
+            compress_word0_one(prefix, &ms[0]),
+            compress_word0_one(prefix, &ms[1]),
+        ]
     }
 
     /// Smallest nonce in `start .. start + len` (saturating) whose BLAKE3
