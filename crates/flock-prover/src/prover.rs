@@ -26,10 +26,10 @@
 //! ```
 
 use flock_core::challenger::Challenger;
-use flock_core::field::{F8, F128};
-use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
+use flock_core::field::{F128, F8};
+use flock_core::lincheck::{self, pack_z_lincheck_from_packed, QuirkyPoint};
 use flock_core::pcs::{self, Commitment, PcsParams};
-use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
+use flock_core::proof::{bind_statement, R1csClaim, R1csProofLigerito, ZClaim};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
@@ -40,7 +40,6 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_log >= pcs::LOG_PACKING + 2
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
 }
-
 
 #[inline]
 fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
@@ -118,7 +117,10 @@ fn precompute_ab_s_hat_v(
             inner_rest_tail,
         ))
     } else if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(z_vec, inner_rest_tail))
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
     } else if r1cs.k_log >= pcs::LOG_PACKING {
         Some(pcs::ring_switch::s_hat_v_from_z_vec(z_vec, inner_rest_tail))
     } else {
@@ -133,21 +135,16 @@ fn precompute_ab_s_hat_v(
 /// narrower captures by presence, so a producer shape miss (e.g. no lincheck
 /// stripe) degrades to a still-correct route instead of panicking.
 #[inline]
-fn pre_c_slot<'a>(
-    r1cs: &BlockR1cs,
-    captured: &'a zerocheck::CapturedSHatVC,
-) -> Option<&'a [F128]> {
-    Some(
-        if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
-            captured.fold8.as_deref().unwrap()
-        } else if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
-            captured.fold4.as_deref().unwrap()
-        } else if ranked_direct_c_precompute_enabled(r1cs) {
-            captured.quad.as_slice()
-        } else {
-            captured.s_hat_v_c.as_slice()
-        },
-    )
+fn pre_c_slot<'a>(r1cs: &BlockR1cs, captured: &'a zerocheck::CapturedSHatVC) -> Option<&'a [F128]> {
+    Some(if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
+        captured.fold8.as_deref().unwrap()
+    } else if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
+        captured.fold4.as_deref().unwrap()
+    } else if ranked_direct_c_precompute_enabled(r1cs) {
+        captured.quad.as_slice()
+    } else {
+        captured.s_hat_v_c.as_slice()
+    })
 }
 
 enum FastLincheckInput {
@@ -844,29 +841,30 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
-        flock_core::gaptime::mark("zerocheck: pool entered");
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        flock_core::gaptime::mark("zerocheck: views built");
-        let r = match c_identity_z {
+    let (zc_proof, zc_claim, s_hat_v_c) =
+        in_zerocheck_phase_pool(r1cs.m, || {
+            flock_core::gaptime::mark("zerocheck: pool entered");
+            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+            let a_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    a_packed_f128.as_ptr() as *const u8,
+                    a_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let b_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    b_packed_f128.as_ptr() as *const u8,
+                    b_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let c_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    z_packed.as_ptr() as *const u8,
+                    z_packed.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            flock_core::gaptime::mark("zerocheck: views built");
+            let r = match c_identity_z {
             Some(c_identity_z) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
                     a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
@@ -877,9 +875,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             ),
         };
-        flock_core::gaptime::mark("zerocheck: work done");
-        r
-    });
+            flock_core::gaptime::mark("zerocheck: work done");
+            r
+        });
     flock_core::gaptime::mark("zerocheck: pool exited");
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
@@ -1097,26 +1095,27 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        match c_identity_z {
+    let (zc_proof, zc_claim, s_hat_v_c) =
+        in_zerocheck_phase_pool(r1cs.m, || {
+            let a_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    a_packed_f128.as_ptr() as *const u8,
+                    a_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let b_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    b_packed_f128.as_ptr() as *const u8,
+                    b_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let c_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    z_packed.as_ptr() as *const u8,
+                    z_packed.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            match c_identity_z {
             Some(c_identity_z) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
                     a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
@@ -1127,7 +1126,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             ),
         }
-    });
+        });
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
@@ -1227,3 +1226,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-32: independent official timing sample of the promoted source; no executable change.
 
 // refire-45: independent official timing sample of the promoted source; no executable change.
+
+// gauntlet-flock-loop-01: independent timing resample of promoted 7791f7e (witfire-16); comment-only, no executable change.
