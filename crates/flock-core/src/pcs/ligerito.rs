@@ -5860,6 +5860,27 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_DF8_FB_OVERLAP=1` restores the incumbent schedule: the whole
+/// f-side `fold16_banked`+`fold4_nested` sweep, then the whole b-side
+/// `gfni_fold64_four_maps_staged` sweep. Default ON runs each SUB=256
+/// f-chunk's GFNI batches immediately after that chunk's f stores, so
+/// `vgf2p8affineqb` (ports 0/1) occupies the same window as the next
+/// chunk's VPCLMUL (port 5) and DRAM. Same calls, same bytes, different
+/// interleaving only.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn df8_fb_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_FB_OVERLAP").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5992,6 +6013,38 @@ fn materialize_direct_fold8(
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
                 // scratch and eliminating the scalar 64-product chain.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                let fb_overlap = b_gfni_on && df8_fb_overlap_enabled();
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                let gfni_pack = if b_gfni_on {
+                    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+                    let (claim0, claim1) = (&claims[0], &claims[1]);
+                    let cols0 = super::ring_switch::compose_block_cols(
+                        &direct_tables[0], claim0.eq_hi[block],
+                    );
+                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let cols1 = super::ring_switch::compose_block_cols(
+                        &direct_tables[1], claim1.eq_hi[block],
+                    );
+                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    Some((mats0_lo, mats0_hi, mats1_lo, mats1_hi))
+                } else {
+                    None
+                };
                 let mut slot = 0usize;
                 while slot < block_len {
                     let n = SUB.min(block_len - slot);
@@ -6012,6 +6065,38 @@ fn materialize_direct_fold8(
                             m4, &mut b_out[slot..slot + n], r4, r5,
                         );
                     }
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vbmi",
+                        target_feature = "vpclmulqdq",
+                        target_feature = "gfni"
+                    ))]
+                    if fb_overlap {
+                        use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+                        let (mats0_lo, mats0_hi, mats1_lo, mats1_hi) =
+                            gfni_pack.as_ref().unwrap();
+                        let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                        for s in (slot..slot + n).step_by(64) {
+                            // SAFETY: each packed-u64 row half supplies 512
+                            // bytes; both output buffers cover 64 F128s;
+                            // `n` is a multiple of 64 when `b_gfni_on`.
+                            unsafe {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(s).cast::<u8>(),
+                                    mats0_lo,
+                                    rows0.1.as_ptr().add(s).cast::<u8>(),
+                                    mats0_hi,
+                                    rows1.0.as_ptr().add(s).cast::<u8>(),
+                                    mats1_lo,
+                                    rows1.1.as_ptr().add(s).cast::<u8>(),
+                                    mats1_hi,
+                                    b_out.as_mut_ptr().add(s),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
+                        }
+                    }
                     slot += n;
                 }
 
@@ -6022,21 +6107,10 @@ fn materialize_direct_fold8(
                     target_feature = "vpclmulqdq",
                     target_feature = "gfni"
                 ))]
-                if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
-                    let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0], claim0.eq_hi[block],
-                    );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1], claim1.eq_hi[block],
-                    );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                if b_gfni_on && !fb_overlap {
+                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+                    let (mats0_lo, mats0_hi, mats1_lo, mats1_hi) =
+                        gfni_pack.as_ref().unwrap();
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
@@ -6044,13 +6118,13 @@ fn materialize_direct_fold8(
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
+                                mats0_lo,
                                 rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
+                                mats0_hi,
                                 rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
+                                mats1_lo,
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
+                                mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
                                 gfni_tmp.as_mut_ptr().cast(),
                             );
