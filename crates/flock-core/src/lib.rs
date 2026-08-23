@@ -77,20 +77,31 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// guest scheduler is free to migrate and to double up on one core while a
 /// sibling core idles. This builds the global pool explicitly and pins worker
 /// `i` to one logical CPU chosen from `/sys/devices/system/cpu/cpu*/topology/
-/// thread_siblings_list`: mode `pin16` (default here) keeps the harness's
-/// thread count but gives every worker a fixed logical CPU, alternating
-/// physical cores first (worker 0 → core 0 sibling 0, worker 1 → core 1
-/// sibling 0, … worker 8 → core 0 sibling 1, …), so a partially-idle pool
-/// still spreads across cores; mode `phys8` uses one worker per physical
-/// core. Selected at build time by `POOL_MODE`; `FLOCK_NO_TOPOLOGY_POOL=1`
-/// disables it (rayon then builds its default pool from `RAYON_NUM_THREADS`).
-/// Engages only when the machine has exactly 2 SMT threads per core and
-/// `RAYON_NUM_THREADS` equals the logical CPU count (i.e. the ranked shape);
-/// anything else falls through to the incumbent behaviour. Pure scheduling:
-/// no arithmetic changes, proof bytes identical.
+/// thread_siblings_list`. Mode `phys8` (the ranked default) uses one worker
+/// per physical core, pinned to sibling 0, so AVX-512 CLMUL/GFNI/shuffle
+/// ports and the 2 MiB L2 are uncontended. Mode `pin16` keeps the harness
+/// thread count with cores-first pinning (the Aug 19 probe that beat an
+/// unpinned 16-thread pool). `FLOCK_POOL_MODE=pin16` restores that probe;
+/// `FLOCK_NO_TOPOLOGY_POOL=1` disables pinning entirely (rayon then builds
+/// its default pool from `RAYON_NUM_THREADS`). Engages only when the machine
+/// has exactly 2 SMT threads per core and `RAYON_NUM_THREADS` equals the
+/// logical CPU count (i.e. the ranked shape); anything else falls through
+/// to the incumbent behaviour. Pure scheduling: no arithmetic changes,
+/// proof bytes identical.
 pub(crate) mod topology_pool {
-    /// "pin16" | "phys8"
-    pub(crate) const POOL_MODE: &str = "pin16";
+    /// Ranked default. Overridable via `FLOCK_POOL_MODE=pin16|phys8`.
+    pub(crate) const POOL_MODE: &str = "phys8";
+
+    fn selected_mode() -> &'static str {
+        static MODE: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+            match std::env::var("FLOCK_POOL_MODE") {
+                Ok(s) if s == "pin16" => "pin16",
+                Ok(s) if s == "phys8" => "phys8",
+                _ => POOL_MODE,
+            }
+        });
+        *MODE
+    }
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
@@ -170,7 +181,7 @@ pub(crate) mod topology_pool {
                     order.push(g[s]);
                 }
             }
-            let n = if POOL_MODE == "phys8" { cores } else { logical };
+            let n = if selected_mode() == "phys8" { cores } else { logical };
             let order = std::sync::Arc::new(order);
             let o2 = order.clone();
             match rayon::ThreadPoolBuilder::new()
