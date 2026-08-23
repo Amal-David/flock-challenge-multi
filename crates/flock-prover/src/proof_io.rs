@@ -217,13 +217,51 @@ struct PreEncodedPrefix {
     /// The commitment's Merkle root. Two distinct proves sharing a root would
     /// be a hash collision, so a root match pins the stash to this prove.
     root: flock_core::merkle::Hash,
-    /// bincode-fixint encoded lengths of commitment / zerocheck / lincheck,
-    /// re-derived from the candidate bundle at publish via `serialized_size`
-    /// (same default fixint config as `serialize_into`).
-    sec_lens: [u64; 3],
+    /// Structural shape of the three encoded sections. This is cheaper to
+    /// re-derive at publish than walking every proof element through
+    /// `bincode::serialized_size`, while distinguishing every shape that can
+    /// change the fixint-encoded prefix length.
+    shape: PreEncodedShape,
     /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
     /// bundle so the publish-tail `pcs_open` append never reallocates.
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreEncodedShape {
+    pcs: (
+        usize,
+        usize,
+        usize,
+        flock_core::pcs::ligerito::LigeritoProfile,
+        flock_core::hash::HashKind,
+    ),
+    zerocheck_lens: [usize; 3],
+    lincheck_lens: [usize; 2],
+}
+
+#[inline]
+fn pre_encoded_shape(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+) -> PreEncodedShape {
+    let params = &commitment.params;
+    PreEncodedShape {
+        pcs: (
+            params.m,
+            params.log_inv_rate,
+            params.log_batch_size,
+            params.profile,
+            params.merkle_hash,
+        ),
+        zerocheck_lens: [
+            zerocheck.round1_ab.len(),
+            zerocheck.round1_c.len(),
+            zerocheck.multilinear_rounds.len(),
+        ],
+        lincheck_lens: [lincheck.rounds.len(), lincheck.z_partial.len()],
+    }
 }
 
 /// Latest stashed prefix. Process-global and single-slot: the ranked worker
@@ -255,36 +293,29 @@ pub fn stash_pre_encoded_prefix(
     // append extends this exact Vec, so it must never need to grow.
     let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
     write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
-    let mut sec_lens = [0u64; 3];
-    let mut mark = bytes.len();
     bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
-    sec_lens[0] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
     bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
-    sec_lens[1] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
     bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
-    sec_lens[2] = (bytes.len() - mark) as u64;
+    let shape = pre_encoded_shape(commitment, zerocheck, lincheck);
     // Assignment-only critical section — nothing that can panic runs while
     // the guard is held, so the lock cannot poison. A poisoned lock
     // (unreachable in practice) skips the stash; publish then full-encodes.
     if let Ok(mut slot) = PRE_ENCODED.lock() {
         *slot = Some(PreEncodedPrefix {
             root: commitment.root,
-            sec_lens,
+            shape,
             bytes,
         });
     }
 }
 
 /// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
+/// and structural shape for the three prefix sections. The Merkle root pins
+/// the proof instance; the shape additionally guards every vector length and
+/// PCS parameter that can change the fixint-encoded prefix length. `None`
+/// (full-encode fallback) on any doubt — no stash, disabled switch, poisoned
+/// lock, or fingerprint miss. The stash is consumed on take; a repeat publish
+/// of the same bundle re-encodes from scratch, byte-identically.
 fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
     if !pre_encode_enabled() {
         return None;
@@ -293,16 +324,15 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
+    let shape = pre_encoded_shape(
+        &bundle.commitment,
+        &bundle.proof.zerocheck,
+        &bundle.proof.lincheck,
+    );
+    if shape != stash.shape {
         return None;
     }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
+    Some(stash.bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +745,21 @@ mod tests {
             bundle.to_bytes(),
             reference,
             "stashed-prefix to_bytes diverged"
+        );
+
+        // A same-root foreign stash with a different proof shape must be
+        // rejected and fall back to a complete encode.
+        stash_pre_encoded_prefix(&bundle.commitment, &bundle.proof.zerocheck, &bundle.proof.lincheck);
+        let mut different_shape = bundle.clone();
+        different_shape.proof.lincheck.z_partial.push(F128::ZERO);
+        let mut different_reference = Vec::new();
+        write_header(&mut different_reference, FLAVOR_R1CS_LIGERITO);
+        bincode::serialize_into(&mut different_reference, &different_shape)
+            .expect("different-shape reference serialize");
+        assert_eq!(
+            different_shape.to_bytes(),
+            different_reference,
+            "shape-mismatched stash was consumed"
         );
 
         let bundle2 = R1csProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
