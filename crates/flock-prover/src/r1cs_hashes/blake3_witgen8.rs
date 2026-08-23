@@ -395,7 +395,7 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
-const RING_WORDS: usize = 32;
+const RING_WORDS: usize = 64;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
 const _RING_GEOMETRY: () = {
