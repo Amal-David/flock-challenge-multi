@@ -2653,6 +2653,17 @@ fn zc_r1ab_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_DIRECT=1` restores the `chunk_ab_bytes` staging copy
+/// and the two-window T0 burst sized for that copy. Ranked default: the
+/// GFNI convert loadu's `ab_inner` directly (`N_CHUNKS * 8 = 64` stride,
+/// sixteen rows already packed), so the 1 KiB store-forward bounce and the
+/// copy-tuned software prefetch both go. Convert is the demand stream.
+fn zc_r1ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_DIRECT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_R1AB_PF_SPREAD=1` restores the incumbent delivery of the
 /// round-1 AB packed-row prefetch: the whole window's hint block issued back
 /// to back ahead of the window's copy loop. The default arm issues the same
@@ -2735,9 +2746,17 @@ fn process_one_x_hi_ab_only(
     }
     let n_lo = n_lo_and_inner - N_INNER;
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
-    // inside the window loop).
+    // inside the window loop). Direct-load of `ab_inner` drops the burst:
+    // it was issued ahead of the deleted copy, so it no longer matches the
+    // convert kernel's demand.
     #[cfg(target_arch = "x86_64")]
-    let pf_windows = if zc_r1ab_pf_enabled() {
+    let direct = zc_r1ab_direct_enabled();
+    #[cfg(not(target_arch = "x86_64"))]
+    let direct = false;
+    #[cfg(target_arch = "x86_64")]
+    let pf_windows = if direct {
+        0
+    } else if zc_r1ab_pf_enabled() {
         ZC_R1AB_PF_WINDOWS
     } else {
         0
@@ -2791,23 +2810,40 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+        let direct_view = direct
+            && chunk_byte_base + ((1 << N_MEDIUM) * 64) <= ab_inner.len();
+        if !direct_view {
+            for b_med in 0..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
-            }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
+            if pf_spread {
+                for b_med in n_b_med..n_next {
+                    pf_one(b_med);
+                }
             }
         }
+        // Direct: sixteen 64-byte rows at `chunk_byte_base` are already the
+        // kernel's `&[[u8; 64]; 16]`. `n_b_med ∈ {15, 16}` only loadu's live
+        // rows; the 16-row view is formed only when 1024 bytes are in-bounds.
+        let chunk_src: &[[u8; 64]; 1 << N_MEDIUM] = if direct_view {
+            // SAFETY: `direct_view` proved 16 contiguous 64-byte rows sit
+            // inside `ab_inner`; that is the same layout the copy produced.
+            unsafe {
+                &*(ab_inner.as_ptr().add(chunk_byte_base) as *const [[u8; 64]; 1 << N_MEDIUM])
+            }
+        } else {
+            &state.chunk_ab_bytes
+        };
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2826,14 +2862,14 @@ fn process_one_x_hi_ab_only(
                 .expect("one plane bank per low index");
             if plane_first_write && w_idx == 0 {
                 kernels::write_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
+                    chunk_src,
                     n_b_med,
                     mats_w,
                     bank,
                 );
             } else {
                 kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
+                    chunk_src,
                     n_b_med,
                     mats_w,
                     bank,
@@ -2841,7 +2877,7 @@ fn process_one_x_hi_ab_only(
             }
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_src,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -2857,7 +2893,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_src,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
