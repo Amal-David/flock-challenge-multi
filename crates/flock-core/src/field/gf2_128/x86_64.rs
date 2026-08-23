@@ -112,35 +112,43 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Karatsuba 3 CLMUL product + binius 2-stage vector reduction (2 CLMUL,
-/// only 2 lane extracts) = 5 CLMUL total, one fewer than the 6-CLMUL binius
-/// schoolbook with the same fully-vector reduction shape. Field-identical.
+/// Karatsuba 3 CLMUL product + binius 2-stage vector reduction (2 CLMUL)
+/// = 5 CLMUL total. Same field element as the previous GPR-pinned form
+/// (`pmull(a.lo, b.lo)` etc. plus `pmull(lane1(t), 0x87)` extracts); the
+/// operands stay in xmm so each product is one `pclmulqdq` immediate and
+/// each `0x87` fold is `pclmulqdq` imm `0x01` against `{0x87, 0}` instead
+/// of extract → pin → `pmull`. Field-identical (the 3-product Karatsuba
+/// identity and the two-stage reduction are unchanged).
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
-    // SAFETY: function carries the required target features.
-    unsafe {
-        let p0 = pmull(a.lo, b.lo);
-        let p1 = pmull(a.hi, b.hi);
-        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
-        // cross = pm ^ p0 ^ p1 is the x^64 coefficient (binius's t1).
+    // SAFETY: `pclmulqdq` + `sse4.1` are enabled by the function attribute.
+    {
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        // p0 = a.lo·b.lo, p1 = a.hi·b.hi, pm = (a.lo⊕a.hi)·(b.lo⊕b.hi).
+        let p0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let p1 = _mm_clmulepi64_si128::<0x11>(va, vb);
+        // Qword-swap (imm 0x4E = [2,3,0,1]) then XOR yields {lo⊕hi, lo⊕hi}
+        // in each operand; clmul 0x00 of those is the Karatsuba middle.
+        let ax = _mm_xor_si128(va, _mm_shuffle_epi32::<0x4E>(va));
+        let bx = _mm_xor_si128(vb, _mm_shuffle_epi32::<0x4E>(vb));
+        let pm = _mm_clmulepi64_si128::<0x00>(ax, bx);
+        // cross = pm ⊕ p0 ⊕ p1 is the x^64 coefficient (binius's t1).
         let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
         let mut t0 = p0;
 
-        // First reduce: t1 = t1 + x^64 · t2 (mod p), with t2 = p1.
-        let t2_shifted = _mm_slli_si128::<8>(p1); // {0, p1.lo}
-        t1 = _mm_xor_si128(t1, t2_shifted);
-        let t2_red = pmull(lane1(p1), 0x87);
-        t1 = _mm_xor_si128(t1, t2_red);
-
+        // poly = {lo: 0x87, hi: 0}. clmul imm 0x01 is hi(src1)×lo(src2).
+        let poly = _mm_set_epi64x(0, 0x87);
+        // First reduce: t1 = t1 + x^64 · p1 (mod p).
+        t1 = _mm_xor_si128(t1, _mm_slli_si128::<8>(p1));
+        t1 = _mm_xor_si128(t1, _mm_clmulepi64_si128::<0x01>(p1, poly));
         // Second reduce: t0 = t0 + x^64 · t1 (mod p).
-        let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
-        t0 = _mm_xor_si128(t0, t1_shifted);
-        let t1_red = pmull(lane1(t1), 0x87);
-        t0 = _mm_xor_si128(t0, t1_red);
+        t0 = _mm_xor_si128(t0, _mm_slli_si128::<8>(t1));
+        t0 = _mm_xor_si128(t0, _mm_clmulepi64_si128::<0x01>(t1, poly));
 
         F128 {
-            lo: lane0(t0),
-            hi: lane1(t0),
+            lo: _mm_cvtsi128_si64(t0) as u64,
+            hi: _mm_extract_epi64::<1>(t0) as u64,
         }
     }
 }

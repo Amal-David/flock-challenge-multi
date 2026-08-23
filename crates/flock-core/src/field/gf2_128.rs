@@ -118,9 +118,10 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
+            // Karatsuba 3-CLMUL product + binius 2-stage xmm reduction (5
+            // CLMUL). Operands stay in xmm (`pclmulqdq` immediates +
+            // `0x01`/`{0x87,0}` folds) — same field element as the previous
+            // GPR-pinned form, fewer pins/extracts on the scalar hot path.
             unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
         }
         #[cfg(not(any(
@@ -493,12 +494,14 @@ mod tests {
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, un, "unreduced");
         }
     }
