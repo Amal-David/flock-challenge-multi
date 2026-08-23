@@ -275,7 +275,9 @@ unsafe fn stream_f128x4<const ALIGNED_ZMM: bool>(
 /// The arithmetic and dispatch are identical, but computed active lanes are
 /// streamed to four disjoint codeword rows and never stored back to scratch.
 /// The ranked odd-row optimization deliberately omits the known-zero scratch
-/// suffix; that suffix is published from a zero register, without reloading it.
+/// suffix. Normally that suffix is published from a zero register without a
+/// scratch reload; the exact `omit_zero_tail` arm leaves it for the proven
+/// final fused-three overwrite instead.
 ///
 /// # Safety
 /// Contract forwarded from the architecture dispatch wrapper. When
@@ -299,6 +301,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
     t_outer: F128,
     t_inner_a: F128,
     t_inner_b: F128,
+    omit_zero_tail: bool,
 ) {
     // SAFETY: forwarded caller contract. Match the incumbent's process-cached
     // multiply selection exactly; it remains outside the lane loop.
@@ -310,11 +313,36 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
                 false,
                 ALIGNED_ZMM,
             >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             )
         } else {
-            butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, true, ALIGNED_ZMM>(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+            butterfly_fused_2layer_publish_nt_impl::<
+                OUTER_LOW,
+                INNER_LOW,
+                true,
+                ALIGNED_ZMM,
+            >(
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             )
         }
     }
@@ -341,6 +369,7 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
     t_outer: F128,
     t_inner_a: F128,
     t_inner_b: F128,
+    omit_zero_tail: bool,
 ) {
     use core::arch::x86_64::*;
 
@@ -348,6 +377,7 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
     // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
     unsafe {
         debug_assert!(lanes == 60 || lanes == 64);
+        debug_assert!(!omit_zero_tail || (ALIGNED_ZMM && lanes == 60));
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
         debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
         let a = src;
@@ -386,11 +416,14 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             i += 4;
         }
 
-        // The exact-shape caller reaches i=60 only for odd_tail=4. That value is
-        // published from the R1CS padding descriptor, so lanes 60..64 are
-        // contractually zero. Publish a zero register: every destination byte
-        // is initialized, with no dependency or reload from the scratch suffix.
-        if i < 64 {
+        // The exact-shape caller reaches i=60 only for odd_tail=4. Normally the
+        // contractual zero is published from a zero register. The one
+        // exact `omit_zero_tail` arm instead leaves these four aligned full-line
+        // destinations untouched: its outer schedule proof says the final
+        // fused-three vector remainder ignores them and overwrites all four
+        // rows before any callback. This loop-invariant test is after all
+        // arithmetic and active-prefix stores.
+        if !omit_zero_tail && i < 64 {
             debug_assert_eq!(i, 60);
             let zero = _mm512_setzero_si512();
             stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
@@ -991,13 +1024,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
 /// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
 /// `0..dense_lanes` run the full 12-butterfly network; lanes
 /// `dense_lanes..num_ntts` run the zero-odd-row specialization (see
-/// [`super::portable::butterfly_fused_3layer_zero_odd`]).
+/// [`super::portable::butterfly_fused_3layer_zero_odd`]), loading only the
+/// even rows and overwriting all eight rows.
 ///
 /// # Safety
 /// The caller guarantees `avx512f` + `vpclmulqdq`, that the eight rows are
 /// valid and disjoint from any concurrently processed group,
-/// `dense_lanes <= num_ntts`, and that rows 1, 3, 5 and 7 are zero on lanes
-/// `dense_lanes..num_ntts`.
+/// `dense_lanes <= num_ntts`. Rows 1, 3, 5 and 7 may be arbitrary or logically
+/// uninitialized on lanes `dense_lanes..num_ntts`; those inputs are ignored
+/// and must not be read.
 ///
 /// Kept out of line (like [`butterfly_fused_4layer_row`]) so the deep-pass
 /// closure that calls it once per block does not inline two full
@@ -1214,8 +1249,9 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             lane += 1;
         }
 
-        // Published zero tail: rows 1, 3, 5, 7 are zero here, so only the
-        // four even rows are read and the deepest layer is a copy.
+        // Reduced odd tail: only the four even rows are read and the deepest
+        // layer is a copy. Odd-row inputs may be stale or never published;
+        // every output row is overwritten before returning.
         while lane + 4 <= num_ntts {
             let mut values = [zero; 8];
             for i in 0..4 {
@@ -1235,8 +1271,8 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         }
         while lane < num_ntts {
             let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *row(i).add(lane);
+            for i in 0..4 {
+                values[2 * i] = *row(2 * i).add(lane);
             }
             super::portable::butterfly_fused_3layer_zero_odd(&mut values, twiddles);
             for (i, value) in values.iter().enumerate() {
@@ -1271,6 +1307,7 @@ mod diet_tests {
         const INNER_LOW: bool,
         const DIET: bool,
         const ALIGNED_ZMM: bool,
+        const OMIT_ZERO_TAIL: bool,
     >(lanes: usize, residue: usize) {
         use core::arch::x86_64::_mm_sfence;
 
@@ -1278,6 +1315,7 @@ mod diet_tests {
             ^ ((OUTER_LOW as u64) << 1)
             ^ ((INNER_LOW as u64) << 2)
             ^ ((DIET as u64) << 3)
+            ^ ((OMIT_ZERO_TAIL as u64) << 4)
             ^ ((lanes as u64) << 8)
             ^ ((residue as u64) << 16);
         let mut next = rng(seed);
@@ -1366,14 +1404,28 @@ mod diet_tests {
                 t_outer,
                 t_inner_a,
                 t_inner_b,
+                OMIT_ZERO_TAIL,
             );
             _mm_sfence();
             for (row, out) in [dst_a, dst_b, dst_c, dst_d].into_iter().enumerate() {
+                let out = core::slice::from_raw_parts(out, 64);
                 assert_eq!(
-                    core::slice::from_raw_parts(out, 64),
-                    &want[row * 64..(row + 1) * 64],
-                    "lanes={lanes} residue={residue} row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET}",
+                    &out[..lanes],
+                    &want[row * 64..row * 64 + lanes],
+                    "active lanes mismatch: lanes={lanes} residue={residue} row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET} omit={OMIT_ZERO_TAIL}",
                 );
+                if OMIT_ZERO_TAIL {
+                    assert!(
+                        out[lanes..].iter().all(|&value| value == junk),
+                        "omitted suffix was written: row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET}",
+                    );
+                } else {
+                    assert_eq!(
+                        &out[lanes..],
+                        &want[row * 64 + lanes..(row + 1) * 64],
+                        "fallback suffix mismatch: lanes={lanes} residue={residue} row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET}",
+                    );
+                }
             }
         }
     }
@@ -1388,26 +1440,45 @@ mod diet_tests {
         unsafe {
             for lanes in [60, 64] {
                 for residue in [0, 16, 32, 48] {
-                    check_direct_publish_case::<false, false, false, false>(lanes, residue);
-                    check_direct_publish_case::<false, false, true, false>(lanes, residue);
-                    check_direct_publish_case::<false, true, false, false>(lanes, residue);
-                    check_direct_publish_case::<false, true, true, false>(lanes, residue);
-                    check_direct_publish_case::<true, false, false, false>(lanes, residue);
-                    check_direct_publish_case::<true, false, true, false>(lanes, residue);
-                    check_direct_publish_case::<true, true, false, false>(lanes, residue);
-                    check_direct_publish_case::<true, true, true, false>(lanes, residue);
+                    check_direct_publish_case::<false, false, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<false, false, true, false, false>(lanes, residue);
+                    check_direct_publish_case::<false, true, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<false, true, true, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, false, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, false, true, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, true, false, false, false>(lanes, residue);
+                    check_direct_publish_case::<true, true, true, false, false>(lanes, residue);
                     if residue == 0 {
-                        check_direct_publish_case::<false, false, false, true>(lanes, residue);
-                        check_direct_publish_case::<false, false, true, true>(lanes, residue);
-                        check_direct_publish_case::<false, true, false, true>(lanes, residue);
-                        check_direct_publish_case::<false, true, true, true>(lanes, residue);
-                        check_direct_publish_case::<true, false, false, true>(lanes, residue);
-                        check_direct_publish_case::<true, false, true, true>(lanes, residue);
-                        check_direct_publish_case::<true, true, false, true>(lanes, residue);
-                        check_direct_publish_case::<true, true, true, true>(lanes, residue);
+                        check_direct_publish_case::<false, false, false, true, false>(lanes, residue);
+                        check_direct_publish_case::<false, false, true, true, false>(lanes, residue);
+                        check_direct_publish_case::<false, true, false, true, false>(lanes, residue);
+                        check_direct_publish_case::<false, true, true, true, false>(lanes, residue);
+                        check_direct_publish_case::<true, false, false, true, false>(lanes, residue);
+                        check_direct_publish_case::<true, false, true, true, false>(lanes, residue);
+                        check_direct_publish_case::<true, true, false, true, false>(lanes, residue);
+                        check_direct_publish_case::<true, true, true, true, false>(lanes, residue);
                     }
                 }
             }
+        }
+    }
+
+    /// The exact aligned-ZMM odd-row specialization leaves the four suffix
+    /// destinations untouched for every arithmetic arm. The ordinary aligned
+    /// and XMM specializations above still publish zeros.
+    #[test]
+    fn direct_publish_exact_odd_tail_omits_only_aligned_zmm_stores() {
+        // SAFETY: this module and test binary exist only when the target has
+        // AVX-512F + VPCLMULQDQ; residue zero satisfies aligned-ZMM stores.
+        unsafe {
+            check_direct_publish_case::<false, false, false, true, true>(60, 0);
+            check_direct_publish_case::<false, false, true, true, true>(60, 0);
+            check_direct_publish_case::<false, true, false, true, true>(60, 0);
+            check_direct_publish_case::<false, true, true, true, true>(60, 0);
+            check_direct_publish_case::<true, false, false, true, true>(60, 0);
+            check_direct_publish_case::<true, false, true, true, true>(60, 0);
+            check_direct_publish_case::<true, true, false, true, true>(60, 0);
+            check_direct_publish_case::<true, true, true, true, true>(60, 0);
         }
     }
 

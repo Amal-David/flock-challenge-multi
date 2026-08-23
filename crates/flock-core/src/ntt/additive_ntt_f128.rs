@@ -829,6 +829,29 @@ const fn direct_fused2_publish_shape(log_d: usize, num_ntts: usize, odd_tail: us
     log_d == 20 && num_ntts == 64 && (odd_tail == 0 || odd_tail == 4)
 }
 
+/// Whether the exact seed-top odd-row suffix is guaranteed to be ignored by
+/// the two fused-four deep stages and overwritten by the final fused-three
+/// stage before any callback can observe it.
+///
+/// Keep this independent of the direct-publisher alignment decision: the
+/// outer transform proves the schedule, while the task dispatch separately
+/// proves that it selected an odd row and the aligned-ZMM publisher.
+#[inline]
+const fn seed_top_odd_tail_is_deep_overwritten(
+    fused4_ok: bool,
+    odd_tail: usize,
+    log_d: usize,
+    n_top: usize,
+    start_layer: usize,
+    fused3_enabled: bool,
+) -> bool {
+    fused4_ok
+        && odd_tail == 4
+        && log_d == n_top + 11
+        && start_layer <= n_top
+        && fused3_enabled
+}
+
 /// Physical staging row that holds logical row `k` in a seed+top block.
 #[inline]
 const fn seed_top_stage_row(k: usize, permuted: bool) -> usize {
@@ -1751,6 +1774,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        omit_zero_tail: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -1759,6 +1783,7 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 64 || lanes4_tail == 4);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
+        debug_assert!(!omit_zero_tail || (ALIGNED_ZMM && lanes2 == 60 && r & 1 == 1));
         let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
 
@@ -1804,6 +1829,7 @@ impl AdditiveNttF128 {
                         t_outer,
                         t_inner_a,
                         t_inner_b,
+                        omit_zero_tail,
                     );
                 }
             }
@@ -1817,6 +1843,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         log_d: usize,
         odd_tail: usize,
+        _omit_odd_tail_store_ok: bool,
     ) {
         use rayon::prelude::*;
         #[cfg(test)]
@@ -2001,6 +2028,13 @@ impl AdditiveNttF128 {
                     // 8×16-quad loop. Every 64-element destination row has a
                     // 1024-byte stride, so it preserves the base residue.
                     if direct_publish_zmm {
+                        // Only odd ranked tasks have a 60-lane suffix, and
+                        // only the outer schedule proof permits leaving that
+                        // suffix unpublished. The loop-invariant decision is
+                        // passed through the existing aligned arithmetic body;
+                        // only its final tail emission tests it.
+                        let omit_zero_tail =
+                            _omit_odd_tail_store_ok && r & 1 == 1 && lanes2 == 60;
                         self.seed_top_direct_fused2_publish::<true>(
                             bufp,
                             base,
@@ -2012,6 +2046,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            omit_zero_tail,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2025,10 +2060,13 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            false,
                         );
                     }
-                    // All 512 rows are published. Drain once for this r task;
-                    // the rayon join below is the deep pass's happens-before.
+                    // Every active prefix is published. In the exact OMIT arm
+                    // only the proven-dead four-lane suffix remains untouched.
+                    // Drain once for this r task; the rayon join below is the
+                    // deep pass's happens-before.
                     core::arch::x86_64::_mm_sfence();
                     return;
                 }
@@ -2331,6 +2369,19 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        // Snapshot the final deep-tail selector once, after `n_top` has
+        // reached its final value. The seed publisher, block-fused deep path,
+        // and sweep deep path must all agree about whether fused-three will
+        // overwrite the exact four-lane odd suffix.
+        let fused3_enabled = !ntt_fused3_disabled();
+        let omit_seed_odd_tail_store = seed_top_odd_tail_is_deep_overwritten(
+            fused4_ok,
+            odd_tail,
+            log_d,
+            n_top,
+            start_layer,
+            fused3_enabled,
+        );
         // Unit tests exercise the deep fused-four schedule through the
         // portable kernel without changing the production dispatch on CPUs
         // that do not provide AVX-512 VPCLMULQDQ.
@@ -2344,7 +2395,18 @@ impl AdditiveNttF128 {
             if let Some(msg) = seed_msg.take() {
                 // Checked above: layer == 3, top fusion on, n_top ≥ 9.
                 debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
-                self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
+                // `top_fusion_ok` includes `stream.is_none()`: no ordered
+                // stream consumer can observe the suffix before the deep
+                // fused-three stage overwrites it.
+                debug_assert!(stream.is_none());
+                self.seed_top_fused8_pass(
+                    msg,
+                    data,
+                    num_ntts,
+                    log_d,
+                    odd_tail,
+                    omit_seed_odd_tail_store,
+                );
                 crate::gaptime::mark("ntt: seed+top fused pass done");
                 layer += 6;
             } else if top_fusion_ok && layer + 5 < n_top {
@@ -2485,7 +2547,7 @@ impl AdditiveNttF128 {
         let fuse_blocks = deep_fused4_ok
             && log_d == n_top + 11
             && start_layer <= n_top
-            && !ntt_fused3_disabled()
+            && fused3_enabled
             && deep_block_fuse_enabled();
 
         let deep_sub = |sub_idx: usize,
@@ -2567,9 +2629,11 @@ impl AdditiveNttF128 {
                         }
                         let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
                         // SAFETY: eight consecutive rows of `num_ntts` lanes,
-                        // owned exclusively by this sub-group task; the zero
-                        // tail lives on odd rows exactly as in the sweep
-                        // schedule (blocks start at even global rows).
+                        // owned exclusively by this sub-group task. At the
+                        // exact ranked 60→64 suffix the four odd-row inputs
+                        // may be unpublished: the reduced kernel reads only
+                        // even rows and overwrites all eight before `cb`.
+                        // Other shapes retain their initialized zero suffix.
                         unsafe {
                             kernels::butterfly_fused_3layer_rows(
                                 eight.as_mut_ptr(),
@@ -2629,7 +2693,7 @@ impl AdditiveNttF128 {
                             );
                         }
                         layer += 4;
-                    } else if layer + 3 == log_d && !ntt_fused3_disabled() {
+                    } else if layer + 3 == log_d && fused3_enabled {
                         // Exactly three layers left (the ranked deep region is
                         // 11 layers = 4 + 4 + 3): run them as ONE fused-three
                         // sweep over eight-row groups instead of a fused-two
@@ -2645,13 +2709,14 @@ impl AdditiveNttF128 {
                         // shared atomic would otherwise sit in the hot loop.
                         #[cfg(test)]
                         FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // The published zero tail lives on ODD rows. Blocks
-                        // start at row `8·block_in_sub` of a sub-group whose
-                        // own base row is even, so row `i` of the group has
-                        // the parity of `i` and the tail is zero on rows
-                        // 1/3/5/7 — exactly the fused-three kernel's
-                        // zero-odd-row contract. The two even-stride layers
-                        // it fuses have preserved that tail up to here.
+                        // Blocks start at row `8·block_in_sub` of a sub-group
+                        // whose own base row is even, so row `i` has parity
+                        // `i`. The two preceding fused-four stages use even
+                        // strides and never read the odd suffix. At the exact
+                        // ranked 60→64 remainder that suffix may therefore be
+                        // unpublished: fused-three reads only even rows and
+                        // overwrites all eight before any observer. Other
+                        // shapes retain their initialized zero suffix.
                         let dense_lanes = num_ntts - odd_tail;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
@@ -4630,6 +4695,32 @@ mod tests {
         assert!(!direct_fused2_publish_shape(20, 64, 8));
     }
 
+    #[test]
+    fn seed_top_odd_tail_omission_requires_exact_deep_schedule() {
+        let exact = |fused4_ok, odd_tail, log_d, n_top, start_layer, fused3_enabled| {
+            seed_top_odd_tail_is_deep_overwritten(
+                fused4_ok,
+                odd_tail,
+                log_d,
+                n_top,
+                start_layer,
+                fused3_enabled,
+            )
+        };
+        assert!(exact(true, 4, 20, 9, 3, true));
+
+        // ISA, lane rounding, deep geometry, entry layer and final fused-three
+        // are independent gates. In particular n_top=10 is forbidden: its
+        // different deep schedule can read the odd suffix before overwrite.
+        assert!(!exact(false, 4, 20, 9, 3, true));
+        assert!(!exact(true, 0, 20, 9, 3, true));
+        assert!(!exact(true, 7, 20, 9, 3, true));
+        assert!(!exact(true, 4, 19, 9, 3, true));
+        assert!(!exact(true, 4, 20, 10, 3, true));
+        assert!(!exact(true, 4, 20, 9, 10, true));
+        assert!(!exact(true, 4, 20, 9, 3, false));
+    }
+
     /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs
     /// the separate seed pass + fused top, vs the scalar full NTT, on the
     /// `rs_encode_interleaved` path (which the ranked commit uses through
@@ -4966,8 +5057,9 @@ mod tests {
             }
             assert!(dense == expected, "fused3 leaf mismatch at num_ntts={num_ntts}");
 
-            // Zero-odd-row tail: zero rows 1/3/5/7 on the last `tail` lanes
-            // and check the reduced network reproduces the dense one.
+            // Ignored odd-row tail: the dense oracle receives zeros, while
+            // the reduced kernel receives poison in rows 1/3/5/7. Matching
+            // outputs prove both vector and scalar tails load only even rows.
             for tail in 1..num_ntts.min(9) {
                 let dense_lanes = num_ntts - tail;
                 let mut armed = base.clone();
@@ -4987,8 +5079,16 @@ mod tests {
                     );
                 }
                 let mut got = armed;
-                // SAFETY: same geometry; rows 1/3/5/7 are zero past
-                // `dense_lanes`, which is the kernel's tail contract.
+                for i in [1usize, 3, 5, 7] {
+                    for lane in dense_lanes..num_ntts {
+                        got[i * num_ntts + lane] = F128 {
+                            lo: 0xA11D_0000 ^ ((i * num_ntts + lane) as u64),
+                            hi: 0x0DD0_0000 ^ ((lane * 8 + i) as u64),
+                        };
+                    }
+                }
+                // SAFETY: same geometry; odd-row inputs past `dense_lanes`
+                // are arbitrary by contract and must not be read.
                 unsafe {
                     kernels::butterfly_fused_3layer_rows(
                         got.as_mut_ptr(),
@@ -4999,7 +5099,7 @@ mod tests {
                 }
                 assert!(
                     got == want,
-                    "fused3 zero-odd tail mismatch at num_ntts={num_ntts} tail={tail}"
+                    "fused3 ignored-odd tail mismatch at num_ntts={num_ntts} tail={tail}"
                 );
             }
         }
@@ -5071,6 +5171,163 @@ mod tests {
                 "fused-three deep tail mismatch at log_d={log_d} num_ntts={num_ntts}"
             );
         }
+    }
+
+    /// The exact ranked deep region is 11 layers (4 + 4 + 3). Its first two
+    /// stages use even row strides, so they cannot observe lanes 60..64 on an
+    /// odd row. The final fused-three stage consumes one complete four-lane
+    /// reduced-tail vector, reads only even rows, and overwrites all eight.
+    ///
+    /// Poison every unpublished odd-row suffix at the deep-region entrance
+    /// and compare the complete 2,048-row output against a zero-initialized
+    /// control under both production orderings: sweep and block-fused.
+    #[test]
+    fn poisoned_odd_tail_is_ignored_by_full_ranked_deep_region() {
+        const LOG_D: usize = 20;
+        const DEEP_START: usize = 9;
+        const SUB_IDX: usize = 173;
+        const NUM_NTTS: usize = 64;
+        const ODD_TAIL: usize = 4;
+        const POSITIONS: usize = 1 << (LOG_D - DEEP_START);
+        const DENSE_LANES: usize = NUM_NTTS - ODD_TAIL;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut rng = Rng::new(0x0DD7_A11D_DEE9_0008);
+        let mut zero_tail = rand_vec(&mut rng, POSITIONS * NUM_NTTS);
+        for row in (1..POSITIONS).step_by(2) {
+            zero_tail[row * NUM_NTTS + DENSE_LANES..(row + 1) * NUM_NTTS]
+                .fill(F128::ZERO);
+        }
+        let mut poisoned_tail = zero_tail.clone();
+        for row in (1..POSITIONS).step_by(2) {
+            for lane in DENSE_LANES..NUM_NTTS {
+                poisoned_tail[row * NUM_NTTS + lane] = F128 {
+                    lo: 0xA11D_0000_0000_0000 ^ ((row as u64) << 6) ^ lane as u64,
+                    hi: 0xDEAD_0000_0000_0000 ^ ((lane as u64) << 20) ^ row as u64,
+                };
+            }
+        }
+
+        let make_tw4 = |layer: usize, block: usize| {
+            let mut tw = [F128::ZERO; 15];
+            tw[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = ntt.twiddle(layer + 3, 8 * block + s);
+            }
+            tw
+        };
+        let make_tw3 = |layer: usize, block: usize| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+
+        let run_deep = |data: &mut [F128], block_fuse: bool| {
+            // Relative layers 0..4: one 2,048-row block, stride 128.
+            let tw0 = make_tw4(DEEP_START, SUB_IDX);
+            butterfly_interleaved_fused_4layer_rows(
+                data,
+                &tw0,
+                128,
+                NUM_NTTS,
+                ODD_TAIL,
+                0,
+            );
+
+            const BLOCK_ROWS: usize = 128;
+            const BLOCK_ELEMS: usize = BLOCK_ROWS * NUM_NTTS;
+            if block_fuse {
+                // Production block-fused ordering: finish each 128-row block
+                // through relative layers 4..11 before moving to the next.
+                for block in 0..16 {
+                    let blk = &mut data[block * BLOCK_ELEMS..(block + 1) * BLOCK_ELEMS];
+                    let global_block4 = SUB_IDX * 16 + block;
+                    let tw4 = make_tw4(DEEP_START + 4, global_block4);
+                    butterfly_interleaved_fused_4layer_rows(
+                        blk,
+                        &tw4,
+                        8,
+                        NUM_NTTS,
+                        ODD_TAIL,
+                        0,
+                    );
+                    for j in 0..16 {
+                        let global_block8 = global_block4 * 16 + j;
+                        let tw3 = make_tw3(DEEP_START + 8, global_block8);
+                        let rows = &mut blk[j * 8 * NUM_NTTS..(j + 1) * 8 * NUM_NTTS];
+                        // SAFETY: eight consecutive rows. The reduced suffix
+                        // deliberately contains poison on odd rows; its
+                        // even-only-load contract is the property under test.
+                        unsafe {
+                            kernels::butterfly_fused_3layer_rows(
+                                rows.as_mut_ptr(),
+                                NUM_NTTS,
+                                DENSE_LANES,
+                                &tw3,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Production sweep ordering: complete the second fused-four
+                // sweep for all blocks, then the fused-three sweep for all
+                // 256 eight-row groups.
+                for block in 0..16 {
+                    let global_block4 = SUB_IDX * 16 + block;
+                    let tw4 = make_tw4(DEEP_START + 4, global_block4);
+                    let blk = &mut data[block * BLOCK_ELEMS..(block + 1) * BLOCK_ELEMS];
+                    butterfly_interleaved_fused_4layer_rows(
+                        blk,
+                        &tw4,
+                        8,
+                        NUM_NTTS,
+                        ODD_TAIL,
+                        0,
+                    );
+                }
+                for group in 0..256 {
+                    let global_block8 = SUB_IDX * 256 + group;
+                    let tw3 = make_tw3(DEEP_START + 8, global_block8);
+                    let rows = &mut data
+                        [group * 8 * NUM_NTTS..(group + 1) * 8 * NUM_NTTS];
+                    // SAFETY: same exact geometry and ignored odd suffix as
+                    // the block-fused arm above.
+                    unsafe {
+                        kernels::butterfly_fused_3layer_rows(
+                            rows.as_mut_ptr(),
+                            NUM_NTTS,
+                            DENSE_LANES,
+                            &tw3,
+                        );
+                    }
+                }
+            }
+        };
+
+        let mut zero_sweep = zero_tail.clone();
+        run_deep(&mut zero_sweep, false);
+        let mut poison_sweep = poisoned_tail.clone();
+        run_deep(&mut poison_sweep, false);
+        assert_eq!(poison_sweep, zero_sweep, "sweep schedule observed odd-tail poison");
+
+        let mut zero_block = zero_tail;
+        run_deep(&mut zero_block, true);
+        let mut poison_block = poisoned_tail;
+        run_deep(&mut poison_block, true);
+        assert_eq!(poison_block, zero_block, "block-fused schedule observed odd-tail poison");
+        assert_eq!(zero_block, zero_sweep, "deep schedule ordering changed the output");
     }
 
     /// Portable replica of `butterfly_fused_2layer_row_from` (dense).

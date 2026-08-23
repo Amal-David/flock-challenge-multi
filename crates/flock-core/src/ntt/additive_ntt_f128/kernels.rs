@@ -158,8 +158,10 @@ pub(super) fn butterfly_fused_2layer(
 /// `dst_a` through `dst_d` must each expose 64 writable, 16-byte-aligned
 /// elements, be mutually disjoint, and not overlap `src`. `lanes` must be 60
 /// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
-/// fallback only requires 16-byte alignment. The cfg gate guarantees the
-/// required target features.
+/// fallback only requires 16-byte alignment. When `omit_zero_tail`, the caller
+/// additionally guarantees the exact 60-lane odd-row shape and that the final
+/// fused-three deep stage overwrites lanes 60..64 before any observer. The cfg
+/// gate guarantees the required target features.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -178,6 +180,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     t_outer: F128,
     t_inner_a: F128,
     t_inner_b: F128,
+    omit_zero_tail: bool,
 ) {
     debug_assert!(lanes == 60 || lanes == 64);
     debug_assert_eq!(dst_a as usize % 16, 0);
@@ -188,6 +191,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     debug_assert!(!ALIGNED_ZMM || dst_b as usize % 64 == 0);
     debug_assert!(!ALIGNED_ZMM || dst_c as usize % 64 == 0);
     debug_assert!(!ALIGNED_ZMM || dst_d as usize % 64 == 0);
+    debug_assert!(!omit_zero_tail || (ALIGNED_ZMM && lanes == 60));
 
     // Match `butterfly_fused_2layer` exactly: both low-twiddle decisions are
     // made once outside the lane loop, and the x86 leaf makes the same
@@ -205,28 +209,68 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
                 false,
                 ALIGNED_ZMM,
             >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             ),
             (false, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
                 false,
                 true,
                 ALIGNED_ZMM,
             >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             ),
             (true, false) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
                 true,
                 false,
                 ALIGNED_ZMM,
             >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             ),
             (true, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
                 true,
                 true,
                 ALIGNED_ZMM,
             >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                src,
+                src_step,
+                dst_a,
+                dst_b,
+                dst_c,
+                dst_d,
+                lanes,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                omit_zero_tail,
             ),
         }
     }
@@ -621,13 +665,16 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// Process one fused-three-layer group of eight consecutive rows.
 ///
 /// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
-/// full three-layer network; on lanes `dense_lanes..num_ntts` the group's odd
-/// rows are known to be zero and the reduced network runs instead.
+/// full three-layer network; on lanes `dense_lanes..num_ntts` the reduced
+/// zero-odd network runs and reads only rows 0, 2, 4 and 6. The odd-row input
+/// slots in that suffix are ignored and all eight output rows are overwritten.
 ///
 /// # Safety
 /// The caller must ensure the eight rows are valid and disjoint from any row
-/// group being processed concurrently, that `dense_lanes <= num_ntts`, and
-/// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
+/// group being processed concurrently and that `dense_lanes <= num_ntts`.
+/// The caller may leave rows 1, 3, 5 and 7 arbitrary (or logically
+/// uninitialized) on lanes `dense_lanes..num_ntts`; no implementation may
+/// read those suffix slots before overwriting them.
 #[inline]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
@@ -642,7 +689,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         target_feature = "vpclmulqdq"
     ))]
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry, disjointness and zero-tail contract. The shaped arm only
+    // geometry, disjointness and ignored-odd-tail contract. The shaped arm only
     // fires when the constant equals the runtime shape (value-identical).
     unsafe {
         if super::ntt_shaped_enabled() && num_ntts == 64 {

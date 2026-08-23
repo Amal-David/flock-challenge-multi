@@ -337,12 +337,14 @@ pub(super) fn butterfly_fused_3layer_zero_odd(values: &mut [F128; 8], twiddles: 
 ///
 /// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
 /// `0..dense_lanes` run the full network; lanes `dense_lanes..num_ntts` run
-/// [`butterfly_fused_3layer_zero_odd`].
+/// [`butterfly_fused_3layer_zero_odd`], reading only rows 0, 2, 4 and 6 and
+/// overwriting all eight rows.
 ///
 /// # Safety
 /// The caller must ensure the eight rows are valid and disjoint from any
-/// group processed concurrently, `dense_lanes <= num_ntts`, and that rows
-/// 1, 3, 5 and 7 are zero on lanes `dense_lanes..num_ntts`.
+/// group processed concurrently and `dense_lanes <= num_ntts`. Rows 1, 3, 5
+/// and 7 may be arbitrary or logically uninitialized on lanes
+/// `dense_lanes..num_ntts`; those input slots are never read.
 #[cfg(any(
     not(all(
         target_arch = "x86_64",
@@ -359,16 +361,22 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 ) {
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..dense_lanes {
             let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(i * num_ntts + lane);
             }
-            if lane < dense_lanes {
-                butterfly_fused_3layer(&mut values, twiddles);
-            } else {
-                butterfly_fused_3layer_zero_odd(&mut values, twiddles);
+            butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *ptr.add(i * num_ntts + lane) = *value;
             }
+        }
+        for lane in dense_lanes..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for i in 0..4 {
+                values[2 * i] = *ptr.add(2 * i * num_ntts + lane);
+            }
+            butterfly_fused_3layer_zero_odd(&mut values, twiddles);
             for (i, value) in values.iter().enumerate() {
                 *ptr.add(i * num_ntts + lane) = *value;
             }
