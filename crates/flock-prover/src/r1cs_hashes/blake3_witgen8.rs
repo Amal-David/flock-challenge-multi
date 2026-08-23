@@ -65,6 +65,20 @@ const ELIDE_B_TAIL_CHUNK: usize = 59;
 const ELIDE_B_TAIL_CHUNK_WIN: usize = 60;
 const ELIDE_B_PREFIX_CHUNKS: usize = 4;
 const LAST_WORD: usize = (USEFUL_BITS - 1) / 32;
+/// First two drain steps (words 0..31) sit entirely inside b's MAX prefix
+/// (words 0..35). Step 2 (32..47) mixes four MAX words with the first data
+/// word and is left on the incumbent `tr8`.
+const B_MAX_FULL_STEPS: usize = 2;
+/// Last drain step (words 496..511). The zero fill starts at word 482;
+/// step 30 (480..495) still owns data words 480/481 and stays on `tr8`.
+const ZERO_FULL_STEP_WORD: usize = U32_PER_BLOCK - STEP_WORDS;
+const _CONST_TR_GEOMETRY: () = {
+    assert!(B_MAX_FULL_STEPS * STEP_WORDS <= 36);
+    assert!((B_MAX_FULL_STEPS + 1) * STEP_WORDS > 36);
+    assert!(ZERO_FULL_STEP_WORD > LAST_WORD);
+    assert!(ZERO_FULL_STEP_WORD % STEP_WORDS == 0);
+    assert!(ZERO_FULL_STEP_WORD + STEP_WORDS == U32_PER_BLOCK);
+};
 const _ELIDE_GEOMETRY: () = {
     assert!(8 * ELIDE_ZERO_CHUNK >= USEFUL_BITS.div_ceil(32));
     assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
@@ -796,6 +810,22 @@ fn spread_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_WIT_CONST_TR=1` restores `tr8` + `vand` on drain steps whose
+/// ring words are layout-constant (b's MAX prefix, the all-zero tail).
+/// Default ON: those steps broadcast the constant and skip the shuffle
+/// network. `tr8` is a bit permutation, so all-ones and all-zeros are
+/// fixed points; `z = a & b` then collapses to `z = a` or `z = 0`.
+fn const_tr8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIT_CONST_TR").is_none());
+    *ON
+}
+
+#[inline(always)]
+fn splat8(v: V8) -> [V8; 8] {
+    [v; 8]
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -1247,8 +1277,32 @@ impl Drain8<'_> {
                 // Every packed row satisfies `z = a & b` and `tr8` is a bit
                 // permutation, so the Z rows are derived from the transposed
                 // A/B rows instead of transposing a third Z ring.
-                let a_lo = tr8_chunk(self.ast, rw);
-                let a_hi = tr8_chunk(self.ast, rw + 8);
+                //
+                // Layout constants: b words 0..35 are `u32::MAX` and words
+                // 482..511 are zero on a/b/z. A bit permutation of an
+                // all-ones (resp. all-zeros) vector is itself, so those
+                // full steps skip `tr8`/`vand` and broadcast. Staging and
+                // NT/elide flags are unchanged — bstatic windows still see
+                // the same 64-byte MAX/zero slabs.
+                let (a_lo, a_hi, b_lo, b_hi, z_lo, z_hi) = if const_tr8_enabled()
+                    && abs_word >= ZERO_FULL_STEP_WORD
+                {
+                    let z = splat8(dup_u32(0));
+                    (z, z, z, z, z, z)
+                } else {
+                    let a_lo = tr8_chunk(self.ast, rw);
+                    let a_hi = tr8_chunk(self.ast, rw + 8);
+                    if const_tr8_enabled() && abs_word < B_MAX_FULL_STEPS * STEP_WORDS {
+                        let ones = splat8(dup_u32(u32::MAX));
+                        (a_lo, a_hi, ones, ones, a_lo, a_hi)
+                    } else {
+                        let b_lo = tr8_chunk(self.bs, rw);
+                        let b_hi = tr8_chunk(self.bs, rw + 8);
+                        let z_lo = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
+                        let z_hi = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
+                        (a_lo, a_hi, b_lo, b_hi, z_lo, z_hi)
+                    }
+                };
                 for r in 0..8 {
                     let p = sa.add(r * STEP_WORDS);
                     store_v8(p, a_lo[r]);
@@ -1258,8 +1312,6 @@ impl Drain8<'_> {
                         widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
                     }
                 }
-                let b_lo = tr8_chunk(self.bs, rw);
-                let b_hi = tr8_chunk(self.bs, rw + 8);
                 for r in 0..8 {
                     let p = sb.add(r * STEP_WORDS);
                     store_v8(p, b_lo[r]);
@@ -1273,8 +1325,6 @@ impl Drain8<'_> {
                         );
                     }
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
 
                 let g = abs_word / 8;
                 let mut flags = base;
@@ -2073,6 +2123,44 @@ mod tests {
                     store_v8(direct_words.as_mut_ptr(), direct[row]);
                     store_v8(derived_words.as_mut_ptr(), derived);
                     assert_eq!(derived_words, direct_words, "case={case} row={row}");
+                }
+            }
+        }
+    }
+
+    /// `tr8` is a bit permutation: all-ones and all-zeros are fixed points,
+    /// and `a & MAX == a`. The drain's constant-ring short-circuit broadcasts
+    /// those values instead of shuffling.
+    #[test]
+    fn tr8_of_constant_words_is_broadcast() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            let ones = dup_u32(u32::MAX);
+            let zeros = dup_u32(0);
+            let t_ones = tr8(ones, ones, ones, ones, ones, ones, ones, ones);
+            let t_zeros = tr8(zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros);
+            for row in 0..8 {
+                assert_eq!(lanes(t_ones[row]), [u32::MAX; 8], "ones row {row}");
+                assert_eq!(lanes(t_zeros[row]), [0u32; 8], "zeros row {row}");
+            }
+            let mut state = 0xA5A5_5A5A_3C3C_C3C3u64;
+            for _ in 0..8 {
+                let av: [V8; 8] = core::array::from_fn(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    dup_u32(state as u32)
+                });
+                let at = tr8(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]);
+                let bt = splat8(ones);
+                for row in 0..8 {
+                    assert_eq!(
+                        lanes(and_v8(at[row], bt[row])),
+                        lanes(at[row]),
+                        "a & MAX == a row {row}"
+                    );
                 }
             }
         }
