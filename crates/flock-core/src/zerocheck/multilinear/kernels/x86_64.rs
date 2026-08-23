@@ -1224,11 +1224,13 @@ unsafe fn fold16_to_4_deferred(
     }
 }
 
-/// Store one ZMM as four XMM non-temporal quarters. Large pool allocations
-/// land 16 mod 64, so a 64-byte-aligned ZMM stream is unreachable; `F128`
-/// is `repr(C, align(16))`, so every `Vec<F128>` base — and every F128
-/// element offset from it — is 16-byte aligned by the allocation layout
-/// (a language guarantee, not malloc folklore).
+/// Store one ZMM as four XMM non-temporal quarters. Ranked large-pool
+/// allocations land 16 mod 64, so selecting a 64-byte ZMM stream per output
+/// only adds a repeatedly-false alignment branch. `F128` is
+/// `repr(C, align(16))`, so every `Vec<F128>` base — and every F128 element
+/// offset from it — is 16-byte aligned by the allocation layout (a language
+/// guarantee, not malloc folklore). Four XMM stores are value-exact at both
+/// 16-byte-only and 64-byte alignment.
 ///
 /// # Safety
 /// `p` must be 16-byte aligned and cover 4 F128s; avx512f is required (the
@@ -1237,14 +1239,8 @@ unsafe fn fold16_to_4_deferred(
 #[inline(always)]
 unsafe fn stream_zmm_as_xmm4(p: *mut F128, v: core::arch::x86_64::__m512i) {
     use core::arch::x86_64::*;
-    // SAFETY: alignment per the contract; features per the cfg above. At
-    // 64-alignment (the allocator's recyclable class on this lineage) one
-    // single-uop ZMM stream publishes the whole line.
+    // SAFETY: alignment per the contract; features per the cfg above.
     unsafe {
-        if p as usize % 64 == 0 {
-            _mm512_stream_si512(p as *mut __m512i, v);
-            return;
-        }
         let d = p as *mut __m128i;
         _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
         _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
