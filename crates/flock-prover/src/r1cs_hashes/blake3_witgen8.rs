@@ -1881,3 +1881,4 @@ mod tests {
 // witfire-7 draw marker 10514
 // witfire-16 draw marker 2194
 // fire51: fresh draw on new bar 3852475 (rival NTT promotion)
+// witfire-52 draw marker 1788
