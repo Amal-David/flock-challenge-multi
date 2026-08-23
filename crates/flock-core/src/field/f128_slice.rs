@@ -107,6 +107,78 @@ pub(crate) fn fold_two_and_msg_in_place(
     fold_two_and_msg_in_place_scalar(f, b, r)
 }
 
+/// Ranked default fuses the post-DirectFold8 open sumcheck's three x86
+/// passes (`fold_pairs(f)`, `fold_pairs(b)`, `msg_reduce`) into one
+/// register-resident product. `FLOCK_NO_OPEN_FOLD_MSG_FUSE=1` restores the
+/// three-pass form. Read once per process; default ON.
+fn fold_msg_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD_MSG_FUSE").is_none());
+    *ON
+}
+
+/// Out-of-place adjacent-pair fold of two source runs plus the `(u0,u2)`
+/// message. Field-identical to `fold_pairs` on each run followed by the
+/// even/odd message reduction over the destinations. Ranked SPR uses the
+/// fused AVX-512 kernel; other builds and the kill switch keep the three
+/// separate passes.
+#[inline]
+pub(crate) fn fold_two_from_pairs_and_msg(
+    f_src: &[F128],
+    b_src: &[F128],
+    base: usize,
+    f_dst: &mut [F128],
+    b_dst: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    assert_eq!(f_dst.len(), b_dst.len());
+    assert!(
+        base + f_dst.len() <= f_src.len() / 2 && base + b_dst.len() <= b_src.len() / 2,
+        "fold source must contain both elements for every destination pair"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if fold_msg_fuse_enabled() && f_dst.len().is_multiple_of(4) {
+        // SAFETY: cfg gate guarantees avx512f+vpclmulqdq; the bounds check
+        // above guarantees both source elements for every destination.
+        return unsafe {
+            x86_64::fold_two_from_pairs_and_msg(f_src, b_src, base, f_dst, b_dst, r)
+        };
+    }
+
+    fold_two_from_pairs_and_msg_scalar(f_src, b_src, base, f_dst, b_dst, r)
+}
+
+/// Three-pass oracle: two `fold_pairs` plus the scalar even/odd message.
+pub(super) fn fold_two_from_pairs_and_msg_scalar(
+    f_src: &[F128],
+    b_src: &[F128],
+    base: usize,
+    f_dst: &mut [F128],
+    b_dst: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    fold_pairs(f_src, base, f_dst, r);
+    fold_pairs(b_src, base, b_dst, r);
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    let mut k = 0usize;
+    while k + 1 < f_dst.len() {
+        let f0 = f_dst[k];
+        let f1 = f_dst[k + 1];
+        let b0 = b_dst[k];
+        let b1 = b_dst[k + 1];
+        u0 += f0 * b0;
+        u2 += (f0 + f1) * (b0 + b1);
+        k += 2;
+    }
+    (u0, u2)
+}
+
 /// Scalar DirectFold8 bind. Also the kill-switch restore and the test oracle.
 pub(super) fn fold_two_and_msg_in_place_scalar(
     f: &mut Vec<F128>,
@@ -335,6 +407,47 @@ mod tests {
         }
     }
 
+    /// Out-of-place fused fold+msg equals two `fold_pairs` plus the scalar
+    /// even/odd message, including a 4-slot tail that misses the 8-output
+    /// SIMD body and a dirty destination (scratch-recycled buffers).
+    #[test]
+    fn fold_two_from_pairs_and_msg_matches_three_pass() {
+        use super::*;
+        let mut state = 0xA11_F01D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [4usize, 8, 12, 16, 64, 256, 2048] {
+            let r = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let f: Vec<F128> = (0..2 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let b: Vec<F128> = (0..2 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut f_got: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut b_got: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut f_want = vec![F128::ZERO; n];
+            let mut b_want = vec![F128::ZERO; n];
+            let got = fold_two_from_pairs_and_msg(&f, &b, 0, &mut f_got, &mut b_got, r);
+            let want = fold_two_from_pairs_and_msg_scalar(&f, &b, 0, &mut f_want, &mut b_want, r);
+            assert_eq!(got, want, "message n={n}");
+            assert_eq!(f_got, f_want, "folded f n={n}");
+            assert_eq!(b_got, b_want, "folded b n={n}");
+        }
+    }
 
     /// The three split-half leaves match the straightforward scalar formulas
     /// at lengths that hit the four-slot body, every tail residue, and the

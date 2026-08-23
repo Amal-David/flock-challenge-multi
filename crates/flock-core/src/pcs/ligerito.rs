@@ -4410,6 +4410,16 @@ fn fold_and_msg_lsb_inner(
                 }
             }
             let len = fc.len();
+            // After DirectFold8 the remaining open folds start at 2^19, so
+            // the NT leaf (`half >= 2^21`) never runs. The three-pass form
+            // (fold f, fold b, reload for msg) is then the leftover x86
+            // cousin of the fused aarch64 SoA leaf. Fuse when there is no
+            // lazy-OOD correction sitting between the b fold and the msg.
+            if lazy_ood.is_none() {
+                return crate::field::f128_slice::fold_two_from_pairs_and_msg(
+                    f, b, base, fc, bc, r,
+                );
+            }
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);

@@ -334,6 +334,107 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     }
 }
 
+/// Adjacent-pair fold of two source runs into two destinations, fused with
+/// the `(u0,u2)` message. Same permute body as [`fold_pairs`] and the same
+/// even/odd message layout as [`fold_two_and_msg_in_place`]. Destinations
+/// are a separate half-length prefix, so this is the out-of-place cousin
+/// used by the recursive open sumcheck (`fold_and_msg_lsb`) after DirectFold8
+/// leaves `half < 2^21` (the NT leaf never runs at that geometry).
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `f_dst.len() == b_dst.len()`,
+/// multiple of 4; `f_src`/`b_src` contain both pair members for every
+/// destination slot starting at pair `base`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_two_from_pairs_and_msg(
+    f_src: &[F128],
+    b_src: &[F128],
+    base: usize,
+    f_dst: &mut [F128],
+    b_dst: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, WideGhashX4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(f_dst.len(), b_dst.len());
+    debug_assert!(f_dst.len().is_multiple_of(4));
+    let half = f_dst.len();
+    debug_assert!(base + half <= f_src.len() / 2);
+    debug_assert!(base + half <= b_src.len() / 2);
+
+    // SAFETY: caller guarantees features, pair occupancy, and that dest
+    // writes do not overlap unread source (separate buffers).
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+        let fold4 = |ptr: *const F128, t: usize| -> __m512i {
+            let s = 2 * (base + t);
+            let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
+            let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
+            let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+            let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+            _mm512_xor_si512(even, ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)))
+        };
+
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let f_ptr = f_src.as_ptr();
+        let b_ptr = b_src.as_ptr();
+        let fd = f_dst.as_mut_ptr();
+        let bd = b_dst.as_mut_ptr();
+        let lanes = half & !7;
+        let mut t = 0usize;
+        while t < lanes {
+            let f0 = fold4(f_ptr, t);
+            let f1 = fold4(f_ptr, t + 4);
+            let b0 = fold4(b_ptr, t);
+            let b1 = fold4(b_ptr, t + 4);
+            _mm512_storeu_si512(fd.add(t) as *mut __m512i, f0);
+            _mm512_storeu_si512(fd.add(t + 4) as *mut __m512i, f1);
+            _mm512_storeu_si512(bd.add(t) as *mut __m512i, b0);
+            _mm512_storeu_si512(bd.add(t + 4) as *mut __m512i, b1);
+
+            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            t += 8;
+        }
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        while t < half {
+            let source = 2 * (base + t);
+            let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
+            let f1 = *f_ptr.add(source + 2)
+                + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
+            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
+            let b1 = *b_ptr.add(source + 2)
+                + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            *fd.add(t) = f0;
+            *fd.add(t + 1) = f1;
+            *bd.add(t) = b0;
+            *bd.add(t + 1) = b1;
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            t += 2;
+        }
+        (u0, u2)
+    }
+}
+
 /// Four-lane split-half bind: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.
 ///
 /// The two operand runs are separate contiguous slices (the top-bit split of
