@@ -18,15 +18,14 @@
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
 
 use super::{
-    ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE,
+    Compression, ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, GS_BASE, G_STRIDE, K, OUT_HI_BASE,
     USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
-    ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_table_images, Round1AbTableImages, Round1AbWindowPlan, ROUND1_AB_OFF_WORDS,
 };
 
 const REC_C0: usize = 0;
@@ -168,8 +167,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +203,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +214,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +223,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -339,15 +329,18 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
     {
-        // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
+        // One VPTERNLOGD (AVX512VL, EVEX.256) folds the AND+OR of the AVX2
         // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
         // Bit-identical; the carry-packing is the hot half of the witness
         // G-functions, and on the ranked runner the ternlog saves one op per
         // push (~16 per G, ~900 per 8-block call). The mask is a compile-time
         // constant here (N is literal), so it folds into the ternlog's memory
         // operand or a constant broadcast; no register pressure change.
+        // Fix: gate on avx512vl (not avx512f) — EVEX.256 ternlog needs VL, and
+        // the fallback cfg must be the exact complement to avoid duplicate defs
+        // on avx512f-only hosts.
         unsafe {
             let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
             _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
@@ -636,7 +629,11 @@ macro_rules! pushf8 {
     ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
         $w.push::<{ ($pos % 32) as i32 }, $width, {
             let u = ($pos % 32) as i32;
-            if u == 0 { 1 } else { 32 - u }
+            if u == 0 {
+                1
+            } else {
+                32 - u
+            }
         }, { $pos / 32 }>($v);
     }};
 }
@@ -1011,9 +1008,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1198,11 +1193,7 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
@@ -1242,7 +1233,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1608,8 +1603,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
