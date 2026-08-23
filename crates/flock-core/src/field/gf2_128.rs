@@ -493,19 +493,21 @@ mod tests {
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, un, "unreduced");
         }
     }
 
     /// The 4-lane VPCLMULQDQ multiply must agree, lane for lane, with the
-    /// canonical scalar `F128::mul` — the clmul `0x87` reduction reaches the
-    /// same field element by a different route, so verify, don't assume.
+    /// canonical scalar `F128::mul` — Karatsuba 5-CLMUL and the schoolbook
+    /// 6-CLMUL reduction reach the same field element by different routes.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -544,6 +546,23 @@ mod tests {
                     "lane {lane}: x4 != scalar mul"
                 );
             }
+            // Direct Karatsuba vs schoolbook, same registers.
+            let (k, s): ([F128; 4], [F128; 4]) = unsafe {
+                let x = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
+                let y = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
+                let mut k = [F128::ZERO; 4];
+                let mut s = [F128::ZERO; 4];
+                _mm512_storeu_si512(
+                    k.as_mut_ptr() as *mut __m512i,
+                    x86_64::ghash_mul_x4_karatsuba(x, y),
+                );
+                _mm512_storeu_si512(
+                    s.as_mut_ptr() as *mut __m512i,
+                    x86_64::ghash_mul_x4_schoolbook(x, y),
+                );
+                (k, s)
+            };
+            assert_eq!(k, s, "x4 karatsuba != x4 schoolbook");
         }
     }
 

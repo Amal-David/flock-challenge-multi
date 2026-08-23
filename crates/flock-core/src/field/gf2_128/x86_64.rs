@@ -284,6 +284,17 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     }
 }
 
+/// `{lo⊕hi, lo⊕hi}` in each 128-bit lane. `vpshufd 0x4E` swaps the two
+/// qwords of the lane; XOR with the original puts the Karatsuba middle
+/// operand in both qwords so `clmul 0x00` of two such vectors is
+/// `(x.lo⊕x.hi)·(y.lo⊕y.hi)`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_halves_x4(v: __m512i) -> __m512i {
+    _mm512_xor_si512(v, _mm512_shuffle_epi32::<0x4E>(v))
+}
+
 /// Reduce four lanes of an XOR-accumulated unreduced product triple
 /// `(lo = Σ x.lo·y.lo, mid = Σ (x.hi·y.lo ^ x.lo·y.hi), hi = Σ x.hi·y.hi)`
 /// — the same two-step fold [`ghash_mul_x4`] applies to a single product.
@@ -305,8 +316,19 @@ pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m
 }
 
 /// 4 independent GF(2^128) products. `x` and `y` each hold 4 contiguous
-/// `F128`; the result holds the 4 reduced products. Field-identical to
-/// applying `ghash_mul_binius` to each lane.
+/// `F128`; the result holds the 4 reduced products.
+///
+/// Karatsuba 3-CLMUL product + the same two-stage `0x87` fold as
+/// [`ghash_mul_karatsuba_vec`]: 5 VPCLMUL instead of the 6-CLMUL schoolbook
+/// (`0x00`/`0x01`/`0x10`/`0x11` + two reductions). Middle coefficient
+/// `(x.lo⊕x.hi)·(y.lo⊕y.hi) ⊕ x.lo·y.lo ⊕ x.hi·y.hi` is the schoolbook
+/// cross `x.hi·y.lo ⊕ x.lo·y.hi`, so the reduced element is identical.
+///
+/// This is not the split-twiddle (`ghash_mul_x4_split`) form: no companion
+/// `t·x^64` is required, so variable×variable products (zerocheck round-2
+/// `a·b`, fold `r·(even⊕odd)` with a non-hoisted operand, ligerito glue)
+/// get the 5-CLMUL count. NTT butterflies already use split and are
+/// unchanged.
 ///
 /// # Safety
 /// Caller must ensure `avx512f` + `vpclmulqdq` are available (statically
@@ -315,6 +337,20 @@ pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe { ghash_mul_x4_karatsuba(x, y) }
+}
+
+/// Schoolbook 4-product + 2-reduce (6 VPCLMUL). Oracle for
+/// [`ghash_mul_x4_karatsuba`]; also the historical `ghash_mul_x4` body.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub unsafe fn ghash_mul_x4_schoolbook(x: __m512i, y: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         // Cross terms: x.hi·y.lo (imm 0x01) ^ x.lo·y.hi (imm 0x10), at x^64.
@@ -327,6 +363,27 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
         // Low product x.lo·y.lo (imm 0x00), then fold t1 down to the result.
         let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
         gf2_128_reduce_x4(t0, t1)
+    }
+}
+
+/// Karatsuba 3-product + 2-reduce (5 VPCLMUL). Field-identical to
+/// [`ghash_mul_x4_schoolbook`].
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_karatsuba(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let p0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let p1 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let pm = _mm512_clmulepi64_epi128::<0x00>(xor_halves_x4(x), xor_halves_x4(y));
+        // t1 = pm ⊕ p0 ⊕ p1, the schoolbook middle coefficient.
+        let t1 = _mm512_ternarylogic_epi64::<0x96>(pm, p0, p1);
+        let t1 = gf2_128_reduce_x4(t1, p1);
+        gf2_128_reduce_x4(p0, t1)
     }
 }
 
@@ -371,8 +428,9 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
 // the tail is one limb shorter, so folding it down needs a single `0x87`
 // CLMUL rather than the incumbent's two-stage recursive reduction:
 //
-//     incumbent `ghash_mul_x4`: 4 product + 2 reduction CLMUL, 5 XOR, 2 VPSLLDQ
+//     schoolbook 6-CLMUL      : 4 product + 2 reduction CLMUL, 5 XOR, 2 VPSLLDQ
 //     split form              : 4 product + 1 reduction CLMUL, 4 XOR, 1 VPSLLDQ
+//     karatsuba (this crate)  : 3 product + 2 reduction CLMUL + 2 vpshufd, no companion
 //
 // On Sapphire Rapids VPCLMULQDQ-zmm and VPSLLDQ-zmm both issue only on port 5,
 // so this drops the port-5 op count per 4-lane multiply from 8 to 6 (-25%);
@@ -515,19 +573,26 @@ impl WideGhashX4 {
 
     /// XOR-accumulate the 4 unreduced products `x[i]·y[i]` into self.
     ///
+    /// Karatsuba 3-CLMUL widen: `lo = x.lo·y.lo`, `hi = x.hi·y.hi`,
+    /// `mid = (x.lo⊕x.hi)·(y.lo⊕y.hi) ⊕ lo ⊕ hi`. Same three limbs as the
+    /// 4-CLMUL schoolbook widen, so [`Self::fold`] / [`Self::reduce_lanes`]
+    /// are unchanged.
+    ///
     /// # Safety
     /// `avx512f` + `vpclmulqdq` available (cfg-gated).
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        // SAFETY: caller carries avx512f+vpclmulqdq.
+        unsafe {
+            let p0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+            let p1 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+            let pm = _mm512_clmulepi64_epi128::<0x00>(xor_halves_x4(x), xor_halves_x4(y));
+            let mid = _mm512_ternarylogic_epi64::<0x96>(pm, p0, p1);
+            self.lo = _mm512_xor_si512(self.lo, p0);
+            self.hi = _mm512_xor_si512(self.hi, p1);
+            self.mid = _mm512_xor_si512(self.mid, mid);
+        }
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

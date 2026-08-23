@@ -165,9 +165,8 @@ fn fold16_pf_ahead() -> usize {
 ///
 /// The 16 slot-major loads of a 4-slot block are transposed (128-bit lanes)
 /// into bank-major vectors, each multiplied by its broadcast weight into ONE
-/// four-lane unreduced accumulator (`WideGhashX4::mul_acc`, 4 CLMUL per
-/// vector), and reduced once per lane at the end — 18 vector CLMULs per four
-/// outputs against 36 for the two nested pair-fold passes it replaces.
+/// four-lane unreduced accumulator (`WideGhashX4::mul_acc`, 3-CLMUL Karatsuba
+/// widen per vector), and reduced once per lane at the end.
 /// Field-identical (reduction is F₂-linear).
 ///
 /// # Safety
