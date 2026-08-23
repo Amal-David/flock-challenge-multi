@@ -301,12 +301,12 @@ fn blake3_platform() -> blake3::platform::Platform {
 /// Inputs handed to `hash_many` per call.
 ///
 /// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
-/// entry can loop over several such groups. Four groups amortize the FFI and
-/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
+/// entry can loop over several such groups. Eight groups amortize the FFI and
+/// state-setup prologue while keeping the pointer array to 1 KiB. Retain
 /// the established 16-input policy on non-x86 targets, where an M4 sweep found
 /// it marginally best and the SIMD width is only four.
 #[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
+const BLAKE3_BATCH: usize = 128;
 #[cfg(not(target_arch = "x86_64"))]
 const BLAKE3_BATCH: usize = 16;
 
