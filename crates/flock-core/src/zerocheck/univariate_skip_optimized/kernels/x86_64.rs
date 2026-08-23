@@ -137,6 +137,17 @@ pub(crate) fn urm_offw_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_HORNER_EO=1` restores the serial high-to-low Horner chain
+/// (`acc = x·acc + y_k`, one accumulator) in the two-image offw kernel.
+/// Default ON splits even/odd powers so two independent `x²`-Horners run
+/// then recombine with one `x` multiply. Same 8 products + 7 scalings,
+/// same bytes. Resolved once per process, outside every window.
+pub(crate) fn urm_horner_eo_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_HORNER_EO").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -326,6 +337,13 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
 /// multiplication is associative and distributes over XOR, so the value is
 /// bit-identical.
 ///
+/// Default body (see [`urm_horner_eo_enabled`]) splits even/odd powers:
+/// `P = E(x²) + x·O(x²)` with two independent three-step `x²`-Horners, then
+/// one multiply by x. Same 8 `y_k` products and 7 scalings; the serial
+/// `acc = x·acc + y_k` chain becomes two shorter ones SPR can overlap.
+/// `FLOCK_NO_URM_HORNER_EO=1` restores the single-acc chain. Dispatch is
+/// once per window from a process-lifetime switch — not a per-K bool.
+///
 /// The eight pre-scaled `u16` offsets of every apply are fetched as two
 /// 64-bit reads and split with shifts. `imgs` are the table images the caller
 /// resolved for this run of windows.
@@ -344,8 +362,35 @@ unsafe fn horner_2img_offw(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
+    // SAFETY: forwarded from the caller's contract. The switch is
+    // process-invariant; each copy is a closed Horner over the same `y_k`.
+    unsafe {
+        if urm_horner_eo_enabled() {
+            horner_2img_offw_eo(imgs, op)
+        } else {
+            horner_2img_offw_chain(imgs, op)
+        }
+    }
+}
+
+/// Serial high-to-low Horner. Kill-switch / oracle twin of
+/// [`horner_2img_offw_eo`].
+///
+/// # Safety
+/// As for [`horner_2img_offw`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw_chain(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
-    // SAFETY: forwarded from the caller's contract.
+    // SAFETY: forwarded from [`horner_2img_offw`].
     unsafe {
         let apply = |o: *const u16| {
             crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
@@ -359,6 +404,51 @@ unsafe fn horner_2img_offw(
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
         }
         acc
+    }
+}
+
+/// Even/odd split of [`horner_2img_offw_chain`]:
+/// `Σ y_k x^k = E(z) + x·O(z)` with `z = x² = 0x04`.
+///
+/// `E = y0 + z(y2 + z(y4 + z y6))`, `O = y1 + z(y3 + z(y5 + z y7))`.
+/// Each `y_k` is still `apply(a_k)·apply(b_k)`. Interleaving the two
+/// three-step Horners keeps both accumulators live so the next apply of
+/// one chain covers the scale of the other. No empty `asm!` fence: pinning
+/// two ZMM accs serialized this family.
+///
+/// # Safety
+/// As for [`horner_2img_offw`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw_eo(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from [`horner_2img_offw`].
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let y = |k: usize| {
+            _mm512_gf2p8mul_epi8(apply(op.add(k * 8)), apply(op.add(64 + k * 8)))
+        };
+        let zb = _mm512_set1_epi8(4);
+        let xb = _mm512_set1_epi8(2);
+        let mut e = y(6);
+        let mut o = y(7);
+        e = _mm512_xor_si512(_mm512_gf2p8mul_epi8(e, zb), y(4));
+        o = _mm512_xor_si512(_mm512_gf2p8mul_epi8(o, zb), y(5));
+        e = _mm512_xor_si512(_mm512_gf2p8mul_epi8(e, zb), y(2));
+        o = _mm512_xor_si512(_mm512_gf2p8mul_epi8(o, zb), y(3));
+        e = _mm512_xor_si512(_mm512_gf2p8mul_epi8(e, zb), y(0));
+        o = _mm512_xor_si512(_mm512_gf2p8mul_epi8(o, zb), y(1));
+        _mm512_xor_si512(e, _mm512_gf2p8mul_epi8(o, xb))
     }
 }
 
