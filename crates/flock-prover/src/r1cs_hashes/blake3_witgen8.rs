@@ -554,40 +554,7 @@ struct Drain8<'t> {
     spread: bool,
 }
 
-/// Convert one low-aligned prior bit to the representation used by [`W8`].
-/// Sapphire Rapids keeps pending bits at the high end of each lane so VBMI2
-/// can join them to the next field with one `vpshldd`; the portable AVX2
-/// fallback retains the incumbent low-aligned representation.
-#[inline(always)]
-fn packer_initial_bit(bit: V8) -> V8 {
-    #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-    {
-        shl_v8::<31>(bit)
-    }
-    #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
-    {
-        bit
-    }
-}
-
-/// Recover low-aligned pending bits from the VBMI2 representation. `BACK` is
-/// `32 - used`; the ranked stream finishes with `used = 17`, hence `BACK=15`.
-#[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-#[inline(always)]
-fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
-    const {
-        assert!(BACK > 0 && BACK < 32);
-    }
-    shr_v8::<BACK>(pending)
-}
-
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
-///
-/// On AVX-512VBMI2+VL targets `pending` is high-aligned: if `USED = u > 0`,
-/// its pending low bits occupy bits `32-u..31`.  This makes
-/// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
-/// Bits below that high-aligned range are don't-care. Other targets keep the
-/// incumbent low-aligned `pending` representation.
 struct W8<'t> {
     pending: V8,
     stage: *mut V8,
@@ -636,47 +603,22 @@ impl<'t> W8<'t> {
         }
         debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
         unsafe {
-            #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-            {
-                // Every u>0 push crosses a word boundary because WIDTH is 31
-                // or 32.  VPSHLD supplies the old high-aligned pending bits
-                // from its second source while shifting the new field left.
-                if USED == 0 {
-                    if WIDTH == 32 {
-                        self.write_word::<WORD>(v);
-                        self.pending = dup_u32(0);
-                    } else {
-                        // 31 pending low bits, moved to bits 1..31.
-                        self.pending = shl_v8::<1>(v);
-                    }
+            if USED == 0 {
+                if WIDTH == 32 {
+                    self.write_word::<WORD>(v);
+                    self.pending = dup_u32(0);
                 } else {
-                    let out = _mm256_shldi_epi32::<USED>(v, self.pending);
-                    self.write_word::<WORD>(out);
-                    // A crossed 31-bit field leaves u-1 low bits; high-aligning
-                    // them is exactly v<<1.  A 32-bit field leaves u bits, so
-                    // v itself already is the high-aligned representation.
-                    self.pending = if WIDTH == 31 { shl_v8::<1>(v) } else { v };
+                    self.pending = v;
                 }
-            }
-            #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
-            {
-                if USED == 0 {
-                    if WIDTH == 32 {
-                        self.write_word::<WORD>(v);
-                        self.pending = dup_u32(0);
-                    } else {
-                        self.pending = v;
-                    }
-                } else if USED + WIDTH < 32 {
-                    self.pending = vsli_v8::<USED>(self.pending, v);
+            } else if USED + WIDTH < 32 {
+                self.pending = vsli_v8::<USED>(self.pending, v);
+            } else {
+                let out = vsli_v8::<USED>(self.pending, v);
+                self.write_word::<WORD>(out);
+                if USED + WIDTH == 32 {
+                    self.pending = dup_u32(0);
                 } else {
-                    let out = vsli_v8::<USED>(self.pending, v);
-                    self.write_word::<WORD>(out);
-                    if USED + WIDTH == 32 {
-                        self.pending = dup_u32(0);
-                    } else {
-                        self.pending = shr_v8::<BACK>(v);
-                    }
+                    self.pending = shr_v8::<BACK>(v);
                 }
             }
         }
@@ -684,18 +626,8 @@ impl<'t> W8<'t> {
 
     #[inline(always)]
     unsafe fn finish(&mut self) {
-        const {
-            assert!(USEFUL_BITS % 32 == 17);
-        }
         unsafe {
-            // The ranked stream finishes with 17 pending bits.  The VBMI2
-            // representation holds those bits in 15..31; the incumbent
-            // fallback is already low-aligned.
-            #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-            let pending = packer_high_to_low::<15>(self.pending);
-            #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
-            let pending = self.pending;
-            self.write_word::<LAST_WORD>(pending);
+            self.write_word::<LAST_WORD>(self.pending);
         }
     }
 }
@@ -1701,12 +1633,12 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             drain.drain_range(16, 16, RING_WORDS - 16);
         }
 
-        let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
+        let pending_bit = shr_v8::<31>(flags);
         let drain_ptr = &mut drain as *mut Drain8;
         let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
+        let mut wb = W8::at(bs, one, drain_ptr, true);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -1823,181 +1755,6 @@ mod tests {
         let mut out = [0u32; 8];
         unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), v) };
         out
-    }
-
-    /// Compile every W8 offset/width specialization used by the witness and
-    /// compare its high-aligned VBMI2 state transition with an independent
-    /// scalar bitstream append.  Bit-basis inputs include the deliberately
-    /// dirty bit 31 of a width-31 field, so the oracle also proves that the
-    /// next field, rather than an eager mask, discards that irrelevant bit.
-    #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn check_vbmi2_push<const USED: i32, const WIDTH: i32, const BACK: i32>() {
-        const {
-            assert!(USED >= 0 && USED < 32);
-            assert!(WIDTH == 31 || WIDTH == 32);
-            assert!(BACK > 0 && BACK < 32);
-        }
-        let pending_mask = if USED == 0 {
-            0
-        } else {
-            ((1u64 << USED) - 1) as u32
-        };
-        let field_mask = if WIDTH == 32 {
-            u32::MAX
-        } else {
-            (1u32 << WIDTH) - 1
-        };
-        let mut pending_cases = vec![0, pending_mask];
-        for bit in 0..USED {
-            pending_cases.push(1u32 << bit);
-        }
-        pending_cases.sort_unstable();
-        pending_cases.dedup();
-        let mut field_cases = vec![0, field_mask, u32::MAX];
-        for bit in 0..32 {
-            field_cases.push(1u32 << bit);
-        }
-        field_cases.sort_unstable();
-        field_cases.dedup();
-
-        for &pending_low in &pending_cases {
-            for &raw_v in &field_cases {
-                let v = raw_v & field_mask;
-                let acc = u64::from(pending_low) | (u64::from(v) << USED);
-                let total = USED + WIDTH;
-                let expected_out = (total >= 32).then_some(acc as u32);
-                let next_used = total % 32;
-                let expected_pending = if total >= 32 {
-                    (acc >> 32) as u32
-                } else {
-                    acc as u32
-                };
-                let pending_hi = if USED == 0 {
-                    0
-                } else {
-                    pending_low << (32 - USED)
-                };
-
-                let sentinel = 0xA5A5_5A5A;
-                let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
-                    stage.as_mut_ptr(),
-                    dup_u32(pending_hi),
-                    core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
-                );
-                unsafe {
-                    writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
-                }
-
-                let got_out = lanes(stage[0])[0];
-                assert_eq!(
-                    got_out,
-                    expected_out.unwrap_or(sentinel),
-                    "out: used={USED} width={WIDTH} pending={pending_low:#x} v={raw_v:#x}"
-                );
-                let got_hi = lanes(writer.pending)[0];
-                if next_used != 0 {
-                    assert_eq!(
-                        got_hi >> (32 - next_used),
-                        expected_pending,
-                        "pending: used={USED} width={WIDTH} pending={pending_low:#x} v={raw_v:#x}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn check_vbmi2_finish<const USED: i32, const BACK: i32>() {
-        const {
-            assert!(USED > 0 && USED < 32);
-            assert!(BACK == 32 - USED);
-        }
-        let mask = ((1u64 << USED) - 1) as u32;
-        let mut cases = vec![0, mask];
-        for bit in 0..USED {
-            cases.push(1u32 << bit);
-        }
-        for pending_low in cases {
-            let pending_hi = dup_u32(pending_low << BACK);
-            let got = lanes(packer_high_to_low::<BACK>(pending_hi));
-            assert_eq!(got, [pending_low; 8], "finish: used={USED}");
-        }
-    }
-
-    #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
-    #[test]
-    fn vbmi2_high_aligned_w8_matches_scalar_all_offsets() {
-        unsafe {
-            macro_rules! check_offset {
-                ($used:literal, $back:literal) => {{
-                    check_vbmi2_push::<$used, 31, $back>();
-                    check_vbmi2_push::<$used, 32, $back>();
-                    check_vbmi2_finish::<$used, $back>();
-                }};
-            }
-            check_vbmi2_push::<0, 31, 1>();
-            check_vbmi2_push::<0, 32, 1>();
-            check_offset!(1, 31);
-            check_offset!(2, 30);
-            check_offset!(3, 29);
-            check_offset!(4, 28);
-            check_offset!(5, 27);
-            check_offset!(6, 26);
-            check_offset!(7, 25);
-            check_offset!(8, 24);
-            check_offset!(9, 23);
-            check_offset!(10, 22);
-            check_offset!(11, 21);
-            check_offset!(12, 20);
-            check_offset!(13, 19);
-            check_offset!(14, 18);
-            check_offset!(15, 17);
-            check_offset!(16, 16);
-            check_offset!(17, 15);
-            check_offset!(18, 14);
-            check_offset!(19, 13);
-            check_offset!(20, 12);
-            check_offset!(21, 11);
-            check_offset!(22, 10);
-            check_offset!(23, 9);
-            check_offset!(24, 8);
-            check_offset!(25, 7);
-            check_offset!(26, 6);
-            check_offset!(27, 5);
-            check_offset!(28, 4);
-            check_offset!(29, 3);
-            check_offset!(30, 2);
-            check_offset!(31, 1);
-
-            let flags = [0, 1, 0x7FFF_FFFF, 0x8000_0000, u32::MAX, 11, 64, 9];
-            let flags_v = load_v8(flags.as_ptr());
-            assert_eq!(
-                lanes(packer_initial_bit(shr_v8::<31>(flags_v))),
-                flags.map(|v| v & 0x8000_0000),
-                "A prior flag must occupy bit 31"
-            );
-            assert_eq!(
-                lanes(packer_initial_bit(dup_u32(1))),
-                [0x8000_0000; 8],
-                "B prior flag must occupy bit 31"
-            );
-
-            // Exercise the production finish itself at the ranked used=17.
-            let pending_low = 0x1_5A5A;
-            let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
-                stage.as_mut_ptr(),
-                dup_u32(pending_low << 15),
-                core::ptr::null_mut::<Drain8<'static>>(),
-                false,
-            );
-            writer.finish();
-            assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);
-        }
     }
 
     #[test]
@@ -2124,3 +1881,4 @@ mod tests {
 // witfire-7 draw marker 10514
 // witfire-16 draw marker 2194
 // fire51: fresh draw on new bar 3852475 (rival NTT promotion)
+// witfire-53 draw marker 9707
