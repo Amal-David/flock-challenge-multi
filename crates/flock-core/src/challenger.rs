@@ -388,12 +388,12 @@ impl Challenger for FsChallenger {
         // multi-threaded critical path. We go parallel once a single grind
         // clears the rayon dispatch break-even (~2^13 hashes); the genuinely
         // tiny deep-level grinds (2^3–2^11) stay sequential, where the serial
-        // loop beats parallel-dispatch overhead. `find_first` returns the
-        // globally smallest satisfying nonce, so the result is identical to the
-        // sequential search (deterministic proofs) regardless of this choice.
+        // loop beats parallel-dispatch overhead. The cyclic worker search
+        // returns the globally smallest satisfying nonce, so the result is
+        // identical to the sequential search (deterministic proofs).
         const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
-        // Nonces per rayon task in the parallel search. Large enough to
-        // amortize task dispatch (a 1024-nonce chunk is ~12 µs under the
+        // Nonces per scan chunk in the parallel search. Large enough to
+        // amortize kernel entry (a 1024-nonce chunk is ~12 µs under the
         // aarch64 NEON kernel, ~86 Mh/s/core — and a whole multiple of its
         // 16-lane batch), small enough to keep cancellation granular once an
         // earlier task has found a match.
@@ -412,36 +412,26 @@ impl Challenger for FsChallenger {
                 start = start.saturating_add(GRIND_CHUNK);
             }
         } else {
-            // Block-parallel search. Blocks are scanned in order and each task
-            // returns the smallest match within its chunk, so the result is
-            // deterministic (the globally smallest satisfying nonce).
+            // Block-parallel search. Pool-sized workers scan disjoint chunks
+            // as an ascending cyclic wavefront. The cancellation bound cannot
+            // skip an unscanned chunk below the returned minimum, so the result
+            // remains the globally smallest satisfying nonce.
             // Block ≈ 2× the expected attempts: large enough that the match
             // usually falls inside one block (so all threads do useful
             // pre-match work), small enough to avoid the 4× over-scan the old
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
-            use rayon::prelude::*;
             let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start: u64 = 0;
             loop {
-                // `find_first` takes the earliest *chunk* that yields a match
-                // and cancels the rest; within a chunk `pow_scan` returns the
-                // smallest nonce. A later chunk cannot hold a smaller nonce, so
-                // this is exactly the globally smallest — identical to the
-                // sequential search, which is what keeps proofs deterministic.
-                let found = (0..n_chunks)
-                    .into_par_iter()
-                    .map(|c| {
-                        pow_scan(
-                            &state_digest,
-                            start.saturating_add(c * GRIND_CHUNK),
-                            GRIND_CHUNK,
-                            bits,
-                            kind,
-                        )
-                    })
-                    .find_first(|r| r.is_some())
-                    .flatten();
+                // One long-lived cyclic scanner per Rayon worker replaces the
+                // ordered iterator's adaptive indexed traversal and prefix
+                // cancellation bookkeeping. The shared bound only comes from
+                // real matches.
+                // A stale relaxed load can therefore cause extra scanning, but
+                // can never skip a chunk below the final best nonce.
+                let found = parallel_find_first_cyclic(start, block, GRIND_CHUNK, |lo, len| {
+                    pow_scan(&state_digest, lo, len, bits, kind)
+                });
                 if let Some(n) = found {
                     break n;
                 }
@@ -1376,6 +1366,61 @@ fn pow_scan(
     }
 }
 
+/// Search fixed-size chunks with one cyclic scanner per worker in the current
+/// Rayon registry. `scan` must return the smallest match in its half-open
+/// range. The returned value is then the globally smallest match.
+///
+/// Worker `w` owns chunks `w, w + P, w + 2P, ...`, where `P` is the number of
+/// active workers. If it observes a best nonce `b`, it may stop once its next
+/// chunk starts at or above `b`: every earlier chunk in that residue class has
+/// already been scanned. Relaxed stale reads only do extra work. The atomic is
+/// only a cancellation bound; the returned worker-local matches determine the
+/// result after the broadcast join.
+fn parallel_find_first_cyclic<F>(start: u64, len: u64, chunk_len: u64, scan: F) -> Option<u64>
+where
+    F: Fn(u64, u64) -> Option<u64> + Sync,
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    debug_assert!(chunk_len > 0);
+    let end = start.saturating_add(len);
+    let n_chunks = len.div_ceil(chunk_len);
+    if n_chunks == 0 {
+        return None;
+    }
+
+    let best = AtomicU64::new(end);
+    let workers = (rayon::current_num_threads() as u64).min(n_chunks);
+    rayon::broadcast(|ctx| {
+        let worker = ctx.index() as u64;
+        if worker >= workers {
+            return None;
+        }
+
+        let mut chunk = worker;
+        while chunk < n_chunks {
+            let lo = start.saturating_add(chunk.saturating_mul(chunk_len));
+            if lo >= best.load(Ordering::Relaxed) {
+                break;
+            }
+            let take = chunk_len.min(end.saturating_sub(lo));
+            if take == 0 {
+                break;
+            }
+            if let Some(found) = scan(lo, take) {
+                debug_assert!(found >= lo && found < lo.saturating_add(take));
+                best.fetch_min(found, Ordering::Relaxed);
+                return Some(found);
+            }
+            chunk = chunk.saturating_add(workers);
+        }
+        None
+    })
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,6 +1872,79 @@ mod tests {
                     "{kind} bits={bits}: returned nonce {nonce} does not satisfy the PoW"
                 );
             }
+        }
+    }
+
+    /// The fixed-worker scheduler must cover each chunk exactly once until a
+    /// real match supplies the stopping bound. Exercise multiple matches,
+    /// ragged tails, no-match blocks, and a range crossing the u32 nonce-word
+    /// carry under a nested Rayon registry.
+    #[test]
+    fn parallel_grind_scheduler_preserves_smallest_match() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("test pool");
+        pool.install(|| {
+            let mut worker_indices = rayon::broadcast(|ctx| ctx.index());
+            worker_indices.sort_unstable();
+            assert_eq!(worker_indices, vec![0, 1, 2, 3]);
+
+            let cases: &[(u64, u64, &[u64])] = &[
+                (0, 16 * 1024, &[]),
+                (0, 16 * 1024, &[0]),
+                (0, 32 * 1024, &[17 * 1024 + 9, 3 * 1024 + 7, 29]),
+                (73, 16 * 1024 + 137, &[73 + 16 * 1024 + 136]),
+                (
+                    (1u64 << 32) - 500,
+                    32 * 1024 + 91,
+                    &[(1u64 << 32) + 11, (1u64 << 32) + 9000],
+                ),
+            ];
+            for &(start, len, matches) in cases {
+                let end = start.saturating_add(len);
+                let expected = matches
+                    .iter()
+                    .copied()
+                    .filter(|&n| n >= start && n < end)
+                    .min();
+                let got = parallel_find_first_cyclic(start, len, 1024, |lo, take| {
+                    let hi = lo.saturating_add(take);
+                    matches.iter().copied().filter(|&n| n >= lo && n < hi).min()
+                });
+                assert_eq!(got, expected, "start={start} len={len}");
+            }
+        });
+    }
+
+    /// `grind_pow` can be called from inside another Rayon registry. Its
+    /// broadcast must stay in that registry and still return the canonical
+    /// globally smallest nonce.
+    #[test]
+    fn parallel_grind_nested_pool_returns_smallest_nonce() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("test pool");
+        for bits in [13u32, 14, 19] {
+            let mut prover = FsChallenger::with_hash(b"grind-nested", HashKind::Blake3);
+            prover.observe_bytes(b"root");
+            let digest = {
+                let mut probe = FsChallenger::with_hash(b"grind-nested", HashKind::Blake3);
+                probe.observe_bytes(b"root");
+                probe.state_digest()
+            };
+            let nonce = pool.install(|| prover.grind_pow(bits));
+            assert!(pow_has_leading_zero_bits(
+                &digest,
+                nonce,
+                bits,
+                HashKind::Blake3
+            ));
+            assert!(
+                (0..nonce).all(|n| !pow_has_leading_zero_bits(&digest, n, bits, HashKind::Blake3)),
+                "bits={bits}: found a smaller valid nonce than {nonce}"
+            );
         }
     }
 
