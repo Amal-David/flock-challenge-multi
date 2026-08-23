@@ -427,24 +427,11 @@ pub(crate) fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind:
             .zip(data.par_chunks(leaf_size))
             .for_each(|(o, leaf)| *o = blake3_leaf_cv(leaf)),
         HashKind::Sha256 => {
-            out.par_chunks_mut(4)
-                .zip(data.par_chunks(4 * leaf_size))
+            let g = sha256_group();
+            out.par_chunks_mut(g)
+                .zip(data.par_chunks(g * leaf_size))
                 .for_each(|(outs, leaves)| {
-                    if outs.len() == 4 {
-                        sha256_hash4(
-                            [
-                                &leaves[..leaf_size],
-                                &leaves[leaf_size..2 * leaf_size],
-                                &leaves[2 * leaf_size..3 * leaf_size],
-                                &leaves[3 * leaf_size..],
-                            ],
-                            outs,
-                        );
-                    } else {
-                        for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
-                            *out = Sha256::digest(leaf).into();
-                        }
-                    }
+                    sha256_hash_run(leaves, leaf_size, outs);
                 });
         }
     }
@@ -503,6 +490,68 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
+/// SHA-256's kernel is four-wide; the previous rayon grain was that SIMD
+/// width (one `hash4` per task). That is ~250× more tasks than BLAKE3's
+/// group at a 2^18-node level. Group many quads per worker; still a multiple
+/// of 4 so the 4-wide kernel is the only body. `FLOCK_NO_SHA256_GROUP=1`
+/// restores grain 4.
+const SHA256_GROUP: usize = 256;
+
+fn sha256_group() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_SHA256_GROUP").is_some() {
+            4
+        } else {
+            SHA256_GROUP
+        }
+    });
+    *N
+}
+
+fn sha256_hash_run(leaves: &[u8], leaf_size: usize, outs: &mut [Hash]) {
+    for (outs, chunk) in outs.chunks_mut(4).zip(leaves.chunks(4 * leaf_size)) {
+        if outs.len() == 4 {
+            sha256_hash4(
+                [
+                    &chunk[..leaf_size],
+                    &chunk[leaf_size..2 * leaf_size],
+                    &chunk[2 * leaf_size..3 * leaf_size],
+                    &chunk[3 * leaf_size..],
+                ],
+                outs,
+            );
+        } else {
+            for (out, leaf) in outs.iter_mut().zip(chunk.chunks(leaf_size)) {
+                *out = Sha256::digest(leaf).into();
+            }
+        }
+    }
+}
+
+fn sha256_hash_pairs_run(children: &[u8], outs: &mut [Hash]) {
+    for (outs, chunk) in outs.chunks_mut(4).zip(children.chunks(256)) {
+        if outs.len() == 4 {
+            sha256_hash4(
+                [
+                    &chunk[..64],
+                    &chunk[64..128],
+                    &chunk[128..192],
+                    &chunk[192..256],
+                ],
+                outs,
+            );
+        } else {
+            for (i, out) in outs.iter_mut().enumerate() {
+                let l: &Hash = chunk[i * 64..i * 64 + 32].try_into().unwrap();
+                let r: &Hash = chunk[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                let mut h = Sha256::new();
+                h.update(l);
+                h.update(r);
+                *out = h.finalize().into();
+            }
+        }
+    }
+}
 
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
@@ -555,37 +604,14 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
             }
         }
         HashKind::Sha256 => {
-            let hash_quad = |outs: &mut [Hash], children: &[u8]| {
-                if outs.len() == 4 {
-                    sha256_hash4(
-                        [
-                            &children[..64],
-                            &children[64..128],
-                            &children[128..192],
-                            &children[192..256],
-                        ],
-                        outs,
-                    );
-                } else {
-                    for (i, out) in outs.iter_mut().enumerate() {
-                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
-                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                        let mut h = Sha256::new();
-                        h.update(l);
-                        h.update(r);
-                        *out = h.finalize().into();
-                    }
-                }
-            };
             if serial {
-                for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
-                    hash_quad(outs, children);
-                }
+                sha256_hash_pairs_run(read_bytes, write);
             } else {
+                let g = sha256_group();
                 write
-                    .par_chunks_mut(4)
-                    .zip(read_bytes.par_chunks(256))
-                    .for_each(|(outs, children)| hash_quad(outs, children));
+                    .par_chunks_mut(g)
+                    .zip(read_bytes.par_chunks(g * 64))
+                    .for_each(|(outs, children)| sha256_hash_pairs_run(children, outs));
             }
         }
     }
