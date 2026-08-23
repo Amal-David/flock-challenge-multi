@@ -142,23 +142,9 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
 }
 
 /// Lines of the sixteen-bank source asked for ahead of the quad the kernel
-/// is folding, in F128 elements. `FLOCK_NO_FOLD16_PF=1` removes the hints
-/// (they move no data of their own and change no value, so the fold is
-/// byte-identical either way); `FLOCK_FOLD16_PF=<n>` overrides the distance.
+/// is folding, in F128 elements. The ranked path always uses this promoted
+/// distance, allowing the compiler to remove the old per-quad selector.
 const FOLD16_PF_AHEAD: usize = 512;
-
-fn fold16_pf_ahead() -> usize {
-    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_FOLD16_PF").is_some() {
-            return 0;
-        }
-        std::env::var("FLOCK_FOLD16_PF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(FOLD16_PF_AHEAD)
-    });
-    *D
-}
 
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
@@ -190,7 +176,7 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
         let quads = dst.len() & !3;
-        let pf_ahead = fold16_pf_ahead();
+        let pf_ahead = FOLD16_PF_AHEAD;
         let pf_limit = src.len().saturating_sub(64);
         let mut t = 0usize;
         while t < quads {
