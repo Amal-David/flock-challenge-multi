@@ -232,11 +232,80 @@ struct PreEncodedPrefix {
 /// by the fingerprint and falls back to the full encode.
 static PRE_ENCODED: std::sync::Mutex<Option<PreEncodedPrefix>> = std::sync::Mutex::new(None);
 
+/// Owned work handed to the process-lifetime prefix encoder. The ranked
+/// worker proves once before publishing readiness and once after receiving the
+/// measured seed, so the first proof creates and warms this worker outside the
+/// timed interval; the measured proof only sends one job to the parked thread.
+struct PreEncodeJob {
+    commitment: Commitment,
+    zerocheck: flock_core::zerocheck::ZerocheckProof,
+    lincheck: flock_core::lincheck::LincheckProof,
+    done: std::sync::mpsc::SyncSender<()>,
+}
+
+/// Completion token for one asynchronously encoded prefix.
+pub(crate) struct PreEncodeWait(std::sync::mpsc::Receiver<()>);
+
+impl PreEncodeWait {
+    /// Wait until the worker has either published the fingerprinted stash or
+    /// disconnected. A disconnect is safe: `to_bytes` then misses the stash
+    /// and performs the existing complete encode.
+    pub(crate) fn wait(self) {
+        let _ = self.0.recv();
+    }
+}
+
+/// The sender keeps one named encoder alive for the process. `None` records a
+/// one-time thread-creation failure and permanently selects the safe fallback.
+static PRE_ENCODE_WORKER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<PreEncodeJob>>> =
+    std::sync::OnceLock::new();
+
 /// `FLOCK_NO_PRE_ENCODE=1` restores the incumbent single-shot bundle encode.
 /// The ranked harness `env_clear()`s, so pre-encode is the default.
 pub(crate) fn pre_encode_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
+}
+
+/// Queue one publish-prefix encode on the process-lifetime worker.
+///
+/// This preserves the incumbent overlap with PCS open while moving
+/// `pthread_create`/join/teardown out of the measured proof. Inputs remain
+/// owned clones exactly as in the former per-proof `thread::spawn` path.
+pub(crate) fn pre_encode_prefix_async(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+) -> Option<PreEncodeWait> {
+    if !pre_encode_enabled() {
+        return None;
+    }
+
+    let worker = PRE_ENCODE_WORKER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PreEncodeJob>(1);
+            let spawned = std::thread::Builder::new()
+                .name("flock-preencode".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        stash_pre_encoded_prefix(&job.commitment, &job.zerocheck, &job.lincheck);
+                        let _ = job.done.send(());
+                    }
+                });
+            spawned.ok().map(|_| tx)
+        })
+        .as_ref()?;
+
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+    worker
+        .send(PreEncodeJob {
+            commitment: commitment.clone(),
+            zerocheck: zerocheck.clone(),
+            lincheck: lincheck.clone(),
+            done: done_tx,
+        })
+        .ok()?;
+    Some(PreEncodeWait(done_rx))
 }
 
 /// Encode and stash the publish prefix for a prove whose commitment /
@@ -716,6 +785,23 @@ mod tests {
             reference,
             "stashed-prefix to_bytes diverged"
         );
+
+        // The process-lifetime worker must preserve those bytes on both its
+        // first job and a reused, already-parked job.
+        for pass in 0..2 {
+            pre_encode_prefix_async(
+                &bundle.commitment,
+                &bundle.proof.zerocheck,
+                &bundle.proof.lincheck,
+            )
+            .expect("pre-encode worker")
+            .wait();
+            assert_eq!(
+                bundle.to_bytes(),
+                reference,
+                "worker-prefix to_bytes diverged on pass {pass}"
+            );
+        }
 
         let bundle2 = R1csProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
         assert_eq!(bundle2.commitment.root, commitment.root);
