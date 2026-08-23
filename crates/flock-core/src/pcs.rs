@@ -162,7 +162,6 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     // prover, freed when it drops. `FLOCK_NO_FOLD_ARENA` is a
     // local-diagnostics escape hatch; the ranked worker's cleared environment
     // never sets it.
-    #[cfg(target_arch = "aarch64")]
     let fold_arena = {
         let l = packed_witness.len();
         let k = lig_config.initial_k;
@@ -175,9 +174,6 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             None
         }
     };
-    // x86_64 keeps its prewarmed scratch-pool fold path unchanged.
-    #[cfg(not(target_arch = "aarch64"))]
-    let fold_arena: Option<ligerito::FoldArena> = None;
     crate::gaptime::mark("open: fold arena ready");
 
     let combined = compute_combined_basis_and_target(
