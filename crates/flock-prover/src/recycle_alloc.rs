@@ -14,7 +14,7 @@ use std::sync::atomic::{
 
 const RECYCLE_MIN: usize = 32 * 1024;
 const MAX_ALIGN: usize = 16;
-const MAX_CLASSES: usize = 512;
+const MAX_CLASSES: usize = 1024;
 
 struct Class {
     size: AtomicUsize,
@@ -30,7 +30,7 @@ static CLASSES: [Class; MAX_CLASSES] = [EMPTY; MAX_CLASSES];
 
 #[inline]
 fn class_slot(size: usize) -> usize {
-    (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
+    (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) % MAX_CLASSES
 }
 
 #[inline]
