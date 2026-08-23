@@ -1,4 +1,5 @@
 use super::super::{build_sum_table, F128};
+use std::sync::OnceLock;
 
 /// GFNI twin of [`partial_fold_packed_z_x86_tiled_padded`]: each stripe's
 /// 256-entry sum table is F2-linear (`T[0] = 0`, XOR-composed from the eight
@@ -314,6 +315,68 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
 /// - `out_planes_ptr` must point to at least `n_blocks64 * 1024` bytes.
+/// `FLOCK_NO_LC_FOLD_FIXED=1` restores the runtime `n_blocks64` loop.
+/// Default: the ranked grouped arm's count (2) and the ragged count (1)
+/// are monomorphized, so LLVM drops the block-bounds ladder from the
+/// 16-plane GFNI battery. Same loads, same affine, same XOR.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn fold_tile_fixed_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LC_FOLD_FIXED").is_some())
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_n<const N: usize>(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        for block in 0..N {
+            let bs = block * 64;
+            let mut rows = [_mm512_setzero_si512(); 8];
+            for (t, row) in rows.iter_mut().enumerate() {
+                *row = _mm512_loadu_si512(
+                    tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i
+                );
+            }
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in 0..16 {
+                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                let mut acc = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                };
+                for t in (0..8).step_by(2) {
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t],
+                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                    );
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t + 1],
+                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                    );
+                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                }
+                _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -331,6 +394,31 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
+        if !fold_tile_fixed_disabled() {
+            match n_blocks64 {
+                2 => {
+                    gfni_fold_tile_n::<2>(
+                        tile_bytes_ptr,
+                        stripe_stride,
+                        mats,
+                        out_planes_ptr,
+                        seed_zero,
+                    );
+                    return;
+                }
+                1 => {
+                    gfni_fold_tile_n::<1>(
+                        tile_bytes_ptr,
+                        stripe_stride,
+                        mats,
+                        out_planes_ptr,
+                        seed_zero,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         for block in 0..n_blocks64 {
             let bs = block * 64;
             let mut rows = [_mm512_setzero_si512(); 8];
