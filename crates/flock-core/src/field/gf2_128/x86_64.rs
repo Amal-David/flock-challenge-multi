@@ -530,6 +530,20 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// XOR another accumulator into `self` (F₂-linear: `reduce(a⊕b) =
+    /// reduce(a) ⊕ reduce(b)`). Lets `fold16_banked` keep two independent
+    /// CLMUL chains and combine them once.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn xor_acc(&mut self, other: Self) {
+        self.lo = _mm512_xor_si512(self.lo, other.lo);
+        self.hi = _mm512_xor_si512(self.hi, other.hi);
+        self.mid = _mm512_xor_si512(self.mid, other.mid);
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.

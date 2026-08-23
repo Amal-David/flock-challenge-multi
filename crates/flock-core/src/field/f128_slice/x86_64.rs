@@ -164,11 +164,10 @@ fn fold16_pf_ahead() -> usize {
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
 /// The 16 slot-major loads of a 4-slot block are transposed (128-bit lanes)
-/// into bank-major vectors, each multiplied by its broadcast weight into ONE
-/// four-lane unreduced accumulator (`WideGhashX4::mul_acc`, 4 CLMUL per
-/// vector), and reduced once per lane at the end — 18 vector CLMULs per four
-/// outputs against 36 for the two nested pair-fold passes it replaces.
-/// Field-identical (reduction is F₂-linear).
+/// into bank-major vectors, each multiplied by its broadcast weight into TWO
+/// four-lane unreduced accumulators (banks 0..7 and 8..15), XOR-combined,
+/// and reduced once per lane. Same CLMUL count as the serial 16-bank chain;
+/// two independent dependency chains. Field-identical (reduction is F₂-linear).
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
@@ -205,28 +204,42 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                     }
                 }
             }
-            let mut acc = WideGhashX4::zero();
-            for g in 0..4 {
-                // v_s = banks 4g..4g+3 of slot t+s.
-                let base = 16 * t + 4 * g;
-                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
-                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
-                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
-                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
-                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1); // [a0.L0 a1.L0 a0.L1 a1.L1]
-                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1); // [a0.L2 a1.L2 a0.L3 a1.L3]
-                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
-                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2); // bank 4g+0 over slots 0..4
-                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
-                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
-                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+            // Two independent deferred accumulators (banks 0..7 and 8..15).
+            // Reduction is F₂-linear so XOR-then-reduce equals the serial
+            // 16-bank chain; the two CLMUL dependency chains overlap.
+            let mut acc0 = WideGhashX4::zero();
+            let mut acc1 = WideGhashX4::zero();
+            for g in 0..2 {
+                let base0 = 16 * t + 4 * g;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base0) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base0 + 16) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base0 + 32) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base0 + 48) as *const __m512i);
+                let p0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let p1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let p2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let p3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                acc0.mul_acc(_mm512_permutex2var_epi64(p0, s2_lo, p2), wb[4 * g]);
+                acc0.mul_acc(_mm512_permutex2var_epi64(p0, s2_hi, p2), wb[4 * g + 1]);
+                acc0.mul_acc(_mm512_permutex2var_epi64(p1, s2_lo, p3), wb[4 * g + 2]);
+                acc0.mul_acc(_mm512_permutex2var_epi64(p1, s2_hi, p3), wb[4 * g + 3]);
+
+                let base1 = 16 * t + 4 * (g + 2);
+                let b0 = _mm512_loadu_si512(src.as_ptr().add(base1) as *const __m512i);
+                let b1 = _mm512_loadu_si512(src.as_ptr().add(base1 + 16) as *const __m512i);
+                let b2 = _mm512_loadu_si512(src.as_ptr().add(base1 + 32) as *const __m512i);
+                let b3 = _mm512_loadu_si512(src.as_ptr().add(base1 + 48) as *const __m512i);
+                let q0 = _mm512_permutex2var_epi64(b0, s1_lo, b1);
+                let q1 = _mm512_permutex2var_epi64(b0, s1_hi, b1);
+                let q2 = _mm512_permutex2var_epi64(b2, s1_lo, b3);
+                let q3 = _mm512_permutex2var_epi64(b2, s1_hi, b3);
+                acc1.mul_acc(_mm512_permutex2var_epi64(q0, s2_lo, q2), wb[4 * g + 8]);
+                acc1.mul_acc(_mm512_permutex2var_epi64(q0, s2_hi, q2), wb[4 * g + 9]);
+                acc1.mul_acc(_mm512_permutex2var_epi64(q1, s2_lo, q3), wb[4 * g + 10]);
+                acc1.mul_acc(_mm512_permutex2var_epi64(q1, s2_hi, q3), wb[4 * g + 11]);
             }
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
+            acc0.xor_acc(acc1);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc0.reduce_lanes());
             t += 4;
         }
         while t < dst.len() {
