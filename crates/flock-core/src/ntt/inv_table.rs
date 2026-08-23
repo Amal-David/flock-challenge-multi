@@ -34,6 +34,9 @@ pub struct InvNttTableByteSingleGf8 {
     /// Start of the logical table inside `data`, chosen so every 64-byte row
     /// in the production `ell = 64` table starts on a cache-line boundary.
     data_offset: usize,
+    /// Number of `256 × ell` images in `data` (1 portable, 2 with the σ₈
+    /// image, 8 on x86_64 with the shuffle-free pre-permuted set).
+    table_images: usize,
 }
 
 impl InvNttTableByteSingleGf8 {
@@ -63,7 +66,14 @@ impl InvNttTableByteSingleGf8 {
         // vector, and the x86 AVX-512 apply folds its entire first butterfly
         // level into the loads (10 port-5 shuffles → 3 per apply). Other
         // architectures keep the original footprint.
-        let table_images = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        // x86_64 carries eight images: base (0), σ₈ (1), and the
+        // σ₁₆/σ₁₆∘σ₈/σ₃₂/σ₃₂∘σ₈/σ₄₈/σ₄₈∘σ₈ pre-permutations (2..7) that let
+        // the AVX-512 apply replace its three residual 128-bit-lane shuffles
+        // with plain loads (out = ⊕ᵢ imgᵢ[oᵢ]; the shuffle-free 8img form).
+        // aarch64 keeps the σ₈ pair; other architectures one image.
+        let table_images = if cfg!(target_arch = "x86_64") {
+            8
+        } else if cfg!(target_arch = "aarch64") {
             2
         } else {
             1
@@ -108,14 +118,63 @@ impl InvNttTableByteSingleGf8 {
 
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
-            let swapped_start = data_offset + table_len;
-            let (original_storage, swapped_storage) = data.split_at_mut(swapped_start);
-            let original = &original_storage[data_offset..data_offset + table_len];
-            let swapped = &mut swapped_storage[..table_len];
-            for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact_mut(16)) {
-                target[..8].copy_from_slice(&source[8..]);
-                target[8..].copy_from_slice(&source[..8]);
+            // Image layout (contiguous in `data`, one `table_len` block each):
+            //   0 = base table T       1 = σ₈(T)
+            //   2 = σ₁₆(T)            3 = σ₁₆∘σ₈(T)
+            //   4 = σ₃₂(T)            5 = σ₃₂∘σ₈(T)
+            //   6 = σ₄₈(T)            7 = σ₄₈∘σ₈(T)
+            // σ₁₆/σ₃₂/σ₄₈ permute the four 16-byte chunks of each 64-byte row
+            // (lane c ↦ c^1 / c^2 / c^3); σ₈ swaps the two 8-byte halves of
+            // every 16-byte chunk. σ₈ commutes with the chunk permutations,
+            // so each odd image is just σ₈ applied to its even partner.
+            let base0 = data_offset;
+            let tl = table_len;
+            // Image 1: σ₈ of the base image (the pre-existing half-swap).
+            {
+                let src = data[base0..base0 + tl].to_vec();
+                for (r, row) in src.chunks_exact(64).enumerate() {
+                    for c in 0..4 {
+                        let o = r * 64 + c * 16;
+                        data[base0 + tl + o..base0 + tl + o + 8]
+                            .copy_from_slice(&row[c * 16 + 8..c * 16 + 16]);
+                        data[base0 + tl + o + 8..base0 + tl + o + 16]
+                            .copy_from_slice(&row[c * 16..c * 16 + 8]);
+                    }
+                }
             }
+            // σ₈ perm applied to the image at `s_off`, written to `d_off`.
+            // Takes `data` as a parameter so the closures never capture a
+            // second mutable borrow of the buffer.
+            let swap8 = |data: &mut Vec<F8>, s_off: usize, d_off: usize| {
+                let src = data[s_off..s_off + tl].to_vec();
+                for (r, row) in src.chunks_exact(64).enumerate() {
+                    for c in 0..4 {
+                        let o = r * 64 + c * 16;
+                        data[d_off + o..d_off + o + 8].copy_from_slice(&row[c * 16 + 8..c * 16 + 16]);
+                        data[d_off + o + 8..d_off + o + 16].copy_from_slice(&row[c * 16..c * 16 + 8]);
+                    }
+                }
+            };
+            // 16-byte-chunk permutation of the base image into image `i`.
+            let perm_chunks = |data: &mut Vec<F8>, dst_img: usize, order: [usize; 4]| {
+                let src = data[base0..base0 + tl].to_vec();
+                let d_off = base0 + dst_img * tl;
+                for (r, row) in src.chunks_exact(64).enumerate() {
+                    for (i, &c) in order.iter().enumerate() {
+                        data[d_off + r * 64 + i * 16..d_off + r * 64 + i * 16 + 16]
+                            .copy_from_slice(&row[c * 16..c * 16 + 16]);
+                    }
+                }
+            };
+            // σ₁₆: lanes c ↦ c^1 → chunk order [1,0,3,2]
+            perm_chunks(&mut data, 2, [1, 0, 3, 2]);
+            swap8(&mut data, base0 + 2 * tl, base0 + 3 * tl);
+            // σ₃₂: lanes c ↦ c^2 → chunk order [2,3,0,1]
+            perm_chunks(&mut data, 4, [2, 3, 0, 1]);
+            swap8(&mut data, base0 + 4 * tl, base0 + 5 * tl);
+            // σ₄₈ = σ₁₆∘σ₃₂: lanes c ↦ c^3 → chunk order [3,2,1,0]
+            perm_chunks(&mut data, 6, [3, 2, 1, 0]);
+            swap8(&mut data, base0 + 6 * tl, base0 + 7 * tl);
         }
 
         Self {
@@ -124,6 +183,7 @@ impl InvNttTableByteSingleGf8 {
             n_chunks,
             data,
             data_offset,
+            table_images,
         }
     }
 
@@ -147,6 +207,17 @@ impl InvNttTableByteSingleGf8 {
         // SAFETY: construction appends one complete logical table immediately
         // after the original image in the same allocation.
         unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
+    }
+
+    /// Raw pointer to image `i` of the multi-image table. Image 0 is the
+    /// base table, 1 the σ₈ image; on x86_64 images 2..7 are the
+    /// σ₁₆/σ₁₆∘σ₈/σ₃₂/σ₃₂∘σ₈/σ₄₈/σ₄₈∘σ₈ pre-permuted forms. Images are
+    /// contiguous `256 × ell` blocks.
+    #[inline]
+    pub fn image_ptr(&self, i: usize) -> *const u8 {
+        // SAFETY: `i < table_images` is the constructor invariant; every
+        // image is a complete `256 * ell` block after `data_offset`.
+        unsafe { self.data.as_ptr().add(self.data_offset + i * 256 * self.ell) as *const u8 }
     }
 
     /// True when the allocation carries the σ₈ second image (tables built by
@@ -556,6 +627,52 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
             let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
             let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        }
+    }
+}
+
+/// Shuffle-free twin of
+/// [`apply_x86_avx512_register_2img_offw_at`]: the two-image form's residual
+/// lane permutations (`out = (U₀ ⊕ σ₃₂(U₂)) ⊕ σ₁₆(U₁ ⊕ σ₃₂(U₃))`, three
+/// `vshufi64x2` per apply) are folded into pre-permuted table images 2..7
+/// (the σ₁₆/σ₃₂/σ₄₈ chunk permutations plus their σ₈-composed odd-byte
+/// partners), so the whole apply collapses to `out = ⊕ᵢ imgᵢ[oᵢ]` — 8 loads
+/// and 7 XORs, zero port-5 shuffle uops. Lane permutations distribute over
+/// XOR, so the value is bit-identical to the two-image form. Images are
+/// contiguous `256 × 64` blocks from `base` (see
+/// [`InvNttTableByteSingleGf8::image_ptr`]).
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_2img_offw_at`], plus eight readable
+/// `256 × 64` images at `base`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_8img_offw_at(
+    base: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: eight readable pre-scaled offsets per the contract; `base`
+    // exposes eight complete `256 * 64` images.
+    {
+        unsafe {
+            const TL: usize = 256 * 64; // production ell = 64 layout
+            let w0 = (off as *const u64).read_unaligned();
+            let w1 = (off.add(4) as *const u64).read_unaligned();
+            let row = |img: usize, o: usize| {
+                _mm512_loadu_si512(base.add(img * TL + o) as *const __m512i)
+            };
+            let mut acc = _mm512_xor_si512(
+                row(0, w0 as u16 as usize),
+                row(1, (w0 >> 16) as u16 as usize),
+            );
+            acc = _mm512_xor_si512(acc, row(2, (w0 >> 32) as u16 as usize));
+            acc = _mm512_xor_si512(acc, row(3, (w0 >> 48) as usize));
+            acc = _mm512_xor_si512(acc, row(4, w1 as u16 as usize));
+            acc = _mm512_xor_si512(acc, row(5, (w1 >> 16) as u16 as usize));
+            acc = _mm512_xor_si512(acc, row(6, (w1 >> 32) as u16 as usize));
+            _mm512_xor_si512(acc, row(7, (w1 >> 48) as usize))
         }
     }
 }
