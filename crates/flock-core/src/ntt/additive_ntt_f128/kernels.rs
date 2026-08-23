@@ -420,6 +420,47 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
 /// # Safety
 /// The caller must ensure the 16 row slices selected by `r` are valid and
 /// disjoint from any row group being processed concurrently.
+/// The fused-4layer twiddle set in the platform's ready-to-use form.
+/// On AVX-512/VPCLMULQD this is the 15 split-form broadcasts with all x^64
+/// companions materialised (the per-row kernels' conversion removed); on
+/// other platforms it is the plain scalar array the portable kernel reads.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) type PreparedFused4Tw = [x86_64::TwX4; 15];
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+pub(super) type PreparedFused4Tw = [F128; 15];
+
+/// Convert one block's 15 twiddles once; all rows of the block share the
+/// result. AVX-512 resolves the diet form here, so the per-row kernels never
+/// re-derive the companions (a real cost on the deep pass, whose rows all
+/// reuse the same twiddle set).
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_prepare(twiddles: &[F128; 15]) -> PreparedFused4Tw {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        return x86_64::butterfly_fused_4layer_prepare(twiddles);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        *twiddles
+    }
+}
+
 #[inline]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
@@ -427,7 +468,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     num_ntts: usize,
     lanes: usize,
     r: usize,
-    twiddles: &[F128; 15],
+    tw: &PreparedFused4Tw,
 ) {
     debug_assert!(lanes <= num_ntts);
     #[cfg(all(
@@ -443,23 +484,23 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
             match sixteenth {
                 128 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
+                        ptr, lanes, r, tw, 0,
                     );
                 }
                 8 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
+                        ptr, lanes, r, tw, 0,
                     );
                 }
                 1 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
+                        ptr, lanes, r, tw, 0,
                     );
                 }
                 _ => {}
             }
         }
-        x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, tw);
     }
 
     #[cfg(not(all(
@@ -469,7 +510,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     )))]
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, tw);
     }
 }
 
@@ -487,7 +528,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     num_ntts: usize,
     lanes: usize,
     r: usize,
-    twiddles: &[F128; 15],
+    tw: &PreparedFused4Tw,
     pf_r: usize,
 ) {
     debug_assert!(lanes <= num_ntts);
@@ -504,19 +545,19 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
             match sixteenth {
                 128 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
+                        ptr, lanes, r, tw, pf_r,
                     );
                 }
                 8 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
+                        ptr, lanes, r, tw, pf_r,
                     );
                 }
                 _ => {}
             }
         }
         x86_64::butterfly_fused_4layer_row_pf::<H>(
-            ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
+            ptr, sixteenth, num_ntts, lanes, r, tw, pf_r,
         );
     }
 
@@ -528,7 +569,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         let _ = pf_r;
-        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, tw);
     }
 }
 
@@ -541,7 +582,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// # Safety
 /// The caller must ensure the eight rows are valid and disjoint from any row
 /// group being processed concurrently, that `dense_lanes <= num_ntts`, and
-/// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
+/// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`._lanes..num_ntts`.
 #[inline]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
