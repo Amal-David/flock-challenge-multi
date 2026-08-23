@@ -6463,6 +6463,23 @@ fn serial_par_enabled() -> bool {
     crate::serial_par_enabled()
 }
 
+/// Query-phase gathers: serial by default. The ranked parallel form of these
+/// two gathers (opened-row copies + Merkle sibling reads) is a
+/// DISPATCH-GRANULARITY regression on every measured machine: rayon's default
+/// fine split of the ~200-element query list costs ~7-30 us per task
+/// (5950X Zen3, 9950X3D Zen5 A/B), so the parallel opens run 10-40x SLOWER
+/// than the incumbent serial walk (atlas: 6.3-8.0 ms -> 0.36-0.68 ms with the
+/// global serial switch). The serial walk is the byte-identity oracle -- both
+/// gathers are order-preserving pure maps -- so the opens keep the serial
+/// form while the other ranked parallel segments (round-1 table prep) keep
+/// theirs. Read once per process. `FLOCK_OPEN_PAR=1` restores the parallel
+/// form for same-binary A/B screening.
+fn opens_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_PAR").is_some());
+    *ON
+}
+
 /// Work floor (total F128 copied) below which the opened-row gather stays on
 /// the sequential path: tiny gathers (deep levels of test geometries) are
 /// below rayon dispatch break-even.
@@ -6520,7 +6537,7 @@ fn sample_distinct_queries<Ch: Challenger>(
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    multi_proof_gather(tree, block_len, queries, serial_par_enabled())
+    multi_proof_gather(tree, block_len, queries, opens_par_enabled())
 }
 
 /// Multi-proof body. `par` splits the incumbent walk into its two halves —
@@ -7301,7 +7318,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> =
-        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+        gather_opened_rows(&queries_0, l0_row, opens_par_enabled());
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -7410,7 +7427,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let opened_rows_last: Vec<Vec<F128>> = gather_opened_rows(
                 &queries_last,
                 |q| wtns_prev.row(q),
-                serial_par_enabled(),
+                opens_par_enabled(),
             );
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
@@ -7553,7 +7570,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(
             &queries_i,
             |q| wtns_prev.row(q),
-            serial_par_enabled(),
+            opens_par_enabled(),
         );
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
