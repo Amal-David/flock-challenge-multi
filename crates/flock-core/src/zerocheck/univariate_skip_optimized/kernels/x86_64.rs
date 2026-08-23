@@ -1304,12 +1304,16 @@ mod tests {
                     n_b_med,
                     &mats,
                     &mut dynamic,
+                    core::ptr::null(),
+                    0,
                 );
                 accumulate_convert_ab_nomul_x86_gfni(
                     &chunk_ab_bytes,
                     n_b_med,
                     &mats,
                     &mut dispatched,
+                    core::ptr::null(),
+                    0,
                 );
             }
             assert_eq!(dispatched, dynamic, "dispatch n_b_med={n_b_med}");
@@ -1318,28 +1322,50 @@ mod tests {
         for n_b_med in [15usize, 16] {
             let mut dynamic = seed;
             let mut fixed = seed;
+            let mut hinted = seed;
             unsafe {
                 accumulate_convert_ab_nomul_x86_gfni_dynamic(
                     &chunk_ab_bytes,
                     n_b_med,
                     &mats,
                     &mut dynamic,
+                    core::ptr::null(),
+                    0,
                 );
                 if n_b_med == 15 {
                     accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
+                        core::ptr::null(),
+                        0,
+                    );
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut hinted,
+                        chunk_ab_bytes.as_ptr() as *const u8,
+                        n_b_med,
                     );
                 } else {
                     accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
+                        core::ptr::null(),
+                        0,
+                    );
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut hinted,
+                        chunk_ab_bytes.as_ptr() as *const u8,
+                        n_b_med,
                     );
                 }
             }
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
+            assert_eq!(hinted, dynamic, "prefetch-hint n_b_med={n_b_med}");
         }
     }
 }
@@ -1368,6 +1394,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
     n_b_med: usize,
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    pf_next: *const u8,
+    pf_n: usize,
 ) {
     // SAFETY: forwarded unchanged to the shared target-feature body; this
     // arm preserves and XOR-accumulates the bank's existing planes.
@@ -1377,6 +1405,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
             n_b_med,
             mats,
             bank_planes,
+            pf_next,
+            pf_n,
         );
     }
 }
@@ -1396,6 +1426,8 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     n_b_med: usize,
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    pf_next: *const u8,
+    pf_n: usize,
 ) {
     // SAFETY: forwarded unchanged to the shared target-feature body; the
     // caller's write-before-read proof permits the overwrite specialization.
@@ -1405,6 +1437,8 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
             n_b_med,
             mats,
             bank_planes,
+            pf_next,
+            pf_n,
         );
     }
 }
@@ -1422,6 +1456,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
     n_b_med: usize,
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    pf_next: *const u8,
+    pf_n: usize,
 ) {
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
@@ -1432,6 +1468,13 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
         for (bm, row) in rows.iter_mut().enumerate().take(n_b_med) {
             *row = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        // Look-ahead T0s of the next packed window, issued after the current
+        // window's stack loadus so SPR LFBs are not shared with that burst.
+        // Not inside the plane loop: a prefetch has no architectural effect
+        // and must not add a per-plane branch on the GFNI battery.
+        for k in 0..pf_n {
+            _mm_prefetch(pf_next.add(k * ELL) as *const i8, _MM_HINT_T0);
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
@@ -1483,6 +1526,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    pf_next: *const u8,
+    pf_n: usize,
 ) {
     use core::arch::x86_64::*;
     debug_assert!(N == 15 || N == 16);
@@ -1492,6 +1537,9 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
         for bm in 0..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        for k in 0..pf_n {
+            _mm_prefetch(pf_next.add(k * ELL) as *const i8, _MM_HINT_T0);
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
@@ -1534,6 +1582,8 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     n_b_med: usize,
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    pf_next: *const u8,
+    pf_n: usize,
 ) {
     // SAFETY: each callee has this entry point's fixed-array and feature
     // contract. Counts outside the ranked pair retain the incumbent body.
@@ -1543,17 +1593,23 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
                 chunk_ab_bytes,
                 mats,
                 bank_planes,
+                pf_next,
+                pf_n,
             ),
             16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
                 chunk_ab_bytes,
                 mats,
                 bank_planes,
+                pf_next,
+                pf_n,
             ),
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
                 chunk_ab_bytes,
                 n_b_med,
                 mats,
                 bank_planes,
+                pf_next,
+                pf_n,
             ),
         }
     }

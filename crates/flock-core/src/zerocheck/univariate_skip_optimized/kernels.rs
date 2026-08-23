@@ -506,10 +506,45 @@ pub(super) fn accumulate_convert_ab_nomul_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * 64],
 ) {
+    accumulate_convert_ab_nomul_gfni_pf(
+        chunk_ab_bytes,
+        n_b_med,
+        mats,
+        bank_planes,
+        core::ptr::null(),
+        0,
+    );
+}
+
+/// [`accumulate_convert_ab_nomul_gfni`] plus look-ahead T0s of `pf_n`
+/// packed 64-byte rows at `pf_next`, issued after the current window's
+/// stack loadus and before the GFNI plane battery. `pf_n == 0` is a no-op.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_gfni_pf(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+    pf_next: *const u8,
+    pf_n: usize,
+) {
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
-    // cover every 64-byte load/store.
+    // cover every 64-byte load/store. Prefetch is a hint.
     unsafe {
-        x86_64::accumulate_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
+        x86_64::accumulate_convert_ab_nomul_x86_gfni(
+            chunk_ab_bytes,
+            n_b_med,
+            mats,
+            bank_planes,
+            pf_next,
+            pf_n,
+        );
     }
 }
 
@@ -528,6 +563,32 @@ pub(super) fn write_convert_ab_nomul_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * 64],
 ) {
+    write_convert_ab_nomul_gfni_pf(
+        chunk_ab_bytes,
+        n_b_med,
+        mats,
+        bank_planes,
+        core::ptr::null(),
+        0,
+    );
+}
+
+/// First-visit twin of [`accumulate_convert_ab_nomul_gfni_pf`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn write_convert_ab_nomul_gfni_pf(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+    pf_next: *const u8,
+    pf_n: usize,
+) {
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every 64-byte load/store. The caller proves write-before-read.
     unsafe {
@@ -536,6 +597,8 @@ pub(super) fn write_convert_ab_nomul_gfni(
             n_b_med,
             mats,
             bank_planes,
+            pf_next,
+            pf_n,
         );
     }
 }

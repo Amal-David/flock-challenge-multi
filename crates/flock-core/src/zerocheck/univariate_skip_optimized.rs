@@ -2665,6 +2665,18 @@ fn zc_r1ab_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_KERNEL_PF=1` restores the copy-loop issue point for the
+/// round-1 AB packed-row T0s. Default: the same sixteen look-ahead lines are
+/// hinted from the convert kernel after its stack loadus land in ZMM, so
+/// SPR LFBs are not shared with the copy's 16 demand loads. A prefetch has
+/// no architectural effect; lanes stay bit-identical. The copy itself is
+/// unchanged.
+fn zc_r1ab_kernel_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_KERNEL_PF").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_R1AB_FIRST_WRITE=1` restores the per-band plane-bank clear
 /// and load/XOR first visit. The default arm is used only when every padding
 /// window is live, which proves that `w_idx == 0` overwrites each bank before
@@ -2746,6 +2758,8 @@ fn process_one_x_hi_ab_only(
     let ab_inner_ptr = ab_inner.as_ptr();
     #[cfg(target_arch = "x86_64")]
     let pf_spread = zc_r1ab_pf_spread_enabled();
+    #[cfg(target_arch = "x86_64")]
+    let kernel_pf = zc_r1ab_kernel_pf_enabled();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
@@ -2785,10 +2799,15 @@ fn process_one_x_hi_ab_only(
                 core::arch::x86_64::_MM_HINT_T0,
             );
         };
+        // Kill-switch path keeps the copy-loop issue point. Default: skip
+        // those T0s here; the convert kernel issues the same lines after
+        // its stack loadus, so they do not share SPR LFBs with the copy.
         #[cfg(target_arch = "x86_64")]
-        if !pf_spread {
-            for b_med in 0..n_next {
-                pf_one(b_med);
+        if !kernel_pf {
+            if !pf_spread {
+                for b_med in 0..n_next {
+                    pf_one(b_med);
+                }
             }
         }
         for b_med in 0..n_b_med {
@@ -2796,14 +2815,14 @@ fn process_one_x_hi_ab_only(
             // issued next to one demand line rather than the whole block
             // queueing ahead of the copy. Same lines, same look-ahead.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
+            if !kernel_pf && pf_spread && b_med < n_next {
                 pf_one(b_med);
             }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
         }
         #[cfg(target_arch = "x86_64")]
-        if pf_spread {
+        if !kernel_pf && pf_spread {
             for b_med in n_b_med..n_next {
                 pf_one(b_med);
             }
@@ -2824,19 +2843,28 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
+            let (pf_ptr, pf_n) = if kernel_pf && n_next > 0 {
+                (ab_inner_ptr.wrapping_add(next_base), n_next)
+            } else {
+                (core::ptr::null(), 0)
+            };
             if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(
+                kernels::write_convert_ab_nomul_gfni_pf(
                     &state.chunk_ab_bytes,
                     n_b_med,
                     mats_w,
                     bank,
+                    pf_ptr,
+                    pf_n,
                 );
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
+                kernels::accumulate_convert_ab_nomul_gfni_pf(
                     &state.chunk_ab_bytes,
                     n_b_med,
                     mats_w,
                     bank,
+                    pf_ptr,
+                    pf_n,
                 );
             }
         } else {
