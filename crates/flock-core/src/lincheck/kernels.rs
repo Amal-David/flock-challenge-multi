@@ -39,3 +39,10 @@ pub(crate) use x86_64::{build_nibble_tables as build_nibble_tables_portable, Nib
     target_feature = "gfni"
 ))]
 pub(crate) use x86_64::{fold_mats_from_basis, gfni_fold_tile, xor_bytes_avx512};
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+pub(crate) use x86_64::xor_workers_transpose_avx512;

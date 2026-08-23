@@ -400,6 +400,130 @@ pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) 
     }
 }
 
+/// 8×64 byte transpose: output register `k`, byte `j` is input register
+/// `j % 8`, byte `k + 8*(j/8)` — the ISA form of packing plane-byte `k`
+/// of eight columns into one qword group. `REV = false` matches the
+/// scalar `lo |= plane[b][col] << 8b` gather (byte 0 of a column is the
+/// least-significant byte of `F128.lo`).
+///
+/// # Safety
+/// Caller carries avx512f + avx512vbmi + avx512bw.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn byte_transpose_8x64(
+    rows: [core::arch::x86_64::__m512i; 8],
+) -> [core::arch::x86_64::__m512i; 8] {
+    use core::arch::x86_64::*;
+    #[rustfmt::skip]
+    const IDX: [i8; 64] = [
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    ];
+    const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+    const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+    const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
+    const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
+    const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
+    const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
+    // SAFETY: register shuffles plus loads of the fixed index constants.
+    unsafe {
+        let mut cur = rows;
+        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
+            let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+            let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+            let mut next = [_mm512_setzero_si512(); 8];
+            for r in 0..8usize {
+                if r & d == 0 {
+                    let x = cur[r];
+                    let y = cur[r | d];
+                    next[r] = _mm512_permutex2var_epi64(x, ia, y);
+                    next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
+                }
+            }
+            cur = next;
+        }
+        let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
+        let mut out = [_mm512_setzero_si512(); 8];
+        for k in 0..8usize {
+            out[k] = _mm512_permutexvar_epi8(idx, cur[k]);
+        }
+        out
+    }
+}
+
+/// Cross-worker plane XOR of one 64-column block, then the VBMI 8×64
+/// transpose back to 64 AoS F128. Bit-identical to `copy + xor_bytes_avx512
+/// + scalar byte gather`: F128 addition is XOR, and the transpose is the
+/// same `plane[b][col] -> limb byte b` map.
+///
+/// 16 plane ZMMs stay live across the worker XOR so the 1024-byte stack
+/// bounce never materialises. `n_workers == 1` is just the transpose.
+///
+/// # Safety
+/// Worker `w`'s block is 1024 readable bytes at
+/// `planes.add(w * worker_stride + block_base)`. `out` covers 64 F128.
+/// Features per the cfg gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+pub(crate) unsafe fn xor_workers_transpose_avx512(
+    planes: *const u8,
+    worker_stride: usize,
+    n_workers: usize,
+    block_base: usize,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: per the function contract.
+    unsafe {
+        let load_plane = |w: usize, p: usize| {
+            _mm512_loadu_si512(
+                planes.add(w * worker_stride + block_base + p * 64) as *const __m512i,
+            )
+        };
+        let mut lo = [load_plane(0, 0); 8];
+        let mut hi = [load_plane(0, 8); 8];
+        for p in 1..8 {
+            lo[p] = load_plane(0, p);
+            hi[p] = load_plane(0, 8 + p);
+        }
+        for w in 1..n_workers {
+            for p in 0..8 {
+                lo[p] = _mm512_xor_si512(lo[p], load_plane(w, p));
+                hi[p] = _mm512_xor_si512(hi[p], load_plane(w, 8 + p));
+            }
+        }
+        let los = byte_transpose_8x64(lo);
+        let his = byte_transpose_8x64(hi);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let dst = out as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(dst.add(2 * k), _mm512_permutex2var_epi64(los[k], idx0, his[k]));
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
+        }
+    }
+}
+
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
 /// `BLOCK_K = 8` block of i_inner positions, keeping all 8 F128 accumulators in

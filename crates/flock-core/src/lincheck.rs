@@ -1018,6 +1018,26 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_PLANE_TRAVX=1` restores the 1024-byte stack bounce plus
+/// scalar byte-gather transpose in the block-major GFNI reduce. Default
+/// ON keeps the 16 plane ZMMs live across the worker XOR and transposes
+/// them with the same 8×64 VBMI kernel the C-bank reassemble already
+/// ships. Bit-identical: XOR is bitwise and the transpose is a
+/// permutation of those bits.
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    )),
+    allow(dead_code)
+)]
+fn lc_plane_travx_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_TRAVX").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
 /// per-chunk `Instant::now()` probes inside the block-major sweep (the
 /// incumbent behaviour, and the way to get the tables / transpose+read /
@@ -1301,12 +1321,33 @@ fn fold_block_major_gfni(
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
     let mut out = vec![F128::ZERO; k];
+    let worker_stride = k * 16;
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
+        #[cfg(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi"
+        ))]
+        if lc_plane_travx_enabled() {
+            // SAFETY: each worker's slab is k*16 bytes; block `blk` is 1024
+            // bytes of 16 planes × 64 columns; `o` is 64 F128. XOR is
+            // bitwise; the VBMI 8×64 transpose matches the scalar gather.
+            unsafe {
+                kernels::xor_workers_transpose_avx512(
+                    planes.as_ptr(),
+                    worker_stride,
+                    n_workers,
+                    base,
+                    o.as_mut_ptr(),
+                );
+            }
+            return;
+        }
         let mut acc = [0u8; 1024];
         acc.copy_from_slice(&planes[base..base + 1024]);
         for w in 1..n_workers {
-            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+            let src = &planes[w * worker_stride + base..w * worker_stride + base + 1024];
             // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
             // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
             unsafe {
@@ -3380,6 +3421,57 @@ mod tests {
                     "forced-off arm m={m} k_log={k_log} useful={useful_bits}"
                 );
             }
+        }
+    }
+
+    /// Register-resident worker XOR + VBMI 8×64 transpose equals the
+    /// scalar byte-gather of the XOR-merged planes, including the
+    /// one-worker (transpose-only) case.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi"
+    ))]
+    #[test]
+    fn xor_workers_transpose_matches_scalar() {
+        let mut rng = Rng::new(0x91C0_7A1B);
+        for n_workers in [1usize, 2, 3, 16] {
+            let mut planes = vec![0u8; n_workers * 1024];
+            for chunk in planes.chunks_mut(8) {
+                chunk.copy_from_slice(&rng.next_u64().to_le_bytes()[..chunk.len()]);
+            }
+            let mut want = [F128::ZERO; 64];
+            let mut acc = [0u8; 1024];
+            acc.copy_from_slice(&planes[..1024]);
+            for w in 1..n_workers {
+                for i in 0..1024 {
+                    acc[i] ^= planes[w * 1024 + i];
+                }
+            }
+            for col in 0..64 {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                want[col] = F128 { lo, hi };
+            }
+            let mut got = [F128::ZERO; 64];
+            // SAFETY: one 1024-byte block per worker, 64 F128 of output.
+            unsafe {
+                kernels::xor_workers_transpose_avx512(
+                    planes.as_ptr(),
+                    1024,
+                    n_workers,
+                    0,
+                    got.as_mut_ptr(),
+                );
+            }
+            assert_eq!(want, got, "n_workers={n_workers}");
         }
     }
 
