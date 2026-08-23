@@ -78,6 +78,35 @@ const N_CHUNKS: usize = 8;
 pub(crate) const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
 
+/// Sixteen packed 64-byte medium rows. `[[u8; 64]; 16]` is align-1, so the
+/// GFNI convert's `_mm512_loadu` of each row can split a cache line. Align
+/// 64 makes every row a single line. Bytes are identical; only the address
+/// residue of the scratch changes.
+#[repr(C, align(64))]
+struct Align64Rows([[u8; 64]; 1 << N_MEDIUM]);
+
+impl Align64Rows {
+    #[inline]
+    fn zero() -> Self {
+        Self([[0u8; 64]; 1 << N_MEDIUM])
+    }
+}
+
+impl core::ops::Deref for Align64Rows {
+    type Target = [[u8; 64]; 1 << N_MEDIUM];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Align64Rows {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
 ///
@@ -1151,8 +1180,8 @@ pub fn round1_shift_reduce_extract_c(
 struct WorkerState {
     partial_ab: [F128; ELL],
     partial_c: [F128; ELL],
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
-    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_ab_bytes: Align64Rows,
+    chunk_c_bytes: Align64Rows,
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     local_res_ab: [F128; ELL],
@@ -1164,8 +1193,8 @@ impl WorkerState {
         Self {
             partial_ab: [F128::ZERO; ELL],
             partial_c: [F128::ZERO; ELL],
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
-            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_bytes: Align64Rows::zero(),
+            chunk_c_bytes: Align64Rows::zero(),
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
@@ -1303,8 +1332,8 @@ pub(crate) struct WorkerStateWithSHatV {
     // test-thread stack; heap-allocating keeps the carried state ~4 KiB —
     // smaller than the pre-DirectC two-bank layout that tested clean.
     partial_c: Box<[[F128; ELL]; N_C_BANKS]>,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
-    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_ab_bytes: Align64Rows,
+    chunk_c_bytes: Align64Rows,
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     pub(crate) local_res_ab: [F128; ELL],
@@ -1316,8 +1345,8 @@ impl WorkerStateWithSHatV {
         Self {
             partial_ab: [F128::ZERO; ELL],
             partial_c: Box::new([[F128::ZERO; ELL]; N_C_BANKS]),
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
-            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_bytes: Align64Rows::zero(),
+            chunk_c_bytes: Align64Rows::zero(),
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
@@ -2121,7 +2150,7 @@ pub(crate) struct WorkerStateFold4 {
     plane_c: Vec<u8>,
     plane_c_off: usize,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_ab_bytes: Align64Rows,
     /// Synthetic C blocks, one per retained q: row `4w + j` holds window w's
     /// transposed row `b_med = 4j + q`.
     chunk_c4: Box<[[[u8; 64]; 16]; N_C_Q]>,
@@ -2139,7 +2168,7 @@ impl WorkerStateFold4 {
             plane_c: Vec::new(),
             plane_c_off: 0,
             partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_bytes: Align64Rows::zero(),
             chunk_c4: Box::new([[[0u8; 64]; 16]; N_C_Q]),
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
@@ -2685,7 +2714,7 @@ fn zc_r1ab_first_write_enabled() -> bool {
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_ab_bytes: Align64Rows,
     pub(crate) local_res_ab: [F128; ELL],
 }
 
@@ -2694,7 +2723,7 @@ impl WorkerStateAbOnly {
         Self {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_bytes: Align64Rows::zero(),
             local_res_ab: [F128::ZERO; ELL],
         }
     }

@@ -752,6 +752,34 @@ pub fn partial_fold_packed_z_fast_padded(
 /// in L1, while one 128-entry output row-group stays hot across all 8 tables.
 const DIRECT_FOLD_TILE_STRIPES: usize = 8;
 
+/// GFNI gather/fold scratch. `[u8; N]` is align-1, so `_mm512_storeu` /
+/// `_mm512_loadu` of each 64-byte stripe can split a cache line. Align 64
+/// makes every ZMM access a single line. Bytes are identical.
+#[repr(C, align(64))]
+struct Align64Bytes<const N: usize>([u8; N]);
+
+impl<const N: usize> Align64Bytes<N> {
+    #[inline]
+    fn zero() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> core::ops::Deref for Align64Bytes<N> {
+    type Target = [u8; N];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for Align64Bytes<N> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Ranked BLAKE3 has `m=32`, `k_log=14`, hence 18 outer variables. Splitting
 /// those variables 9+9 replaces the 4 MiB full equality tensor with two 8 KiB
 /// factors. Reconstructing each of the 2^18 weights once in the fold plus the
@@ -1081,7 +1109,8 @@ fn fold_block_major_gfni(
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            const GATHER4_BYTES: usize = 4 * DIRECT_FOLD_TILE_STRIPES * 128;
+            let mut transposed = Align64Bytes::<GATHER4_BYTES>::zero();
             // First tile this worker writes into a freshly zeroed plane
             // buffer: seed the GFNI acc from a register zero idiom.
             let mut first_tile = true;
@@ -1424,7 +1453,8 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                 claim_hi = 0;
             }
             let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
-            let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            const GATHER1_BYTES: usize = DIRECT_FOLD_TILE_STRIPES * 128;
+            let mut transposed = Align64Bytes::<GATHER1_BYTES>::zero();
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
