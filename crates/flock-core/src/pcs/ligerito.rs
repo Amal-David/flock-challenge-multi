@@ -2169,12 +2169,25 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// `FLOCK_NO_TNT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
+/// inside the open-phase transpose butterfly. Default ON uses the same
+/// 5-CLMUL split product the additive-NTT row butterflies already ship
+/// (`ghash_mul_x4_split` with `t·x^64` paid once per call). Read once per
+/// process, outside every lane loop — a per-lane select here would be the
+/// class that inflated this kernel when a zero-twiddle test sat inside it.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn tnt_mul_diet_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_MUL_DIET").is_some());
+    *OFF
+}
+
 /// 4-lane AVX-512 transpose butterfly: `s = a ⊕ b; a' = s; b' = t·s ⊕ b`.
 ///
-/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one `ghash_mul_x4`
+/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one product
 /// per 4-lane group, XOR for the sum. Field-identical to the scalar loop
-/// (`ghash_mul_x4` is the canonical mod-p product, cross-checked against
-/// `ghash_mul_karatsuba_barrett` in the field tests).
+/// (`ghash_mul_x4` / `ghash_mul_x4_split` are the same mod-p element,
+/// cross-checked against `ghash_mul_karatsuba_barrett` in the field tests).
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site). `top` and
@@ -2182,12 +2195,38 @@ pub(crate) fn induce_sumcheck_poly(
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    // SAFETY: caller carries the target features; slice bounds hold.
+    // Dispatch is once per butterfly call, not per lane: the two
+    // monomorphs share no inner-loop branch. Ranked env is cleared, so
+    // the 6-CLMUL copy is diagnostics-only.
+    unsafe {
+        if tnt_mul_diet_disabled() {
+            transpose_butterfly_avx512_gen::<false>(top, bot, t);
+        } else {
+            transpose_butterfly_avx512_gen::<true>(top, bot, t);
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`transpose_butterfly_avx512`]. `DIET` picks the
+/// split 5-CLMUL product; the companion is materialised once, before the
+/// lane loop, so it is a loop-invariant register not a per-product op.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn transpose_butterfly_avx512_gen<const DIET: bool>(
+    top: &mut [F128],
+    bot: &mut [F128],
+    t: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
-    // SAFETY: caller carries the target features; slice bounds hold.
+    // SAFETY: forwarded from [`transpose_butterfly_avx512`].
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let companion = if DIET { ghash_shift64_x4(tb) } else { tb };
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2195,7 +2234,12 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let prod = if DIET {
+                ghash_mul_x4_split(vs, tb, companion)
+            } else {
+                ghash_mul_x4(tb, vs)
+            };
+            let nb = _mm512_xor_si512(vb, prod);
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -11182,6 +11226,33 @@ mod tests {
                 transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
+        }
+    }
+
+    /// Split-product transpose butterfly equals the 6-CLMUL form on random
+    /// rows. Compiles only when the AVX-512 GHASH kernels are in the native
+    /// feature set (the SPR ranked worker); the scalar wrapper is the AMD
+    /// CI path and is already covered by `transpose_blocked_matches_per_layer`.
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn transpose_butterfly_diet_matches_schoolbook() {
+        use crate::challenger::Challenger;
+        let mut ch = crate::challenger::RandomChallenger::new(0xD1E7_0001);
+        for &n in &[1usize, 3, 4, 5, 8, 15, 64, 65, 128] {
+            let t = ch.sample_f128();
+            let top0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let bot0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let mut a_top = top0.clone();
+            let mut a_bot = bot0.clone();
+            let mut b_top = top0;
+            let mut b_bot = bot0;
+            // SAFETY: cfg gate supplies avx512f+vpclmulqdq; equal lengths.
+            unsafe {
+                super::transpose_butterfly_avx512_gen::<false>(&mut a_top, &mut a_bot, t);
+                super::transpose_butterfly_avx512_gen::<true>(&mut b_top, &mut b_bot, t);
+            }
+            assert_eq!(a_top, b_top, "top n={n}");
+            assert_eq!(a_bot, b_bot, "bot n={n}");
         }
     }
 
