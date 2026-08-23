@@ -446,11 +446,11 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false>(
+            butterfly_fused_2layer_row_from_geo_impl::<false, 0, 0, 0>(
                 src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
             )
         } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true>(
+            butterfly_fused_2layer_row_from_geo_impl::<true, 0, 0, 0>(
                 src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
             )
         }
@@ -458,11 +458,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
 }
 
 /// # Safety
-/// Same contract as [`butterfly_fused_2layer_row_from_geo`].
+/// Same contract as [`butterfly_fused_2layer_row_from_geo`]. `SRC_Q`/`DST_Q`/
+/// `NN` are either 0 (use the runtime quarter / lane count) or the exact
+/// runtime values (the shaped wrappers): distinct constants force a distinct
+/// monomorphization, so the shaped form gets compile-time address arithmetic
+/// even though the body is never inlined into its wrapper.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
+unsafe fn butterfly_fused_2layer_row_from_geo_impl<
+    const DIET: bool,
+    const SRC_Q: usize,
+    const DST_Q: usize,
+    const NN: usize,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -475,6 +484,12 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
     use core::arch::x86_64::*;
 
     let [t_outer, t_inner_a, t_inner_b] = *twiddles;
+    // Shape substitution: compile-time when the wrapper pins one (nonzero),
+    // the runtime argument otherwise. Wrappers only pin values equal to the
+    // runtime shape, so this is the identity.
+    let src_quarter = if SRC_Q != 0 { SRC_Q } else { src_quarter };
+    let dst_quarter = if DST_Q != 0 { DST_Q } else { dst_quarter };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
     // SAFETY: caller guarantees target features, pointer geometry, and
     // non-aliasing src/dst.
     unsafe {
@@ -540,6 +555,45 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
     }
 }
 
+/// Shape-monomorphized [`butterfly_fused_2layer_row_from_geo`] for the ranked
+/// seed-top gather: `SRC_Q` (`src_quarter`), `DST_Q` (`dst_quarter`) and
+/// `NN` (`num_ntts`) become compile-time constants, so the four source and
+/// four destination row addresses collapse to one base plus constant
+/// displacements. The generic kernel's register pressure forces those eight
+/// pointers to the stack and reloads them every lane step — the same spill
+/// the fused-four shaped forms already deleted. Same kernel, same element
+/// order, bit-identical stores.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_geo`], with
+/// `src_quarter == SRC_Q`, `dst_quarter == DST_Q`, and `num_ntts == NN`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_shaped<
+    const SRC_Q: usize,
+    const DST_Q: usize,
+    const NN: usize,
+>(
+    src: *const F128,
+    src_r: usize,
+    dst: *mut F128,
+    dst_r: usize,
+    twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded caller contract; SRC_Q/DST_Q/NN substitute equal
+    // runtime values in the same impl body (a distinct monomorphization).
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_geo_impl::<false, SRC_Q, DST_Q, NN>(
+                src, SRC_Q, src_r, dst, DST_Q, dst_r, NN, twiddles,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_geo_impl::<true, SRC_Q, DST_Q, NN>(
+                src, SRC_Q, src_r, dst, DST_Q, dst_r, NN, twiddles,
+            )
+        }
+    }
+}
+
 /// Sparse sibling: layer-1 and left layer-2 twiddles are zero, so `a` is
 /// unchanged. Dense-with-zeros of [`butterfly_fused_2layer_row_from`].
 ///
@@ -589,7 +643,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -601,7 +655,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 core::ptr::null(),
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -640,7 +694,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -652,7 +706,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 pf_src,
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -668,11 +722,18 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
 }
 
 /// # Safety
-/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`].
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`]. `SRC_Q`/
+/// `DST_Q`/`NN` follow the fused-four shaped convention (0 = runtime).
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, const PF: bool>(
+unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
+    const DIET: bool,
+    const PF: bool,
+    const SRC_Q: usize,
+    const DST_Q: usize,
+    const NN: usize,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -685,6 +746,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
 ) {
     use core::arch::x86_64::*;
 
+    let src_quarter = if SRC_Q != 0 { SRC_Q } else { src_quarter };
+    let dst_quarter = if DST_Q != 0 { DST_Q } else { dst_quarter };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
     // SAFETY: caller guarantees target features, pointer geometry, and
     // non-aliasing src/dst.
     unsafe {
@@ -739,6 +803,103 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
             *dst_row(2).add(lane) = c;
             *dst_row(3).add(lane) = d;
             lane += 1;
+        }
+    }
+}
+
+/// Shape-monomorphized [`butterfly_fused_2layer_row_from_sparse_geo`].
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`], with
+/// `src_quarter == SRC_Q`, `dst_quarter == DST_Q`, and `num_ntts == NN`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_shaped<
+    const SRC_Q: usize,
+    const DST_Q: usize,
+    const NN: usize,
+>(
+    src: *const F128,
+    src_r: usize,
+    dst: *mut F128,
+    dst_r: usize,
+    right_twiddle: F128,
+) {
+    // SAFETY: forwarded caller contract; SRC_Q/DST_Q/NN substitute equal
+    // runtime values in the same impl body (a distinct monomorphization).
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, SRC_Q, DST_Q, NN>(
+                src,
+                SRC_Q,
+                src_r,
+                dst,
+                DST_Q,
+                dst_r,
+                NN,
+                right_twiddle,
+                core::ptr::null(),
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, SRC_Q, DST_Q, NN>(
+                src,
+                SRC_Q,
+                src_r,
+                dst,
+                DST_Q,
+                dst_r,
+                NN,
+                right_twiddle,
+                core::ptr::null(),
+            )
+        }
+    }
+}
+
+/// Shape-monomorphized [`butterfly_fused_2layer_row_from_sparse_geo_pf`].
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo_pf`], with
+/// `src_quarter == SRC_Q`, `dst_quarter == DST_Q`, and `num_ntts == NN`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf_shaped<
+    const SRC_Q: usize,
+    const DST_Q: usize,
+    const NN: usize,
+>(
+    src: *const F128,
+    src_r: usize,
+    dst: *mut F128,
+    dst_r: usize,
+    right_twiddle: F128,
+    pf_src: *const F128,
+) {
+    // SAFETY: forwarded caller contract; SRC_Q/DST_Q/NN substitute equal
+    // runtime values in the same impl body (a distinct monomorphization).
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true, SRC_Q, DST_Q, NN>(
+                src,
+                SRC_Q,
+                src_r,
+                dst,
+                DST_Q,
+                dst_r,
+                NN,
+                right_twiddle,
+                pf_src,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true, SRC_Q, DST_Q, NN>(
+                src,
+                SRC_Q,
+                src_r,
+                dst,
+                DST_Q,
+                dst_r,
+                NN,
+                right_twiddle,
+                pf_src,
+            )
         }
     }
 }
@@ -1671,7 +1832,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_geo_impl::<true>(
+                        butterfly_fused_2layer_row_from_geo_impl::<true, 0, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1682,7 +1843,7 @@ mod diet_tests {
                             &tw3,
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_geo_impl::<false>(
+                        butterfly_fused_2layer_row_from_geo_impl::<false, 0, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1704,7 +1865,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, 0, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1716,7 +1877,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, 0, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -1769,5 +1930,84 @@ mod diet_tests {
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
         }
+    }
+
+    /// Shaped seed 2-layer wrappers pin SRC_Q/DST_Q/NN equal to the runtime
+    /// arguments, so they must match the generic form byte-for-byte. Compact
+    /// geometry (not the ranked 2^17 source quarter) keeps the oracle in
+    /// cache; the ranked dispatch substitutes the same way.
+    #[test]
+    fn seed_2layer_shaped_matches_generic() {
+        let mut next = rng(0xA11C_E5ED);
+        const SRC_Q: usize = 8;
+        const DST_Q: usize = 4;
+        const NN: usize = 8;
+        let src_r = 3usize;
+        let dst_r = 1usize;
+        let src: Vec<F128> = (0..(3 * SRC_Q + src_r + 1) * NN)
+            .map(|_| next())
+            .collect();
+        let tw3 = [next(), next(), next()];
+        let right = next();
+
+        let run_dense = |shaped: bool| {
+            let mut dst = vec![F128::ZERO; (3 * DST_Q + dst_r + 1) * NN];
+            // SAFETY: src covers every (i*SRC_Q+src_r) row of NN lanes; dst
+            // covers every (i*DST_Q+dst_r) row; this module's cfg gate supplies
+            // avx512f+vpclmulqdq.
+            unsafe {
+                if shaped {
+                    butterfly_fused_2layer_row_from_geo_shaped::<SRC_Q, DST_Q, NN>(
+                        src.as_ptr(),
+                        src_r,
+                        dst.as_mut_ptr(),
+                        dst_r,
+                        &tw3,
+                    );
+                } else {
+                    butterfly_fused_2layer_row_from_geo(
+                        src.as_ptr(),
+                        SRC_Q,
+                        src_r,
+                        dst.as_mut_ptr(),
+                        DST_Q,
+                        dst_r,
+                        NN,
+                        &tw3,
+                    );
+                }
+            }
+            dst
+        };
+        assert_eq!(run_dense(true), run_dense(false), "dense geo");
+
+        let run_sparse = |shaped: bool| {
+            let mut dst = vec![F128::ZERO; (3 * DST_Q + dst_r + 1) * NN];
+            // SAFETY: same geometry contract as `run_dense`.
+            unsafe {
+                if shaped {
+                    butterfly_fused_2layer_row_from_sparse_geo_shaped::<SRC_Q, DST_Q, NN>(
+                        src.as_ptr(),
+                        src_r,
+                        dst.as_mut_ptr(),
+                        dst_r,
+                        right,
+                    );
+                } else {
+                    butterfly_fused_2layer_row_from_sparse_geo(
+                        src.as_ptr(),
+                        SRC_Q,
+                        src_r,
+                        dst.as_mut_ptr(),
+                        DST_Q,
+                        dst_r,
+                        NN,
+                        right,
+                    );
+                }
+            }
+            dst
+        };
+        assert_eq!(run_sparse(true), run_sparse(false), "sparse geo");
     }
 }

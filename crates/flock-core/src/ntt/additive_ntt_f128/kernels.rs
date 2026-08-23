@@ -299,8 +299,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: cfg gate guarantees the required target features.
+    // SAFETY: cfg gate guarantees the required target features. The shaped
+    // arm only fires when the constants equal the runtime shape, so it is
+    // value-identical.
     unsafe {
+        if super::ntt_shaped_enabled()
+            && src_quarter == (1 << 17)
+            && dst_quarter == 64
+            && num_ntts == 64
+        {
+            x86_64::butterfly_fused_2layer_row_from_geo_shaped::<{ 1 << 17 }, 64, 64>(
+                src, src_r, dst, dst_r, twiddles,
+            );
+            return;
+        }
         x86_64::butterfly_fused_2layer_row_from_geo(
             src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
         );
@@ -345,8 +357,24 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: cfg gate guarantees the required target features.
+    // SAFETY: cfg gate guarantees the required target features. The shaped
+    // arm only fires when the constants equal the runtime shape, so it is
+    // value-identical.
     unsafe {
+        if super::ntt_shaped_enabled()
+            && src_quarter == (1 << 17)
+            && dst_quarter == 64
+            && num_ntts == 64
+        {
+            x86_64::butterfly_fused_2layer_row_from_sparse_geo_shaped::<{ 1 << 17 }, 64, 64>(
+                src,
+                src_r,
+                dst,
+                dst_r,
+                right_twiddle,
+            );
+            return;
+        }
         x86_64::butterfly_fused_2layer_row_from_sparse_geo(
             src,
             src_quarter,
@@ -409,8 +437,25 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: cfg gate guarantees the required target features.
+    // SAFETY: cfg gate guarantees the required target features. The shaped
+    // arm only fires when the constants equal the runtime shape, so it is
+    // value-identical.
     unsafe {
+        if super::ntt_shaped_enabled()
+            && src_quarter == (1 << 17)
+            && dst_quarter == 64
+            && num_ntts == 64
+        {
+            x86_64::butterfly_fused_2layer_row_from_sparse_geo_pf_shaped::<{ 1 << 17 }, 64, 64>(
+                src,
+                src_r,
+                dst,
+                dst_r,
+                right_twiddle,
+                pf_src,
+            );
+            return;
+        }
         x86_64::butterfly_fused_2layer_row_from_sparse_geo_pf(
             src,
             src_quarter,

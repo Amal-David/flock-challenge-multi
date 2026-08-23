@@ -586,13 +586,13 @@ fn deep_pf_hint() -> u8 {
 static NTT_SHAPED_TEST_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Shape-monomorphized deep row kernels (see
-/// `kernels::x86_64::butterfly_fused_4layer_row_shaped`): the recurring
-/// `(sixteenth, num_ntts)` geometries dispatch to const-generic bodies whose
-/// address arithmetic is compile-time, deleting the generic kernel's
-/// per-lane-step row-pointer reloads. Value-identical by construction — the
-/// constants replace equal runtime values in the same body — so the kill
-/// switch exists purely for same-binary A/B screening:
+/// Shape-monomorphized row kernels (see
+/// `kernels::x86_64::butterfly_fused_4layer_row_shaped` and the seed
+/// 2-layer `*_geo_shaped` siblings): the recurring geometries dispatch to
+/// const-generic bodies whose address arithmetic is compile-time, deleting
+/// the generic kernel's per-lane-step row-pointer reloads. Value-identical
+/// by construction — the constants replace equal runtime values in the same
+/// body — so the kill switch exists purely for same-binary A/B screening:
 /// `FLOCK_NO_NTT_SHAPED=1` restores the generic dispatch. Read once per
 /// process — never inside a loop.
 #[cfg_attr(
