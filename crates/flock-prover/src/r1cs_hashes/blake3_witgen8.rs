@@ -46,6 +46,10 @@ const STEP_WORDS: usize = 16;
 /// u32s of the streaming projection's staging pair: one step's sixteen words
 /// for eight blocks, a side.
 pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
+/// Sixteen-block twin: a side then b side, sixteen 16-word block rows each.
+/// Same bytes as two consecutive `STREAM_STAGE_WORDS` pairs.
+pub(crate) const STREAM_STAGE_WORDS_16: usize = 2 * 16 * STEP_WORDS;
+const _STAGE_16: () = assert!(STREAM_STAGE_WORDS_16 == 2 * STREAM_STAGE_WORDS);
 // 62, not 61: an odd boundary leaves the z drain's paired NT loop with a
 // lone 32-byte tail chunk — one masked, partially-written NT line per block
 // (an ECC read-modify-write at the memory controller, 2^18 times per
@@ -408,16 +412,18 @@ const _RING_GEOMETRY: () = {
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
 /// step is one 64-byte round-1 medium window per block, so the transform runs
-/// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
-/// of off two full-block window buffers.
+/// off a staging pair as the words are produced instead of off two full-block
+/// window buffers.
 ///
-/// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
-/// block rows each) and is 64-byte aligned. `out` owns this octa's eight
+/// `stage` owns `2 * n_blocks * STEP_WORDS` u32s (a side then b side,
+/// `n_blocks` 16-word block rows each) and is 64-byte aligned. `n_blocks` is
+/// 8 for the octa drain and 16 for the hex drain. `out` owns that many
 /// `BYTES_PER_BLOCK` ab_inner blocks. Bit `j` of `live` selects block `j`.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
     pub(crate) live: u32,
+    pub(crate) n_blocks: usize,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
 }
@@ -425,14 +431,15 @@ pub(crate) struct StreamProj<'t> {
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
-        // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
-        (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
+        // SAFETY: the staging owns `2 * n_blocks * STEP_WORDS` u32s.
+        debug_assert!(self.n_blocks == 8 || self.n_blocks == 16);
+        (self.stage, unsafe { self.stage.add(self.n_blocks * STEP_WORDS) })
     }
 
     /// Transform the staged window `blk` (`0..2 · 16`) for every live block.
     ///
     /// # Safety
-    /// Both staging sides hold the eight blocks' bytes for window `blk`.
+    /// Both staging sides hold the `n_blocks` blocks' bytes for window `blk`.
     #[inline(never)]
     unsafe fn project(&self, blk: usize) {
         unsafe {
@@ -442,8 +449,8 @@ impl StreamProj<'_> {
     }
 
     /// The window's per-block invariants: its static-B eligibility and the
-    /// table images the kernel addresses. Both are the same for all eight
-    /// blocks, so a producer that walks the eight blocks in several pieces
+    /// table images the kernel addresses. Both are the same for every block
+    /// of this step, so a producer that walks the blocks in several pieces
     /// resolves them ONCE and hands them to every piece.
     #[inline(always)]
     fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
@@ -452,9 +459,9 @@ impl StreamProj<'_> {
     }
 
     /// [`Self::project`] with the window invariants already resolved, and with
-    /// an optional set of drain rows to publish AS the eight blocks are
+    /// an optional set of drain rows to publish AS the `n_blocks` blocks are
     /// transformed. `rows` is what makes the streaming stores spread: they are
-    /// emitted three per block instead of twenty-four per step, and because
+    /// emitted three per block instead of 3·n_blocks per step, and because
     /// the publisher lives inside the transform loop it costs no extra call
     /// and no second copy of the kernel body.
     ///
@@ -462,9 +469,9 @@ impl StreamProj<'_> {
     /// As for [`Self::project`], and `plan`/`imgs` must be this window's
     /// [`Self::window_prep`]; `rows`, when present, must describe the drain
     /// step that produced this window's staging. `off`, when present, must
-    /// point to the eight blocks' prebuilt offset arena
-    /// (`8 * ROUND1_AB_OFF_WORDS` u16s, 64-byte aligned, block-major) for
-    /// this window's staging bytes, and `plan.offsets_eligible(blk)` must
+    /// point to the `n_blocks` blocks' prebuilt offset arena
+    /// (`n_blocks * ROUND1_AB_OFF_WORDS` u16s, 64-byte aligned, block-major)
+    /// for this window's staging bytes, and `plan.offsets_eligible(blk)` must
     /// hold.
     #[inline(never)]
     unsafe fn project_blocks(
@@ -483,7 +490,7 @@ impl StreamProj<'_> {
             // Publish scheduling identical to the loops below.
             if let Some(op) = off {
                 debug_assert!(plan.offsets_eligible(blk));
-                for j in 0..8usize {
+                for j in 0..self.n_blocks {
                     if let Some(rows) = rows {
                         rows.publish(j, sa, sb);
                     }
@@ -504,12 +511,12 @@ impl StreamProj<'_> {
                 }
                 return;
             }
-            for j in 0..8usize {
+            for j in 0..self.n_blocks {
                 // ONE block transformed per THREE lines published: the drain's
-                // streaming stores land ~1/8 of a window apart instead of all
-                // together. Publishing block `j`'s rows before transforming it
-                // is deliberate — the two touch disjoint memory, and this way
-                // the eight-block loop below is untouched.
+                // streaming stores land ~1/n_blocks of a window apart instead
+                // of all together. Publishing block `j`'s rows before
+                // transforming it is deliberate — the two touch disjoint
+                // memory, and this way the transform body is untouched.
                 if let Some(rows) = rows {
                     rows.publish(j, sa, sb);
                 }
@@ -641,6 +648,15 @@ macro_rules! pushf8 {
     }};
 }
 
+macro_rules! pushf16 {
+    ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+        $w.push::<{ ($pos % 32) as u32 }, { $width as u32 }, {
+            let u = ($pos % 32) as u32;
+            if u == 0 { 1 } else { 32 - u }
+        }, { $pos / 32 }>($v);
+    }};
+}
+
 #[inline(always)]
 fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
@@ -681,6 +697,638 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
             8 => or_v8(shr_v8::<8>(v), shl_v8::<24>(v)),
             7 => or_v8(shr_v8::<7>(v), shl_v8::<25>(v)),
             _ => panic!("unexpected rotate count {N}"),
+        }
+    }
+}
+
+/// 16-wide (ZMM) twin of the 8-wide G-function AND of [`Drain8`]. The G
+/// loop stays in ZMM; the ring, transpose, `z = a & b`, and spread schedule
+/// are 16-block. Published z/a/b and ab_inner layout stay 8-block-major, so
+/// the bytes are identical to two sequential octa dumps. Ranked live path
+/// only; `FLOCK_NO_WITGEN16=1` restores the two-octa loop.
+pub(crate) fn witgen16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN16").is_none());
+    *ON
+}
+
+#[cfg(target_arch = "x86_64")]
+type V16 = __m512i;
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn merge_v8(lo: V8, hi: V8) -> V16 {
+    unsafe { _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn split_v16(v: V16) -> (V8, V8) {
+    unsafe {
+        (
+            _mm512_castsi512_si256(v),
+            _mm512_extracti64x4_epi64::<1>(v),
+        )
+    }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn dup_u32_16(x: u32) -> V16 {
+    unsafe { _mm512_set1_epi32(x as i32) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_xor_si512(a, b) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn or_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_or_si512(a, b) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn and_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_and_si512(a, b) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn add_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_add_epi32(a, b) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn shr_v16<const N: u32>(v: V16) -> V16 {
+    unsafe { _mm512_srli_epi32::<N>(v) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn shl_v16<const N: u32>(v: V16) -> V16 {
+    unsafe { _mm512_slli_epi32::<N>(v) }
+}
+
+/// Same boolean as [`vsli_v8`]: bits `N..32` from `b<<N`, bits `0..N` from `a`.
+///
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn vsli_v16<const N: u32>(a: V16, b: V16) -> V16 {
+    unsafe {
+        let mask = _mm512_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        _mm512_ternarylogic_epi32::<0xF8>(_mm512_slli_epi32::<N>(b), a, mask)
+    }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn ror_v16<const N: i32>(v: V16) -> V16 {
+    unsafe { _mm512_ror_epi32::<N>(v) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
+    debug_assert_eq!(N + M, 32);
+    unsafe { ror_v16::<N>(xor_v16(x, y)) }
+}
+
+/// Same algebra as [`add_carry_parts_v8`].
+///
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+unsafe fn add_carry_parts_v16(x: V16, y: V16) -> (V16, V16, V16, V16) {
+    unsafe {
+        let sum = add_v16(x, y);
+        let left = xor_v16(sum, y);
+        let right = xor_v16(sum, x);
+        let carry = and_v16(left, right);
+        (sum, left, right, carry)
+    }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn load_v16(p: *const u32) -> V16 {
+    unsafe { _mm512_loadu_si512(p.cast::<__m512i>()) }
+}
+
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn store_v16(p: *mut u32, v: V16) {
+    unsafe { _mm512_storeu_si512(p.cast::<__m512i>(), v) }
+}
+
+/// One 64-byte non-temporal store when `p` is line-aligned. Falls back to
+/// [`stream_pair_v8`] (the Drain8 pair form) otherwise, so the bytes match.
+///
+/// # Safety
+/// Caller must be in an `avx512f` context; `p` is 16-byte aligned.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn stream_v16(p: *mut u32, v: V16, wide_nt: bool) {
+    unsafe {
+        if wide_nt && p as usize % 64 == 0 {
+            _mm512_stream_si512(p.cast::<__m512i>(), v);
+            return;
+        }
+        let (lo, hi) = split_v16(v);
+        stream_pair_v8(p, lo, hi, wide_nt);
+    }
+}
+
+/// Publish one 16-word (64-byte) transposed row under the same `nt`/liveness
+/// policy as [`emit_pair`]. Both-live + NT is one ZMM stream instead of a
+/// split-and-remerge of two YMM streams.
+///
+/// # Safety
+/// As for [`stream_v16`] / [`emit_pair`].
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn emit_v16(
+    p: *mut u32,
+    v: V16,
+    lo_live: bool,
+    hi_live: bool,
+    nt: bool,
+    wide_nt: bool,
+) {
+    unsafe {
+        match (nt, lo_live, hi_live) {
+            (true, true, true) => stream_v16(p, v, wide_nt),
+            (false, true, true) => store_v16(p, v),
+            (nt, lo, hi) => {
+                let (a, b) = split_v16(v);
+                emit_pair(p, a, b, lo, hi, nt, wide_nt);
+            }
+        }
+    }
+}
+
+/// 16×16 u32 transpose. `r[i]` lane `j` becomes `out[j]` lane `i`.
+/// Four-stage AVX-512: unpack32, unpack64, then two `shuffle_i32x4`
+/// passes (128-bit then 256-bit groups). Bit permutation of the 256
+/// input lanes; inverse of itself.
+///
+/// # Safety
+/// Caller must be in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn tr16(v: [V16; 16]) -> [V16; 16] {
+    unsafe {
+        let t0 = _mm512_unpacklo_epi32(v[0], v[1]);
+        let t1 = _mm512_unpackhi_epi32(v[0], v[1]);
+        let t2 = _mm512_unpacklo_epi32(v[2], v[3]);
+        let t3 = _mm512_unpackhi_epi32(v[2], v[3]);
+        let t4 = _mm512_unpacklo_epi32(v[4], v[5]);
+        let t5 = _mm512_unpackhi_epi32(v[4], v[5]);
+        let t6 = _mm512_unpacklo_epi32(v[6], v[7]);
+        let t7 = _mm512_unpackhi_epi32(v[6], v[7]);
+        let t8 = _mm512_unpacklo_epi32(v[8], v[9]);
+        let t9 = _mm512_unpackhi_epi32(v[8], v[9]);
+        let t10 = _mm512_unpacklo_epi32(v[10], v[11]);
+        let t11 = _mm512_unpackhi_epi32(v[10], v[11]);
+        let t12 = _mm512_unpacklo_epi32(v[12], v[13]);
+        let t13 = _mm512_unpackhi_epi32(v[12], v[13]);
+        let t14 = _mm512_unpacklo_epi32(v[14], v[15]);
+        let t15 = _mm512_unpackhi_epi32(v[14], v[15]);
+
+        let u0 = _mm512_unpacklo_epi64(t0, t2);
+        let u1 = _mm512_unpackhi_epi64(t0, t2);
+        let u2 = _mm512_unpacklo_epi64(t1, t3);
+        let u3 = _mm512_unpackhi_epi64(t1, t3);
+        let u4 = _mm512_unpacklo_epi64(t4, t6);
+        let u5 = _mm512_unpackhi_epi64(t4, t6);
+        let u6 = _mm512_unpacklo_epi64(t5, t7);
+        let u7 = _mm512_unpackhi_epi64(t5, t7);
+        let u8 = _mm512_unpacklo_epi64(t8, t10);
+        let u9 = _mm512_unpackhi_epi64(t8, t10);
+        let u10 = _mm512_unpacklo_epi64(t9, t11);
+        let u11 = _mm512_unpackhi_epi64(t9, t11);
+        let u12 = _mm512_unpacklo_epi64(t12, t14);
+        let u13 = _mm512_unpackhi_epi64(t12, t14);
+        let u14 = _mm512_unpacklo_epi64(t13, t15);
+        let u15 = _mm512_unpackhi_epi64(t13, t15);
+
+        let q0 = _mm512_shuffle_i32x4::<0x88>(u0, u4);
+        let q1 = _mm512_shuffle_i32x4::<0x88>(u1, u5);
+        let q2 = _mm512_shuffle_i32x4::<0x88>(u2, u6);
+        let q3 = _mm512_shuffle_i32x4::<0x88>(u3, u7);
+        let q4 = _mm512_shuffle_i32x4::<0xDD>(u0, u4);
+        let q5 = _mm512_shuffle_i32x4::<0xDD>(u1, u5);
+        let q6 = _mm512_shuffle_i32x4::<0xDD>(u2, u6);
+        let q7 = _mm512_shuffle_i32x4::<0xDD>(u3, u7);
+        let q8 = _mm512_shuffle_i32x4::<0x88>(u8, u12);
+        let q9 = _mm512_shuffle_i32x4::<0x88>(u9, u13);
+        let q10 = _mm512_shuffle_i32x4::<0x88>(u10, u14);
+        let q11 = _mm512_shuffle_i32x4::<0x88>(u11, u15);
+        let q12 = _mm512_shuffle_i32x4::<0xDD>(u8, u12);
+        let q13 = _mm512_shuffle_i32x4::<0xDD>(u9, u13);
+        let q14 = _mm512_shuffle_i32x4::<0xDD>(u10, u14);
+        let q15 = _mm512_shuffle_i32x4::<0xDD>(u11, u15);
+
+        [
+            _mm512_shuffle_i32x4::<0x88>(q0, q8),
+            _mm512_shuffle_i32x4::<0x88>(q1, q9),
+            _mm512_shuffle_i32x4::<0x88>(q2, q10),
+            _mm512_shuffle_i32x4::<0x88>(q3, q11),
+            _mm512_shuffle_i32x4::<0x88>(q4, q12),
+            _mm512_shuffle_i32x4::<0x88>(q5, q13),
+            _mm512_shuffle_i32x4::<0x88>(q6, q14),
+            _mm512_shuffle_i32x4::<0x88>(q7, q15),
+            _mm512_shuffle_i32x4::<0xDD>(q0, q8),
+            _mm512_shuffle_i32x4::<0xDD>(q1, q9),
+            _mm512_shuffle_i32x4::<0xDD>(q2, q10),
+            _mm512_shuffle_i32x4::<0xDD>(q3, q11),
+            _mm512_shuffle_i32x4::<0xDD>(q4, q12),
+            _mm512_shuffle_i32x4::<0xDD>(q5, q13),
+            _mm512_shuffle_i32x4::<0xDD>(q6, q14),
+            _mm512_shuffle_i32x4::<0xDD>(q7, q15),
+        ]
+    }
+}
+
+/// Transpose the sixteen stage words at `w` (one 16-word drain step) into
+/// sixteen row-major 64-byte runs.
+///
+/// # Safety
+/// `stage` owns at least `w + 16` V16s; caller is in an `avx512f` context.
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn tr16_step(stage: *const V16, w: usize) -> [V16; 16] {
+    unsafe {
+        tr16([
+            load_v16(stage.add(w) as *const u32),
+            load_v16(stage.add(w + 1) as *const u32),
+            load_v16(stage.add(w + 2) as *const u32),
+            load_v16(stage.add(w + 3) as *const u32),
+            load_v16(stage.add(w + 4) as *const u32),
+            load_v16(stage.add(w + 5) as *const u32),
+            load_v16(stage.add(w + 6) as *const u32),
+            load_v16(stage.add(w + 7) as *const u32),
+            load_v16(stage.add(w + 8) as *const u32),
+            load_v16(stage.add(w + 9) as *const u32),
+            load_v16(stage.add(w + 10) as *const u32),
+            load_v16(stage.add(w + 11) as *const u32),
+            load_v16(stage.add(w + 12) as *const u32),
+            load_v16(stage.add(w + 13) as *const u32),
+            load_v16(stage.add(w + 14) as *const u32),
+            load_v16(stage.add(w + 15) as *const u32),
+        ])
+    }
+}
+
+/// 16-block drain: V16 ring, one `tr16` per step, `z = a & b` in ZMM, one
+/// spread over `j in 0..16`. Published layout is still `[block][word]`.
+struct Drain16<'t> {
+    ast: *mut V16,
+    bs: *mut V16,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: Option<StreamProj<'t>>,
+    elide: [bool; 3],
+    z_nt: bool,
+    wide_nt: bool,
+    spread: bool,
+}
+
+/// Lane-wise packed-word writer: 16 independent `PackedWordWriter`s.
+struct W16<'t> {
+    pending: V16,
+    stage: *mut V16,
+    drain: *mut Drain16<'t>,
+    flush: bool,
+}
+
+impl<'t> W16<'t> {
+    #[inline(always)]
+    fn at(stage: *mut V16, pending: V16, drain: *mut Drain16<'t>, flush: bool) -> Self {
+        Self {
+            pending,
+            stage,
+            drain,
+            flush,
+        }
+    }
+
+    /// # Safety
+    /// Caller must be in an `avx512f` context; `WORD` indexes the ring.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
+        unsafe {
+            store_v16(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+                if WORD + 1 == RING_WORDS {
+                    (*self.drain).drain_range(16, 16, RING_WORDS - 16);
+                } else {
+                    (*self.drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must be in an `avx512f` context.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn push<const USED: u32, const WIDTH: u32, const BACK: u32, const WORD: usize>(
+        &mut self,
+        v: V16,
+    ) {
+        const {
+            assert!(USED < 32);
+            assert!(WIDTH == 31 || WIDTH == 32);
+            assert!(BACK >= 1 && BACK < 32);
+            assert!(WORD < U32_PER_BLOCK);
+        }
+        debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+        unsafe {
+            if USED == 0 {
+                if WIDTH == 32 {
+                    self.write_word::<WORD>(v);
+                    self.pending = dup_u32_16(0);
+                } else {
+                    self.pending = v;
+                }
+            } else if USED + WIDTH < 32 {
+                self.pending = vsli_v16::<USED>(self.pending, v);
+            } else {
+                let out = vsli_v16::<USED>(self.pending, v);
+                self.write_word::<WORD>(out);
+                if USED + WIDTH == 32 {
+                    self.pending = dup_u32_16(0);
+                } else {
+                    self.pending = shr_v16::<BACK>(v);
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must be in an `avx512f` context.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn finish(&mut self) {
+        unsafe {
+            self.write_word::<LAST_WORD>(self.pending);
+        }
+    }
+}
+
+impl Drain16<'_> {
+    #[inline(always)]
+    fn ab_ranges(&self) -> (usize, usize, usize) {
+        let a_g1 = if self.elide[1] {
+            ELIDE_ZERO_CHUNK
+        } else {
+            DUMP_CHUNKS
+        };
+        let b_g0 = if self.elide[2] {
+            ELIDE_B_PREFIX_CHUNKS
+        } else {
+            0
+        };
+        let b_g1 = if !self.elide[2] {
+            DUMP_CHUNKS
+        } else if self.proj.is_some() {
+            ELIDE_B_TAIL_CHUNK_WIN
+        } else {
+            ELIDE_B_TAIL_CHUNK
+        };
+        (a_g1, b_g0, b_g1)
+    }
+
+    /// # Safety
+    /// Ring words `[ring_word, ring_word + words)` are initialized; destinations
+    /// own 16 contiguous 512-word blocks. Caller is in an `avx512f` context.
+    #[target_feature(enable = "avx512f")]
+    #[inline(never)]
+    unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            if let Some(proj) = &self.proj {
+                if self.spread {
+                    self.drain_range_spread(proj, base_word, ring_word, words);
+                    return;
+                }
+                self.drain_range_bunched(proj, base_word, ring_word, words);
+                return;
+            }
+            self.drain_range_buffered(base_word, ring_word, words);
+        }
+    }
+
+    /// Bunched 16-block twin of Drain8's non-spread streaming arm: transpose
+    /// once, publish all sixteen blocks' three rows, then project. Kept for
+    /// `FLOCK_NO_SPREAD_NT=1`.
+    ///
+    /// # Safety
+    /// As for [`Self::drain_range`].
+    #[target_feature(enable = "avx512f")]
+    #[inline(never)]
+    unsafe fn drain_range_bunched(
+        &self,
+        proj: &StreamProj<'_>,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
+            let (sa, sb) = proj.sides();
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+                let g = abs_word / 8;
+                let a_lo = g < a_g1;
+                let a_hi = g + 1 < a_g1;
+                let b_lo = g >= b_g0 && g < b_g1;
+                let b_hi = g + 1 >= b_g0 && g + 1 < b_g1;
+                let z_lo = g < z_g1;
+                let z_hi = g + 1 < z_g1;
+                let a_rows = tr16_step(self.ast, rw);
+                let b_rows = tr16_step(self.bs, rw);
+                for j in 0..16 {
+                    store_v16(sa.add(j * STEP_WORDS), a_rows[j]);
+                    store_v16(sb.add(j * STEP_WORDS), b_rows[j]);
+                    let z = and_v16(a_rows[j], b_rows[j]);
+                    let o = j * U32_PER_BLOCK + abs_word;
+                    emit_v16(self.a.add(o), a_rows[j], a_lo, a_hi, true, self.wide_nt);
+                    emit_v16(self.b.add(o), b_rows[j], b_lo, b_hi, true, self.wide_nt);
+                    emit_v16(self.z.add(o), z, z_lo, z_hi, self.z_nt, self.wide_nt);
+                }
+                proj.project(abs_word / STEP_WORDS);
+            }
+        }
+    }
+
+    /// One spread over 16 blocks: transpose into staging, derive z in ZMM,
+    /// then publish three lines per block inside the transform loop. Same
+    /// addresses and bytes as [`Self::drain_range_bunched`].
+    ///
+    /// # Safety
+    /// As for [`Self::drain_range`].
+    #[target_feature(enable = "avx512f")]
+    #[inline(never)]
+    unsafe fn drain_range_spread(
+        &self,
+        proj: &StreamProj<'_>,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
+            let (sa, sb) = proj.sides();
+            let mut base = 0u8;
+            if self.z_nt {
+                base |= 0x40;
+            }
+            if self.wide_nt {
+                base |= 0x80;
+            }
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+                let blk = abs_word / STEP_WORDS;
+                let (plan, imgs) = proj.window_prep(blk);
+                let use_off = plan.offsets_eligible(blk);
+                #[repr(align(64))]
+                struct OffArena([u16; 16 * ROUND1_AB_OFF_WORDS]);
+                let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+                let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
+
+                let a_rows = tr16_step(self.ast, rw);
+                let b_rows = tr16_step(self.bs, rw);
+                let mut z_lo = [dup_u32(0); 16];
+                let mut z_hi = [dup_u32(0); 16];
+                for j in 0..16 {
+                    store_v16(sa.add(j * STEP_WORDS), a_rows[j]);
+                    store_v16(sb.add(j * STEP_WORDS), b_rows[j]);
+                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                    if use_off {
+                        let (alo, ahi) = split_v16(a_rows[j]);
+                        let (blo, bhi) = split_v16(b_rows[j]);
+                        widen_off_half(alo, ahi, op.add(j * ROUND1_AB_OFF_WORDS));
+                        widen_off_half(
+                            blo,
+                            bhi,
+                            op.add(j * ROUND1_AB_OFF_WORDS + 64),
+                        );
+                    }
+                    let z = and_v16(a_rows[j], b_rows[j]);
+                    let (lo, hi) = split_v16(z);
+                    z_lo[j] = lo;
+                    z_hi[j] = hi;
+                }
+
+                let g = abs_word / 8;
+                let mut flags = base;
+                if g < z_g1 {
+                    flags |= 1;
+                }
+                if g + 1 < z_g1 {
+                    flags |= 2;
+                }
+                if g < a_g1 {
+                    flags |= 4;
+                }
+                if g + 1 < a_g1 {
+                    flags |= 8;
+                }
+                if g >= b_g0 && g < b_g1 {
+                    flags |= 0x10;
+                }
+                if g + 1 >= b_g0 && g + 1 < b_g1 {
+                    flags |= 0x20;
+                }
+                let rows = StepRows {
+                    z: self.z.add(abs_word),
+                    a: self.a.add(abs_word),
+                    b: self.b.add(abs_word),
+                    z_lo: z_lo.as_ptr(),
+                    z_hi: z_hi.as_ptr(),
+                    flags,
+                };
+
+                proj.project_blocks(
+                    blk,
+                    plan,
+                    imgs,
+                    Some(rows),
+                    if use_off { Some(op as *const u16) } else { None },
+                );
+            }
+        }
+    }
+
+    /// Temporal 16-block publish used by the byte-identity test (no proj).
+    ///
+    /// # Safety
+    /// As for [`Self::drain_range`].
+    #[target_feature(enable = "avx512f")]
+    #[inline(never)]
+    unsafe fn drain_range_buffered(&mut self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+                let g = abs_word / 8;
+                let a_lo = g < a_g1;
+                let a_hi = g + 1 < a_g1;
+                let b_lo = g >= b_g0 && g < b_g1;
+                let b_hi = g + 1 >= b_g0 && g + 1 < b_g1;
+                let z_lo = g < z_g1;
+                let z_hi = g + 1 < z_g1;
+                let a_rows = tr16_step(self.ast, rw);
+                let b_rows = tr16_step(self.bs, rw);
+                for j in 0..16 {
+                    let z = and_v16(a_rows[j], b_rows[j]);
+                    let o = j * U32_PER_BLOCK + abs_word;
+                    emit_v16(self.a.add(o), a_rows[j], a_lo, a_hi, false, self.wide_nt);
+                    emit_v16(self.b.add(o), b_rows[j], b_lo, b_hi, false, self.wide_nt);
+                    emit_v16(self.z.add(o), z, z_lo, z_hi, self.z_nt, self.wide_nt);
+                }
+            }
         }
     }
 }
@@ -876,7 +1524,8 @@ impl StepRows {
     /// Publish block `j`'s three rows.
     ///
     /// # Safety
-    /// `self` describes one live drain step and `j < 8`.
+    /// `self` describes one live drain step and `j` is in `0..n_blocks` of
+    /// the `StreamProj` that holds these staging sides.
     #[inline(always)]
     unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
@@ -1466,19 +2115,9 @@ unsafe fn dump_elide_win(
 /// non-temporal arm the caller must `_mm_sfence()` on this thread after its
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
-    inputs: OctaInputs<'_>,
-    z: *mut u32,
-    a: *mut u32,
-    b: *mut u32,
-    win_ab: Option<(*mut u32, *mut u32)>,
-    proj: Option<StreamProj<'_>>,
-    elide: [bool; 3],
-    z_nt: bool,
-) {
+unsafe fn prepare_octa_inputs(inputs: OctaInputs<'_>) -> PreparedInputs {
     unsafe {
-        let prepared = match inputs {
+        match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
                     inputs[0].0.as_ptr(),
@@ -1559,7 +2198,23 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 }
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
-        };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    win_ab: Option<(*mut u32, *mut u32)>,
+    proj: Option<StreamProj<'_>>,
+    elide: [bool; 3],
+    z_nt: bool,
+) {
+    unsafe {
+        let prepared = prepare_octa_inputs(inputs);
         let cv_v = prepared.cv;
         let m = prepared.message;
         let tlo = prepared.counter_lo;
@@ -1747,6 +2402,202 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     }
 }
 
+/// 16-lane G-function and 16-block drain. Byte-identical to two sequential
+/// [`build_octa_witness_ab_stream_elide`] calls on the same 16 compressions.
+/// The G loop, packed ring, transpose, `z = a & b`, and spread schedule all
+/// stay 16-wide; published z/a/b stay 8-block-major `[block][word]`.
+///
+/// # Safety
+/// AVX-512F. `z`/`a`/`b` each own 16 contiguous 512-word blocks. `proj`, when
+/// present, covers all 16 blocks of that span (`n_blocks == 16`). Same
+/// NT/sfence contract as the octa builder.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn build_hex_witness_ab_stream_elide(
+    inputs0: OctaInputs<'_>,
+    inputs1: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: Option<StreamProj<'_>>,
+    elide: [bool; 3],
+    z_nt: bool,
+) {
+    unsafe {
+        if let Some(p) = &proj {
+            debug_assert_eq!(p.n_blocks, 16);
+        }
+        let p0 = prepare_octa_inputs(inputs0);
+        let p1 = prepare_octa_inputs(inputs1);
+        let cv_v: [V16; 8] = core::array::from_fn(|i| merge_v8(p0.cv[i], p1.cv[i]));
+        let m: [V16; 16] = core::array::from_fn(|i| merge_v8(p0.message[i], p1.message[i]));
+        let tlo = merge_v8(p0.counter_lo, p1.counter_lo);
+        let thi = merge_v8(p0.counter_hi, p1.counter_hi);
+        let blen = merge_v8(p0.block_len, p1.block_len);
+        let flags = merge_v8(p0.flags, p1.flags);
+
+        let mut state: [V16; 16] = [
+            cv_v[0],
+            cv_v[1],
+            cv_v[2],
+            cv_v[3],
+            cv_v[4],
+            cv_v[5],
+            cv_v[6],
+            cv_v[7],
+            dup_u32_16(BLAKE3_IV[0]),
+            dup_u32_16(BLAKE3_IV[1]),
+            dup_u32_16(BLAKE3_IV[2]),
+            dup_u32_16(BLAKE3_IV[3]),
+            tlo,
+            thi,
+            blen,
+            flags,
+        ];
+
+        let zero = dup_u32_16(0);
+        let maxv = dup_u32_16(u32::MAX);
+        let one = dup_u32_16(1);
+        let wide_nt = wide_nt_enabled();
+        let spread = spread_nt_enabled();
+
+        let mut ast = core::mem::MaybeUninit::<[V16; RING_WORDS]>::uninit();
+        let mut bs = core::mem::MaybeUninit::<[V16; RING_WORDS]>::uninit();
+        let ast = ast.as_mut_ptr().cast::<V16>();
+        let bs = bs.as_mut_ptr().cast::<V16>();
+
+        let mut drain = Drain16 {
+            ast,
+            bs,
+            z,
+            a,
+            b,
+            proj,
+            elide,
+            z_nt,
+            wide_nt,
+            spread,
+        };
+
+        let chain: [V16; 20] = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
+            m[13], m[14], m[15], tlo, thi, blen, flags,
+        ];
+        for k in 0..20usize {
+            let v = if k == 0 {
+                or_v16(one, shl_v16::<1>(chain[0]))
+            } else {
+                or_v16(shr_v16::<31>(chain[k - 1]), shl_v16::<1>(chain[k]))
+            };
+            let w = 16 + k;
+            let i = w & (RING_WORDS - 1);
+            store_v16(ast.add(i) as *mut u32, v);
+            store_v16(bs.add(i) as *mut u32, maxv);
+        }
+        if RING_WORDS <= PROLOGUE_WORDS + 16 {
+            drain.drain_range(16, 16, RING_WORDS - 16);
+        }
+
+        let pending_bit = shr_v16::<31>(flags);
+        let d = &mut drain as *mut Drain16;
+        let mut wa = W16::at(ast, pending_bit, d, false);
+        let mut wb = W16::at(bs, one, d, true);
+
+        macro_rules! g16 {
+            ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+             $mx:literal, $my:literal) => {{
+                let (t0, l0, r0, _) = add_carry_parts_v16(state[$la], state[$lb]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                let (a1, l1, r1, _) = add_carry_parts_v16(t0, m[$mx]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                let d1 = xor_rotr16::<16, 16>(state[$ld], a1);
+                let (c1s, l2, r2, _) = add_carry_parts_v16(state[$lc], d1);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                let b1 = xor_rotr16::<12, 20>(state[$lb], c1s);
+                let (t1, l3, r3, _) = add_carry_parts_v16(a1, b1);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                let (a2, l4, r4, _) = add_carry_parts_v16(t1, m[$my]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                let d2 = xor_rotr16::<8, 24>(d1, a2);
+                let (c2s, l5, r5, _) = add_carry_parts_v16(c1s, d2);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                let bn = xor_rotr16::<7, 25>(b1, c2s);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                state[$la] = a2;
+                state[$lb] = bn;
+                state[$lc] = c2s;
+                state[$ld] = d2;
+            }};
+        }
+        macro_rules! round16 {
+            ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+             $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+             $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+             $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                g16!($gb, 0, 4, 8, 12, $m0, $m1);
+                g16!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                g16!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                g16!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                g16!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                g16!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                g16!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                g16!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+        round16!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        round16!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        round16!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        round16!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        round16!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        round16!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        round16!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+        macro_rules! oh16 {
+            ($w:literal) => {{
+                let hv = xor_v16(state[$w + 8], cv_v[$w]);
+                pushf16!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
+                pushf16!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+            }};
+        }
+        oh16!(0);
+        oh16!(1);
+        oh16!(2);
+        oh16!(3);
+        oh16!(4);
+        oh16!(5);
+        oh16!(6);
+        oh16!(7);
+        wa.finish();
+        wb.finish();
+
+        const ZF: usize = USEFUL_BITS.div_ceil(32);
+        for w in ZF..U32_PER_BLOCK {
+            let i = w & (RING_WORDS - 1);
+            store_v16(ast.add(i) as *mut u32, zero);
+            store_v16(bs.add(i) as *mut u32, zero);
+        }
+        drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+
+        for w in 0..8usize {
+            let lo = xor_v16(state[w], state[w + 8]);
+            store_v16(ast.add(w) as *mut u32, cv_v[w]);
+            store_v16(bs.add(w) as *mut u32, maxv);
+            store_v16(ast.add(8 + w) as *mut u32, lo);
+            store_v16(bs.add(8 + w) as *mut u32, maxv);
+        }
+        drain.drain_range(0, 0, 16);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1755,6 +2606,64 @@ mod tests {
         let mut out = [0u32; 8];
         unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), v) };
         out
+    }
+
+    #[test]
+    fn hex_dump_matches_two_octas() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        unsafe {
+            let init = 0xC0FF_EE42_u64;
+            let base = 48usize;
+            const N: usize = 16 * 512;
+            let mut z8 = vec![0u32; N];
+            let mut a8 = vec![0u32; N];
+            let mut b8 = vec![0u32; N];
+            let mut z16 = vec![0u32; N];
+            let mut a16 = vec![0u32; N];
+            let mut b16 = vec![0u32; N];
+            let elide = [false, false, false];
+            build_octa_witness_ab_stream_elide(
+                OctaInputs::Closed { init, base },
+                z8.as_mut_ptr(),
+                a8.as_mut_ptr(),
+                b8.as_mut_ptr(),
+                None,
+                None,
+                elide,
+                false,
+            );
+            build_octa_witness_ab_stream_elide(
+                OctaInputs::Closed {
+                    init,
+                    base: base + 8,
+                },
+                z8.as_mut_ptr().add(8 * 512),
+                a8.as_mut_ptr().add(8 * 512),
+                b8.as_mut_ptr().add(8 * 512),
+                None,
+                None,
+                elide,
+                false,
+            );
+            build_hex_witness_ab_stream_elide(
+                OctaInputs::Closed { init, base },
+                OctaInputs::Closed {
+                    init,
+                    base: base + 8,
+                },
+                z16.as_mut_ptr(),
+                a16.as_mut_ptr(),
+                b16.as_mut_ptr(),
+                None,
+                elide,
+                false,
+            );
+            assert_eq!(z8, z16, "z mismatch");
+            assert_eq!(a8, a16, "a mismatch");
+            assert_eq!(b8, b16, "b mismatch");
+        }
     }
 
     #[test]
@@ -1841,6 +2750,56 @@ mod tests {
             return;
         }
         unsafe { tr8_check() }
+    }
+
+    #[test]
+    fn witgen16_tr16_is_16x16_u32_transpose() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        unsafe { tr16_check() }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn tr16_check() {
+        unsafe {
+            let rows: [V16; 16] = core::array::from_fn(|i| {
+                _mm512_setr_epi32(
+                    (1000 * i) as i32,
+                    (1000 * i + 1) as i32,
+                    (1000 * i + 2) as i32,
+                    (1000 * i + 3) as i32,
+                    (1000 * i + 4) as i32,
+                    (1000 * i + 5) as i32,
+                    (1000 * i + 6) as i32,
+                    (1000 * i + 7) as i32,
+                    (1000 * i + 8) as i32,
+                    (1000 * i + 9) as i32,
+                    (1000 * i + 10) as i32,
+                    (1000 * i + 11) as i32,
+                    (1000 * i + 12) as i32,
+                    (1000 * i + 13) as i32,
+                    (1000 * i + 14) as i32,
+                    (1000 * i + 15) as i32,
+                )
+            });
+            let t = tr16(rows);
+            for j in 0..16 {
+                let mut buf = [0i32; 16];
+                _mm512_storeu_si512(buf.as_mut_ptr().cast(), t[j]);
+                for i in 0..16 {
+                    assert_eq!(buf[i], (1000 * i + j) as i32, "t[{j}] lane {i}");
+                }
+            }
+            let back = tr16(t);
+            for i in 0..16 {
+                let mut a = [0i32; 16];
+                let mut b = [0i32; 16];
+                _mm512_storeu_si512(a.as_mut_ptr().cast(), rows[i]);
+                _mm512_storeu_si512(b.as_mut_ptr().cast(), back[i]);
+                assert_eq!(a, b, "tr16² row {i}");
+            }
+        }
     }
 
     unsafe fn tr8_check() {

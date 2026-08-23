@@ -1715,11 +1715,14 @@ fn generate_round1_inner_octa(
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
+    // One 16-block pair when the hex G-function + Drain16 path is live.
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+    const STAGE_LINES_16: usize = blake3_witgen8::STREAM_STAGE_WORDS_16 * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let hex_ok = ab_stream && blake3_witgen8::witgen16_enabled();
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -1750,7 +1753,7 @@ fn generate_round1_inner_octa(
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
                 let want = if ab_stream {
-                    STAGE_LINES
+                    if hex_ok { STAGE_LINES_16 } else { STAGE_LINES }
                 } else if ab_nt {
                     WIN_LINES
                 } else {
@@ -1778,7 +1781,10 @@ fn generate_round1_inner_octa(
                     None
                 };
                 let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
+                    debug_assert_eq!(
+                        win.len(),
+                        if hex_ok { STAGE_LINES_16 } else { STAGE_LINES }
+                    );
                     Some(win.as_mut_ptr().cast::<u32>())
                 } else {
                     None
@@ -1790,7 +1796,94 @@ fn generate_round1_inner_octa(
                 // token-verified constant chunks of a/b/z; the windows are
                 // always written in full.
                 unsafe {
+                    let use_hex = hex_ok
+                        && n_here >= GROUP
+                        && std::is_x86_feature_detected!("avx512f");
+                    if use_hex {
+                        let base0 = GROUP * g;
+                        let base1 = base0 + SIMD;
+                        let mut staged0 = [*padding; SIMD];
+                        let mut staged1 = [*padding; SIMD];
+                        let octa0 = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    s.get(base0 + j).unwrap_or(padding)
+                                }))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len }
+                                if base0 + SIMD <= len =>
+                            {
+                                blake3_witgen8::OctaInputs::Closed { init, base: base0 }
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged0 = std::array::from_fn(|j| {
+                                    let idx = base0 + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    &staged0[j]
+                                }))
+                            }
+                        };
+                        let octa1 = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    s.get(base1 + j).unwrap_or(padding)
+                                }))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len }
+                                if base1 + SIMD <= len =>
+                            {
+                                blake3_witgen8::OctaInputs::Closed { init, base: base1 }
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged1 = std::array::from_fn(|j| {
+                                    let idx = base1 + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    &staged1[j]
+                                }))
+                            }
+                        };
+                        let st = stage.expect("hex path is streaming-only");
+                        let mut live = 0u32;
+                        for j in 0..GROUP {
+                            if base0 + j >= skip_blocks {
+                                live |= 1 << j;
+                            }
+                        }
+                        let proj = blake3_witgen8::StreamProj {
+                            stage: st,
+                            out: ab_out.as_mut_ptr(),
+                            live,
+                            n_blocks: GROUP,
+                            inv_table,
+                            plan: win_plan,
+                        };
+                        blake3_witgen8::build_hex_witness_ab_stream_elide(
+                            octa0,
+                            octa1,
+                            z_out.as_mut_ptr().cast::<u32>(),
+                            a_out.as_mut_ptr().cast::<u32>(),
+                            b_out.as_mut_ptr().cast::<u32>(),
+                            Some(proj),
+                            elide,
+                            z_nt,
+                        );
+                    }
                     for half in 0..(n_here / SIMD) {
+                        if use_hex {
+                            break;
+                        }
                         let base = GROUP * g + half * SIMD;
                         // Lead 2: a full closed-form octa carries only init/base
                         // into the witness kernel, which generates all 25 draws
@@ -1839,6 +1932,7 @@ fn generate_round1_inner_octa(
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 live,
+                                n_blocks: SIMD,
                                 inv_table,
                                 plan: win_plan,
                             }
