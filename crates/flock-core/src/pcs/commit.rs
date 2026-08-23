@@ -19,8 +19,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -153,7 +153,238 @@ pub struct Commitment {
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
     pub codeword: Vec<F128>,
+    /// Retained flat Merkle nodes. This is either the canonical `2n-1` full
+    /// tree, or (CPU x86_64 BLAKE3 leafless mode) its exact `full[n..]` tail
+    /// of `n-1` nodes; the latter rehashes omitted leaves from `codeword` when
+    /// opening. In both forms the root is the final element.
     pub merkle_tree: Vec<Hash>,
+}
+
+/// Minimum original-leaf count for the CPU BLAKE3 leafless representation.
+/// Below this, the saved writes are too small to justify the extra proof-time
+/// leaf rehash dispatch, and the NTT callback may use tiny scalar geometries.
+const LEAFLESS_MERKLE_MIN_LEAVES: usize = 128;
+
+/// Original leaf CVs are transient. Hash at most this many into one fixed 4 KiB
+/// worker-local buffer, immediately pair them, then reuse the buffer for the
+/// next chunk/callback. This avoids one heap allocation or zero-fill per NTT
+/// callback (8,192 callbacks at the ranked L0 shape).
+const LEAFLESS_MERKLE_SCRATCH_LEAVES: usize = 128;
+
+// Const-initialized native TLS: one 4 KiB buffer per callback worker, zeroed
+// only on that thread's first use and then overwritten/reused. This avoids both
+// UB-prone uninitialized references and an otherwise material 4 KiB memset on
+// each of the ranked L0 path's 8,192 callbacks.
+std::thread_local! {
+    static LEAFLESS_MERKLE_SCRATCH: std::cell::RefCell<
+        [Hash; LEAFLESS_MERKLE_SCRATCH_LEAVES]
+    > = const {
+        std::cell::RefCell::new([[0u8; 32]; LEAFLESS_MERKLE_SCRATCH_LEAVES])
+    };
+}
+
+/// Retained Merkle-tree representation.
+///
+/// `Full` is the canonical flat `2n-1` tree. `Leafless` omits only the `n`
+/// original leaf CVs, so its `n-1` retained hashes are byte-for-byte
+/// `full[n..]`: exactly a normal flat tree whose `n/2` leaves are the original
+/// level-1 parents. The root is therefore always the final retained element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MerkleTreeShape {
+    Full,
+    Leafless,
+}
+
+impl MerkleTreeShape {
+    #[inline]
+    pub(crate) fn retained_leaves(self, original_leaves: usize) -> usize {
+        match self {
+            Self::Full => original_leaves,
+            Self::Leafless => original_leaves / 2,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn node_count(self, original_leaves: usize) -> usize {
+        2 * self.retained_leaves(original_leaves) - 1
+    }
+
+    /// Infer the representation from the retained vector length. These two
+    /// lengths are unambiguous for every supported `original_leaves >= 2`.
+    pub(crate) fn from_len(original_leaves: usize, tree_len: usize) -> Self {
+        assert!(
+            original_leaves.is_power_of_two() && original_leaves > 0,
+            "Merkle leaf count must be a non-zero power of two"
+        );
+        if tree_len == 2 * original_leaves - 1 {
+            Self::Full
+        } else if original_leaves >= 2 && tree_len == original_leaves - 1 {
+            Self::Leafless
+        } else {
+            panic!(
+                "retained Merkle tree has wrong length: got {tree_len}, expected {} (full) or {} (leafless)",
+                2 * original_leaves - 1,
+                original_leaves.saturating_sub(1),
+            );
+        }
+    }
+
+    /// Resolve one canonical full-tree index without changing proof ordering.
+    /// Leaf CVs omitted by `Leafless` are recomputed from their retained
+    /// codeword rows; every original parent index `i >= n` maps to `i - n`.
+    pub(crate) fn canonical_node(
+        self,
+        tree: &[Hash],
+        codeword_bytes: &[u8],
+        original_leaves: usize,
+        leaf_size: usize,
+        canonical_index: usize,
+        kind: HashKind,
+    ) -> Hash {
+        debug_assert_eq!(tree.len(), self.node_count(original_leaves));
+        debug_assert_eq!(codeword_bytes.len(), original_leaves * leaf_size);
+        debug_assert!(canonical_index < 2 * original_leaves - 1);
+        match self {
+            Self::Full => tree[canonical_index],
+            Self::Leafless if canonical_index < original_leaves => {
+                let start = canonical_index * leaf_size;
+                merkle::hash_leaf(&codeword_bytes[start..start + leaf_size], kind)
+            }
+            Self::Leafless => tree[canonical_index - original_leaves],
+        }
+    }
+}
+
+/// Pure selector body, kept separate so tests can cover target and kill-switch
+/// fallbacks without mutating the process environment.
+#[inline]
+fn leafless_merkle_selected_for(
+    original_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    callback_ranges_pairable: bool,
+    target_is_x86_64: bool,
+    disabled: bool,
+) -> bool {
+    target_is_x86_64
+        && !disabled
+        && callback_ranges_pairable
+        && kind == HashKind::Blake3
+        && original_leaves >= LEAFLESS_MERKLE_MIN_LEAVES
+        && original_leaves.is_power_of_two()
+        && leaf_size > 0
+        && merkle::blake3_leaf_size_is_batchable(leaf_size)
+}
+
+/// Default-on only for safe x86_64 CPU BLAKE3 shapes. The environment is read
+/// once per process, never from a commit callback or proof gather hot loop.
+pub(crate) fn merkle_tree_shape(
+    original_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    callback_ranges_pairable: bool,
+) -> MerkleTreeShape {
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LEAFLESS_MERKLE").is_some());
+    if leafless_merkle_selected_for(
+        original_leaves,
+        leaf_size,
+        kind,
+        callback_ranges_pairable,
+        cfg!(target_arch = "x86_64"),
+        *DISABLED,
+    ) {
+        MerkleTreeShape::Leafless
+    } else {
+        MerkleTreeShape::Full
+    }
+}
+
+#[inline]
+fn leafless_callback_range_is_pairable(range: &core::ops::Range<usize>) -> bool {
+    range.start.is_multiple_of(2) && range.len() >= 2 && range.len().is_multiple_of(2)
+}
+
+/// Hash original leaves into a fixed local buffer, immediately pair them, and
+/// publish only original level-1 parents into the compact tree slice.
+///
+/// Every scratch element is overwritten by `hash_leaves_serial` before
+/// `hash_pairs_level_serial` reads it. Each loop chunk has an even leaf count,
+/// so no parent straddles a callback or chunk boundary.
+fn publish_leafless_level1(
+    bytes: &[u8],
+    leaf_size: usize,
+    parents_out: &mut [Hash],
+    kind: HashKind,
+) -> bool {
+    if leaf_size == 0 || bytes.len() % leaf_size != 0 {
+        return false;
+    }
+    let leaf_count = bytes.len() / leaf_size;
+    if leaf_count < 2 || !leaf_count.is_multiple_of(2) || parents_out.len() != leaf_count / 2 {
+        return false;
+    }
+
+    LEAFLESS_MERKLE_SCRATCH.with(|slot| {
+        let mut leaf_scratch = slot.borrow_mut();
+        let mut leaf_off = 0usize;
+        while leaf_off < leaf_count {
+            let take = (leaf_count - leaf_off).min(LEAFLESS_MERKLE_SCRATCH_LEAVES);
+            debug_assert!(take.is_multiple_of(2));
+            let byte_start = leaf_off * leaf_size;
+            let byte_end = (leaf_off + take) * leaf_size;
+            // `hash_leaves_serial` overwrites all `take` entries before the
+            // parent kernel reads them; no CV from a prior callback is read.
+            merkle::hash_leaves_serial(
+                &bytes[byte_start..byte_end],
+                leaf_size,
+                &mut leaf_scratch[..take],
+                kind,
+            );
+            merkle::hash_pairs_level_serial(
+                &leaf_scratch[..take],
+                &mut parents_out[leaf_off / 2..(leaf_off + take) / 2],
+                kind,
+            );
+            leaf_off += take;
+        }
+    });
+    true
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FusedMerkleResult {
+    pub(crate) folded: usize,
+    pub(crate) geometry_ok: bool,
+}
+
+/// Finish a fused retained tree. An unexpected odd/misaligned callback is not
+/// allowed to cross-pair with another worker: after the NTT join, discard the
+/// partial compact tree and rebuild the incumbent full tree from the completed
+/// codeword instead.
+pub(crate) fn finish_fused_merkle_tree(
+    mut tree: Vec<Hash>,
+    codeword_bytes: &[u8],
+    original_leaves: usize,
+    kind: HashKind,
+    result: FusedMerkleResult,
+) -> (Vec<Hash>, usize) {
+    let shape = MerkleTreeShape::from_len(original_leaves, tree.len());
+    if shape == MerkleTreeShape::Leafless && !result.geometry_ok {
+        give_tree(tree);
+        let mut full = take_tree(2 * original_leaves - 1);
+        merkle::fill_merkle_tree(&mut full, codeword_bytes, original_leaves, kind);
+        return (full, 0);
+    }
+    assert!(result.geometry_ok, "full-tree fused geometry cannot fail");
+    let retained_leaves = shape.retained_leaves(original_leaves);
+    build_upper_levels(
+        &mut tree,
+        retained_leaves,
+        retained_leaves >> result.folded,
+        kind,
+    );
+    (tree, result.folded)
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
@@ -282,21 +513,25 @@ fn finalize_commit(
         }
     }
 
-    // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
-    // each NTT deep-pass sub-group retires (regular stores, same worker).
-    // Parents fold after the encode join via [`build_upper_levels`] — the
-    // same `hash_pairs_level` sequence `merkle_tree()` uses. No
-    // `wide_hash_pool` (same-width hop / nested-install footgun). No Metal.
+    // ---- Merkle rewrite 1: stream hashes as each NTT deep-pass sub-group
+    // retires (regular stores, same worker). The x86_64 BLAKE3 route retains
+    // only original level 1 and above (`n-1` hashes); every fallback retains
+    // the incumbent full `2n-1` tree. No Metal reaches this branch.
     let n_leaves = params.n_leaves();
     let kind = params.merkle_hash;
     let leaf_size = params.leaf_size_bytes();
     let num_ntts = params.num_ntts();
+    let callback_ranges_pairable = ntt.rs_encode_interleaved_callback_ranges_pairable(
+        z_packed.len(),
+        codeword.len(),
+        num_ntts,
+    );
+    let tree_shape = merkle_tree_shape(n_leaves, leaf_size, kind, callback_ranges_pairable);
+    let retained_leaves = tree_shape.retained_leaves(n_leaves);
     // Pooled like every other prove-cycle buffer: `ProverData::drop` returns
-    // the tree to TREE_POOL, so on all proves after the first the 64 MiB
-    // (ranked shape) allocation is already resident — no mmap/fault-in here
-    // and no munmap/TLB-shootdown at drop. Same write-before-read contract
-    // as the uninit alloc this replaces.
-    let mut merkle_tree: Vec<Hash> = take_tree(2 * n_leaves - 1);
+    // the retained tree to TREE_POOL, so after warmup its pages stay resident.
+    // Same write-before-read contract as the uninit alloc this replaces.
+    let mut merkle_tree: Vec<Hash> = take_tree(tree_shape.node_count(n_leaves));
     let tree_addr = merkle_tree.as_mut_ptr() as usize;
 
     // Subtree parents while hot: after a deep-pass sub-group's leaves are
@@ -315,13 +550,32 @@ fn finalize_commit(
     // upper-level build runs — those levels are simply rewritten, so a partial
     // local fold is never wrong, only wasted.
     let subtree_parents = subtree_parents_enabled();
-    let regroup_subtree_parents = subtree_parent_regroup_enabled(
-        n_leaves,
-        num_ntts,
-        leaf_size,
-        kind,
-    );
+    let regroup_subtree_parents =
+        subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
+    // Ranked leafless regroup reads sixteen callback-owned compact ranges at
+    // once. One completion mask per 2048-leaf subgroup makes that
+    // cross-callback read conditional on release-published completion of
+    // every block. This is one bounded allocation per commit and one atomic
+    // RMW per callback, never an allocation per callback.
+    let leafless_regroup_states =
+        if subtree_parents && regroup_subtree_parents && tree_shape == MerkleTreeShape::Leafless {
+            let state_count = n_leaves / RANKED_PARENT_SUBGROUP_LEAVES;
+            debug_assert_eq!(
+                state_count.checked_mul(core::mem::size_of::<LeaflessRegroupState>()),
+                Some(32 * 1024),
+            );
+            Some(
+                (0..state_count)
+                    .map(|_| LeaflessRegroupState {
+                        completed: AtomicU16::new(0),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
     let local_levels = AtomicUsize::new(usize::MAX);
+    let callback_geometry_ok = AtomicBool::new(true);
 
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
@@ -338,16 +592,47 @@ fn finalize_commit(
                     sub_data.len() * core::mem::size_of::<F128>(),
                 )
             };
-            // SAFETY: each deep-pass sub-group maps to a disjoint leaf-index
-            // range; only this worker writes `tree[range]`, and NTT writes to
-            // those leaves have retired on this thread.
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (tree_addr as *mut Hash).add(range.start),
-                    range.len(),
-                )
-            };
-            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            let mut regroup_claim = None;
+            match tree_shape {
+                MerkleTreeShape::Full => {
+                    // SAFETY: each deep-pass sub-group maps to a disjoint leaf
+                    // range; only this worker writes `tree[range]`, and NTT
+                    // writes to those leaves retired on this thread.
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(range.start),
+                            range.len(),
+                        )
+                    };
+                    merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+                }
+                MerkleTreeShape::Leafless => {
+                    if !leafless_callback_range_is_pairable(&range) {
+                        callback_geometry_ok.store(false, Ordering::Release);
+                        return;
+                    }
+                    if let Some(states) = leafless_regroup_states.as_deref() {
+                        let Some(claim) = leafless_regroup_claim(states, &range) else {
+                            callback_geometry_ok.store(false, Ordering::Release);
+                            return;
+                        };
+                        regroup_claim = Some(claim);
+                    }
+                    // Dividing disjoint, even-aligned original ranges by two
+                    // yields disjoint compact-leaf ranges. Each output parent
+                    // is written once after both local child CVs exist.
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(range.start / 2),
+                            range.len() / 2,
+                        )
+                    };
+                    if !publish_leafless_level1(bytes, leaf_size, out, kind) {
+                        callback_geometry_ok.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
 
             if !subtree_parents {
                 return;
@@ -358,15 +643,37 @@ fn finalize_commit(
             // only when the subgroup's final FIFO block arrives. At that
             // point all 2048 leaf CVs are ready, so one depth-11 fold fills
             // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
-            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
-            else {
-                return;
+            let original_parent_range = if let Some(claim) = regroup_claim {
+                let Some(range) = leafless_regroup_complete(
+                    leafless_regroup_states
+                        .as_deref()
+                        .expect("a claim requires regroup state"),
+                    claim,
+                ) else {
+                    return;
+                };
+                range
+            } else {
+                let Some(range) = local_parent_fold_range(&range, regroup_subtree_parents) else {
+                    return;
+                };
+                range
+            };
+            let parent_range = match tree_shape {
+                MerkleTreeShape::Full => original_parent_range,
+                MerkleTreeShape::Leafless => {
+                    if !leafless_callback_range_is_pairable(&original_parent_range) {
+                        callback_geometry_ok.store(false, Ordering::Release);
+                        return;
+                    }
+                    original_parent_range.start / 2..original_parent_range.end / 2
+                }
             };
             let len = parent_range.len();
             let depth = if len.is_power_of_two()
                 && len >= 2
                 && parent_range.start % len == 0
-                && n_leaves % len == 0
+                && retained_leaves % len == 0
             {
                 len.trailing_zeros() as usize
             } else {
@@ -388,20 +695,21 @@ fn finalize_commit(
             if depth == 0 || seen == 0 {
                 return;
             }
-            // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
-            // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
+            // Level j (j ≥ 1) has retained_leaves >> j nodes and starts at
+            // flat offset 2·retained_leaves − 2·(retained_leaves >> j).
+            // This sub-group owns
             // nodes [start >> j, (start + len) >> j) of it.
-            let mut lvl_read_off = parent_range.start; // level 0 = leaves
+            let mut lvl_read_off = parent_range.start; // retained level 0
             let mut lvl_read_len = len;
             for j in 1..=depth {
-                let nodes_j = n_leaves >> j;
-                let base_j = 2 * n_leaves - 2 * nodes_j;
+                let nodes_j = retained_leaves >> j;
+                let base_j = 2 * retained_leaves - 2 * nodes_j;
                 let write_off = base_j + (parent_range.start >> j);
                 let write_len = len >> j;
                 // SAFETY: the read range is this worker's own just-written
                 // nodes of level j−1 (leaves for j = 1); the write range is
                 // this worker's own disjoint slice of level j. Both are inside
-                // the 2·n_leaves−1 tree and never alias each other.
+                // the retained flat tree and never alias each other.
                 let (read, write) = unsafe {
                     (
                         core::slice::from_raw_parts(
@@ -431,8 +739,25 @@ fn finalize_commit(
         usize::MAX | 0 => 0,
         d => d,
     };
-    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves >> folded, kind);
-    let root = merkle_tree[2 * n_leaves - 2];
+    // The encoder has joined, so every codeword row is final. This byte view is
+    // used only if an unexpected callback geometry forces the full-tree repair.
+    let codeword_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
+    let (merkle_tree, folded) = finish_fused_merkle_tree(
+        merkle_tree,
+        codeword_bytes,
+        n_leaves,
+        kind,
+        FusedMerkleResult {
+            folded,
+            geometry_ok: callback_geometry_ok.load(Ordering::Acquire),
+        },
+    );
+    let root = *merkle_tree.last().expect("Merkle tree is non-empty");
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms (subtree levels folded in-callback: {})",
@@ -510,6 +835,11 @@ pub fn set_gpu_merkle_split(chunks: usize) {
 /// re-allocating it would churn a fresh wire+wrap every prove (season-1 rule).
 static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
 
+/// Keep the ranked compact L2 tree (`2^16 - 1` nodes) resident. The previous
+/// `2^16` floor missed it by one node and reintroduced allocation/page-fault
+/// churn on every timed proof after removing the original leaf level.
+const TREE_POOL_MIN_NODES: usize = 1 << 15;
+
 pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
     if let Ok(mut pool) = TREE_POOL.lock() {
         // Smallest-fit: an L1 (16 MiB) take must not steal the parked L0
@@ -518,8 +848,7 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
         // delete.
         let mut best: Option<usize> = None;
         for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= total_nodes
-                && best.is_none_or(|b| v.capacity() < pool[b].capacity())
+            if v.capacity() >= total_nodes && best.is_none_or(|b| v.capacity() < pool[b].capacity())
             {
                 best = Some(i);
             }
@@ -537,14 +866,15 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
 
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
-    // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
-    // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
-    if tree.capacity() < (1 << 16) {
+    // Floor at 2^15 nodes (1 MiB) so the ranked compact L2 tree (65535 nodes,
+    // ~2 MiB) is recycled alongside compact L0 (~32 MiB) and L1 (~8 MiB).
+    if tree.capacity() < TREE_POOL_MIN_NODES {
         return;
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {
-        // Cap 3: ranked L0 (64 MiB) + L1 (16 MiB) + L2 (4 MiB) all park
+        // Cap 3: ranked compact L0 (~32 MiB) + L1 (~8 MiB) + L2 (~2 MiB)
+        // all park
         // after untimed warmup; the timed prove takes all three without
         // a fresh mmap/fault. Trees are sequential (L_i dropped before
         // L_{i+1} is committed), so at most three are ever parked at once.
@@ -716,6 +1046,68 @@ fn local_parent_fold_range(
     Some(range.end - RANKED_PARENT_SUBGROUP_LEAVES..range.end)
 }
 
+// Sapphire Rapids has 64-byte coherent cache lines. Giving each subgroup's
+// completion atomic an independent line avoids false sharing when workers
+// perform locked RMWs for adjacent subgroups; Vec uses `size_of::<T>()` as its
+// element stride.
+#[repr(align(64))]
+struct LeaflessRegroupState {
+    completed: AtomicU16,
+}
+
+const _: () = {
+    assert!(core::mem::align_of::<LeaflessRegroupState>() == 64);
+    assert!(core::mem::size_of::<LeaflessRegroupState>() == 64);
+};
+
+#[derive(Clone, Copy)]
+struct LeaflessRegroupClaim {
+    subgroup: usize,
+    bit: u16,
+}
+
+/// Validate and identify one ranked 128-leaf callback before it writes compact
+/// parents. Callback ranges are disjoint by the NTT contract; an unexpected
+/// range never contributes to the completion mask.
+fn leafless_regroup_claim(
+    states: &[LeaflessRegroupState],
+    range: &core::ops::Range<usize>,
+) -> Option<LeaflessRegroupClaim> {
+    if range.len() != RANKED_PARENT_BLOCK_LEAVES
+        || !range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
+    {
+        return None;
+    }
+    let subgroup = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
+    states.get(subgroup)?;
+    let in_subgroup = range.start % RANKED_PARENT_SUBGROUP_LEAVES;
+    let block = in_subgroup / RANKED_PARENT_BLOCK_LEAVES;
+    if block >= u16::BITS as usize {
+        return None;
+    }
+    let bit = 1u16 << block;
+    Some(LeaflessRegroupClaim { subgroup, bit })
+}
+
+/// Publish completion only after this callback's compact parents are fully
+/// written. The callback that observes all sixteen release-published blocks
+/// may fold the 1024 compact leaves; any missing/invalid callback leaves the
+/// mask incomplete, so no worker can read its unwritten range.
+fn leafless_regroup_complete(
+    states: &[LeaflessRegroupState],
+    claim: LeaflessRegroupClaim,
+) -> Option<core::ops::Range<usize>> {
+    let state = &states[claim.subgroup];
+    let old = state.completed.fetch_or(claim.bit, Ordering::AcqRel);
+    debug_assert_eq!(old & claim.bit, 0);
+    if old | claim.bit == u16::MAX {
+        let start = claim.subgroup * RANKED_PARENT_SUBGROUP_LEAVES;
+        Some(start..start + RANKED_PARENT_SUBGROUP_LEAVES)
+    } else {
+        None
+    }
+}
+
 /// `FLOCK_NO_LIG_FUSED_COMMIT=1` restores the Ligerito recursive commits'
 /// incumbent shape (full `rs_encode_interleaved`, then a separate parallel
 /// `fill_merkle_tree` pass over the codeword). Resolved once per process.
@@ -732,11 +1124,11 @@ pub(crate) fn lig_fused_commit_enabled() -> bool {
 /// The NTT's deep pass fires `on_range_done` once per finalized sub-group on
 /// the worker that finished it; that worker hashes the sub-group's leaves
 /// while the codeword slice is still cache-resident and folds the sub-group's
-/// own Merkle subtree (every level whose nodes depend only on those leaves)
-/// into the flat tree. Returns the folded depth (0 = nothing folded); the
-/// caller finishes with `build_upper_levels(tree, n_leaves, n_leaves >>
-/// depth, kind)`. Bit-identical to encode-then-`fill_merkle_tree`: same
-/// leaves, same pair hashes, only the pass structure changes.
+/// own retained Merkle subtree (every level whose nodes depend only on those
+/// leaves) into the flat tree. For a leafless tree, original leaves live only
+/// in fixed stack scratch and the first published level has `n/2` nodes.
+/// Returns the folded retained depth plus callback-geometry status; the caller
+/// completes (or safely repairs) through [`finish_fused_merkle_tree`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_encode_leaves_subtree(
     ntt: &AdditiveNttF128,
@@ -747,13 +1139,15 @@ pub(crate) fn fused_encode_leaves_subtree(
     n_leaves: usize,
     leaf_size: usize,
     kind: HashKind,
-) -> usize {
+) -> FusedMerkleResult {
     debug_assert_eq!(codeword.len(), n_leaves * num_ntts);
     debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
-    debug_assert_eq!(tree.len(), 2 * n_leaves - 1);
+    let tree_shape = MerkleTreeShape::from_len(n_leaves, tree.len());
+    let retained_leaves = tree_shape.retained_leaves(n_leaves);
     let tree_addr = tree.as_mut_ptr() as usize;
     let subtree_parents = subtree_parents_enabled();
     let local_levels = AtomicUsize::new(usize::MAX);
+    let callback_geometry_ok = AtomicBool::new(true);
     ntt.rs_encode_interleaved_on_range_done(msg, codeword, num_ntts, &|range, sub_data| {
         debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
         let bytes: &[u8] = unsafe {
@@ -762,21 +1156,46 @@ pub(crate) fn fused_encode_leaves_subtree(
                 sub_data.len() * core::mem::size_of::<F128>(),
             )
         };
-        // SAFETY: each finalized sub-group maps to a disjoint leaf-index
-        // range; only this worker writes `tree[range]`, and the NTT writes to
-        // those leaves have retired on this thread.
-        let out = unsafe {
-            core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(range.start), range.len())
+        let retained_range = match tree_shape {
+            MerkleTreeShape::Full => {
+                // SAFETY: callbacks own disjoint original leaf ranges.
+                let out = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (tree_addr as *mut Hash).add(range.start),
+                        range.len(),
+                    )
+                };
+                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+                range.clone()
+            }
+            MerkleTreeShape::Leafless => {
+                if !leafless_callback_range_is_pairable(&range) {
+                    callback_geometry_ok.store(false, Ordering::Release);
+                    return;
+                }
+                // SAFETY: even-aligned disjoint original ranges map to
+                // disjoint compact-leaf ranges after division by two.
+                let out = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (tree_addr as *mut Hash).add(range.start / 2),
+                        range.len() / 2,
+                    )
+                };
+                if !publish_leafless_level1(bytes, leaf_size, out, kind) {
+                    callback_geometry_ok.store(false, Ordering::Release);
+                    return;
+                }
+                range.start / 2..range.end / 2
+            }
         };
-        merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
         if !subtree_parents {
             return;
         }
-        let len = range.len();
+        let len = retained_range.len();
         let depth = if len.is_power_of_two()
             && len >= 2
-            && range.start % len == 0
-            && n_leaves % len == 0
+            && retained_range.start % len == 0
+            && retained_leaves % len == 0
         {
             len.trailing_zeros() as usize
         } else {
@@ -797,16 +1216,16 @@ pub(crate) fn fused_encode_leaves_subtree(
         if depth == 0 || seen == 0 {
             return;
         }
-        let mut lvl_read_off = range.start;
+        let mut lvl_read_off = retained_range.start;
         let mut lvl_read_len = len;
         for j in 1..=depth {
-            let nodes_j = n_leaves >> j;
-            let base_j = 2 * n_leaves - 2 * nodes_j;
-            let write_off = base_j + (range.start >> j);
+            let nodes_j = retained_leaves >> j;
+            let base_j = 2 * retained_leaves - 2 * nodes_j;
+            let write_off = base_j + (retained_range.start >> j);
             let write_len = len >> j;
             // SAFETY: read = this worker's own just-written nodes of level
             // j−1; write = this worker's own disjoint slice of level j; both
-            // inside the 2·n_leaves−1 tree, never aliasing.
+            // inside the retained flat tree, never aliasing.
             let (read, write) = unsafe {
                 (
                     core::slice::from_raw_parts(
@@ -824,9 +1243,13 @@ pub(crate) fn fused_encode_leaves_subtree(
             lvl_read_len = write_len;
         }
     });
-    match local_levels.load(Ordering::Acquire) {
+    let folded = match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,
         d => d,
+    };
+    FusedMerkleResult {
+        folded,
+        geometry_ok: callback_geometry_ok.load(Ordering::Acquire),
     }
 }
 
@@ -1218,11 +1641,158 @@ pub fn prefault_codeword_during<R>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn leafless_selector_and_callback_fallbacks_are_narrow() {
+        assert!(leafless_merkle_selected_for(
+            LEAFLESS_MERKLE_MIN_LEAVES,
+            64,
+            HashKind::Blake3,
+            true,
+            true,
+            false,
+        ));
+        for selected in [
+            leafless_merkle_selected_for(128, 64, HashKind::Blake3, false, true, false),
+            leafless_merkle_selected_for(64, 64, HashKind::Blake3, true, true, false),
+            leafless_merkle_selected_for(192, 64, HashKind::Blake3, true, true, false),
+            leafless_merkle_selected_for(128, 96, HashKind::Blake3, true, true, false),
+            leafless_merkle_selected_for(128, 64, HashKind::Sha256, true, true, false),
+            leafless_merkle_selected_for(128, 64, HashKind::Blake3, true, false, false),
+            leafless_merkle_selected_for(128, 64, HashKind::Blake3, true, true, true),
+        ] {
+            assert!(!selected);
+        }
+
+        assert!(leafless_callback_range_is_pairable(&(0..128)));
+        assert!(leafless_callback_range_is_pairable(&(128..256)));
+        assert!(!leafless_callback_range_is_pairable(&(1..129)));
+        assert!(!leafless_callback_range_is_pairable(&(0..127)));
+        assert!(!leafless_callback_range_is_pairable(&(0..1)));
+
+        let mut parents = [[0u8; 32]; 1];
+        assert!(!publish_leafless_level1(
+            &[0u8; 65],
+            64,
+            &mut parents,
+            HashKind::Blake3,
+        ));
+        assert!(!publish_leafless_level1(
+            &[0u8; 3 * 64],
+            64,
+            &mut parents,
+            HashKind::Blake3,
+        ));
+
+        let data: Vec<u8> = (0..128 * 64)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
+            .collect();
+        let full = merkle::merkle_tree(&data, 128, HashKind::Blake3);
+        let mut published = vec![[0u8; 32]; 64];
+        assert!(publish_leafless_level1(
+            &data,
+            64,
+            &mut published,
+            HashKind::Blake3,
+        ));
+        assert_eq!(published, full[128..128 + 64]);
+    }
+
+    /// `full[n..]` is exactly the compact tree, and resolving canonical
+    /// sibling indices against it reproduces the full-tree multi-proof bytes
+    /// for empty, singleton, sibling-paired, edge, and all-query sets.
+    #[test]
+    fn leafless_compact_tail_and_multiproof_bytes_match_full() {
+        const LEAF_SIZE: usize = 64;
+        for n in [2usize, 4, 8, 16, 128] {
+            let mut data = vec![0u8; n * LEAF_SIZE];
+            for (i, byte) in data.iter_mut().enumerate() {
+                *byte = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left((i & 31) as u32) as u8;
+            }
+            let full = merkle::merkle_tree(&data, n, HashKind::Blake3);
+            let compact = full[n..].to_vec();
+            assert_eq!(compact.len(), n - 1);
+            assert_eq!(compact.last(), full.last());
+            let shape = MerkleTreeShape::from_len(n, compact.len());
+            assert_eq!(shape, MerkleTreeShape::Leafless);
+
+            for i in 0..2 * n - 1 {
+                assert_eq!(
+                    shape.canonical_node(&compact, &data, n, LEAF_SIZE, i, HashKind::Blake3,),
+                    full[i],
+                    "canonical node mapping n={n} i={i}"
+                );
+            }
+
+            let mut query_sets = vec![
+                vec![],
+                vec![0],
+                vec![n - 1],
+                vec![0, n - 1],
+                (0..n).collect::<Vec<_>>(),
+            ];
+            if n >= 4 {
+                query_sets.push(vec![2, 3]);
+                query_sets.push(vec![n - 1, 0, n - 1, 1]);
+            }
+            for queries in query_sets {
+                let oracle = merkle::merkle_multi_proof(&full, n, &queries);
+                let got: Vec<Hash> = merkle::merkle_multi_proof_sibling_indices(n, &queries)
+                    .into_iter()
+                    .map(|i| {
+                        shape.canonical_node(&compact, &data, n, LEAF_SIZE, i, HashKind::Blake3)
+                    })
+                    .collect();
+                assert_eq!(got, oracle, "multi-proof bytes n={n} queries={queries:?}");
+            }
+        }
+    }
+
+    /// If an NTT callback ever violates the even pair boundary, the compact
+    /// partial result is discarded after the encode join and the incumbent
+    /// full tree is rebuilt from the final codeword.
+    #[test]
+    fn leafless_misaligned_callback_status_rebuilds_full_tree() {
+        const N: usize = 8;
+        const LEAF_SIZE: usize = 64;
+        let data: Vec<u8> = (0..N * LEAF_SIZE)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let oracle = merkle::merkle_tree(&data, N, HashKind::Blake3);
+        let partial_compact = vec![[0xA5u8; 32]; N - 1];
+        let (repaired, folded) = finish_fused_merkle_tree(
+            partial_compact,
+            &data,
+            N,
+            HashKind::Blake3,
+            FusedMerkleResult {
+                folded: 3,
+                geometry_ok: false,
+            },
+        );
+        assert_eq!(folded, 0);
+        assert_eq!(repaired, oracle);
+        assert_eq!(
+            MerkleTreeShape::from_len(N, repaired.len()),
+            MerkleTreeShape::Full
+        );
+    }
+
     /// The exact ranked selector is narrow, and regrouping sixteen retired
     /// blocks into one 2048-leaf parent fold reproduces every flat-tree node.
     #[test]
     fn subtree_parent_regroup_matches_full_tree_node_for_node() {
-        use super::*;
+        assert_eq!(core::mem::align_of::<LeaflessRegroupState>(), 64);
+        assert_eq!(core::mem::size_of::<LeaflessRegroupState>(), 64);
+        let ranked_state_count = (1usize << 20) / RANKED_PARENT_SUBGROUP_LEAVES;
+        assert_eq!(ranked_state_count, 512);
+        assert_eq!(
+            ranked_state_count.checked_mul(core::mem::size_of::<LeaflessRegroupState>()),
+            Some(32 * 1024),
+        );
 
         assert!(subtree_parent_regroup_selected(
             1 << 20,
@@ -1232,41 +1802,11 @@ mod tests {
             false,
         ));
         for selected in [
-            subtree_parent_regroup_selected(
-                (1 << 20) - 1,
-                64,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                32,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                512,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Sha256,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Blake3,
-                true,
-            ),
+            subtree_parent_regroup_selected((1 << 20) - 1, 64, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 32, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 512, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Sha256, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Blake3, true),
         ] {
             assert!(!selected);
         }
@@ -1281,10 +1821,24 @@ mod tests {
             Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
         );
         let unexpected = 0..256;
-        assert_eq!(
-            local_parent_fold_range(&unexpected, true),
-            Some(unexpected),
-        );
+        assert_eq!(local_parent_fold_range(&unexpected, true), Some(unexpected),);
+
+        let state = [LeaflessRegroupState {
+            completed: AtomicU16::new(0),
+        }];
+        assert!(leafless_regroup_claim(&state, &(1..129)).is_none());
+        assert!(leafless_regroup_claim(&state, &(0..256)).is_none());
+        for block in (0..16usize).rev() {
+            let range =
+                block * RANKED_PARENT_BLOCK_LEAVES..(block + 1) * RANKED_PARENT_BLOCK_LEAVES;
+            let claim = leafless_regroup_claim(&state, &range).unwrap();
+            let ready = leafless_regroup_complete(&state, claim);
+            if block == 0 {
+                assert_eq!(ready, Some(0..RANKED_PARENT_SUBGROUP_LEAVES));
+            } else {
+                assert_eq!(ready, None);
+            }
+        }
 
         const N_LEAVES: usize = 2 * RANKED_PARENT_SUBGROUP_LEAVES;
         const LEAF_SIZE: usize = 1024;
@@ -1343,10 +1897,8 @@ mod tests {
             }
             calls
         };
-        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES)
-            + platform_calls(8_192);
-        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES)
-            + platform_calls(512);
+        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES) + platform_calls(8_192);
+        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES) + platform_calls(512);
         assert_eq!(
             (old_calls, new_calls, old_calls - new_calls),
             (90_627, 67_107, 23_520),
@@ -1359,6 +1911,55 @@ mod tests {
             HashKind::Blake3,
         );
         assert_eq!(tree, oracle);
+
+        // Cutoff=1 uses the same regroup schedule over 1024 retained level-1
+        // parents per original 2048-leaf subgroup, then the ordinary compact
+        // upper builder. This exercises actual publication and every retained
+        // node rather than constructing the compact tree from `oracle[n..]`.
+        let retained_leaves = N_LEAVES / 2;
+        let mut compact = vec![[0u8; 32]; N_LEAVES - 1];
+        let states: Vec<LeaflessRegroupState> = (0..2)
+            .map(|_| LeaflessRegroupState {
+                completed: AtomicU16::new(0),
+            })
+            .collect();
+        for start in (0..N_LEAVES).step_by(RANKED_PARENT_BLOCK_LEAVES) {
+            let range = start..start + RANKED_PARENT_BLOCK_LEAVES;
+            let claim = leafless_regroup_claim(&states, &range).unwrap();
+            assert!(publish_leafless_level1(
+                &bytes[range.start * LEAF_SIZE..range.end * LEAF_SIZE],
+                LEAF_SIZE,
+                &mut compact[range.start / 2..range.end / 2],
+                HashKind::Blake3,
+            ));
+            let Some(parent_range) = leafless_regroup_complete(&states, claim) else {
+                continue;
+            };
+            let parent_range = parent_range.start / 2..parent_range.end / 2;
+            let depth = parent_range.len().trailing_zeros() as usize;
+            let mut read_off = parent_range.start;
+            let mut read_len = parent_range.len();
+            for j in 1..=depth {
+                let nodes_j = retained_leaves >> j;
+                let write_off = 2 * retained_leaves - 2 * nodes_j + (parent_range.start >> j);
+                let write_len = parent_range.len() >> j;
+                let (before_write, write_and_after) = compact.split_at_mut(write_off);
+                merkle::hash_pairs_level_serial(
+                    &before_write[read_off..read_off + read_len],
+                    &mut write_and_after[..write_len],
+                    HashKind::Blake3,
+                );
+                read_off = write_off;
+                read_len = write_len;
+            }
+        }
+        build_upper_levels(
+            &mut compact,
+            retained_leaves,
+            retained_leaves >> 10,
+            HashKind::Blake3,
+        );
+        assert_eq!(compact, oracle[N_LEAVES..]);
     }
 
     /// The fused recursive-commit route (encode → per-sub-group serial leaves
@@ -1369,7 +1970,6 @@ mod tests {
     /// the tiny scalar-NTT shapes where the callback fires once.
     #[test]
     fn fused_recursive_commit_matches_encode_then_fill() {
-        use super::*;
         use crate::merkle::fill_merkle_tree;
         for &(log_d, num_ntts, log_inv_rate) in &[
             (10usize, 8usize, 2usize),
@@ -1404,6 +2004,11 @@ mod tests {
                 let n_leaves = 1usize << log_d;
                 let leaf = num_ntts * 16;
                 let mut cw_a = vec![F128::ZERO; n_leaves * num_ntts];
+                assert!(ntt.rs_encode_interleaved_callback_ranges_pairable(
+                    msg.len(),
+                    cw_a.len(),
+                    num_ntts,
+                ));
                 ntt.rs_encode_interleaved(&msg, &mut cw_a, num_ntts);
                 let mut tree_a = vec![Hash::default(); 2 * n_leaves - 1];
                 let bytes_a = unsafe {
@@ -1413,22 +2018,62 @@ mod tests {
 
                 let mut cw_b = vec![F128::new(u64::MAX, u64::MAX); n_leaves * num_ntts];
                 let mut tree_b: Vec<Hash> = vec![[0xAAu8; 32]; 2 * n_leaves - 1];
-                let folded = fused_encode_leaves_subtree(
-                    &ntt, &msg, &mut cw_b, num_ntts, &mut tree_b, n_leaves, leaf, kind,
+                let fused = fused_encode_leaves_subtree(
+                    &ntt,
+                    &msg,
+                    &mut cw_b,
+                    num_ntts,
+                    &mut tree_b,
+                    n_leaves,
+                    leaf,
+                    kind,
                 );
-                build_upper_levels(&mut tree_b, n_leaves, n_leaves >> folded, kind);
-                assert_eq!(cw_a, cw_b, "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}");
+                let bytes_b = unsafe {
+                    core::slice::from_raw_parts(cw_b.as_ptr() as *const u8, cw_b.len() * 16)
+                };
+                let (tree_b, folded) =
+                    finish_fused_merkle_tree(tree_b, bytes_b, n_leaves, kind, fused);
+                assert_eq!(
+                    cw_a, cw_b,
+                    "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}"
+                );
                 assert_eq!(
                     tree_a, tree_b,
                     "tree log_d={log_d} n={num_ntts} rate={log_inv_rate} kind={kind:?} folded={folded}"
                 );
+
+                if kind == HashKind::Blake3 {
+                    let mut cw_c = vec![F128::new(u64::MAX, u64::MAX); n_leaves * num_ntts];
+                    let mut tree_c: Vec<Hash> = vec![[0x55u8; 32]; n_leaves - 1];
+                    let fused_c = fused_encode_leaves_subtree(
+                        &ntt,
+                        &msg,
+                        &mut cw_c,
+                        num_ntts,
+                        &mut tree_c,
+                        n_leaves,
+                        leaf,
+                        kind,
+                    );
+                    assert!(
+                        fused_c.geometry_ok,
+                        "power-of-two NTT callbacks must be pairable"
+                    );
+                    let bytes_c = unsafe {
+                        core::slice::from_raw_parts(cw_c.as_ptr() as *const u8, cw_c.len() * 16)
+                    };
+                    let (tree_c, _) =
+                        finish_fused_merkle_tree(tree_c, bytes_c, n_leaves, kind, fused_c);
+                    assert_eq!(cw_a, cw_c, "leafless codeword drift at log_d={log_d}");
+                    assert_eq!(
+                        tree_c,
+                        tree_a[n_leaves..],
+                        "leafless retained tail drift at log_d={log_d} n={num_ntts} rate={log_inv_rate}"
+                    );
+                }
             }
         }
     }
-
-
-    use super::*;
-
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -1650,19 +2295,24 @@ mod tests {
                 )
             };
             let oracle = merkle::merkle_tree(codeword_bytes, params.n_leaves(), HashKind::Blake3);
+            let shape = MerkleTreeShape::from_len(params.n_leaves(), pd.merkle_tree.len());
+            let retained_oracle: &[Hash] = match shape {
+                MerkleTreeShape::Full => &oracle,
+                MerkleTreeShape::Leafless => &oracle[params.n_leaves()..],
+            };
             assert_eq!(
                 pd.merkle_tree.len(),
-                2 * params.n_leaves() - 1,
-                "flat 2n-1 layout at m={m}"
+                retained_oracle.len(),
+                "retained layout at m={m}"
             );
             assert_eq!(
-                pd.merkle_tree, oracle,
+                pd.merkle_tree, retained_oracle,
                 "streamed CPU tree != merkle_tree() node-for-node at m={m}"
             );
             assert_eq!(
                 commitment.root,
                 oracle[2 * params.n_leaves() - 2],
-                "root at 2n-2 at m={m}"
+                "root mismatch at m={m}"
             );
         }
     }
@@ -1797,7 +2447,7 @@ mod tests {
     /// buffer, not steal the large one (L1 must not evict L0).
     #[test]
     fn tree_pool_smallest_fit_reuses_matching_buffer() {
-        // Both sizes clear give_tree's 1<<18-node (8 MiB) floor.
+        // Both sizes clear the pool floor.
         let n_small = 1 << 18;
         let n_large = 1 << 19;
         {
@@ -1835,20 +2485,20 @@ mod tests {
         }
     }
 
-    /// TREE_POOL cap 3 + lowered floor: the ranked L2 Ligerito tree
-    /// (2^16 leaves → 2·2^16−1 = 131071 nodes, ~4 MiB) must now be parked
-    /// by give_tree (previously refused by the 2^18 floor), and three
-    /// trees (L0/L1/L2 sizes) must coexist in the pool.
+    /// TREE_POOL cap 3 + compact floor: the ranked leafless L2 tree
+    /// (`2^16 - 1 = 65535` retained nodes, ~2 MiB) must be parked despite
+    /// sitting one node below the previous `2^16` floor, and compact
+    /// L0/L1/L2 sizes must coexist in the pool.
     #[test]
     fn tree_pool_parks_l2_and_caps_at_three() {
-        let n_l2 = 2 * (1 << 16) - 1; // 131071 — ranked L2
-        let n_l1 = 2 * (1 << 18) - 1; // ranked L1
-        let n_l0 = 2 * (1 << 20) - 1; // ranked L0
+        let n_l2 = (1 << 16) - 1; // compact ranked L2
+        let n_l1 = (1 << 18) - 1; // compact ranked L1
+        let n_l0 = (1 << 20) - 1; // compact ranked L0
         {
             let mut pool = TREE_POOL.lock().unwrap();
             pool.clear();
         }
-        // L2-sized tree must now be parked (was refused by old 2^18 floor).
+        // Compact L2 must be parked (it was refused by the old 2^16 floor).
         let l2 = take_tree(n_l2);
         let ptr_l2 = l2.as_ptr();
         give_tree(l2);

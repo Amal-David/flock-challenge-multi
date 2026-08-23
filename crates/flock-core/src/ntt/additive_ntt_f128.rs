@@ -1228,6 +1228,80 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Prove, before allocating a callback-written output, that every range
+    /// emitted by [`Self::rs_encode_interleaved_on_range_done`] begins and
+    /// ends on an original-leaf pair boundary.
+    ///
+    /// This shares [`Self::interleaved_deep_geometry`] with the encoder, so
+    /// the cache-size override and the lone-top/deep-block switches cannot
+    /// make the preflight drift from the schedule that actually runs.
+    pub(crate) fn rs_encode_interleaved_callback_ranges_pairable(
+        &self,
+        msg_len: usize,
+        codeword_len: usize,
+        num_ntts: usize,
+    ) -> bool {
+        if num_ntts == 0
+            || !num_ntts.is_power_of_two()
+            || msg_len == 0
+            || !msg_len.is_multiple_of(num_ntts)
+            || !codeword_len.is_multiple_of(msg_len)
+            || !codeword_len.is_multiple_of(num_ntts)
+        {
+            return false;
+        }
+        let inv_rate = codeword_len / msg_len;
+        let n_positions = codeword_len / num_ntts;
+        if !inv_rate.is_power_of_two() || inv_rate <= 1 || !n_positions.is_power_of_two() {
+            return false;
+        }
+        let log_inv_rate = log2_pow2(inv_rate);
+        let log_d = log2_pow2(n_positions);
+        if log_inv_rate > log_d
+            || msg_len / num_ntts != 1usize << (log_d - log_inv_rate)
+            || log_d > self.log_domain_size()
+        {
+            return false;
+        }
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        let callback_len = {
+            let start_layer = if log_inv_rate == 1 && log_d >= 12 && !rate_half_seed_disabled() {
+                3
+            } else if log_inv_rate >= 2
+                && log_inv_rate + 2 <= log_d
+                && msg_len / num_ntts >= 4
+                && !rate_seed_disabled()
+            {
+                log_inv_rate + 2
+            } else {
+                log_inv_rate
+            };
+            let (n_top, fuse_blocks) =
+                Self::interleaved_deep_geometry(log_d, num_ntts, start_layer);
+            if n_top == 0 || log_d < 8 {
+                n_positions
+            } else if fuse_blocks {
+                1usize << (log_d - (n_top + 4))
+            } else {
+                1usize << (log_d - n_top)
+            }
+        };
+
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        let callback_len = n_positions;
+
+        callback_len >= 2
+            && callback_len.is_multiple_of(2)
+            && n_positions.is_multiple_of(callback_len)
+    }
+
     /// [`Self::rs_encode_interleaved`] with **ordered chunk streaming**: the
     /// deep (cache-resident) NTT pass runs as ONE fully-parallel rayon pass
     /// (same schedule as the unstreamed path) whose sub-groups are claimed in
@@ -2040,6 +2114,26 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Exact deep-pass partition used both by the encoder and by callback
+    /// geometry preflight. `fuse_blocks` changes one subgroup callback into
+    /// sixteen equal block callbacks; both remain power-of-two aligned.
+    fn interleaved_deep_geometry(
+        log_d: usize,
+        num_ntts: usize,
+        start_layer: usize,
+    ) -> (usize, bool) {
+        let mut n_top = Self::interleaved_n_top(log_d, num_ntts);
+        if n_top == start_layer + 1 && n_top + 1 + 8 <= log_d && !ntt_lone_top_bump_disabled() {
+            n_top += 1;
+        }
+        let fuse_blocks = (Self::top_fusion_available() || cfg!(test))
+            && log_d == n_top + 11
+            && start_layer <= n_top
+            && !ntt_fused3_disabled()
+            && deep_block_fuse_enabled();
+        (n_top, fuse_blocks)
+    }
+
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -2065,7 +2159,7 @@ impl AdditiveNttF128 {
         // what keeps a row group single-parity.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
-        let mut n_top = Self::interleaved_n_top(log_d, num_ntts);
+        let (n_top, fuse_blocks) = Self::interleaved_deep_geometry(log_d, num_ntts, start_layer);
         // A lone top layer (`n_top == start_layer + 1`) would run as one
         // rayon region PER BLOCK through the single-layer fallback (the
         // Ligerito rate-1/8 recursive commit: log_d 16, num_ntts 8, start
@@ -2075,9 +2169,6 @@ impl AdditiveNttF128 {
         // sub-groups stay ≥ 2^8 positions. Same butterflies, same twiddles,
         // same lane bounds → bit-identical. Disjoint from the seed-fused top
         // task, which requires `n_top ≥ 9` at start layer 3.
-        if n_top == start_layer + 1 && n_top + 1 + 8 <= log_d && !ntt_lone_top_bump_disabled() {
-            n_top += 1;
-        }
         // Six top layers per DRAM pass (default on AVX-512; portable in
         // tests): a fused-four sweep followed by a fused-two sweep would read
         // and write the whole buffer twice; the cache-blocked task below does
@@ -2282,11 +2373,14 @@ impl AdditiveNttF128 {
         // per-row order — only the interleaving of DISJOINT blocks changes,
         // so the output bytes are identical. `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1`
         // restores the sweep schedule (exact same-binary A/B).
-        let fuse_blocks = deep_fused4_ok
-            && log_d == n_top + 11
-            && start_layer <= n_top
-            && !ntt_fused3_disabled()
-            && deep_block_fuse_enabled();
+        debug_assert_eq!(
+            fuse_blocks,
+            deep_fused4_ok
+                && log_d == n_top + 11
+                && start_layer <= n_top
+                && !ntt_fused3_disabled()
+                && deep_block_fuse_enabled()
+        );
 
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],

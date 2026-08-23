@@ -357,6 +357,43 @@ fn blake3_hash_many<const N: usize>(
     }
 }
 
+/// `blake3_hash_many` for arbitrary rows of one equal-width backing slice.
+/// `indices[j]` is hashed directly into `out[j]`, so caller ordering,
+/// duplicates, and non-contiguous sibling rows are preserved without copying
+/// their payloads into a temporary contiguous buffer.
+#[inline]
+fn blake3_hash_many_indexed<const N: usize>(data: &[u8], indices: &[usize], out: &mut [Hash]) {
+    debug_assert_eq!(indices.len(), out.len());
+    let plat = blake3_platform();
+    for (outs, rows) in out
+        .chunks_mut(BLAKE3_BATCH)
+        .zip(indices.chunks(BLAKE3_BATCH))
+    {
+        let n = outs.len();
+        let first_start = rows[0] * N;
+        let first: &[u8; N] = data[first_start..first_start + N].try_into().unwrap();
+        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        for (slot, &row) in inputs[..n].iter_mut().zip(rows) {
+            let start = row * N;
+            *slot = data[start..start + N].try_into().unwrap();
+        }
+        // SAFETY: `Hash` is `[u8; 32]`; `hash_many` writes exactly one CV per
+        // input into the contiguous `outs` byte view.
+        let out_bytes: &mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+        plat.hash_many(
+            &inputs[..n],
+            &BLAKE3_IV,
+            0,
+            blake3::IncrementCounter::No,
+            0,
+            BLAKE3_CHUNK_START,
+            BLAKE3_CHUNK_END,
+            out_bytes,
+        );
+    }
+}
+
 /// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
 /// contiguously in `data`. Equivalent to [`blake3_leaf_cv`] per leaf.
 ///
@@ -389,6 +426,47 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
 #[inline]
 pub(crate) fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
     matches!(leaf_size, 64 | 128 | 256 | 512 | 1024)
+}
+
+/// Hash selected BLAKE3 leaf rows into the corresponding output slots.
+/// Returns `false` without touching `out` unless the kind, leaf width, backing
+/// length, output length, and every row index fit the SIMD batch contract.
+pub(crate) fn hash_indexed_blake3_leaves(
+    data: &[u8],
+    leaf_size: usize,
+    indices: &[usize],
+    out: &mut [Hash],
+    kind: HashKind,
+) -> bool {
+    if kind != HashKind::Blake3
+        || !blake3_leaf_size_is_batchable(leaf_size)
+        || indices.len() != out.len()
+        || !data.len().is_multiple_of(leaf_size)
+        || indices.iter().any(|&i| i >= data.len() / leaf_size)
+    {
+        return false;
+    }
+
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+
+    macro_rules! dispatch {
+        ($($n:literal),+ $(,)?) => {
+            match leaf_size {
+                $($n => blake3_hash_many_indexed::<$n>(data, indices, out),)+
+                _ => unreachable!("batchability was checked above"),
+            }
+        };
+    }
+    dispatch!(64, 128, 256, 512, 1024);
+    true
 }
 
 /// Batched BLAKE3 parent nodes: `data` is `out.len()` contiguous 64-byte
@@ -1272,6 +1350,56 @@ mod tests {
                 blake3_leaf_size_is_batchable(leaf_size),
                 "predicate and dispatch disagree at leaf_size={leaf_size}"
             );
+        }
+    }
+
+    #[test]
+    fn indexed_blake3_leaves_preserve_slots_and_reject_fallbacks() {
+        for leaf_size in [64usize, 128, 256, 512, 1024] {
+            let rows = 137usize;
+            let data = random_data(rows, leaf_size, 0x1D3E_0000 | leaf_size as u64);
+            // Empty, unsorted, duplicate, first/last, and a tail longer than
+            // one x86 BLAKE3 pointer batch.
+            let mut indices = vec![136usize, 0, 64, 64, 1];
+            indices.extend((3..75).rev());
+            let mut out = vec![[0xA5u8; 32]; indices.len()];
+            assert!(hash_indexed_blake3_leaves(
+                &data,
+                leaf_size,
+                &indices,
+                &mut out,
+                HashKind::Blake3,
+            ));
+            for (slot, &row) in indices.iter().enumerate() {
+                assert_eq!(
+                    out[slot],
+                    hash_leaf(
+                        &data[row * leaf_size..(row + 1) * leaf_size],
+                        HashKind::Blake3,
+                    ),
+                    "slot={slot} row={row} leaf={leaf_size}"
+                );
+            }
+            assert!(hash_indexed_blake3_leaves(
+                &data,
+                leaf_size,
+                &[],
+                &mut [],
+                HashKind::Blake3,
+            ));
+        }
+
+        let data = vec![7u8; 4 * 64];
+        for (leaf_size, indices, kind) in [
+            (64usize, vec![0usize], HashKind::Sha256),
+            (96, vec![0], HashKind::Blake3),
+            (64, vec![4], HashKind::Blake3),
+        ] {
+            let mut out = [[0xCCu8; 32]; 1];
+            assert!(!hash_indexed_blake3_leaves(
+                &data, leaf_size, &indices, &mut out, kind,
+            ));
+            assert_eq!(out, [[0xCCu8; 32]; 1], "fallback touched output");
         }
     }
 
