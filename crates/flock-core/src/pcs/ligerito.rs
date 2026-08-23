@@ -2169,23 +2169,45 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// `FLOCK_NO_TNT_LOW_MUL=1` restores the 6-CLMUL product for every
+/// transpose butterfly, including twiddles whose high limb is already
+/// zero. Default ON matches the additive-NTT row butterfly: dispatch
+/// once per call on `t.hi == 0` to `ghash_mul_x4_low_lhs` (3 CLMUL).
+/// The bodies are `inline(never)` so the blocked-schedule closures do
+/// not clone both copies — the class that lost when a zero test sat
+/// *inside* the inlined leaf.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn tnt_low_mul_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_LOW_MUL").is_some());
+    *OFF
+}
+
 /// 4-lane AVX-512 transpose butterfly: `s = a ⊕ b; a' = s; b' = t·s ⊕ b`.
 ///
-/// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one `ghash_mul_x4`
-/// per 4-lane group, XOR for the sum. Field-identical to the scalar loop
-/// (`ghash_mul_x4` is the canonical mod-p product, cross-checked against
-/// `ghash_mul_karatsuba_barrett` in the field tests).
+/// `LOW` asserts `t.hi == 0` in every lane (3-CLMUL `ghash_mul_x4_low_lhs`);
+/// otherwise the incumbent 6-CLMUL `ghash_mul_x4`. Outlined so a per-call
+/// dispatch cannot inflate the rayon closures. Field-identical: the low
+/// form is the same product with the two `x.hi` limb CLMULs and their
+/// reduction dropped as zeros.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site). `top` and
-/// `bot` must have equal length.
+/// `bot` must have equal length. When `LOW`, `t.hi == 0`.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+unsafe fn transpose_butterfly_avx512_gen<const LOW: bool>(
+    top: &mut [F128],
+    bot: &mut [F128],
+    t: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_low_lhs};
     use core::arch::x86_64::*;
 
-    // SAFETY: caller carries the target features; slice bounds hold.
+    debug_assert!(!LOW || t.hi == 0);
+    // SAFETY: caller carries the target features; slice bounds hold;
+    // `LOW` is the zero-high-limb precondition.
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
         let lanes = top.len() & !3;
@@ -2195,7 +2217,12 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let prod = if LOW {
+                ghash_mul_x4_low_lhs(tb, vs)
+            } else {
+                ghash_mul_x4(tb, vs)
+            };
+            let nb = _mm512_xor_si512(vb, prod);
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -2211,13 +2238,19 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
 
 /// Scalar/vector transpose butterfly on two equal-length halves:
 /// `s = a + b; a' = s; b' = t·s + b`. Thin cfg wrapper so the schedulers
-/// below stay readable.
+/// below stay readable. The `t.hi == 0` dispatch is once per call, outside
+/// every lane loop, matching [`crate::ntt::additive_ntt_f128`] row pairs.
 #[inline(always)]
 fn transpose_butterfly(top_h: &mut [F128], bot: &mut [F128], t: F128) {
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-    // SAFETY: target features cfg-guaranteed; halves are equal-length.
+    // SAFETY: target features cfg-guaranteed; halves are equal-length;
+    // `LOW` is taken only when `t.hi == 0`.
     unsafe {
-        transpose_butterfly_avx512(top_h, bot, t)
+        if t.hi == 0 && !tnt_low_mul_disabled() {
+            transpose_butterfly_avx512_gen::<true>(top_h, bot, t);
+        } else {
+            transpose_butterfly_avx512_gen::<false>(top_h, bot, t);
+        }
     }
     #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
     {
@@ -11182,6 +11215,35 @@ mod tests {
                 transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
+        }
+    }
+
+    /// 3-CLMUL low-twiddle transpose butterfly equals the 6-CLMUL form
+    /// on random rows with `t.hi == 0`.
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn transpose_butterfly_low_matches_schoolbook() {
+        use crate::challenger::Challenger;
+        let mut ch = crate::challenger::RandomChallenger::new(0x70EE_0001);
+        for &n in &[1usize, 3, 4, 5, 8, 15, 64, 65, 128] {
+            let t = F128 {
+                lo: ch.sample_f128().lo,
+                hi: 0,
+            };
+            let top0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let bot0: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let mut a_top = top0.clone();
+            let mut a_bot = bot0.clone();
+            let mut b_top = top0;
+            let mut b_bot = bot0;
+            // SAFETY: cfg gate supplies avx512f+vpclmulqdq; LOW twiddle has
+            // a zero high limb; equal lengths.
+            unsafe {
+                super::transpose_butterfly_avx512_gen::<false>(&mut a_top, &mut a_bot, t);
+                super::transpose_butterfly_avx512_gen::<true>(&mut b_top, &mut b_bot, t);
+            }
+            assert_eq!(a_top, b_top, "top n={n}");
+            assert_eq!(a_bot, b_bot, "bot n={n}");
         }
     }
 
