@@ -1,3 +1,4 @@
+// witfire-88 draw marker 4471
 //! 8-wide AVX2 lockstep BLAKE3 witness builder (`__m256i`, 8×u32).
 //!
 //! Same G-function / carry-bit / packed-row stream as the 4-wide SSE kernel,
