@@ -1229,5 +1229,3 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // refire-45: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-47: independent official timing sample of the promoted source; no executable change.
-
-// zarar-x86-resample-110: independent official timing sample of the promoted source; no executable change.
