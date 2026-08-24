@@ -496,6 +496,18 @@ pub struct WideGhashX4 {
     mid: __m512i,
 }
 
+/// `FLOCK_NO_ZC_MUL_KARATSUBA=1` restores the incumbent 4-CLMUL schoolbook
+/// widen inside the deferred-reduction accumulator ([`WideGhashX4::mul_acc`]),
+/// so a candidate/control pair differs only in the product form. The Karatsuba
+/// form is field-identical (char-2 identity: `mid = cross ^ lo ^ hi`), so
+/// every downstream fold/reduce - and the proof bytes - are unchanged. Read
+/// once, outside every lane loop.
+#[inline]
+fn zc_mul_karatsuba_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_MUL_KARATSUBA").is_some())
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 impl WideGhashX4 {
     /// Empty accumulator.
@@ -520,14 +532,41 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        // SAFETY: caller carries avx512f+vpclmulqdq (statically satisfied by
+        // the cfg gate on this module and the target_feature attribute).
+        unsafe {
+            if zc_mul_karatsuba_disabled() {
+                // Incumbent schoolbook widen: 4 CLMULs + XOR-accumulate.
+                self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+                self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+                let m = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x01>(x, y),
+                    _mm512_clmulepi64_epi128::<0x10>(x, y),
+                );
+                self.mid = _mm512_xor_si512(self.mid, m);
+            } else {
+                // Karatsuba widen: 3 CLMULs. In characteristic 2 the cross
+                // term (x.lo+x.hi)*(y.lo+y.hi) equals lo + mid + hi, so
+                // mid = cross ^ lo ^ hi reproduces the schoolbook (lo, mid,
+                // hi) triple EXACTLY - the deferred reduction downstream
+                // (reduce_lanes / fold / ghash_reduce_acc_x4) sees
+                // bit-identical inputs and the proof bytes are unchanged.
+                // One fewer VPCLMULQDQ per 4-lane product (port 5 on SPR);
+                // two extra vector XORs on the cheaper ALU ports.
+                // `FLOCK_NO_ZC_MUL_KARATSUBA=1` restores the incumbent form
+                // inside the same binary (exact same-binary A/B).
+                let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+                let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+                // Per 128-bit lane: hi' = lo ^ hi (lo' is unused by 0x10).
+                let x_sum = _mm512_xor_si512(x, _mm512_bsrli_epi128::<8>(x));
+                let y_sum = _mm512_xor_si512(y, _mm512_bsrli_epi128::<8>(y));
+                let cross = _mm512_clmulepi64_epi128::<0x10>(x_sum, y_sum);
+                let mid = _mm512_xor_si512(_mm512_xor_si512(cross, lo), hi);
+                self.lo = _mm512_xor_si512(self.lo, lo);
+                self.hi = _mm512_xor_si512(self.hi, hi);
+                self.mid = _mm512_xor_si512(self.mid, mid);
+            }
+        }
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
