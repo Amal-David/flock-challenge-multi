@@ -306,7 +306,7 @@ fn blake3_platform() -> blake3::platform::Platform {
 /// the established 16-input policy on non-x86 targets, where an M4 sweep found
 /// it marginally best and the SIMD width is only four.
 #[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
+const BLAKE3_BATCH: usize = 128;
 #[cfg(not(target_arch = "x86_64"))]
 const BLAKE3_BATCH: usize = 16;
 
@@ -467,8 +467,8 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
             for (outs, leaves) in out
-                .chunks_mut(BLAKE3_GROUP)
-                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
+                .chunks_mut(BLAKE3_SERIAL_GROUP)
+                .zip(data.chunks(BLAKE3_SERIAL_GROUP * leaf_size))
             {
                 blake3_hash_many_leaves(leaves, leaf_size, outs);
             }
@@ -502,7 +502,15 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
+/// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
+/// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
+
+/// Leaves per iteration of the serial in-callback hasher. The ranked deep
+/// pass retires 2048-leaf sub-groups, so 2048 makes each per-callback leaf
+/// fold one batched call chain instead of two; smaller callers just chunk
+/// normally. Pure batching granularity — same CVs at any value.
+const BLAKE3_SERIAL_GROUP: usize = 2048;
 
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
