@@ -2643,7 +2643,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
 /// before use; both measure worse. Nothing is added to the sweep and
 /// nothing moves — a prefetch has no architectural effect — so the
 /// accumulated lanes are bit-identical either way.
-const ZC_R1AB_PF_WINDOWS: usize = 2;
+const ZC_R1AB_PF_WINDOWS: usize = 3;
 
 /// `FLOCK_NO_ZC_R1AB_PF=1` restores the incumbent no-prefetch round-1 AB
 /// sweep (exact same-binary A/B). Resolved once per process.
