@@ -137,6 +137,16 @@ pub(crate) fn urm_offw_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_URM_APPLY_8IMG=1` restores the three-shuffle two-image apply
+/// (σ₃₂/σ₃₂/σ₁₆ `vshufi64x2` per apply) in the shift-reduce AB kernel instead
+/// of the shuffle-free eight-image form (`out = ⊕ᵢ imgᵢ[oᵢ]`). Resolved once
+/// per process.
+pub(crate) fn urm_apply_8img_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_APPLY_8IMG").is_none());
+    *ON
+}
+
 /// Terminal 64-byte store for the shift-reduce AB kernels. `nt` selects the
 /// store class, decided once per precompute call by the producer:
 /// - `0`: temporal `storeu` (the incumbent; all in-fold callers).
@@ -347,8 +357,13 @@ unsafe fn horner_2img_offw(
     use core::arch::x86_64::*;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
+        let eight = urm_apply_8img_enabled();
         let apply = |o: *const u16| {
-            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+            if eight {
+                crate::ntt::inv_table::apply_x86_avx512_register_8img_offw_at(imgs.0, o)
+            } else {
+                crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+            }
         };
         let xb = _mm512_set1_epi8(2);
         let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
