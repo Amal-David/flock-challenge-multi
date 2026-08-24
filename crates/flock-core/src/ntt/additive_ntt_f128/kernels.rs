@@ -475,6 +475,26 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
         target_feature = "vpclmulqdq"
     ))]
     unsafe {
+        // Ranked seed-top: src_quarter = 2^17, dst_quarter = 64, num_ntts = 64.
+        // Same body as the generic hold-4 leaf; the constants collapse twelve
+        // row addresses to base-plus-displacement. Kill switch
+        // FLOCK_NO_NTT_SEED_HOLD4_SHAPED restores the runtime-argument form.
+        if super::ntt_seed_hold4_shaped_enabled()
+            && src_quarter == (1 << 17)
+            && dst_quarter == 64
+            && num_ntts == 64
+        {
+            x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo_shaped::<{ 1 << 17 }, 64, 64>(
+                src,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                right_twiddle,
+                dense_tw,
+                pf_src,
+            );
+            return;
+        }
         x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo(
             src,
             src_quarter,

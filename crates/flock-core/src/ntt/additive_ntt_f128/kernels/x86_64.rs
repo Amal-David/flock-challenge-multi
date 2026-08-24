@@ -770,7 +770,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 ) {
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false>(
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -783,7 +783,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 pf_src,
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true>(
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, 0, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -799,12 +799,72 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     }
 }
 
+/// Shape-monomorphized [`butterfly_fused_2layer_row_from_sparse_dense_geo`].
+/// `SQ`/`DQ`/`NN` replace equal runtime `src_quarter`/`dst_quarter`/`num_ntts`
+/// in the same impl body so the twelve row addresses fold to one base plus
+/// constant displacements. Ranked seed-top is `(SQ, DQ, NN) = (2^17, 64, 64)`.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`], with
+/// `src_quarter == SQ`, `dst_quarter == DQ`, and `num_ntts == NN`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_shaped<
+    const SQ: usize,
+    const DQ: usize,
+    const NN: usize,
+>(
+    src: *const F128,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src: *const F128,
+) {
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, SQ, DQ, NN>(
+                src,
+                SQ,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                DQ,
+                NN,
+                right_twiddle,
+                dense_tw,
+                pf_src,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, SQ, DQ, NN>(
+                src,
+                SQ,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                DQ,
+                NN,
+                right_twiddle,
+                dense_tw,
+                pf_src,
+            )
+        }
+    }
+}
+
 /// # Safety
 /// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`].
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool>(
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
+    const DIET: bool,
+    const SQ: usize,
+    const DQ: usize,
+    const NN: usize,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -819,6 +879,12 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     use core::arch::x86_64::*;
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     let pf = !pf_src.is_null();
+    // Shape substitution: compile-time when the wrapper pins one (SQ/DQ/NN
+    // nonzero), the runtime argument otherwise. Wrappers only pin values
+    // equal to the runtime shape, so this is the identity.
+    let src_quarter = if SQ != 0 { SQ } else { src_quarter };
+    let dst_quarter = if DQ != 0 { DQ } else { dst_quarter };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
     unsafe {
         let sparse_b = tw_x4::<false, DIET>(right_twiddle);
         let outer = tw_x4::<false, DIET>(t_outer);
@@ -1939,5 +2005,129 @@ mod diet_tests {
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
         }
+    }
+
+    /// Const-generic hold-4 is the generic body with SQ/DQ/NN substituted
+    /// for equal runtime values. Pin that identity on a small geometry that
+    /// still exercises the vector body and the scalar tail.
+    #[test]
+    fn hold4_shaped_matches_generic() {
+        let mut next = rng(0xA11C_E0DE);
+        // src_quarter=4, dst_quarter=1, so four source rows sit at
+        // i * 4 * NN and four dest rows at i * 1 * NN. Compact, same algebra.
+        const SQ: usize = 4;
+        const DQ: usize = 1;
+        for nn in [5usize, 8, 64] {
+            let src: Vec<F128> = (0..4 * SQ * nn).map(|_| next()).collect();
+            let right = next();
+            let dense = [next(), next(), next()];
+            let run = |shaped: bool, diet: bool| {
+                let mut sp = vec![F128::ZERO; 4 * DQ * nn];
+                let mut dn = vec![F128::ZERO; 4 * DQ * nn];
+                // SAFETY: src/sp/dn are disjoint; geometry matches the consts.
+                unsafe {
+                    match (shaped, diet) {
+                        (false, false) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, 0, 0, 0>(
+                                src.as_ptr(),
+                                SQ,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                DQ,
+                                nn,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            )
+                        }
+                        (false, true) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, 0, 0, 0>(
+                                src.as_ptr(),
+                                SQ,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                DQ,
+                                nn,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            )
+                        }
+                        (true, false) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, SQ, DQ, 0>(
+                                src.as_ptr(),
+                                SQ,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                DQ,
+                                nn,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            )
+                        }
+                        (true, true) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, SQ, DQ, 0>(
+                                src.as_ptr(),
+                                SQ,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                DQ,
+                                nn,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            )
+                        }
+                    }
+                }
+                (sp, dn)
+            };
+            // NN const 0 keeps runtime num_ntts so one test covers 5/8/64.
+            assert_eq!(run(false, true), run(true, true), "hold4 sq/dq nn={nn} diet");
+            assert_eq!(run(false, false), run(true, false), "hold4 sq/dq nn={nn} raw");
+        }
+
+        // Ranked pin (NN=64) with SQ/DQ/NN all const, matching the dispatch arm.
+        const NN: usize = 8;
+        let src: Vec<F128> = (0..4 * SQ * NN).map(|_| next()).collect();
+        let right = next();
+        let dense = [next(), next(), next()];
+        let mut sp_g = vec![F128::ZERO; 4 * DQ * NN];
+        let mut dn_g = vec![F128::ZERO; 4 * DQ * NN];
+        let mut sp_s = vec![F128::ZERO; 4 * DQ * NN];
+        let mut dn_s = vec![F128::ZERO; 4 * DQ * NN];
+        unsafe {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, 0, 0, 0>(
+                src.as_ptr(),
+                SQ,
+                0,
+                sp_g.as_mut_ptr(),
+                dn_g.as_mut_ptr(),
+                DQ,
+                NN,
+                right,
+                &dense,
+                core::ptr::null(),
+            );
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, SQ, DQ, NN>(
+                src.as_ptr(),
+                SQ,
+                0,
+                sp_s.as_mut_ptr(),
+                dn_s.as_mut_ptr(),
+                DQ,
+                NN,
+                right,
+                &dense,
+                core::ptr::null(),
+            );
+        }
+        assert_eq!(sp_g, sp_s, "hold4 ranked-pin sparse");
+        assert_eq!(dn_g, dn_s, "hold4 ranked-pin dense");
     }
 }

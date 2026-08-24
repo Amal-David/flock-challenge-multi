@@ -280,6 +280,30 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_HOLD4_SHAPED=1` restores the generic hold-4 leaf
+/// (runtime `src_quarter` / `dst_quarter` / `num_ntts` in the address
+/// arithmetic). Default ON: the ranked triple `(2^17, 64, 64)` dispatches
+/// to a const-generic monomorph of the same body so twelve row addresses
+/// fold to one base plus displacements. Value-identical by construction —
+/// the constants replace equal runtime values — so the switch exists for
+/// same-binary A/B. Independent of `FLOCK_NO_NTT_SEED_HOLD4` (which restores
+/// the two-gather form) and of `FLOCK_NO_NTT_SHAPED` (deep fused-four /
+/// fused-three).
+#[inline]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )),
+    allow(dead_code)
+)]
+fn ntt_seed_hold4_shaped_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4_SHAPED").is_none());
+    *ON
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
