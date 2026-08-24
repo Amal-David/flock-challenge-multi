@@ -67,6 +67,127 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
     }
 }
 
+/// Issue three independent broadcast-twiddle products as one schedule.  The
+/// ranked hold-four seed leaf has exactly this dependency frontier: its sparse
+/// right-inner product and the dense layer's two outer products all consume
+/// the original four message rows.  Keeping the products in one inline body
+/// lets LLVM overlap their VPCLMUL chains without retaining a second lane
+/// chunk or adding another loop/dispatch.
+///
+/// # Safety
+/// Same split-companion and target-feature contract as [`mul_x4`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_three<const DIET: bool>(
+    ta: TwX4,
+    va: core::arch::x86_64::__m512i,
+    tb: TwX4,
+    vb: core::arch::x86_64::__m512i,
+    tc: TwX4,
+    vc: core::arch::x86_64::__m512i,
+) -> (
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+
+    unsafe {
+        if !DIET {
+            return (
+                mul_x4::<false, false>(ta, va),
+                mul_x4::<false, false>(tb, vb),
+                mul_x4::<false, false>(tc, vc),
+            );
+        }
+
+        // Four product CLMULs for each split multiply, issued across the
+        // three independent inputs before any reduction dependency chain.
+        let a00 = _mm512_clmulepi64_epi128::<0x00>(va, ta.0);
+        let b00 = _mm512_clmulepi64_epi128::<0x00>(vb, tb.0);
+        let c00 = _mm512_clmulepi64_epi128::<0x00>(vc, tc.0);
+        let a01 = _mm512_clmulepi64_epi128::<0x01>(va, ta.1);
+        let b01 = _mm512_clmulepi64_epi128::<0x01>(vb, tb.1);
+        let c01 = _mm512_clmulepi64_epi128::<0x01>(vc, tc.1);
+        let a10 = _mm512_clmulepi64_epi128::<0x10>(va, ta.0);
+        let b10 = _mm512_clmulepi64_epi128::<0x10>(vb, tb.0);
+        let c10 = _mm512_clmulepi64_epi128::<0x10>(vc, tc.0);
+        let a11 = _mm512_clmulepi64_epi128::<0x11>(va, ta.1);
+        let b11 = _mm512_clmulepi64_epi128::<0x11>(vb, tb.1);
+        let c11 = _mm512_clmulepi64_epi128::<0x11>(vc, tc.1);
+
+        let alo = _mm512_xor_si512(a00, a01);
+        let blo = _mm512_xor_si512(b00, b01);
+        let clo = _mm512_xor_si512(c00, c01);
+        let ahi = _mm512_xor_si512(a10, a11);
+        let bhi = _mm512_xor_si512(b10, b11);
+        let chi = _mm512_xor_si512(c10, c11);
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+
+        let ar = _mm512_xor_si512(
+            _mm512_xor_si512(alo, _mm512_bslli_epi128::<8>(ahi)),
+            _mm512_clmulepi64_epi128::<0x01>(ahi, poly),
+        );
+        let br = _mm512_xor_si512(
+            _mm512_xor_si512(blo, _mm512_bslli_epi128::<8>(bhi)),
+            _mm512_clmulepi64_epi128::<0x01>(bhi, poly),
+        );
+        let cr = _mm512_xor_si512(
+            _mm512_xor_si512(clo, _mm512_bslli_epi128::<8>(chi)),
+            _mm512_clmulepi64_epi128::<0x01>(chi, poly),
+        );
+        (ar, br, cr)
+    }
+}
+
+/// Two-product companion of [`mul_x4_three`] for the independent dense inner
+/// butterflies that become ready together after the outer layer.
+///
+/// # Safety
+/// Same split-companion and target-feature contract as [`mul_x4`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_two<const DIET: bool>(
+    ta: TwX4,
+    va: core::arch::x86_64::__m512i,
+    tb: TwX4,
+    vb: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+
+    unsafe {
+        if !DIET {
+            return (
+                mul_x4::<false, false>(ta, va),
+                mul_x4::<false, false>(tb, vb),
+            );
+        }
+
+        let a00 = _mm512_clmulepi64_epi128::<0x00>(va, ta.0);
+        let b00 = _mm512_clmulepi64_epi128::<0x00>(vb, tb.0);
+        let a01 = _mm512_clmulepi64_epi128::<0x01>(va, ta.1);
+        let b01 = _mm512_clmulepi64_epi128::<0x01>(vb, tb.1);
+        let a10 = _mm512_clmulepi64_epi128::<0x10>(va, ta.0);
+        let b10 = _mm512_clmulepi64_epi128::<0x10>(vb, tb.0);
+        let a11 = _mm512_clmulepi64_epi128::<0x11>(va, ta.1);
+        let b11 = _mm512_clmulepi64_epi128::<0x11>(vb, tb.1);
+        let alo = _mm512_xor_si512(a00, a01);
+        let blo = _mm512_xor_si512(b00, b01);
+        let ahi = _mm512_xor_si512(a10, a11);
+        let bhi = _mm512_xor_si512(b10, b11);
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        let ar = _mm512_xor_si512(
+            _mm512_xor_si512(alo, _mm512_bslli_epi128::<8>(ahi)),
+            _mm512_clmulepi64_epi128::<0x01>(ahi, poly),
+        );
+        let br = _mm512_xor_si512(
+            _mm512_xor_si512(blo, _mm512_bslli_epi128::<8>(bhi)),
+            _mm512_clmulepi64_epi128::<0x01>(bhi, poly),
+        );
+        (ar, br)
+    }
+}
+
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     // SAFETY: forwarded caller contract.
@@ -842,30 +963,38 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
             let vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
             let vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
 
+            let sparse_a = va;
             let mut sb = vb;
             let mut sc = _mm512_xor_si512(vc, va);
             let mut sd = _mm512_xor_si512(vd, vb);
             sb = _mm512_xor_si512(sb, va);
-            let new_c = _mm512_xor_si512(sc, mul_x4::<false, DIET>(sparse_b, sd));
+            // The sparse right-inner and both dense outer products depend
+            // only on the original message rows. Issue their split-product
+            // chains together, then consume the three results in the exact
+            // incumbent butterfly order.
+            let (sparse_product, outer_c, outer_d) =
+                mul_x4_three::<DIET>(sparse_b, sd, outer, vc, outer, vd);
+            let new_c = _mm512_xor_si512(sc, sparse_product);
             sd = _mm512_xor_si512(sd, new_c);
             sc = new_c;
-            _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, va);
+
+            let new_a = _mm512_xor_si512(va, outer_c);
+            let vc = _mm512_xor_si512(vc, new_a);
+            let va = new_a;
+            let new_b = _mm512_xor_si512(vb, outer_d);
+            let vd = _mm512_xor_si512(vd, new_b);
+            let vb = new_b;
+            let (inner_product_a, inner_product_b) = mul_x4_two::<DIET>(inner_a, vb, inner_b, vd);
+            let new_a = _mm512_xor_si512(va, inner_product_a);
+            let vb = _mm512_xor_si512(vb, new_a);
+            let va = new_a;
+            let new_c = _mm512_xor_si512(vc, inner_product_b);
+            let vd = _mm512_xor_si512(vd, new_c);
+            let vc = new_c;
+            _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, sparse_a);
             _mm512_storeu_si512(sp_row(1).add(lane) as *mut __m512i, sb);
             _mm512_storeu_si512(sp_row(2).add(lane) as *mut __m512i, sc);
             _mm512_storeu_si512(sp_row(3).add(lane) as *mut __m512i, sd);
-
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
-            let vc = _mm512_xor_si512(vc, new_a);
-            let va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
-            let vd = _mm512_xor_si512(vd, new_b);
-            let vb = new_b;
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
-            let vb = _mm512_xor_si512(vb, new_a);
-            let va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
-            let vd = _mm512_xor_si512(vd, new_c);
-            let vc = new_c;
             _mm512_storeu_si512(dn_row(0).add(lane) as *mut __m512i, va);
             _mm512_storeu_si512(dn_row(1).add(lane) as *mut __m512i, vb);
             _mm512_storeu_si512(dn_row(2).add(lane) as *mut __m512i, vc);
@@ -1902,6 +2031,56 @@ mod diet_tests {
                 dst
             };
             assert_eq!(run_sparse(true), run_sparse(false), "sparse len={len}");
+
+            // --- hold-four sparse+dense seed leaf ------------------------
+            // This pins the new product schedule to both incumbent two-call
+            // outputs, including vector-body and scalar-tail lane counts.
+            let run_hold4 = |diet: bool| {
+                let mut sparse = vec![F128::ZERO; 4 * len];
+                let mut dense = vec![F128::ZERO; 4 * len];
+                // SAFETY: 4 rows of `len` lanes; src/sparse/dense are
+                // pairwise disjoint and the prefetch pointer is null.
+                unsafe {
+                    if diet {
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true>(
+                            src.as_ptr(),
+                            1,
+                            0,
+                            sparse.as_mut_ptr(),
+                            dense.as_mut_ptr(),
+                            1,
+                            len,
+                            right,
+                            &tw3,
+                            core::ptr::null(),
+                        );
+                    } else {
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false>(
+                            src.as_ptr(),
+                            1,
+                            0,
+                            sparse.as_mut_ptr(),
+                            dense.as_mut_ptr(),
+                            1,
+                            len,
+                            right,
+                            &tw3,
+                            core::ptr::null(),
+                        );
+                    }
+                }
+                (sparse, dense)
+            };
+            let want_sparse = run_sparse(false);
+            let want_dense = run_from(false);
+            for diet in [false, true] {
+                let (got_sparse, got_dense) = run_hold4(diet);
+                assert_eq!(
+                    got_sparse, want_sparse,
+                    "hold4 sparse diet={diet} len={len}"
+                );
+                assert_eq!(got_dense, want_dense, "hold4 dense diet={diet} len={len}");
+            }
 
             // --- fused four-layer -----------------------------------------
             let mut tw15 = [F128::ZERO; 15];
