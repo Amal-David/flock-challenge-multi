@@ -360,7 +360,7 @@ pub fn split_n_lo(n: usize) -> usize {
 /// Coarser split for deferred table-composition kernels: keep the streamed
 /// low factor within private L2 while amortizing each composed-table build
 /// over many output slots.
-fn deferred_split_n_lo(n: usize) -> usize {
+pub(crate) fn deferred_split_n_lo(n: usize) -> usize {
     let balanced = split_n_lo(n);
     let coarse = n.saturating_sub(8).min(15);
     coarse.max(balanced)
@@ -2589,6 +2589,11 @@ pub(crate) struct DirectFold4Factors {
 pub(crate) struct DirectFold8Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
+    /// Exact suffix coordinates left after the six DirectFold8 bank binds.
+    /// Keep these alongside the tensor factors: the factors are sufficient to
+    /// evaluate the current dense basis, but do not safely reveal the next
+    /// coordinate needed to rebind its F2-linear map.
+    pub(crate) remaining_coordinates: Vec<F128>,
     /// A[b,e] = transpose(s_hat_v_fold8[e])[b].
     pub(crate) a_state: Vec<F128>,
     /// W[b,d] = Phi(low_eq[d] * x^b), in the same bit-major layout.
@@ -2675,6 +2680,7 @@ fn build_direct_fold8_factors(
     DirectFold8Factors {
         eq_lo,
         eq_hi,
+        remaining_coordinates: tail.to_vec(),
         a_state,
         w_state,
         round0,
@@ -4372,6 +4378,10 @@ mod tests {
             assert_eq!(par.round0, seq.round0, "round0 tail_len={tail_len}");
             assert_eq!(par.eq_lo, seq.eq_lo, "eq_lo tail_len={tail_len}");
             assert_eq!(par.eq_hi, seq.eq_hi, "eq_hi tail_len={tail_len}");
+            assert_eq!(
+                par.remaining_coordinates, seq.remaining_coordinates,
+                "remaining coordinates tail_len={tail_len}"
+            );
             // Negative control: one corrupted statistic entry must reach both
             // the transposed state and the cached round-0 message.
             let mut bad = fold8.clone();

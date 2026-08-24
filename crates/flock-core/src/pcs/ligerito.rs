@@ -5686,7 +5686,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
     current_len: usize,
     direct_fold4_mode: bool,
 ) -> bool {
-    ranked_l1_lazy_ood_eq_selected(
+    let selected = ranked_l1_lazy_ood_eq_selected(
         config,
         log_n,
         n_1,
@@ -5699,7 +5699,22 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_feature = "vpclmulqdq"
         )),
         std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
-    )
+    );
+    #[cfg(test)]
+    if !selected
+        && direct_fold8_basis_defer_test_force_enabled()
+        && direct_fold4_mode
+        && l1_ood_count == 1
+        && config.initial_k == 6
+        && config.initial_log_num_interleaved == 6
+        && config.initial_log_msg_cols == n_1
+        && config.log_inv_rates.first() == Some(&1)
+        && log_n == n_1 + config.initial_k
+        && current_len == (1usize << n_1)
+    {
+        return true;
+    }
+    selected
 }
 
 #[inline]
@@ -5784,6 +5799,553 @@ fn ranked_deep_lazy_ood_eq_selected(
         && config.log_inv_rates.first() == Some(&1)
 }
 
+/// Exact production selector for deferring only the DirectFold8 basis across
+/// L1's introduce/glue and into its first fold. The selected sibling kernels
+/// require the ranked two-claim geometry and the existing factorized L1 OOD
+/// path; every mismatch stays on [`materialize_direct_fold8`].
+#[inline]
+fn ranked_direct_fold8_basis_defer_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    packed_len: usize,
+    ordinary_basis_len: usize,
+    claims: &[super::ring_switch::DirectFold8Factors],
+) -> bool {
+    let factor_shape_ok = claims.iter().all(|claim| {
+        claim.remaining_coordinates.len() == 19
+            && claim.eq_lo.len() == (1usize << 11)
+            && claim.eq_hi.len() == (1usize << 8)
+            && claim.a_state.len() == 64 * (1usize << super::LOG_PACKING)
+            && claim.w_state.len() == claim.a_state.len()
+    });
+    let selected = ranked_direct_fold8_basis_defer_enabled_after_shape(
+        config,
+        log_n,
+        packed_len,
+        ordinary_basis_len,
+        claims,
+        factor_shape_ok,
+    );
+    #[cfg(test)]
+    let selected = selected
+        || (direct_fold8_basis_defer_test_force_enabled()
+            && log_n >= config.initial_k
+            && packed_len == (1usize << log_n)
+            && ordinary_basis_len == 0
+            && claims.len() == 2
+            && claims.iter().all(|claim| {
+                claim.remaining_coordinates.len() == log_n - config.initial_k
+                    && claim.eq_lo.len() * claim.eq_hi.len()
+                        == packed_len >> config.initial_k
+                    && claim.a_state.len() == 64 * (1usize << super::LOG_PACKING)
+                    && claim.w_state.len() == claim.a_state.len()
+            })
+            && config.initial_log_msg_cols == log_n - config.initial_k
+            && config.initial_log_num_interleaved == 6
+            && config.initial_k == 6
+            && config.log_inv_rates.first() == Some(&1)
+            && config.ood_samples.get(1) == Some(&1)
+            && config.recursive_ks.first().is_some_and(|&k| k >= 1));
+    #[cfg(test)]
+    if selected {
+        direct_fold8_basis_defer_test_trace_bump(0);
+    }
+    selected
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DIRECT_FOLD8_BASIS_DEFER_TEST_FORCE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// selector, deferred materializer, ordinary glue, first deferred fold
+    static DIRECT_FOLD8_BASIS_DEFER_TEST_TRACE: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+#[cfg(test)]
+fn direct_fold8_basis_defer_test_force_enabled() -> bool {
+    DIRECT_FOLD8_BASIS_DEFER_TEST_FORCE.get()
+}
+
+#[cfg(test)]
+fn direct_fold8_basis_defer_test_set_force(enabled: bool) {
+    DIRECT_FOLD8_BASIS_DEFER_TEST_FORCE.set(enabled);
+    if enabled {
+        DIRECT_FOLD8_BASIS_DEFER_TEST_TRACE.set([0; 4]);
+    }
+}
+
+#[cfg(test)]
+fn direct_fold8_basis_defer_test_trace_bump(slot: usize) {
+    DIRECT_FOLD8_BASIS_DEFER_TEST_TRACE.with(|cell| {
+        let mut trace = cell.get();
+        trace[slot] += 1;
+        cell.set(trace);
+    });
+}
+
+#[cfg(test)]
+fn direct_fold8_basis_defer_test_trace() -> [usize; 4] {
+    DIRECT_FOLD8_BASIS_DEFER_TEST_TRACE.get()
+}
+
+#[cfg(test)]
+mod direct_fold8_basis_defer_tests {
+    use super::*;
+
+    fn ready_fold_arena(fold_input_len: usize) -> FoldArena {
+        let mut arena = FoldArena::new_prefaulted(FoldArena::capacity_for(fold_input_len, 1));
+        for thread in arena.threads.drain(..) {
+            thread.join().expect("test FoldArena prefaulter");
+        }
+        arena
+    }
+
+    fn test_deferred_direct_map(
+        rng: &mut crate::challenger::RandomChallenger,
+        remaining_coordinates: Vec<F128>,
+    ) -> DeferredDirectFold8Map {
+        use crate::challenger::Challenger;
+        let generators: Vec<F128> = (0..(1usize << super::super::LOG_PACKING))
+            .map(|_| rng.sample_f128())
+            .collect();
+        let split = super::super::ring_switch::deferred_split_n_lo(
+            remaining_coordinates.len(),
+        );
+        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
+            &remaining_coordinates,
+            split,
+        );
+        DeferredDirectFold8Map {
+            table: super::super::ring_switch::build_direct_fold8_table_from_generators(
+                &generators,
+            ),
+            remaining_coordinates,
+            eq_lo,
+            eq_hi,
+        }
+    }
+
+    fn test_post_bind_direct_fold8_claim(
+        rng: &mut crate::challenger::RandomChallenger,
+        remaining_coordinates: Vec<F128>,
+    ) -> super::super::ring_switch::DirectFold8Factors {
+        use crate::challenger::Challenger;
+        let split = super::super::ring_switch::deferred_split_n_lo(
+            remaining_coordinates.len(),
+        );
+        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
+            &remaining_coordinates,
+            split,
+        );
+        // State immediately before DirectFold8's sixth bind: five online
+        // binds reduced 64*128 entries to 2*128 entries.
+        let a_state = (0..2 * (1usize << super::super::LOG_PACKING))
+            .map(|_| rng.sample_f128())
+            .collect();
+        let w_state = (0..2 * (1usize << super::super::LOG_PACKING))
+            .map(|_| rng.sample_f128())
+            .collect();
+        super::super::ring_switch::DirectFold8Factors {
+            eq_lo,
+            eq_hi,
+            remaining_coordinates,
+            a_state,
+            w_state,
+            round0: (rng.sample_f128(), rng.sample_f128()),
+        }
+    }
+
+    #[test]
+    fn direct_fold8_deferred_materializer_matches_dense_f_basis_and_message() {
+        use crate::challenger::Challenger;
+        let log_out = 8usize;
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3FE_88A5_15E0_0001);
+        let claims: Vec<_> = (0..2)
+            .map(|_| {
+                let coordinates = (0..log_out).map(|_| rng.sample_f128()).collect();
+                test_post_bind_direct_fold8_claim(&mut rng, coordinates)
+            })
+            .collect();
+        let packed: Vec<F128> = (0..64 * (1usize << log_out))
+            .map(|_| rng.sample_f128())
+            .collect();
+        let challenges: [F128; 6] = std::array::from_fn(|_| rng.sample_f128());
+
+        let (want_f, want_b, want_msg) =
+            materialize_direct_fold8(packed.clone(), Vec::new(), &claims, challenges);
+        let (got_f, got_basis, got_msg) =
+            materialize_direct_fold8_deferred_basis(packed, claims, challenges);
+        assert_eq!(got_f, want_f);
+        assert_eq!(got_msg, want_msg);
+        assert_eq!(got_basis.maps.len(), 2);
+        assert!(got_basis.induced_scale.is_none());
+        assert_eq!(materialize_deferred_direct_fold8_basis(&got_basis), want_b);
+    }
+
+    #[test]
+    fn direct_fold8_map_rebind_matches_dense_lsb_fold_at_edges() {
+        use crate::challenger::Challenger;
+        let log_n = 8usize;
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3FE_88A5_15E0_0002);
+        let generators: Vec<F128> = (0..(1usize << super::super::LOG_PACKING))
+            .map(|_| rng.sample_f128())
+            .collect();
+        let base = super::super::ring_switch::build_direct_fold8_table_from_generators(
+            &generators,
+        );
+        let tail: Vec<F128> = (1..log_n).map(|_| rng.sample_f128()).collect();
+        let random_z = rng.sample_f128();
+        let random_r = rng.sample_f128();
+        for (z, r, label) in [
+            (F128::ZERO, F128::ZERO, "z0-r0"),
+            (F128::ZERO, F128::ONE, "z0-r1"),
+            (F128::ONE, F128::ZERO, "z1-r0"),
+            (F128::ONE, F128::ONE, "z1-r1"),
+            (random_z, random_r, "random"),
+        ] {
+            let mut coordinates = Vec::with_capacity(log_n);
+            coordinates.push(z);
+            coordinates.extend_from_slice(&tail);
+            let split = super::super::ring_switch::deferred_split_n_lo(log_n);
+            let (eq_lo, eq_hi) =
+                super::super::ring_switch::build_eq_split(&coordinates, split);
+            let basis = DeferredDirectFold8Basis {
+                maps: vec![DeferredDirectFold8Map {
+                    table: base.clone(),
+                    remaining_coordinates: coordinates,
+                    eq_lo,
+                    eq_hi,
+                }],
+                induced_scale: None,
+            };
+            let dense = materialize_deferred_direct_fold8_basis(&basis);
+            let mut want = vec![F128::ZERO; dense.len() / 2];
+            crate::field::f128_slice::fold_pairs(&dense, 0, &mut want, r);
+            let rebound = rebind_deferred_direct_fold8_basis_lsb(basis, r);
+            assert_eq!(rebound.maps.len(), 1, "component growth at {label}");
+            assert_eq!(
+                rebound.maps[0].table.len(),
+                super::super::ring_switch::FOLD_TABLE_TOTAL,
+                "map width at {label}"
+            );
+            let got = materialize_deferred_direct_fold8_basis(&rebound);
+            assert_eq!(got, want, "rebind mismatch at {label}");
+            let boundary = rebound.maps[0].eq_lo.len();
+            assert_eq!(got[boundary - 1], want[boundary - 1], "low boundary-1 {label}");
+            assert_eq!(got[boundary], want[boundary], "low boundary {label}");
+        }
+    }
+
+    #[test]
+    fn deferred_direct_fold8_glue_and_first_fold_match_dense_with_pending_ood() {
+        use crate::challenger::Challenger;
+        // half=2^12 reaches the incumbent parallel path where FoldArena is
+        // consulted (the tiny scalar fallback intentionally bypasses it).
+        let log_n = 13usize;
+        let n = 1usize << log_n;
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3FE_88A5_15E0_0003);
+        let maps: Vec<_> = (0..2)
+            .map(|_| {
+                let coordinates = (0..log_n).map(|_| rng.sample_f128()).collect();
+                test_deferred_direct_map(&mut rng, coordinates)
+            })
+            .collect();
+        let basis = DeferredDirectFold8Basis {
+            maps,
+            induced_scale: None,
+        };
+        let direct_dense = materialize_deferred_direct_fold8_basis(&basis);
+        let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+        let induced: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
+        let ood_z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let target = rng.sample_f128();
+        let enforced_sum = rng.sample_f128();
+        let ood_beta = rng.sample_f128();
+        let fold_r = rng.sample_f128();
+        let next_r = rng.sample_f128();
+        let random_alpha = rng.sample_f128();
+        let transcript: [SumcheckMessage; 7] = std::array::from_fn(|_| SumcheckMessage {
+            u_0: rng.sample_f128(),
+            u_2: rng.sample_f128(),
+        });
+
+        for (alpha, ood_z_0, label) in [
+            (F128::ZERO, F128::ZERO, "alpha-zero-ood-z0"),
+            (F128::ONE, F128::ONE, "alpha-one-ood-z1"),
+            (random_alpha, ood_z[0], "alpha-random-ood-random"),
+        ] {
+            let use_arena = label == "alpha-random-ood-random";
+            let mut ood_point = ood_z.clone();
+            ood_point[0] = ood_z_0;
+            let mut dense = SumcheckProver::new_after_direct_fold8(
+                f.clone(),
+                direct_dense.clone(),
+                target,
+                transcript,
+                use_arena.then(|| ready_fold_arena(n)),
+            );
+            let mut deferred = SumcheckProver::new_after_direct_fold8_deferred_basis(
+                f.clone(),
+                basis.clone(),
+                target,
+                transcript,
+                use_arena.then(|| ready_fold_arena(n)),
+            );
+
+            let dense_ood = dense.introduce_new_ood_factorized(&ood_point).unwrap();
+            let deferred_ood = deferred.introduce_new_ood_factorized(&ood_point).unwrap();
+            assert_eq!(deferred_ood, dense_ood, "OOD intro {label}");
+            dense.glue_factorized_ood(ood_beta);
+            deferred.glue_factorized_ood(ood_beta);
+            assert_eq!(deferred.t_r, dense.t_r, "OOD t_r {label}");
+
+            let dense_intro = dense.introduce_new(induced.clone(), enforced_sum);
+            let deferred_intro = deferred.introduce_new(induced.clone(), enforced_sum);
+            assert_eq!(deferred_intro, dense_intro, "ordinary intro {label}");
+            dense.glue(alpha);
+            deferred.glue(alpha);
+            assert_eq!(deferred.t_r, dense.t_r, "ordinary glue t_r {label}");
+            assert_eq!(&*deferred.combined_basis, induced.as_slice());
+            assert!(deferred.deferred_direct_fold8_basis.is_some());
+
+            let dense_msg = dense.fold(fold_r);
+            let deferred_msg = deferred.fold(fold_r);
+            assert_eq!(deferred_msg, dense_msg, "first fold message {label}");
+            assert_eq!(dense.f_is_arena(), use_arena, "dense arena carve {label}");
+            assert_eq!(
+                deferred.f_is_arena(),
+                use_arena,
+                "deferred arena carve {label}"
+            );
+            assert_eq!(&*deferred.f, &*dense.f, "first fold f {label}");
+            assert_eq!(
+                &*deferred.combined_basis,
+                &*dense.combined_basis,
+                "first fold basis {label}"
+            );
+            assert_eq!(deferred.t_r, dense.t_r, "first fold t_r {label}");
+            assert_eq!(deferred.transcript, dense.transcript, "transcript {label}");
+            assert!(deferred.deferred_direct_fold8_basis.is_none());
+            assert!(deferred.pending_ood_eq.is_none());
+
+            let dense_next = dense.fold(next_r);
+            let deferred_next = deferred.fold(next_r);
+            assert_eq!(deferred_next, dense_next, "dense rejoin message {label}");
+            assert_eq!(&*deferred.f, &*dense.f, "dense rejoin f {label}");
+            assert_eq!(
+                &*deferred.combined_basis,
+                &*dense.combined_basis,
+                "dense rejoin basis {label}"
+            );
+            if use_arena {
+                assert!(!dense.f_is_arena(), "dense arena exhausted after first fold");
+                assert!(
+                    !deferred.f_is_arena(),
+                    "deferred arena exhausted after first fold"
+                );
+            }
+            drop(deferred);
+            drop(dense);
+        }
+    }
+
+    #[test]
+    fn deferred_direct_fold8_constructor_drops_safely_before_first_fold() {
+        use crate::challenger::Challenger;
+        let log_n = 8usize;
+        let n = 1usize << log_n;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rng =
+                crate::challenger::RandomChallenger::new(0xD3FE_88A5_15E0_0004);
+            let maps = (0..2)
+                .map(|_| {
+                    let coordinates = (0..log_n).map(|_| rng.sample_f128()).collect();
+                    test_deferred_direct_map(&mut rng, coordinates)
+                })
+                .collect();
+            let basis = DeferredDirectFold8Basis {
+                maps,
+                induced_scale: None,
+            };
+            let f = (0..n).map(|_| rng.sample_f128()).collect();
+            let transcript = std::array::from_fn(|_| SumcheckMessage {
+                u_0: rng.sample_f128(),
+                u_2: rng.sample_f128(),
+            });
+            let prover = SumcheckProver::new_after_direct_fold8_deferred_basis(
+                f,
+                basis,
+                rng.sample_f128(),
+                transcript,
+                Some(ready_fold_arena(n)),
+            );
+            assert!(prover.deferred_direct_fold8_basis.is_some());
+            assert!(prover.combined_basis.is_empty());
+            assert!(!prover.f_is_arena());
+            drop(prover);
+        }));
+        assert!(result.is_ok(), "dropping pre-fold deferred state panicked");
+    }
+
+    #[test]
+    fn direct_fold8_basis_defer_selector_is_strict_and_kill_switch_safe() {
+        let exact = ProverConfig {
+            log_inv_rates: vec![1, 1],
+            recursive_steps: 1,
+            initial_log_msg_cols: 19,
+            initial_log_num_interleaved: 6,
+            initial_k: 6,
+            recursive_log_msg_cols: vec![16],
+            recursive_ks: vec![3],
+            queries: vec![1, 1],
+            grinding_bits: vec![0, 0],
+            fold_grinding_bits: vec![0, 0],
+            ood_samples: vec![0, 1],
+            merkle_hash: Default::default(),
+        };
+        let selected = |config: &ProverConfig,
+                        log_n,
+                        packed_len,
+                        basis_len,
+                        claims,
+                        factors,
+                        platform,
+                        lazy,
+                        disabled| {
+            ranked_direct_fold8_basis_defer_selected(
+                config,
+                log_n,
+                packed_len,
+                basis_len,
+                claims,
+                factors,
+                platform,
+                lazy,
+                disabled,
+            )
+        };
+        assert!(selected(
+            &exact,
+            25,
+            1usize << 25,
+            0,
+            2,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!selected(&exact, 24, 1usize << 25, 0, 2, true, true, true, false));
+        assert!(!selected(&exact, 25, 1usize << 24, 0, 2, true, true, true, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 1, 2, true, true, true, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 0, 1, true, true, true, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 0, 2, false, true, true, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 0, 2, true, false, true, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 0, 2, true, true, false, false));
+        assert!(!selected(&exact, 25, 1usize << 25, 0, 2, true, true, true, true));
+
+        for mutate in [
+            |c: &mut ProverConfig| c.initial_log_msg_cols = 18,
+            |c: &mut ProverConfig| c.initial_log_num_interleaved = 5,
+            |c: &mut ProverConfig| c.initial_k = 5,
+            |c: &mut ProverConfig| c.log_inv_rates[0] = 2,
+            |c: &mut ProverConfig| c.ood_samples[1] = 0,
+            |c: &mut ProverConfig| c.recursive_ks[0] = 0,
+        ] {
+            let mut wrong = exact.clone();
+            mutate(&mut wrong);
+            assert!(!selected(
+                &wrong,
+                25,
+                1usize << 25,
+                0,
+                2,
+                true,
+                true,
+                true,
+                false,
+            ));
+        }
+    }
+
+}
+
+#[inline]
+fn ranked_direct_fold8_basis_defer_enabled_after_shape(
+    config: &ProverConfig,
+    log_n: usize,
+    packed_len: usize,
+    ordinary_basis_len: usize,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    factor_shape_ok: bool,
+) -> bool {
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let platform_supported = direct_fold8_b_gfni_enabled();
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let platform_supported = false;
+    let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
+        config,
+        log_n,
+        log_n.saturating_sub(config.initial_k),
+        config.ood_samples.get(1).copied().unwrap_or(0),
+        packed_len >> config.initial_k,
+        true,
+    );
+    ranked_direct_fold8_basis_defer_selected(
+        config,
+        log_n,
+        packed_len,
+        ordinary_basis_len,
+        claims.len(),
+        factor_shape_ok,
+        platform_supported,
+        lazy_l1_ood,
+        std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD8_B_DEFER").is_some(),
+    )
+}
+
+#[inline]
+fn ranked_direct_fold8_basis_defer_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    packed_len: usize,
+    ordinary_basis_len: usize,
+    claim_count: usize,
+    factor_shape_ok: bool,
+    platform_supported: bool,
+    lazy_l1_ood: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && lazy_l1_ood
+        && !disabled
+        && log_n == 25
+        && packed_len == (1usize << 25)
+        && ordinary_basis_len == 0
+        && claim_count == 2
+        && factor_shape_ok
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.log_inv_rates.first() == Some(&1)
+        && config.ood_samples.get(1) == Some(&1)
+        && config.recursive_ks.first().is_some_and(|&k| k >= 1)
+}
+
 enum PendingOodEq {
     Introduced {
         eq_lo: Vec<F128>,
@@ -5844,6 +6406,261 @@ fn direct_fold8_final_generators(
     let mut generators = vec![F128::ZERO; claim.w_state.len() / 2];
     crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
     generators
+}
+
+/// Compact post-DirectFold8 basis state. `table` encodes one claim's
+/// F2-linear map Phi, while the exact remaining coordinates retain the tensor
+/// argument on which Phi is evaluated. The split factors are compact cached
+/// evaluations used by the block evaluator; they are never inverted to
+/// recover a coordinate.
+#[derive(Clone, Debug)]
+struct DeferredDirectFold8Map {
+    table: Vec<F128>,
+    remaining_coordinates: Vec<F128>,
+    eq_lo: Vec<F128>,
+    eq_hi: Vec<F128>,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredDirectFold8Basis {
+    maps: Vec<DeferredDirectFold8Map>,
+    /// Separation scalar for the L0-induced dense basis retained at glue.
+    /// `None` until that one ordinary introduce/glue pair completes.
+    induced_scale: Option<F128>,
+}
+
+/// Prepared block evaluator shared only by the two new deferred siblings.
+/// The incumbent materializer remains independent, preserving its fallback
+/// code generation and kill-switch oracle.
+struct DeferredDirectFold8Evaluator<'a> {
+    maps: &'a [DeferredDirectFold8Map],
+    gfni_on: bool,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    rows: Vec<(Vec<u64>, Vec<u64>)>,
+}
+
+impl<'a> DeferredDirectFold8Evaluator<'a> {
+    fn new(maps: &'a [DeferredDirectFold8Map]) -> Self {
+        assert!(!maps.is_empty());
+        let block_len = maps[0].eq_lo.len();
+        let out_len = block_len * maps[0].eq_hi.len();
+        assert!(maps.iter().all(|map| {
+            map.eq_lo.len() == block_len && map.eq_lo.len() * map.eq_hi.len() == out_len
+        }));
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let gfni_on = direct_fold8_b_gfni_enabled()
+            && maps.len() == 2
+            && block_len.is_multiple_of(64);
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        let gfni_on = false;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let rows = if gfni_on {
+            maps.iter()
+                .map(|map| {
+                    (
+                        map.eq_lo.iter().map(|x| x.lo).collect(),
+                        map.eq_lo.iter().map(|x| x.hi).collect(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            maps,
+            gfni_on,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            rows,
+        }
+    }
+
+    #[inline]
+    fn block_len(&self) -> usize {
+        self.maps[0].eq_lo.len()
+    }
+
+    #[inline]
+    fn scalar_scratch_len(&self) -> usize {
+        if self.gfni_on {
+            0
+        } else {
+            super::ring_switch::FOLD_TABLE_TOTAL
+        }
+    }
+
+    #[inline]
+    fn gfni_scratch_len(&self) -> usize {
+        if self.gfni_on { 64 } else { 0 }
+    }
+
+    fn evaluate_block(
+        &self,
+        block: usize,
+        out: &mut [F128],
+        scalar_scratch: &mut [F128],
+        _gfni_scratch: &mut [F128],
+    ) {
+        assert_eq!(out.len(), self.block_len());
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if self.gfni_on {
+            use crate::zerocheck::multilinear::kernels::x86_64::{
+                build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+            };
+            let (map0, map1) = (&self.maps[0], &self.maps[1]);
+            let cols0 = super::ring_switch::compose_block_cols(&map0.table, map0.eq_hi[block]);
+            let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+            let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+            let cols1 = super::ring_switch::compose_block_cols(&map1.table, map1.eq_hi[block]);
+            let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+            let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+            let (rows0, rows1) = (&self.rows[0], &self.rows[1]);
+            for slot in (0..out.len()).step_by(64) {
+                // SAFETY: the selector supplies the static features, each
+                // separated row has at least `block_len` u64 values, and every
+                // call owns a complete 64-output batch plus 64-F128 scratch.
+                unsafe {
+                    gfni_fold64_four_maps_staged(
+                        rows0.0.as_ptr().add(slot).cast::<u8>(),
+                        &mats0_lo,
+                        rows0.1.as_ptr().add(slot).cast::<u8>(),
+                        &mats0_hi,
+                        rows1.0.as_ptr().add(slot).cast::<u8>(),
+                        &mats1_lo,
+                        rows1.1.as_ptr().add(slot).cast::<u8>(),
+                        &mats1_hi,
+                        out.as_mut_ptr().add(slot),
+                        _gfni_scratch.as_mut_ptr().cast(),
+                    );
+                }
+            }
+            return;
+        }
+
+        assert_eq!(scalar_scratch.len(), super::ring_switch::FOLD_TABLE_TOTAL);
+        let (first, rest) = self.maps.split_first().unwrap();
+        super::ring_switch::compose_block_table(
+            &first.table,
+            first.eq_hi[block],
+            scalar_scratch,
+        );
+        for (slot, value) in out.iter_mut().enumerate() {
+            *value = super::ring_switch::fold_one_slot(first.eq_lo[slot], scalar_scratch);
+        }
+        for map in rest {
+            super::ring_switch::compose_block_table(
+                &map.table,
+                map.eq_hi[block],
+                scalar_scratch,
+            );
+            for (slot, value) in out.iter_mut().enumerate() {
+                *value += super::ring_switch::fold_one_slot(map.eq_lo[slot], scalar_scratch);
+            }
+        }
+    }
+}
+
+/// Bind the next equality coordinate into an F2-linear Direct map. Phi is not
+/// F128-linear, so neither `(1+z)` nor `z` may be pulled through it. Instead
+/// compose both input scalings column-by-column, then apply the fold weights
+/// to their output columns:
+/// `Phi'(x) = (1+r)Phi((1+z)x) + r Phi(zx)`.
+fn rebind_direct_fold8_map_lsb(base: &[F128], z: F128, r: F128) -> Vec<F128> {
+    let even = super::ring_switch::compose_block_cols(base, F128::ONE + z);
+    let odd = super::ring_switch::compose_block_cols(base, z);
+    let even_weight = F128::ONE + r;
+    let generators: [F128; 128] =
+        std::array::from_fn(|i| even_weight * even[i] + r * odd[i]);
+    super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+}
+
+fn rebind_deferred_direct_fold8_basis_lsb(
+    basis: DeferredDirectFold8Basis,
+    r: F128,
+) -> DeferredDirectFold8Basis {
+    let maps = basis
+        .maps
+        .into_iter()
+        .map(|map| {
+            let (&z, remaining) = map
+                .remaining_coordinates
+                .split_first()
+                .expect("deferred DirectFold8 map must retain the next coordinate");
+            let remaining_coordinates = remaining.to_vec();
+            let split = super::ring_switch::deferred_split_n_lo(remaining_coordinates.len());
+            let (eq_lo, eq_hi) =
+                super::ring_switch::build_eq_split(&remaining_coordinates, split);
+            DeferredDirectFold8Map {
+                table: rebind_direct_fold8_map_lsb(&map.table, z, r),
+                remaining_coordinates,
+                eq_lo,
+                eq_hi,
+            }
+        })
+        .collect();
+    DeferredDirectFold8Basis {
+        maps,
+        induced_scale: basis.induced_scale,
+    }
+}
+
+#[cfg(test)]
+fn materialize_deferred_direct_fold8_basis(basis: &DeferredDirectFold8Basis) -> Vec<F128> {
+    use rayon::prelude::*;
+    let evaluator = DeferredDirectFold8Evaluator::new(&basis.maps);
+    let block_len = evaluator.block_len();
+    let out_len = block_len * basis.maps[0].eq_hi.len();
+    let mut out = vec![F128::ZERO; out_len];
+    out.par_chunks_mut(block_len)
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    crate::scratch::LocalBuf::new(evaluator.scalar_scratch_len(), true),
+                    crate::scratch::LocalBuf::new(evaluator.gfni_scratch_len(), true),
+                )
+            },
+            |(scalar_scratch, gfni_scratch), (block, out)| {
+                evaluator.evaluate_block(block, out, scalar_scratch, gfni_scratch);
+            },
+        )
+        .for_each(drop);
+    out
 }
 
 #[cfg(all(
@@ -6114,6 +6931,253 @@ fn materialize_direct_fold8(
     )
 }
 
+/// One-fold DirectFold8 sibling: materialize `f8` and compute M6 while each
+/// Direct basis block is hot, but never allocate or publish the N-sized `b8`.
+/// The compact maps and exact remaining coordinates survive until the first
+/// recursive fold, where the basis rejoins the dense incumbent path at N/2.
+fn materialize_direct_fold8_deferred_basis(
+    packed_witness: Vec<F128>,
+    claims: Vec<super::ring_switch::DirectFold8Factors>,
+    challenges: [F128; 6],
+) -> (Vec<F128>, DeferredDirectFold8Basis, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    #[cfg(test)]
+    direct_fold8_basis_defer_test_trace_bump(1);
+    assert_eq!(claims.len(), 2, "deferred DirectFold8 requires exactly two maps");
+    assert!(packed_witness.len().is_multiple_of(64));
+    let [_, _, _, _, r4, r5] = challenges;
+    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
+        let mut weight = F128::ONE;
+        for (bit, &challenge) in challenges[..4].iter().enumerate() {
+            weight *= if (bank >> bit) & 1 == 0 {
+                F128::ONE + challenge
+            } else {
+                challenge
+            };
+        }
+        weight
+    });
+    let direct_tables: Vec<Vec<F128>> = claims
+        .par_iter()
+        .map(|claim| {
+            let generators = direct_fold8_final_generators(claim, challenges[5]);
+            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+        })
+        .collect();
+    let maps: Vec<DeferredDirectFold8Map> = claims
+        .into_iter()
+        .zip(direct_tables)
+        .map(|(claim, table)| DeferredDirectFold8Map {
+            table,
+            remaining_coordinates: claim.remaining_coordinates,
+            eq_lo: claim.eq_lo,
+            eq_hi: claim.eq_hi,
+        })
+        .collect();
+    let evaluator = DeferredDirectFold8Evaluator::new(&maps);
+    let block_len = evaluator.block_len();
+    let out_len = packed_witness.len() / 64;
+    assert_eq!(out_len, block_len * maps[0].eq_hi.len());
+
+    let mut folded_f = crate::scratch::take_f128(out_len);
+    const SUB: usize = 256;
+    let stats = folded_f
+        .par_chunks_mut(block_len)
+        .enumerate()
+        .map_init(
+            || {
+                let pooled = crate::scratch::fold_buf_pool_enabled();
+                (
+                    crate::scratch::LocalBuf::new(evaluator.scalar_scratch_len(), pooled),
+                    crate::scratch::LocalBuf::new(4 * SUB, pooled),
+                    crate::scratch::LocalBuf::new(block_len, pooled),
+                    crate::scratch::LocalBuf::new(evaluator.gfni_scratch_len(), pooled),
+                )
+            },
+            |(scalar_scratch, mid4, b_block, gfni_scratch), (block, f_out)| {
+                let start = 64 * block * block_len;
+                let f_in = &packed_witness[start..start + 64 * block_len];
+                let mut slot = 0usize;
+                while slot < block_len {
+                    let n = SUB.min(block_len - slot);
+                    let m4 = &mut mid4[..4 * n];
+                    crate::field::f128_slice::fold16_banked(
+                        &f_in[64 * slot..64 * (slot + n)],
+                        m4,
+                        &fold16_weight,
+                    );
+                    crate::field::f128_slice::fold4_nested(
+                        m4,
+                        &mut f_out[slot..slot + n],
+                        r4,
+                        r5,
+                    );
+                    slot += n;
+                }
+                evaluator.evaluate_block(
+                    block,
+                    &mut b_block[..block_len],
+                    scalar_scratch,
+                    gfni_scratch,
+                );
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: features cfg-guaranteed and both slices have the
+                    // same even power-of-two block length.
+                    unsafe { msg_reduce_avx512(f_out, &b_block[..block_len]) }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    super::round0_scalar(f_out, &b_block[..block_len])
+                }
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+    crate::scratch::give_f128(packed_witness);
+    (
+        folded_f,
+        DeferredDirectFold8Basis {
+            maps,
+            induced_scale: None,
+        },
+        SumcheckMessage {
+            u_0: stats.0,
+            u_2: stats.1,
+        },
+    )
+}
+
+/// First-and-only fold of the deferred basis. Rebind both Direct maps, fold
+/// and scale the retained L0-induced dense basis, inject the already-glued
+/// factorized L1 OOD correction, and emit `(nf, nb, next-fold message)` in one N/2 output
+/// pass. The returned basis is ordinary dense storage; no deferred component
+/// survives this function.
+fn fold_deferred_direct_fold8_basis_and_msg(
+    f: &[F128],
+    induced_basis: &[F128],
+    basis: DeferredDirectFold8Basis,
+    r: F128,
+    arena: Option<&mut FoldArena>,
+    pending_ood: Option<PendingOodEq>,
+) -> (FoldBuf, FoldBuf, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    #[cfg(test)]
+    direct_fold8_basis_defer_test_trace_bump(3);
+    assert_eq!(f.len(), induced_basis.len());
+    assert!(f.len().is_power_of_two() && f.len() >= 2);
+    let induced_scale = basis
+        .induced_scale
+        .expect("deferred DirectFold8 fold before ordinary glue");
+    let rebound = rebind_deferred_direct_fold8_basis_lsb(basis, r);
+    let evaluator = DeferredDirectFold8Evaluator::new(&rebound.maps);
+    let half = f.len() / 2;
+    let block_len = evaluator.block_len();
+    assert_eq!(half, block_len * rebound.maps[0].eq_hi.len());
+
+    let pending_ood = match pending_ood {
+        Some(PendingOodEq::Glued {
+            eq_lo,
+            eq_hi,
+            z_0,
+            beta,
+        }) => {
+            assert_eq!(half, eq_lo.len() * eq_hi.len());
+            assert!(eq_lo.len().is_multiple_of(block_len));
+            Some((eq_lo, eq_hi, beta * (F128::ONE + z_0 + r)))
+        }
+        Some(PendingOodEq::Introduced { .. }) => {
+            panic!("deferred DirectFold8 fold before factorized OOD glue")
+        }
+        None => None,
+    };
+
+    let (mut nf, mut nb) = match arena.and_then(|a| a.carve_pair(half)) {
+        Some(pair) => pair,
+        None => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (
+                    FoldBuf::Owned(crate::scratch::take_f128(half)),
+                    FoldBuf::Owned(crate::scratch::take_f128(half)),
+                )
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                (
+                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
+                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
+                )
+            }
+        }
+    };
+    let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
+    let (u_0, u_2) = nf_s
+        .par_chunks_mut(block_len)
+        .zip(nb_s.par_chunks_mut(block_len))
+        .enumerate()
+        .map_init(
+            || {
+                let pooled = crate::scratch::fold_buf_pool_enabled();
+                (
+                    crate::scratch::LocalBuf::new(evaluator.scalar_scratch_len(), pooled),
+                    crate::scratch::LocalBuf::new(block_len, pooled),
+                    crate::scratch::LocalBuf::new(evaluator.gfni_scratch_len(), pooled),
+                )
+            },
+            |(scalar_scratch, induced_fold, gfni_scratch), (block, (f_out, b_out))| {
+                let base = block * block_len;
+                crate::field::f128_slice::fold_pairs(f, base, f_out, r);
+                evaluator.evaluate_block(
+                    block,
+                    b_out,
+                    scalar_scratch,
+                    gfni_scratch,
+                );
+                crate::field::f128_slice::fold_pairs(
+                    induced_basis,
+                    base,
+                    &mut induced_fold[..block_len],
+                    r,
+                );
+                crate::field::f128_slice::add_scaled(
+                    b_out,
+                    &induced_fold[..block_len],
+                    induced_scale,
+                );
+                if let Some((eq_lo, eq_hi, gamma)) = pending_ood.as_ref() {
+                    let low_chunks = eq_lo.len() / block_len;
+                    let low_chunk = block % low_chunks;
+                    let high = block / low_chunks;
+                    let lo_start = low_chunk * block_len;
+                    crate::field::f128_slice::add_scaled(
+                        b_out,
+                        &eq_lo[lo_start..lo_start + block_len],
+                        *gamma * eq_hi[high],
+                    );
+                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: features cfg-guaranteed; equal even chunks.
+                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    super::round0_scalar(f_out, b_out)
+                }
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+        );
+    (nf, nb, SumcheckMessage { u_0, u_2 })
+}
+
 pub struct SumcheckProver {
     f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -6132,6 +7196,10 @@ pub struct SumcheckProver {
     /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
     /// next fold consumes its glued correction.
     pending_ood_eq: Option<PendingOodEq>,
+    /// Present only between DirectFold8's sixth bind and the first recursive
+    /// fold on the exact ranked selector. Once consumed, all later rounds use
+    /// `combined_basis` exactly like the incumbent.
+    deferred_direct_fold8_basis: Option<DeferredDirectFold8Basis>,
 }
 
 impl SumcheckProver {
@@ -6145,6 +7213,7 @@ impl SumcheckProver {
             transcript: Vec::new(),
             pending_glue: None,
             pending_ood_eq: None,
+            deferred_direct_fold8_basis: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -6182,6 +7251,7 @@ impl SumcheckProver {
             transcript: Vec::new(),
             pending_glue: None,
             pending_ood_eq: None,
+            deferred_direct_fold8_basis: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
@@ -6203,6 +7273,7 @@ impl SumcheckProver {
             transcript: transcript.to_vec(),
             pending_glue: None,
             pending_ood_eq: None,
+            deferred_direct_fold8_basis: None,
         }
     }
 
@@ -6222,6 +7293,7 @@ impl SumcheckProver {
             transcript: transcript.to_vec(),
             pending_glue: None,
             pending_ood_eq: None,
+            deferred_direct_fold8_basis: None,
         }
     }
 
@@ -6241,6 +7313,34 @@ impl SumcheckProver {
             transcript: transcript.to_vec(),
             pending_glue: None,
             pending_ood_eq: None,
+            deferred_direct_fold8_basis: None,
+        }
+    }
+
+    fn new_after_direct_fold8_deferred_basis(
+        f: Vec<F128>,
+        basis: DeferredDirectFold8Basis,
+        target: F128,
+        transcript: [SumcheckMessage; 7],
+        fold_arena: Option<FoldArena>,
+    ) -> Self {
+        assert_eq!(
+            f.len(),
+            basis.maps[0].eq_lo.len() * basis.maps[0].eq_hi.len()
+        );
+        assert!(basis.maps.iter().all(|map| {
+            map.remaining_coordinates.len() == f.len().trailing_zeros() as usize
+                && map.eq_lo.len() * map.eq_hi.len() == f.len()
+        }));
+        Self {
+            f: FoldBuf::Owned(f),
+            combined_basis: FoldBuf::Owned(Vec::new()),
+            fold_arena,
+            t_r: target,
+            transcript: transcript.to_vec(),
+            pending_glue: None,
+            pending_ood_eq: None,
+            deferred_direct_fold8_basis: Some(basis),
         }
     }
 
@@ -6250,33 +7350,45 @@ impl SumcheckProver {
         // [`fold_and_msg_lsb`].
         assert!(self.pending_glue.is_none(), "fold before ordinary glue");
         let pending_ood = self.pending_ood_eq.take();
-        let (nf, nb, msg) = match pending_ood {
-            Some(PendingOodEq::Glued {
-                eq_lo,
-                eq_hi,
-                z_0,
-                beta,
-            }) => {
-                // Folding eq([z0, z_tail], ·) at LSB challenge r leaves
-                // (1 + z0 + r) * eq(z_tail, ·) in characteristic two.
-                let gamma = beta * (F128::ONE + z_0 + r);
-                fold_and_msg_lsb_inner(
+        let deferred_basis = self.deferred_direct_fold8_basis.take();
+        let (nf, nb, msg) = if let Some(basis) = deferred_basis {
+            fold_deferred_direct_fold8_basis_and_msg(
+                &self.f,
+                &self.combined_basis,
+                basis,
+                r,
+                self.fold_arena.as_mut(),
+                pending_ood,
+            )
+        } else {
+            match pending_ood {
+                Some(PendingOodEq::Glued {
+                    eq_lo,
+                    eq_hi,
+                    z_0,
+                    beta,
+                }) => {
+                    // Folding eq([z0, z_tail], ·) at LSB challenge r leaves
+                    // (1 + z0 + r) * eq(z_tail, ·) in characteristic two.
+                    let gamma = beta * (F128::ONE + z_0 + r);
+                    fold_and_msg_lsb_inner(
+                        &self.f,
+                        &self.combined_basis,
+                        r,
+                        self.fold_arena.as_mut(),
+                        Some((&eq_lo, &eq_hi, gamma)),
+                    )
+                }
+                Some(PendingOodEq::Introduced { .. }) => {
+                    panic!("fold before factorized OOD glue")
+                }
+                None => fold_and_msg_lsb(
                     &self.f,
                     &self.combined_basis,
                     r,
                     self.fold_arena.as_mut(),
-                    Some((&eq_lo, &eq_hi, gamma)),
-                )
+                ),
             }
-            Some(PendingOodEq::Introduced { .. }) => {
-                panic!("fold before factorized OOD glue")
-            }
-            None => fold_and_msg_lsb(
-                &self.f,
-                &self.combined_basis,
-                r,
-                self.fold_arena.as_mut(),
-            ),
         };
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
         // pool (same ownership as the Drop impl) so the next round's
@@ -6394,6 +7506,21 @@ impl SumcheckProver {
             .pending_glue
             .take()
             .expect("glue without introduce_new");
+        if let Some(deferred) = self.deferred_direct_fold8_basis.as_mut() {
+            #[cfg(test)]
+            direct_fold8_basis_defer_test_trace_bump(2);
+            assert!(
+                matches!(self.pending_ood_eq, Some(PendingOodEq::Glued { .. })),
+                "deferred DirectFold8 ordinary glue requires factorized L1 OOD"
+            );
+            assert!(self.combined_basis.is_empty());
+            assert!(deferred.induced_scale.is_none());
+            assert_eq!(b_new.len(), self.f.len());
+            self.combined_basis = FoldBuf::Owned(b_new);
+            deferred.induced_scale = Some(alpha);
+            self.t_r += alpha * h_new;
+            return;
+        }
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -7019,6 +8146,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let direct_fold4_mode = direct_fold4.is_some();
     let direct_fold8_mode = direct_fold8.is_some();
     let direct_mode = direct_fold2.is_some() || direct_fold4_mode || direct_fold8_mode;
+    let defer_direct_fold8_basis = direct_fold8.as_ref().is_some_and(|claims| {
+        ranked_direct_fold8_basis_defer_enabled(
+            config,
+            log_n,
+            packed_witness.len(),
+            b_initial.len(),
+            claims,
+        )
+    });
     if direct_fold8_mode {
         assert_eq!(initial_k, 6, "direct fold8 needs six initial rounds");
     } else if direct_fold4_mode {
@@ -7095,19 +8231,46 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     r,
                 )
             } else {
-                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                let challenges = [
+                    fold4_challenges[0],
+                    fold4_challenges[1],
+                    fold4_challenges[2],
+                    fold4_challenges[3],
+                    fold4_challenges[4],
+                    r,
+                ];
+                if defer_direct_fold8_basis {
+                    let ordinary = b_initial.take().unwrap();
+                    assert!(ordinary.is_empty());
+                    let (f8, deferred_basis, msg) =
+                        materialize_direct_fold8_deferred_basis(
+                            packed_witness.take().unwrap(),
+                            direct,
+                            challenges,
+                        );
+                    sc_prover = Some(SumcheckProver::new_after_direct_fold8_deferred_basis(
+                        f8,
+                        deferred_basis,
+                        target,
+                        [
+                            start_msg,
+                            fold4_msgs[0],
+                            fold4_msgs[1],
+                            fold4_msgs[2],
+                            fold4_msgs[3],
+                            fold4_msgs[4],
+                            msg,
+                        ],
+                        fold_arena.take(),
+                    ));
+                    msg
+                } else {
                     let (f8, b8, msg) = materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
                         &direct,
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            fold4_challenges[3],
-                            fold4_challenges[4],
-                            r,
-                        ],
+                        challenges,
                     );
                     sc_prover = Some(SumcheckProver::new_after_direct_fold8(
                         f8,
@@ -7125,6 +8288,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         fold_arena.take(),
                     ));
                     msg
+                }
             };
             fold4_challenges.push(r);
             fold4_msgs.push(msg);
@@ -11962,7 +13126,7 @@ mod tests {
         let log_n = 12;
         let initial_k = 6;
         let k_0 = 2;
-        let log_inv_rate = 3;
+        let log_inv_rate = 1;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
@@ -12018,15 +13182,29 @@ mod tests {
         }
         let (eq_lo, eq_hi) =
             super::super::ring_switch::build_eq_split(&suffix[6..], (log_n - 6) / 2);
-        let direct = vec![super::super::ring_switch::DirectFold8Factors {
+        let mut direct = vec![super::super::ring_switch::DirectFold8Factors {
             eq_lo,
             eq_hi,
+            remaining_coordinates: suffix[6..].to_vec(),
             a_state,
             w_state,
             round0,
         }];
+        // The ranked selector has exactly two claims. A zero second map keeps
+        // this compact oracle's dense basis and all transcript messages
+        // unchanged while exercising the exact two-map production sequence.
+        let first = direct[0].clone();
+        direct.push(super::super::ring_switch::DirectFold8Factors {
+            eq_lo: first.eq_lo,
+            eq_hi: first.eq_hi,
+            remaining_coordinates: first.remaining_coordinates,
+            a_state: first.a_state,
+            w_state: vec![F128::ZERO; first.w_state.len()],
+            round0: (F128::ZERO, F128::ZERO),
+        });
 
         let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+        let queries = vec![4; log_inv_rates.len()];
         let cfg = ProverConfig {
             log_inv_rates: log_inv_rates.clone(),
             recursive_steps: 1,
@@ -12035,10 +13213,10 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            queries: queries.clone(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
+            ood_samples: vec![0, 1],
             merkle_hash: Default::default(),
         };
         let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
@@ -12064,8 +13242,27 @@ mod tests {
             None,
             &mut ordinary_challenger,
         );
+        // Force-off is the kill-switch oracle: on this non-SPR host the
+        // strict selector retains the incumbent materialized DirectFold8
+        // sequence and must produce the ordinary proof byte-for-byte.
+        let mut fallback_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let fallback = recursive_prover_with_basis_direct_fold8(
+            &cfg,
+            poly.clone(),
+            Vec::new(),
+            direct.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            round0,
+            None,
+            &mut fallback_challenger,
+        );
+        assert_eq!(fallback, ordinary, "force-off incumbent proof oracle");
         let mut direct_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        direct_fold8_basis_defer_test_set_force(true);
         let got = recursive_prover_with_basis_direct_fold8(
             &cfg,
             poly,
@@ -12078,11 +13275,22 @@ mod tests {
             None,
             &mut direct_challenger,
         );
+        direct_fold8_basis_defer_test_set_force(false);
+        assert_eq!(
+            direct_fold8_basis_defer_test_trace(),
+            [1, 1, 1, 1],
+            "selector/materializer/glue/first-fold production sequence"
+        );
 
         assert_eq!(got, ordinary);
         assert_eq!(
             bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
-            bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
+            bincode::serialize(&(ordinary.clone(), target))
+                .expect("serialize ordinary proof/claim"),
+        );
+        assert_eq!(
+            bincode::serialize(&(fallback, target)).expect("serialize fallback proof/claim"),
+            bincode::serialize(&(ordinary, target)).expect("serialize ordinary fallback oracle"),
         );
 
         let v_cfg = VerifierConfig {
@@ -12093,10 +13301,10 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            queries,
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
+            ood_samples: vec![0, 1],
             merkle_hash: Default::default(),
         };
         let mut verifier_challenger =
@@ -12108,6 +13316,19 @@ mod tests {
             target,
             &wtns_0.root(),
             &mut verifier_challenger,
+        ));
+
+        let mut mutated = got.clone();
+        mutated.ood_values[0] += F128::ONE;
+        let mut mutation_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        assert!(!recursive_verifier_with_basis(
+            &v_cfg,
+            &mutated,
+            &combined_basis,
+            target,
+            &wtns_0.root(),
+            &mut mutation_challenger,
         ));
     }
 
