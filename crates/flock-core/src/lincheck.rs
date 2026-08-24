@@ -942,6 +942,16 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GATHER_FOLD=1` restores the outlined gather4 store into a
+/// stride-128 `u8` bounce plus a separate `gfni_fold_tile` reload. Default
+/// (ranked sandbox never sets it) runs both in one `#[target_feature]` body.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_gather_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_FOLD").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
@@ -1101,6 +1111,8 @@ fn fold_block_major_gfni(
             };
             #[cfg(target_feature = "avx512vbmi")]
             let pf_spread = lc_zfold_pf_spread_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather_fold = gather_tr_fused && lc_gather4_enabled() && lc_gather_fold_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1173,6 +1185,9 @@ fn fold_block_major_gfni(
                                     }
                                 }
                             }
+                            if gather_fold {
+                                continue;
+                            }
                             // SAFETY: rows (outer_base + r) * chunks_per_block
                             // + q + c for c in 0..4 are the indices four
                             // single gathers would read; each column slab is
@@ -1183,6 +1198,23 @@ fn fold_block_major_gfni(
                                     chunks_per_block,
                                     transposed.as_mut_ptr().add(t * 128),
                                     1024,
+                                );
+                            }
+                        }
+                        if gather_fold {
+                            // SAFETY: the eight-stripe, four-column rectangle
+                            // starting at stripe_base / q is the same set of
+                            // F128s eight gather4 calls would read; planes
+                            // cover 4 columns × 2 × 1024 bytes.
+                            unsafe {
+                                kernels::gather4_fold_tile(
+                                    z_packed.as_ptr().add(
+                                        8 * stripe_base * chunks_per_block + q,
+                                    ),
+                                    chunks_per_block,
+                                    &mats,
+                                    wplanes.as_mut_ptr().add(2 * q * 1024),
+                                    first_tile,
                                 );
                             }
                         }
@@ -1212,6 +1244,9 @@ fn fold_block_major_gfni(
                                         }
                                     }
                                 }
+                            }
+                            if gather_fold {
+                                continue;
                             }
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
