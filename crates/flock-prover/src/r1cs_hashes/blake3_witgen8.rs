@@ -339,7 +339,11 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
     {
         // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
         // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
@@ -353,7 +357,11 @@ fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
             _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    )))]
     unsafe {
         let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
         _mm256_or_si256(_mm256_slli_epi32::<N>(b), _mm256_and_si256(a, mask))
@@ -731,15 +739,24 @@ fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
 
 /// Rotate-right by N on AVX-512 (single `vprold`, EVEX.256) -- three ops on
 /// AVX2. Bit-identical either way; the witness phase is ALU-bound so the
-/// uop cut matters on the ranked runner. The EVEX form needs `avx512f`.
+/// uop cut matters on the ranked runner. The EVEX.256 form needs `avx512f`
+/// and `avx512vl`.
 #[inline(always)]
 fn ror_v8<const N: i32>(v: V8) -> V8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
     {
         // SAFETY: target feature checked at compile time.
         unsafe { _mm256_ror_epi32::<N>(v) }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    )))]
     {
         // N is a monomorphized literal (16/12/8/7 in the G-functions), so the
         // match folds to the single shift+or pair at compile time.
@@ -794,6 +811,20 @@ fn spread_nt_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
     *ON
+}
+
+/// W16 is deliberately narrower than the general W8 contract: the ranked
+/// path uses wide/spread publication, while either drain kill-switch is an
+/// oracle/diagnostic shape that must remain on W8. The dedicated W16 switch
+/// gives same-binary rollback without changing any incumbent toggle.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512vl",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2"
+))]
+pub(crate) fn w16_ranked_drain_enabled() -> bool {
+    wide_nt_enabled() && spread_nt_enabled() && std::env::var_os("FLOCK_NO_WITGEN_W16").is_none()
 }
 
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
@@ -1815,6 +1846,27 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     }
 }
 
+// Keep the W16 arithmetic in a separate source unit while letting it reuse
+// this module's proven W8 drain/projection contract. Its release entrypoint is
+// Closed-only; the child can see the private ring/drain machinery, while
+// callers only see the narrow W16 entrypoint.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512vl",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2"
+))]
+#[path = "blake3_witgen16.rs"]
+mod w16;
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512vl",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2"
+))]
+pub(crate) use w16::{HexaInputs, build_hexa_witness_ab_stream_elide};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2033,6 +2085,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The W16 arithmetic/pipeline boundary is byte-identical to two incumbent
+    /// W8 calls. Closed input exercises the exact live generator and streaming
+    /// projection; slice input exercises arbitrary counters/flags and the
+    /// W16 block gather. This is SPR-only by construction.
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    ))]
+    #[test]
+    fn w16_matches_w8x2_closed_stream_and_slice() {
+        const N: usize = 16;
+        const WORDS: usize = N * U32_PER_BLOCK;
+        const AB_BYTES: usize = N * BYTES_PER_BLOCK;
+
+        #[repr(align(64))]
+        struct Stage([u32; STREAM_STAGE_WORDS]);
+
+        unsafe fn run_closed_w8x2(
+            init: u64,
+            base: usize,
+            inv_table: &InvNttTableByteSingleGf8,
+        ) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u8>) {
+            unsafe {
+                let mut z = vec![0xA5A5_5A5A; WORDS];
+                let mut a = vec![0x5A5A_A5A5; WORDS];
+                let mut b = vec![0xC3C3_3C3C; WORDS];
+                let mut ab = vec![0x96; AB_BYTES];
+                let plan =
+                    flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                        inv_table, &ab, false,
+                    );
+                let mut stage = Stage([0; STREAM_STAGE_WORDS]);
+                for half in 0..2 {
+                    build_octa_witness_ab_stream_elide(
+                        OctaInputs::Closed {
+                            init,
+                            base: base + 8 * half,
+                        },
+                        z.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                        a.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                        b.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                        None,
+                        Some(StreamProj {
+                            stage: stage.0.as_mut_ptr(),
+                            out: ab.as_mut_ptr().add(half * 8 * BYTES_PER_BLOCK),
+                            live: 0xFF,
+                            inv_table,
+                            plan,
+                        }),
+                        [false; 3],
+                        false,
+                    );
+                }
+                _mm_sfence();
+                (z, a, b, ab)
+            }
+        }
+
+        unsafe fn run_closed_w16(
+            init: u64,
+            base: usize,
+            inv_table: &InvNttTableByteSingleGf8,
+        ) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u8>) {
+            unsafe {
+                let mut z = vec![0xA5A5_5A5A; WORDS];
+                let mut a = vec![0x5A5A_A5A5; WORDS];
+                let mut b = vec![0xC3C3_3C3C; WORDS];
+                let mut ab = vec![0x96; AB_BYTES];
+                let plan =
+                    flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                        inv_table, &ab, false,
+                    );
+                let mut stage = Stage([0; STREAM_STAGE_WORDS]);
+                let projs = std::array::from_fn(|half| {
+                    Some(StreamProj {
+                        stage: stage.0.as_mut_ptr(),
+                        out: ab.as_mut_ptr().add(half * 8 * BYTES_PER_BLOCK),
+                        live: 0xFF,
+                        inv_table,
+                        plan,
+                    })
+                });
+                build_hexa_witness_ab_stream_elide(
+                    HexaInputs::closed(init, base),
+                    z.as_mut_ptr(),
+                    a.as_mut_ptr(),
+                    b.as_mut_ptr(),
+                    projs,
+                    [false; 3],
+                    false,
+                );
+                _mm_sfence();
+                (z, a, b, ab)
+            }
+        }
+
+        let ntt_s =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let init = 0x0123_4567_89AB_CDEF;
+        let base = 37;
+        let w8 = unsafe { run_closed_w8x2(init, base, &inv_table) };
+        let w16 = unsafe { run_closed_w16(init, base, &inv_table) };
+        assert_eq!(w16, w8, "closed z/a/b/StreamProj bytes differ");
+
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as u32
+        };
+        let blocks: [Compression; N] = std::array::from_fn(|j| {
+            let cv = std::array::from_fn(|_| next());
+            let message = std::array::from_fn(|_| next());
+            let counter = (u64::from(next()) << 32) | u64::from(next());
+            (cv, message, counter, 1 + j as u32, next())
+        });
+        let mut z8 = vec![0xDEAD_BEEF; WORDS];
+        let mut a8 = vec![0xDEAD_BEEF; WORDS];
+        let mut b8 = vec![0xDEAD_BEEF; WORDS];
+        unsafe {
+            for half in 0..2 {
+                build_octa_witness_ab_stream_elide(
+                    OctaInputs::Blocks(std::array::from_fn(|j| &blocks[half * 8 + j])),
+                    z8.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                    a8.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                    b8.as_mut_ptr().add(half * 8 * U32_PER_BLOCK),
+                    None,
+                    None,
+                    [false; 3],
+                    false,
+                );
+            }
+        }
+        let mut z16 = vec![0xDEAD_BEEF; WORDS];
+        let mut a16 = vec![0xDEAD_BEEF; WORDS];
+        let mut b16 = vec![0xDEAD_BEEF; WORDS];
+        unsafe {
+            build_hexa_witness_ab_stream_elide(
+                HexaInputs::Blocks(std::array::from_fn(|j| &blocks[j])),
+                z16.as_mut_ptr(),
+                a16.as_mut_ptr(),
+                b16.as_mut_ptr(),
+                [None, None],
+                [false; 3],
+                false,
+            );
+        }
+        assert_eq!(z16, z8, "slice z differs");
+        assert_eq!(a16, a8, "slice a differs");
+        assert_eq!(b16, b8, "slice b differs");
     }
 
     /// Independent algebra/codegen oracle for the production Z derivation.

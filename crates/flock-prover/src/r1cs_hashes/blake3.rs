@@ -1674,6 +1674,52 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
 
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    )
+))]
+const WITGEN_W16_RANKED_BLOCKS: usize = 1 << 18;
+
+/// Pure shape half of the W16 dispatch gate. Keeping it feature-independent
+/// lets portable tests prove that slices, ragged groups, and every restored
+/// publication mode stay on the incumbent W8 path.
+#[inline(always)]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    )
+))]
+fn witgen_w16_ranked_shape(
+    closed_len: Option<usize>,
+    n_total: usize,
+    n_here: usize,
+    ab_nt: bool,
+    ab_stream: bool,
+    abinner_nt: bool,
+    z_nt: bool,
+    ranked_drain: bool,
+) -> bool {
+    closed_len == Some(WITGEN_W16_RANKED_BLOCKS)
+        && n_total == WITGEN_W16_RANKED_BLOCKS
+        && n_here == 16
+        && ab_nt
+        && ab_stream
+        && abinner_nt
+        && z_nt
+        && ranked_drain
+}
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
@@ -1735,6 +1781,46 @@ fn generate_round1_inner_octa(
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     let win_plan = flock_core::zerocheck::univariate_skip_optimized::
         prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    ))]
+    let closed_len = match blocks {
+        crate::seed_pipe::BlockSource::Closed { len, .. } => Some(len),
+        crate::seed_pipe::BlockSource::Slice(_) => None,
+    };
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    ))]
+    let total_blocks = z.len() / F128_PER_BLOCK;
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    ))]
+    let ranked_drain = blake3_witgen8::w16_ranked_drain_enabled();
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi2"
+    ))]
+    let ranked_w16 = witgen_w16_ranked_shape(
+        closed_len,
+        total_blocks,
+        16,
+        ab_nt,
+        ab_stream,
+        abinner_nt,
+        z_nt,
+        ranked_drain,
+    );
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -1766,6 +1852,13 @@ fn generate_round1_inner_octa(
             },
             |win, (g, (((z_out, a_out), b_out), ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
+                #[cfg(all(
+                    target_feature = "avx512f",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512dq",
+                    target_feature = "avx512vbmi2"
+                ))]
+                let use_w16 = ranked_w16 && n_here == 16;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
@@ -1790,92 +1883,148 @@ fn generate_round1_inner_octa(
                 // token-verified constant chunks of a/b/z; the windows are
                 // always written in full.
                 unsafe {
-                    for half in 0..(n_here / SIMD) {
-                        let base = GROUP * g + half * SIMD;
-                        // Lead 2: a full closed-form octa carries only init/base
-                        // into the witness kernel, which generates all 25 draws
-                        // directly in word-major SIMD lanes. Slice input still
-                        // borrows in place; only a ragged closed octa uses the
-                        // scalar staging needed to preserve padding semantics.
-                        let staged: [Compression; SIMD];
-                        let octa = match blocks {
-                            crate::seed_pipe::BlockSource::Slice(s) => {
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    s.get(base + j).unwrap_or(padding)
-                                }))
+                    #[cfg(all(
+                        target_feature = "avx512f",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512dq",
+                        target_feature = "avx512vbmi2"
+                    ))]
+                    let used_w16 = if use_w16 {
+                        let base = GROUP * g;
+                        let hexa = match blocks {
+                            crate::seed_pipe::BlockSource::Closed { init, .. } => {
+                                blake3_witgen8::HexaInputs::closed(init, base)
                             }
-                            crate::seed_pipe::BlockSource::Closed { init, len }
-                                if base + SIMD <= len =>
-                            {
-                                blake3_witgen8::OctaInputs::Closed { init, base }
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len } => {
-                                staged = std::array::from_fn(|j| {
-                                    let idx = base + j;
-                                    if idx < len {
-                                        crate::seed_pipe::gen_block(init, idx)
-                                    } else {
-                                        *padding
-                                    }
-                                });
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    &staged[j]
-                                }))
-                            }
+                            crate::seed_pipe::BlockSource::Slice(_) => unreachable!(),
                         };
-                        let off = half * SIMD * F128_PER_BLOCK;
-                        // Streaming arm: the drain transforms each 64-byte
-                        // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
-                        let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
+                        let projs = match stage {
+                            Some(st) => std::array::from_fn(|half| {
+                                let mut live = 0u32;
+                                for j in 0..SIMD {
+                                    if base + half * SIMD + j >= skip_blocks {
+                                        live |= 1 << j;
+                                    }
                                 }
-                            }
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
-                                inv_table,
-                                plan: win_plan,
-                            }
-                        });
-                        blake3_witgen8::build_octa_witness_ab_stream_elide(
-                            octa,
-                            z_out.as_mut_ptr().add(off).cast::<u32>(),
-                            a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            win_ab,
-                            proj,
+                                Some(blake3_witgen8::StreamProj {
+                                    stage: st,
+                                    out: ab_out
+                                        .as_mut_ptr()
+                                        .add(half * SIMD * BYTES_PER_BLOCK),
+                                    live,
+                                    inv_table,
+                                    plan: win_plan,
+                                })
+                            }),
+                            None => [None, None],
+                        };
+                        blake3_witgen8::build_hexa_witness_ab_stream_elide(
+                            hexa,
+                            z_out.as_mut_ptr().cast::<u32>(),
+                            a_out.as_mut_ptr().cast::<u32>(),
+                            b_out.as_mut_ptr().cast::<u32>(),
+                            projs,
                             elide,
                             z_nt,
                         );
-                        // Fused arm: project THIS octa's eight blocks now, off
-                        // the just-written windows, while they are L1-hot. Same
-                        // ascending block order as the incumbent loop below, so
-                        // ab_inner's NT stream stays sequential per thread.
-                        if let Some((win_a, win_b)) = win_ab {
-                            for j in 0..SIMD {
-                                if base + j < skip_blocks {
-                                    continue;
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(all(
+                        target_feature = "avx512f",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512dq",
+                        target_feature = "avx512vbmi2"
+                    )))]
+                    let used_w16 = false;
+                    if !used_w16 {
+                        for half in 0..(n_here / SIMD) {
+                            let base = GROUP * g + half * SIMD;
+                            // Lead 2: a full closed-form octa carries only init/base
+                            // into the witness kernel, which generates all 25 draws
+                            // directly in word-major SIMD lanes. Slice input still
+                            // borrows in place; only a ragged closed octa uses the
+                            // scalar staging needed to preserve padding semantics.
+                            let staged: [Compression; SIMD];
+                            let octa = match blocks {
+                                crate::seed_pipe::BlockSource::Slice(s) => {
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        s.get(base + j).unwrap_or(padding)
+                                    }))
                                 }
-                                let a_bytes = std::slice::from_raw_parts(
-                                    win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let b_bytes = std::slice::from_raw_parts(
-                                    win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let blk = half * SIMD + j;
-                                let ab_blk =
-                                    &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
-                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                                );
+                                crate::seed_pipe::BlockSource::Closed { init, len }
+                                    if base + SIMD <= len =>
+                                {
+                                    blake3_witgen8::OctaInputs::Closed { init, base }
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                    staged = std::array::from_fn(|j| {
+                                        let idx = base + j;
+                                        if idx < len {
+                                            crate::seed_pipe::gen_block(init, idx)
+                                        } else {
+                                            *padding
+                                        }
+                                    });
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        &staged[j]
+                                    }))
+                                }
+                            };
+                            let off = half * SIMD * F128_PER_BLOCK;
+                            // Streaming arm: the drain transforms each 64-byte
+                            // round-1 window as it is produced, straight into
+                            // this octa's ab_inner blocks. `live` carries the same
+                            // `skip_blocks` prefix rule as the loops below.
+                            let proj = stage.map(|st| {
+                                let mut live = 0u32;
+                                for j in 0..SIMD {
+                                    if base + j >= skip_blocks {
+                                        live |= 1 << j;
+                                    }
+                                }
+                                blake3_witgen8::StreamProj {
+                                    stage: st,
+                                    out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                                    live,
+                                    inv_table,
+                                    plan: win_plan,
+                                }
+                            });
+                            blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                octa,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                                b_out.as_mut_ptr().add(off).cast::<u32>(),
+                                win_ab,
+                                proj,
+                                elide,
+                                z_nt,
+                            );
+                            // Fused arm: project THIS octa's eight blocks now, off
+                            // the just-written windows, while they are L1-hot. Same
+                            // ascending block order as the incumbent loop below, so
+                            // ab_inner's NT stream stays sequential per thread.
+                            if let Some((win_a, win_b)) = win_ab {
+                                for j in 0..SIMD {
+                                    if base + j < skip_blocks {
+                                        continue;
+                                    }
+                                    let a_bytes = std::slice::from_raw_parts(
+                                        win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                        BYTES_PER_BLOCK,
+                                    );
+                                    let b_bytes = std::slice::from_raw_parts(
+                                        win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                        BYTES_PER_BLOCK,
+                                    );
+                                    let blk = half * SIMD + j;
+                                    let ab_blk =
+                                        &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
+                                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3657,6 +3806,128 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w16_ranked_gate_rejects_every_oracle_and_ragged_shape() {
+        let exact = || {
+            witgen_w16_ranked_shape(
+                Some(WITGEN_W16_RANKED_BLOCKS),
+                WITGEN_W16_RANKED_BLOCKS,
+                16,
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+        };
+        assert!(exact());
+        assert!(!witgen_w16_ranked_shape(
+            None,
+            WITGEN_W16_RANKED_BLOCKS,
+            16,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ));
+        assert!(!witgen_w16_ranked_shape(
+            Some(27),
+            32,
+            16,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ));
+        assert!(!witgen_w16_ranked_shape(
+            Some(WITGEN_W16_RANKED_BLOCKS),
+            WITGEN_W16_RANKED_BLOCKS,
+            8,
+            true,
+            true,
+            true,
+            true,
+            true,
+        ));
+        for restored in 0..5 {
+            let mut switches = [true; 5];
+            switches[restored] = false;
+            assert!(!witgen_w16_ranked_shape(
+                Some(WITGEN_W16_RANKED_BLOCKS),
+                WITGEN_W16_RANKED_BLOCKS,
+                16,
+                switches[0],
+                switches[1],
+                switches[2],
+                switches[3],
+                switches[4],
+            ));
+        }
+    }
+
+    /// Portable oracle for the high-aligned pending representation used by
+    /// the ZMM packer. The SPR test below exercises the intrinsic itself;
+    /// this proves the same transition for every stream offset without
+    /// requiring an AVX-512 host.
+    #[test]
+    fn w16_packer_formula_matches_scalar_all_offsets() {
+        fn check(used: u32, width: u32, pending_low: u32, raw_v: u32) {
+            let field_mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            let v = raw_v & field_mask;
+            let pending_hi = if used == 0 {
+                0
+            } else {
+                pending_low << (32 - used)
+            };
+            let acc = u64::from(pending_low) | (u64::from(v) << used);
+            let total = used + width;
+            let expected_out = (total >= 32).then_some(acc as u32);
+            let next_used = total % 32;
+            let expected_pending = if total >= 32 {
+                (acc >> 32) as u32
+            } else {
+                acc as u32
+            };
+
+            let (got_out, next_hi) = if used == 0 {
+                if width == 32 {
+                    (Some(v), 0)
+                } else {
+                    (None, v << 1)
+                }
+            } else {
+                let out = v.wrapping_shl(used) | pending_hi.wrapping_shr(32 - used);
+                let next = if width == 31 { v << 1 } else { v };
+                (Some(out), next)
+            };
+            assert_eq!(got_out, expected_out, "used={used} width={width}");
+            if next_used != 0 {
+                assert_eq!(
+                    next_hi >> (32 - next_used),
+                    expected_pending,
+                    "pending used={used} width={width}",
+                );
+            }
+        }
+
+        for used in 0..32 {
+            let pending_mask = ((1u64 << used) - 1) as u32;
+            for width in [31, 32] {
+                for pending in [0, pending_mask, 0xA5A5_5A5A & pending_mask] {
+                    for value in [0, u32::MAX, 0xD192_ED03, 1] {
+                        check(used, width, pending, value);
+                    }
+                }
+            }
+        }
+    }
 
     /// The 4-wide lockstep quad builder must reproduce the scalar driver
     /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and
