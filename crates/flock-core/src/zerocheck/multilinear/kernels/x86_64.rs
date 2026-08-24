@@ -2202,6 +2202,92 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
     }
 }
 
+/// DirectFold8 b-side four-map fold through the broadcast factorisation
+/// already used by the URM c4 leaf ([`gfni_fold64_regs_sigma_bcast`]).
+/// Each map emits residue-major `out[16k + t] = fold(row 4t + k)`; the four
+/// maps XOR in that domain (XOR is F2-linear), then a scatter writes the
+/// sequential `out[i] = fold(row i)` layout [`msg_reduce_avx512`] consumes.
+///
+/// Same 512 `vgf2p8affineqb` as [`gfni_fold64_four_maps_staged`]. `planes`
+/// is unused and kept so the call site can switch on a kill switch without
+/// changing the scratch contract.
+///
+/// # Safety
+/// As [`gfni_fold64_four_maps_staged`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_four_maps_bcast(
+    rows0: *const u8,
+    mats0: &[u64; 128],
+    rows1: *const u8,
+    mats1: &[u64; 128],
+    rows2: *const u8,
+    mats2: &[u64; 128],
+    rows3: *const u8,
+    mats3: &[u64; 128],
+    out: *mut F128,
+    _planes: *mut core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded four-map contract; residue-major temps are local
+    // 64-F128 stacks; sequential scatter writes 64 F128s at `out`.
+    unsafe {
+        #[repr(C, align(64))]
+        struct Rm([F128; 64]);
+        let mut acc = Rm([F128 { lo: 0, hi: 0 }; 64]);
+        let mut tmp = Rm([F128 { lo: 0, hi: 0 }; 64]);
+        let load_z = |rows: *const u8| -> [__m512i; 8] {
+            core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()))
+        };
+        gfni_fold64_regs_sigma_bcast(load_z(rows0), mats0, acc.0.as_mut_ptr());
+        gfni_fold64_regs_sigma_bcast(load_z(rows1), mats1, tmp.0.as_mut_ptr());
+        {
+            let ap = acc.0.as_mut_ptr().cast::<__m512i>();
+            let tp = tmp.0.as_ptr().cast::<__m512i>();
+            for i in 0..16 {
+                _mm512_storeu_si512(
+                    ap.add(i),
+                    _mm512_xor_si512(_mm512_loadu_si512(ap.add(i)), _mm512_loadu_si512(tp.add(i))),
+                );
+            }
+        }
+        gfni_fold64_regs_sigma_bcast(load_z(rows2), mats2, tmp.0.as_mut_ptr());
+        {
+            let ap = acc.0.as_mut_ptr().cast::<__m512i>();
+            let tp = tmp.0.as_ptr().cast::<__m512i>();
+            for i in 0..16 {
+                _mm512_storeu_si512(
+                    ap.add(i),
+                    _mm512_xor_si512(_mm512_loadu_si512(ap.add(i)), _mm512_loadu_si512(tp.add(i))),
+                );
+            }
+        }
+        gfni_fold64_regs_sigma_bcast(load_z(rows3), mats3, tmp.0.as_mut_ptr());
+        {
+            let ap = acc.0.as_mut_ptr().cast::<__m512i>();
+            let tp = tmp.0.as_ptr().cast::<__m512i>();
+            for i in 0..16 {
+                _mm512_storeu_si512(
+                    ap.add(i),
+                    _mm512_xor_si512(_mm512_loadu_si512(ap.add(i)), _mm512_loadu_si512(tp.add(i))),
+                );
+            }
+        }
+        // Residue-major `acc[16k + t] = fold(row 4t + k)` → sequential.
+        for t in 0..16 {
+            for k in 0..4 {
+                *out.add(4 * t + k) = acc.0[16 * k + t];
+            }
+        }
+    }
+}
+
 /// [`gfni_fold64_rows`] with the tile's provably-all-padding 64-byte lines
 /// left unread: bit `i` of `dead_lines` replaces the load of rows
 /// `8i ..= 8i+7` with a zero register, so that cache line is never fetched.

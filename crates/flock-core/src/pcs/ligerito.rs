@@ -5860,6 +5860,24 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_DF8_FOUR_BCAST=1` restores the staged four-map GFNI leaf
+/// (qword-transpose planes) in the same binary. Default: the URM c4
+/// broadcast factorisation, XOR in residue-major, sequential scatter.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn df8_four_bcast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_FOUR_BCAST").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -6024,7 +6042,8 @@ fn materialize_direct_fold8(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_bcast,
+                        gfni_fold64_four_maps_staged,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
@@ -6042,18 +6061,33 @@ fn materialize_direct_fold8(
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
-                                b_out.as_mut_ptr().add(slot),
-                                gfni_tmp.as_mut_ptr().cast(),
-                            );
+                            if df8_four_bcast_enabled() {
+                                gfni_fold64_four_maps_bcast(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            } else {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
                         }
                     }
                 }
@@ -11899,7 +11933,7 @@ mod tests {
     #[test]
     fn direct_fold8_four_map_gfni_matches_fold_one_slot_sum() {
         use crate::zerocheck::multilinear::kernels::x86_64::{
-            build_row_fold_mats, gfni_fold64_four_maps_staged,
+            build_row_fold_mats, gfni_fold64_four_maps_bcast, gfni_fold64_four_maps_staged,
         };
         let mut state = 0xB6F1_6408_5EED_191Du64;
         let mut next = || {
@@ -11952,6 +11986,30 @@ mod tests {
                 )
             });
             assert_eq!(got[i], expect);
+        }
+        let mut got_b = vec![F128::ZERO; 64];
+        unsafe {
+            gfni_fold64_four_maps_bcast(
+                values[0].as_ptr().cast::<u8>(),
+                &mats[0],
+                values[1].as_ptr().cast::<u8>(),
+                &mats[1],
+                values[2].as_ptr().cast::<u8>(),
+                &mats[2],
+                values[3].as_ptr().cast::<u8>(),
+                &mats[3],
+                got_b.as_mut_ptr(),
+                planes.as_mut_ptr().cast(),
+            );
+        }
+        for i in 0..64 {
+            let expect = (0..4).fold(F128::ZERO, |acc, map| {
+                acc + super::super::ring_switch::fold_one_slot(
+                    F128::new(values[map][i], 0),
+                    &tables[map],
+                )
+            });
+            assert_eq!(got_b[i], expect, "bcast row {i}");
         }
     }
 
