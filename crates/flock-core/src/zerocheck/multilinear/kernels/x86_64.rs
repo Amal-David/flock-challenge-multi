@@ -2071,11 +2071,31 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     }
 }
 
+/// Ranked default for [`gfni_fold64_four_maps_staged`]: XOR the four maps
+/// into one 16-plane accumulator one map at a time — the same 16+8 ZMM
+/// live-set as [`gfni_fold64_two_maps`]. `FLOCK_NO_DF8_SERIAL4=1` restores
+/// the two-pair `planes` bounce (exact same-binary A/B).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn df8_serial4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DF8_SERIAL4").is_none())
+}
+
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
 /// each completed output-byte plane. This replaces LLVM's accidental
 /// 16-plane spills plus the inter-claim row-major temporary with one explicit
 /// 16-ZMM plane buffer whose traffic is fixed and easy to audit.
+///
+/// Ranked default (`FLOCK_NO_DF8_SERIAL4` unset) instead XOR-accumulates the
+/// four maps sequentially, one eight-plane input at a time, then transposes
+/// from the named 16-plane acc — no `planes` bounce. Same XOR terms.
 ///
 /// # Safety
 /// Each row pointer covers 512 bytes, `out` covers 64 F128s, `planes` covers
@@ -2089,6 +2109,252 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 pub(crate) unsafe fn gfni_fold64_four_maps_staged(
+    rows0: *const u8,
+    mats0: &[u64; 128],
+    rows1: *const u8,
+    mats1: &[u64; 128],
+    rows2: *const u8,
+    mats2: &[u64; 128],
+    rows3: *const u8,
+    mats3: &[u64; 128],
+    out: *mut F128,
+    planes: *mut core::arch::x86_64::__m512i,
+) {
+    // Two separate `#[inline(never)]` bodies so the serial acc cannot share
+    // a register file with the bounce path (that mix is how staged-hold
+    // spilled 32 ZMMs). Dispatcher is a predicted OnceLock load per 64-slot
+    // call, not per affine.
+    // SAFETY: this function and both callees share the same `target_feature`
+    // set; the pointers are the caller's contract.
+    unsafe {
+        if df8_serial4_enabled() {
+            four_maps_serial4(
+                rows0, mats0, rows1, mats1, rows2, mats2, rows3, mats3, out,
+            );
+        } else {
+            four_maps_staged_bounce(
+                rows0, mats0, rows1, mats1, rows2, mats2, rows3, mats3, out, planes,
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(never)]
+unsafe fn four_maps_serial4(
+    rows0: *const u8,
+    mats0: &[u64; 128],
+    rows1: *const u8,
+    mats1: &[u64; 128],
+    rows2: *const u8,
+    mats2: &[u64; 128],
+    rows3: *const u8,
+    mats3: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast());
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+        let input_planes = |rows: *const u8| -> [__m512i; 8] {
+            let z: [__m512i; 8] = core::array::from_fn(|i| {
+                _mm512_loadu_si512(rows.add(64 * i).cast())
+            });
+            qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
+        };
+        let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
+            let g = |j: usize| {
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
+            };
+            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+            _mm512_xor_si512(v2, v3)
+        };
+
+        let emit_named = |
+            a0: __m512i, a1: __m512i, a2: __m512i, a3: __m512i,
+            a4: __m512i, a5: __m512i, a6: __m512i, a7: __m512i,
+            a8: __m512i, a9: __m512i, a10: __m512i, a11: __m512i,
+            a12: __m512i, a13: __m512i, a14: __m512i, a15: __m512i,
+        | {
+            // Same epilogue as `gfni_fold64_two_maps`: transpose from sixteen
+            // named ZMM args, never a `[__m512i; 16]` memory object.
+            let lo_half = qword_transpose([a0, a1, a2, a3, a4, a5, a6, a7]);
+            let hi_half = qword_transpose([a8, a9, a10, a11, a12, a13, a14, a15]);
+            let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+            let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+            for i in 0..8 {
+                let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
+                let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
+                let v0 = _mm512_permutex2var_epi64(lo, il_lo, hi);
+                let v1 = _mm512_permutex2var_epi64(lo, il_hi, hi);
+                let out_ptr = out.add(8 * i).cast::<__m512i>();
+                _mm512_storeu_si512(out_ptr, v0);
+                _mm512_storeu_si512(out_ptr.add(1), v1);
+            }
+        };
+
+        // Sequential one-map acc: durable live set is the sixteen plane accs
+        // plus one eight-plane input — the same 16+8 cap
+        // `gfni_fold64_two_maps` already uses. Two maps live at once plus
+        // sixteen accs is 32 ZMMs and spills on SPR (priced `e65531a`).
+            let (
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            ) = {
+                let p = input_planes(rows0);
+                (
+                    map_plane(&p, mats0, 0),
+                    map_plane(&p, mats0, 1),
+                    map_plane(&p, mats0, 2),
+                    map_plane(&p, mats0, 3),
+                    map_plane(&p, mats0, 4),
+                    map_plane(&p, mats0, 5),
+                    map_plane(&p, mats0, 6),
+                    map_plane(&p, mats0, 7),
+                    map_plane(&p, mats0, 8),
+                    map_plane(&p, mats0, 9),
+                    map_plane(&p, mats0, 10),
+                    map_plane(&p, mats0, 11),
+                    map_plane(&p, mats0, 12),
+                    map_plane(&p, mats0, 13),
+                    map_plane(&p, mats0, 14),
+                    map_plane(&p, mats0, 15),
+                )
+            };
+            let (
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            ) = {
+                let p = input_planes(rows1);
+                (
+                    _mm512_xor_si512(a0, map_plane(&p, mats1, 0)),
+                    _mm512_xor_si512(a1, map_plane(&p, mats1, 1)),
+                    _mm512_xor_si512(a2, map_plane(&p, mats1, 2)),
+                    _mm512_xor_si512(a3, map_plane(&p, mats1, 3)),
+                    _mm512_xor_si512(a4, map_plane(&p, mats1, 4)),
+                    _mm512_xor_si512(a5, map_plane(&p, mats1, 5)),
+                    _mm512_xor_si512(a6, map_plane(&p, mats1, 6)),
+                    _mm512_xor_si512(a7, map_plane(&p, mats1, 7)),
+                    _mm512_xor_si512(a8, map_plane(&p, mats1, 8)),
+                    _mm512_xor_si512(a9, map_plane(&p, mats1, 9)),
+                    _mm512_xor_si512(a10, map_plane(&p, mats1, 10)),
+                    _mm512_xor_si512(a11, map_plane(&p, mats1, 11)),
+                    _mm512_xor_si512(a12, map_plane(&p, mats1, 12)),
+                    _mm512_xor_si512(a13, map_plane(&p, mats1, 13)),
+                    _mm512_xor_si512(a14, map_plane(&p, mats1, 14)),
+                    _mm512_xor_si512(a15, map_plane(&p, mats1, 15)),
+                )
+            };
+            let (
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            ) = {
+                let p = input_planes(rows2);
+                (
+                    _mm512_xor_si512(a0, map_plane(&p, mats2, 0)),
+                    _mm512_xor_si512(a1, map_plane(&p, mats2, 1)),
+                    _mm512_xor_si512(a2, map_plane(&p, mats2, 2)),
+                    _mm512_xor_si512(a3, map_plane(&p, mats2, 3)),
+                    _mm512_xor_si512(a4, map_plane(&p, mats2, 4)),
+                    _mm512_xor_si512(a5, map_plane(&p, mats2, 5)),
+                    _mm512_xor_si512(a6, map_plane(&p, mats2, 6)),
+                    _mm512_xor_si512(a7, map_plane(&p, mats2, 7)),
+                    _mm512_xor_si512(a8, map_plane(&p, mats2, 8)),
+                    _mm512_xor_si512(a9, map_plane(&p, mats2, 9)),
+                    _mm512_xor_si512(a10, map_plane(&p, mats2, 10)),
+                    _mm512_xor_si512(a11, map_plane(&p, mats2, 11)),
+                    _mm512_xor_si512(a12, map_plane(&p, mats2, 12)),
+                    _mm512_xor_si512(a13, map_plane(&p, mats2, 13)),
+                    _mm512_xor_si512(a14, map_plane(&p, mats2, 14)),
+                    _mm512_xor_si512(a15, map_plane(&p, mats2, 15)),
+                )
+            };
+            let (
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            ) = {
+                let p = input_planes(rows3);
+                (
+                    _mm512_xor_si512(a0, map_plane(&p, mats3, 0)),
+                    _mm512_xor_si512(a1, map_plane(&p, mats3, 1)),
+                    _mm512_xor_si512(a2, map_plane(&p, mats3, 2)),
+                    _mm512_xor_si512(a3, map_plane(&p, mats3, 3)),
+                    _mm512_xor_si512(a4, map_plane(&p, mats3, 4)),
+                    _mm512_xor_si512(a5, map_plane(&p, mats3, 5)),
+                    _mm512_xor_si512(a6, map_plane(&p, mats3, 6)),
+                    _mm512_xor_si512(a7, map_plane(&p, mats3, 7)),
+                    _mm512_xor_si512(a8, map_plane(&p, mats3, 8)),
+                    _mm512_xor_si512(a9, map_plane(&p, mats3, 9)),
+                    _mm512_xor_si512(a10, map_plane(&p, mats3, 10)),
+                    _mm512_xor_si512(a11, map_plane(&p, mats3, 11)),
+                    _mm512_xor_si512(a12, map_plane(&p, mats3, 12)),
+                    _mm512_xor_si512(a13, map_plane(&p, mats3, 13)),
+                    _mm512_xor_si512(a14, map_plane(&p, mats3, 14)),
+                    _mm512_xor_si512(a15, map_plane(&p, mats3, 15)),
+                )
+            };
+            emit_named(
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+            );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(never)]
+unsafe fn four_maps_staged_bounce(
     rows0: *const u8,
     mats0: &[u64; 128],
     rows1: *const u8,
@@ -2160,7 +2426,6 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
             _mm512_xor_si512(v2, v3)
         };
-
         {
             let p0 = input_planes(rows0);
             let p1 = input_planes(rows1);
@@ -2184,7 +2449,6 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 _mm512_storeu_si512(planes.add(k), value);
             }
         }
-
         let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
         let lo_half = qword_transpose(acc[..8].try_into().unwrap());
         let hi_half = qword_transpose(acc[8..].try_into().unwrap());
