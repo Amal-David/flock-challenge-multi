@@ -942,6 +942,19 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_PLANE_F128=1` restores the scalar plane-to-F128 reconstruct
+/// at the end of the GFNI block-major fold (exact same-binary A/B).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
@@ -1313,6 +1326,36 @@ fn fold_block_major_gfni(
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi"
+        ))]
+        if lc_plane_f128_enabled() {
+            let block: &[u8; 1024] = &acc;
+            let slot: &mut [F128; 64] = o.try_into().expect("64-column block");
+            // SAFETY: 1024-byte XOR-merged planes and 64 F128s; features per cfg.
+            unsafe {
+                kernels::planes16x64_to_f12864(block, slot);
+            }
+        } else {
+            for (col, slot) in o.iter_mut().enumerate() {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                *slot = F128 { lo, hi };
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi"
+        )))]
         for (col, slot) in o.iter_mut().enumerate() {
             let mut lo = 0u64;
             let mut hi = 0u64;

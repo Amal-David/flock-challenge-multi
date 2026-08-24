@@ -96,8 +96,20 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 
     // One transpose back to F128 columns at the very end.
     let mut out = vec![F128::ZERO; k];
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512vbmi"))]
+    let vec_tr = std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none();
     for b in 0..k / 64 {
         let base = b * 1024;
+        #[cfg(all(target_feature = "avx512f", target_feature = "avx512vbmi"))]
+        if vec_tr {
+            let block: &[u8; 1024] = planes[base..base + 1024].try_into().unwrap();
+            let slot: &mut [F128; 64] = (&mut out[b * 64..b * 64 + 64]).try_into().unwrap();
+            // SAFETY: 1024-byte plane block and 64 F128s; features per cfg.
+            unsafe {
+                planes16x64_to_f12864(block, slot);
+            }
+            continue;
+        }
         for col in 0..64 {
             let mut lo = 0u64;
             let mut hi = 0u64;
@@ -396,6 +408,83 @@ pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) 
             let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
             let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
             _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+        }
+    }
+}
+
+/// Reassemble 16 byte-planes × 64 columns into 64 F128s. Same layout and
+/// permute as `c_plane_bank_to_f128_x86_avx512`: `out[col].lo` byte `b` is
+/// `planes[b*64+col]`, `.hi` byte `b` is `planes[(8+b)*64+col]`. Bit-identical
+/// to the scalar reconstruct at the end of [`partial_fold_packed_z_x86_gfni_padded`]
+/// and `fold_block_major_gfni`.
+///
+/// # Safety
+/// `planes` is 1024 readable bytes; `out` is 64 writable F128s; avx512f+vbmi.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi")]
+pub(crate) unsafe fn planes16x64_to_f12864(planes: &[u8; 1024], out: &mut [F128; 64]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        #[rustfmt::skip]
+        const IDX: [i8; 64] = [
+             0,  8, 16, 24, 32, 40, 48, 56,
+             1,  9, 17, 25, 33, 41, 49, 57,
+             2, 10, 18, 26, 34, 42, 50, 58,
+             3, 11, 19, 27, 35, 43, 51, 59,
+             4, 12, 20, 28, 36, 44, 52, 60,
+             5, 13, 21, 29, 37, 45, 53, 61,
+             6, 14, 22, 30, 38, 46, 54, 62,
+             7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+        const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+        const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
+        const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
+        const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
+        const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
+        let byte_tr = |rows: [__m512i; 8]| -> [__m512i; 8] {
+            let mut cur = rows;
+            for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
+                let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+                let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+                let mut next = [_mm512_setzero_si512(); 8];
+                for r in 0..8usize {
+                    if r & d == 0 {
+                        let x = cur[r];
+                        let y = cur[r | d];
+                        next[r] = _mm512_permutex2var_epi64(x, ia, y);
+                        next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
+                    }
+                }
+                cur = next;
+            }
+            let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
+            let mut outv = [_mm512_setzero_si512(); 8];
+            for k in 0..8usize {
+                outv[k] = _mm512_permutexvar_epi8(idx, cur[k]);
+            }
+            outv
+        };
+        let src = planes.as_ptr();
+        let lo_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(src.add(k * 64) as *const __m512i));
+        let hi_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(src.add((8 + k) * 64) as *const __m512i));
+        let los = byte_tr(lo_rows);
+        let his = byte_tr(hi_rows);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let dst = out.as_mut_ptr() as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(dst.add(2 * k), _mm512_permutex2var_epi64(los[k], idx0, his[k]));
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
         }
     }
 }
