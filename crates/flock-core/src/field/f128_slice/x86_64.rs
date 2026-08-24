@@ -32,13 +32,44 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
     }
 }
 
+/// `FLOCK_NO_ADD_SCALED_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
+/// product inside [`add_scaled`]. Default ON: hoist `scale * x^64 mod p` once
+/// per call and use the 5-CLMUL split form. Ranked env is cleared.
+#[inline]
+fn add_scaled_diet_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ADD_SCALED_DIET").is_some())
+}
+
 /// Four-lane `dst += scale * addend` for the lazy-OOD correction.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    // SAFETY: forwarded caller contract; the diet latch is process-cached and
+    // the two monomorphs are outlined so the caller does not clone both.
+    unsafe {
+        if add_scaled_diet_disabled() {
+            add_scaled_impl::<false>(dst, addend, scale);
+        } else {
+            add_scaled_impl::<true>(dst, addend, scale);
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`add_scaled`]. `DIET` selects the 5-CLMUL split product
+/// (`true`) or the incumbent 6-CLMUL `ghash_mul_x4` (`false`).
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn add_scaled_impl<const DIET: bool>(
+    dst: &mut [F128],
+    addend: &[F128],
+    scale: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(dst.len(), addend.len());
@@ -46,12 +77,18 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
     unsafe {
         let scale_x4 =
             _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let companion = if DIET { ghash_shift64_x4(scale_x4) } else { scale_x4 };
         let lanes = dst.len() & !3;
         let mut i = 0usize;
         while i < lanes {
             let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
             let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
-            let corrected = _mm512_xor_si512(current, ghash_mul_x4(scale_x4, extra));
+            let prod = if DIET {
+                ghash_mul_x4_split(extra, scale_x4, companion)
+            } else {
+                ghash_mul_x4(scale_x4, extra)
+            };
+            let corrected = _mm512_xor_si512(current, prod);
             _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
             i += 4;
         }
