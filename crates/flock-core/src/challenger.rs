@@ -26,6 +26,7 @@
 use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
@@ -172,6 +173,14 @@ const OP_BYTES: u8 = 0x05;
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
+/// `FLOCK_NO_SAMPLE_F128_DIRECT=1` restores the incumbent temporary byte
+/// buffer plus parse/copy path in the same binary.
+#[inline]
+fn sample_f128_direct_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_SAMPLE_F128_DIRECT").is_some())
+}
+
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
 /// tracked via [`FsChallenger::absorbed_bytes`].
@@ -298,6 +307,86 @@ impl FsChallenger {
         }
     }
 
+    /// Fill an already allocated `F128` output buffer directly from the
+    /// transcript byte stream, then duplex those exact bytes back into the
+    /// live transcript.
+    ///
+    /// This is little-endian only: `F128` is `repr(C)` with two adjacent
+    /// `u64` limbs, so its in-memory bytes are exactly the incumbent parser's
+    /// `(lo, hi)` little-endian representation. Big-endian targets keep the
+    /// explicit parser below.
+    #[cfg(target_endian = "little")]
+    #[inline]
+    fn fill_f128_vec_direct(&mut self, values: &mut [core::mem::MaybeUninit<F128>]) {
+        const {
+            assert!(core::mem::size_of::<F128>() == 16);
+            assert!(core::mem::align_of::<F128>() == 16);
+        }
+
+        // SAFETY: `values` is exclusively borrowed. `F128` has size 16 with
+        // no padding (asserted above), every byte pattern is valid for its two
+        // `u64` fields, and `size_of_val` cannot exceed the allocation
+        // represented by the source slice. `squeeze_into` writes every byte
+        // before the allocation is retyped as initialized `F128` values.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+        };
+        self.squeeze_into(bytes);
+        self.absorb(bytes);
+    }
+
+    /// Consume a fully byte-initialized `MaybeUninit<F128>` allocation as the
+    /// returned `Vec<F128>` without allocating, copying, or changing its
+    /// pointer.
+    #[cfg(target_endian = "little")]
+    #[inline]
+    unsafe fn assume_init_f128_vec(
+        mut values: Vec<core::mem::MaybeUninit<F128>>,
+    ) -> Vec<F128> {
+        let ptr = values.as_mut_ptr().cast::<F128>();
+        let len = values.len();
+        let capacity = values.capacity();
+        core::mem::forget(values);
+        // SAFETY: `MaybeUninit<F128>` and `F128` have identical layout. The
+        // caller guarantees every byte of all `len` elements was initialized;
+        // the allocation's pointer and capacity are unchanged.
+        unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+    }
+
+    #[cfg(target_endian = "little")]
+    #[inline]
+    fn sample_f128_vec_direct_payload(&mut self, n: usize) -> Vec<F128> {
+        let mut values = Vec::<core::mem::MaybeUninit<F128>>::with_capacity(n);
+        // SAFETY: an uninitialized `MaybeUninit<F128>` is valid. The direct
+        // fill below overwrites every byte before conversion to `F128`.
+        unsafe { values.set_len(n) };
+        self.fill_f128_vec_direct(&mut values);
+        // SAFETY: `fill_f128_vec_direct` initialized all 16 bytes of every
+        // element on every successful return.
+        unsafe { Self::assume_init_f128_vec(values) }
+    }
+
+    /// Incumbent byte-buffer plus little-endian parse path. This remains the
+    /// big-endian implementation and the same-binary control selected by
+    /// `FLOCK_NO_SAMPLE_F128_DIRECT=1`.
+    #[inline]
+    fn sample_f128_vec_legacy_payload(&mut self, n: usize) -> Vec<F128> {
+        let mut buf = vec![0u8; n * 16];
+        self.squeeze_into(&mut buf);
+        self.absorb(&buf);
+        buf.as_chunks::<16>()
+            .0
+            .iter()
+            .map(|c| F128 {
+                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
     /// 32-byte digest of the current transcript state, used as the PoW base.
     /// Cloning + finalizing gives a state-bound digest without mutating the
     /// live hasher.
@@ -364,17 +453,11 @@ impl Challenger for FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
         self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+        #[cfg(target_endian = "little")]
+        if !sample_f128_direct_disabled() {
+            return self.sample_f128_vec_direct_payload(n);
+        }
+        self.sample_f128_vec_legacy_payload(n)
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -1528,6 +1611,93 @@ mod tests {
             let unique: std::collections::HashSet<_> = vals.iter().collect();
             assert_eq!(unique.len(), vals.len(), "{kind}: squeeze stream repeats");
         }
+    }
+
+    #[test]
+    fn sample_f128_direct_layout_is_exactly_two_u64_limbs() {
+        assert_eq!(core::mem::size_of::<F128>(), 16);
+        assert_eq!(core::mem::align_of::<F128>(), 16);
+        assert_eq!(core::mem::offset_of!(F128, lo), 0);
+        assert_eq!(core::mem::offset_of!(F128, hi), 8);
+    }
+
+    /// Pins the optimized output backing against the incumbent byte parser,
+    /// including the duplex state observed by the following challenge.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn sample_f128_vec_direct_matches_legacy_transcript() {
+        for kind in KINDS {
+            for n in [0usize, 1, 2, 7, 8, 9, 64] {
+                let mut direct = FsChallenger::with_hash(b"sample-direct", kind);
+                let mut legacy = direct.clone();
+                direct.observe_bytes(b"prior transcript payload");
+                legacy.observe_bytes(b"prior transcript payload");
+
+                direct.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+                direct.absorb(&(n as u64).to_le_bytes());
+                let mut direct_backing =
+                    Vec::<core::mem::MaybeUninit<F128>>::with_capacity(n);
+                // SAFETY: `MaybeUninit` may be uninitialized; the direct fill
+                // writes every byte before the conversion below.
+                unsafe { direct_backing.set_len(n) };
+                let return_backing = direct_backing.as_ptr().cast::<F128>();
+                direct.fill_f128_vec_direct(&mut direct_backing);
+                // SAFETY: the direct fill initialized every element.
+                let direct_values = unsafe {
+                    FsChallenger::assume_init_f128_vec(direct_backing)
+                };
+                assert_eq!(direct_values.as_ptr(), return_backing, "{kind}, n={n}");
+
+                legacy.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+                legacy.absorb(&(n as u64).to_le_bytes());
+                let legacy_values = legacy.sample_f128_vec_legacy_payload(n);
+
+                assert_eq!(direct_values, legacy_values, "{kind}, n={n}");
+                assert_eq!(direct.n_absorbed, legacy.n_absorbed, "{kind}, n={n}");
+                assert_eq!(direct.sample_f128(), legacy.sample_f128(), "{kind}, n={n}");
+            }
+        }
+    }
+
+    /// Exercise the real environment kill in a fresh test process so the
+    /// process-lifetime `OnceLock` cannot race another unit test.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn sample_f128_vec_direct_kill_uses_legacy_path() {
+        const CHILD_MARKER: &str = "FLOCK_SAMPLE_F128_DIRECT_KILL_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert!(sample_f128_direct_disabled());
+            for kind in KINDS {
+                let mut selected = FsChallenger::with_hash(b"sample-kill", kind);
+                let mut legacy = selected.clone();
+                let got = selected.sample_f128_vec(9);
+                legacy.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+                legacy.absorb(&9u64.to_le_bytes());
+                let expected = legacy.sample_f128_vec_legacy_payload(9);
+                assert_eq!(got, expected, "{kind}");
+                assert_eq!(selected.sample_f128(), legacy.sample_f128(), "{kind}");
+            }
+            return;
+        }
+
+        let test_name = concat!(
+            module_path!(),
+            "::sample_f128_vec_direct_kill_uses_legacy_path"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("FLOCK_NO_SAMPLE_F128_DIRECT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "kill child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The batched BLAKE3 nonce search must agree with the scalar spec
