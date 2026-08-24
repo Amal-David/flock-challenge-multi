@@ -335,8 +335,29 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
-        for v in values {
-            self.absorb_f128(*v);
+
+        #[cfg(target_endian = "little")]
+        if !values.is_empty() {
+            // SAFETY: F128 is `repr(C, align(16))` with exactly two adjacent
+            // u64 fields (`lo`, then `hi`), size 16 and no padding. On a
+            // little-endian target its object bytes are therefore exactly the
+            // incumbent transcript order `lo.to_le_bytes() || hi.to_le_bytes()`
+            // for every element. The source slice supplies validity and the
+            // byte view does not outlive it.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(values),
+                )
+            };
+            self.absorb(bytes);
+        }
+
+        // Big-endian object bytes do not match the transcript's canonical
+        // little-endian encoding, so retain the incumbent field-wise path.
+        #[cfg(target_endian = "big")]
+        for &v in values {
+            self.absorb_f128(v);
         }
     }
 
@@ -1874,6 +1895,69 @@ mod tests {
     }
 
     // ---- FsChallenger ------------------------------------------------------
+
+    #[test]
+    fn fs_challenger_f128_layout_is_bulk_absorb_safe() {
+        assert_eq!(core::mem::size_of::<F128>(), 16);
+        assert_eq!(core::mem::align_of::<F128>(), 16);
+        assert_eq!(core::mem::offset_of!(F128, lo), 0);
+        assert_eq!(core::mem::offset_of!(F128, hi), 8);
+    }
+
+    #[test]
+    fn fs_challenger_f128_slice_matches_legacy_byte_absorb() {
+        for kind in KINDS {
+            // Cross SHA-256's 64-byte block boundary (4 F128), BLAKE3's
+            // 1-KiB chunk boundary (64 F128), and the prior 4-KiB staging
+            // boundary (256 F128) on both sides, plus the ranked lengths.
+            for len in [
+                0usize, 1, 2, 3, 4, 5, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000,
+            ] {
+                let values: Vec<F128> = (0..len)
+                    .map(|i| F128 {
+                        lo: 0x0123_4567_89AB_CDEFu64
+                            .wrapping_mul((i as u64).wrapping_add(1)),
+                        hi: 0xFEDC_BA98_7654_3210u64
+                            .wrapping_add((i as u64).rotate_left(17)),
+                    })
+                    .collect();
+
+                let mut bulk = FsChallenger::with_hash(b"bulk-f128-slice", kind);
+                let counter_start = u64::MAX - 9;
+                bulk.n_absorbed = counter_start;
+                bulk.observe_f128_slice(&values);
+
+                let mut legacy = FsChallenger::with_hash(b"bulk-f128-slice", kind);
+                legacy.n_absorbed = counter_start;
+                legacy.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                legacy.absorb(&(values.len() as u64).to_le_bytes());
+                for &v in &values {
+                    legacy.absorb(&v.lo.to_le_bytes());
+                    legacy.absorb(&v.hi.to_le_bytes());
+                }
+
+                assert_eq!(
+                    bulk.n_absorbed, legacy.n_absorbed,
+                    "absorbed-byte count diverged for {kind} len={len}"
+                );
+                assert_eq!(
+                    bulk.n_absorbed,
+                    counter_start.wrapping_add(10 + (len as u64).wrapping_mul(16)),
+                    "absorbed-byte wrapping diverged for {kind} len={len}"
+                );
+                assert_eq!(
+                    bulk.state_digest(),
+                    legacy.state_digest(),
+                    "hash state diverged for {kind} len={len}"
+                );
+                assert_eq!(
+                    bulk.sample_f128_vec(4),
+                    legacy.sample_f128_vec(4),
+                    "transcript diverged for {kind} len={len}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fs_challenger_identical_scripts_produce_identical_output() {
