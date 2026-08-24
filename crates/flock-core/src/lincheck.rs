@@ -123,6 +123,8 @@ use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 mod kernels;
@@ -2276,10 +2278,126 @@ struct LastRhoPrepared {
 // keeps `z` alive and unmutated (see [`LastRhoZFoldGuard`]).
 unsafe impl Send for LastRhoPrepared {}
 
+struct LastRhoJob {
+    z_addr: usize,
+    z_len: usize,
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: Vec<F128>,
+}
+
+impl LastRhoJob {
+    fn run(self, trace_label: &'static str) -> Vec<F128> {
+        // SAFETY: [`prepare_last_rho_z_fold`] contract — `z` is live,
+        // unmutated, and not aliased for writes (`C` aliases `z` but the
+        // leftover fold starts after the last ρ, when C is no longer written).
+        let z = unsafe { std::slice::from_raw_parts(self.z_addr as *const F128, self.z_len) };
+        let trace = std::env::var_os("LINCHECK_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let out = fold_block_major_one_shot(
+            z,
+            self.m,
+            self.k_log,
+            self.useful_bits,
+            &self.x_outer,
+        );
+        if trace {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                trace_label,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        out
+    }
+}
+
+struct LastRhoWorker {
+    jobs: SyncSender<LastRhoJob>,
+    results: Mutex<Receiver<Option<Vec<F128>>>>,
+}
+
+impl LastRhoWorker {
+    fn submit(&self, job: LastRhoJob) -> Result<(), LastRhoJob> {
+        self.jobs.send(job).map_err(|e| e.0)
+    }
+
+    fn wait(&self) -> Option<Vec<F128>> {
+        self.results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv()
+            .ok()
+            .flatten()
+    }
+}
+
+fn last_rho_worker_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+static LAST_RHO_WORKER_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    last_rho_worker_enabled_value(
+        std::env::var_os("FLOCK_NO_LC_LAST_RHO_WORKER").as_deref(),
+    )
+});
+
+fn last_rho_worker() -> Option<&'static LastRhoWorker> {
+    if !*LAST_RHO_WORKER_ENABLED {
+        return None;
+    }
+    static WORKER: OnceLock<Option<LastRhoWorker>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            // Zero-capacity channels are a rendezvous: at most one proof owns
+            // the raw-z job while the worker runs. The result rendezvous also
+            // serializes concurrent callers before the worker accepts another
+            // raw pointer.
+            let (jobs, job_rx) = sync_channel::<LastRhoJob>(0);
+            let (result_tx, results) = sync_channel::<Option<Vec<F128>>>(0);
+            std::thread::Builder::new()
+                .name("flock-last-rho-z-fold".into())
+                .spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        // A kernel panic must not strand the registering thread
+                        // with a live raw pointer. `None` selects the established
+                        // sequential one-shot fallback while `z` is still guarded.
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                job.run("kicked z-fold (worker)")
+                            }))
+                            .ok();
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .ok()
+                .map(|handle| {
+                    // The process-lifetime channels own the detached worker.
+                    drop(handle);
+                    LastRhoWorker {
+                        jobs,
+                        results: Mutex::new(results),
+                    }
+                })
+        })
+        .as_ref()
+}
+
+fn spawn_last_rho_job(job: LastRhoJob) -> JoinHandle<Vec<F128>> {
+    std::thread::Builder::new()
+        .name("flock-last-rho-z-fold".into())
+        .spawn(move || job.run("kicked z-fold (thread)"))
+        .expect("spawn last-ρ z-fold")
+}
+
 enum LastRhoSlot {
     Empty,
     Prepared(LastRhoPrepared),
-    Running(JoinHandle<Vec<F128>>),
+    RunningWorker,
+    RunningThread(JoinHandle<Vec<F128>>),
 }
 
 thread_local! {
@@ -2350,37 +2468,23 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let Some(p) = prepared else {
         return;
     };
-    let x_outer = mlv[p.inner_rest_len..].to_vec();
-    // Carry the address as usize so the spawn closure is Send without
-    // relying on `*const F128: Send`.
-    let z_addr = p.z_ptr as usize;
-    let z_len = p.z_len;
-    let m = p.m;
-    let k_log = p.k_log;
-    let useful_bits = p.useful_bits;
-    let handle = std::thread::Builder::new()
-        .name("flock-last-rho-z-fold".into())
-        .spawn(move || {
-            // SAFETY: [`prepare_last_rho_z_fold`] contract — `z` is live,
-            // unmutated, and not aliased for writes (`C` aliases `z` but
-            // the leftover fold starts after the last ρ, when C is no
-            // longer written).
-            let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
-            let trace = std::env::var_os("LINCHECK_TRACE").is_some();
-            let t0 = std::time::Instant::now();
-            let out = fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer);
-            if trace {
-                eprintln!(
-                    "[lc] {:<26} {:>7.2} ms",
-                    "kicked z-fold (thread)",
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            out
-        })
-        .expect("spawn last-ρ z-fold");
+    let job = LastRhoJob {
+        z_addr: p.z_ptr as usize,
+        z_len: p.z_len,
+        m: p.m,
+        k_log: p.k_log,
+        useful_bits: p.useful_bits,
+        x_outer: mlv[p.inner_rest_len..].to_vec(),
+    };
+    let running = match last_rho_worker() {
+        Some(worker) => match worker.submit(job) {
+            Ok(()) => LastRhoSlot::RunningWorker,
+            Err(job) => LastRhoSlot::RunningThread(spawn_last_rho_job(job)),
+        },
+        None => LastRhoSlot::RunningThread(spawn_last_rho_job(job)),
+    };
     LAST_RHO.with(|slot| {
-        *slot.borrow_mut() = LastRhoSlot::Running(handle);
+        *slot.borrow_mut() = running;
     });
 }
 
@@ -2389,13 +2493,21 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
 /// a kick was running; `None` if nothing was kicked (caller runs today's
 /// sequential one-shot).
 pub fn wait_last_rho_z_fold() -> Option<Vec<F128>> {
-    let handle = LAST_RHO.with(|slot| {
+    enum Running {
+        Worker,
+        Thread(JoinHandle<Vec<F128>>),
+    }
+    let running = LAST_RHO.with(|slot| {
         match std::mem::replace(&mut *slot.borrow_mut(), LastRhoSlot::Empty) {
-            LastRhoSlot::Running(h) => Some(h),
+            LastRhoSlot::RunningWorker => Some(Running::Worker),
+            LastRhoSlot::RunningThread(handle) => Some(Running::Thread(handle)),
             LastRhoSlot::Prepared(_) | LastRhoSlot::Empty => None,
         }
     });
-    handle.map(|h| h.join().expect("last-ρ z-fold thread"))
+    match running? {
+        Running::Worker => last_rho_worker()?.wait(),
+        Running::Thread(handle) => Some(handle.join().expect("last-ρ z-fold thread")),
+    }
 }
 
 /// Prove the lincheck statement for the block-diagonal R1CS instance
@@ -3555,6 +3667,8 @@ mod tests {
     /// path and the ranked `n_log=18` factorized path without a LOG2=18 prove.
     #[test]
     fn last_rho_kick_then_wait_matches_oneshot_fold() {
+        let worker_addr =
+            last_rho_worker().map(|worker| worker as *const LastRhoWorker as usize);
         let cases: &[(usize, usize, usize)] = &[
             (16, 8, 241),
             (18, 10, 997),
@@ -3601,6 +3715,24 @@ mod tests {
                 want, got,
                 "m={m} k_log={k_log} useful={useful_bits} last-ρ ≠ one-shot"
             );
+            let bytes = |values: &[F128]| {
+                values
+                    .iter()
+                    .flat_map(|v| v.lo.to_le_bytes().into_iter().chain(v.hi.to_le_bytes()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                bytes(&want),
+                bytes(&got),
+                "persistent worker must preserve incumbent output bytes"
+            );
+            if let Some(worker_addr) = worker_addr {
+                assert_eq!(
+                    worker_addr,
+                    last_rho_worker().unwrap() as *const LastRhoWorker as usize,
+                    "all last-ρ jobs must reuse one process-lifetime worker"
+                );
+            }
             assert_eq!(
                 z_block_major, z_before,
                 "m={m} last-ρ kick must not mutate z"
@@ -3613,6 +3745,16 @@ mod tests {
                 "kick after wait must be a no-op"
             );
         }
+    }
+
+    #[test]
+    fn last_rho_worker_kill_switch_is_exact() {
+        use std::ffi::OsStr;
+
+        assert!(last_rho_worker_enabled_value(None));
+        assert!(last_rho_worker_enabled_value(Some(OsStr::new("0"))));
+        assert!(last_rho_worker_enabled_value(Some(OsStr::new("true"))));
+        assert!(!last_rho_worker_enabled_value(Some(OsStr::new("1"))));
     }
 
     /// Kicking with a short `mlv` (zerocheck rounds 2–27, `x_outer`
