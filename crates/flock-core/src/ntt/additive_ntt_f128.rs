@@ -1513,6 +1513,113 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Publish a contiguous row range of the exact post-layer-4 state for a
+    /// rate-1/4 encoding directly from a producer-owned message buffer.
+    ///
+    /// This is the row-granular counterpart of
+    /// [`Self::seed_layers_pair_from_msg`] for `k = 2`. It exists for the
+    /// ranked DirectFold8 -> L1 handoff: four completed producer chunks,
+    /// separated by one message quarter, own one disjoint `rows` range and
+    /// can publish it without a later full-message Rayon seed pass.
+    ///
+    /// # Safety
+    ///
+    /// - `msg` points to `msg_positions * num_ntts` initialized `F128`s;
+    /// - all four source quarter-ranges selected by `rows` have completed and
+    ///   will not be written again for the duration of this call;
+    /// - `codeword` points to `4 * msg_positions * num_ntts` writable
+    ///   `F128`s, and no other caller writes the destination rows selected by
+    ///   `rows` concurrently.
+    pub(crate) unsafe fn seed_rate_quarter_rows_from_raw(
+        &self,
+        msg: *const F128,
+        codeword: *mut F128,
+        msg_positions: usize,
+        num_ntts: usize,
+        rows: core::ops::Range<usize>,
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(msg_positions >= 4 && msg_positions.is_power_of_two());
+        let quarter = msg_positions >> 2;
+        assert!(rows.start <= rows.end && rows.end <= quarter);
+        let msg_len = msg_positions * num_ntts;
+        let twiddles: [[F128; 3]; 4] = std::array::from_fn(|block| {
+            [
+                self.twiddle(2, block),
+                self.twiddle(3, 2 * block),
+                self.twiddle(3, 2 * block + 1),
+            ]
+        });
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+
+        for r in rows {
+            // SAFETY: the caller owns all four source rows and every output
+            // row for this `r`; the kernel contracts are exactly the pointer
+            // and geometry bounds documented above.
+            unsafe {
+                kernels::butterfly_fused_2layer_row_from_sparse(
+                    msg,
+                    codeword,
+                    quarter,
+                    num_ntts,
+                    r,
+                    twiddles[0][2],
+                );
+                for (block, twiddle) in twiddles.iter().enumerate().skip(1) {
+                    kernels::butterfly_fused_2layer_row_from(
+                        msg,
+                        codeword.add(block * msg_len),
+                        quarter,
+                        num_ntts,
+                        r,
+                        twiddle,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Continue a rate-1/4 interleaved encoding whose layers 0..4 were
+    /// already published by [`Self::seed_rate_quarter_rows_from_raw`]. The
+    /// callback contract is identical to
+    /// [`Self::rs_encode_interleaved_on_range_done`].
+    pub(crate) fn finish_rate_quarter_seed_on_range_done(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(codeword.len() % num_ntts, 0);
+        let n_positions = codeword.len() / num_ntts;
+        assert!(n_positions.is_power_of_two());
+        assert_eq!(n_positions % 4, 0);
+        let log_d = log2_pow2(n_positions);
+        assert!(log_d >= 4 && log_d <= self.log_domain_size());
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            codeword,
+            num_ntts,
+            4,
+            None,
+            Some(on_range_done),
+            None,
+        );
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            self.forward_transform_interleaved_scalar_from_layer(codeword, num_ntts, 4);
+            on_range_done(0..n_positions, codeword);
+        }
+    }
+
     /// One cache-blocked DRAM pass applying six consecutive top layers
     /// `layer..layer+6` (whole-buffer strided layers) of the interleaved
     /// transform.
@@ -3926,6 +4033,61 @@ mod tests {
             ntt.forward_transform_interleaved_scalar_from_layer(&mut got, num_ntts, k + 2);
 
             assert_eq!(got, want, "shape {si}: log_msg_pos={log_msg_pos} ntts={num_ntts} k={k}");
+        }
+    }
+
+    #[test]
+    fn producer_rate_quarter_rows_match_seed_and_finish_from_poison() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for &(log_msg_positions, num_ntts) in &[(4usize, 1usize), (6, 4), (8, 8)] {
+            let msg_positions = 1usize << log_msg_positions;
+            let log_d = log_msg_positions + 2;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut rng = Rng::new(0xF018_8EED ^ log_msg_positions as u64 ^ num_ntts as u64);
+            let msg = rand_vec(&mut rng, msg_positions * num_ntts);
+            let codeword_len = 4 * msg.len();
+
+            let mut expected_seed = vec![F128::ZERO; codeword_len];
+            ntt.seed_layers_pair_from_msg(&msg, &mut expected_seed, num_ntts, 2);
+
+            let poison = F128::new(u64::MAX, 0xA5A5_A5A5_A5A5_A5A5);
+            let mut produced_seed = vec![poison; codeword_len];
+            let quarter = msg_positions >> 2;
+            let cuts = [0, 1, quarter / 2, quarter.saturating_sub(1), quarter];
+            for pair in cuts.windows(2) {
+                if pair[0] == pair[1] {
+                    continue;
+                }
+                // SAFETY: `msg` and `produced_seed` have the documented
+                // complete geometry; these ranges are disjoint and cover the
+                // whole quarter exactly once.
+                unsafe {
+                    ntt.seed_rate_quarter_rows_from_raw(
+                        msg.as_ptr(),
+                        produced_seed.as_mut_ptr(),
+                        msg_positions,
+                        num_ntts,
+                        pair[0]..pair[1],
+                    );
+                }
+            }
+            assert_eq!(produced_seed, expected_seed);
+            assert!(!produced_seed.iter().any(|&value| value == poison));
+
+            let mut expected_full = vec![F128::ZERO; codeword_len];
+            ntt.rs_encode_interleaved(&msg, &mut expected_full, num_ntts);
+            let finalized_rows = AtomicUsize::new(0);
+            ntt.finish_rate_quarter_seed_on_range_done(
+                &mut produced_seed,
+                num_ntts,
+                &|range, sub_data| {
+                    assert_eq!(sub_data.len(), range.len() * num_ntts);
+                    finalized_rows.fetch_add(range.len(), Ordering::Relaxed);
+                },
+            );
+            assert_eq!(finalized_rows.load(Ordering::Relaxed), 1usize << log_d);
+            assert_eq!(produced_seed, expected_full);
         }
     }
 
