@@ -142,20 +142,26 @@ fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
 ///
 /// Bounded by construction: `standard` asserts `dim ≤ 64`, so this is 65
 /// slots holding at most 65·65/2 `F128` between them.
+fn build_standard_evals(dim: usize) -> Arc<Vec<Vec<F128>>> {
+    let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+    Arc::new(generate_evals_from_subspace(&basis))
+}
+
+fn standard_evals_cell(dim: usize) -> &'static OnceLock<Arc<Vec<Vec<F128>>>> {
+    static TABLES: OnceLock<[OnceLock<Arc<Vec<Vec<F128>>>>; 65]> = OnceLock::new();
+    &TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()))[dim]
+}
+
 fn cached_standard_evals(dim: usize) -> Arc<Vec<Vec<F128>>> {
-    let build = || {
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Arc::new(generate_evals_from_subspace(&basis))
-    };
     static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
         || matches!(std::env::var_os("FLOCK_NO_EVALS_CACHE"), Some(v) if v == "1"),
     );
     if *DISABLED {
-        return build();
+        return build_standard_evals(dim);
     }
-    static TABLES: OnceLock<[OnceLock<Arc<Vec<Vec<F128>>>>; 65]> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    Arc::clone(tables[dim].get_or_init(build))
+    Arc::clone(
+        standard_evals_cell(dim).get_or_init(|| build_standard_evals(dim)),
+    )
 }
 
 fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
@@ -283,6 +289,26 @@ fn ntt_seed_hold4_disabled() -> bool {
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_NTT_SEED_TWIDDLE_CACHE=1` restores the incumbent per-pass
+/// construction and heap allocation of the seed+top fused twiddle bundle.
+fn ntt_seed_twiddle_cache_disabled() -> bool {
+    #[cfg(test)]
+    if SEED_TWIDDLE_CACHE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        matches!(
+            std::env::var_os("FLOCK_NO_NTT_SEED_TWIDDLE_CACHE"),
+            Some(v) if v == "1"
+        )
+    })
+}
+
+#[cfg(test)]
+static SEED_TWIDDLE_CACHE_TEST_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only counters: how many times each fused pass actually ran (so the
@@ -885,6 +911,13 @@ pub struct AdditiveNttF128 {
     /// this separate preserves the compact fallback for unusually large
     /// domains while making every hot-path twiddle lookup O(1).
     precomputed_twiddles: Option<Arc<[F128]>>,
+}
+
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+struct SeedTopTwiddles {
+    seed_right: F128,
+    seed_dense: [F128; 3],
+    tw4: [[F128; 15]; 8],
 }
 
 /// Prefetch schedule for the seed-fused top pass's message gather.
@@ -1824,6 +1857,57 @@ impl AdditiveNttF128 {
         }
     }
 
+    fn build_seed_top_twiddles(&self) -> SeedTopTwiddles {
+        const LAYER: usize = 3;
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let tw4 = std::array::from_fn(|block| {
+            let mut tw = [F128::ZERO; 15];
+            tw[0] = self.twiddle(LAYER, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
+            }
+            tw
+        });
+        SeedTopTwiddles {
+            seed_right: seed_tw[0][2],
+            seed_dense: seed_tw[1],
+            tw4,
+        }
+    }
+
+    fn cached_standard_seed_top_twiddles(&self) -> Option<&'static SeedTopTwiddles> {
+        if ntt_seed_twiddle_cache_disabled() {
+            return None;
+        }
+        let dim = self.log_domain_size();
+        if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
+            return None;
+        }
+        let standard_evals = standard_evals_cell(dim).get()?;
+        if !Arc::ptr_eq(&self.evals, standard_evals) {
+            return None;
+        }
+        static TABLES: OnceLock<
+            [OnceLock<Box<SeedTopTwiddles>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1],
+        > = OnceLock::new();
+        let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+        Some(tables[dim].get_or_init(|| Box::new(self.build_seed_top_twiddles())))
+    }
+
     fn seed_top_fused8_pass(
         &self,
         msg: &[F128],
@@ -1850,35 +1934,49 @@ impl AdditiveNttF128 {
         let lanes2_tail = if quarter.is_multiple_of(2) { odd_tail } else { 0 };
         let row_len = num_ntts;
 
-        // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
-        let mut seed_tw = [[F128::ZERO; 3]; 2];
-        for (block, tw) in seed_tw.iter_mut().enumerate() {
-            tw[0] = self.twiddle(1, block);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(2, 2 * block + s);
-            }
-        }
-        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
-        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
-        let seed_right = seed_tw[0][2];
-        let seed_dense = seed_tw[1];
-
-        let tw4: Vec<[F128; 15]> = (0..8)
-            .map(|block| {
-                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                tw[0] = self.twiddle(LAYER, block);
+        // Standard-basis seed/top twiddles are public parameters. The ranked
+        // warm-up fills this process-lifetime bundle; measured proofs borrow
+        // it instead of rebuilding and allocating the same 8×15 table.
+        let cached_twiddles = self.cached_standard_seed_top_twiddles();
+        let fallback_twiddles = cached_twiddles.is_none().then(|| {
+            // Keep the incumbent allocation/construction spelling behind the
+            // kill switch and for custom bases.
+            let mut seed_tw = [[F128::ZERO; 3]; 2];
+            for (block, tw) in seed_tw.iter_mut().enumerate() {
+                tw[0] = self.twiddle(1, block);
                 for s in 0..2 {
-                    tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+                    tw[1 + s] = self.twiddle(2, 2 * block + s);
                 }
-                for s in 0..4 {
-                    tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
-                }
-                for s in 0..8 {
-                    tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
-                }
-                tw
-            })
-            .collect();
+            }
+            debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+            debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+            let tw4: Vec<[F128; 15]> = (0..8)
+                .map(|block| {
+                    let mut tw = [F128::ZERO; 15];
+                    tw[0] = self.twiddle(LAYER, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
+                    }
+                    for s in 0..8 {
+                        tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
+                    }
+                    tw
+                })
+                .collect();
+            (seed_tw[0][2], seed_tw[1], tw4)
+        });
+        let (seed_right, seed_dense, tw4): (F128, [F128; 3], &[[F128; 15]]) =
+            if let Some(tw) = cached_twiddles {
+                (tw.seed_right, tw.seed_dense, &tw.tw4)
+            } else {
+                let (right, dense, table) = fallback_twiddles
+                    .as_ref()
+                    .expect("fallback table built when cache is unavailable");
+                (*right, *dense, table)
+            };
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
@@ -4811,6 +4909,40 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cached_seed_top_twiddles_match_fallback_and_reuse() {
+        use std::sync::atomic::Ordering;
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = GUARD.lock().unwrap();
+
+        for dim in [9usize, 12, 17, 20] {
+            let ntt = AdditiveNttF128::standard(dim);
+            let fallback = ntt.build_seed_top_twiddles();
+
+            SEED_TWIDDLE_CACHE_TEST_OFF.store(false, Ordering::Relaxed);
+            let first = ntt
+                .cached_standard_seed_top_twiddles()
+                .expect("standard basis should use the seed twiddle cache");
+            let warm = ntt
+                .cached_standard_seed_top_twiddles()
+                .expect("warm cache should remain reachable");
+            assert_eq!(first, &fallback, "cached table mismatch at dim={dim}");
+            assert!(std::ptr::eq(first, warm), "dim={dim} cache was rebuilt");
+
+            SEED_TWIDDLE_CACHE_TEST_OFF.store(true, Ordering::Relaxed);
+            assert!(ntt.cached_standard_seed_top_twiddles().is_none());
+            SEED_TWIDDLE_CACHE_TEST_OFF.store(false, Ordering::Relaxed);
+
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            let custom = AdditiveNttF128::new(&basis);
+            assert_eq!(custom.build_seed_top_twiddles(), fallback);
+            assert!(
+                custom.cached_standard_seed_top_twiddles().is_none(),
+                "custom-basis constructor must retain the fallback"
+            );
         }
     }
 
