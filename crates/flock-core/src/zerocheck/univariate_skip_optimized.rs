@@ -2870,20 +2870,21 @@ fn process_one_x_hi_ab_only(
         // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
         // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
         // shared `add_scaled` leaf, which selects the architecture kernel.
-        let mut bank_f128 = [F128::ZERO; ELL];
         let wide = r1_eqfold_x4_enabled();
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
-            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            if wide {
-                crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
-                    &bank_f128,
-                    *eq_bot_val,
-                );
-            } else {
+        if wide {
+            for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+                let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_madd(bank, &mut state.partial_ab, *eq_bot_val);
+            }
+        } else {
+            let mut bank_f128 = [F128::ZERO; ELL];
+            for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+                let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
                 for lane in 0..ELL {
                     state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
                 }

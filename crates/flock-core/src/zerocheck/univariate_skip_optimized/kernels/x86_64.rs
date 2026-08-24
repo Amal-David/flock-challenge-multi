@@ -1828,3 +1828,57 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
         }
     }
 }
+
+/// [`c_plane_bank_to_f128_x86_avx512`] fused with `dst[i] += scale * lane[i]`.
+/// Same 8+8 plane loads, same byte-transposes, same `vpermt2q` interleave —
+/// the 64 F128s stay in ZMMs and the scale product is XORed into `partial`
+/// instead of a 1 KiB store/reload through a stack bank. Bit-identical to
+/// convert-then-`add_scaled`: GHASH is the field product and F128 add is XOR.
+///
+/// # Safety
+/// Features per the cfg/`target_feature` gate; `bank_planes` is 16×64 bytes
+/// and `partial` is 64 F128s.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")]
+pub(crate) unsafe fn c_plane_bank_madd_x86_avx512(
+    bank_planes: &[u8; 16 * ELL],
+    partial: &mut [F128; ELL],
+    scale: F128,
+) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    unsafe {
+        let src = bank_planes.as_ptr();
+        let lo_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(src.add(k * ELL) as *const __m512i));
+        let hi_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(src.add((8 + k) * ELL) as *const __m512i));
+        let los = byte_transpose_8x64::<false>(lo_rows);
+        let his = byte_transpose_8x64::<false>(hi_rows);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let scale_x4 =
+            _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let dst = partial.as_mut_ptr() as *mut __m512i;
+        for k in 0..8usize {
+            let v0 = _mm512_permutex2var_epi64(los[k], idx0, his[k]);
+            let v1 = _mm512_permutex2var_epi64(los[k], idx1, his[k]);
+            let p0 = _mm512_loadu_si512(dst.add(2 * k) as *const __m512i);
+            let p1 = _mm512_loadu_si512(dst.add(2 * k + 1) as *const __m512i);
+            _mm512_storeu_si512(
+                dst.add(2 * k),
+                _mm512_xor_si512(p0, ghash_mul_x4(scale_x4, v0)),
+            );
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_xor_si512(p1, ghash_mul_x4(scale_x4, v1)),
+            );
+        }
+    }
+}

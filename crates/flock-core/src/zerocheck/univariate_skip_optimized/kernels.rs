@@ -573,6 +573,42 @@ pub(super) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super
     }
 }
 
+/// Ranked default: fuse plane-bank reassembly with the `eq_bot` scale so the
+/// 64 F128s never bounce through a stack bank. `FLOCK_NO_R1_PLANE_MADD=1`
+/// restores convert-then-`add_scaled` (exact same-binary A/B).
+fn r1_plane_madd_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R1_PLANE_MADD").is_none())
+}
+
+/// `partial[i] += scale * f128(bank)[i]`. Bit-identical to
+/// [`c_plane_bank_to_f128`] then `f128_slice::add_scaled`.
+#[inline]
+pub(super) fn c_plane_bank_madd(
+    bank_planes: &[u8; 16 * 64],
+    partial: &mut [super::F128; 64],
+    scale: super::F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if r1_plane_madd_enabled() {
+        // SAFETY: cfg gate supplies the features; both arrays are fixed-size.
+        unsafe {
+            x86_64::c_plane_bank_madd_x86_avx512(bank_planes, partial, scale);
+        }
+        return;
+    }
+
+    let mut bank_f128 = [super::F128::ZERO; 64];
+    c_plane_bank_to_f128(bank_planes, &mut bank_f128);
+    crate::field::f128_slice::add_scaled(partial, &bank_f128, scale);
+}
+
 /// Ascending bulk fetch of one four-window C group into the worker staging
 /// buffer; see the kernel.
 #[cfg(all(
