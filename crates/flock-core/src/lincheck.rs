@@ -1018,6 +1018,21 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_REDUCE_INPLACE=1` restores the 1 KiB copy of worker 0's
+/// plane slab into a stack acc plus a zeroed `out`. Ranked default XORs
+/// sibling workers into worker 0's slab and writes `out` uninitialized
+/// (every slot is stored by the reconstruct).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_reduce_inplace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_INPLACE").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
 /// per-chunk `Instant::now()` probes inside the block-major sweep (the
 /// incumbent behaviour, and the way to get the tables / transpose+read /
@@ -1300,19 +1315,9 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
-        let base = blk * 1024;
-        let mut acc = [0u8; 1024];
-        acc.copy_from_slice(&planes[base..base + 1024]);
-        for w in 1..n_workers {
-            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
-            // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
-            // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
-            unsafe {
-                kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
-            }
-        }
+    let reconstruct = |acc: &[u8], o: &mut [F128]| {
+        debug_assert_eq!(acc.len(), 1024);
+        debug_assert_eq!(o.len(), 64);
         for (col, slot) in o.iter_mut().enumerate() {
             let mut lo = 0u64;
             let mut hi = 0u64;
@@ -1324,7 +1329,52 @@ fn fold_block_major_gfni(
             }
             *slot = F128 { lo, hi };
         }
-    });
+    };
+    let inplace = lc_reduce_inplace_enabled();
+    let mut out: Vec<F128> = if inplace {
+        crate::alloc_uninit_vec(k)
+    } else {
+        vec![F128::ZERO; k]
+    };
+    if inplace {
+        let slab = k * 16;
+        let (p0, rest) = planes.split_at_mut(slab);
+        let rest_ptr = rest.as_ptr() as usize;
+        p0.par_chunks_mut(1024)
+            .zip(out.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(blk, (acc, o))| {
+                for w in 1..n_workers {
+                    let src_off = (w - 1) * slab + blk * 1024;
+                    // SAFETY: `acc` is worker 0's 1 KiB column block; `src`
+                    // is the matching block of worker `w`, disjoint after the
+                    // fold join. XOR is bitwise, same as the stack-acc path.
+                    unsafe {
+                        kernels::xor_bytes_avx512(
+                            acc.as_mut_ptr(),
+                            (rest_ptr as *const u8).add(src_off),
+                            1024,
+                        );
+                    }
+                }
+                reconstruct(acc, o);
+            });
+    } else {
+        out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
+            let base = blk * 1024;
+            let mut acc = [0u8; 1024];
+            acc.copy_from_slice(&planes[base..base + 1024]);
+            for w in 1..n_workers {
+                let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+                // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
+                // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
+                unsafe {
+                    kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
+                }
+            }
+            reconstruct(&acc, o);
+        });
+    }
     out
 }
 
