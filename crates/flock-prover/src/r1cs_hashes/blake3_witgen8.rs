@@ -2128,3 +2128,5 @@ mod tests {
 // vbmi2draw-1: independent official timing sample of promoted fbc3001 VBMI2 W8 packer; no executable change.
 // rivaldraw-28 marker 76708 on 2758bc1
 // rivaldraw-37 marker 33507 on ca47b5d
+
+// rivaldraw-51 marker 10051 on 3172d51
