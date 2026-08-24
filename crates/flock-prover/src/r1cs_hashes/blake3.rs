@@ -1412,6 +1412,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
         use_nt,
         use_simd,
         witgen_simd::witgen_ab_nt_enabled(),
+        witgen_simd::witgen_stage_inline_enabled(),
     )
 }
 
@@ -1425,6 +1426,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     use_nt: bool,
     use_simd: bool,
     ab_nt: bool,
+    stage_inline: bool,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -1505,6 +1507,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            stage_inline,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -1528,7 +1531,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
+    let _ = (use_simd, ab_nt, stage_inline, a_tok, b_tok, z_tok);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let _ = (ab_nt, a_tok, b_tok, z_tok);
 
@@ -1664,15 +1667,64 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     (z, a, b, ab_inner)
 }
 
-/// One 64-byte line of a rayon task's fused a/b projection windows. A task
-/// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
-/// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
-/// total — allocated once per `for_each_init` bout and rewritten by every octa
-/// in the task, so it stays L1-resident. The `align(64)` is what the whole
-/// allocation inherits; nothing ever reads the field.
+/// One aligned 64-byte line of fused a/b projection scratch. The ranked
+/// streaming arm keeps 16 lines (1 KiB) inline; the non-streaming restore
+/// retains its 512-line (32 KiB) heap window.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const AB_WIN_LINES: usize = 2 * 8 * (K / 8) / 64;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const AB_STREAM_STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+
+/// Scratch owned by one Rayon folder. The ranked streaming arm needs only a
+/// 1 KiB staging pair, so keep it inline and avoid one allocator round trip
+/// per folder. The non-streaming restore still needs its 32 KiB window and
+/// deliberately remains heap-backed.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+enum AbWinScratch {
+    Empty,
+    Inline([core::mem::MaybeUninit<AbWinLine>; AB_STREAM_STAGE_LINES]),
+    Heap(Vec<core::mem::MaybeUninit<AbWinLine>>),
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl AbWinScratch {
+    fn new(ab_stream: bool, ab_nt: bool, stage_inline: bool) -> Self {
+        if ab_stream && stage_inline {
+            return Self::Inline(
+                [const { core::mem::MaybeUninit::uninit() }; AB_STREAM_STAGE_LINES],
+            );
+        }
+        let want = if ab_stream {
+            AB_STREAM_STAGE_LINES
+        } else if ab_nt {
+            AB_WIN_LINES
+        } else {
+            0
+        };
+        if want == 0 {
+            return Self::Empty;
+        }
+        let mut v = Vec::new();
+        v.reserve_exact(want);
+        // SAFETY: `MaybeUninit<T>` needs no initialization, and
+        // `reserve_exact` guaranteed the capacity.
+        unsafe { v.set_len(want) };
+        Self::Heap(v)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [core::mem::MaybeUninit<AbWinLine>] {
+        match self {
+            Self::Empty => &mut [],
+            Self::Inline(v) => v,
+            Self::Heap(v) => v,
+        }
+    }
+}
 
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
@@ -1705,6 +1757,7 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    stage_inline: bool,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -1712,10 +1765,6 @@ fn generate_round1_inner_octa(
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
-    // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
-    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
-    // 64-byte lines backing one task's streaming projection staging pair.
-    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
@@ -1741,36 +1790,15 @@ fn generate_round1_inner_octa(
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
-            || {
-                // Rayon splits this down to one bout per GROUP under stealing
-                // pressure, so the init runs about as often as the dump does —
-                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
-                // allocation (64-aligned via `AbWinLine`) and skips the fill;
-                // the dump writes every window byte before the projection
-                // reads any.
-                let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
-                    WIN_LINES
-                } else {
-                    0
-                };
-                if want != 0 {
-                    v.reserve_exact(want);
-                    // SAFETY: `MaybeUninit<T>` needs no initialization, and
-                    // `reserve_exact` guaranteed the capacity.
-                    unsafe { v.set_len(want) };
-                }
-                v
-            },
+            || AbWinScratch::new(ab_stream, ab_nt, stage_inline),
             |win, (g, (((z_out, a_out), b_out), ab_out))| {
+                let win = win.as_mut_slice();
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
                 let win_ab = if ab_nt && !ab_stream {
-                    debug_assert_eq!(win.len(), WIN_LINES);
+                    debug_assert_eq!(win.len(), AB_WIN_LINES);
                     let wa = win.as_mut_ptr().cast::<u32>();
                     // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
                     Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
@@ -1778,7 +1806,7 @@ fn generate_round1_inner_octa(
                     None
                 };
                 let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
+                    debug_assert_eq!(win.len(), AB_STREAM_STAGE_LINES);
                     Some(win.as_mut_ptr().cast::<u32>())
                 } else {
                     None
@@ -2206,6 +2234,15 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_ab_winstream_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_WINSTREAM").is_none());
+        *ON
+    }
+
+    /// Keep the default streaming projection's 1 KiB staging pair inline in
+    /// the Rayon folder state. `FLOCK_NO_WITGEN_STAGE_INLINE=1` restores the
+    /// prior heap-backed staging Vec for a same-binary comparison.
+    pub(crate) fn witgen_stage_inline_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_STAGE_INLINE").is_none());
         *ON
     }
 
@@ -4102,6 +4139,7 @@ mod tests {
                     false,
                     true,
                     true,
+                    true,
                 );
             let (z_t, a_t, b_t, mut ab_t) =
                 generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
@@ -4110,6 +4148,7 @@ mod tests {
                     false,
                     true,
                     false,
+                    true,
                 );
 
             assert_eq!(z_f, z_t, "z mismatch, n_blocks={n_blocks}");
@@ -4121,6 +4160,139 @@ mod tests {
                 &ab_f.as_bytes_mut()[skip..],
                 &ab_t.as_bytes_mut()[skip..],
                 "ab_inner mismatch, n_blocks={n_blocks}"
+            );
+        }
+    }
+
+    /// The ranked winstream arm keeps exactly 1 KiB inline and the kill
+    /// switch restores the prior 1 KiB heap Vec. The non-streaming 32 KiB
+    /// window and the no-window arm retain their incumbent representations.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn winstream_inline_stage_geometry_and_fallbacks() {
+        let mut inline = AbWinScratch::new(true, true, true);
+        assert!(matches!(&inline, AbWinScratch::Inline(_)));
+        assert_eq!(inline.as_mut_slice().len(), AB_STREAM_STAGE_LINES);
+        assert_eq!(
+            inline.as_mut_slice().len() * core::mem::size_of::<AbWinLine>(),
+            1024
+        );
+        assert_eq!(inline.as_mut_slice().as_ptr() as usize % 64, 0);
+
+        let mut restored = AbWinScratch::new(true, true, false);
+        assert!(matches!(&restored, AbWinScratch::Heap(_)));
+        assert_eq!(restored.as_mut_slice().len(), AB_STREAM_STAGE_LINES);
+        assert_eq!(restored.as_mut_slice().as_ptr() as usize % 64, 0);
+
+        let mut nonstream = AbWinScratch::new(false, true, true);
+        assert!(matches!(&nonstream, AbWinScratch::Heap(_)));
+        assert_eq!(nonstream.as_mut_slice().len(), AB_WIN_LINES);
+        assert_eq!(
+            nonstream.as_mut_slice().len() * core::mem::size_of::<AbWinLine>(),
+            32 * 1024
+        );
+
+        let mut empty = AbWinScratch::new(false, false, true);
+        assert!(matches!(&empty, AbWinScratch::Empty));
+        assert!(empty.as_mut_slice().is_empty());
+    }
+
+    /// Same winstream arithmetic and publication, changing only whether its
+    /// 1 KiB scratch lives inline or in the incumbent Vec. Covers one octa,
+    /// one full GROUP, a padded tail, and both sides of the 512-block seam.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn round1_inner_stage_inline_matches_heap() {
+        assert!(witgen_simd::witgen_ab_winstream_enabled());
+        for &n_blocks in &[8usize, 16, 27, 511, 512, 513] {
+            let mut rng = Rng::new(0x57A6_1A11 ^ n_blocks as u64);
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                    (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+                })
+                .collect();
+            let n_log = min_n_blocks_log(n_blocks);
+
+            let (z_h, a_h, b_h, mut ab_h) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    crate::seed_pipe::BlockSource::Slice(&blocks),
+                    n_log,
+                    false,
+                    true,
+                    true,
+                    false,
+                );
+            let (z_i, a_i, b_i, mut ab_i) =
+                generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                    crate::seed_pipe::BlockSource::Slice(&blocks),
+                    n_log,
+                    false,
+                    true,
+                    true,
+                    true,
+                );
+
+            assert_eq!(z_h, z_i, "z mismatch, n_blocks={n_blocks}");
+            assert_eq!(a_h, a_i, "a mismatch, n_blocks={n_blocks}");
+            assert_eq!(b_h, b_i, "b mismatch, n_blocks={n_blocks}");
+            let skip = ab_h.invalid_prefix_bytes();
+            assert_eq!(skip, ab_i.invalid_prefix_bytes());
+            assert_eq!(
+                &ab_h.as_bytes_mut()[skip..],
+                &ab_i.as_bytes_mut()[skip..],
+                "ab_inner mismatch, n_blocks={n_blocks}"
+            );
+        }
+    }
+
+    /// Exercise the folder state under a serial pool and a stealing-prone
+    /// 16-thread pool. Kept ignored because it materializes four m=26 witness
+    /// sets; run alone on x86 with `--ignored --exact`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    #[ignore]
+    fn round1_inner_stage_inline_matches_heap_1t_16t_stealing() {
+        let n_blocks = 1usize << 12;
+        let mut rng = Rng::new(0x57EA_1160);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let n_log = min_n_blocks_log(n_blocks);
+        for threads in [1usize, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let run = |stage_inline| {
+                pool.install(|| {
+                    generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                        crate::seed_pipe::BlockSource::Slice(&blocks),
+                        n_log,
+                        false,
+                        true,
+                        true,
+                        stage_inline,
+                    )
+                })
+            };
+            let (z_h, a_h, b_h, mut ab_h) = run(false);
+            let (z_i, a_i, b_i, mut ab_i) = run(true);
+            assert_eq!(z_h, z_i, "z mismatch at {threads} threads");
+            assert_eq!(a_h, a_i, "a mismatch at {threads} threads");
+            assert_eq!(b_h, b_i, "b mismatch at {threads} threads");
+            let skip = ab_h.invalid_prefix_bytes();
+            assert_eq!(skip, ab_i.invalid_prefix_bytes());
+            assert_eq!(
+                &ab_h.as_bytes_mut()[skip..],
+                &ab_i.as_bytes_mut()[skip..],
+                "ab_inner mismatch at {threads} threads"
             );
         }
     }
@@ -4206,6 +4378,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    true,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
@@ -4632,6 +4805,63 @@ mod tests {
             .verify(&commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("ligerito verify rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
+    }
+
+    /// Full-proof transcript oracle for the heap restore versus the default
+    /// inline winstream stage. Run alone on x86 with `--ignored --exact`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    #[ignore]
+    fn winstream_inline_stage_proof_bytes_identical() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0x57A6_EF00);
+        let blocks: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, 0u64, 64u32, 11u32)
+            })
+            .collect();
+
+        let prove = |stage_inline| {
+            let (z, a, b, ab_inner) = generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
+                crate::seed_pipe::BlockSource::Slice(&blocks),
+                setup.n_blocks_log(),
+                false,
+                true,
+                true,
+                stage_inline,
+            );
+            let mut challenger = FsChallenger::new(b"flock-winstream-inline-v0");
+            crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                ab_inner,
+                setup.r1cs.csc_lincheck_circuit(),
+                None,
+                &mut challenger,
+            )
+        };
+
+        let (proof_heap, commit_heap, claim_heap) = prove(false);
+        let (proof_inline, commit_inline, claim_inline) = prove(true);
+        assert_eq!(commit_heap.root, commit_inline.root);
+        assert_eq!(claim_heap, claim_inline);
+        assert_eq!(
+            bincode::serialize(&proof_heap).unwrap(),
+            bincode::serialize(&proof_inline).unwrap(),
+            "inline-stage proof must be byte-identical to the heap restore"
+        );
+
+        let mut challenger = FsChallenger::new(b"flock-winstream-inline-v0");
+        let claim_v = setup
+            .verify(&commit_inline, &proof_inline, &mut challenger)
+            .unwrap_or_else(|e| panic!("verify rejected inline-stage proof: {e:?}"));
+        assert_eq!(claim_inline, claim_v);
     }
 
     /// Transcript oracle for the opt-in merged pcs-combine kernel: at m = 29
