@@ -743,11 +743,22 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
     }
 }
 
+/// `FLOCK_NO_NTT_SEED_HOLD4_X2=1` restores the 4-lane hold-4 body (one
+/// independent 4-lane chunk per iteration). Default ON: two independent
+/// 4-lane chunks in the same leaf, same algebra and stores. Read once per
+/// process, outside every lane loop.
+#[inline]
+fn seed_hold4_x2_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4_X2").is_some())
+}
+
 /// One four-row message load feeds both seed staging groups: sparse block-0
 /// (`t_outer = t_inner_a = 0`) and dense block-1. Algebra of each group is
-/// copied from the two-call form; destinations are the same. Live set is the
-/// four original ZMMs plus three sparse working copies plus twiddle
-/// broadcasts — not 32.
+/// copied from the two-call form; destinations are the same. Live set is two
+/// independent 4-lane chunks (eight original ZMMs + six sparse working
+/// copies) plus twiddle broadcasts — still under SPR's 32, not the 64-ZMM
+/// class. `FLOCK_NO_NTT_SEED_HOLD4_X2=1` keeps a single chunk.
 ///
 /// # Safety
 /// Same geometry as the two-call form. `dst_sparse` / `dst_dense` must not
@@ -769,8 +780,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     pf_src: *const F128,
 ) {
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false>(
+        match (mul_diet_disabled(), seed_hold4_x2_disabled()) {
+            (true, true) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -781,9 +792,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 right_twiddle,
                 dense_tw,
                 pf_src,
-            )
-        } else {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true>(
+            ),
+            (true, false) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
                 src,
                 src_quarter,
                 src_r,
@@ -794,7 +804,31 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 right_twiddle,
                 dense_tw,
                 pf_src,
-            )
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, false>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                pf_src,
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                pf_src,
+            ),
         }
     }
 }
@@ -804,7 +838,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool>(
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
+    const DIET: bool,
+    const X2: bool,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -830,6 +867,85 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        if X2 {
+            while lane + 8 <= lanes {
+                if pf {
+                    let off0 = lane * core::mem::size_of::<F128>();
+                    let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                    for i in 0..4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                    }
+                }
+                let zero = _mm512_setzero_si512();
+                let mut v = [[zero; 4]; 2];
+                for c in 0..2 {
+                    let off = lane + 4 * c;
+                    v[c][0] = _mm512_loadu_si512(src_row(0).add(off) as *const __m512i);
+                    v[c][1] = _mm512_loadu_si512(src_row(1).add(off) as *const __m512i);
+                    v[c][2] = _mm512_loadu_si512(src_row(2).add(off) as *const __m512i);
+                    v[c][3] = _mm512_loadu_si512(src_row(3).add(off) as *const __m512i);
+                }
+
+                let mut sb = [v[0][1], v[1][1]];
+                let mut sc = [
+                    _mm512_xor_si512(v[0][2], v[0][0]),
+                    _mm512_xor_si512(v[1][2], v[1][0]),
+                ];
+                let mut sd = [
+                    _mm512_xor_si512(v[0][3], v[0][1]),
+                    _mm512_xor_si512(v[1][3], v[1][1]),
+                ];
+                sb[0] = _mm512_xor_si512(sb[0], v[0][0]);
+                sb[1] = _mm512_xor_si512(sb[1], v[1][0]);
+                let nc0 = _mm512_xor_si512(sc[0], mul_x4::<false, DIET>(sparse_b, sd[0]));
+                let nc1 = _mm512_xor_si512(sc[1], mul_x4::<false, DIET>(sparse_b, sd[1]));
+                sd[0] = _mm512_xor_si512(sd[0], nc0);
+                sd[1] = _mm512_xor_si512(sd[1], nc1);
+                sc[0] = nc0;
+                sc[1] = nc1;
+                for c in 0..2 {
+                    let off = lane + 4 * c;
+                    _mm512_storeu_si512(sp_row(0).add(off) as *mut __m512i, v[c][0]);
+                    _mm512_storeu_si512(sp_row(1).add(off) as *mut __m512i, sb[c]);
+                    _mm512_storeu_si512(sp_row(2).add(off) as *mut __m512i, sc[c]);
+                    _mm512_storeu_si512(sp_row(3).add(off) as *mut __m512i, sd[c]);
+                }
+
+                let na0 = _mm512_xor_si512(v[0][0], mul_x4::<false, DIET>(outer, v[0][2]));
+                let na1 = _mm512_xor_si512(v[1][0], mul_x4::<false, DIET>(outer, v[1][2]));
+                v[0][2] = _mm512_xor_si512(v[0][2], na0);
+                v[1][2] = _mm512_xor_si512(v[1][2], na1);
+                v[0][0] = na0;
+                v[1][0] = na1;
+                let nb0 = _mm512_xor_si512(v[0][1], mul_x4::<false, DIET>(outer, v[0][3]));
+                let nb1 = _mm512_xor_si512(v[1][1], mul_x4::<false, DIET>(outer, v[1][3]));
+                v[0][3] = _mm512_xor_si512(v[0][3], nb0);
+                v[1][3] = _mm512_xor_si512(v[1][3], nb1);
+                v[0][1] = nb0;
+                v[1][1] = nb1;
+                let na0 = _mm512_xor_si512(v[0][0], mul_x4::<false, DIET>(inner_a, v[0][1]));
+                let na1 = _mm512_xor_si512(v[1][0], mul_x4::<false, DIET>(inner_a, v[1][1]));
+                v[0][1] = _mm512_xor_si512(v[0][1], na0);
+                v[1][1] = _mm512_xor_si512(v[1][1], na1);
+                v[0][0] = na0;
+                v[1][0] = na1;
+                let nc0 = _mm512_xor_si512(v[0][2], mul_x4::<false, DIET>(inner_b, v[0][3]));
+                let nc1 = _mm512_xor_si512(v[1][2], mul_x4::<false, DIET>(inner_b, v[1][3]));
+                v[0][3] = _mm512_xor_si512(v[0][3], nc0);
+                v[1][3] = _mm512_xor_si512(v[1][3], nc1);
+                v[0][2] = nc0;
+                v[1][2] = nc1;
+                for c in 0..2 {
+                    let off = lane + 4 * c;
+                    _mm512_storeu_si512(dn_row(0).add(off) as *mut __m512i, v[c][0]);
+                    _mm512_storeu_si512(dn_row(1).add(off) as *mut __m512i, v[c][1]);
+                    _mm512_storeu_si512(dn_row(2).add(off) as *mut __m512i, v[c][2]);
+                    _mm512_storeu_si512(dn_row(3).add(off) as *mut __m512i, v[c][3]);
+                }
+                lane += 8;
+            }
+        }
         while lane < lanes {
             if pf {
                 let off = lane * core::mem::size_of::<F128>();
@@ -1902,6 +2018,83 @@ mod diet_tests {
                 dst
             };
             assert_eq!(run_sparse(true), run_sparse(false), "sparse len={len}");
+
+            let run_hold4 = |diet: bool, x2: bool| {
+                let mut sp = vec![F128::ZERO; 4 * len];
+                let mut dn = vec![F128::ZERO; 4 * len];
+                // SAFETY: 4 rows of `len` lanes, src/sp/dn pairwise disjoint.
+                unsafe {
+                    match (diet, x2) {
+                        (false, false) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
+                                src.as_ptr(),
+                                1,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                1,
+                                len,
+                                right,
+                                &tw3,
+                                core::ptr::null(),
+                            )
+                        }
+                        (false, true) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+                                src.as_ptr(),
+                                1,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                1,
+                                len,
+                                right,
+                                &tw3,
+                                core::ptr::null(),
+                            )
+                        }
+                        (true, false) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, false>(
+                                src.as_ptr(),
+                                1,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                1,
+                                len,
+                                right,
+                                &tw3,
+                                core::ptr::null(),
+                            )
+                        }
+                        (true, true) => {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                                src.as_ptr(),
+                                1,
+                                0,
+                                sp.as_mut_ptr(),
+                                dn.as_mut_ptr(),
+                                1,
+                                len,
+                                right,
+                                &tw3,
+                                core::ptr::null(),
+                            )
+                        }
+                    }
+                }
+                (sp, dn)
+            };
+            let want_sp = run_sparse(true);
+            let want_dn = run_from(true);
+            for diet in [true, false] {
+                for x2 in [false, true] {
+                    let (got_sp, got_dn) = run_hold4(diet, x2);
+                    assert_eq!(got_sp, want_sp, "hold4 sparse diet={diet} x2={x2} len={len}");
+                    assert_eq!(got_dn, want_dn, "hold4 dense diet={diet} x2={x2} len={len}");
+                }
+            }
+
 
             // --- fused four-layer -----------------------------------------
             let mut tw15 = [F128::ZERO; 15];
