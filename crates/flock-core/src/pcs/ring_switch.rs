@@ -3013,7 +3013,8 @@ pub fn prove_batched_padded<Ch: Challenger>(
 ///
 /// `precomputed_s_hat_v` must be `&[]` (no precomputes) or have length equal
 /// to `x_outers.len()`. Each entry is either the ordinary `2^LOG_PACKING`
-/// statistic or four consecutive banks retaining the low two suffix bits.
+/// statistic, a retained-coordinate tensor, or the ranked lincheck bundle:
+/// 64 Fold8 banks followed by the already-bound canonical statistic.
 ///
 /// Output is **byte-identical** to [`prove_batched_padded`] when the precomputed
 /// `s_hat_v` is honest (matches what `fold_1b_rows` would produce). Transcript
@@ -3080,8 +3081,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             p.len() == n_packed
                 || p.len() == 4 * n_packed
                 || p.len() == 16 * n_packed
-                || p.len() == 64 * n_packed,
-            "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, or 64·2^LOG_PACKING"
+                || p.len() == 64 * n_packed
+                || p.len() == 65 * n_packed,
+            "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, 64·2^LOG_PACKING, or the 65·2^LOG_PACKING Fold8+canonical bundle"
         );
     }
 
@@ -3179,7 +3181,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // Fill precomputed slots first.
     for d in 0..dense_suffixes.len() {
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
-            dense_s_hat_v[d] = if p.len() == 64 * n_packed {
+            dense_s_hat_v[d] = if p.len() == 65 * n_packed {
+                p[64 * n_packed..].to_vec()
+            } else if p.len() == 64 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
@@ -3208,7 +3212,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .copied()
             .flatten()
         {
-            sparse_s_hat_v[s] = if p.len() == 64 * n_packed {
+            sparse_s_hat_v[s] = if p.len() == 65 * n_packed {
+                p[64 * n_packed..].to_vec()
+            } else if p.len() == 64 * n_packed {
                 assert!(
                     sparse_suffixes[s].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
@@ -3314,8 +3320,15 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+            .and_then(|precomputed| {
+                if precomputed.len() == 64 * n_packed {
+                    Some(precomputed.to_vec())
+                } else if precomputed.len() == 65 * n_packed {
+                    Some(precomputed[..64 * n_packed].to_vec())
+                } else {
+                    None
+                }
+            });
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
@@ -4505,6 +4518,32 @@ mod tests {
             u2 += (f0 + f1) * (b0 + b1);
         }
         assert_eq!(factors.round0, (u0, u2));
+
+        // Bundled intake routes the canonical tail to the wire and preserves
+        // the Fold8 prefix for direct factors, without collapsing that prefix.
+        let mut bundled = Vec::with_capacity(65 * n_packed);
+        bundled.extend_from_slice(&fold8);
+        bundled.extend_from_slice(&ordinary);
+        let mut bundled_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
+        let (bundled_result, bundled_gammas) = prove_batched_padded_with_precomputed(
+            &packed, &[&point], &[Some(&bundled)], &padding, &mut bundled_challenger,
+        );
+        assert_eq!(bundled_gammas, baseline_gammas);
+        assert_eq!(bundled_result[0].0, baseline[0].0);
+        let bundled_factors = bundled_result[0].1.direct_fold8.as_ref().unwrap();
+        assert_eq!(bundled_factors.a_state, factors.a_state);
+        assert_eq!(bundled_factors.w_state, factors.w_state);
+
+        // Poison only Fold8: the wire remains canonical-identical while the
+        // direct factor state changes. This is a routing oracle for no-collapse.
+        bundled[0] += F128::ONE;
+        let mut routed_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
+        let (routed, routed_gammas) = prove_batched_padded_with_precomputed(
+            &packed, &[&point], &[Some(&bundled)], &padding, &mut routed_challenger,
+        );
+        assert_eq!(routed_gammas, baseline_gammas);
+        assert_eq!(routed[0].0, baseline[0].0);
+        assert_ne!(routed[0].1.direct_fold8.as_ref().unwrap().a_state, factors.a_state);
     }
 
     #[test]

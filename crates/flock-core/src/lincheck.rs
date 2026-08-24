@@ -2233,6 +2233,37 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
+/// Ranked dual-boundary capture wrapper. Keeping allocation and copies behind
+/// this non-inlined call prevents LLVM from peeling the transcript loop around
+/// `t == 0` / `t == 6`; only the selected monomorph carries those round bits.
+#[inline(never)]
+fn sumcheck_bind_both_and_eval_next_capture(
+    comb: &mut Vec<F128>,
+    z: &mut Vec<F128>,
+    r: F128,
+    capture_fold8: bool,
+    capture_canonical: bool,
+    captured: &mut Option<Vec<F128>>,
+) -> (F128, F128) {
+    let next = sumcheck_bind_both_and_eval_next(comb, z, r);
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    if capture_fold8 {
+        debug_assert_eq!(z.len(), 64 * n_packed);
+        // Reserve final capacity now, so appending the canonical tail cannot
+        // realloc and copy the 8192-element (128 KiB) Fold8 prefix.
+        let mut bundled = Vec::with_capacity(65 * n_packed);
+        bundled.extend_from_slice(z);
+        *captured = Some(bundled);
+    } else if capture_canonical {
+        debug_assert_eq!(z.len(), n_packed);
+        captured
+            .as_mut()
+            .expect("ranked chain must reach Fold8 before canonical")
+            .extend_from_slice(z);
+    }
+    next
+}
+
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
@@ -2241,6 +2272,13 @@ enum PackedZ<'a> {
     LincheckStripe(&'a [u8]),
     BlockMajor(&'a [F128]),
 }
+
+// Compile-time policies keep ordinary/pre-sumcheck bodies independent from
+// the ranked dual-boundary variant. No runtime mode branch or capture state is
+// introduced into incumbent monomorphizations.
+const CAPTURE_NONE: u8 = 0;
+const CAPTURE_PRE_SUMCHECK: u8 = 1;
+const CAPTURE_FOLD8_AND_CANONICAL: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Last-ρ leftover z-fold (wait-not-join)
@@ -2445,7 +2483,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _) = prove_padded_inner::<CAPTURE_NONE, Ch>(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2453,7 +2491,6 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
         challenger,
     );
     (proof, claim)
@@ -2478,7 +2515,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured) = prove_padded_inner::<CAPTURE_PRE_SUMCHECK, Ch>(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2486,7 +2523,6 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
         challenger,
     );
     (
@@ -2510,7 +2546,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured) = prove_padded_inner::<CAPTURE_PRE_SUMCHECK, Ch>(
         PackedZ::BlockMajor(z_packed),
         m,
         k_log,
@@ -2518,7 +2554,6 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
         challenger,
     );
     (
@@ -2528,8 +2563,43 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     )
 }
 
+/// Exact ranked block-major specialization returning the 64-bank Fold8 tensor
+/// followed by its already-bound canonical `s_hat_v`, in one pre-sized owned
+/// bundle. Both captures reuse lincheck's in-place sumcheck chain.
 #[allow(clippy::too_many_arguments)]
-fn prove_padded_inner<Ch: Challenger>(
+pub fn prove_padded_capture_fold8_and_canonical_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    assert_eq!(k_log, 14, "fold-chain capture fixes ranked k_log=14");
+    assert_eq!(k_skip, 6, "fold-chain capture fixes ranked k_skip=6");
+    let (proof, claim, captured) =
+        prove_padded_inner::<CAPTURE_FOLD8_AND_CANONICAL, Ch>(
+            PackedZ::BlockMajor(z_packed),
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            circuit,
+            x_ab,
+            challenger,
+        );
+    (
+        proof,
+        claim,
+        captured.expect("ranked fold-chain capture must produce bundled statistics"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn prove_padded_inner<const CAPTURE: u8, Ch: Challenger>(
     z_packed: PackedZ<'_>,
     m: usize,
     k_log: usize,
@@ -2537,9 +2607,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+    debug_assert!(CAPTURE <= CAPTURE_FOLD8_AND_CANONICAL);
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -2676,7 +2746,7 @@ fn prove_padded_inner<Ch: Challenger>(
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    let mut captured_z_vec: Option<Vec<F128>> = if CAPTURE == CAPTURE_PRE_SUMCHECK {
         Some(z_vec.clone())
     } else {
         None
@@ -2707,7 +2777,18 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = if CAPTURE == CAPTURE_FOLD8_AND_CANONICAL {
+                    sumcheck_bind_both_and_eval_next_capture(
+                        &mut comb_vec,
+                        &mut z_vec,
+                        r,
+                        t == 0,
+                        t == 6,
+                        &mut captured_z_vec,
+                    )
+                } else {
+                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
+                };
                 e1 = ne1;
                 einf = neinf;
             } else {
@@ -2716,6 +2797,13 @@ fn prove_padded_inner<Ch: Challenger>(
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
         }
+    }
+    if CAPTURE == CAPTURE_FOLD8_AND_CANONICAL {
+        assert_eq!(
+            captured_z_vec.as_ref().map(Vec::len),
+            Some(65 * (1usize << crate::pcs::LOG_PACKING)),
+            "ranked chain must capture Fold8 plus canonical s_hat_v"
+        );
     }
     if let Some(t) = t_sumcheck_start {
         eprintln!(
@@ -3901,6 +3989,67 @@ mod tests {
             let z_eval = mle_eval_bool(&z, &point);
             assert_eq!(z_partial[i_inner], z_eval, "i_inner={i_inner}");
         }
+    }
+
+    struct ZeroCircuit(usize);
+
+    impl LincheckCircuit for ZeroCircuit {
+        fn n_cols(&self) -> usize { self.0 }
+        fn fold_alpha_batched(&self, _alpha: F128, _eq_inner: &[F128]) -> Vec<F128> {
+            vec![F128::ZERO; self.0]
+        }
+    }
+
+    #[test]
+    fn fold_chain_capture_boundaries_match_ring_switch_oracles() {
+        use crate::pcs::ring_switch::{s_hat_v_fold8_from_z_vec, s_hat_v_from_z_vec};
+        let mut rng = Rng::new(0xB1C0_11EC_7A11);
+        for mode in 0..3 {
+            let initial = rng.f128_vec(1 << 14);
+            let inner_rest = match mode {
+                0 => vec![F128::ZERO; 8],
+                1 => vec![F128::ONE; 8],
+                _ => rng.f128_vec(8),
+            };
+            let want_fold8 = s_hat_v_fold8_from_z_vec(&initial, &inner_rest[1..]);
+            let want_canonical = s_hat_v_from_z_vec(&initial, &inner_rest[1..]);
+            let mut folded = initial;
+            let mut got_fold8 = None;
+            let mut got_canonical = None;
+            for (t, r) in inner_rest.iter().copied().rev().enumerate() {
+                sumcheck_bind_top_in_place_par(&mut folded, r);
+                if t == 0 { got_fold8 = Some(folded.clone()); }
+                if t == 6 { got_canonical = Some(folded.clone()); }
+            }
+            assert_eq!(got_fold8.unwrap(), want_fold8, "mode={mode}");
+            assert_eq!(got_canonical.unwrap(), want_canonical, "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn block_major_fold_chain_capture_preserves_proof_and_claim() {
+        use crate::challenger::FsChallenger;
+        use crate::pcs::ring_switch::{s_hat_v_fold8_from_z_vec, s_hat_v_from_z_vec};
+        const M: usize = 17;
+        const K_LOG: usize = 14;
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0xB1C0_11EC_0A11);
+        let z = rng.f128_vec(1usize << (M - 7));
+        let point = random_quirky_point(M, K_LOG, K_SKIP, &mut rng);
+        let circuit = ZeroCircuit(1 << K_LOG);
+        let mut ch0 = FsChallenger::new(b"lincheck-fold-capture");
+        let (p0, c0, z_pre) = prove_padded_capture_z_vec_block_major(
+            &z, M, K_LOG, K_SKIP, 1 << K_LOG, &circuit, &point, &mut ch0,
+        );
+        let mut ch1 = FsChallenger::new(b"lincheck-fold-capture");
+        let (p1, c1, captured) = prove_padded_capture_fold8_and_canonical_block_major(
+            &z, M, K_LOG, K_SKIP, 1 << K_LOG, &circuit, &point, &mut ch1,
+        );
+        assert_eq!(p1, p0);
+        assert_eq!(c1, c0);
+        let n = 1usize << crate::pcs::LOG_PACKING;
+        assert_eq!(&captured[..64 * n], s_hat_v_fold8_from_z_vec(&z_pre, &c0.r_inner_rest[1..]));
+        assert_eq!(&captured[64 * n..], s_hat_v_from_z_vec(&z_pre, &c0.r_inner_rest[1..]));
     }
 
     // ---- End-to-end prove/verify roundtrip on honest data ----
