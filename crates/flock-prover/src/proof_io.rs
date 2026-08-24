@@ -165,8 +165,12 @@ impl R1csProofBundleLigerito {
         // struct encoding is untagged field concatenation, so appending the
         // last field reproduces the single-shot encode byte-for-byte; the
         // fingerprint gate below guarantees the stash is for THIS bundle.
-        if let Some(mut out) = take_matching_pre_encoded(self) {
-            encode_pcs_open_into(&mut out, &self.proof.pcs_open);
+        if let Some((mut out, has_l0)) = take_matching_pre_encoded(self) {
+            if has_l0 {
+                encode_ligerito_suffix_into(&mut out, &self.proof.pcs_open.ligerito);
+            } else {
+                encode_pcs_open_into(&mut out, &self.proof.pcs_open);
+            }
             return out;
         }
         // Ranked m=32 proofs serialize to ~437-440 KB; reserving up front
@@ -224,6 +228,21 @@ struct PreEncodedPrefix {
     /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
     /// bundle so the publish-tail `pcs_open` append never reallocates.
     bytes: Vec<u8>,
+    /// Present only when the same output backing already contains the ordered
+    /// `ring_switches || initial_root || initial_proof` prefix.
+    pcs_l0: Option<PcsL0Fingerprint>,
+}
+
+#[derive(Clone, Copy)]
+struct PcsL0Fingerprint {
+    initial_root: MerkleHash,
+    ring_ptr: usize,
+    ring_len: usize,
+    rows_ptr: usize,
+    rows_len: usize,
+    merkle_ptr: usize,
+    merkle_len: usize,
+    encoded_len: usize,
 }
 
 /// Latest stashed prefix. Process-global and single-slot: the ranked worker
@@ -239,6 +258,126 @@ pub(crate) fn pre_encode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
 }
 
+fn l0_pre_encode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    pre_encode_enabled()
+        && fast_pcs_open_encode_enabled()
+        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_L0_PRE_ENCODE").is_none())
+}
+
+enum L0PreEncodeMessage {
+    RingSwitches(std::sync::Arc<Vec<RingSwitchProof>>),
+    InitialProof(MerkleHash, std::sync::Arc<RecursiveProof>),
+    Abort,
+}
+
+/// One helper owns the final-capacity output Vec from prefix allocation until
+/// either the ranked L0 slice is complete or the session falls back to the
+/// incumbent plain prefix. The channel transports only cheap Arc handles.
+pub(crate) struct PreEncodeSession {
+    tx: Option<std::sync::mpsc::SyncSender<L0PreEncodeMessage>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    ring_sent: bool,
+    initial_sent: bool,
+}
+
+impl PreEncodeSession {
+    pub(crate) fn spawn(
+        commitment: Commitment,
+        zerocheck: flock_core::zerocheck::ZerocheckProof,
+        lincheck: flock_core::lincheck::LincheckProof,
+    ) -> Self {
+        // A worker panic or early channel failure must fall back to a fresh
+        // full encode, never leave a same-root stash from an earlier prove.
+        if let Ok(mut slot) = PRE_ENCODED.lock() {
+            *slot = None;
+        }
+        let (tx, rx) = if l0_pre_encode_enabled() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let worker = std::thread::spawn(move || {
+            let prefix = build_pre_encoded_prefix(&commitment, &zerocheck, &lincheck);
+            let prefix = match rx {
+                Some(rx) => extend_pre_encoded_l0(prefix, &rx),
+                None => prefix,
+            };
+            store_pre_encoded_prefix(prefix);
+        });
+        Self {
+            tx,
+            worker: Some(worker),
+            ring_sent: false,
+            initial_sent: false,
+        }
+    }
+
+    pub(crate) fn l0_sink(&mut self) -> Option<&mut dyn flock_core::pcs::L0PreEncodeSink> {
+        self.tx.as_ref()?;
+        Some(self)
+    }
+
+    pub(crate) fn finish_worker(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        if !self.initial_sent {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(L0PreEncodeMessage::Abort);
+            }
+        }
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl flock_core::pcs::L0PreEncodeSink for PreEncodeSession {
+    fn ring_switches_ready(
+        &mut self,
+        ring_switches: std::sync::Arc<Vec<RingSwitchProof>>,
+    ) -> bool {
+        if self.ring_sent || self.initial_sent {
+            return false;
+        }
+        let sent = self
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(L0PreEncodeMessage::RingSwitches(ring_switches)).is_ok());
+        self.ring_sent = sent;
+        sent
+    }
+
+    fn initial_proof_ready(
+        &mut self,
+        initial_root: MerkleHash,
+        initial_proof: std::sync::Arc<RecursiveProof>,
+    ) -> bool {
+        if !self.ring_sent || self.initial_sent {
+            return false;
+        }
+        let sent = self.tx.as_ref().is_some_and(|tx| {
+            tx.send(L0PreEncodeMessage::InitialProof(initial_root, initial_proof))
+                .is_ok()
+        });
+        self.initial_sent = sent;
+        sent
+    }
+
+    fn finish(&mut self) {
+        self.finish_worker();
+    }
+}
+
+impl Drop for PreEncodeSession {
+    fn drop(&mut self) {
+        self.finish_worker();
+    }
+}
+
 /// Encode and stash the publish prefix for a prove whose commitment /
 /// zerocheck / lincheck are final. Called by the prover on a detached helper
 /// thread concurrently with the PCS open (tens of µs of alloc + encode
@@ -251,6 +390,18 @@ pub fn stash_pre_encoded_prefix(
     if !pre_encode_enabled() {
         return;
     }
+    store_pre_encoded_prefix(build_pre_encoded_prefix(
+        commitment,
+        zerocheck,
+        lincheck,
+    ));
+}
+
+fn build_pre_encoded_prefix(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+) -> PreEncodedPrefix {
     // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
     // append extends this exact Vec, so it must never need to grow.
     let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
@@ -265,16 +416,53 @@ pub fn stash_pre_encoded_prefix(
     mark = bytes.len();
     bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
     sec_lens[2] = (bytes.len() - mark) as u64;
+    PreEncodedPrefix {
+        root: commitment.root,
+        sec_lens,
+        bytes,
+        pcs_l0: None,
+    }
+}
+
+fn store_pre_encoded_prefix(prefix: PreEncodedPrefix) {
     // Assignment-only critical section — nothing that can panic runs while
     // the guard is held, so the lock cannot poison. A poisoned lock
     // (unreachable in practice) skips the stash; publish then full-encodes.
     if let Ok(mut slot) = PRE_ENCODED.lock() {
-        *slot = Some(PreEncodedPrefix {
-            root: commitment.root,
-            sec_lens,
-            bytes,
-        });
+        *slot = Some(prefix);
     }
+}
+
+fn extend_pre_encoded_l0(
+    mut prefix: PreEncodedPrefix,
+    rx: &std::sync::mpsc::Receiver<L0PreEncodeMessage>,
+) -> PreEncodedPrefix {
+    let base_len = prefix.bytes.len();
+    let ring_switches = match rx.recv() {
+        Ok(L0PreEncodeMessage::RingSwitches(ring_switches)) => ring_switches,
+        Ok(L0PreEncodeMessage::Abort) | Err(_) => return prefix,
+        Ok(L0PreEncodeMessage::InitialProof(_, _)) => return prefix,
+    };
+    encode_ring_switches_into(&mut prefix.bytes, &ring_switches);
+
+    let (initial_root, initial_proof) = match rx.recv() {
+        Ok(L0PreEncodeMessage::InitialProof(root, proof)) => (root, proof),
+        Ok(L0PreEncodeMessage::Abort) | Err(_) => {
+            prefix.bytes.truncate(base_len);
+            return prefix;
+        }
+        Ok(L0PreEncodeMessage::RingSwitches(_)) => {
+            prefix.bytes.truncate(base_len);
+            return prefix;
+        }
+    };
+    encode_ligerito_l0_into(&mut prefix.bytes, initial_root, &initial_proof);
+    prefix.pcs_l0 = Some(PcsL0Fingerprint::new(
+        &ring_switches,
+        initial_root,
+        &initial_proof,
+    ));
+    prefix
 }
 
 /// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
@@ -285,7 +473,7 @@ pub fn stash_pre_encoded_prefix(
 /// disabled switch, poisoned lock, any fingerprint miss. The stash is
 /// consumed on take; a repeat publish of the same bundle re-encodes from
 /// scratch, byte-identically.
-fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
+fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<(Vec<u8>, bool)> {
     if !pre_encode_enabled() {
         return None;
     }
@@ -301,8 +489,18 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if sec_lens != stash.sec_lens {
         return None;
     }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
+    let base_len = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
+    match stash.pcs_l0 {
+        Some(fingerprint) => {
+            let pcs = &bundle.proof.pcs_open;
+            if !fingerprint.matches(pcs) || stash.bytes.len() != base_len + fingerprint.encoded_len
+            {
+                return None;
+            }
+            Some((stash.bytes, true))
+        }
+        None => (stash.bytes.len() == base_len).then_some((stash.bytes, false)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +535,53 @@ use flock_core::pcs::BatchOpeningProofLigerito;
 use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
 use flock_core::pcs::ring_switch::RingSwitchProof;
 
+fn pcs_l0_encoded_len(ring_switches: &[RingSwitchProof], initial_proof: &RecursiveProof) -> usize {
+    8 + ring_switches
+        .iter()
+        .map(|rs| 8 + rs.s_hat_v.len() * std::mem::size_of::<F128>())
+        .sum::<usize>()
+        + 32
+        + 8
+        + initial_proof
+            .opened_rows
+            .iter()
+            .map(|row| 8 + row.len() * std::mem::size_of::<F128>())
+            .sum::<usize>()
+        + 8
+        + initial_proof.merkle_proof.len() * std::mem::size_of::<MerkleHash>()
+}
+
+impl PcsL0Fingerprint {
+    fn new(
+        ring_switches: &[RingSwitchProof],
+        initial_root: MerkleHash,
+        initial_proof: &RecursiveProof,
+    ) -> Self {
+        Self {
+            initial_root,
+            ring_ptr: ring_switches.as_ptr() as usize,
+            ring_len: ring_switches.len(),
+            rows_ptr: initial_proof.opened_rows.as_ptr() as usize,
+            rows_len: initial_proof.opened_rows.len(),
+            merkle_ptr: initial_proof.merkle_proof.as_ptr() as usize,
+            merkle_len: initial_proof.merkle_proof.len(),
+            encoded_len: pcs_l0_encoded_len(ring_switches, initial_proof),
+        }
+    }
+
+    fn matches(self, pcs: &BatchOpeningProofLigerito) -> bool {
+        let initial = &pcs.ligerito.initial_proof;
+        self.initial_root == pcs.ligerito.initial_root
+            && self.ring_ptr == pcs.ring_switches.as_ptr() as usize
+            && self.ring_len == pcs.ring_switches.len()
+            && self.rows_ptr == initial.opened_rows.as_ptr() as usize
+            && self.rows_len == initial.opened_rows.len()
+            && self.merkle_ptr == initial.merkle_proof.as_ptr() as usize
+            && self.merkle_len == initial.merkle_proof.len()
+            && self.encoded_len == pcs_l0_encoded_len(&pcs.ring_switches, initial)
+    }
+}
+
 fn fast_pcs_open_encode_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(target_endian = "little")
@@ -355,11 +600,29 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ring_switches,
         ligerito,
     } = p;
+    encode_ring_switches_into(out, ring_switches);
+    encode_ligerito_l0_into(out, ligerito.initial_root, &ligerito.initial_proof);
+    encode_ligerito_suffix_into(out, ligerito);
+}
+
+fn encode_ring_switches_into(out: &mut Vec<u8>, ring_switches: &[RingSwitchProof]) {
     put_u64(out, ring_switches.len() as u64);
     for rs in ring_switches {
         let RingSwitchProof { s_hat_v } = rs;
         put_f128_vec(out, s_hat_v);
     }
+}
+
+fn encode_ligerito_l0_into(
+    out: &mut Vec<u8>,
+    initial_root: MerkleHash,
+    initial_proof: &RecursiveProof,
+) {
+    out.extend_from_slice(&initial_root);
+    put_recursive_proof(out, initial_proof);
+}
+
+fn encode_ligerito_suffix_into(out: &mut Vec<u8>, ligerito: &LigeritoProof) {
     let LigeritoProof {
         initial_root,
         initial_proof,
@@ -371,8 +634,9 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ood_values,
         fold_grinding_nonces,
     } = ligerito;
-    out.extend_from_slice(initial_root);
-    put_recursive_proof(out, initial_proof);
+    // These fields are already present in an extended prefix. Naming them in
+    // the exhaustive destructure keeps a wire-schema change compile-visible.
+    let _ = (initial_root, initial_proof);
     put_hash_vec(out, recursive_roots);
     put_u64(out, recursive_proofs.len() as u64);
     for rp in recursive_proofs {
@@ -661,7 +925,118 @@ mod tests {
                 flat, incumbent,
                 "flat encoder diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
             );
+
+            let mut split = Vec::new();
+            encode_ring_switches_into(&mut split, &proof.ring_switches);
+            encode_ligerito_l0_into(
+                &mut split,
+                proof.ligerito.initial_root,
+                &proof.ligerito.initial_proof,
+            );
+            assert_eq!(
+                split.len(),
+                pcs_l0_encoded_len(&proof.ring_switches, &proof.ligerito.initial_proof),
+                "L0 split length diverged"
+            );
+            encode_ligerito_suffix_into(&mut split, &proof.ligerito);
+            assert_eq!(
+                split, incumbent,
+                "L0-prefix plus suffix diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
+            );
         }
+    }
+
+    #[test]
+    fn l0_worker_preserves_arc_ownership_and_abort_fallback() {
+        let ring = std::sync::Arc::new(vec![
+            RingSwitchProof {
+                s_hat_v: vec![F128::ZERO, F128::new(1, u64::MAX)],
+            },
+            RingSwitchProof { s_hat_v: vec![] },
+        ]);
+        let initial = std::sync::Arc::new(RecursiveProof {
+            opened_rows: vec![
+                vec![],
+                vec![F128::new(7, 11)],
+                vec![F128::new(13, 17), F128::new(19, 23)],
+            ],
+            merkle_proof: vec![[0xA5; 32], [0x5A; 32]],
+        });
+        let root = [0x3C; 32];
+        let base = vec![0xC7; 19];
+        let prefix = PreEncodedPrefix {
+            root: [0x11; 32],
+            sec_lens: [3, 5, 4],
+            bytes: base.clone(),
+            pcs_l0: None,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let worker = std::thread::spawn(move || extend_pre_encoded_l0(prefix, &rx));
+        tx.send(L0PreEncodeMessage::RingSwitches(std::sync::Arc::clone(&ring)))
+            .unwrap();
+        tx.send(L0PreEncodeMessage::InitialProof(
+            root,
+            std::sync::Arc::clone(&initial),
+        ))
+        .unwrap();
+        let extended = worker.join().unwrap();
+        assert_eq!(std::sync::Arc::strong_count(&ring), 1);
+        assert_eq!(std::sync::Arc::strong_count(&initial), 1);
+        let fingerprint = extended.pcs_l0.expect("completed L0 stage");
+        assert_eq!(
+            extended.bytes.len(),
+            base.len() + pcs_l0_encoded_len(&ring, &initial)
+        );
+        let mut expected = base.clone();
+        encode_ring_switches_into(&mut expected, &ring);
+        encode_ligerito_l0_into(&mut expected, root, &initial);
+        assert_eq!(extended.bytes, expected);
+
+        let ring = std::sync::Arc::try_unwrap(ring).expect("worker dropped ring Arc");
+        let initial = std::sync::Arc::try_unwrap(initial).expect("worker dropped initial Arc");
+        let pcs = BatchOpeningProofLigerito {
+            ring_switches: ring,
+            ligerito: LigeritoProof {
+                initial_root: root,
+                initial_proof: initial,
+                recursive_roots: vec![],
+                recursive_proofs: vec![],
+                final_proof: FinalProof {
+                    yr: vec![],
+                    opened_rows: vec![],
+                    merkle_proof: vec![],
+                },
+                sumcheck_transcript: vec![],
+                grinding_nonces: vec![],
+                ood_values: vec![],
+                fold_grinding_nonces: vec![],
+            },
+        };
+        assert!(fingerprint.matches(&pcs));
+        let cloned_pcs = pcs.clone();
+        assert!(
+            !fingerprint.matches(&cloned_pcs),
+            "a reconstructed PCS must miss the ownership fingerprint"
+        );
+
+        let abort_ring = std::sync::Arc::new(pcs.ring_switches.clone());
+        let abort_prefix = PreEncodedPrefix {
+            root: [0x22; 32],
+            sec_lens: [2, 3, 5],
+            bytes: base.clone(),
+            pcs_l0: None,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let worker = std::thread::spawn(move || extend_pre_encoded_l0(abort_prefix, &rx));
+        tx.send(L0PreEncodeMessage::RingSwitches(std::sync::Arc::clone(
+            &abort_ring,
+        )))
+        .unwrap();
+        tx.send(L0PreEncodeMessage::Abort).unwrap();
+        let aborted = worker.join().unwrap();
+        assert_eq!(aborted.bytes, base, "partial ring bytes must be truncated");
+        assert!(aborted.pcs_l0.is_none());
+        assert_eq!(std::sync::Arc::strong_count(&abort_ring), 1);
     }
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.

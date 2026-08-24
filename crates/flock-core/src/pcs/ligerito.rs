@@ -35,6 +35,7 @@ use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// `FLOCK_OPEN_TIMING`: per-level open-phase instrumentation — recursive
 /// commit shapes with their NTT-encode/Merkle split, plus the section totals
@@ -6746,6 +6747,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
         challenger,
     )
 }
@@ -6787,6 +6789,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         None,
         None,
         fold_arena,
+        None,
         challenger,
     )
 }
@@ -6827,6 +6830,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         None,
         None,
         fold_arena,
+        None,
         challenger,
     )
 }
@@ -6872,6 +6876,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         Some(direct),
         None,
         fold_arena,
+        None,
         challenger,
     )
 }
@@ -6891,6 +6896,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
     fold_arena: Option<FoldArena>,
+    l0_sink: Option<&mut dyn super::L0PreEncodeSink>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     assert_eq!(config.initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
@@ -6914,6 +6920,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         None,
         Some(direct),
         fold_arena,
+        l0_sink,
         challenger,
     )
 }
@@ -6936,6 +6943,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
     fold_arena: Option<FoldArena>,
+    mut l0_sink: Option<&mut dyn super::L0PreEncodeSink>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -7356,6 +7364,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         opened_rows: opened_rows_0,
         merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
     });
+    let mut initial_proof = Some(initial_proof);
+    let mut shared_initial_proof = None;
+    if let Some(sink) = l0_sink.as_deref_mut() {
+        let shared = Arc::new(initial_proof.take().expect("initial proof owned once"));
+        if sink.initial_proof_ready(initial_root, Arc::clone(&shared)) {
+            shared_initial_proof = Some(shared);
+        } else {
+            initial_proof = Some(Arc::try_unwrap(shared).unwrap_or_else(|_| {
+                panic!("rejected L0 sink retained initial-proof ownership")
+            }));
+        }
+    }
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -7462,6 +7482,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
+            if let Some(sink) = l0_sink.as_deref_mut() {
+                sink.finish();
+            }
+            let initial_proof = match shared_initial_proof.take() {
+                Some(shared) => Arc::try_unwrap(shared).unwrap_or_else(|_| {
+                    panic!("L0 sink retained initial-proof ownership after finish")
+                }),
+                None => initial_proof.take().expect("initial proof remains owned"),
+            };
             return LigeritoProof {
                 initial_root,
                 initial_proof,

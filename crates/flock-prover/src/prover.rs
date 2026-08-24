@@ -259,6 +259,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     precomputed_s_hat_v: &[Option<&[F128]>],
     padding: &zerocheck::PaddingSpec,
     lig_config: &pcs::ligerito::ProverConfig,
+    l0_sink: Option<&mut dyn pcs::L0PreEncodeSink>,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
     let x_fulls: Vec<Vec<F128>> = claims
@@ -272,7 +273,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     // short statically-chunked ligerito section loses to E-core stragglers
     // (lig-prove total +4.3 ms). Only the combine is widened, inside
     // `pcs::in_wide_combine_pool` (kill switch FLOCK_NO_OPEN_POOL=1).
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_l0_sink(
         z_packed,
         prover_data,
         commitment,
@@ -281,6 +282,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         &[],
         padding,
         lig_config,
+        l0_sink,
         challenger,
     )
 }
@@ -378,6 +380,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        None,
         challenger,
     );
 
@@ -523,23 +526,20 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     flock_core::gaptime::mark("open: begin");
-    // Publish-prefix pre-encode: commitment / zerocheck / lincheck are
-    // transcript-final here, so their serialization (plus the 460 kB output
-    // allocation) runs on a detached helper thread concurrently with the
-    // ~20 ms open instead of inside the measured publish tail. Tens of µs of
-    // work; the fingerprint gate in `proof_io` makes a stale or missing
-    // stash fall back to the incumbent full encode, byte-identically.
-    let stash = if crate::proof_io::pre_encode_enabled() {
-        let commitment_c = commitment.clone();
-        let zc_c = zc_proof.clone();
-        let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
-            crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
-        }))
+    // One publish helper owns the final-capacity output buffer for the entire
+    // open. It writes the small stable prefix immediately, then receives only
+    // Arc ownership handles for the finalized DirectFold8 ring-switch and L0
+    // opening; no large proof payload or fragment Vec is cloned.
+    let mut stash = if crate::proof_io::pre_encode_enabled() {
+        Some(crate::proof_io::PreEncodeSession::spawn(
+            commitment.clone(),
+            zc_proof.clone(),
+            lc_proof.clone(),
+        ))
     } else {
         None
     };
+    let l0_sink = stash.as_mut().and_then(|session| session.l0_sink());
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -548,12 +548,13 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        l0_sink,
         challenger,
     );
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
+    if let Some(session) = stash.as_mut() {
+        // DirectFold8 normally joined at its return point so Arc ownership can
+        // be recovered. This no-op join also closes every shape-miss fallback.
+        session.finish_worker();
     }
     flock_core::gaptime::mark("open: returned");
 
@@ -1186,6 +1187,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
+        None,
         challenger,
     );
     t.open_s = t0.elapsed().as_secs_f64();

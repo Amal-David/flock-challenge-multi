@@ -34,8 +34,10 @@ pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
 use crate::field::F128;
+use crate::merkle::Hash;
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Batched opening proof: ring-switching frontend + Ligerito backend.
 /// The combined `b_combined` + target_combined feed
@@ -44,6 +46,21 @@ use serde::{Deserialize, Serialize};
 pub struct BatchOpeningProofLigerito {
     pub ring_switches: Vec<RingSwitchProof>,
     pub ligerito: ligerito::LigeritoProof,
+}
+
+/// Optional publish encoder handoff for the ranked DirectFold8 open. The
+/// payloads are moved into `Arc`s, read by one join-owned helper while the
+/// recursive prover continues, then recovered with `Arc::try_unwrap` before
+/// the ordinary proof value is returned. Implementations must not retain an
+/// `Arc` after [`Self::finish`] returns.
+pub trait L0PreEncodeSink {
+    fn ring_switches_ready(&mut self, ring_switches: Arc<Vec<RingSwitchProof>>) -> bool;
+    fn initial_proof_ready(
+        &mut self,
+        initial_root: Hash,
+        initial_proof: Arc<ligerito::RecursiveProof>,
+    ) -> bool;
+    fn finish(&mut self);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +154,37 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_l0_sink(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        None,
+        challenger,
+    )
+}
+
+/// Ranked-only extension of
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`] which can hand the
+/// finalized ring-switch and L0 opening ownership to a publish encoder. Every
+/// non-DirectFold8 route ignores the sink and remains byte-for-byte incumbent.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_l0_sink<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    mut l0_sink: Option<&mut dyn L0PreEncodeSink>,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
@@ -180,7 +228,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     let fold_arena: Option<ligerito::FoldArena> = None;
     crate::gaptime::mark("open: fold arena ready");
 
-    let combined = compute_combined_basis_and_target(
+    let mut combined = compute_combined_basis_and_target(
         &packed_witness,
         x_outers,
         precomputed_s_hat_v,
@@ -191,6 +239,28 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
     crate::gaptime::mark("open: combined basis + target done");
 
+    // Only the exact ranked DirectFold8 path has the long independent window
+    // needed to overlap L0 publication. Move the ring proof into an Arc (no
+    // payload clone); the helper drops its Arc at `finish`, after which the
+    // original Vec allocation is recovered below.
+    let mut shared_ring_switches = None;
+    if combined.direct_fold8.is_some() {
+        if let Some(sink) = l0_sink.as_deref_mut() {
+            let shared = Arc::new(std::mem::take(&mut combined.ring_switches));
+            if sink.ring_switches_ready(Arc::clone(&shared)) {
+                shared_ring_switches = Some(shared);
+            } else {
+                combined.ring_switches = Arc::try_unwrap(shared)
+                    .unwrap_or_else(|_| panic!("rejected L0 sink retained ring-switch ownership"));
+            }
+        }
+    }
+
+    let direct_l0_sink = if shared_ring_switches.is_some() {
+        l0_sink.take()
+    } else {
+        None
+    };
     let t = std::time::Instant::now();
     let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
         ligerito::recursive_prover_with_basis_direct_fold8(
@@ -203,6 +273,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             &*prover_data.merkle_tree,
             combined.round0_prime,
             fold_arena,
+            direct_l0_sink,
             challenger,
         )
     } else if let Some(direct) = combined.direct_fold4 {
@@ -268,8 +339,13 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         );
     }
 
+    let ring_switches = match shared_ring_switches {
+        Some(shared) => Arc::try_unwrap(shared)
+            .unwrap_or_else(|_| panic!("L0 sink retained ring-switch ownership after finish")),
+        None => combined.ring_switches,
+    };
     BatchOpeningProofLigerito {
-        ring_switches: combined.ring_switches,
+        ring_switches,
         ligerito: ligerito_proof,
     }
 }
