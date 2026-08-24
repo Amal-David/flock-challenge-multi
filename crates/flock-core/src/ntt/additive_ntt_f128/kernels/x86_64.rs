@@ -10,6 +10,27 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_FUSED4_LAYER_TW=1` restores broadcasting all fifteen
+/// fused-four twiddles into ZMMs before the lane loop. Under DIET that is
+/// thirty companion registers plus the sixteen row values — the 16-slot
+/// `values[]` array then spills and the rows bounce through the stack
+/// every butterfly. Default ON: each layer materialises only that layer's
+/// twiddles, so the sixteen row ZMMs stay in the file. Same 15 setup
+/// CLMULs, same 32 butterflies, same stores, same bytes.
+#[inline]
+fn fused4_layer_tw_disabled() -> bool {
+    #[cfg(test)]
+    if FUSED4_LAYER_TW_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED4_LAYER_TW").is_some())
+}
+
+#[cfg(test)]
+static FUSED4_LAYER_TW_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -1050,7 +1071,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 /// (use the runtime `sixteenth`/`num_ntts`) or the exact runtime values (the
 /// shaped wrappers): distinct constants force a distinct monomorphization, so
 /// the shaped forms get compile-time address arithmetic even though the
-/// ninety-line body is never inlined into its wrapper.
+/// body is never inlined into its wrapper.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
@@ -1067,19 +1088,47 @@ unsafe fn butterfly_fused_4layer_row_impl<
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
-    use core::arch::x86_64::*;
+    // SAFETY: forwarded caller contract. The restore path is outlined so
+    // the ranked body does not carry both live-sets in one I-cache footprint.
+    unsafe {
+        if fused4_layer_tw_disabled() {
+            butterfly_fused_4layer_row_impl_array::<DIET, H, S16, NN>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles, pf_r,
+            );
+            return;
+        }
+        butterfly_fused_4layer_row_impl_rowfile::<DIET, H, S16, NN>(
+            ptr, sixteenth, num_ntts, active_lanes, r, twiddles, pf_r,
+        );
+    }
+}
 
-    // Shape substitution: a compile-time constant when the wrapper pins one
-    // (S16/NN nonzero), the runtime argument otherwise. The wrappers only
-    // pin values equal to the runtime shape, so this is the identity.
+/// Kill-switch restore: 16-slot `values[]` plus all 15 diet broadcasts live
+/// together. Outlined so it is not in the ranked I-cache footprint.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row_impl`].
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_impl_array<
+    const DIET: bool,
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    use core::arch::x86_64::*;
     let sixteenth = if S16 != 0 { S16 } else { sixteenth };
     let num_ntts = if NN != 0 { NN } else { num_ntts };
-
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
-        // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
-        // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
         for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
@@ -1105,16 +1154,16 @@ unsafe fn butterfly_fused_4layer_row_impl<
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
             }
-
             macro_rules! butterfly {
                 ($u:expr, $v:expr, $twiddle:expr) => {{
-                    let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                    let new_u = _mm512_xor_si512(
+                        values[$u],
+                        mul_x4::<false, DIET>($twiddle, values[$v]),
+                    );
                     values[$v] = _mm512_xor_si512(values[$v], new_u);
                     values[$u] = new_u;
                 }};
             }
-
             let outer = tw[0];
             for i in 0..8 {
                 butterfly!(i, i + 8, outer);
@@ -1135,13 +1184,178 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 let twiddle = tw[7 + s];
                 butterfly!(2 * s, 2 * s + 1, twiddle);
             }
-
             for (i, value) in values.iter().enumerate() {
                 _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
             }
             lane += 4;
         }
+        while lane < active_lanes {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
 
+/// Ranked fused-four: sixteen named row ZMMs, each layer's twiddles local.
+/// Peak live is 16 rows + 8 diet companions (last layer, two waves of four).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row_impl`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_impl_rowfile<
+    const DIET: bool,
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    use core::arch::x86_64::*;
+    let sixteenth = if S16 != 0 { S16 } else { sixteenth };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
+    // SAFETY: caller provides target features and pointer geometry.
+    unsafe {
+        // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
+        // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
+        // steps of savings. The ZMM pairs live in `tw` on the stack; each
+        // layer reloads only that layer's pair into the file next to the
+        // sixteen named rows, so the rows never bounce.
+        let zero = _mm512_setzero_si512();
+        let mut tw = [(zero, zero); 15];
+        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+            *slot = tw_x4::<false, DIET>(*value);
+        }
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+        let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
+        let lanes = active_lanes & !3;
+        let mut lane = 0;
+        while lane < lanes {
+            if H != 0 {
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..16 {
+                    let p = pf_row(i).add(off);
+                    if H == 1 {
+                        _mm_prefetch::<_MM_HINT_T0>(p);
+                    } else {
+                        _mm_prefetch::<_MM_HINT_T1>(p);
+                    }
+                }
+            }
+            let mut v0 = _mm512_loadu_si512(row(0).add(lane) as *const __m512i);
+            let mut v1 = _mm512_loadu_si512(row(1).add(lane) as *const __m512i);
+            let mut v2 = _mm512_loadu_si512(row(2).add(lane) as *const __m512i);
+            let mut v3 = _mm512_loadu_si512(row(3).add(lane) as *const __m512i);
+            let mut v4 = _mm512_loadu_si512(row(4).add(lane) as *const __m512i);
+            let mut v5 = _mm512_loadu_si512(row(5).add(lane) as *const __m512i);
+            let mut v6 = _mm512_loadu_si512(row(6).add(lane) as *const __m512i);
+            let mut v7 = _mm512_loadu_si512(row(7).add(lane) as *const __m512i);
+            let mut v8 = _mm512_loadu_si512(row(8).add(lane) as *const __m512i);
+            let mut v9 = _mm512_loadu_si512(row(9).add(lane) as *const __m512i);
+            let mut v10 = _mm512_loadu_si512(row(10).add(lane) as *const __m512i);
+            let mut v11 = _mm512_loadu_si512(row(11).add(lane) as *const __m512i);
+            let mut v12 = _mm512_loadu_si512(row(12).add(lane) as *const __m512i);
+            let mut v13 = _mm512_loadu_si512(row(13).add(lane) as *const __m512i);
+            let mut v14 = _mm512_loadu_si512(row(14).add(lane) as *const __m512i);
+            let mut v15 = _mm512_loadu_si512(row(15).add(lane) as *const __m512i);
+
+            macro_rules! bf {
+                ($u:ident, $v:ident, $t:expr) => {{
+                    let new_u = _mm512_xor_si512($u, mul_x4::<false, DIET>($t, $v));
+                    $v = _mm512_xor_si512($v, new_u);
+                    $u = new_u;
+                }};
+            }
+
+            {
+                let t = tw[0];
+                bf!(v0, v8, t);
+                bf!(v1, v9, t);
+                bf!(v2, v10, t);
+                bf!(v3, v11, t);
+                bf!(v4, v12, t);
+                bf!(v5, v13, t);
+                bf!(v6, v14, t);
+                bf!(v7, v15, t);
+            }
+            {
+                let t0 = tw[1];
+                bf!(v0, v4, t0);
+                bf!(v1, v5, t0);
+                bf!(v2, v6, t0);
+                bf!(v3, v7, t0);
+                let t1 = tw[2];
+                bf!(v8, v12, t1);
+                bf!(v9, v13, t1);
+                bf!(v10, v14, t1);
+                bf!(v11, v15, t1);
+            }
+            {
+                let t0 = tw[3];
+                bf!(v0, v2, t0);
+                bf!(v1, v3, t0);
+                let t1 = tw[4];
+                bf!(v4, v6, t1);
+                bf!(v5, v7, t1);
+                let t2 = tw[5];
+                bf!(v8, v10, t2);
+                bf!(v9, v11, t2);
+                let t3 = tw[6];
+                bf!(v12, v14, t3);
+                bf!(v13, v15, t3);
+            }
+            {
+                let t0 = tw[7];
+                bf!(v0, v1, t0);
+                let t1 = tw[8];
+                bf!(v2, v3, t1);
+                let t2 = tw[9];
+                bf!(v4, v5, t2);
+                let t3 = tw[10];
+                bf!(v6, v7, t3);
+            }
+            {
+                let t0 = tw[11];
+                bf!(v8, v9, t0);
+                let t1 = tw[12];
+                bf!(v10, v11, t1);
+                let t2 = tw[13];
+                bf!(v12, v13, t2);
+                let t3 = tw[14];
+                bf!(v14, v15, t3);
+            }
+
+            _mm512_storeu_si512(row(0).add(lane) as *mut __m512i, v0);
+            _mm512_storeu_si512(row(1).add(lane) as *mut __m512i, v1);
+            _mm512_storeu_si512(row(2).add(lane) as *mut __m512i, v2);
+            _mm512_storeu_si512(row(3).add(lane) as *mut __m512i, v3);
+            _mm512_storeu_si512(row(4).add(lane) as *mut __m512i, v4);
+            _mm512_storeu_si512(row(5).add(lane) as *mut __m512i, v5);
+            _mm512_storeu_si512(row(6).add(lane) as *mut __m512i, v6);
+            _mm512_storeu_si512(row(7).add(lane) as *mut __m512i, v7);
+            _mm512_storeu_si512(row(8).add(lane) as *mut __m512i, v8);
+            _mm512_storeu_si512(row(9).add(lane) as *mut __m512i, v9);
+            _mm512_storeu_si512(row(10).add(lane) as *mut __m512i, v10);
+            _mm512_storeu_si512(row(11).add(lane) as *mut __m512i, v11);
+            _mm512_storeu_si512(row(12).add(lane) as *mut __m512i, v12);
+            _mm512_storeu_si512(row(13).add(lane) as *mut __m512i, v13);
+            _mm512_storeu_si512(row(14).add(lane) as *mut __m512i, v14);
+            _mm512_storeu_si512(row(15).add(lane) as *mut __m512i, v15);
+            lane += 4;
+        }
         while lane < active_lanes {
             let mut values = [F128::ZERO; 16];
             for (i, value) in values.iter_mut().enumerate() {
@@ -1544,6 +1758,84 @@ mod diet_tests {
                     &want[row * 64..(row + 1) * 64],
                     "lanes={lanes} residue={residue} row={row} outer_low={OUTER_LOW} inner_low={INNER_LOW} diet={DIET}",
                 );
+            }
+        }
+    }
+
+    /// Layer-local fused-four twiddles are bit-identical to the 16-slot
+    /// `values[]` array form (the kill switch) on every ranked shape the
+    /// deep pass actually runs: sixteenth in {1, 8, 128}, 60- and 64-lane
+    /// bounds, both DIET arms. Prefetch does not touch values.
+    #[test]
+    fn fused4_layer_tw_matches_array_form() {
+        use std::sync::atomic::Ordering;
+        let mut next = rng(0xF4F4_11E0);
+        for sixteenth in [1usize, 8, 128] {
+            for active in [60usize, 64] {
+                let n = 16 * sixteenth * 64;
+                let mut base = vec![F128::ZERO; n];
+                for v in base.iter_mut() {
+                    *v = next();
+                }
+                let tw: [F128; 15] = std::array::from_fn(|_| next());
+                for diet in [false, true] {
+                    FUSED4_LAYER_TW_TEST_OFF.store(true, Ordering::Relaxed);
+                    let mut want = base.clone();
+                    // SAFETY: this module compiles only with avx512f+vpclmulqdq;
+                    // the buffer holds every row of group r = 0.
+                    unsafe {
+                        if diet {
+                            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                                want.as_mut_ptr(),
+                                sixteenth,
+                                64,
+                                active,
+                                0,
+                                &tw,
+                                0,
+                            );
+                        } else {
+                            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                                want.as_mut_ptr(),
+                                sixteenth,
+                                64,
+                                active,
+                                0,
+                                &tw,
+                                0,
+                            );
+                        }
+                    }
+                    FUSED4_LAYER_TW_TEST_OFF.store(false, Ordering::Relaxed);
+                    let mut got = base.clone();
+                    unsafe {
+                        if diet {
+                            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                                got.as_mut_ptr(),
+                                sixteenth,
+                                64,
+                                active,
+                                0,
+                                &tw,
+                                0,
+                            );
+                        } else {
+                            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                                got.as_mut_ptr(),
+                                sixteenth,
+                                64,
+                                active,
+                                0,
+                                &tw,
+                                0,
+                            );
+                        }
+                    }
+                    assert!(
+                        got == want,
+                        "fused4 layer-tw mismatch s16={sixteenth} lanes={active} diet={diet}"
+                    );
+                }
             }
         }
     }
