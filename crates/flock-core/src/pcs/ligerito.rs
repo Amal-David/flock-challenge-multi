@@ -2169,6 +2169,85 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// Dense induced basis when the opened-row binding was already accumulated
+/// while the proof rows were copied. `alpha_weights` is the same truncated
+/// eq(alpha, ·) table used by [`induce_sumcheck_poly`].
+fn induce_sumcheck_basis_preweighted(
+    log_msg_cols: usize,
+    sks_vks: &[F128],
+    queries: &[usize],
+    alpha_weights: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let n = 1usize << log_msg_cols;
+    let n_queries = queries.len();
+    assert_eq!(alpha_weights.len(), n_queries);
+
+    let inv_sks_vks: Vec<F128> = sks_vks
+        .iter()
+        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+        .collect();
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
+    let partials: Vec<Vec<F128>> = (0..n_threads)
+        .into_par_iter()
+        .map(|t| {
+            let start = t * chunk_size;
+            let end = (start + chunk_size).min(n_queries);
+            if start >= end {
+                return vec![F128::ZERO; n];
+            }
+            let mut accum_basis = vec![F128::ZERO; n];
+            let mut local_basis = vec![F128::ZERO; n];
+            let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
+            for i in start..end {
+                evaluate_scaled_basis_inplace(
+                    &mut sks_at_x,
+                    &mut local_basis,
+                    sks_vks,
+                    &inv_sks_vks,
+                    F128::new(queries[i] as u64, 0),
+                    alpha_weights[i],
+                );
+                for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
+                    *acc += v;
+                }
+            }
+            accum_basis
+        })
+        .collect();
+
+    let mut basis_poly = vec![F128::ZERO; n];
+    const REDUCE_PAR_FLOOR: usize = 1 << 12;
+    if induce_sched_enabled() && n >= REDUCE_PAR_FLOOR && partials.len() > 1 {
+        let reduce_floor = if open_fill_enabled() {
+            1usize << 9
+        } else {
+            REDUCE_PAR_FLOOR
+        };
+        let chunk = (n / rayon::current_num_threads().max(1)).max(reduce_floor);
+        basis_poly
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let base = ci * chunk;
+                let len = out.len();
+                for lb in partials.iter() {
+                    for (acc, &v) in out.iter_mut().zip(lb[base..base + len].iter()) {
+                        *acc += v;
+                    }
+                }
+            });
+    } else {
+        for lb in partials.iter() {
+            for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
+                *acc += v;
+            }
+        }
+    }
+    basis_poly
+}
+
 /// 4-lane AVX-512 transpose butterfly: `s = a ⊕ b; a' = s; b' = t·s ⊕ b`.
 ///
 /// Mirrors the forward-NTT x86 kernel shape: broadcast `t`, one `ghash_mul_x4`
@@ -2575,6 +2654,32 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (coeffs, enforced_sum)
 }
 
+/// F^T induced basis using weights and binding accumulated by the fused row
+/// gather. This is the basis-only half of [`induce_sumcheck_poly_via_ntt`].
+fn induce_sumcheck_basis_via_ntt_preweighted(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    queries: &[usize],
+    alpha_weights: &[F128],
+) -> Vec<F128> {
+    let n = 1usize << log_msg_cols;
+    let log_block = log_msg_cols + log_inv_rate;
+    let block_len = 1usize << log_block;
+    assert_eq!(alpha_weights.len(), queries.len());
+    let mut coeffs = if log_block == 0 {
+        let mut c = vec![F128::ZERO; block_len];
+        for i in 0..queries.len() {
+            c[queries[i]] += alpha_weights[i];
+        }
+        c
+    } else {
+        let ntt = AdditiveNttF128::standard(log_block);
+        transpose_forward_ntt_sparse(&ntt, queries, alpha_weights, log_block)
+    };
+    coeffs.truncate(n);
+    coeffs
+}
+
 /// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
 /// sparse-NTT [`induce_sumcheck_poly_via_ntt`].
 ///
@@ -2740,6 +2845,13 @@ fn induce_ntt_crossover_c() -> usize {
     if induce_sched_enabled() { 1 } else { 4 }
 }
 
+#[inline]
+fn induce_should_use_ntt(log_msg_cols: usize, log_inv_rate: usize, n_queries: usize) -> bool {
+    let log_block = log_msg_cols + log_inv_rate;
+    log_msg_cols >= 12
+        && n_queries > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1)
+}
+
 /// `sks_vks` feeds ONLY the dense arm (the Fᵀ-NTT arm never reads it); pass
 /// `None` to have the dense arm build the table itself when — and only
 /// when — it is actually taken. `Some` keeps the caller's precomputed table
@@ -2753,9 +2865,7 @@ pub(crate) fn induce_sumcheck_poly_auto(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt = log_msg_cols >= 12
-        && queries.len() > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1);
+    let use_ntt = induce_should_use_ntt(log_msg_cols, log_inv_rate, queries.len());
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -2783,6 +2893,38 @@ pub(crate) fn induce_sumcheck_poly_auto(
             alpha,
         )
     }
+}
+
+/// Basis-only counterpart of [`induce_sumcheck_poly_auto`] for the fused
+/// opened-row gather. The crossover predicate is intentionally identical.
+fn induce_sumcheck_poly_auto_preweighted(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    sks_vks: Option<&[F128]>,
+    queries: &[usize],
+    alpha_weights: &[F128],
+    enforced_sum: F128,
+) -> (Vec<F128>, F128) {
+    let use_ntt = induce_should_use_ntt(log_msg_cols, log_inv_rate, queries.len());
+    let basis = if use_ntt {
+        induce_sumcheck_basis_via_ntt_preweighted(
+            log_msg_cols,
+            log_inv_rate,
+            queries,
+            alpha_weights,
+        )
+    } else {
+        let computed;
+        let sks_vks = match sks_vks {
+            Some(table) => table,
+            None => {
+                computed = eval_sk_at_vks(log_msg_cols);
+                &computed
+            }
+        };
+        induce_sumcheck_basis_preweighted(log_msg_cols, sks_vks, queries, alpha_weights)
+    };
+    (basis, enforced_sum)
 }
 
 /// `FLOCK_NO_INDUCE_FUSED_DENSIFY=1` restores the two-pass densify of the
@@ -6486,6 +6628,109 @@ where
     }
 }
 
+/// `FLOCK_NO_OPEN_GATHER_ENFORCED=1` restores the incumbent two-pass
+/// gather-then-induce binding. Read once per process; default ON.
+fn gather_enforced_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_OPEN_GATHER_ENFORCED").is_none()
+    });
+    *ON
+}
+
+struct GatheredOpenedRows {
+    rows: Vec<Vec<F128>>,
+    alpha_weights: Vec<F128>,
+    enforced_sum: F128,
+}
+
+/// Copy a row for the proof and consume each source element for the opening
+/// binding before advancing it. This keeps the proof allocation/copy but
+/// removes the induction phase's second traversal of the copied row.
+#[inline(never)]
+fn copy_opened_row_and_dot(source: &[F128], eq: &[F128]) -> (Vec<F128>, F128) {
+    debug_assert_eq!(source.len(), eq.len());
+    let mut dot = F128::ZERO;
+    let copied = source
+        .iter()
+        .zip(eq.iter())
+        .map(|(&value, &weight)| {
+            dot += value * weight;
+            value
+        })
+        .collect();
+    (copied, dot)
+}
+
+/// Order-preserving opened-row gather with the exact binding used by the
+/// later induced sumcheck. Parallel workers fill disjoint indexed row chunks
+/// and return one binding subtotal per chunk.
+fn gather_opened_rows_with_enforced<'a, F>(
+    queries: &[usize],
+    row: F,
+    par: bool,
+    v_challenges: &[F128],
+    alpha: &[F128],
+) -> GatheredOpenedRows
+where
+    F: Fn(usize) -> &'a [F128] + Sync,
+{
+    use rayon::prelude::*;
+    let eq = build_eq_table(v_challenges);
+    let alpha_weights: Vec<F128> = if queries.is_empty() {
+        Vec::new()
+    } else {
+        let table = build_eq_table(alpha);
+        debug_assert!(table.len() >= queries.len());
+        table.into_iter().take(queries.len()).collect()
+    };
+    let gather_one = |q: usize, weight: F128| {
+        let (copied, dot) = copy_opened_row_and_dot(row(q), &eq);
+        (copied, dot * weight)
+    };
+
+    if par && queries.len() * eq.len() >= ROW_GATHER_PAR_MIN_ELEMS {
+        let mut rows: Vec<Vec<F128>> = (0..queries.len()).map(|_| Vec::new()).collect();
+        let chunk = queries.len().div_ceil(rayon::current_num_threads().max(1));
+        let partials: Vec<F128> = rows
+            .par_chunks_mut(chunk)
+            .zip(queries.par_chunks(chunk))
+            .zip(alpha_weights.par_chunks(chunk))
+            .map(|((row_chunk, query_chunk), weight_chunk)| {
+                let mut local_sum = F128::ZERO;
+                for ((opened, &q), &weight) in row_chunk
+                    .iter_mut()
+                    .zip(query_chunk.iter())
+                    .zip(weight_chunk.iter())
+                {
+                    let (copied, term) = gather_one(q, weight);
+                    *opened = copied;
+                    local_sum += term;
+                }
+                local_sum
+            })
+            .collect();
+        let enforced_sum = partials.into_iter().fold(F128::ZERO, |sum, v| sum + v);
+        GatheredOpenedRows {
+            rows,
+            alpha_weights,
+            enforced_sum,
+        }
+    } else {
+        let mut rows = Vec::with_capacity(queries.len());
+        let mut enforced_sum = F128::ZERO;
+        for (&q, &weight) in queries.iter().zip(alpha_weights.iter()) {
+            let (opened, term) = gather_one(q, weight);
+            rows.push(opened);
+            enforced_sum += term;
+        }
+        GatheredOpenedRows {
+            rows,
+            alpha_weights,
+            enforced_sum,
+        }
+    }
+}
+
 /// Sibling-count floor below which the multi-proof gather stays on the
 /// incumbent single-pass walk (index walk + parallel gather costs a rayon
 /// dispatch; tiny test trees don't earn it).
@@ -7300,8 +7545,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> =
-        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+    let (opened_rows_0, fused_binding_0) = if gather_enforced_enabled() {
+        let GatheredOpenedRows {
+            rows,
+            alpha_weights,
+            enforced_sum,
+        } = gather_opened_rows_with_enforced(
+            &queries_0,
+            l0_row,
+            serial_par_enabled(),
+            &r_lane_fold,
+            &alpha_0,
+        );
+        (rows, Some((alpha_weights, enforced_sum)))
+    } else {
+        (
+            gather_opened_rows(&queries_0, l0_row, serial_par_enabled()),
+            None,
+        )
+    };
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -7330,15 +7592,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         Some(eval_sk_at_vks(n1))
     };
     let _t = std::time::Instant::now();
-    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
-        n1,
-        log_inv_rate_0,
-        sks_vks_n1.as_deref(),
-        &opened_rows_0,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
-    );
+    let (basis_0_induced, enforced_sum_0) = match fused_binding_0.as_ref() {
+        Some((alpha_weights, enforced_sum)) => induce_sumcheck_poly_auto_preweighted(
+            n1,
+            log_inv_rate_0,
+            sks_vks_n1.as_deref(),
+            &queries_0,
+            alpha_weights,
+            *enforced_sum,
+        ),
+        None => induce_sumcheck_poly_auto(
+            n1,
+            log_inv_rate_0,
+            sks_vks_n1.as_deref(),
+            &opened_rows_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+        ),
+    };
     if trace {
         let d = _t.elapsed();
         t_induce += d;
@@ -7550,11 +7822,29 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(
-            &queries_i,
-            |q| wtns_prev.row(q),
-            serial_par_enabled(),
-        );
+        let (opened_rows_i, fused_binding_i) = if gather_enforced_enabled() {
+            let GatheredOpenedRows {
+                rows,
+                alpha_weights,
+                enforced_sum,
+            } = gather_opened_rows_with_enforced(
+                &queries_i,
+                |q| wtns_prev.row(q),
+                serial_par_enabled(),
+                &level_rs,
+                &alpha_i,
+            );
+            (rows, Some((alpha_weights, enforced_sum)))
+        } else {
+            (
+                gather_opened_rows(
+                    &queries_i,
+                    |q| wtns_prev.row(q),
+                    serial_par_enabled(),
+                ),
+                None,
+            )
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
@@ -7584,8 +7874,29 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // dispatch L0 uses applies here. (Was hard-wired to the dense arm
         // back when the transposed NTT cost one DRAM pass per layer; the
         // blocked sweep moved the crossover well below level 1's shape.)
-        let (basis_i_induced, enforced_sum_i) = if induce_sched_enabled() {
-            induce_sumcheck_poly_auto(
+        let (basis_i_induced, enforced_sum_i) = match fused_binding_i.as_ref() {
+            Some((alpha_weights, enforced_sum)) if induce_sched_enabled() => {
+                induce_sumcheck_poly_auto_preweighted(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    sks_vks_i.as_deref(),
+                    &queries_i,
+                    alpha_weights,
+                    *enforced_sum,
+                )
+            }
+            Some((alpha_weights, enforced_sum)) => (
+                induce_sumcheck_basis_preweighted(
+                    n_next,
+                    sks_vks_i
+                        .as_deref()
+                        .expect("sched-disabled induce always precomputes sks_vks"),
+                    &queries_i,
+                    alpha_weights,
+                ),
+                *enforced_sum,
+            ),
+            None if induce_sched_enabled() => induce_sumcheck_poly_auto(
                 n_next,
                 config.log_inv_rates[i + 1],
                 sks_vks_i.as_deref(),
@@ -7593,9 +7904,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
-        } else {
-            induce_sumcheck_poly(
+            ),
+            None => induce_sumcheck_poly(
                 n_next,
                 sks_vks_i
                     .as_deref()
@@ -7604,7 +7914,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
+            ),
         };
         if trace {
             let d = _t.elapsed();
@@ -10626,6 +10936,112 @@ mod tests {
             );
             assert_eq!(ntt.1, dense.1, "shape {si}: enforced_sum");
             assert_eq!(ntt.0, dense.0, "shape {si}: basis_poly");
+        }
+    }
+
+    #[test]
+    fn gather_opened_rows_with_enforced_matches_two_pass_edges() {
+        use crate::challenger::Challenger;
+        for &row_len in &[1usize, 8, 64] {
+            let counts: &[usize] = match row_len {
+                1 => &[0, 1, 511, 512, 513],
+                8 => &[0, 1, 63, 64, 65],
+                64 => &[0, 1, 7, 8, 9],
+                _ => unreachable!(),
+            };
+            let mut ch = crate::challenger::RandomChallenger::new(0xD500 + row_len as u64);
+            let source: Vec<Vec<F128>> = (0..counts.iter().copied().max().unwrap())
+                .map(|_| ch.sample_f128_vec(row_len))
+                .collect();
+            let v_challenges = ch.sample_f128_vec(row_len.trailing_zeros() as usize);
+            for &count in counts {
+                let queries: Vec<usize> = (0..count).collect();
+                let alpha = ch.sample_f128_vec(ceil_log2(count));
+                let incumbent = gather_opened_rows(&queries, |q| &source[q], false);
+                let expected_sum = induce_sumcheck_enforced_sum(
+                    &incumbent,
+                    &v_challenges,
+                    &queries,
+                    &alpha,
+                );
+                for par in [false, true] {
+                    let fused = gather_opened_rows_with_enforced(
+                        &queries,
+                        |q| &source[q],
+                        par,
+                        &v_challenges,
+                        &alpha,
+                    );
+                    assert_eq!(fused.rows, incumbent, "row_len={row_len} q={count} par={par}");
+                    assert_eq!(
+                        fused.enforced_sum, expected_sum,
+                        "sum row_len={row_len} q={count} par={par}"
+                    );
+                    let expected_weights: Vec<F128> = if count == 0 {
+                        Vec::new()
+                    } else {
+                        build_eq_table(&alpha).into_iter().take(count).collect()
+                    };
+                    assert_eq!(fused.alpha_weights, expected_weights);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_preweighted_induce_matches_incumbent_ranked_levels() {
+        use crate::challenger::Challenger;
+        // (log message columns, log inverse rate, log row length, queries,
+        // expected NTT dispatch). These are the ranked m32 L0-L4 shapes.
+        let shapes = [
+            (19usize, 1usize, 6usize, 218usize, true),
+            (16, 2, 3, 106, true),
+            (13, 3, 3, 71, false),
+            (10, 4, 3, 53, false),
+            (7, 5, 3, 43, false),
+        ];
+        for (si, &(log_msg, rate, log_row, n_queries, expected_ntt))
+            in shapes.iter().enumerate()
+        {
+            assert_eq!(
+                induce_should_use_ntt(log_msg, rate, n_queries),
+                expected_ntt,
+                "shape {si}: dispatch"
+            );
+            let mut ch = crate::challenger::RandomChallenger::new(0xD510 + si as u64);
+            let row_len = 1usize << log_row;
+            let source: Vec<Vec<F128>> = (0..n_queries)
+                .map(|_| ch.sample_f128_vec(row_len))
+                .collect();
+            let queries: Vec<usize> = (0..n_queries).collect();
+            let v_challenges = ch.sample_f128_vec(log_row);
+            let alpha = ch.sample_f128_vec(ceil_log2(n_queries));
+            let fused = gather_opened_rows_with_enforced(
+                &queries,
+                |q| &source[q],
+                true,
+                &v_challenges,
+                &alpha,
+            );
+            let sks_vks = eval_sk_at_vks(log_msg);
+            let incumbent = induce_sumcheck_poly_auto(
+                log_msg,
+                rate,
+                Some(&sks_vks),
+                &fused.rows,
+                &v_challenges,
+                &queries,
+                &alpha,
+            );
+            let preweighted = induce_sumcheck_poly_auto_preweighted(
+                log_msg,
+                rate,
+                Some(&sks_vks),
+                &queries,
+                &fused.alpha_weights,
+                fused.enforced_sum,
+            );
+            assert_eq!(preweighted, incumbent, "shape {si}");
         }
     }
 
