@@ -179,6 +179,14 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
+/// Shared inverse-NTT table for the protocol-fixed [`K_SKIP`]. Witness
+/// producers use the same immutable map as round one instead of rebuilding
+/// its NTTs, table images, and aligned allocation for every proof.
+#[inline]
+pub fn urm_inv_table_k_skip() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
+
 /// Witness padding descriptor for URM work-skipping.
 ///
 /// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;

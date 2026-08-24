@@ -110,6 +110,7 @@ pub const K_LOG: usize = 14;
 pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
+const _: () = assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
 
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
@@ -1415,6 +1416,48 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     )
 }
 
+enum WitnessInvTable {
+    Shared(&'static flock_core::ntt::InvNttTableByteSingleGf8),
+    Owned(flock_core::ntt::InvNttTableByteSingleGf8),
+}
+
+impl std::ops::Deref for WitnessInvTable {
+    type Target = flock_core::ntt::InvNttTableByteSingleGf8;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(table) => table,
+            Self::Owned(table) => table,
+        }
+    }
+}
+
+fn witgen_inv_table_cache_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        witgen_inv_table_cache_enabled_for(
+            std::env::var_os("FLOCK_NO_WITGEN_INV_TABLE_CACHE").as_deref(),
+        )
+    });
+    *ENABLED
+}
+
+fn witgen_inv_table_cache_enabled_for(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn witness_inv_table(cache_enabled: bool) -> WitnessInvTable {
+    if cache_enabled {
+        WitnessInvTable::Shared(flock_core::zerocheck::urm_inv_table_k_skip())
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        WitnessInvTable::Owned(flock_core::ntt::InvNttTableByteSingleGf8::new(
+            &ntt_s, &ntt_l,
+        ))
+    }
+}
+
 /// Same as [`generate_witness_with_ab_packed_and_round1_inner_impl_ex`] with
 /// the fused a/b-NT drain (`ab_nt`) also spelled out, so tests can A/B the
 /// fused octa path against its `FLOCK_NO_WITGEN_AB_NT=1` restore in one
@@ -1466,9 +1509,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let inv_table = witness_inv_table(witgen_inv_table_cache_enabled());
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -3849,6 +3890,69 @@ mod tests {
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+    }
+
+    #[test]
+    fn witness_inv_table_cache_matches_fresh_and_poisoned_fallback() {
+        assert_eq!(K_SKIP, flock_core::zerocheck::K_SKIP);
+        assert!(witgen_inv_table_cache_enabled_for(None));
+        assert!(witgen_inv_table_cache_enabled_for(Some(
+            std::ffi::OsStr::new("0")
+        )));
+        assert!(!witgen_inv_table_cache_enabled_for(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        let cached = witness_inv_table(true);
+        let fresh = witness_inv_table(false);
+        assert!(matches!(&cached, WitnessInvTable::Shared(_)));
+        assert!(matches!(&fresh, WitnessInvTable::Owned(_)));
+        assert!(std::ptr::eq(
+            &*cached,
+            flock_core::zerocheck::urm_inv_table_k_skip(),
+        ));
+        assert_eq!((cached.k, cached.ell, cached.n_chunks), (K_SKIP, 64, 8));
+        assert_eq!(
+            (fresh.k, fresh.ell, fresh.n_chunks),
+            (cached.k, cached.ell, cached.n_chunks),
+        );
+
+        let table_len = 256 * cached.ell;
+        // SAFETY: both constructors expose a logical table pointer valid for
+        // exactly `256 * ell` bytes for the lifetime of the table borrow.
+        let cached_bytes = unsafe { std::slice::from_raw_parts(cached.data_ptr(), table_len) };
+        let fresh_bytes = unsafe { std::slice::from_raw_parts(fresh.data_ptr(), table_len) };
+        assert_eq!(cached_bytes, fresh_bytes, "cached primary image differs");
+
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            // SAFETY: these targets build the second sigma-8 image with the
+            // same `table_len`; the public pointer remains table-owned.
+            let cached_swapped =
+                unsafe { std::slice::from_raw_parts(cached.half_swapped_data_ptr(), table_len) };
+            let fresh_swapped =
+                unsafe { std::slice::from_raw_parts(fresh.half_swapped_data_ptr(), table_len) };
+            assert_eq!(
+                cached_swapped, fresh_swapped,
+                "cached sigma-8 image differs"
+            );
+        }
+
+        let inputs = [
+            [0u8; 8],
+            [u8::MAX; 8],
+            [0, 1, 2, 4, 8, 16, 32, 64],
+            [0xA5, 0x5A, 0xC3, 0x3C, 0x81, 0x18, 0x7E, 0xE7],
+        ];
+        for input in inputs {
+            let mut cached_out = vec![flock_core::field::F8(0xA5); cached.ell];
+            let mut fresh_out = vec![flock_core::field::F8(0x5A); fresh.ell];
+            let mut scalar_out = vec![flock_core::field::F8(0xC3); fresh.ell];
+            cached.apply(&input, &mut cached_out);
+            fresh.apply(&input, &mut fresh_out);
+            fresh.apply_scalar(&input, &mut scalar_out);
+            assert_eq!(cached_out, fresh_out, "cached/fallback apply differs");
+            assert_eq!(cached_out, scalar_out, "cached/scalar apply differs");
+        }
     }
 
     /// Reference compression matches the `blake3` crate for empty input
