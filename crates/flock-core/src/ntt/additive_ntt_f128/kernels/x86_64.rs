@@ -10,6 +10,15 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_F2PUB_X2=1` restores the serial 4-lane body of the
+/// direct-publish fused-two leaf. Default ON: two independent 4-lane chunks
+/// per iteration, same algebra and NT destinations. Read once per process.
+#[inline]
+fn fused2_pub_x2_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_F2PUB_X2").is_some())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -359,6 +368,61 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
 
         let mut i = 0;
+        // Two independent 4-lane chunks per iteration. 8 live row registers
+        // plus 6 twiddle registers still fit SPR's 32 ZMMs. Products inside a
+        // chunk are data-dependent; the two chunks are independent, so this
+        // covers VPCLMULQDQ latency the same way the fused-three deep leaf
+        // already does. Not the hold-4 seed x2 (that leaf is untouched).
+        // `FLOCK_NO_NTT_F2PUB_X2=1` skips this body; the 4-lane loop below is
+        // the incumbent serial form.
+        if !fused2_pub_x2_disabled() {
+            while i + 8 <= lanes {
+                let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
+                let mut vb0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
+                let mut vc0 = _mm512_loadu_si512(c.add(i) as *const __m512i);
+                let mut vd0 = _mm512_loadu_si512(d.add(i) as *const __m512i);
+                let mut va1 = _mm512_loadu_si512(a.add(i + 4) as *const __m512i);
+                let mut vb1 = _mm512_loadu_si512(b.add(i + 4) as *const __m512i);
+                let mut vc1 = _mm512_loadu_si512(c.add(i + 4) as *const __m512i);
+                let mut vd1 = _mm512_loadu_si512(d.add(i + 4) as *const __m512i);
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+                i += 8;
+            }
+        }
         while i < lanes {
             let mut va = _mm512_loadu_si512(a.add(i) as *const __m512i);
             let mut vb = _mm512_loadu_si512(b.add(i) as *const __m512i);

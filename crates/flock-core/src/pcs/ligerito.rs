@@ -2624,6 +2624,17 @@ fn eq_split_x4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_OPEN_MUL_DIET=1` restores 6-CLMUL `ghash_mul_x4` in the open-phase
+/// broadcast-scale leaves [`eq_expand_block_x4`] and [`glue_block_x4`].
+/// Default ON: one `ghash_shift64_x4` of the broadcast, then 5-CLMUL split
+/// products. Not the NTT diet, not TNT-low, not the f128_slice add_scaled row.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn open_mul_diet_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_MUL_DIET").is_some());
+    *OFF
+}
+
 /// Four-lane expansion block of [`build_eq_table_split`]: `out[i] = lo[i]·e`.
 ///
 /// # Safety
@@ -2632,7 +2643,7 @@ fn eq_split_x4_enabled() -> bool {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(out.len(), lo.len());
     // SAFETY: caller carries the target features; the slices are equal-length
@@ -2641,10 +2652,25 @@ unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
         let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
         let lanes = out.len() & !3;
         let mut i = 0usize;
-        while i < lanes {
-            let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, ghash_mul_x4(eb, v));
-            i += 4;
+        if !open_mul_diet_disabled() {
+            let eb_x64 = ghash_shift64_x4(eb);
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                _mm512_storeu_si512(
+                    out.as_mut_ptr().add(i) as *mut __m512i,
+                    ghash_mul_x4_split(v, eb, eb_x64),
+                );
+                i += 4;
+            }
+        } else {
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                _mm512_storeu_si512(
+                    out.as_mut_ptr().add(i) as *mut __m512i,
+                    ghash_mul_x4(eb, v),
+                );
+                i += 4;
+            }
         }
         while i < out.len() {
             out[i] = lo[i] * e;
@@ -4081,7 +4107,7 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(acc.len(), src.len());
     // SAFETY: caller carries the target features; the slices are equal-length
@@ -4090,14 +4116,27 @@ unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
         let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
         let lanes = acc.len() & !3;
         let mut i = 0usize;
-        while i < lanes {
-            let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
-            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(
-                acc.as_mut_ptr().add(i) as *mut __m512i,
-                _mm512_xor_si512(a, ghash_mul_x4(ab, v)),
-            );
-            i += 4;
+        if !open_mul_diet_disabled() {
+            let ab_x64 = ghash_shift64_x4(ab);
+            while i < lanes {
+                let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
+                let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+                _mm512_storeu_si512(
+                    acc.as_mut_ptr().add(i) as *mut __m512i,
+                    _mm512_xor_si512(a, ghash_mul_x4_split(v, ab, ab_x64)),
+                );
+                i += 4;
+            }
+        } else {
+            while i < lanes {
+                let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
+                let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+                _mm512_storeu_si512(
+                    acc.as_mut_ptr().add(i) as *mut __m512i,
+                    _mm512_xor_si512(a, ghash_mul_x4(ab, v)),
+                );
+                i += 4;
+            }
         }
         while i < acc.len() {
             acc[i] += alpha * src[i];
