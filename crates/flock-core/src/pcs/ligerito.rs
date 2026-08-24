@@ -6015,6 +6015,8 @@ fn materialize_direct_fold8(
                     slot += n;
                 }
 
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                let mut gfni_tiled: Option<(F128, F128)> = None;
                 #[cfg(all(
                     target_arch = "x86_64",
                     target_feature = "avx512f",
@@ -6038,6 +6040,8 @@ fn materialize_direct_fold8(
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    let tile = super::ranked_df8_msg_tile_enabled();
+                    let mut tiled = (F128::ZERO, F128::ZERO);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
@@ -6055,6 +6059,20 @@ fn materialize_direct_fold8(
                                 gfni_tmp.as_mut_ptr().cast(),
                             );
                         }
+                        if tile {
+                            // SAFETY: 64-slot slices; even length; just-written b.
+                            let t = unsafe {
+                                msg_reduce_avx512(
+                                    &f_out[slot..slot + 64],
+                                    &b_out[slot..slot + 64],
+                                )
+                            };
+                            tiled.0 += t.0;
+                            tiled.1 += t.1;
+                        }
+                    }
+                    if tile {
+                        gfni_tiled = Some(tiled);
                     }
                 }
                 if !b_gfni_on {
@@ -6088,8 +6106,13 @@ fn materialize_direct_fold8(
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
                 {
                     // SAFETY: features cfg-guaranteed; slices are equal and
-                    // block_len is an even power of two.
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                    // block_len is an even power of two. Tiled reduce (set
+                    // inside the GFNI loop) is the same XOR of pair products.
+                    if let Some(m) = gfni_tiled {
+                        m
+                    } else {
+                        unsafe { msg_reduce_avx512(f_out, b_out) }
+                    }
                 }
                 #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
                 {

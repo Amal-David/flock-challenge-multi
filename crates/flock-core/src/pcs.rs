@@ -752,6 +752,15 @@ pub fn ranked_direct_c_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none())
 }
 
+/// Ranked default: DirectFold8 b-GFNI tiles `msg_reduce` onto each 64-slot
+/// store so `f_out`/`b_out` are not re-walked after the GFNI loop.
+/// `FLOCK_NO_DF8_MSG_TILE=1` restores one reduce of the whole block.
+#[inline]
+pub fn ranked_df8_msg_tile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DF8_MSG_TILE").is_none())
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
