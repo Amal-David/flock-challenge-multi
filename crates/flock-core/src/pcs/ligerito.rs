@@ -6546,6 +6546,12 @@ fn multi_proof_gather(
                 .map(|&i| tree[i])
                 .collect();
         }
+        // The index helper emits siblings in exactly the incumbent proof
+        // order. Reuse that completed walk below the Rayon threshold too;
+        // falling through to `merkle_multi_proof` would sort/dedup and walk
+        // the same active positions a second time before doing these exact
+        // tree reads. `par = false` remains the fused sequential oracle.
+        return indices.into_iter().map(|i| tree[i]).collect();
     }
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
