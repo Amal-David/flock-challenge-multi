@@ -395,6 +395,132 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
+/// `FLOCK_NO_WIT_TR8X2=1` restores two YMM `tr8` calls per 16-word drain
+/// step. Default on SPR (`target-cpu=native` ⇒ `avx512f`): one ZMM network
+/// whose 256-bit halves are those two 8×8s. Read once per process.
+#[cfg(target_feature = "avx512f")]
+fn tr8x2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIT_TR8X2").is_none());
+    *ON
+}
+
+/// Two independent 8×8 u32 transposes packed into one ZMM unpack network.
+/// Low 256 bits of each output are `tr8(v0..v7)`; high 256 bits are
+/// `tr8(w0..w7)`. `vpunpck*` is per 128-bit lane; `vpermt2q` with `idx20` /
+/// `idx31` is `vperm2i128` immediates `0x20` / `0x31` on each half.
+///
+/// # Safety
+/// Requires `avx512f`.
+#[cfg(target_feature = "avx512f")]
+#[target_feature(enable = "avx512f")]
+unsafe fn tr8x2(
+    v0: V8,
+    v1: V8,
+    v2: V8,
+    v3: V8,
+    v4: V8,
+    v5: V8,
+    v6: V8,
+    v7: V8,
+    w0: V8,
+    w1: V8,
+    w2: V8,
+    w3: V8,
+    w4: V8,
+    w5: V8,
+    w6: V8,
+    w7: V8,
+) -> [__m512i; 8] {
+    unsafe {
+        let pack = |lo: V8, hi: V8| _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+        let z0 = pack(v0, w0);
+        let z1 = pack(v1, w1);
+        let z2 = pack(v2, w2);
+        let z3 = pack(v3, w3);
+        let z4 = pack(v4, w4);
+        let z5 = pack(v5, w5);
+        let z6 = pack(v6, w6);
+        let z7 = pack(v7, w7);
+        let t0 = _mm512_unpacklo_epi32(z0, z1);
+        let t1 = _mm512_unpackhi_epi32(z0, z1);
+        let t2 = _mm512_unpacklo_epi32(z2, z3);
+        let t3 = _mm512_unpackhi_epi32(z2, z3);
+        let t4 = _mm512_unpacklo_epi32(z4, z5);
+        let t5 = _mm512_unpackhi_epi32(z4, z5);
+        let t6 = _mm512_unpacklo_epi32(z6, z7);
+        let t7 = _mm512_unpackhi_epi32(z6, z7);
+        let u0 = _mm512_unpacklo_epi64(t0, t2);
+        let u1 = _mm512_unpackhi_epi64(t0, t2);
+        let u2 = _mm512_unpacklo_epi64(t1, t3);
+        let u3 = _mm512_unpackhi_epi64(t1, t3);
+        let u4 = _mm512_unpacklo_epi64(t4, t6);
+        let u5 = _mm512_unpackhi_epi64(t4, t6);
+        let u6 = _mm512_unpacklo_epi64(t5, t7);
+        let u7 = _mm512_unpackhi_epi64(t5, t7);
+        let idx20 = _mm512_setr_epi64(0, 1, 8, 9, 4, 5, 12, 13);
+        let idx31 = _mm512_setr_epi64(2, 3, 10, 11, 6, 7, 14, 15);
+        [
+            _mm512_permutex2var_epi64(u0, idx20, u4),
+            _mm512_permutex2var_epi64(u1, idx20, u5),
+            _mm512_permutex2var_epi64(u2, idx20, u6),
+            _mm512_permutex2var_epi64(u3, idx20, u7),
+            _mm512_permutex2var_epi64(u0, idx31, u4),
+            _mm512_permutex2var_epi64(u1, idx31, u5),
+            _mm512_permutex2var_epi64(u2, idx31, u6),
+            _mm512_permutex2var_epi64(u3, idx31, u7),
+        ]
+    }
+}
+
+/// Sixteen consecutive stage words → two `[V8; 8]` transposes, one ZMM pass.
+///
+/// # Safety
+/// As [`tr8_chunk`] for `w..w+16`; requires `avx512f`.
+#[cfg(target_feature = "avx512f")]
+#[target_feature(enable = "avx512f")]
+unsafe fn tr8x2_chunk(stage: *const V8, w: usize) -> ([V8; 8], [V8; 8]) {
+    unsafe {
+        let z = tr8x2(
+            load_v8(stage.add(w) as *const u32),
+            load_v8(stage.add(w + 1) as *const u32),
+            load_v8(stage.add(w + 2) as *const u32),
+            load_v8(stage.add(w + 3) as *const u32),
+            load_v8(stage.add(w + 4) as *const u32),
+            load_v8(stage.add(w + 5) as *const u32),
+            load_v8(stage.add(w + 6) as *const u32),
+            load_v8(stage.add(w + 7) as *const u32),
+            load_v8(stage.add(w + 8) as *const u32),
+            load_v8(stage.add(w + 9) as *const u32),
+            load_v8(stage.add(w + 10) as *const u32),
+            load_v8(stage.add(w + 11) as *const u32),
+            load_v8(stage.add(w + 12) as *const u32),
+            load_v8(stage.add(w + 13) as *const u32),
+            load_v8(stage.add(w + 14) as *const u32),
+            load_v8(stage.add(w + 15) as *const u32),
+        );
+        let lo = core::array::from_fn(|r| _mm512_castsi512_si256(z[r]));
+        let hi = core::array::from_fn(|r| _mm512_extracti64x4_epi64::<1>(z[r]));
+        (lo, hi)
+    }
+}
+
+/// One 16-word drain-step transpose. SPR uses [`tr8x2_chunk`]; AVX2 and the
+/// kill switch keep two [`tr8_chunk`] calls.
+///
+/// # Safety
+/// As [`tr8_chunk`] for `w` and `w + 8`.
+#[inline(always)]
+unsafe fn tr8_pair(stage: *const V8, w: usize) -> ([V8; 8], [V8; 8]) {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        if tr8x2_enabled() {
+            return tr8x2_chunk(stage, w);
+        }
+    }
+    unsafe { (tr8_chunk(stage, w), tr8_chunk(stage, w + 8)) }
+}
+
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
@@ -1247,8 +1373,7 @@ impl Drain8<'_> {
                 // Every packed row satisfies `z = a & b` and `tr8` is a bit
                 // permutation, so the Z rows are derived from the transposed
                 // A/B rows instead of transposing a third Z ring.
-                let a_lo = tr8_chunk(self.ast, rw);
-                let a_hi = tr8_chunk(self.ast, rw + 8);
+                let (a_lo, a_hi) = tr8_pair(self.ast, rw);
                 for r in 0..8 {
                     let p = sa.add(r * STEP_WORDS);
                     store_v8(p, a_lo[r]);
@@ -1258,8 +1383,7 @@ impl Drain8<'_> {
                         widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
                     }
                 }
-                let b_lo = tr8_chunk(self.bs, rw);
-                let b_hi = tr8_chunk(self.bs, rw + 8);
+                let (b_lo, b_hi) = tr8_pair(self.bs, rw);
                 for r in 0..8 {
                     let p = sb.add(r * STEP_WORDS);
                     store_v8(p, b_lo[r]);
@@ -2117,6 +2241,64 @@ mod tests {
                 _mm256_storeu_si256(a.as_mut_ptr().cast(), rows[i]);
                 _mm256_storeu_si256(b.as_mut_ptr().cast(), back[i]);
                 assert_eq!(a, b, "tr8² row {i}");
+            }
+        }
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn witgen8_tr8x2_matches_two_tr8() {
+        unsafe {
+            let mut word = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = || {
+                word ^= word << 13;
+                word ^= word >> 7;
+                word ^= word << 17;
+                word
+            };
+            for _ in 0..32 {
+                let lo: [V8; 8] = core::array::from_fn(|_| {
+                    _mm256_setr_epi32(
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                    )
+                });
+                let hi: [V8; 8] = core::array::from_fn(|_| {
+                    _mm256_setr_epi32(
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                        next() as i32,
+                    )
+                });
+                let z = tr8x2(
+                    lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7],
+                    hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7],
+                );
+                let want_lo = tr8(lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7]);
+                let want_hi = tr8(hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7]);
+                for r in 0..8 {
+                    let got_lo = _mm512_castsi512_si256(z[r]);
+                    let got_hi = _mm512_extracti64x4_epi64::<1>(z[r]);
+                    let mut a = [0i32; 8];
+                    let mut b = [0i32; 8];
+                    _mm256_storeu_si256(a.as_mut_ptr().cast(), got_lo);
+                    _mm256_storeu_si256(b.as_mut_ptr().cast(), want_lo[r]);
+                    assert_eq!(a, b, "lo row {r}");
+                    _mm256_storeu_si256(a.as_mut_ptr().cast(), got_hi);
+                    _mm256_storeu_si256(b.as_mut_ptr().cast(), want_hi[r]);
+                    assert_eq!(a, b, "hi row {r}");
+                }
             }
         }
     }
