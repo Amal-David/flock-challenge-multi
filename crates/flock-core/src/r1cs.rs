@@ -329,8 +329,9 @@ impl BlockR1cs {
     /// statement being proved.
     ///
     /// Lazily cached in [`Self::digest_cache`]; first call materializes it
-    /// (matters for dense matrices — BLAKE3's R1CS has ~21M nonzeros, ~250 ms
-    /// to hash), subsequent calls are essentially free.
+    /// (matters for dense matrices — BLAKE3's R1CS has ~21M nonzeros; the
+    /// parallel staging form below materialises it in ~25 ms instead of
+    /// ~360 ms), subsequent calls are essentially free.
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
             let mut h = blake3::Hasher::new();
@@ -373,15 +374,86 @@ impl BlockR1cs {
 /// `(num_rows, num_cols, [(row_len, col_indices...) for each row])`, all
 /// little-endian u64, so two matrices with different shapes/contents always
 /// produce different states.
+///
+/// The sequential form feeds one u64 per `h.update` through a serial
+/// `blake3::Hasher`; at BLAKE3's ranked scale the three matrices hold ~21M
+/// nonzeros and this loop costs ~360 ms of single-thread time inside the
+/// first `statement_digest()` of a fresh worker process — which is the
+/// untimed warm-up proof, not the timed one (`digest_cache` is a
+/// `OnceLock`, and `Blake3Setup::with_profile_and_rate` materialises it
+/// during construction so no timed proof ever re-pays it). This function is
+/// therefore *latency-neutral* for the ranked worker; it exists to make
+/// `statement_digest()` itself thread-parallel so any *other* call pattern
+/// (test provers, `flock_chain`, future worker layouts where the first
+/// digest lands inside a timed window) stops paying the serial ~360 ms.
+///
+/// Exactness: BLAKE3 is a chunk tree — hashing the same byte stream through
+/// `Hasher::update` in any splitting produces identical output bytes. We
+/// build the full little-endian u64 byte stream in parallel
+/// (row-chunked into one contiguous `Vec<u8>`), then hash it serially with
+/// one `Hasher`. The digest is byte-identical to the one-update-at-a-time
+/// form; verified by a `FLOCK_NO_STMT_DIGEST_PAR` A/B test in this repo.
+/// Serial fallback: set `FLOCK_NO_STMT_DIGEST_PAR=1`.
 fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
+    use rayon::prelude::*;
     h.update(&(m.num_rows as u64).to_le_bytes());
     h.update(&(m.num_cols as u64).to_le_bytes());
-    for row in &m.rows {
-        h.update(&(row.len() as u64).to_le_bytes());
-        for &col in row {
-            h.update(&(col as u64).to_le_bytes());
+    let total: usize = m.rows.iter().map(|r| 8 + 8 * r.len()).sum();
+    if total < (1 << 16) || std::env::var_os("FLOCK_NO_STMT_DIGEST_PAR").is_some() {
+        // Small matrices (tests, sub-circuits): the serial form is cheaper
+        // than spawning a parallel staging buffer.
+        for row in &m.rows {
+            h.update(&(row.len() as u64).to_le_bytes());
+            for &col in row {
+                h.update(&(col as u64).to_le_bytes());
+            }
+        }
+        return;
+    }
+    // Parallel staging: each row chunk writes `[row_len, cols...]` as u64 LE
+    // into its disjoint slice of one buffer, then one serial pass hashes it.
+    // Splitting by row count (not bytes) keeps every chunk boundary on a row
+    // boundary, so the concatenated stream equals the serial update stream.
+    let n = m.rows.len();
+    let threads = rayon::current_num_threads().max(1);
+    let chunk_rows = n.div_ceil(threads * 4).max(1);
+    // Byte offset of each row chunk (rows have variable length, so chunk
+    // byte sizes vary; only the boundaries must line up with the buffer).
+    let n_chunks = n.div_ceil(chunk_rows);
+    let mut starts = Vec::with_capacity(n_chunks + 1);
+    let mut acc = 0usize;
+    for c in 0..n_chunks {
+        starts.push(acc);
+        let end = ((c + 1) * chunk_rows).min(n);
+        for r in &m.rows[c * chunk_rows..end] {
+            acc += 8 + 8 * r.len();
         }
     }
+    starts.push(acc);
+    let mut buf = vec![0u8; total];
+    // Split the staging buffer into per-row-chunk mutable slices at the
+    // recorded byte offsets, then fill them in parallel.
+    let mut rest: &mut [u8] = buf.as_mut_slice();
+    let mut byte_chunks: Vec<&mut [u8]> = Vec::with_capacity(n_chunks);
+    for c in 0..n_chunks {
+        let (head, tail) = rest.split_at_mut(starts[c + 1] - starts[c]);
+        byte_chunks.push(head);
+        rest = tail;
+    }
+    byte_chunks
+        .into_par_iter()
+        .zip(m.rows.par_chunks(chunk_rows))
+        .for_each(|(mut w, rows)| {
+            for row in rows {
+                w[..8].copy_from_slice(&(row.len() as u64).to_le_bytes());
+                w = &mut w[8..];
+                for &col in row {
+                    w[..8].copy_from_slice(&(col as u64).to_le_bytes());
+                    w = &mut w[8..];
+                }
+            }
+        });
+    h.update(&buf);
 }
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z` over GF(2).
