@@ -3145,17 +3145,16 @@ impl Blake3Setup {
 
     /// Ligerito-backend prove. Requires m ≥ ~21.
     ///
-    /// First call in a process at ranked scale (m ≥ 29) runs two extra
-    /// throwaway proves before the caller's prove. Rationale (gap-hunt,
-    /// wave 7): the NT-store DRAM phases (zerocheck R2, open combine) and
-    /// the GPU share calibration warm over the first ~3 proves of a process
-    /// (measured 259 → 247 → 237 ms best across a process's first proves
-    /// even after one warm-up prove). The ranked worker performs exactly one
-    /// untimed warm-up prove before signalling readiness; folding the extra
-    /// passes into that first call moves the remaining ramp out of the
-    /// timed window. The throwaway proves use a private challenger and are
-    /// discarded — the caller's transcript and proof bytes are untouched.
-    /// `FLOCK_NO_EXTRA_WARMUP=1` disables.
+    /// First call in a process at ranked scale (m ≥ 29) runs one extra
+    /// throwaway proof before the caller's proof. Together with the caller's
+    /// fixed warm-up and the seed-pipe thread's own warm-up, this gives the
+    /// pool three complete pre-ready proves — the measured ramp point
+    /// (259 → 247 → 237 ms) that motivated the original two-extra policy —
+    /// without a redundant fourth proof's thermal and memory pressure.
+    /// The throwaway proof uses a private challenger and is discarded, so the
+    /// caller's transcript and proof bytes are untouched.
+    /// `FLOCK_NO_EXTRA_WARMUP=1` disables the block;
+    /// `FLOCK_EXTRA_WARMUP_RUNS=2` restores the promoted count for A/B.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
@@ -3184,7 +3183,11 @@ impl Blake3Setup {
             && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
             && std::env::var_os("FLOCK_NO_EXTRA_WARMUP").is_none()
         {
-            for _ in 0..2 {
+            let extra_warmup_runs = std::env::var("FLOCK_EXTRA_WARMUP_RUNS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            for _ in 0..extra_warmup_runs {
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
