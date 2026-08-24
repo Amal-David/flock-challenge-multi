@@ -41,6 +41,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
@@ -671,6 +672,24 @@ enum StagingInit {
 #[cfg(test)]
 static STAGING_INIT_TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Test override for [`ntt_stage_pool_enabled`]; 0 = production selector,
+/// 1 = force off, 2 = force on (while retaining the exact ranked size).
+#[cfg(test)]
+static NTT_STAGE_POOL_TEST_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+static NTT_STAGE_POOL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static NTT_STAGE_POOL_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static NTT_STAGE_POOL_RETURNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 const STAGING_POISON: F128 = F128 {
     lo: 0xDEAD_BEEF_FEED_FACE,
@@ -693,6 +712,86 @@ fn staging_init_mode() -> StagingInit {
             _ => StagingInit::Uninit,
         });
     *MODE
+}
+
+const SEED_TOP_STAGE_ELEMENTS: usize = 512 * 64;
+
+thread_local! {
+    /// One free ranked 512 KiB seed buffer on the current Rayon worker. A live
+    /// job owns its `Vec`; TLS contains only an idle buffer, so task stealing
+    /// and nested jobs cannot alias storage.
+    static NTT_STAGE_POOL: RefCell<Option<Vec<F128>>> = const { RefCell::new(None) };
+}
+
+#[inline]
+fn ntt_stage_pool_enabled(rows: usize, row_len: usize, init: StagingInit) -> bool {
+    if init != StagingInit::Uninit || row_len != 64 || rows != 512 {
+        return false;
+    }
+    #[cfg(test)]
+    match NTT_STAGE_POOL_TEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_NTT_STAGE_POOL").is_none()
+        });
+        *ON && rayon::current_num_threads() == 16
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    false
+}
+
+/// Owned fused-pass staging. Pooled values move out of TLS on acquisition and
+/// move back only after the Rayon folder drops them; no worker identity is
+/// observed or assumed.
+struct NttStageBlock {
+    buf: Vec<F128>,
+    pooled: bool,
+}
+
+impl std::ops::Deref for NttStageBlock {
+    type Target = [F128];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for NttStageBlock {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buf
+    }
+}
+
+impl Drop for NttStageBlock {
+    fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
+        let buf = std::mem::take(&mut self.buf);
+        let _ = NTT_STAGE_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.is_none() {
+                *pool = Some(buf);
+                #[cfg(test)]
+                NTT_STAGE_POOL_RETURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
 }
 
 /// A `rows × row_len` per-worker staging block for the fused top passes.
@@ -724,9 +823,8 @@ fn staging_init_mode() -> StagingInit {
 ///
 /// `alloc_uninit_vec` additionally `madvise(MADV_HUGEPAGE)`s blocks ≥ 2 MiB,
 /// which the `vec![F128::ZERO; …]` it replaces did not.
-fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
-    let n = rows * row_len;
-    match staging_init_mode() {
+fn staging_block_with_init(n: usize, init: StagingInit) -> Vec<F128> {
+    match init {
         // SAFETY (of the write-before-read contract, not of this call): see
         // the per-call-site census above.
         StagingInit::Uninit => crate::alloc_uninit_vec::<F128>(n),
@@ -738,6 +836,36 @@ fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
             v
         }
     }
+}
+
+fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
+    staging_block_with_init(rows * row_len, staging_init_mode())
+}
+
+fn seed_staging_block(row_len: usize, allow_pool: bool) -> NttStageBlock {
+    let rows = 512;
+    let n = rows * row_len;
+    let init = staging_init_mode();
+    let pooled = allow_pool
+        && init == StagingInit::Uninit
+        && row_len == 64
+        && rows == 512;
+    if pooled {
+        debug_assert_eq!(n, SEED_TOP_STAGE_ELEMENTS);
+        if let Some(buf) = NTT_STAGE_POOL.with(|pool| pool.borrow_mut().take()) {
+            debug_assert_eq!(buf.len(), n);
+            #[cfg(test)]
+            NTT_STAGE_POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return NttStageBlock {
+                buf,
+                pooled: true,
+            };
+        }
+        #[cfg(test)]
+        NTT_STAGE_POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let buf = staging_block_with_init(n, init);
+    NttStageBlock { buf, pooled }
 }
 
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
@@ -1849,6 +1977,7 @@ impl AdditiveNttF128 {
         let lanes4_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
         let lanes2_tail = if quarter.is_multiple_of(2) { odd_tail } else { 0 };
         let row_len = num_ntts;
+        let pool_staging = ntt_stage_pool_enabled(512, row_len, staging_init_mode());
 
         // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
         let mut seed_tw = [[F128::ZERO; 3]; 2];
@@ -1922,7 +2051,7 @@ impl AdditiveNttF128 {
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);
         let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
-        let task = |buf: &mut Vec<F128>, r: usize| {
+        let task = |buf: &mut [F128], r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
             // `msg`; codeword rows `block·B + r + k·S` are inside `data`;
@@ -2175,18 +2304,22 @@ impl AdditiveNttF128 {
 
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
-        // (all lanes) before the layer loops read any of them, so the
-        // 512 KiB zero-fill per init was dead work — rayon runs the
-        // initializer once per JOB, not per worker.
+        // (all lanes) before the layer loops read any of them. The current
+        // incumbent already allocates those 512 KiB blocks uninitialized; the
+        // ranked pool removes repeated allocator round trips after warmup.
+        // Rayon runs this initializer per folder, not once per worker.
         if sub_stride < PARALLEL_TASK_THRESHOLD {
-            let mut buf = staging_block(512, row_len);
+            let mut buf = seed_staging_block(row_len, pool_staging);
             for r in 0..sub_stride {
                 task(&mut buf, r);
             }
         } else {
             (0..sub_stride)
                 .into_par_iter()
-                .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+                .for_each_init(
+                    || seed_staging_block(row_len, pool_staging),
+                    |buf, r| task(buf, r),
+                );
         }
     }
 
@@ -4941,6 +5074,92 @@ mod tests {
                 "poison sentinel leaked into the output at log_d={log_d} num_ntts={num_ntts}"
             );
         }
+    }
+
+    /// The ranked staging recycler is ownership-based, not worker-indexed:
+    /// nested live jobs cannot alias, unwind returns the owned allocation, and
+    /// the ranked seed-fused pass is byte-identical to fresh allocation.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn ranked_ntt_stage_pool_reuses_owned_buffers() {
+        use std::sync::atomic::Ordering;
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        STAGING_INIT_TEST_MODE.store(3, Ordering::SeqCst); // Uninit
+        NTT_STAGE_POOL_TEST_MODE.store(2, Ordering::SeqCst); // Force on
+        NTT_STAGE_POOL.with(|pool| *pool.borrow_mut() = None);
+        NTT_STAGE_POOL_HITS.store(0, Ordering::SeqCst);
+        NTT_STAGE_POOL_MISSES.store(0, Ordering::SeqCst);
+        NTT_STAGE_POOL_RETURNS.store(0, Ordering::SeqCst);
+
+        let first = seed_staging_block(64, true);
+        let first_ptr = first.as_ptr();
+        let nested = seed_staging_block(64, true);
+        let nested_ptr = nested.as_ptr();
+        assert_ne!(first_ptr, nested_ptr, "two live jobs aliased one TLS slot");
+        drop(nested);
+        drop(first); // Slot is already full; this extra allocation is freed.
+        let reused = seed_staging_block(64, true);
+        assert_eq!(reused.as_ptr(), nested_ptr, "idle seed buffer was not reused");
+        drop(reused);
+
+        let panic_ptr = std::cell::Cell::new(core::ptr::null::<F128>());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let buf = seed_staging_block(64, true);
+            panic_ptr.set(buf.as_ptr());
+            panic!("intentional staging unwind");
+        }));
+        assert!(unwind.is_err());
+        let after_unwind = seed_staging_block(64, true);
+        assert_eq!(
+            after_unwind.as_ptr(),
+            panic_ptr.get(),
+            "unwind did not return the owned seed buffer"
+        );
+        drop(after_unwind);
+        assert!(NTT_STAGE_POOL_HITS.load(Ordering::SeqCst) >= 2);
+        assert!(NTT_STAGE_POOL_MISSES.load(Ordering::SeqCst) >= 2);
+        assert!(NTT_STAGE_POOL_RETURNS.load(Ordering::SeqCst) >= 3);
+
+        // A non-ranked lane count is the ordinary generic fallback even when
+        // the test override requests pooling.
+        let misses = NTT_STAGE_POOL_MISSES.load(Ordering::SeqCst);
+        let fallback = seed_staging_block(63, true);
+        assert!(!fallback.pooled);
+        drop(fallback);
+        assert_eq!(NTT_STAGE_POOL_MISSES.load(Ordering::SeqCst), misses);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let ntt = AdditiveNttF128::standard(10);
+        let codeword_len = (1usize << 10) * 64;
+        let msg_len = codeword_len >> 1;
+        let mut rng = Rng::new(0xC306_5120);
+        let msg = rand_vec(&mut rng, msg_len);
+        let run = |pool_mode: u8| {
+            NTT_STAGE_POOL_TEST_MODE.store(pool_mode, Ordering::SeqCst);
+            pool.install(|| {
+                NTT_STAGE_POOL.with(|slot| *slot.borrow_mut() = None);
+                let seed_before = SEED_TOP_FUSION_HITS.load(Ordering::Relaxed);
+                let mut encoded = junk_vec(codeword_len);
+                ntt.seed_top_fused8_pass(&msg, &mut encoded, 64, 10, 0);
+                assert!(SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) > seed_before);
+                encoded
+            })
+        };
+
+        let fresh = run(1); // Kill/fallback: fresh staging allocation.
+        let pooled = run(2);
+        assert_eq!(fresh, pooled, "pooled seed codeword differs");
+
+        NTT_STAGE_POOL_TEST_MODE.store(0, Ordering::SeqCst);
+        STAGING_INIT_TEST_MODE.store(0, Ordering::SeqCst);
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
