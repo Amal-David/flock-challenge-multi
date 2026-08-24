@@ -504,10 +504,22 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
 
+/// `FLOCK_NO_MERKLE_SHA_SERIAL_X4=1` restores per-parent `Sha256::digest` in
+/// [`hash_pairs_level_serial`]. Ranked default matches [`hash_pairs_level`]'s
+/// SHA-NI 4-wide body. Resolved once per process.
+fn merkle_sha_serial_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SHA_SERIAL_X4").is_none());
+    *ON
+}
+
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
 /// its leaves are still cache-hot, from inside the NTT rayon job (where a
 /// nested `par_chunks_mut` would oversubscribe the pool).
+///
+/// SHA-256 parents walk the same `sha256_hash4` 4-wide body as the parallel
+/// level hasher; a 1–3 node tail stays scalar. BLAKE3 already batch-compresses.
 pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -518,6 +530,27 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     match kind {
         HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 if merkle_sha_serial_x4_enabled() => {
+            // Same 4-parent body as `hash_pairs_level`'s SHA-256 arm. Children
+            // of parent i occupy `read_bytes[i*64 .. i*64+64]`.
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (o, pair) in outs.iter_mut().zip(children.chunks(64)) {
+                        *o = Sha256::digest(pair).into();
+                    }
+                }
+            }
+        }
         HashKind::Sha256 => {
             for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
                 *o = Sha256::digest(children).into();
@@ -1251,6 +1284,31 @@ mod tests {
                         "leaf {i} of {n} at size {leaf_size}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Serial SHA-256 parent fold must match `hash_pair` at every width the
+    /// NTT deep-pass subtree uses, including 1–3 leftover parents after the
+    /// 4-wide SHA-NI run.
+    #[test]
+    fn hash_pairs_level_serial_sha256_matches_hash_pair() {
+        let counts = [1usize, 2, 3, 4, 5, 7, 8, 16, 64, 127, 128];
+        for n in counts {
+            let mut children = vec![[0u8; 32]; 2 * n];
+            for (i, h) in children.iter_mut().enumerate() {
+                let seed = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                h[..8].copy_from_slice(&seed.to_le_bytes());
+                h[8..16].copy_from_slice(&(seed.rotate_left(17)).to_le_bytes());
+            }
+            let mut serial = vec![[0u8; 32]; n];
+            hash_pairs_level_serial(&children, &mut serial, HashKind::Sha256);
+            let mut parallel = vec![[0u8; 32]; n];
+            hash_pairs_level(&children, &mut parallel, HashKind::Sha256);
+            for i in 0..n {
+                let spec = hash_pair(&children[2 * i], &children[2 * i + 1], HashKind::Sha256);
+                assert_eq!(serial[i], spec, "serial parent {i} of {n}");
+                assert_eq!(parallel[i], spec, "parallel parent {i} of {n}");
             }
         }
     }
