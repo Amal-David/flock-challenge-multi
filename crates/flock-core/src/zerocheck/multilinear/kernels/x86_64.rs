@@ -162,18 +162,20 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 
 /// x86 lookahead round-two sweep for one worker chunk: folds every pair of
 /// this chunk into `a_chunk`/`b_chunk` (bit-identical to the incumbent
-/// sweep) and returns the eight per-chunk sums
+/// sweep).  Entries `0..8` of the result are
 /// `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`, each reduced,
-/// all accumulated on the group's shared odd-lane weight `w = eq_lo[2u+1]`
-/// (see `uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead`).
+/// all accumulated on the group's shared odd-lane weight `w = eq_lo[2u+1]`.
+///
+/// With `FOLD3=true`, entries `8..26` additionally hold the two nine-point
+/// `(0,1,∞)²` grids for round four on the odd-odd weight
+/// `eq_lo[4y+3]`; `FOLD3=false` compiles that work away.  `WRITE=false` (the
+/// no-materialize sweep) skips every table store, so `a_chunk`/`b_chunk` may
+/// be empty.
 ///
 /// Per four groups (eight pairs): four reduced `w`-prescalings of the `a`
-/// rows, then all eight products are one unreduced `WideGhashX4::mul_acc`
-/// each — 56 CLMUL against the incumbent's 40 for the same eight pairs.
-///
-/// `WRITE = false` (the no-materialize sweep) skips every table store;
-/// `a_chunk`/`b_chunk` may then be empty.
-///
+/// rows, then all eight incumbent products are one unreduced
+/// `WideGhashX4::mul_acc` each.  The fold3 grid is evaluated from those same
+/// row registers before they leave the loop.
 /// # Safety
 /// `table_data` must point to the 8 × 256 `F128` fold table; `a_pkt`/`b_pkt`
 /// must expose 8 readable bytes for every post-URM row
@@ -186,7 +188,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
+pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<
+    const WRITE: bool,
+    const FOLD3: bool,
+>(
     table_data: *const F128,
     mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
@@ -199,7 +204,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
-) -> [F128; 8] {
+) -> [F128; 26] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -207,6 +212,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     debug_assert!(!WRITE || a_chunk.len() == 2 * lo_size);
     debug_assert!(!WRITE || b_chunk.len() == 2 * lo_size);
     debug_assert!(lo_size.is_multiple_of(2));
+    debug_assert!(!FOLD3 || lo_size.is_multiple_of(8));
 
     // SAFETY: the function's contract bounds every packed-row read, table
     // read and chunk write; the cfg gate supplies every intrinsic feature.
@@ -216,6 +222,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
+        // The fold3 route carries the round-four tensor-grid values as
+        // reduced lane accumulators.  Only lanes 1 and 3 are live: each is
+        // the odd four-row half of one consecutive eight-row group.
+        let mut bivar_acc = [_mm512_setzero_si512(); 18];
         let mut x_lo = 0;
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
@@ -429,6 +439,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
+            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
@@ -436,8 +449,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 // a permute plus a CLMUL of pure latency — at the head of
                 // the chain feeding all eight accumulates, every iteration.
                 let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                let w = _mm512_loadu_si512(wp);
+                let w_pre = _mm512_loadu_si512(wp);
                 let w64 = _mm512_loadu_si512(wp.add(1));
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w_pre, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w_pre, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w_pre, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w_pre, w64),
+                )
+            } else if wsplit {
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
                 (
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
@@ -445,25 +466,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                 )
             } else {
-                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                    (
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                    )
-                } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
-                }
+                (
+                    ghash_mul_x4(w, a0),
+                    ghash_mul_x4(w, a1),
+                    ghash_mul_x4(w, a2),
+                    ghash_mul_x4(w, a3),
+                )
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -477,6 +485,43 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
             acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            if FOLD3 {
+                // Keep the second group of each adjacent pair (F128 lanes
+                // 1 and 3).  Its weight is
+                // `eq₂(4y+3) = r₁·r₂·eq₄(y)`.
+                let wb = _mm512_maskz_mov_epi64(0xcc, w);
+                let pair_even = |v: __m512i| {
+                    let replicated =
+                        _mm512_permutexvar_epi64(_mm512_set_epi64(5, 4, 5, 4, 1, 0, 1, 0), v);
+                    _mm512_xor_si512(v, replicated)
+                };
+                let grid = |q: [__m512i; 4]| {
+                    [
+                        q[0],
+                        q[1],
+                        _mm512_xor_si512(q[0], q[1]),
+                        q[2],
+                        q[3],
+                        _mm512_xor_si512(q[2], q[3]),
+                        _mm512_xor_si512(q[0], q[2]),
+                        _mm512_xor_si512(q[1], q[3]),
+                        _mm512_xor_si512(
+                            _mm512_xor_si512(q[0], q[1]),
+                            _mm512_xor_si512(q[2], q[3]),
+                        ),
+                    ]
+                };
+                let ga1 = grid([a0, a1, a2, a3]);
+                let gb1 = grid([b0, b1, b2, b3]);
+                let gai = grid([pair_even(a0), pair_even(a1), pair_even(a2), pair_even(a3)]);
+                let gbi = grid([pair_even(b0), pair_even(b1), pair_even(b2), pair_even(b3)]);
+                for i in 0..9 {
+                    let one = ghash_mul_x4(ghash_mul_x4(wb, ga1[i]), gb1[i]);
+                    let inf = ghash_mul_x4(ghash_mul_x4(wb, gai[i]), gbi[i]);
+                    bivar_acc[i] = _mm512_xor_si512(bivar_acc[i], one);
+                    bivar_acc[9 + i] = _mm512_xor_si512(bivar_acc[9 + i], inf);
+                }
+            }
             x_lo += 8;
         }
 
@@ -534,10 +579,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             x_lo += 2;
         }
 
-        let mut out = [F128::ZERO; 8];
+        let mut out = [F128::ZERO; 26];
         for i in 0..8 {
             tail[i] ^= acc[i].fold();
             out[i] = tail[i].reduce();
+        }
+        if FOLD3 {
+            for i in 0..18 {
+                let lanes = core::mem::transmute::<__m512i, [F128; 4]>(bivar_acc[i]);
+                out[8 + i] = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+            }
         }
         out
     }
@@ -1804,6 +1855,193 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         if nt_out {
             // Drain the WC buffers before this chunk's task returns; the
             // caller's rayon reduce is the next level's happens-before edge.
+            _mm_sfence();
+        }
+        let mut out = [F128::ZERO; 8];
+        for i in 0..8 {
+            tail[i] ^= acc[i].fold();
+            out[i] = tail[i].reduce();
+        }
+        out
+    }
+}
+
+/// AVX-512 packed triple fold for the ranked zerocheck pass.  Each packed row
+/// is table-folded once, eight consecutive rows become one output under
+/// `(ρ₁,ρ₂,ρ₃)`, and four output groups stay in ZMM registers for the
+/// round-five message and round-six lookahead accumulators.
+///
+/// # Safety
+/// The table has the protocol 8×256 shape; packed inputs expose eight bytes
+/// for rows `8*out_base .. 8*(out_base+a_out.len())`; outputs have
+/// `2*eq_lo.len()` elements.  AVX-512F and VPCLMULQDQ are cfg-gated.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_from_packed_lookahead_x86_avx512(
+    table_data: *const F128,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    rho3: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
+    debug_assert!(eq_lo.len().is_multiple_of(2));
+
+    #[inline(always)]
+    unsafe fn group4(
+        table_data: *const F128,
+        a_pkt: *const u8,
+        b_pkt: *const u8,
+        x0: usize,
+        r1: __m512i,
+        r2: __m512i,
+        r3: __m512i,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> (__m512i, __m512i) {
+        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use core::arch::x86_64::*;
+        unsafe {
+            let mut ae = [[F128::ZERO; 4]; 4];
+            let mut ao = [[F128::ZERO; 4]; 4];
+            let mut be = [[F128::ZERO; 4]; 4];
+            let mut bo = [[F128::ZERO; 4]; 4];
+            for lane in 0..4 {
+                for p in 0..4 {
+                    let pair = 4 * (x0 + lane) + p;
+                    if (pair & pair_in_block_mask) >= useful_pairs_inclusive {
+                        continue;
+                    }
+                    let row = 2 * pair;
+                    let f = fold_round2_pair_x86_unchecked_8(
+                        table_data,
+                        a_pkt.add(row * 8),
+                        a_pkt.add((row + 1) * 8),
+                        b_pkt.add(row * 8),
+                        b_pkt.add((row + 1) * 8),
+                    );
+                    ae[p][lane] = f[0];
+                    ao[p][lane] = f[1];
+                    be[p][lane] = f[2];
+                    bo[p][lane] = f[3];
+                }
+            }
+            let pair_fold = |e: __m512i, o: __m512i, r: __m512i| {
+                _mm512_xor_si512(e, ghash_mul_x4(r, _mm512_xor_si512(e, o)))
+            };
+            let mut ta = [_mm512_setzero_si512(); 4];
+            let mut tb = [_mm512_setzero_si512(); 4];
+            for p in 0..4 {
+                ta[p] = pair_fold(f128x4_loadu(ae[p].as_ptr()), f128x4_loadu(ao[p].as_ptr()), r1);
+                tb[p] = pair_fold(f128x4_loadu(be[p].as_ptr()), f128x4_loadu(bo[p].as_ptr()), r1);
+            }
+            let ua0 = pair_fold(ta[0], ta[1], r2);
+            let ua1 = pair_fold(ta[2], ta[3], r2);
+            let ub0 = pair_fold(tb[0], tb[1], r2);
+            let ub1 = pair_fold(tb[2], tb[3], r2);
+            (pair_fold(ua0, ua1, r3), pair_fold(ub0, ub1, r3))
+        }
+    }
+
+    unsafe {
+        let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho1.hi as i64, rho1.lo as i64));
+        let r2 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho2.hi as i64, rho2.lo as i64));
+        let r3 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho3.hi as i64, rho3.lo as i64));
+        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut tail = [F256Unreduced::ZERO; 8];
+        let mut x_lo = 0;
+
+        while x_lo + 8 <= eq_lo.len() {
+            let output = 2 * x_lo;
+            let xg = out_base + output;
+            let (oa0, ob0) = group4(table_data, a_pkt, b_pkt, xg, r1, r2, r3, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa1, ob1) = group4(table_data, a_pkt, b_pkt, xg + 4, r1, r2, r3, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa2, ob2) = group4(table_data, a_pkt, b_pkt, xg + 8, r1, r2, r3, pair_in_block_mask, useful_pairs_inclusive);
+            let (oa3, ob3) = group4(table_data, a_pkt, b_pkt, xg + 12, r1, r2, r3, pair_in_block_mask, useful_pairs_inclusive);
+            let ap = a_out.as_mut_ptr().add(output);
+            let bp = b_out.as_mut_ptr().add(output);
+            if nt_out {
+                stream_zmm_as_xmm4(ap, oa0);
+                stream_zmm_as_xmm4(ap.add(4), oa1);
+                stream_zmm_as_xmm4(ap.add(8), oa2);
+                stream_zmm_as_xmm4(ap.add(12), oa3);
+                stream_zmm_as_xmm4(bp, ob0);
+                stream_zmm_as_xmm4(bp.add(4), ob1);
+                stream_zmm_as_xmm4(bp.add(8), ob2);
+                stream_zmm_as_xmm4(bp.add(12), ob3);
+            } else {
+                _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
+                _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
+                _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), oa2);
+                _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), oa3);
+                _mm512_storeu_si512(bp.cast::<__m512i>(), ob0);
+                _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), ob1);
+                _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), ob2);
+                _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
+            }
+            let [a0, a1, a2, a3] = transpose4_lanes(oa0, oa1, oa2, oa3);
+            let [b0, b1, b2, b3] = transpose4_lanes(ob0, ob1, ob2, ob3);
+            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+            let a0w = ghash_mul_x4(w, a0);
+            let a1w = ghash_mul_x4(w, a1);
+            let a2w = ghash_mul_x4(w, a2);
+            let a3w = ghash_mul_x4(w, a3);
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+            acc[4].mul_acc(a2w, b2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            acc[5].mul_acc(e_aw, e_b);
+            acc[6].mul_acc(o_aw, o_b);
+            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            x_lo += 8;
+        }
+
+        while x_lo + 2 <= eq_lo.len() {
+            let output = 2 * x_lo;
+            let (oa, ob) = group4(table_data, a_pkt, b_pkt, out_base + output, r1, r2, r3, pair_in_block_mask, useful_pairs_inclusive);
+            _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), oa);
+            _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), ob);
+            let a = [a_out[output], a_out[output + 1], a_out[output + 2], a_out[output + 3]];
+            let b = [b_out[output], b_out[output + 1], b_out[output + 2], b_out[output + 3]];
+            let wt = eq_lo[x_lo + 1];
+            let aw = [wt * a[0], wt * a[1], wt * a[2], wt * a[3]];
+            tail[0] ^= aw[1].mul_unreduced(b[1]);
+            tail[1] ^= (aw[0] + aw[1]).mul_unreduced(b[0] + b[1]);
+            tail[2] ^= aw[3].mul_unreduced(b[3]);
+            tail[3] ^= (aw[2] + aw[3]).mul_unreduced(b[2] + b[3]);
+            tail[4] ^= aw[2].mul_unreduced(b[2]);
+            let (e_aw, e_b) = (aw[0] + aw[2], b[0] + b[2]);
+            let (o_aw, o_b) = (aw[1] + aw[3], b[1] + b[3]);
+            tail[5] ^= e_aw.mul_unreduced(e_b);
+            tail[6] ^= o_aw.mul_unreduced(o_b);
+            tail[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+            x_lo += 2;
+        }
+        if nt_out {
             _mm_sfence();
         }
         let mut out = [F128::ZERO; 8];
