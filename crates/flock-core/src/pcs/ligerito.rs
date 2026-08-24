@@ -1854,6 +1854,41 @@ fn open_basis_x4_enabled() -> bool {
     *ON
 }
 
+/// Exact ranked shapes whose dense induction has sixteen worker partials.
+/// L0/L1 take the F^T-NTT arm; only L2--L4 reach this selector.
+#[inline]
+fn induce_overwrite_ranked_shape(log_msg_cols: usize, n_queries: usize, n_threads: usize) -> bool {
+    cfg!(target_arch = "x86_64")
+        && n_threads == 16
+        && matches!((log_msg_cols, n_queries), (13, 71) | (10, 53) | (7, 43))
+}
+
+/// `FLOCK_NO_INDUCE_OVERWRITE_INIT=1` restores the incumbent dense-induction
+/// worker lifecycle exactly: zero-filled accumulator/scratch buffers, sixteen
+/// partials including empty workers, and a separately zero-filled output.
+/// The default ranked x86 route instead relies on
+/// [`evaluate_scaled_basis_inplace`]'s full-write contract, initializes each
+/// worker accumulator with its first query, omits trailing empty partials, and
+/// takes ownership of partial zero as the output. The decision is made once at
+/// the dense call boundary, never in a query or slot loop.
+fn induce_overwrite_enabled(log_msg_cols: usize, n_queries: usize, n_threads: usize) -> bool {
+    #[cfg(test)]
+    match INDUCE_OVERWRITE_TEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_INDUCE_OVERWRITE_INIT").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    });
+    *ON && induce_overwrite_ranked_shape(log_msg_cols, n_queries, n_threads)
+}
+
+#[cfg(test)]
+static INDUCE_OVERWRITE_TEST_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 // ===================================================================
 // induce_sumcheck_poly — the per-level basis-poly builder.
 // ===================================================================
@@ -2028,6 +2063,132 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
     }
 }
 
+/// Ranked dense-induction lifecycle with overwrite-before-read buffers.
+/// Kept out of line so the SPR assembly can prove that its worker closure has
+/// no incumbent zero-fill or first-query accumulator loop.
+#[inline(never)]
+fn induce_sumcheck_poly_overwrite(
+    log_msg_cols: usize,
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    opened_rows: &[Vec<F128>],
+    eq: &[F128],
+    queries: &[usize],
+    alpha_pows: &[F128],
+    n_threads: usize,
+) -> (Vec<F128>, F128) {
+    use rayon::prelude::*;
+
+    let n = 1usize << log_msg_cols;
+    let n_queries = queries.len();
+    if n_queries == 0 {
+        return (vec![F128::ZERO; n], F128::ZERO);
+    }
+
+    // Preserve the incumbent query-to-partial partition exactly. Only the
+    // known-empty suffix of workers is omitted from allocation and reduction.
+    let chunk_size = n_queries.div_ceil(n_threads.max(1));
+    let n_active = n_queries.div_ceil(chunk_size);
+    debug_assert!(n_active <= n_threads);
+    let mut partials: Vec<(Vec<F128>, F128)> = (0..n_active)
+        .into_par_iter()
+        .map(|t| {
+            let start = t * chunk_size;
+            let end = (start + chunk_size).min(n_queries);
+            debug_assert!(start < end);
+
+            let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
+            // SAFETY contract of alloc_uninit_f128_vec: the evaluator writes
+            // basis[0], then doubles the initialized prefix until every one
+            // of the n slots has been written. No accumulator read occurs
+            // before that first full write.
+            let mut accum_basis = crate::alloc_uninit_f128_vec(n);
+            let first_row = &opened_rows[start];
+            let first_ap = alpha_pows[start];
+            let first_dot: F128 = first_row
+                .iter()
+                .zip(eq.iter())
+                .map(|(&r, &e)| r * e)
+                .fold(F128::ZERO, |a, v| a + v);
+            let mut local_sum = first_dot * first_ap;
+            evaluate_scaled_basis_inplace(
+                &mut sks_at_x,
+                &mut accum_basis,
+                sks_vks,
+                inv_sks_vks,
+                F128::new(queries[start] as u64, 0),
+                first_ap,
+            );
+
+            // A one-query tail worker needs no second basis allocation. Every
+            // later query fully overwrites this one reusable scratch before it
+            // is XORed into the initialized accumulator.
+            if start + 1 < end {
+                let mut local_basis = crate::alloc_uninit_f128_vec(n);
+                for i in start + 1..end {
+                    let row = &opened_rows[i];
+                    let ap = alpha_pows[i];
+                    let dot: F128 = row
+                        .iter()
+                        .zip(eq.iter())
+                        .map(|(&r, &e)| r * e)
+                        .fold(F128::ZERO, |a, v| a + v);
+                    local_sum += dot * ap;
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut local_basis,
+                        sks_vks,
+                        inv_sks_vks,
+                        F128::new(queries[i] as u64, 0),
+                        ap,
+                    );
+                    for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
+                        *acc += v;
+                    }
+                }
+            }
+            (accum_basis, local_sum)
+        })
+        .collect();
+
+    // `0 + partial[0]` is partial[0], so move that allocation into the return
+    // value and retain the incumbent partial-1, partial-2, ... XOR order.
+    let (mut basis_poly, mut enforced_sum) =
+        std::mem::replace(&mut partials[0], (Vec::new(), F128::ZERO));
+    let partials = &partials[1..];
+    for (_, local_sum) in partials.iter() {
+        enforced_sum += *local_sum;
+    }
+    const REDUCE_PAR_FLOOR: usize = 1 << 12;
+    if induce_sched_enabled() && n >= REDUCE_PAR_FLOOR && !partials.is_empty() {
+        let reduce_floor = if open_fill_enabled() {
+            1usize << 9
+        } else {
+            REDUCE_PAR_FLOOR
+        };
+        let chunk = (n / rayon::current_num_threads().max(1)).max(reduce_floor);
+        basis_poly
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let base = ci * chunk;
+                let len = out.len();
+                for (lb, _) in partials.iter() {
+                    for (acc, &v) in out.iter_mut().zip(lb[base..base + len].iter()) {
+                        *acc += v;
+                    }
+                }
+            });
+    } else {
+        for (lb, _) in partials.iter() {
+            for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
+                *acc += v;
+            }
+        }
+    }
+    (basis_poly, enforced_sum)
+}
+
 /// `queries` are **0-indexed** codeword positions. `q_field = F128::new(q, 0)`.
 ///
 /// Parallel: each thread takes a chunk of queries, builds a partial basis_poly
@@ -2077,6 +2238,19 @@ pub(crate) fn induce_sumcheck_poly(
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
+
+    if induce_overwrite_enabled(log_msg_cols, n_queries, n_threads) {
+        return induce_sumcheck_poly_overwrite(
+            log_msg_cols,
+            sks_vks,
+            &inv_sks_vks,
+            opened_rows,
+            &eq,
+            queries,
+            &alpha_pows,
+            n_threads,
+        );
+    }
 
     let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
         .into_par_iter()
@@ -9192,6 +9366,149 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     use super::*;
 
+    struct InduceOverwriteModeReset;
+
+    impl Drop for InduceOverwriteModeReset {
+        fn drop(&mut self) {
+            INDUCE_OVERWRITE_TEST_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn induce_sumcheck_poly_in_mode(
+        mode: u8,
+        log_msg_cols: usize,
+        sks_vks: &[F128],
+        opened_rows: &[Vec<F128>],
+        v_challenges: &[F128],
+        queries: &[usize],
+        alpha: &[F128],
+    ) -> (Vec<F128>, F128) {
+        let _reset = InduceOverwriteModeReset;
+        INDUCE_OVERWRITE_TEST_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+        induce_sumcheck_poly(
+            log_msg_cols,
+            sks_vks,
+            opened_rows,
+            v_challenges,
+            queries,
+            alpha,
+        )
+    }
+
+    #[test]
+    fn induce_overwrite_selector_is_exact() {
+        let on_target = cfg!(target_arch = "x86_64");
+        for &(log_msg_cols, n_queries) in &[(13usize, 71usize), (10, 53), (7, 43)] {
+            assert_eq!(
+                induce_overwrite_ranked_shape(log_msg_cols, n_queries, 16),
+                on_target
+            );
+            assert!(!induce_overwrite_ranked_shape(log_msg_cols, n_queries, 15));
+            assert!(!induce_overwrite_ranked_shape(log_msg_cols, n_queries + 1, 16));
+        }
+        assert!(!induce_overwrite_ranked_shape(19, 218, 16));
+        assert!(!induce_overwrite_ranked_shape(16, 106, 16));
+    }
+
+    #[test]
+    fn evaluate_scaled_basis_overwrites_poison_before_read() {
+        use crate::challenger::Challenger;
+
+        let poison = F128::new(0xDEAD_BEEF_FEED_FACE, 0xBAAD_F00D_C0DE_D00D);
+        let mut ch = crate::challenger::RandomChallenger::new(0x0B17_EB45_15u64);
+        for log_n in 0usize..=13 {
+            let n = 1usize << log_n;
+            let sks_vks = eval_sk_at_vks(log_n);
+            let inv_sks_vks: Vec<F128> = sks_vks
+                .iter()
+                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+                .collect();
+            for alpha in [F128::ZERO, ch.sample_f128()] {
+                let x = ch.sample_f128();
+                let mut poisoned = vec![poison; n];
+                let mut zeroed = vec![F128::ZERO; n];
+                let mut poison_sks = vec![poison; log_n.max(1)];
+                let mut zero_sks = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_inplace(
+                    &mut poison_sks,
+                    &mut poisoned,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                evaluate_scaled_basis_inplace(
+                    &mut zero_sks,
+                    &mut zeroed,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                assert_eq!(poisoned, zeroed, "log_n={log_n} alpha={alpha:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn induce_overwrite_matches_incumbent_edges_and_ranked_dense_shapes() {
+        use crate::challenger::Challenger;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .expect("build exact ranked 16-thread test pool");
+        let shapes = [
+            (4usize, 0usize, 0usize),
+            (4, 1, 0),
+            (4, 3, 1),
+            (4, 16, 2),
+            (4, 17, 3),
+            (13, 71, 3),
+            (10, 53, 3),
+            (7, 43, 3),
+        ];
+        for (shape, &(log_msg_cols, n_queries, log_interleaved)) in shapes.iter().enumerate() {
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0x1D0C_E0A7_E000u64 ^ shape as u64,
+            );
+            let queries: Vec<usize> = (0..n_queries)
+                .map(|i| i.wrapping_mul(17).wrapping_add(3))
+                .collect();
+            let opened_rows: Vec<Vec<F128>> = (0..n_queries)
+                .map(|_| ch.sample_f128_vec(1usize << log_interleaved))
+                .collect();
+            let v_challenges = ch.sample_f128_vec(log_interleaved);
+            let alpha = ch.sample_f128_vec(ceil_log2(n_queries));
+            let sks_vks = eval_sk_at_vks(log_msg_cols);
+
+            let incumbent = pool.install(|| {
+                induce_sumcheck_poly_in_mode(
+                    1,
+                    log_msg_cols,
+                    &sks_vks,
+                    &opened_rows,
+                    &v_challenges,
+                    &queries,
+                    &alpha,
+                )
+            });
+            let candidate = pool.install(|| {
+                induce_sumcheck_poly_in_mode(
+                    2,
+                    log_msg_cols,
+                    &sks_vks,
+                    &opened_rows,
+                    &v_challenges,
+                    &queries,
+                    &alpha,
+                )
+            });
+            assert_eq!(candidate.1, incumbent.1, "shape {shape}: enforced sum");
+            assert_eq!(candidate.0, incumbent.0, "shape {shape}: basis bytes");
+        }
+    }
+
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
     /// `iter().map(to_vec)` gather, the multi-proof against the incumbent
@@ -11959,6 +12276,8 @@ mod tests {
     fn direct_fold8_full_proof_and_claim_bytes_match_ordinary_fold2() {
         use crate::challenger::Challenger;
 
+        let _mode_reset = InduceOverwriteModeReset;
+
         let log_n = 12;
         let initial_k = 6;
         let k_0 = 2;
@@ -12051,6 +12370,10 @@ mod tests {
             HashKind::Sha256,
         );
 
+        let kill_poly = poly.clone();
+        let kill_direct = direct.clone();
+
+        INDUCE_OVERWRITE_TEST_MODE.store(1, std::sync::atomic::Ordering::Relaxed);
         let mut ordinary_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
         let ordinary = recursive_prover_with_basis_precomputed_round0(
@@ -12064,6 +12387,22 @@ mod tests {
             None,
             &mut ordinary_challenger,
         );
+        let mut kill_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let kill = recursive_prover_with_basis_direct_fold8(
+            &cfg,
+            kill_poly,
+            Vec::new(),
+            kill_direct,
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            round0,
+            None,
+            &mut kill_challenger,
+        );
+
+        INDUCE_OVERWRITE_TEST_MODE.store(2, std::sync::atomic::Ordering::Relaxed);
         let mut direct_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
         let got = recursive_prover_with_basis_direct_fold8(
@@ -12079,6 +12418,7 @@ mod tests {
             &mut direct_challenger,
         );
 
+        assert_eq!(got, kill, "overwrite candidate differs from exact kill path");
         assert_eq!(got, ordinary);
         assert_eq!(
             bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
