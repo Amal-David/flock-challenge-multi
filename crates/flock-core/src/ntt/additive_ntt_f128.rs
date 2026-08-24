@@ -266,6 +266,20 @@ fn ntt_direct_fused2_publish_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_HOLD4=1` restores the two-gather seed step (sparse
+/// 2-layer then dense 2-layer, each loading the same four message rows).
+/// Default ON: one load, both staging groups from those registers.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_seed_hold4_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -1956,7 +1970,25 @@ impl AdditiveNttF128 {
                             );
                         }
                     }
-                    if pf_next.is_null() {
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if !ntt_seed_hold4_disabled() {
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(kp * row_len),
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            row_len,
+                            seed_right,
+                            &seed_dense,
+                            pf_next,
+                        );
+                    } else if pf_next.is_null() {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo(
                             src,
                             block_size,
@@ -1966,6 +1998,16 @@ impl AdditiveNttF128 {
                             0,
                             row_len,
                             seed_right,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
                         );
                     } else {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
@@ -1979,17 +2021,58 @@ impl AdditiveNttF128 {
                             seed_right,
                             pf_next,
                         );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
                     }
-                    kernels::butterfly_fused_2layer_row_from_geo(
-                        src,
-                        block_size,
-                        r_s,
-                        bufp.add((256 + kp) * row_len),
-                        64,
-                        0,
-                        row_len,
-                        &seed_dense,
-                    );
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
+                    {
+                        if pf_next.is_null() {
+                            kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                                src,
+                                block_size,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                64,
+                                0,
+                                row_len,
+                                seed_right,
+                            );
+                        } else {
+                            kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
+                                src,
+                                block_size,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                64,
+                                0,
+                                row_len,
+                                seed_right,
+                                pf_next,
+                            );
+                        }
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    }
                 }
                 #[cfg(all(
                     target_arch = "x86_64",

@@ -445,6 +445,81 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     }
 }
 
+/// One four-row message load, both seed staging groups. x86 AVX-512 holds the
+/// four ZMMs; other builds run the two-call form (same bytes, two gathers).
+///
+/// # Safety
+/// Union of the sparse-geo and dense-geo contracts on the shared source and
+/// the two destinations. Destinations must not alias.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src: *const F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            pf_src,
+        );
+        return;
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    unsafe {
+        let _ = pf_src;
+        portable::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_quarter,
+            0,
+            num_ntts,
+            right_twiddle,
+        );
+        portable::butterfly_fused_2layer_row_from_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_dense,
+            dst_quarter,
+            0,
+            num_ntts,
+            dense_tw,
+        );
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only
