@@ -222,6 +222,49 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     }
 }
 
+/// Sequential sparse-then-dense pair. Same bytes as the AVX-512 fused
+/// body; used on non-AVX-512 targets and as the portable oracle.
+///
+/// # Safety
+/// Same contract as the two separate gathers; destinations must not overlap.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded; the two gathers write disjoint row groups.
+    unsafe {
+        butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        );
+        butterfly_fused_2layer_row_from_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_dense,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            dense_twiddles,
+        );
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

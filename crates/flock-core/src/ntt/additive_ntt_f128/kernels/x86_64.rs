@@ -743,6 +743,238 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
     }
 }
 
+/// Sparse and dense seed 2-layer gathers sharing four message rows.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`] for
+/// `dst_sparse` and [`butterfly_fused_2layer_row_from_geo`] for `dst_dense`.
+/// The two destination groups must not overlap each other or `src`.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                dense_twiddles,
+                core::ptr::null(),
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, false>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                dense_twiddles,
+                core::ptr::null(),
+            )
+        }
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse_dense_geo`] with the same
+/// per-lane-step four-row hints `sparse_geo_pf` issues.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`];
+/// the four rows at `pf_src` use `src`'s row geometry.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_pf(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+    pf_src: *const F128,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                dense_twiddles,
+                pf_src,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                src,
+                src_quarter,
+                src_r,
+                dst_sparse,
+                dst_dense,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                right_twiddle,
+                dense_twiddles,
+                pf_src,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
+    const DIET: bool,
+    const PF: bool,
+>(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+    pf_src: *const F128,
+) {
+    use core::arch::x86_64::*;
+
+    let [t_outer, t_inner_a, t_inner_b] = *dense_twiddles;
+    // SAFETY: caller guarantees target features, pointer geometry, and
+    // non-aliasing src / dst_sparse / dst_dense.
+    unsafe {
+        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
+        let outer = tw_x4::<false, DIET>(t_outer);
+        let inner_a = tw_x4::<false, DIET>(t_inner_a);
+        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let sparse_row = |i: usize| dst_sparse.add((i * dst_quarter + dst_r) * num_ntts);
+        let dense_row = |i: usize| dst_dense.add((i * dst_quarter + dst_r) * num_ntts);
+        let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
+        let lanes = num_ntts & !3;
+        let mut lane = 0;
+        while lane < lanes {
+            if PF {
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                }
+            }
+            let a0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let b0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let c0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let d0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            // Sparse: t_outer = 0, t_inner_a = 0. `a` is unchanged.
+            let mut vb_s = _mm512_xor_si512(b0, a0);
+            let mut vc_s = _mm512_xor_si512(c0, a0);
+            let mut vd_s = _mm512_xor_si512(d0, b0);
+            let new_c_s = _mm512_xor_si512(vc_s, mul_x4::<false, DIET>(sparse_b, vd_s));
+            vd_s = _mm512_xor_si512(vd_s, new_c_s);
+            vc_s = new_c_s;
+            _mm512_storeu_si512(sparse_row(0).add(lane) as *mut __m512i, a0);
+            _mm512_storeu_si512(sparse_row(1).add(lane) as *mut __m512i, vb_s);
+            _mm512_storeu_si512(sparse_row(2).add(lane) as *mut __m512i, vc_s);
+            _mm512_storeu_si512(sparse_row(3).add(lane) as *mut __m512i, vd_s);
+
+            // Dense: full three-twiddle 2-layer on the same originals.
+            let mut va = _mm512_xor_si512(a0, mul_x4::<false, DIET>(outer, c0));
+            let mut vc = _mm512_xor_si512(c0, va);
+            let mut vb = _mm512_xor_si512(b0, mul_x4::<false, DIET>(outer, d0));
+            let mut vd = _mm512_xor_si512(d0, vb);
+            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
+            vb = _mm512_xor_si512(vb, new_a);
+            va = new_a;
+            let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
+            vd = _mm512_xor_si512(vd, new_c);
+            vc = new_c;
+            _mm512_storeu_si512(dense_row(0).add(lane) as *mut __m512i, va);
+            _mm512_storeu_si512(dense_row(1).add(lane) as *mut __m512i, vb);
+            _mm512_storeu_si512(dense_row(2).add(lane) as *mut __m512i, vc);
+            _mm512_storeu_si512(dense_row(3).add(lane) as *mut __m512i, vd);
+            lane += 4;
+        }
+        while lane < num_ntts {
+            let a0 = *src_row(0).add(lane);
+            let b0 = *src_row(1).add(lane);
+            let c0 = *src_row(2).add(lane);
+            let d0 = *src_row(3).add(lane);
+
+            let mut b = b0;
+            let mut c = c0;
+            let mut d = d0;
+            c += a0;
+            d += b;
+            b += a0;
+            let new_c = c + d * right_twiddle;
+            d += new_c;
+            c = new_c;
+            *sparse_row(0).add(lane) = a0;
+            *sparse_row(1).add(lane) = b;
+            *sparse_row(2).add(lane) = c;
+            *sparse_row(3).add(lane) = d;
+
+            let mut a = a0;
+            let mut b = b0;
+            let mut c = c0;
+            let mut d = d0;
+            let new_a = a + c * t_outer;
+            c += new_a;
+            a = new_a;
+            let new_b = b + d * t_outer;
+            d += new_b;
+            b = new_b;
+            let new_a = a + b * t_inner_a;
+            b += new_a;
+            a = new_a;
+            let new_c = c + d * t_inner_b;
+            d += new_c;
+            c = new_c;
+            *dense_row(0).add(lane) = a;
+            *dense_row(1).add(lane) = b;
+            *dense_row(2).add(lane) = c;
+            *dense_row(3).add(lane) = d;
+            lane += 1;
+        }
+    }
+}
+
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -1732,6 +1964,54 @@ mod diet_tests {
                 dst
             };
             assert_eq!(run_sparse(true), run_sparse(false), "sparse len={len}");
+
+            // Sparse+dense fused gather must match sequential sparse then geo
+            // and must agree across the diet switch.
+            let run_sd = |diet: bool| {
+                let mut sparse = vec![F128::ZERO; 4 * len];
+                let mut dense = vec![F128::ZERO; 4 * len];
+                // SAFETY: four source rows, two disjoint four-row destinations.
+                unsafe {
+                    if diet {
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, false>(
+                            src.as_ptr(),
+                            1,
+                            0,
+                            sparse.as_mut_ptr(),
+                            dense.as_mut_ptr(),
+                            1,
+                            0,
+                            len,
+                            right,
+                            &tw3,
+                            core::ptr::null(),
+                        );
+                    } else {
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
+                            src.as_ptr(),
+                            1,
+                            0,
+                            sparse.as_mut_ptr(),
+                            dense.as_mut_ptr(),
+                            1,
+                            0,
+                            len,
+                            right,
+                            &tw3,
+                            core::ptr::null(),
+                        );
+                    }
+                }
+                (sparse, dense)
+            };
+            let fused_on = run_sd(true);
+            let fused_off = run_sd(false);
+            assert_eq!(fused_on, fused_off, "sparse_dense diet len={len}");
+            assert_eq!(
+                fused_on,
+                (run_sparse(true), run_from(true)),
+                "sparse_dense vs sequential len={len}"
+            );
 
             // --- fused four-layer -----------------------------------------
             let mut tw15 = [F128::ZERO; 15];

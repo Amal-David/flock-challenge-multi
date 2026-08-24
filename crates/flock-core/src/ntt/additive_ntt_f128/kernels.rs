@@ -445,6 +445,146 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     }
 }
 
+/// Sparse and dense seed 2-layer gathers that share four message rows.
+/// Bit-identical to `sparse_geo` into `dst_sparse` then `geo` into
+/// `dst_dense`.
+///
+/// # Safety
+/// Same contract as the two separate gathers; the destination groups must
+/// not overlap each other or `src`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+            dense_twiddles,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+            dense_twiddles,
+        );
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse_dense_geo`] with the same
+/// per-lane-step message hints `sparse_geo_pf` already issues. Portable
+/// builds ignore the hints.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`];
+/// the four rows `pf_src + i * src_quarter * num_ntts` must lie inside the
+/// source buffer.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_pf(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_twiddles: &[F128; 3],
+    pf_src: *const F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo_pf(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+            dense_twiddles,
+            pf_src,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = pf_src;
+        portable::butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+            dense_twiddles,
+        );
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only
