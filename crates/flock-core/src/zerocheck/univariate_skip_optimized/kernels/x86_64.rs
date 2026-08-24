@@ -1330,12 +1330,14 @@ mod tests {
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
+                        false,
                     );
                 } else {
                     accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
+                        false,
                     );
                 }
             }
@@ -1397,16 +1399,49 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
-    // SAFETY: forwarded unchanged to the shared target-feature body; the
-    // caller's write-before-read proof permits the overwrite specialization.
+    // SAFETY: forwarded to the ranked 15/16 unrolled bodies with a zero
+    // seed (XOR identity: 0 ⊕ x = x), or the runtime-count first-write
+    // impl outside those counts / when the kill switch is set.
     unsafe {
-        accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
-            chunk_ab_bytes,
-            n_b_med,
-            mats,
-            bank_planes,
-        );
+        if write_convert_fixed_enabled() {
+            match n_b_med {
+                15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                    chunk_ab_bytes,
+                    mats,
+                    bank_planes,
+                    true,
+                ),
+                16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                    chunk_ab_bytes,
+                    mats,
+                    bank_planes,
+                    true,
+                ),
+                _ => accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                    chunk_ab_bytes,
+                    n_b_med,
+                    mats,
+                    bank_planes,
+                ),
+            }
+        } else {
+            accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            );
+        }
     }
+}
+
+/// `FLOCK_NO_ZC_R1AB_WRITE_FIXED=1` restores the runtime-`n_b_med` first-write
+/// GFNI body for every window. Default: ranked 15/16 reuse the accumulate
+/// unrolled leaves with a zero seed. Read once per process.
+fn write_convert_fixed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_WRITE_FIXED").is_none());
+    *ON
 }
 
 #[inline]
@@ -1483,11 +1518,13 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
+    seed_zero: bool,
 ) {
     use core::arch::x86_64::*;
     debug_assert!(N == 15 || N == 16);
     // SAFETY: the fixed arrays cover every row/plane load and store. `N` is
     // one of the two ranked live-row counts and the cfg gate supplies GFNI.
+    // `seed_zero` is the first-visit identity 0 ⊕ x = x; no extra monomorph.
     unsafe {
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
         for bm in 0..N {
@@ -1495,7 +1532,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut acc = if seed_zero {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
             let mut bm = 0;
             while bm + 1 < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -1543,11 +1584,13 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
                 chunk_ab_bytes,
                 mats,
                 bank_planes,
+                false,
             ),
             16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
                 chunk_ab_bytes,
                 mats,
                 bank_planes,
+                false,
             ),
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
                 chunk_ab_bytes,
