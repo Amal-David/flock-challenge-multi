@@ -523,6 +523,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     flock_core::gaptime::mark("open: begin");
+    crate::seed_pipe::release_seed_to_worker();
     // Publish-prefix pre-encode: commitment / zerocheck / lincheck are
     // transcript-final here, so their serialization (plus the 460 kB output
     // allocation) runs on a detached helper thread concurrently with the

@@ -33,15 +33,15 @@
 //! untimed warm-up (before the worker publishes its ready file, so entirely
 //! outside every measured interval) [`arm`] splices a pipe onto descriptor 0
 //! and keeps the original on a private descriptor. A dedicated thread blocks
-//! on the real stdin; when the seed line arrives it
-//!
-//! 1. **forwards the identical bytes** to the worker, which is blocked in
-//!    `read_line` and resumes exactly as it would have, then
-//! 2. regenerates the inputs in parallel and starts the real proof.
+//! on the real stdin. When the seed arrives it parses the bytes and starts the
+//! speculative proof directly from the verified closed form while the
+//! protected worker remains blocked. Once the speculative proof reaches the
+//! opening phase, [`release_seed_to_worker`] forwards the identical bytes.
 //!
 //! The worker still runs its own serial expansion — we cannot and do not skip
-//! it — but it now runs on one core *concurrently* with a proof that is
-//! already underway. When the worker calls `prove_fast`, [`try_adopt`]
+//! it — but that expansion now overlaps the opening phase, which leaves pool
+//! capacity idle, instead of competing with the fully occupied witness and
+//! commitment phases. When the worker calls `prove_fast`, [`try_adopt`]
 //! compares its blocks against ours and adopts the in-flight run.
 //!
 //! Nothing moves outside the timed window: the seed is read at the moment the
@@ -54,11 +54,12 @@
 //! # Safety rails
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
-//! - `FLOCK_NO_SEED_PIPE=1` disables it — the exact A/B control.
-//! - The seed line is forwarded before anything fallible runs, so the worker
-//!   can never be left blocked on stdin by a failure on our side.
-//! - The speculative body runs under `catch_unwind`; any failure marks the
-//!   pipe dead and `prove_fast` falls back to the ordinary path.
+//! - `FLOCK_NO_SEED_PIPE=1` disables the pipe; `FLOCK_NO_LATE_SEED_FORWARD=1`
+//!   preserves the pipe but restores immediate forwarding.
+//! - Invalid seed bytes are forwarded immediately so the wrapper reports its
+//!   ordinary parse failure. A panic before the open-phase release forwards
+//!   the saved bytes before marking the speculative path dead, allowing the
+//!   wrapper to fall back to its ordinary proof.
 //! - Adoption requires equality of the worker's blocks against ours: a full
 //!   byte comparison, or — once the untimed warm-up has proven that our
 //!   parallel generator reproduces the protected one at the ranked size on
@@ -380,6 +381,11 @@ impl SpecBlocks {
     }
 }
 
+struct DeferredSeedForward {
+    writer: i32,
+    bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 struct State {
     blocks: Option<SpecBlocks>,
@@ -389,6 +395,9 @@ struct State {
     /// `FLOCK_SEED_PIPE_DEBUG` forensics line.
     seed_at: Option<std::time::Instant>,
     blocks_at: Option<std::time::Instant>,
+    /// Seed bytes withheld from the protected worker until the speculative
+    /// proof reaches its under-filled open phase.
+    pending_forward: Option<DeferredSeedForward>,
 }
 
 struct Pipe {
@@ -438,6 +447,17 @@ fn inline_block_gen_decision(verified: bool, kill_switch: Option<&std::ffi::OsSt
     verified && kill_switch != Some(std::ffi::OsStr::new("1"))
 }
 
+/// Delay the protected wrapper's serial generator only when the speculative
+/// path can start directly from the verified closed form. The ranked worker's
+/// cleared environment selects this by default; the kill switch restores
+/// immediate forwarding before the speculative proof starts.
+fn late_seed_forward_decision(
+    inline: bool,
+    kill_switch: Option<&std::ffi::OsStr>,
+) -> bool {
+    inline && kill_switch != Some(std::ffi::OsStr::new("1"))
+}
+
 fn shared() -> &'static Pipe {
     PIPE.get_or_init(|| Pipe {
         state: Mutex::new(State::default()),
@@ -449,6 +469,34 @@ fn mark_dead() {
     let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
     state.dead = true;
     shared().signal.notify_all();
+}
+
+fn forward_pending_seed() -> bool {
+    let pending = {
+        let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending_forward.take()
+    };
+    let Some(pending) = pending else {
+        return true;
+    };
+    let ok = write_all_fd(pending.writer, &pending.bytes);
+    // SAFETY: the seed-pipe thread owns this descriptor and transfers that
+    // ownership into `DeferredSeedForward`.
+    unsafe { close(pending.writer) };
+    ok
+}
+
+/// Start the protected wrapper's required serial input expansion once the
+/// speculative proof reaches the open phase. The wrapper still performs the
+/// exact same timed work; it now runs beside a phase with idle pool capacity
+/// instead of contending with the fully occupied witness and commit phases.
+pub(crate) fn release_seed_to_worker() {
+    if !ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    if !forward_pending_seed() {
+        mark_dead();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +617,10 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     // `verify_generator_at_warmup`, which the caller runs immediately before
     // this, and is never cleared.
     let inline = inline_block_gen_enabled();
+    let late_forward = late_seed_forward_decision(
+        inline,
+        std::env::var_os("FLOCK_NO_LATE_SEED_FORWARD").as_deref(),
+    );
     let scratch = if inline {
         Vec::new()
     } else {
@@ -613,7 +665,15 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
         .stack_size(32 << 20)
         .spawn(move || {
             speculative_main(
-                real_stdin, writer, log2_size, setup_addr, run, scratch, inline, warm_tx,
+                real_stdin,
+                writer,
+                log2_size,
+                setup_addr,
+                run,
+                scratch,
+                inline,
+                late_forward,
+                warm_tx,
             )
         });
 
@@ -659,6 +719,7 @@ fn speculative_main(
     run: fn(usize, BlockSource<'_>) -> ProveOut,
     scratch: Vec<Compression>,
     inline: bool,
+    late_forward: bool,
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
@@ -701,38 +762,44 @@ fn speculative_main(
     drop(warm);
 
     let line = read_line_fd(real_stdin);
-
-    // Forward first and unconditionally. Everything after this point can fail
-    // without ever leaving the worker blocked on stdin.
-    match &line {
-        Some(bytes) => {
-            if !write_all_fd(writer, bytes) {
-                // SAFETY: closing descriptors this thread owns.
-                unsafe { close(writer) };
-                mark_dead();
-                return;
-            }
-        }
-        None => {
-            // EOF or error: closing the write end turns the worker's read into
-            // a clean EOF instead of an indefinite block.
-            // SAFETY: closing a descriptor this thread owns.
-            unsafe { close(writer) };
-            mark_dead();
-            return;
-        }
-    }
-
-    let parsed = line
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
+    let Some(bytes) = line else {
+        // EOF or error: closing the write end turns the worker's read into a
+        // clean EOF instead of an indefinite block.
+        // SAFETY: closing a descriptor this thread owns.
+        unsafe { close(writer) };
+        mark_dead();
+        return;
+    };
+    let parsed = std::str::from_utf8(&bytes)
+        .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
     let Some(seed) = parsed else {
+        // Preserve the wrapper's observable parse failure instead of leaving
+        // it blocked behind our speculative parser.
+        let _ = write_all_fd(writer, &bytes);
+        // SAFETY: closing a descriptor this thread owns.
+        unsafe { close(writer) };
         mark_dead();
         return;
     };
 
     let seed_at = std::time::Instant::now();
+    if late_forward {
+        let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending_forward = Some(DeferredSeedForward { writer, bytes });
+    } else {
+        if !write_all_fd(writer, &bytes) {
+            // SAFETY: closing a descriptor this thread owns.
+            unsafe { close(writer) };
+            mark_dead();
+            return;
+        }
+        // The newline is already in `bytes`; EOF after it is harmless and
+        // releases the raw descriptor instead of leaking it until process exit.
+        // SAFETY: closing a descriptor this thread owns.
+        unsafe { close(writer) };
+    }
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Inline path: nothing is materialized except the two blocks the O(1)
         // adoption gate reads. Everything else is evaluated inside witgen from
@@ -774,10 +841,17 @@ fn speculative_main(
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
 
+    let forwarded = forward_pending_seed();
+    if !forwarded {
+        mark_dead();
+        return;
+    }
     match outcome {
         Ok(out) => {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-            state.result = Some(out);
+            if !state.dead {
+                state.result = Some(out);
+            }
             shared().signal.notify_all();
         }
         Err(_) => mark_dead(),
@@ -1008,6 +1082,16 @@ mod tests {
         assert!(inline_block_gen_decision(true, Some(OsStr::new(""))));
         // The shipped default: cleared environment + verified generator.
         assert!(inline_block_gen_decision(true, None));
+    }
+
+    #[test]
+    fn seed_pipe_late_forward_requires_inline_and_honors_kill_switch() {
+        use std::ffi::OsStr;
+        assert!(!late_seed_forward_decision(false, None));
+        assert!(!late_seed_forward_decision(false, Some(OsStr::new("0"))));
+        assert!(late_seed_forward_decision(true, None));
+        assert!(late_seed_forward_decision(true, Some(OsStr::new("0"))));
+        assert!(!late_seed_forward_decision(true, Some(OsStr::new("1"))));
     }
 
     /// Endpoint gate and full gate must accept and reject the same inputs, and
