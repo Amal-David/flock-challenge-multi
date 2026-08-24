@@ -2820,16 +2820,38 @@ fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<V
 /// ([`crate::alloc_uninit_vec`]'s write-before-read contract is discharged by
 /// the partition), which deletes the serial 16 MiB zero pass and spreads the
 /// first-touch page faults across the rayon pool instead of one thread.
+
+/// `FLOCK_SPARSE_PAR=1` restores the parallel window / densify passes in the
+/// sparse-prefix transpose. Default: serial. The window/densify element
+/// counts are 77-256, below the ~25-30us/task rayon dispatch cost measured on
+/// the 9950X3D (openserial AB, this session); serial is byte-identical
+/// (window order irrelevant — `window_slots` scatters by window index — and
+/// densify writes are positional).
+fn sparse_fill_serial_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SPARSE_PAR").is_none());
+    *ON
+}
+
 fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> Vec<F128> {
     use rayon::prelude::*;
     debug_assert_eq!(slots.len(), n >> k);
     let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(1usize << k)
-        .zip(slots.into_par_iter())
-        .for_each(|(dst, src)| match src {
-            Some(buf) => dst.copy_from_slice(&buf),
-            None => dst.fill(F128::ZERO),
-        });
+    if sparse_fill_serial_enabled() {
+        for (dst, src) in data.chunks_mut(1usize << k).zip(slots.into_iter()) {
+            match src {
+                Some(buf) => dst.copy_from_slice(&buf),
+                None => dst.fill(F128::ZERO),
+            }
+        }
+    } else {
+        data.par_chunks_mut(1usize << k)
+            .zip(slots.into_par_iter())
+            .for_each(|(dst, src)| match src {
+                Some(buf) => dst.copy_from_slice(&buf),
+                None => dst.fill(F128::ZERO),
+            });
+    }
     data
 }
 
@@ -3132,11 +3154,8 @@ fn transpose_forward_ntt_sparse_inner(
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
-        runs.par_iter()
-            .map_init(
-                Vec::<F128>::new,
-                |scratch, &(rs, re)| {
+    let win_task = |scratch: &mut Vec<F128>, &(rs, re): &(usize, usize)| -> (usize, Vec<F128>) {
+
                 let first = order[rs] as usize;
                 let w = positions[first] >> k;
                     let nnz = re - rs;
@@ -3189,8 +3208,18 @@ fn transpose_forward_ntt_sparse_inner(
                     buf[positions[i] & wmask] += values[i];
                 }
                 transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-                },
-            )
+    };
+    let processed: Vec<(usize, Vec<F128>)> = if fill {
+        if sparse_fill_serial_enabled() {
+            let mut scratch = Vec::<F128>::new();
+            runs.iter().map(|r| win_task(&mut scratch, r)).collect()
+        } else {
+            runs.par_iter().map_init(Vec::<F128>::new, &win_task).collect()
+        }
+    } else if sparse_fill_serial_enabled() {
+        win_vec
+            .into_iter()
+            .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
             .collect()
     } else {
         win_vec
@@ -6463,6 +6492,23 @@ fn serial_par_enabled() -> bool {
     crate::serial_par_enabled()
 }
 
+/// Query-phase gathers: serial by default. The ranked parallel form of these
+/// two gathers (opened-row copies + Merkle sibling reads) is a
+/// DISPATCH-GRANULARITY regression on every measured machine: rayon's default
+/// fine split of the ~200-element query list costs ~7-30 us per task
+/// (5950X Zen3, 9950X3D Zen5 A/B), so the parallel opens run 10-40x SLOWER
+/// than the incumbent serial walk (atlas: 6.3-8.0 ms -> 0.36-0.68 ms with the
+/// global serial switch). The serial walk is the byte-identity oracle -- both
+/// gathers are order-preserving pure maps -- so the opens keep the serial
+/// form while the other ranked parallel segments (round-1 table prep) keep
+/// theirs. Read once per process. `FLOCK_OPEN_PAR=1` restores the parallel
+/// form for same-binary A/B screening.
+fn opens_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_PAR").is_some());
+    *ON
+}
+
 /// Work floor (total F128 copied) below which the opened-row gather stays on
 /// the sequential path: tiny gathers (deep levels of test geometries) are
 /// below rayon dispatch break-even.
@@ -6520,7 +6566,7 @@ fn sample_distinct_queries<Ch: Challenger>(
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    multi_proof_gather(tree, block_len, queries, serial_par_enabled())
+    multi_proof_gather(tree, block_len, queries, opens_par_enabled())
 }
 
 /// Multi-proof body. `par` splits the incumbent walk into its two halves —
@@ -7301,7 +7347,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> =
-        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+        gather_opened_rows(&queries_0, l0_row, opens_par_enabled());
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -7410,7 +7456,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let opened_rows_last: Vec<Vec<F128>> = gather_opened_rows(
                 &queries_last,
                 |q| wtns_prev.row(q),
-                serial_par_enabled(),
+                opens_par_enabled(),
             );
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
@@ -7553,7 +7599,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(
             &queries_i,
             |q| wtns_prev.row(q),
-            serial_par_enabled(),
+            opens_par_enabled(),
         );
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);

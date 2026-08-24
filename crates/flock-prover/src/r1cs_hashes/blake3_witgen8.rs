@@ -2126,5 +2126,3 @@ mod tests {
 // fire51: fresh draw on new bar 3852475 (rival NTT promotion)
 
 // vbmi2draw-1: independent official timing sample of promoted fbc3001 VBMI2 W8 packer; no executable change.
-// rivaldraw-28 marker 76708 on 2758bc1
-// rivaldraw-37 marker 33507 on ca47b5d
