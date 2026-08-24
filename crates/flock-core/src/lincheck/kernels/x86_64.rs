@@ -263,6 +263,142 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
     }
 }
 
+/// One grouped 4-column visit: the eight-stripe gather+transpose and the
+/// 16-plane GFNI fold, in a single `#[target_feature]` body.
+///
+/// Ranked `fold_block_major_gfni` currently calls
+/// [`gather_transpose_stripe4_x86`] eight times then [`gfni_fold_tile`] four
+/// times. Each gather stores 4×128 bytes of bit-transposed stripe data into
+/// a strided `u8` slab; each fold reloads those eight 64-byte rows per
+/// 64-column block. The two bodies are separately outlined
+/// `#[target_feature]` functions, so LLVM cannot DSE / mem2reg the 4 KiB
+/// bounce. This leaf is that pair with the stores and matching loads
+/// deleted: the eight `t_lo` / `t_hi` registers of each column feed the
+/// incumbent 16-plane loop directly.
+///
+/// Algebra is the two-call form. Same eight 64-byte row loads per stripe
+/// (one pass over the 2048-byte-strided z rows — not four 16-byte
+/// revisits). Same `tr4` 128-bit-lane transpose, same VBMI byte permute,
+/// same `VGF2P8AFFINEQB` bit-transpose. Same 8-row-then-16-plane fold with
+/// `vpternlogq` 0x96, same `seed_zero` first-tile identity. Same plane
+/// destinations at `out + c·2048 + block·1024`. XOR is F₂ addition, so
+/// keeping a value in a ZMM instead of storing it and loading it back is
+/// bit-identical.
+///
+/// Live set is eight stripe-halves plus one accumulator plus two affine
+/// temps (~12 ZMMs) for the column under fold. The four columns × two
+/// halves × eight stripes do not all stay in the 32-ZMM file at once —
+/// that would be the 64-ZMM class. Columns 0..2 occupy sequential stack
+/// slots (not a stride-128 `u8` bounce); column 3 is the DSE candidate.
+///
+/// # Safety
+/// For `t ∈ 0..8` and `r ∈ 0..8`, the four F128s at
+/// `z_ptr + (8·(stripe_base + t) + r)·stride + q` are readable.
+/// `mats` holds the tile's 8×16 affine qwords. `out_planes_ptr + c·2048`
+/// covers 2048 writable bytes for each `c ∈ 0..4`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather4_fold_tile(
+    z_ptr: *const F128,
+    stride: usize,
+    stripe_base: usize,
+    q: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
+    // SAFETY: bounds per the contract; features per the cfg gate and the
+    // `target_feature` attribute.
+    unsafe {
+        let ld = |base: *const F128, r: usize| {
+            _mm512_loadu_si512(base.add(r * stride) as *const __m512i)
+        };
+        #[inline(always)]
+        unsafe fn tr4(a: __m512i, b: __m512i, c: __m512i, d: __m512i) -> [__m512i; 4] {
+            unsafe {
+                let ab_lo = _mm512_shuffle_i64x2::<0x44>(a, b);
+                let ab_hi = _mm512_shuffle_i64x2::<0xEE>(a, b);
+                let cd_lo = _mm512_shuffle_i64x2::<0x44>(c, d);
+                let cd_hi = _mm512_shuffle_i64x2::<0xEE>(c, d);
+                [
+                    _mm512_shuffle_i64x2::<0x88>(ab_lo, cd_lo),
+                    _mm512_shuffle_i64x2::<0xDD>(ab_lo, cd_lo),
+                    _mm512_shuffle_i64x2::<0x88>(ab_hi, cd_hi),
+                    _mm512_shuffle_i64x2::<0xDD>(ab_hi, cd_hi),
+                ]
+            }
+        }
+        #[repr(C, align(64))]
+        struct BIdx4([u8; 64]);
+        static BIDX4: BIdx4 = {
+            let mut t = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                i += 1;
+            }
+            BIdx4(t)
+        };
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        let bidx = _mm512_load_si512(BIDX4.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
+        let zero = _mm512_setzero_si512();
+        // Column-major halves: `lo[c][t]` is stripe t, column c, low 64
+        // columns. Sequential in `t` so the fold's eight-row reload is a
+        // unit-stride stack walk, not the two-call form's stride-128 `u8`.
+        let mut lo = [[zero; 8]; 4];
+        let mut hi = [[zero; 8]; 4];
+        for t in 0..8 {
+            let zp = z_ptr.add((8 * (stripe_base + t)) * stride + q);
+            let r = [ld(zp, 0), ld(zp, 1), ld(zp, 2), ld(zp, 3), ld(zp, 4), ld(zp, 5), ld(zp, 6), ld(zp, 7)];
+            let z0s = tr4(r[0], r[1], r[2], r[3]);
+            let z1s = tr4(r[4], r[5], r[6], r[7]);
+            for c in 0..4 {
+                let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
+                let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
+                lo[c][t] =
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
+                hi[c][t] =
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
+            }
+        }
+        for c in 0..4 {
+            for (block, rows) in [lo[c], hi[c]].into_iter().enumerate() {
+                let planes = out_planes_ptr.add(c * 2048 + block * 1024);
+                for byte_k in 0..16 {
+                    let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                    let mut acc = if seed_zero {
+                        zero
+                    } else {
+                        _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    };
+                    for t in (0..8).step_by(2) {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t],
+                            _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                        );
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t + 1],
+                            _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                        );
+                        acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                    }
+                    _mm512_storeu_si512(plane_ptr, acc);
+                }
+            }
+        }
+    }
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching

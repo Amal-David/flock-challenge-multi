@@ -942,6 +942,17 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GATHER_FOLD=1` restores the two-call gather4 then
+/// `gfni_fold_tile` pair in the block-major GFNI fold (exact same-binary
+/// A/B). The fused leaf is bit-identical: same eight loads, same
+/// transpose, same 16-plane XOR. Ranked env is cleared, so the fuse runs.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_gather_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_FOLD").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
@@ -1131,74 +1142,47 @@ fn fold_block_major_gfni(
                 #[cfg(target_feature = "avx512vbmi")]
                 if gather_tr_fused && lc_gather4_enabled() {
                     let full_chunks = useful_bits / 128;
+                    let gather_fold = lc_gather_fold_enabled();
                     while q + 4 <= full_chunks {
-                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                            let outer_base = 8 * (stripe_base + t);
-                            if pf_far && !pf_spread {
-                                // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
-                                // on: the lines this stripe demand-loads two
-                                // grouped visits from now. Issued here, the
-                                // miss overlaps the current visit's GFNI fold.
-                                // `qn <= full_chunks` keeps the prefetch on
-                                // a line the sweep really demands; `qn <
-                                // chunks_per_block` keeps the address inside
-                                // the block for any (useful_bits, k) shape.
-                                let qn = q + pf_chunks;
-                                if qn <= full_chunks && qn < chunks_per_block {
+                        if gather_fold {
+                            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                                let outer_base = 8 * (stripe_base + t);
+                                if pf_far && !pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        unsafe {
+                                            for r in 0..8 {
+                                                core::arch::x86_64::_mm_prefetch(
+                                                    z_packed
+                                                        .as_ptr()
+                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .cast::<i8>(),
+                                                    core::arch::x86_64::_MM_HINT_T0,
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if pf_far {
+                                } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                                    let next_base = 8 * (stripe_base + t + 1);
                                     unsafe {
                                         for r in 0..8 {
                                             core::arch::x86_64::_mm_prefetch(
                                                 z_packed
                                                     .as_ptr()
-                                                    .add((outer_base + r) * chunks_per_block + qn)
+                                                    .add((next_base + r) * chunks_per_block + q)
                                                     .cast::<i8>(),
                                                 core::arch::x86_64::_MM_HINT_T0,
                                             );
                                         }
                                     }
                                 }
-                            } else if pf_far {
-                            } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
-                                let next_base = 8 * (stripe_base + t + 1);
-                                // One line per row covers all four columns.
-                                unsafe {
-                                    for r in 0..8 {
-                                        core::arch::x86_64::_mm_prefetch(
-                                            z_packed
-                                                .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
-                                                .cast::<i8>(),
-                                            core::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                }
                             }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q + c for c in 0..4 are the indices four
-                            // single gathers would read; each column slab is
-                            // 1024 writable bytes of `transposed`.
-                            unsafe {
-                                kernels::gather_transpose_stripe4_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
-                                    chunks_per_block,
-                                    transposed.as_mut_ptr().add(t * 128),
-                                    1024,
-                                );
-                            }
-                        }
-                        for c in 0..4 {
-                            // Spread delivery: the same eight-hints-per-stripe
-                            // block, issued from the fold that follows the
-                            // gather instead of from the gather itself, two
-                            // stripes at a time. Same lines, same look-ahead.
                             if pf_far && pf_spread {
                                 let qn = q + pf_chunks;
                                 if qn <= full_chunks && qn < chunks_per_block {
-                                    for t in 2 * c..2 * c + 2 {
+                                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
                                         let outer_base = 8 * (stripe_base + t);
-                                        // SAFETY: the same indices the gather
-                                        // reads on a later grouped visit; a
-                                        // prefetch never dereferences.
                                         unsafe {
                                             for r in 0..8 {
                                                 core::arch::x86_64::_mm_prefetch(
@@ -1213,17 +1197,118 @@ fn fold_block_major_gfni(
                                     }
                                 }
                             }
-                            // SAFETY: as for the single-column call below;
-                            // every grouped chunk is full (2 blocks of 64).
+                            // SAFETY: the eight stripes × four columns the
+                            // two-call arm gathers are in bounds; each
+                            // column's 2×1024-byte plane slab is the same
+                            // destination `gfni_fold_tile` would write.
                             unsafe {
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
+                                kernels::gather4_fold_tile(
+                                    z_packed.as_ptr(),
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
                                     &mats,
-                                    wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
+                                    wplanes.as_mut_ptr().add(2 * q * 1024),
                                     first_tile,
                                 );
+                            }
+                        } else {
+                            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                                let outer_base = 8 * (stripe_base + t);
+                                if pf_far && !pf_spread {
+                                    // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
+                                    // on: the lines this stripe demand-loads two
+                                    // grouped visits from now. Issued here, the
+                                    // miss overlaps the current visit's GFNI fold.
+                                    // `qn <= full_chunks` keeps the prefetch on
+                                    // a line the sweep really demands; `qn <
+                                    // chunks_per_block` keeps the address inside
+                                    // the block for any (useful_bits, k) shape.
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        unsafe {
+                                            for r in 0..8 {
+                                                core::arch::x86_64::_mm_prefetch(
+                                                    z_packed
+                                                        .as_ptr()
+                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .cast::<i8>(),
+                                                    core::arch::x86_64::_MM_HINT_T0,
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if pf_far {
+                                } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+                                    let next_base = 8 * (stripe_base + t + 1);
+                                    // One line per row covers all four columns.
+                                    unsafe {
+                                        for r in 0..8 {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                z_packed
+                                                    .as_ptr()
+                                                    .add((next_base + r) * chunks_per_block + q)
+                                                    .cast::<i8>(),
+                                                core::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                                // SAFETY: rows (outer_base + r) * chunks_per_block
+                                // + q + c for c in 0..4 are the indices four
+                                // single gathers would read; each column slab is
+                                // 1024 writable bytes of `transposed`.
+                                unsafe {
+                                    kernels::gather_transpose_stripe4_x86(
+                                        z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                                        chunks_per_block,
+                                        transposed.as_mut_ptr().add(t * 128),
+                                        1024,
+                                    );
+                                }
+                            }
+                            for c in 0..4 {
+                                // Spread delivery: the same eight-hints-per-stripe
+                                // block, issued from the fold that follows the
+                                // gather instead of from the gather itself, two
+                                // stripes at a time. Same lines, same look-ahead.
+                                if pf_far && pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        for t in 2 * c..2 * c + 2 {
+                                            let outer_base = 8 * (stripe_base + t);
+                                            // SAFETY: the same indices the gather
+                                            // reads on a later grouped visit; a
+                                            // prefetch never dereferences.
+                                            unsafe {
+                                                for r in 0..8 {
+                                                    core::arch::x86_64::_mm_prefetch(
+                                                        z_packed
+                                                            .as_ptr()
+                                                            .add(
+                                                                (outer_base + r) * chunks_per_block
+                                                                    + qn,
+                                                            )
+                                                            .cast::<i8>(),
+                                                        core::arch::x86_64::_MM_HINT_T0,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // SAFETY: as for the single-column call below;
+                                // every grouped chunk is full (2 blocks of 64).
+                                unsafe {
+                                    kernels::gfni_fold_tile(
+                                        transposed.as_ptr().add(c * 1024),
+                                        128,
+                                        2,
+                                        &mats,
+                                        wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
+                                        first_tile,
+                                    );
+                                }
                             }
                         }
                         q += 4;
@@ -3442,6 +3527,70 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The fused gather4+fold leaf must equal eight `gather_transpose_stripe4`
+    /// calls followed by four `gfni_fold_tile` calls, for both the zero-seed
+    /// first tile and a pre-filled plane buffer.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gather4_fold_matches_two_step() {
+        let mut rng = Rng::new(0xF01D_C0DE);
+        const STRIDE: usize = 32;
+        const Q: usize = 4;
+        let n_rows = 8 * DIRECT_FOLD_TILE_STRIPES;
+        let z: Vec<F128> = (0..n_rows * STRIDE + Q + 4).map(|_| rng.f128()).collect();
+        let mut mats = [0u64; 128];
+        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+            let eq8: [F128; 8] = std::array::from_fn(|_| rng.f128());
+            kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+        }
+        for seed_zero in [true, false] {
+            let mut want = vec![0u8; 4 * 2048];
+            if !seed_zero {
+                for b in &mut want {
+                    *b = (rng.f128().lo as u8) ^ 0x5A;
+                }
+            }
+            let mut got = want.clone();
+            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            unsafe {
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    let outer_base = 8 * t;
+                    kernels::gather_transpose_stripe4_x86(
+                        z.as_ptr().add(outer_base * STRIDE + Q),
+                        STRIDE,
+                        transposed.as_mut_ptr().add(t * 128),
+                        1024,
+                    );
+                }
+                for c in 0..4 {
+                    kernels::gfni_fold_tile(
+                        transposed.as_ptr().add(c * 1024),
+                        128,
+                        2,
+                        &mats,
+                        want.as_mut_ptr().add(c * 2048),
+                        seed_zero,
+                    );
+                }
+                kernels::gather4_fold_tile(
+                    z.as_ptr(),
+                    STRIDE,
+                    0,
+                    Q,
+                    &mats,
+                    got.as_mut_ptr(),
+                    seed_zero,
+                );
+            }
+            assert_eq!(want, got, "seed_zero={seed_zero}");
         }
     }
 
