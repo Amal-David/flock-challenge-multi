@@ -2071,11 +2071,32 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     }
 }
 
+/// `FLOCK_NO_DF8_STAGED_HOLD8=1` restores pair-2/3's store of the XOR-merge
+/// into `planes` and the sixteen-ZMM reload that feeds the output transpose.
+/// Default: hold eight merged planes, transpose that half, then the other
+/// eight. Peak live is p2+p3+8 accs (~24 ZMMs), not the 16-acc hold that
+/// scored -0.84% (`9d9e77b`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn df8_staged_hold8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_STAGED_HOLD8").is_none());
+    *ON
+}
+
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
 /// each completed output-byte plane. This replaces LLVM's accidental
 /// 16-plane spills plus the inter-claim row-major temporary with one explicit
 /// 16-ZMM plane buffer whose traffic is fixed and easy to audit.
+///
+/// Pair 2/3 then holds the XOR-merge in two 8-ZMM groups and transposes each
+/// group from registers (`FLOCK_NO_DF8_STAGED_HOLD8=1` restores store+reload).
 ///
 /// # Safety
 /// Each row pointer covers 512 bytes, `out` covers 64 F128s, `planes` covers
@@ -2172,22 +2193,47 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 _mm512_storeu_si512(planes.add(k), value);
             }
         }
-        {
+        let (lo_half, hi_half) = {
             let p2 = input_planes(rows2);
             let p3 = input_planes(rows3);
-            for k in 0..16 {
-                let value = _mm512_xor_si512(
-                    map_plane(&p2, mats2, k),
-                    map_plane(&p3, mats3, k),
-                );
-                let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
-                _mm512_storeu_si512(planes.add(k), value);
+            if df8_staged_hold8_enabled() {
+                // Hold 8 merged planes, transpose, then the other 8. Pair 0/1
+                // still spills through `planes`; this only deletes pair 2/3's
+                // store-back and the 16-ZMM reload. Not the 16-acc hold.
+                let acc_lo: [__m512i; 8] = core::array::from_fn(|k| {
+                    let value = _mm512_xor_si512(
+                        map_plane(&p2, mats2, k),
+                        map_plane(&p3, mats3, k),
+                    );
+                    _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)))
+                });
+                let lo_half = qword_transpose(acc_lo);
+                let acc_hi: [__m512i; 8] = core::array::from_fn(|k| {
+                    let k = k + 8;
+                    let value = _mm512_xor_si512(
+                        map_plane(&p2, mats2, k),
+                        map_plane(&p3, mats3, k),
+                    );
+                    _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)))
+                });
+                (lo_half, qword_transpose(acc_hi))
+            } else {
+                for k in 0..16 {
+                    let value = _mm512_xor_si512(
+                        map_plane(&p2, mats2, k),
+                        map_plane(&p3, mats3, k),
+                    );
+                    let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
+                    _mm512_storeu_si512(planes.add(k), value);
+                }
+                let acc: [__m512i; 16] =
+                    core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
+                (
+                    qword_transpose(acc[..8].try_into().unwrap()),
+                    qword_transpose(acc[8..].try_into().unwrap()),
+                )
             }
-        }
-
-        let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        };
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
