@@ -38,7 +38,7 @@ static POOL: Mutex<Vec<(Vec<F128>, u64)>> = Mutex::new(Vec::new());
 /// open stage would fault fresh pages every prove (the pool denies malloc
 /// the page reuse it would otherwise get from the freed early-phase
 /// buffers) — measured as a +24% open_batch regression on M4 before this.
-const MAX_POOLED: usize = 24;
+const MAX_POOLED: usize = 32;
 
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.

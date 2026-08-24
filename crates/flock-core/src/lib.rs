@@ -371,3 +371,4 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+// flock fallback craft 2026-08-24T14:02:12+02:00 iter 1000
