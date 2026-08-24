@@ -2071,6 +2071,22 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     }
 }
 
+/// `FLOCK_NO_DF8_STAGED_HOLD=1` restores the pair-2/3 store into `planes`
+/// and the sixteen-ZMM reload before the output transpose. Default: keep
+/// the XOR-merged planes in a local `[__m512i; 16]` and transpose from it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn df8_staged_hold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_STAGED_HOLD").is_none());
+    *ON
+}
+
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
 /// each completed output-byte plane. This replaces LLVM's accidental
@@ -2172,7 +2188,19 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 _mm512_storeu_si512(planes.add(k), value);
             }
         }
-        {
+        let acc: [__m512i; 16] = if df8_staged_hold_enabled() {
+            // Pair 0/1 already sits in `planes`. Merge pair 2/3 into a
+            // local acc and transpose from it — no write-back, no reload.
+            let p2 = input_planes(rows2);
+            let p3 = input_planes(rows3);
+            core::array::from_fn(|k| {
+                let value = _mm512_xor_si512(
+                    map_plane(&p2, mats2, k),
+                    map_plane(&p3, mats3, k),
+                );
+                _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)))
+            })
+        } else {
             let p2 = input_planes(rows2);
             let p3 = input_planes(rows3);
             for k in 0..16 {
@@ -2183,9 +2211,8 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
                 _mm512_storeu_si512(planes.add(k), value);
             }
-        }
-
-        let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
+            core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)))
+        };
         let lo_half = qword_transpose(acc[..8].try_into().unwrap());
         let hi_half = qword_transpose(acc[8..].try_into().unwrap());
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
