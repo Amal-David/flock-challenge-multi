@@ -749,12 +749,66 @@ pub(crate) fn fused_encode_leaves_subtree(
     kind: HashKind,
 ) -> usize {
     debug_assert_eq!(codeword.len(), n_leaves * num_ntts);
+    fused_leaves_subtree_with(
+        tree,
+        n_leaves,
+        num_ntts,
+        leaf_size,
+        kind,
+        |on_range_done| {
+            ntt.rs_encode_interleaved_on_range_done(
+                msg,
+                codeword,
+                num_ntts,
+                on_range_done,
+            );
+        },
+    )
+}
+
+/// Finish a rate-1/4 recursive encoding whose post-layer-4 codeword was
+/// published by the DirectFold8 producer, then hash the identical finalized
+/// sub-groups through the incumbent fused Merkle callback.
+pub(crate) fn fused_seeded_rate_quarter_leaves_subtree(
+    ntt: &AdditiveNttF128,
+    codeword: &mut [F128],
+    num_ntts: usize,
+    tree: &mut [Hash],
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+) -> usize {
+    debug_assert_eq!(codeword.len(), n_leaves * num_ntts);
+    fused_leaves_subtree_with(
+        tree,
+        n_leaves,
+        num_ntts,
+        leaf_size,
+        kind,
+        |on_range_done| {
+            ntt.finish_rate_quarter_seed_on_range_done(
+                codeword,
+                num_ntts,
+                on_range_done,
+            );
+        },
+    )
+}
+
+fn fused_leaves_subtree_with(
+    tree: &mut [Hash],
+    n_leaves: usize,
+    num_ntts: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    produce: impl FnOnce(&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+) -> usize {
     debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
     debug_assert_eq!(tree.len(), 2 * n_leaves - 1);
     let tree_addr = tree.as_mut_ptr() as usize;
     let subtree_parents = subtree_parents_enabled();
     let local_levels = AtomicUsize::new(usize::MAX);
-    ntt.rs_encode_interleaved_on_range_done(msg, codeword, num_ntts, &|range, sub_data| {
+    produce(&|range, sub_data| {
         debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(

@@ -3480,6 +3480,44 @@ pub(crate) fn ligero_commit(
     }
 }
 
+/// Complete the L1 commitment from a DirectFold8-owned rate-1/4 seed.
+/// Transcript publication remains at the caller's incumbent post-M6 point;
+/// this function only replaces `ligero_commit`'s separate seed pass.
+fn ligero_commit_from_fold8_l1_seed(
+    mut seed: DirectFold8L1SeedHandoff,
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    kind: HashKind,
+) -> LigeroWitness {
+    let msg_cols = 1usize << log_msg_cols;
+    let num_interleaved = 1usize << log_num_interleaved;
+    let block_len = msg_cols << 2;
+    assert_eq!(seed.num_interleaved, num_interleaved);
+    assert_eq!(seed.msg_positions, msg_cols);
+    assert_eq!(seed.mat.len(), block_len * num_interleaved);
+    assert!(crate::pcs::commit::lig_fused_commit_enabled());
+    assert!(!crate::gpu::merkle::available());
+
+    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
+    let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
+    let folded = crate::pcs::commit::fused_seeded_rate_quarter_leaves_subtree(
+        &seed.ntt,
+        &mut seed.mat,
+        num_interleaved,
+        &mut tree,
+        block_len,
+        leaf_size_bytes,
+        kind,
+    );
+    crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
+    LigeroWitness {
+        mat: seed.mat,
+        tree,
+        block_len,
+        num_interleaved,
+    }
+}
+
 /// Leaf-count floor for routing a recursive-commit Merkle tree through the
 /// GPU session. Only the L1 (2^18 leaves at the ranked m=32 shape) and L2
 /// (2^16) trees are big enough to possibly beat the wide-pool CPU hash.
@@ -5860,6 +5898,74 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_FOLD8_L1_SEED_HANDOFF=1` restores the incumbent DirectFold8
+/// materialization followed by a separate rate-seed pass over f8.
+#[inline]
+fn fold8_l1_seed_handoff_disabled() -> bool {
+    #[cfg(test)]
+    if FOLD8_L1_SEED_TEST_OFF.with(core::cell::Cell::get) {
+        return true;
+    }
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var_os("FLOCK_NO_FOLD8_L1_SEED_HANDOFF"), Some(v) if v == "1")
+    });
+    *OFF
+}
+
+#[cfg(test)]
+thread_local! {
+    static FOLD8_L1_SEED_TEST_OFF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+fn fold8_l1_seed_handoff_enabled(
+    log_n: usize,
+    initial_k: usize,
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+) -> bool {
+    if fold8_l1_seed_handoff_disabled() || log_inv_rate != 2 {
+        return false;
+    }
+    let production = cfg!(target_arch = "x86_64")
+        && log_n == 25
+        && initial_k == 6
+        && log_msg_cols == 16
+        && log_num_interleaved == 3;
+    #[cfg(test)]
+    let compatible_test = initial_k == 6
+        && log_msg_cols >= 2
+        && log_num_interleaved >= 1
+        && log_n == initial_k + log_msg_cols + log_num_interleaved;
+    #[cfg(not(test))]
+    let compatible_test = false;
+    (production || compatible_test)
+        && crate::pcs::commit::lig_fused_commit_enabled()
+        && !crate::gpu::merkle::available()
+}
+
+struct DirectFold8L1SeedHandoff {
+    ntt: AdditiveNttF128,
+    mat: Vec<F128>,
+    num_interleaved: usize,
+    msg_positions: usize,
+}
+
+impl DirectFold8L1SeedHandoff {
+    fn new(log_msg_cols: usize, log_num_interleaved: usize) -> Self {
+        let num_interleaved = 1usize << log_num_interleaved;
+        let msg_positions = 1usize << log_msg_cols;
+        let codeword_len = 4 * msg_positions * num_interleaved;
+        Self {
+            ntt: AdditiveNttF128::standard(log_msg_cols + 2),
+            mat: crate::scratch::take_f128(codeword_len),
+            num_interleaved,
+            msg_positions,
+        }
+    }
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5871,6 +5977,7 @@ fn materialize_direct_fold8(
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
+    mut l1_seed: Option<&mut DirectFold8L1SeedHandoff>,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -5949,6 +6056,30 @@ fn materialize_direct_fold8(
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
+    let folded_f_addr = folded_f.as_ptr() as usize;
+    let seed_geometry = l1_seed.as_deref_mut().map(|seed| {
+        assert_eq!(out_len, seed.msg_positions * seed.num_interleaved);
+        assert_eq!(seed.mat.len(), 4 * out_len);
+        assert_eq!(block_len % seed.num_interleaved, 0);
+        let chunk_rows = block_len / seed.num_interleaved;
+        let quarter_rows = seed.msg_positions >> 2;
+        assert_eq!(quarter_rows % chunk_rows, 0);
+        let quarter_chunks = quarter_rows / chunk_rows;
+        assert_eq!(claims[0].eq_hi.len(), 4 * quarter_chunks);
+        (
+            &seed.ntt,
+            seed.mat.as_mut_ptr() as usize,
+            seed.msg_positions,
+            seed.num_interleaved,
+            chunk_rows,
+            quarter_chunks,
+        )
+    });
+    let seed_done: Vec<std::sync::atomic::AtomicU8> = (0..seed_geometry
+        .as_ref()
+        .map_or(0, |geometry| geometry.5))
+        .map(|_| std::sync::atomic::AtomicU8::new(0))
+        .collect();
     const SUB: usize = 256;
     let stats = folded_b
         .par_chunks_mut(block_len)
@@ -6086,21 +6217,67 @@ fn materialize_direct_fold8(
                     }
                 }
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
+                let block_stats = {
                     // SAFETY: features cfg-guaranteed; slices are equal and
                     // block_len is an even power of two.
                     unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
+                };
                 #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
+                let block_stats = {
                     super::round0_scalar(f_out, b_out)
+                };
+
+                // End the producer's unique borrows before the fourth chunk
+                // publishes this group's seed rows through raw pointers.
+                // Other live Rayon jobs own disjoint chunks; the AcqRel RMW
+                // chain makes every prior producer store visible to the one
+                // worker that observes completion count three.
+                let _ = f_out;
+                let _ = b_out;
+                if let Some(&(
+                    seed_ntt,
+                    seed_addr,
+                    msg_positions,
+                    num_interleaved,
+                    chunk_rows,
+                    quarter_chunks,
+                )) = seed_geometry.as_ref()
+                {
+                    let group = block % quarter_chunks;
+                    let prior = seed_done[group].fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::AcqRel,
+                    );
+                    assert!(prior < 4, "each rate-seed group has exactly four chunks");
+                    if prior == 3 {
+                        let rows = group * chunk_rows..(group + 1) * chunk_rows;
+                        // SAFETY: the four chunks `group + q*quarter_chunks`
+                        // have all released their final stores through the
+                        // counter above. Groups own disjoint source quarters
+                        // and disjoint destination rows; both backing Vecs
+                        // outlive this Rayon reduction.
+                        unsafe {
+                            seed_ntt.seed_rate_quarter_rows_from_raw(
+                                folded_f_addr as *const F128,
+                                seed_addr as *mut F128,
+                                msg_positions,
+                                num_interleaved,
+                                rows,
+                            );
+                        }
+                    }
                 }
+                block_stats
             },
         )
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
+
+    debug_assert!(seed_done.iter().all(|done| {
+        done.load(std::sync::atomic::Ordering::Acquire) == 4
+    }));
 
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
@@ -7026,6 +7203,27 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     } else if direct_mode {
         assert!(initial_k >= 2, "direct AB fold2 needs two initial rounds");
     }
+    let n1 = log_n - initial_k;
+    let log_num_interleaved_1 = config.recursive_ks[0];
+    assert!(n1 >= log_num_interleaved_1);
+    let log_msg_cols_1 = n1 - log_num_interleaved_1;
+    let log_inv_rate_1 = config.log_inv_rates[1];
+    let mut fold8_l1_seed = if direct_fold8_mode
+        && fold8_l1_seed_handoff_enabled(
+            log_n,
+            initial_k,
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+        )
+    {
+        Some(DirectFold8L1SeedHandoff::new(
+            log_msg_cols_1,
+            log_num_interleaved_1,
+        ))
+    } else {
+        None
+    };
     let mut packed_witness = Some(packed_witness);
     let mut b_initial = Some(b_initial);
     let mut direct_fold2 = direct_fold2;
@@ -7108,6 +7306,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             fold4_challenges[4],
                             r,
                         ],
+                        fold8_l1_seed.as_mut(),
                     );
                     sc_prover = Some(SumcheckProver::new_after_direct_fold8(
                         f8,
@@ -7222,21 +7421,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut sc_prover = sc_prover.expect("direct state must materialize during the initial rounds");
 
     // Commit f^1 = folded packed witness as wtns_1.
-    let n1 = log_n - initial_k;
-    let log_num_interleaved_1 = config.recursive_ks[0];
-    assert!(n1 >= log_num_interleaved_1);
-    let log_msg_cols_1 = n1 - log_num_interleaved_1;
-    let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
-    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let wtns_1 = ligero_commit(
-        sc_prover.f(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
+    let wtns_1 = if let Some(seed) = fold8_l1_seed.take() {
+        ligero_commit_from_fold8_l1_seed(
+            seed,
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            config.merkle_hash,
+        )
+    } else {
+        let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+        ligero_commit(
+            sc_prover.f(),
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    };
     if trace {
         t_commits += _t.elapsed();
     }
@@ -11959,10 +12162,10 @@ mod tests {
     fn direct_fold8_full_proof_and_claim_bytes_match_ordinary_fold2() {
         use crate::challenger::Challenger;
 
-        let log_n = 12;
+        let log_n = 14;
         let initial_k = 6;
         let k_0 = 2;
-        let log_inv_rate = 3;
+        let log_inv_rate = 2;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
@@ -12066,6 +12269,8 @@ mod tests {
         );
         let mut direct_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let fallback_poly = poly.clone();
+        let fallback_direct = direct.clone();
         let got = recursive_prover_with_basis_direct_fold8(
             &cfg,
             poly,
@@ -12079,10 +12284,32 @@ mod tests {
             &mut direct_challenger,
         );
 
+        FOLD8_L1_SEED_TEST_OFF.with(|off| off.set(true));
+        let mut fallback_challenger =
+            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+        let fallback = recursive_prover_with_basis_direct_fold8(
+            &cfg,
+            fallback_poly,
+            Vec::new(),
+            fallback_direct,
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            round0,
+            None,
+            &mut fallback_challenger,
+        );
+        FOLD8_L1_SEED_TEST_OFF.with(|off| off.set(false));
+
         assert_eq!(got, ordinary);
+        assert_eq!(got, fallback);
         assert_eq!(
             bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
             bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
+        );
+        assert_eq!(
+            bincode::serialize(&(got.clone(), target)).expect("serialize producer-seeded proof"),
+            bincode::serialize(&(fallback, target)).expect("serialize fallback-seeded proof"),
         );
 
         let v_cfg = VerifierConfig {
