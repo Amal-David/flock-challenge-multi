@@ -145,6 +145,8 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
 /// is folding, in F128 elements. `FLOCK_NO_FOLD16_PF=1` removes the hints
 /// (they move no data of their own and change no value, so the fold is
 /// byte-identical either way); `FLOCK_FOLD16_PF=<n>` overrides the distance.
+/// Delivery of those lines is spread across the four `g` steps by default;
+/// `FLOCK_NO_FOLD16_PF_SPREAD=1` restores the sixteen-line burst.
 const FOLD16_PF_AHEAD: usize = 512;
 
 fn fold16_pf_ahead() -> usize {
@@ -158,6 +160,18 @@ fn fold16_pf_ahead() -> usize {
             .unwrap_or(FOLD16_PF_AHEAD)
     });
     *D
+}
+
+/// `FLOCK_NO_FOLD16_PF_SPREAD=1` restores the incumbent delivery of the
+/// fold16 look-ahead: sixteen T0s issued back to back ahead of the sixteen
+/// demand loads of the current quad. The default arm issues the same sixteen
+/// lines (the 1 KiB block `pf_ahead` elements on), one quartet per `g` step,
+/// next to that step's four `_mm512_loadu`s. A prefetch has no architectural
+/// effect, so the fold is byte-identical either way.
+fn fold16_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_PF_SPREAD").is_none());
+    *ON
 }
 
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
@@ -191,10 +205,13 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
         let quads = dst.len() & !3;
         let pf_ahead = fold16_pf_ahead();
+        let pf_spread = fold16_pf_spread_enabled();
         let pf_limit = src.len().saturating_sub(64);
         let mut t = 0usize;
         while t < quads {
-            if pf_ahead != 0 {
+            // Burst delivery: sixteen consecutive lines of the +pf_ahead
+            // block, issued ahead of every demand load of this quad.
+            if pf_ahead != 0 && !pf_spread {
                 let ahead = 16 * t + pf_ahead;
                 if ahead <= pf_limit {
                     let p = src.as_ptr().add(ahead).cast::<i8>();
@@ -207,6 +224,19 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
             }
             let mut acc = WideGhashX4::zero();
             for g in 0..4 {
+                // Spread delivery: the four lines this `g` will demand at
+                // +pf_ahead, issued next to this `g`'s four loadus. Same
+                // sixteen lines as the burst, over the four `g` steps.
+                if pf_ahead != 0 && pf_spread {
+                    let ahead = 16 * t + 4 * g + pf_ahead;
+                    if 16 * t + pf_ahead <= pf_limit {
+                        let p = src.as_ptr().add(ahead).cast::<i8>();
+                        _mm_prefetch::<_MM_HINT_T0>(p);
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(256));
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(512));
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(768));
+                    }
+                }
                 // v_s = banks 4g..4g+3 of slot t+s.
                 let base = 16 * t + 4 * g;
                 let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
