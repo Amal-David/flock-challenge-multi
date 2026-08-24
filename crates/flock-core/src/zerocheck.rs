@@ -662,6 +662,21 @@ fn prove_packed_padded_inner<C: Challenger>(
     // environment never sets it.
     let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
 
+    // Small-round tail fusion threshold: the fused parallel path
+    // (fold_and_compute_round_pair_into) keeps the rayon region for rounds
+    // whose input is at least 2^TAIL_FUSION_MIN_LOG bytes; smaller rounds run
+    // the serial fold+round-pair (byte-identical by construction -- see
+    // prove_fused_tail_matches_unfused_two_pass). On the AVX-512 class the
+    // fused path's region handoff costs ~1.5-2.9ms per round at 2^16..2^10
+    // while the serial path runs them in 0.04-0.13ms (measured, 9950X3D,
+    // NT=16), so below 2^18 the serial path wins outright. Env knob for
+    // local/A-B use only; the ranked harness clears the env, so the shipped
+    // default is what the runner runs.
+    let tail_fusion_min_log: usize = std::env::var("FLOCK_ZC_TAIL_FUSION_MIN_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18);
+
     // Two-challenge symbolic lookahead: round three's message is a quadratic
     // in ρ₁, so its six coefficients ride along inside round two's sweep and
     // rounds 3+4 collapse into a single composed double-fold pass out of the
@@ -941,7 +956,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 10 && !no_tail_fusion {
+        let (m1, mi) = if log_n_before >= tail_fusion_min_log && !no_tail_fusion {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
