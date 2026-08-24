@@ -700,12 +700,82 @@ impl<'t> W8<'t> {
     }
 }
 
+/// `FLOCK_NO_W8X2=1` restores two independent `W8::push` calls. Default
+/// interleaves the A/B `vpshldd` pair so both pending joins issue before
+/// either store. Ranked sandbox never sets the flag.
+fn w8x2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_W8X2").is_none());
+    *ON
+}
+
+/// One A-field and one B-field at the same `(USED, WIDTH, WORD)`. Same
+/// stores, same pending updates, same drain trigger as `wa.push` then
+/// `wb.push`. The VBMI2 body issues both `vpshldd` before either stage
+/// store so the two independent joins can dual-issue.
+#[inline(always)]
+unsafe fn push2<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
+    wa: &mut W8<'_>,
+    wb: &mut W8<'_>,
+    va: V8,
+    vb: V8,
+) {
+    const {
+        assert!(USED >= 0 && USED < 32);
+        assert!(WIDTH == 31 || WIDTH == 32);
+        assert!(BACK >= 1 && BACK < 32);
+        assert!(WORD < U32_PER_BLOCK);
+    }
+    unsafe {
+        if !w8x2_enabled() {
+            wa.push::<USED, WIDTH, BACK, WORD>(va);
+            wb.push::<USED, WIDTH, BACK, WORD>(vb);
+            return;
+        }
+        #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
+        {
+            if USED == 0 {
+                if WIDTH == 32 {
+                    wa.write_word::<WORD>(va);
+                    wb.write_word::<WORD>(vb);
+                    wa.pending = dup_u32(0);
+                    wb.pending = dup_u32(0);
+                } else {
+                    wa.pending = shl_v8::<1>(va);
+                    wb.pending = shl_v8::<1>(vb);
+                }
+            } else {
+                let oa = _mm256_shldi_epi32::<USED>(va, wa.pending);
+                let ob = _mm256_shldi_epi32::<USED>(vb, wb.pending);
+                wa.write_word::<WORD>(oa);
+                wb.write_word::<WORD>(ob);
+                wa.pending = if WIDTH == 31 { shl_v8::<1>(va) } else { va };
+                wb.pending = if WIDTH == 31 { shl_v8::<1>(vb) } else { vb };
+            }
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
+        {
+            wa.push::<USED, WIDTH, BACK, WORD>(va);
+            wb.push::<USED, WIDTH, BACK, WORD>(vb);
+        }
+    }
+}
+
 macro_rules! pushf8 {
     ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
         $w.push::<{ ($pos % 32) as i32 }, $width, {
             let u = ($pos % 32) as i32;
             if u == 0 { 1 } else { 32 - u }
         }, { $pos / 32 }>($v);
+    }};
+}
+
+macro_rules! push2f8 {
+    ($wa:ident, $wb:ident, $pos:expr, $width:literal, $va:expr, $vb:expr) => {{
+        push2::<{ ($pos % 32) as i32 }, $width, {
+            let u = ($pos % 32) as i32;
+            if u == 0 { 1 } else { 32 - u }
+        }, { $pos / 32 }>(&mut $wa, &mut $wb, $va, $vb);
     }};
 }
 
@@ -1712,31 +1782,23 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
                 let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0, r0);
                 let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
                 let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
                 let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3, r3);
                 let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
                 let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn, maxv);
+                push2f8!(wa, wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2, maxv);
                 state[$la] = a2;
                 state[$lb] = bn;
                 state[$lc] = c2s;
@@ -1772,8 +1834,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         macro_rules! oh {
             ($w:literal) => {{
                 let hv = xor_v8(state[$w + 8], cv_v[$w]);
-                pushf8!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
-                pushf8!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+                push2f8!(wa, wb, OUT_HI_BASE + 32 * $w, 32, hv, maxv);
             }};
         }
         oh!(0);
