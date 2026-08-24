@@ -158,16 +158,20 @@ fn cached_standard_evals(dim: usize) -> Arc<Vec<Vec<F128>>> {
     Arc::clone(tables[dim].get_or_init(build))
 }
 
+fn standard_twiddles_cell(dim: usize) -> &'static OnceLock<Arc<[F128]>> {
+    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
+        OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    &tables[dim]
+}
+
 fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
     if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
         return None;
     }
 
-    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
-        OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     Some(
-        tables[dim]
+        standard_twiddles_cell(dim)
             .get_or_init(|| {
                 Arc::from(
                     precompute_twiddles(evals)
@@ -176,6 +180,18 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
             })
             .clone(),
     )
+}
+
+/// Restore proof-local recursive twiddle construction for same-binary A/B.
+#[inline]
+fn recursive_twiddle_cache_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        matches!(
+            std::env::var_os("FLOCK_NO_NTT_RECURSIVE_TWIDDLE_CACHE"),
+            Some(value) if value == "1"
+        )
+    })
 }
 
 /// Interleaved lane count of the ranked production commitment.
@@ -998,6 +1014,119 @@ impl AdditiveNttF128 {
         span_get(&v[1..], block)
     }
 
+    /// True only for the process-cached standard-basis table. Explicit custom
+    /// bases retain the incumbent proof-local construction even when their
+    /// dimension happens to match a ranked standard domain.
+    #[inline]
+    fn recursive_twiddle_cache_available(&self) -> bool {
+        if recursive_twiddle_cache_disabled() {
+            return false;
+        }
+        let dim = self.log_domain_size();
+        let Some(own) = self.precomputed_twiddles.as_ref() else {
+            return false;
+        };
+        dim <= MAX_PRECOMPUTED_TWIDDLE_LOG
+            && standard_twiddles_cell(dim)
+                .get()
+                .is_some_and(|standard| Arc::ptr_eq(own, standard))
+    }
+
+    fn cached_recursive_seed_twiddles(&self, k: usize) -> Option<&'static [[F128; 3]]> {
+        if !self.recursive_twiddle_cache_available() || k + 1 >= self.log_domain_size() {
+            return None;
+        }
+        type Cell = OnceLock<Box<[[F128; 3]]>>;
+        static TABLES: OnceLock<
+            [[Cell; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]; MAX_PRECOMPUTED_TWIDDLE_LOG + 1],
+        > = OnceLock::new();
+        let tables = TABLES
+            .get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+        let dim = self.log_domain_size();
+        Some(
+            tables[dim][k]
+                .get_or_init(|| {
+                    (0..1usize << k)
+                        .map(|block| {
+                            [
+                                self.twiddle(k, block),
+                                self.twiddle(k + 1, 2 * block),
+                                self.twiddle(k + 1, 2 * block + 1),
+                            ]
+                        })
+                        .collect()
+                })
+                .as_ref(),
+        )
+    }
+
+    fn cached_recursive_fused4_twiddles(&self, layer: usize) -> Option<&'static [[F128; 15]]> {
+        if !self.recursive_twiddle_cache_available() || layer + 3 >= self.log_domain_size() {
+            return None;
+        }
+        type Cell = OnceLock<Box<[[F128; 15]]>>;
+        static TABLES: OnceLock<
+            [[Cell; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]; MAX_PRECOMPUTED_TWIDDLE_LOG + 1],
+        > = OnceLock::new();
+        let tables = TABLES
+            .get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+        let dim = self.log_domain_size();
+        Some(
+            tables[dim][layer]
+                .get_or_init(|| {
+                    (0..1usize << layer)
+                        .map(|block| {
+                            let mut tw = [F128::ZERO; 15];
+                            tw[0] = self.twiddle(layer, block);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                            }
+                            for s in 0..8 {
+                                tw[7 + s] = self.twiddle(layer + 3, 8 * block + s);
+                            }
+                            tw
+                        })
+                        .collect()
+                })
+                .as_ref(),
+        )
+    }
+
+    fn cached_recursive_fused3_twiddles(&self, layer: usize) -> Option<&'static [[F128; 7]]> {
+        if !self.recursive_twiddle_cache_available() || layer + 2 >= self.log_domain_size() {
+            return None;
+        }
+        type Cell = OnceLock<Box<[[F128; 7]]>>;
+        static TABLES: OnceLock<
+            [[Cell; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]; MAX_PRECOMPUTED_TWIDDLE_LOG + 1],
+        > = OnceLock::new();
+        let tables = TABLES
+            .get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+        let dim = self.log_domain_size();
+        Some(
+            tables[dim][layer]
+                .get_or_init(|| {
+                    (0..1usize << layer)
+                        .map(|block| {
+                            let mut tw = [F128::ZERO; 7];
+                            tw[0] = self.twiddle(layer, block);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                            }
+                            tw
+                        })
+                        .collect()
+                })
+                .as_ref(),
+        )
+    }
+
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
     /// `log_d ≤ log_domain_size()`. Layer `l ∈ [0, log_d)` is processed in
     /// order (neighbors-last: top layer first).
@@ -1428,15 +1557,21 @@ impl AdditiveNttF128 {
         debug_assert!(msg_positions >= 4 && msg_positions.is_power_of_two());
         let quarter = msg_positions >> 2;
 
-        let twiddles: Vec<[F128; 3]> = (0..blocks)
-            .map(|block| {
-                [
-                    self.twiddle(k, block),
-                    self.twiddle(k + 1, 2 * block),
-                    self.twiddle(k + 1, 2 * block + 1),
-                ]
-            })
-            .collect();
+        let fallback_twiddles;
+        let twiddles: &[[F128; 3]] = if let Some(cached) = self.cached_recursive_seed_twiddles(k) {
+            cached
+        } else {
+            fallback_twiddles = (0..blocks)
+                .map(|block| {
+                    [
+                        self.twiddle(k, block),
+                        self.twiddle(k + 1, 2 * block),
+                        self.twiddle(k + 1, 2 * block + 1),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            &fallback_twiddles
+        };
         debug_assert_eq!(twiddles[0][0], F128::ZERO);
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
 
@@ -1463,7 +1598,6 @@ impl AdditiveNttF128 {
             && dst % 128 == 0
             && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
             && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
-        let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             if use_nt {
@@ -2571,6 +2705,37 @@ impl AdditiveNttF128 {
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
 
+        // Resolve the warm standard-basis tables once per recursive level,
+        // outside every Rayon sub-group and block loop. Ranked L1--L4 need at
+        // most three fused-four passes and one fused-three pass; unusual
+        // schedules beyond that compact plan simply retain local twiddles.
+        let mut cached_fused4 = [None; 3];
+        let mut cached_fused4_len = 0usize;
+        let mut cached_fused3 = None;
+        if deep_fused4_ok && !fuse_blocks {
+            let mut cache_layer = n_top.max(start_layer);
+            while cache_layer < log_d {
+                if cache_layer + 3 < log_d {
+                    if cached_fused4_len < cached_fused4.len() {
+                        cached_fused4[cached_fused4_len] = self
+                            .cached_recursive_fused4_twiddles(cache_layer)
+                            .map(|table| (cache_layer, table));
+                        cached_fused4_len += 1;
+                    }
+                    cache_layer += 4;
+                } else if cache_layer + 3 == log_d && !ntt_fused3_disabled() {
+                    cached_fused3 = self
+                        .cached_recursive_fused3_twiddles(cache_layer)
+                        .map(|table| (cache_layer, table));
+                    cache_layer += 3;
+                } else if cache_layer + 1 < log_d {
+                    cache_layer += 2;
+                } else {
+                    cache_layer += 1;
+                }
+            }
+        }
+
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
@@ -2688,23 +2853,38 @@ impl AdditiveNttF128 {
 
                     if layer + 3 < log_d {
                         let sixteenth = block_size >> 4;
+                        let cached = cached_fused4[..cached_fused4_len]
+                            .iter()
+                            .flatten()
+                            .find_map(|&(cached_layer, table)| {
+                                (cached_layer == layer).then_some(table)
+                            });
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
-                            for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                            }
+                            let local;
+                            let tw = if let Some(table) = cached {
+                                &table[global_block]
+                            } else {
+                                local = {
+                                    let mut tw = [F128::ZERO; 15];
+                                    tw[0] = self.twiddle(layer, global_block);
+                                    for s in 0..2 {
+                                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                    }
+                                    for s in 0..4 {
+                                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                    }
+                                    for s in 0..8 {
+                                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                                    }
+                                    tw
+                                };
+                                &local
+                            };
                             let block_start = block_in_sub * block_bytes;
                             butterfly_interleaved_fused_4layer_rows(
                                 &mut sub_data[block_start..block_start + block_bytes],
-                                &tw,
+                                tw,
                                 sixteenth,
                                 num_ntts,
                                 if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
@@ -2736,16 +2916,28 @@ impl AdditiveNttF128 {
                         // zero-odd-row contract. The two even-stride layers
                         // it fuses have preserved that tail up to here.
                         let dense_lanes = num_ntts - odd_tail;
+                        let cached = cached_fused3
+                            .filter(|&(cached_layer, _)| cached_layer == layer)
+                            .map(|(_, table)| table);
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
+                            let local;
+                            let tw = if let Some(table) = cached {
+                                &table[global_block]
+                            } else {
+                                local = {
+                                    let mut tw = [F128::ZERO; 7];
+                                    tw[0] = self.twiddle(layer, global_block);
+                                    for s in 0..2 {
+                                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                    }
+                                    for s in 0..4 {
+                                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                    }
+                                    tw
+                                };
+                                &local
+                            };
                             let block_start = block_in_sub * block_bytes;
                             let block = &mut sub_data[block_start..block_start + block_bytes];
                             debug_assert_eq!(block.len(), 8 * num_ntts);
@@ -2757,7 +2949,7 @@ impl AdditiveNttF128 {
                                     block.as_mut_ptr(),
                                     num_ntts,
                                     dense_lanes,
-                                    &tw,
+                                    tw,
                                 );
                             }
                         }
@@ -3926,6 +4118,97 @@ mod tests {
             ntt.forward_transform_interleaved_scalar_from_layer(&mut got, num_ntts, k + 2);
 
             assert_eq!(got, want, "shape {si}: log_msg_pos={log_msg_pos} ntts={num_ntts} k={k}");
+        }
+    }
+
+    #[test]
+    fn recursive_twiddle_tables_match_incumbent_and_reuse_warm_storage() {
+        let ranked = [
+            (18usize, 2usize, &[4usize, 8, 12][..], None),
+            (16, 3, &[5usize, 9][..], Some(13usize)),
+            (14, 4, &[6usize, 10][..], None),
+            (12, 5, &[7usize][..], None),
+            (10, 6, &[][..], None),
+        ];
+
+        for &(dim, k, fused4_layers, fused3_layer) in &ranked {
+            let ntt = AdditiveNttF128::standard(dim);
+            let seed = ntt
+                .cached_recursive_seed_twiddles(k)
+                .expect("ranked standard seed table must be cached");
+            assert!(core::ptr::eq(
+                seed,
+                ntt.cached_recursive_seed_twiddles(k).unwrap()
+            ));
+            for (block, got) in seed.iter().enumerate() {
+                assert_eq!(
+                    *got,
+                    [
+                        ntt.twiddle(k, block),
+                        ntt.twiddle(k + 1, 2 * block),
+                        ntt.twiddle(k + 1, 2 * block + 1),
+                    ],
+                    "seed dim={dim} k={k} block={block}"
+                );
+            }
+
+            for &layer in fused4_layers {
+                let table = ntt.cached_recursive_fused4_twiddles(layer).unwrap();
+                assert!(core::ptr::eq(
+                    table,
+                    ntt.cached_recursive_fused4_twiddles(layer).unwrap()
+                ));
+                for (block, got) in table.iter().enumerate() {
+                    let mut want = [F128::ZERO; 15];
+                    want[0] = ntt.twiddle(layer, block);
+                    for s in 0..2 {
+                        want[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        want[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+                    }
+                    for s in 0..8 {
+                        want[7 + s] = ntt.twiddle(layer + 3, 8 * block + s);
+                    }
+                    assert_eq!(
+                        *got, want,
+                        "fused4 dim={dim} layer={layer} block={block}"
+                    );
+                }
+            }
+
+            if let Some(layer) = fused3_layer {
+                let table = ntt.cached_recursive_fused3_twiddles(layer).unwrap();
+                assert!(core::ptr::eq(
+                    table,
+                    ntt.cached_recursive_fused3_twiddles(layer).unwrap()
+                ));
+                for (block, got) in table.iter().enumerate() {
+                    let mut want = [F128::ZERO; 7];
+                    want[0] = ntt.twiddle(layer, block);
+                    for s in 0..2 {
+                        want[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        want[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+                    }
+                    assert_eq!(
+                        *got, want,
+                        "fused3 dim={dim} layer={layer} block={block}"
+                    );
+                }
+            }
+
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            let custom = AdditiveNttF128::new(&basis);
+            assert!(!custom.recursive_twiddle_cache_available());
+            assert!(custom.cached_recursive_seed_twiddles(k).is_none());
+            if let Some(&layer) = fused4_layers.first() {
+                assert!(custom.cached_recursive_fused4_twiddles(layer).is_none());
+            }
+            if let Some(layer) = fused3_layer {
+                assert!(custom.cached_recursive_fused3_twiddles(layer).is_none());
+            }
         }
     }
 
