@@ -5767,4 +5767,31 @@ mod low_twiddle_invariant {
             }
         }
     }
+
+    /// `twiddle(layer, 0)` is the empty bit-span, so it is zero at every
+    /// layer. A fused-four on NTT block 0 therefore has zeros at slots
+    /// 0, 1, 3, 7 — the predicate the AVX-512 XOR peel keys on.
+    #[test]
+    fn twiddle_block0_is_zero_and_fused4_slots_match() {
+        for dim in 9..=22usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            for layer in 0..dim {
+                assert_eq!(
+                    ntt.twiddle(layer, 0),
+                    F128::ZERO,
+                    "dim={dim} layer={layer}"
+                );
+            }
+            for layer in 0..dim.saturating_sub(3) {
+                let tw0 = ntt.twiddle(layer, 0);
+                let tw1 = ntt.twiddle(layer + 1, 0);
+                let tw3 = ntt.twiddle(layer + 2, 0);
+                let tw7 = ntt.twiddle(layer + 3, 0);
+                assert_eq!(tw0, F128::ZERO);
+                assert_eq!(tw1, F128::ZERO);
+                assert_eq!(tw3, F128::ZERO);
+                assert_eq!(tw7, F128::ZERO);
+            }
+        }
+    }
 }

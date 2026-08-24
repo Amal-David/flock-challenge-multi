@@ -10,6 +10,24 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_FUSED4_ZERO=1` restores multiply-by-zero for the four
+/// fused-four slots that are `twiddle(*, 0) = 0` (the empty span sum).
+/// Default ON: those 15 butterflies are `v ^= u`, no CLMUL. Read once,
+/// outside every lane loop.
+#[inline]
+fn fused4_zero_disabled() -> bool {
+    #[cfg(test)]
+    if FUSED4_ZERO_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED4_ZERO").is_some())
+}
+
+#[cfg(test)]
+static FUSED4_ZERO_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -1077,13 +1095,32 @@ unsafe fn butterfly_fused_4layer_row_impl<
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
-        // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
-        // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
+        // Additive-NTT `twiddle(layer, 0)` is the empty span, hence zero.
+        // A fused-four on NTT block 0 therefore has zeros at slots 0, 1, 3, 7
+        // (`twiddle(L+k, 0)` for k = 0..4). `v * 0 = 0`, so those 15
+        // butterflies collapse to `v ^= u`. Kill switch restores the
+        // multiply-by-zero form in the same binary.
+        let z0 = !fused4_zero_disabled()
+            && twiddles[0] == F128::ZERO
+            && twiddles[1] == F128::ZERO
+            && twiddles[3] == F128::ZERO
+            && twiddles[7] == F128::ZERO;
+        // Broadcast (and, under DIET, x^64-companion) every live twiddle
+        // ONCE per row group. Zero slots skip the companion CLMUL too.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
+        if z0 {
+            tw[2] = tw_x4::<false, DIET>(twiddles[2]);
+            tw[4] = tw_x4::<false, DIET>(twiddles[4]);
+            tw[5] = tw_x4::<false, DIET>(twiddles[5]);
+            tw[6] = tw_x4::<false, DIET>(twiddles[6]);
+            for s in 1..8 {
+                tw[7 + s] = tw_x4::<false, DIET>(twiddles[7 + s]);
+            }
+        } else {
+            for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+                *slot = tw_x4::<false, DIET>(*value);
+            }
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
@@ -1114,26 +1151,59 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     values[$u] = new_u;
                 }};
             }
+            // t = 0: new_u = u + v*0 = u, then v += new_u ⇒ v ^= u, u unchanged.
+            macro_rules! butterfly_zero {
+                ($u:expr, $v:expr) => {{
+                    values[$v] = _mm512_xor_si512(values[$v], values[$u]);
+                }};
+            }
 
-            let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
-            }
-            for s in 0..2 {
-                let twiddle = tw[1 + s];
+            if z0 {
+                for i in 0..8 {
+                    butterfly_zero!(i, i + 8);
+                }
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    butterfly_zero!(i, i + 4);
                 }
-            }
-            for s in 0..4 {
-                let twiddle = tw[3 + s];
+                let twiddle = tw[2];
+                for i in 0..4 {
+                    butterfly!(8 + i, 12 + i, twiddle);
+                }
                 for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    butterfly_zero!(i, i + 2);
                 }
-            }
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                for s in 1..4 {
+                    let twiddle = tw[3 + s];
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
+                }
+                butterfly_zero!(0, 1);
+                for s in 1..8 {
+                    let twiddle = tw[7 + s];
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
+            } else {
+                let outer = tw[0];
+                for i in 0..8 {
+                    butterfly!(i, i + 8, outer);
+                }
+                for s in 0..2 {
+                    let twiddle = tw[1 + s];
+                    for i in 0..4 {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    }
+                }
+                for s in 0..4 {
+                    let twiddle = tw[3 + s];
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
+                }
+                for s in 0..8 {
+                    let twiddle = tw[7 + s];
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -1938,6 +2008,60 @@ mod diet_tests {
                 buf
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
+
+            // Block-0 fused-four: slots 0, 1, 3, 7 are the empty-span zeros.
+            // The XOR peel must match multiply-by-zero (diet on or off).
+            let mut tw15z = tw15;
+            tw15z[0] = F128::ZERO;
+            tw15z[1] = F128::ZERO;
+            tw15z[3] = F128::ZERO;
+            tw15z[7] = F128::ZERO;
+            let run_fused4z = |off: bool, diet: bool| {
+                FUSED4_ZERO_TEST_OFF.store(off, std::sync::atomic::Ordering::Relaxed);
+                let mut buf = base.clone();
+                // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
+                unsafe {
+                    if diet {
+                        butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw15z,
+                            0,
+                        );
+                    } else {
+                        butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                            buf.as_mut_ptr(),
+                            1,
+                            len,
+                            len,
+                            0,
+                            &tw15z,
+                            0,
+                        );
+                    }
+                }
+                FUSED4_ZERO_TEST_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                buf
+            };
+            let peeled = run_fused4z(false, true);
+            assert_eq!(
+                peeled,
+                run_fused4z(false, false),
+                "fused4 z0 diet len={len}"
+            );
+            assert_eq!(
+                peeled,
+                run_fused4z(true, true),
+                "fused4 z0 vs mul0 len={len}"
+            );
+            assert_eq!(
+                peeled,
+                run_fused4z(true, false),
+                "fused4 z0 vs mul0 diet-off len={len}"
+            );
         }
     }
 }
