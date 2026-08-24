@@ -280,6 +280,23 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_F4WAVE=1` restores the incumbent seed-then-fused-four
+/// schedule (64 k-steps write all 512 staging rows, then eight fused-four
+/// blocks consume them). Default ON: four waves of 16 k-steps, each wave
+/// filling one fused-four group of every block, then that group is butterflied
+/// while those 128 KiB are still the last stores. Same butterflies, same
+/// rows, same bytes; only the interleaving of disjoint k-steps against the
+/// fused-four that consumes them changes.
+#[inline]
+fn ntt_seed_f4wave_disabled() -> bool {
+    #[cfg(test)]
+    if F4WAVE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_F4WAVE").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -292,6 +309,9 @@ static TOP_FUSION_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 #[cfg(test)]
 static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static F4WAVE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// `FLOCK_NO_NTT_KERNEL_DIET=1` restores the incumbent butterfly kernel
 /// schedule inside the same binary. Two value-identical instruction-stream
@@ -1745,7 +1765,10 @@ impl AdditiveNttF128 {
     /// Exact ranked geometry: `bufp` owns 512 initialized staging rows of 64
     /// elements; `base` owns the disjoint 2^20×64 codeword; distinct concurrent
     /// `r` tasks select disjoint destination rows. When `ALIGNED_ZMM`, `base`
-    /// must be 64-byte aligned; otherwise it must be 16-byte aligned.
+    /// must be 64-byte aligned; otherwise it must be 16-byte aligned. When
+    /// `skip_fused4` is true the caller has already run every fused-four group
+    /// of this staging block (the seed f4-wave); only the fused-two NT publish
+    /// remains.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1765,6 +1788,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        skip_fused4: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -1783,16 +1807,18 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 let tw = &tw4[block];
-                for j in 0..4 {
-                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
-                        region.add(j * g4_base * row_len),
-                        g4_stride,
-                        row_len,
-                        lanes4,
-                        0,
-                        tw,
-                    );
+                if !skip_fused4 {
+                    for j in 0..4 {
+                        let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                        kernels::butterfly_fused_4layer_row(
+                            region.add(j * g4_base * row_len),
+                            g4_stride,
+                            row_len,
+                            lanes4,
+                            0,
+                            tw,
+                        );
+                    }
                 }
                 for m in 0..16 {
                     let outer_block = block * 16 + m;
@@ -1917,6 +1943,8 @@ impl AdditiveNttF128 {
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
+        #[cfg(not(target_arch = "x86_64"))]
+        let pf_dist = 0usize;
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);
@@ -1938,36 +1966,31 @@ impl AdditiveNttF128 {
                 // The four message rows a step reads are asked for a fixed
                 // number of steps ahead. The hints move no data of their own
                 // and change no value; `FLOCK_NO_NTT_SEED_PF=1` removes them.
-                #[cfg(target_arch = "x86_64")]
-                if pf_dist != 0 {
-                    for k in 0..pf_dist.min(64) {
-                        pf_msg_rows(
-                            src,
-                            r + k * sub_stride,
-                            block_size,
-                            row_len,
-                            pf_lines,
-                        );
-                    }
-                }
-                for k in 0..64 {
+                let wave = !ntt_seed_f4wave_disabled();
+                let seed_k = |k: usize, next_k: Option<usize>| {
+                    // SAFETY: same pointer contract as the task body.
+                    unsafe {
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = next_k;
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
                     // One line per lane step from inside the kernel, or the
                     // whole burst up front; never both.
                     let mut pf_next: *const F128 = core::ptr::null();
                     #[cfg(target_arch = "x86_64")]
-                    if pf_dist != 0 && k + pf_dist < 64 {
-                        if pf_spread {
-                            pf_next = src.add((r_s + pf_dist * sub_stride) * row_len);
-                        } else {
-                            pf_msg_rows(
-                                src,
-                                r_s + pf_dist * sub_stride,
-                                block_size,
-                                row_len,
-                                pf_lines,
-                            );
+                    if pf_dist != 0 {
+                        if let Some(nk) = next_k {
+                            if pf_spread {
+                                pf_next = src.add((r + nk * sub_stride) * row_len);
+                            } else {
+                                pf_msg_rows(
+                                    src,
+                                    r + nk * sub_stride,
+                                    block_size,
+                                    row_len,
+                                    pf_lines,
+                                );
+                            }
                         }
                     }
                     #[cfg(all(
@@ -2073,6 +2096,70 @@ impl AdditiveNttF128 {
                             &seed_dense,
                         );
                     }
+                    }
+                };
+                let fused4_group = |j: usize| {
+                    // SAFETY: group `j` of every block is the sixteen staging
+                    // rows the just-finished wave wrote, exclusive to this task.
+                    unsafe {
+                        for block in 0..8 {
+                            let region = bufp.add(block * 64 * row_len);
+                            let tw = &tw4[block];
+                            let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                            kernels::butterfly_fused_4layer_row(
+                                region.add(j * g4_base * row_len),
+                                g4_stride,
+                                row_len,
+                                lanes4,
+                                0,
+                                tw,
+                            );
+                        }
+                    }
+                };
+                #[cfg(target_arch = "x86_64")]
+                if pf_dist != 0 {
+                    for idx in 0..pf_dist.min(64) {
+                        let k = if wave {
+                            let j = idx / 16;
+                            let t = idx % 16;
+                            4 * t + j
+                        } else {
+                            idx
+                        };
+                        pf_msg_rows(
+                            src,
+                            r + k * sub_stride,
+                            block_size,
+                            row_len,
+                            pf_lines,
+                        );
+                    }
+                }
+                if wave {
+                    for j in 0..4 {
+                        for t in 0..16 {
+                            let idx = j * 16 + t;
+                            let k = 4 * t + j;
+                            let next = if pf_dist != 0 && idx + pf_dist < 64 {
+                                let ni = idx + pf_dist;
+                                Some(4 * (ni % 16) + ni / 16)
+                            } else {
+                                None
+                            };
+                            seed_k(k, next);
+                        }
+                        fused4_group(j);
+                    }
+                } else {
+                    for k in 0..64 {
+                        let next = if pf_dist != 0 && k + pf_dist < 64 {
+                            Some(k + pf_dist)
+                        } else {
+                            None
+                        };
+                        seed_k(k, next);
+                    }
                 }
                 #[cfg(all(
                     target_arch = "x86_64",
@@ -2095,6 +2182,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            wave,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2108,6 +2196,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            wave,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2119,16 +2208,18 @@ impl AdditiveNttF128 {
                 for block in 0..8 {
                     let region = bufp.add(block * 64 * row_len);
                     let tw = &tw4[block];
-                    for j in 0..4 {
-                        let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                        kernels::butterfly_fused_4layer_row(
-                            region.add(j * g4_base * row_len),
-                            g4_stride,
-                            row_len,
-                            lanes4,
-                            0,
-                            tw,
-                        );
+                    if !wave {
+                        for j in 0..4 {
+                            let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                            kernels::butterfly_fused_4layer_row(
+                                region.add(j * g4_base * row_len),
+                                g4_stride,
+                                row_len,
+                                lanes4,
+                                0,
+                                tw,
+                            );
+                        }
                     }
                     for m in 0..16 {
                         let outer_block = block * 16 + m;
