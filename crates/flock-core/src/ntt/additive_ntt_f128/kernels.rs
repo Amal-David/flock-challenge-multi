@@ -520,6 +520,78 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     }
 }
 
+/// Publish a rate-1/4 seed row range with eight interleaved field elements.
+///
+/// The Sapphire Rapids implementation loads each four-row message lane group
+/// once and derives the sparse block plus all three dense rate blocks before
+/// advancing. Other targets retain the byte-identical four-kernel form.
+///
+/// # Safety
+///
+/// `src` contains `msg_positions * 8` initialized elements, `dst` contains
+/// `4 * msg_positions * 8` writable elements, source and destination do not
+/// alias, and concurrent calls own disjoint ranges within `rows`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_rows_rate_quarter_8(
+    src: *const F128,
+    dst: *mut F128,
+    msg_positions: usize,
+    rows: core::ops::Range<usize>,
+    twiddles: &[[F128; 3]; 4],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::butterfly_fused_2layer_rows_rate_quarter_8(
+            src,
+            dst,
+            msg_positions,
+            rows,
+            twiddles,
+        );
+        return;
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    unsafe {
+        const NUM_NTTS: usize = 8;
+        let quarter = msg_positions >> 2;
+        let msg_len = msg_positions * NUM_NTTS;
+        for r in rows {
+            portable::butterfly_fused_2layer_row_from_sparse(
+                src,
+                dst,
+                quarter,
+                NUM_NTTS,
+                r,
+                twiddles[0][2],
+            );
+            for (block, twiddle) in twiddles.iter().enumerate().skip(1) {
+                portable::butterfly_fused_2layer_row_from(
+                    src,
+                    dst.add(block * msg_len),
+                    quarter,
+                    NUM_NTTS,
+                    r,
+                    twiddle,
+                );
+            }
+        }
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only

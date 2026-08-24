@@ -913,6 +913,178 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     }
 }
 
+/// One source traversal publishes all four rate-1/4 seed blocks for a
+/// contiguous row range at the ranked eight-way interleave.
+///
+/// # Safety
+/// Same contract as the public dispatch wrapper in `kernels.rs`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_rows_rate_quarter_8(
+    src: *const F128,
+    dst: *mut F128,
+    msg_positions: usize,
+    rows: core::ops::Range<usize>,
+    twiddles: &[[F128; 3]; 4],
+) {
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_rows_rate_quarter_8_impl::<false>(
+                src,
+                dst,
+                msg_positions,
+                rows,
+                twiddles,
+            )
+        } else {
+            butterfly_fused_2layer_rows_rate_quarter_8_impl::<true>(
+                src,
+                dst,
+                msg_positions,
+                rows,
+                twiddles,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_rows_rate_quarter_8`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_rows_rate_quarter_8_impl<const DIET: bool>(
+    src: *const F128,
+    dst: *mut F128,
+    msg_positions: usize,
+    rows: core::ops::Range<usize>,
+    twiddles: &[[F128; 3]; 4],
+) {
+    use core::arch::x86_64::*;
+
+    const NUM_NTTS: usize = 8;
+    let quarter = msg_positions >> 2;
+    let msg_len = msg_positions * NUM_NTTS;
+    let sparse_b = unsafe { tw_x4::<false, DIET>(twiddles[0][2]) };
+    let d1_outer = unsafe { tw_x4::<false, DIET>(twiddles[1][0]) };
+    let d1_inner_a = unsafe { tw_x4::<false, DIET>(twiddles[1][1]) };
+    let d1_inner_b = unsafe { tw_x4::<false, DIET>(twiddles[1][2]) };
+    let d2_outer = unsafe { tw_x4::<false, DIET>(twiddles[2][0]) };
+    let d2_inner_a = unsafe { tw_x4::<false, DIET>(twiddles[2][1]) };
+    let d2_inner_b = unsafe { tw_x4::<false, DIET>(twiddles[2][2]) };
+    let d3_outer = unsafe { tw_x4::<false, DIET>(twiddles[3][0]) };
+    let d3_inner_a = unsafe { tw_x4::<false, DIET>(twiddles[3][1]) };
+    let d3_inner_b = unsafe { tw_x4::<false, DIET>(twiddles[3][2]) };
+
+    macro_rules! store_dense {
+        ($block:expr, $outer:expr, $inner_a:expr, $inner_b:expr,
+         $va:expr, $vb:expr, $vc:expr, $vd:expr, $row:expr, $lane:expr) => {{
+            let mut a = $va;
+            let mut b = $vb;
+            let mut c = $vc;
+            let mut d = $vd;
+            let new_a = _mm512_xor_si512(a, mul_x4::<false, DIET>($outer, c));
+            c = _mm512_xor_si512(c, new_a);
+            a = new_a;
+            let new_b = _mm512_xor_si512(b, mul_x4::<false, DIET>($outer, d));
+            d = _mm512_xor_si512(d, new_b);
+            b = new_b;
+            let new_a = _mm512_xor_si512(a, mul_x4::<false, DIET>($inner_a, b));
+            b = _mm512_xor_si512(b, new_a);
+            a = new_a;
+            let new_c = _mm512_xor_si512(c, mul_x4::<false, DIET>($inner_b, d));
+            d = _mm512_xor_si512(d, new_c);
+            c = new_c;
+            let block_dst = dst.add($block * msg_len);
+            _mm512_storeu_si512(
+                block_dst.add(($row * NUM_NTTS) + $lane) as *mut __m512i,
+                a,
+            );
+            _mm512_storeu_si512(
+                block_dst.add(((quarter + $row) * NUM_NTTS) + $lane) as *mut __m512i,
+                b,
+            );
+            _mm512_storeu_si512(
+                block_dst.add(((2 * quarter + $row) * NUM_NTTS) + $lane) as *mut __m512i,
+                c,
+            );
+            _mm512_storeu_si512(
+                block_dst.add(((3 * quarter + $row) * NUM_NTTS) + $lane) as *mut __m512i,
+                d,
+            );
+        }};
+    }
+
+    unsafe {
+        for r in rows {
+            let src_row = |i: usize| src.add((i * quarter + r) * NUM_NTTS);
+            let mut lane = 0;
+            while lane < NUM_NTTS {
+                let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+                let vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+                let vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+                let vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+                let sb = _mm512_xor_si512(vb, va);
+                let sc0 = _mm512_xor_si512(vc, va);
+                let mut sd = _mm512_xor_si512(vd, vb);
+                let sc = _mm512_xor_si512(sc0, mul_x4::<false, DIET>(sparse_b, sd));
+                sd = _mm512_xor_si512(sd, sc);
+                _mm512_storeu_si512(dst.add((r * NUM_NTTS) + lane) as *mut __m512i, va);
+                _mm512_storeu_si512(
+                    dst.add(((quarter + r) * NUM_NTTS) + lane) as *mut __m512i,
+                    sb,
+                );
+                _mm512_storeu_si512(
+                    dst.add(((2 * quarter + r) * NUM_NTTS) + lane) as *mut __m512i,
+                    sc,
+                );
+                _mm512_storeu_si512(
+                    dst.add(((3 * quarter + r) * NUM_NTTS) + lane) as *mut __m512i,
+                    sd,
+                );
+
+                store_dense!(
+                    1,
+                    d1_outer,
+                    d1_inner_a,
+                    d1_inner_b,
+                    va,
+                    vb,
+                    vc,
+                    vd,
+                    r,
+                    lane
+                );
+                store_dense!(
+                    2,
+                    d2_outer,
+                    d2_inner_a,
+                    d2_inner_b,
+                    va,
+                    vb,
+                    vc,
+                    vd,
+                    r,
+                    lane
+                );
+                store_dense!(
+                    3,
+                    d3_outer,
+                    d3_inner_a,
+                    d3_inner_b,
+                    va,
+                    vb,
+                    vc,
+                    vd,
+                    r,
+                    lane
+                );
+                lane += 4;
+            }
+        }
+    }
+}
+
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
