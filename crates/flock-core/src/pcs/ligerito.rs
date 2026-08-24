@@ -5860,6 +5860,25 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_DF8_FOUR_BCAST=1` restores [`gfni_fold64_four_maps_staged`]
+/// (plane `vpermb` + qword transpose, then 16-plane affine). Default ON
+/// uses the broadcast factorisation already shipping for URM c4: same
+/// 128 affines per map, `vpbroadcastq` instead of the two 24-shuffle
+/// qword transposes. Output is scattered to sequential `out[i]`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn df8_four_bcast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_FOUR_BCAST").is_none()
+    });
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -6024,7 +6043,8 @@ fn materialize_direct_fold8(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_bcast,
+                        gfni_fold64_four_maps_staged,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
@@ -6038,22 +6058,37 @@ fn materialize_direct_fold8(
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    let bcast = df8_four_bcast_enabled();
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
-                                b_out.as_mut_ptr().add(slot),
-                                gfni_tmp.as_mut_ptr().cast(),
-                            );
+                            if bcast {
+                                gfni_fold64_four_maps_bcast(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                );
+                            } else {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
                         }
                     }
                 }
@@ -11899,7 +11934,7 @@ mod tests {
     #[test]
     fn direct_fold8_four_map_gfni_matches_fold_one_slot_sum() {
         use crate::zerocheck::multilinear::kernels::x86_64::{
-            build_row_fold_mats, gfni_fold64_four_maps_staged,
+            build_row_fold_mats, gfni_fold64_four_maps_bcast, gfni_fold64_four_maps_staged,
         };
         let mut state = 0xB6F1_6408_5EED_191Du64;
         let mut next = || {
@@ -11953,6 +11988,21 @@ mod tests {
             });
             assert_eq!(got[i], expect);
         }
+        let mut got_bcast = vec![F128::ZERO; 64];
+        unsafe {
+            gfni_fold64_four_maps_bcast(
+                values[0].as_ptr().cast::<u8>(),
+                &mats[0],
+                values[1].as_ptr().cast::<u8>(),
+                &mats[1],
+                values[2].as_ptr().cast::<u8>(),
+                &mats[2],
+                values[3].as_ptr().cast::<u8>(),
+                &mats[3],
+                got_bcast.as_mut_ptr(),
+            );
+        }
+        assert_eq!(got_bcast, got, "bcast vs staged four-map");
     }
 
     #[test]
