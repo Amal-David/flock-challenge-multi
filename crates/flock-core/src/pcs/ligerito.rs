@@ -6501,10 +6501,65 @@ fn sample_distinct_queries<Ch: Challenger>(
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
+    sample_distinct_queries_inner(
+        challenger,
+        block_len,
+        count,
+        query_open_table_enabled() && block_len.is_power_of_two(),
+    )
+}
+
+/// `FLOCK_NO_QUERY_OPEN_TABLE=1` restores the incumbent `% block_len` plus
+/// randomized `HashSet` sampler. The ranked Ligerito domains are powers of
+/// two, so the default path maps the same low limb with a mask and tracks
+/// membership in a deterministic, count-sized open-address table.
+fn query_open_table_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_QUERY_OPEN_TABLE").is_none());
+    *ON
+}
+
+fn sample_distinct_queries_inner<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    use_open_table: bool,
+) -> Vec<usize> {
     assert!(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
+    if use_open_table {
+        debug_assert!(block_len.is_power_of_two());
+        let table_len = count
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .unwrap_or_else(|| panic!("sample_distinct_queries: query table size overflow"))
+            .max(1);
+        let table_mask = table_len - 1;
+        let query_mask = block_len - 1;
+        let mut table = vec![usize::MAX; table_len];
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            let v = challenger.sample_f128();
+            let q = (v.lo as usize) & query_mask;
+            let mut slot = q & table_mask;
+            loop {
+                let seen = table[slot];
+                if seen == q {
+                    break;
+                }
+                if seen == usize::MAX {
+                    table[slot] = q;
+                    out.push(q);
+                    break;
+                }
+                slot = (slot + 1) & table_mask;
+            }
+        }
+        out.sort_unstable();
+        return out;
+    }
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
@@ -9192,6 +9247,82 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct ScriptedQueries {
+        values: Vec<F128>,
+        cursor: usize,
+    }
+
+    impl Challenger for ScriptedQueries {
+        fn observe_f128(&mut self, _value: F128) {}
+
+        fn sample_f128(&mut self) -> F128 {
+            let value = self.values[self.cursor];
+            self.cursor += 1;
+            value
+        }
+    }
+
+    /// The deterministic table is a membership implementation only: it must
+    /// consume the exact same scalar challenges as `%` + `HashSet`, including
+    /// duplicate retries and low-table-bit probe collisions, and emit the same
+    /// sorted positions at ranked and boundary shapes.
+    #[test]
+    fn query_open_table_matches_hashset_edges_and_collisions() {
+        for &(block_len, count, seed) in &[
+            (1usize, 0usize, 1u64),
+            (1, 1, 2),
+            (8, 8, 3),
+            (1 << 20, 218, 4),
+            (1 << 18, 106, 5),
+            (1 << 16, 71, 6),
+            (1 << 14, 53, 7),
+            (1 << 12, 43, 8),
+            (1 << 10, 36, 9),
+        ] {
+            let mut incumbent = crate::challenger::RandomChallenger::new(seed);
+            let mut candidate = incumbent.clone();
+            let want = sample_distinct_queries_inner(&mut incumbent, block_len, count, false);
+            let got = sample_distinct_queries_inner(&mut candidate, block_len, count, true);
+            assert_eq!(got, want, "block_len={block_len} count={count}");
+            assert_eq!(
+                candidate.sample_f128_vec(4),
+                incumbent.sample_f128_vec(4),
+                "samplers consumed a different number of retries"
+            );
+        }
+
+        // With table_len=8, 0/8/16/24 all start in slot zero. The repeated 0
+        // forces one transcript retry while the other values force probing.
+        let values = [0u64, 8, 16, 0, 24]
+            .into_iter()
+            .map(|lo| F128 { lo, hi: !lo })
+            .collect::<Vec<_>>();
+        let mut incumbent = ScriptedQueries {
+            values: values.clone(),
+            cursor: 0,
+        };
+        let mut candidate = ScriptedQueries { values, cursor: 0 };
+        let want = sample_distinct_queries_inner(&mut incumbent, 32, 4, false);
+        let got = sample_distinct_queries_inner(&mut candidate, 32, 4, true);
+        assert_eq!(got, want);
+        assert_eq!(got, vec![0, 8, 16, 24]);
+        assert_eq!(candidate.cursor, incumbent.cursor);
+        assert_eq!(candidate.cursor, 5);
+    }
+
+    #[test]
+    fn query_open_table_fs_state_matches_hashset() {
+        for &(block_len, count) in &[(1usize, 1usize), (512, 218), (1024, 36)] {
+            let mut incumbent = crate::challenger::FsChallenger::new(b"query-table-equivalence");
+            let mut candidate = incumbent.clone();
+            let want = sample_distinct_queries_inner(&mut incumbent, block_len, count, false);
+            let got = sample_distinct_queries_inner(&mut candidate, block_len, count, true);
+            assert_eq!(got, want, "block_len={block_len} count={count}");
+            assert_eq!(candidate.sample_f128(), incumbent.sample_f128());
+        }
+    }
+
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
     /// `iter().map(to_vec)` gather, the multi-proof against the incumbent
@@ -11805,7 +11936,9 @@ mod tests {
         let bytes = bincode::serialize(&proof).expect("serialize");
         let proof2: LigeritoProof = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(proof, proof2);
+        let digest = crate::merkle::hash_leaf(&bytes, HashKind::Sha256);
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
+        eprintln!("LigeritoProof bincode sha256: {digest:02x?}");
     }
 
     /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
