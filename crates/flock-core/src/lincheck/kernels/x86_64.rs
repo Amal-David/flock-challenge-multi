@@ -400,6 +400,93 @@ pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) 
     }
 }
 
+/// 8×64 byte transpose, row-major planes in, qword-major bytes out.
+/// `out[k].byte[8L + b] = rows[b][8k + L]`.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn byte_transpose_8x64_fwd(
+    rows: [core::arch::x86_64::__m512i; 8],
+) -> [core::arch::x86_64::__m512i; 8] {
+    use core::arch::x86_64::*;
+    #[rustfmt::skip]
+    const IDX: [i8; 64] = [
+         0,  8, 16, 24, 32, 40, 48, 56,
+         1,  9, 17, 25, 33, 41, 49, 57,
+         2, 10, 18, 26, 34, 42, 50, 58,
+         3, 11, 19, 27, 35, 43, 51, 59,
+         4, 12, 20, 28, 36, 44, 52, 60,
+         5, 13, 21, 29, 37, 45, 53, 61,
+         6, 14, 22, 30, 38, 46, 54, 62,
+         7, 15, 23, 31, 39, 47, 55, 63,
+    ];
+    const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+    const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
+    const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
+    const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
+    const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
+    const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
+    unsafe {
+        let mut cur = rows;
+        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
+            let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
+            let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
+            let mut next = [_mm512_setzero_si512(); 8];
+            for r in 0..8usize {
+                if r & d == 0 {
+                    let x = cur[r];
+                    let y = cur[r | d];
+                    next[r] = _mm512_permutex2var_epi64(x, ia, y);
+                    next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
+                }
+            }
+            cur = next;
+        }
+        let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
+        core::array::from_fn(|k| _mm512_permutexvar_epi8(idx, cur[k]))
+    }
+}
+
+/// Reconstruct 64 F128 columns from a 16×64 byte-plane slab
+/// (`acc[byte * 64 + col]` is byte `byte` of column `col`). Bit-identical
+/// to the scalar insert loop in `fold_block_major_gfni`.
+///
+/// # Safety
+/// `acc` covers 1024 bytes, `out` covers 64 F128s; requires avx512f/bw/vbmi.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+pub(crate) unsafe fn planes_to_f128_avx512(acc: *const u8, out: *mut F128) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let lo_rows: [__m512i; 8] =
+            core::array::from_fn(|k| _mm512_loadu_si512(acc.add(k * 64) as *const __m512i));
+        let hi_rows: [__m512i; 8] =
+            core::array::from_fn(|k| _mm512_loadu_si512(acc.add((8 + k) * 64) as *const __m512i));
+        let los = byte_transpose_8x64_fwd(lo_rows);
+        let his = byte_transpose_8x64_fwd(hi_rows);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let dst = out as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(dst.add(2 * k), _mm512_permutex2var_epi64(los[k], idx0, his[k]));
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
+        }
+    }
+}
+
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
 /// `BLOCK_K = 8` block of i_inner positions, keeping all 8 F128 accumulators in
