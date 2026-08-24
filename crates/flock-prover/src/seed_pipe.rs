@@ -674,23 +674,44 @@ fn speculative_main(
     //
     // The warm-up prove takes the *same* block source the timed one will, so
     // whichever of the two witgen paths ships is the one that gets warmed.
+    //
+    // Four passes, not one: the residual first-touch faults this pass retires
+    // are not all retired by the first one, and the timed prove's fault count
+    // falls monotonically to a plateau at four. `FLOCK_NO_SPEC_WARMUP=1`
+    // restores the single pass. Same 300 s startup budget as the main-thread
+    // loop; `arm()` blocks on this whole block, so the wall-clock guard here
+    // is what keeps the ready file inside `STARTUP_TIMEOUT`.
     if inline || scratch.len() == 1usize << log2_size {
-        let t0 = std::time::Instant::now();
-        let warm_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let src = if inline {
-                BlockSource::closed(log2_size, WARMUP_SEED)
-            } else {
-                fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
-                BlockSource::Slice(&scratch)
-            };
-            let _ = std::hint::black_box(run(setup_addr, src));
-        }))
-        .is_ok();
-        if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
-            eprintln!(
-                "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed, inline={inline})",
-                t0.elapsed().as_secs_f64() * 1e3
-            );
+        const SPEC_WARMUP_PROVES: usize = 4;
+        const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+        // Read once, outside the loop.
+        let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
+            1
+        } else {
+            SPEC_WARMUP_PROVES
+        };
+        let warmup_started = std::time::Instant::now();
+        for _ in 0..spec_warmup_proves {
+            let t0 = std::time::Instant::now();
+            let warm_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let src = if inline {
+                    BlockSource::closed(log2_size, WARMUP_SEED)
+                } else {
+                    fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
+                    BlockSource::Slice(&scratch)
+                };
+                let _ = std::hint::black_box(run(setup_addr, src));
+            }))
+            .is_ok();
+            if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+                eprintln!(
+                    "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed, inline={inline})",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            if warmup_started.elapsed() >= SPEC_WARMUP_BUDGET {
+                break;
+            }
         }
     }
     {
