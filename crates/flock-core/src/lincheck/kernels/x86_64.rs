@@ -263,6 +263,21 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
     }
 }
 
+/// `FLOCK_NO_LC_MATS_VPERM=1` restores the scalar lane extract, two
+/// 64-byte transpose bounces, and per-group `swap_bytes`. Ranked env is
+/// cleared, so the VBMI leaf runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lc_mats_vperm_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_MATS_VPERM").is_none());
+    *ON
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
@@ -275,6 +290,12 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
 /// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
 /// group. Bit-identical to the bit-extract loop: see
 /// `fold_mats_from_basis_matches_sum_table`.
+///
+/// Default path keeps the two transpose ZMMs live through a VBMI
+/// reverse-within-8-byte-groups (`vpermb`) and stores sixteen qwords —
+/// same bytes as the scalar `from_le_bytes` + `swap_bytes` tail, no
+/// 128-byte bounce and no GPR extract. `FLOCK_NO_LC_MATS_VPERM=1`
+/// restores that tail.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -283,6 +304,16 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512vbmi"))]
+    if lc_mats_vperm_enabled() {
+        // SAFETY: cfg supplies avx512f+vbmi; `eq8` is eight F128s (128 B);
+        // `mats` is sixteen u64s (128 B).
+        unsafe {
+            fold_mats_from_basis_avx512(eq8, mats);
+        }
+        return;
+    }
 
     let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
     let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
@@ -300,6 +331,93 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
         let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
         mats[c] = u64::from_le_bytes(lo).swap_bytes();
         mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    }
+}
+
+/// Register-resident `fold_mats_from_basis`: deinterleave eight `F128`s into
+/// lo/hi ZMMs, the same 8×8 byte-then-bit transpose as
+/// [`crate::zerocheck::univariate_skip_optimized::kernels::x86_64::bit_transpose_64bytes_avx512`],
+/// then `vpermb` reverse-within-8-byte-groups (the affine `swap_bytes`).
+///
+/// # Safety
+/// Requires `avx512f` and `avx512vbmi`. `eq8.len() == 8`, `mats.len() == 16`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi")]
+unsafe fn fold_mats_from_basis_avx512(eq8: &[F128], mats: &mut [u64]) {
+    use core::arch::x86_64::*;
+    // Gather index = NEON IDX0 ++ IDX1 ++ IDX2 ++ IDX3 (the 8×8 byte transpose).
+    #[rustfmt::skip]
+    const IDX: [i8; 64] = [
+        0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+        2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+        4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+        6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+    ];
+    // Reverse bytes within each 8-byte group: `u64::from_le_bytes(g).swap_bytes()`.
+    #[rustfmt::skip]
+    const REV8: [u8; 64] = [
+        7, 6, 5, 4, 3, 2, 1, 0,
+        15, 14, 13, 12, 11, 10, 9, 8,
+        23, 22, 21, 20, 19, 18, 17, 16,
+        31, 30, 29, 28, 27, 26, 25, 24,
+        39, 38, 37, 36, 35, 34, 33, 32,
+        47, 46, 45, 44, 43, 42, 41, 40,
+        55, 54, 53, 52, 51, 50, 49, 48,
+        63, 62, 61, 60, 59, 58, 57, 56,
+    ];
+    // SAFETY: caller upholds length and target-feature contracts.
+    unsafe {
+        let a = _mm512_loadu_si512(eq8.as_ptr() as *const __m512i);
+        let b = _mm512_loadu_si512(eq8.as_ptr().add(4) as *const __m512i);
+        // F128 is `{lo, hi}`: even qwords are lo, odd qwords are hi.
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        let lo = _mm512_permutex2var_epi64(a, lo_idx, b);
+        let hi = _mm512_permutex2var_epi64(a, hi_idx, b);
+        let t_idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
+        let rev = _mm512_loadu_si512(REV8.as_ptr() as *const __m512i);
+        let lo = bit_transpose_then_swap_zmm(lo, t_idx, rev);
+        let hi = bit_transpose_then_swap_zmm(hi, t_idx, rev);
+        _mm512_storeu_si512(mats.as_mut_ptr() as *mut __m512i, lo);
+        _mm512_storeu_si512(mats.as_mut_ptr().add(8) as *mut __m512i, hi);
+    }
+}
+
+/// Same 8×8 byte permute + Hacker's Delight 8×8 bit transpose as
+/// `bit_transpose_64bytes_avx512`, then reverse each 8-byte group.
+///
+/// # Safety
+/// Caller enables `avx512f,avx512vbmi`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi")]
+unsafe fn bit_transpose_then_swap_zmm(
+    inp: core::arch::x86_64::__m512i,
+    t_idx: core::arch::x86_64::__m512i,
+    rev: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut y = _mm512_permutexvar_epi8(t_idx, inp);
+        let mask1 = _mm512_set1_epi64(0x00AA00AA00AA00AAu64 as i64);
+        let mask2 = _mm512_set1_epi64(0x0000CCCC0000CCCCu64 as i64);
+        let mask3 = _mm512_set1_epi64(0x00000000F0F0F0F0u64 as i64);
+        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<7>(y)), mask1);
+        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<7>(t)));
+        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<14>(y)), mask2);
+        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<14>(t)));
+        let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<28>(y)), mask3);
+        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<28>(t)));
+        _mm512_permutexvar_epi8(rev, y)
     }
 }
 
