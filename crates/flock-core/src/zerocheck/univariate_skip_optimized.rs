@@ -2665,6 +2665,16 @@ fn zc_r1ab_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_DIRECT=1` restores the 1 KiB copy into `chunk_ab_bytes`
+/// and the two-window T0 burst that was tuned for that copy. Default: the
+/// convert kernel loadu's packed `ab_inner` rows and the burst is not issued.
+/// Ranked env is cleared, so the direct path is ON.
+fn zc_r1ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_DIRECT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_R1AB_FIRST_WRITE=1` restores the per-band plane-bank clear
 /// and load/XOR first visit. The default arm is used only when every padding
 /// window is live, which proves that `w_idx == 0` overwrites each bank before
@@ -2736,8 +2746,13 @@ fn process_one_x_hi_ab_only(
     let n_lo = n_lo_and_inner - N_INNER;
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
     // inside the window loop).
+    let direct = zc_r1ab_direct_enabled();
+    // The two-window T0 burst was sized for the copy loop as the demand
+    // stream. On the direct path the convert kernel's 64-byte loadu of
+    // `ab_inner` is the demand stream; issuing the old burst is LFB spam
+    // in front of those loads (the 1d95aac miss). Kill-switch restores both.
     #[cfg(target_arch = "x86_64")]
-    let pf_windows = if zc_r1ab_pf_enabled() {
+    let pf_windows = if !direct && zc_r1ab_pf_enabled() {
         ZC_R1AB_PF_WINDOWS
     } else {
         0
@@ -2753,60 +2768,72 @@ fn process_one_x_hi_ab_only(
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
-        // window's copy loop will demand, and exactly as many of them (the
-        // padding skip drops the last chunk of every second window). Issued
-        // BEFORE this window's own copy, so the hint sits two whole windows
-        // of work ahead of the demand load it feeds; issued after the copy it
-        // reaches only ~1.5 windows back and measures ~0.7 ms worse.
-        // `wrapping_add` keeps the past-the-end address on the last windows
-        // of the last band well defined, and that hint is simply dropped.
-        // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
-        // padding skip leaves live.
-        #[cfg(target_arch = "x86_64")]
-        let (n_next, next_base) = if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            (
-                b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
-                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
-            )
+        let chunk_ab: &[[u8; 64]; 16];
+        if direct && chunk_byte_base + 16 * 64 <= ab_inner.len() {
+            // Sixteen packed 64-byte rows. The convert kernel indexes
+            // `0..n_b_med` only (`n_b_med` is 15 or 16 on ranked BLAKE3).
+            // SAFETY: the length check above covers 1024 bytes; `ab_inner`
+            // is not mutated for the rest of this window.
+            chunk_ab = unsafe {
+                &*(ab_inner.as_ptr().add(chunk_byte_base) as *const [[u8; 64]; 16])
+            };
         } else {
-            (0, 0)
-        };
-        // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
-        // possible, and the address is formed by `wrapping_add` on the base
-        // pointer.
-        #[cfg(target_arch = "x86_64")]
-        let pf_one = |b_med: usize| unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                ab_inner_ptr
-                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                    .cast::<i8>(),
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        };
-        #[cfg(target_arch = "x86_64")]
-        if !pf_spread {
-            for b_med in 0..n_next {
-                pf_one(b_med);
-            }
-        }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+            // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
+            // window's copy loop will demand, and exactly as many of them (the
+            // padding skip drops the last chunk of every second window). Issued
+            // BEFORE this window's own copy, so the hint sits two whole windows
+            // of work ahead of the demand load it feeds; issued after the copy it
+            // reaches only ~1.5 windows back and measures ~0.7 ms worse.
+            // `wrapping_add` keeps the past-the-end address on the last windows
+            // of the last band well defined, and that hint is simply dropped.
+            // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
+            // padding skip leaves live.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
+            let (n_next, next_base) = if pf_windows != 0 {
+                let x_next = x_outer_lo + pf_windows;
+                (
+                    b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
+                    ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
+                )
+            } else {
+                (0, 0)
+            };
+            // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
+            // possible, and the address is formed by `wrapping_add` on the base
+            // pointer.
+            #[cfg(target_arch = "x86_64")]
+            let pf_one = |b_med: usize| unsafe {
+                core::arch::x86_64::_mm_prefetch(
+                    ab_inner_ptr
+                        .wrapping_add(next_base + b_med * N_CHUNKS * 8)
+                        .cast::<i8>(),
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+            };
+            #[cfg(target_arch = "x86_64")]
+            if !pf_spread {
+                for b_med in 0..n_next {
+                    pf_one(b_med);
+                }
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
+            for b_med in 0..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             }
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread {
+                for b_med in n_b_med..n_next {
+                    pf_one(b_med);
+                }
+            }
+            chunk_ab = &state.chunk_ab_bytes;
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -2826,14 +2853,14 @@ fn process_one_x_hi_ab_only(
                 .expect("one plane bank per low index");
             if plane_first_write && w_idx == 0 {
                 kernels::write_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
+                    chunk_ab,
                     n_b_med,
                     mats_w,
                     bank,
                 );
             } else {
                 kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
+                    chunk_ab,
                     n_b_med,
                     mats_w,
                     bank,
@@ -2841,7 +2868,7 @@ fn process_one_x_hi_ab_only(
             }
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -2857,7 +2884,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
