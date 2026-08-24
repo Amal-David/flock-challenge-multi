@@ -172,6 +172,14 @@ const OP_BYTES: u8 = 0x05;
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
+/// `FLOCK_NO_ZERO_BIT_GRIND_FAST=1` restores the incumbent zero-bit path,
+/// including its unused transcript-state digest extraction.
+fn zero_bit_grind_fast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZERO_BIT_GRIND_FAST").is_none());
+    *ON
+}
+
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
 /// tracked via [`FsChallenger::absorbed_bytes`].
@@ -378,6 +386,14 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        if bits == 0 && zero_bit_grind_fast_enabled() {
+            // Zero-bit PoW has the canonical nonce 0. Preserve the incumbent
+            // transcript operation while skipping the unused cloned-state
+            // finalization performed only to prepare a search that never runs.
+            let nonce = 0u64;
+            self.observe_bytes(&nonce.to_le_bytes());
+            return nonce;
+        }
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
@@ -1380,6 +1396,8 @@ fn pow_scan(
 mod tests {
     use super::*;
 
+    static ZERO_BIT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Every FsChallenger property must hold under both transcript hashes:
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
@@ -1452,6 +1470,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The zero-bit shortcut must retain the incumbent nonce absorption and
+    /// next-challenge state under both transcript hashes.
+    #[test]
+    fn fs_challenger_zero_bit_fast_path_preserves_state() {
+        let _guard = ZERO_BIT_TEST_GUARD.lock().unwrap();
+        for kind in KINDS {
+            let mk = || {
+                let mut ch = FsChallenger::with_hash(b"zero-bit-fast", kind);
+                ch.observe_label(b"flock-zero-bit-fast");
+                ch.observe_bytes(b"root");
+                ch
+            };
+
+            let mut candidate = mk();
+            let mut incumbent = mk();
+            assert_eq!(candidate.grind_pow(0), 0);
+            let _unused_digest = incumbent.state_digest();
+            incumbent.observe_bytes(&0u64.to_le_bytes());
+            assert_eq!(candidate.n_absorbed, incumbent.n_absorbed);
+            assert_eq!(candidate.sample_f128_vec(4), incumbent.sample_f128_vec(4));
+        }
+    }
+
+    /// `state_digest` is counted as a squeeze. The default zero-bit route
+    /// deletes it; the kill switch restores exactly one extraction.
+    #[cfg(feature = "hash-count")]
+    #[test]
+    fn fs_challenger_zero_bit_fast_path_digest_count() {
+        let _guard = ZERO_BIT_TEST_GUARD.lock().unwrap();
+        fs_count::reset();
+        let mut ch = FsChallenger::new(b"zero-bit-count");
+        ch.observe_bytes(b"root");
+        assert_eq!(ch.grind_pow(0), 0);
+        let expected = u64::from(!zero_bit_grind_fast_enabled());
+        assert_eq!(fs_count::snapshot(), (expected, 0));
     }
 
     /// `new` must stay SHA-256: 300-odd call sites construct challengers that
