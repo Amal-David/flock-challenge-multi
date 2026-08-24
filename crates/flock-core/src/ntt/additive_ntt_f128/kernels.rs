@@ -520,6 +520,54 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     }
 }
 
+/// One 64-k seed task of [`butterfly_fused_2layer_row_from_sparse_dense_geo`].
+/// Twiddle broadcasts are hoisted out of the k-loop; each step's algebra,
+/// destinations, prefetch contract, and lane tails match the 64-call form.
+///
+/// # Safety
+/// Union of 64 consecutive hold-4 visits: message rows `r + k·sub_stride`
+/// (`k ∈ 0..64`) and staging rows `perm(k)` / `256+perm(k)` must be valid
+/// and non-aliasing. `num_ntts` is the SoA row length.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_rows_from_sparse_dense_geo_k64(
+    src: *const F128,
+    src_quarter: usize,
+    r: usize,
+    sub_stride: usize,
+    bufp: *mut F128,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    stage_perm: bool,
+    pf_dist: usize,
+    pf_spread: bool,
+    pf_lines: usize,
+) {
+    // SAFETY: forwarded caller contract; AVX-512 features are cfg-gated.
+    unsafe {
+        x86_64::butterfly_fused_2layer_rows_from_sparse_dense_geo_k64(
+            src,
+            src_quarter,
+            r,
+            sub_stride,
+            bufp,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            stage_perm,
+            pf_dist,
+            pf_spread,
+            pf_lines,
+        );
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only

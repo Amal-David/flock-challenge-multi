@@ -913,6 +913,214 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     }
 }
 
+/// One 64-k hold-4 seed task. The four twiddle broadcasts (and diet `x^64`
+/// companions) are materialised once; each k-step is the hold-4 leaf on a
+/// distinct source row-group. Live set is still one k-step (~15 ZMMs).
+///
+/// `dst` layout matches the seed-top caller: sparse rows at `perm(k)` and
+/// dense rows at `256 + perm(k)`, with `dst_quarter = 64`. Prefetch contract
+/// matches the 64-call form: spread delivers one line per lane step of the
+/// k+dist visit; burst issues `pf_lines` T0s on the four message rows.
+///
+/// # Safety
+/// Same geometry as 64 calls of
+/// [`butterfly_fused_2layer_row_from_sparse_dense_geo`] for
+/// `src_r = r + k·sub_stride`, `k ∈ 0..64`. Destinations must not alias
+/// `src` or each other.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_rows_from_sparse_dense_geo_k64(
+    src: *const F128,
+    src_quarter: usize,
+    r: usize,
+    sub_stride: usize,
+    bufp: *mut F128,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    stage_perm: bool,
+    pf_dist: usize,
+    pf_spread: bool,
+    pf_lines: usize,
+) {
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_rows_from_sparse_dense_geo_k64_impl::<false>(
+                src,
+                src_quarter,
+                r,
+                sub_stride,
+                bufp,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                stage_perm,
+                pf_dist,
+                pf_spread,
+                pf_lines,
+            )
+        } else {
+            butterfly_fused_2layer_rows_from_sparse_dense_geo_k64_impl::<true>(
+                src,
+                src_quarter,
+                r,
+                sub_stride,
+                bufp,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                stage_perm,
+                pf_dist,
+                pf_spread,
+                pf_lines,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_rows_from_sparse_dense_geo_k64`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_rows_from_sparse_dense_geo_k64_impl<const DIET: bool>(
+    src: *const F128,
+    src_quarter: usize,
+    r: usize,
+    sub_stride: usize,
+    bufp: *mut F128,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    stage_perm: bool,
+    pf_dist: usize,
+    pf_spread: bool,
+    pf_lines: usize,
+) {
+    use core::arch::x86_64::*;
+    let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
+    // SAFETY: caller carries the required target features. Twiddle broadcasts
+    // are identical for every k of this task (pass-level seed_right / seed_dense).
+    unsafe {
+        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
+        let outer = tw_x4::<false, DIET>(t_outer);
+        let inner_a = tw_x4::<false, DIET>(t_inner_a);
+        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        const DST_QUARTER: usize = 64;
+        const K_STEPS: usize = 64;
+        let src_row = |i: usize, src_r: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let sp_row = |i: usize, kp: usize| bufp.add((kp + i * DST_QUARTER) * num_ntts);
+        let dn_row = |i: usize, kp: usize| bufp.add((256 + kp + i * DST_QUARTER) * num_ntts);
+        let lanes = num_ntts & !3;
+        for k in 0..K_STEPS {
+            let src_r = r + k * sub_stride;
+            let kp = if stage_perm {
+                (k & 3) * 16 + (k >> 2)
+            } else {
+                k
+            };
+            let mut pf_src: *const F128 = core::ptr::null();
+            if pf_dist != 0 && k + pf_dist < K_STEPS {
+                if pf_spread {
+                    pf_src = src.add((src_r + pf_dist * sub_stride) * num_ntts);
+                } else {
+                    let row = src_r + pf_dist * sub_stride;
+                    for i in 0..4 {
+                        let p = src.add((i * src_quarter + row) * num_ntts) as *const i8;
+                        for l in 0..pf_lines {
+                            _mm_prefetch::<_MM_HINT_T0>(p.add(l * 64));
+                        }
+                    }
+                }
+            }
+            let pf = !pf_src.is_null();
+            let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
+            let mut lane = 0;
+            while lane < lanes {
+                if pf {
+                    let off = lane * core::mem::size_of::<F128>();
+                    for i in 0..4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                    }
+                }
+                let va = _mm512_loadu_si512(src_row(0, src_r).add(lane) as *const __m512i);
+                let vb = _mm512_loadu_si512(src_row(1, src_r).add(lane) as *const __m512i);
+                let vc = _mm512_loadu_si512(src_row(2, src_r).add(lane) as *const __m512i);
+                let vd = _mm512_loadu_si512(src_row(3, src_r).add(lane) as *const __m512i);
+
+                let mut sb = vb;
+                let mut sc = _mm512_xor_si512(vc, va);
+                let mut sd = _mm512_xor_si512(vd, vb);
+                sb = _mm512_xor_si512(sb, va);
+                let new_c = _mm512_xor_si512(sc, mul_x4::<false, DIET>(sparse_b, sd));
+                sd = _mm512_xor_si512(sd, new_c);
+                sc = new_c;
+                _mm512_storeu_si512(sp_row(0, kp).add(lane) as *mut __m512i, va);
+                _mm512_storeu_si512(sp_row(1, kp).add(lane) as *mut __m512i, sb);
+                _mm512_storeu_si512(sp_row(2, kp).add(lane) as *mut __m512i, sc);
+                _mm512_storeu_si512(sp_row(3, kp).add(lane) as *mut __m512i, sd);
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
+                let vc = _mm512_xor_si512(vc, new_a);
+                let va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
+                let vd = _mm512_xor_si512(vd, new_b);
+                let vb = new_b;
+                let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
+                let vb = _mm512_xor_si512(vb, new_a);
+                let va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
+                let vd = _mm512_xor_si512(vd, new_c);
+                let vc = new_c;
+                _mm512_storeu_si512(dn_row(0, kp).add(lane) as *mut __m512i, va);
+                _mm512_storeu_si512(dn_row(1, kp).add(lane) as *mut __m512i, vb);
+                _mm512_storeu_si512(dn_row(2, kp).add(lane) as *mut __m512i, vc);
+                _mm512_storeu_si512(dn_row(3, kp).add(lane) as *mut __m512i, vd);
+                lane += 4;
+            }
+            while lane < num_ntts {
+                let a = *src_row(0, src_r).add(lane);
+                let b = *src_row(1, src_r).add(lane);
+                let c = *src_row(2, src_r).add(lane);
+                let d = *src_row(3, src_r).add(lane);
+                let mut sb = b;
+                let mut sc = c + a;
+                let mut sd = d + b;
+                sb += a;
+                let new_c = sc + sd * right_twiddle;
+                sd += new_c;
+                sc = new_c;
+                *sp_row(0, kp).add(lane) = a;
+                *sp_row(1, kp).add(lane) = sb;
+                *sp_row(2, kp).add(lane) = sc;
+                *sp_row(3, kp).add(lane) = sd;
+                let mut va = a;
+                let mut vb = b;
+                let mut vc = c;
+                let mut vd = d;
+                let new_a = va + vc * t_outer;
+                vc += new_a;
+                va = new_a;
+                let new_b = vb + vd * t_outer;
+                vd += new_b;
+                vb = new_b;
+                let new_a = va + vb * t_inner_a;
+                vb += new_a;
+                va = new_a;
+                let new_c = vc + vd * t_inner_b;
+                vd += new_c;
+                vc = new_c;
+                *dn_row(0, kp).add(lane) = va;
+                *dn_row(1, kp).add(lane) = vb;
+                *dn_row(2, kp).add(lane) = vc;
+                *dn_row(3, kp).add(lane) = vd;
+                lane += 1;
+            }
+        }
+    }
+}
+
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -1938,6 +2146,120 @@ mod diet_tests {
                 buf
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
+        }
+    }
+
+    /// The 64-k hoisted-twiddle leaf must match 64 single-k hold-4 visits,
+    /// diet on and off, permuted and natural staging.
+    #[test]
+    fn hold4_k64_matches_sixty_four_calls() {
+        // SAFETY: this module is compiled under avx512f+vpclmulqdq.
+        unsafe { hold4_k64_matches_sixty_four_calls_avx512() }
+    }
+
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    unsafe fn hold4_k64_matches_sixty_four_calls_avx512() {
+        let mut st = 0xC0FF_EE00_11D4_4B64u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            F128 { lo: st, hi: st.wrapping_mul(0x9E37_79B9_7F4A_7C15) }
+        };
+        const NN: usize = 8;
+        const SQ: usize = 8;
+        const SUB: usize = 1;
+        const R: usize = 0;
+        let src_len = (3 * SQ + R + 63 * SUB + 1) * NN;
+        let src: Vec<F128> = (0..src_len).map(|_| next()).collect();
+        let right = next();
+        let dense = [next(), next(), next()];
+        for stage_perm in [false, true] {
+            let run_calls = |diet: bool| {
+                let mut buf = vec![F128::ZERO; 512 * NN];
+                unsafe {
+                    for k in 0..64 {
+                        let src_r = R + k * SUB;
+                        let kp = if stage_perm {
+                            (k & 3) * 16 + (k >> 2)
+                        } else {
+                            k
+                        };
+                        if diet {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true>(
+                                src.as_ptr(),
+                                SQ,
+                                src_r,
+                                buf.as_mut_ptr().add(kp * NN),
+                                buf.as_mut_ptr().add((256 + kp) * NN),
+                                64,
+                                NN,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            );
+                        } else {
+                            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false>(
+                                src.as_ptr(),
+                                SQ,
+                                src_r,
+                                buf.as_mut_ptr().add(kp * NN),
+                                buf.as_mut_ptr().add((256 + kp) * NN),
+                                64,
+                                NN,
+                                right,
+                                &dense,
+                                core::ptr::null(),
+                            );
+                        }
+                    }
+                }
+                buf
+            };
+            let run_k64 = |diet: bool| {
+                let mut buf = vec![F128::ZERO; 512 * NN];
+                unsafe {
+                    if diet {
+                        butterfly_fused_2layer_rows_from_sparse_dense_geo_k64_impl::<true>(
+                            src.as_ptr(),
+                            SQ,
+                            R,
+                            SUB,
+                            buf.as_mut_ptr(),
+                            NN,
+                            right,
+                            &dense,
+                            stage_perm,
+                            0,
+                            false,
+                            0,
+                        );
+                    } else {
+                        butterfly_fused_2layer_rows_from_sparse_dense_geo_k64_impl::<false>(
+                            src.as_ptr(),
+                            SQ,
+                            R,
+                            SUB,
+                            buf.as_mut_ptr(),
+                            NN,
+                            right,
+                            &dense,
+                            stage_perm,
+                            0,
+                            false,
+                            0,
+                        );
+                    }
+                }
+                buf
+            };
+            let a = run_calls(true);
+            let b = run_k64(true);
+            assert_eq!(a, b, "k64 vs 64-call diet perm={stage_perm}");
+            let c = run_calls(false);
+            let d = run_k64(false);
+            assert_eq!(c, d, "k64 vs 64-call full perm={stage_perm}");
+            assert_eq!(b, d, "k64 diet vs full perm={stage_perm}");
         }
     }
 }

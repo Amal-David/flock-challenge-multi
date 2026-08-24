@@ -280,6 +280,22 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_HOLD4_K64=1` restores the 64 per-k outlined hold-4
+/// calls in the same binary. Default ON: one outlined 64-k leaf, with the
+/// four twiddle broadcasts (and their diet `x^64` companions) hoisted out
+/// of the k-loop. Algebra, destinations, prefetch contract, and lane tails
+/// match the 64-call form. Live set is still one k-step.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_seed_hold4_k64_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4_K64").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -1950,6 +1966,44 @@ impl AdditiveNttF128 {
                         );
                     }
                 }
+                // One outlined 64-k hold-4 leaf hoists the four twiddle
+                // broadcasts out of the k-loop. Kill switch
+                // `FLOCK_NO_NTT_SEED_HOLD4_K64` restores the 64 calls.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                let seed_k64 =
+                    !ntt_seed_hold4_disabled() && !ntt_seed_hold4_k64_disabled();
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )))]
+                let seed_k64 = false;
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if seed_k64 {
+                    kernels::butterfly_fused_2layer_rows_from_sparse_dense_geo_k64(
+                        src,
+                        block_size,
+                        r,
+                        sub_stride,
+                        bufp,
+                        row_len,
+                        seed_right,
+                        &seed_dense,
+                        stage_perm,
+                        pf_dist,
+                        pf_spread,
+                        pf_lines,
+                    );
+                }
+                if !seed_k64 {
                 for k in 0..64 {
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
@@ -2073,6 +2127,7 @@ impl AdditiveNttF128 {
                             &seed_dense,
                         );
                     }
+                }
                 }
                 #[cfg(all(
                     target_arch = "x86_64",
