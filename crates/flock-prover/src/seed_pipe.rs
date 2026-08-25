@@ -552,6 +552,10 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     std::fs::rename(temporary, path)
 }
 
+fn retain_adoption_state(direct_publish: bool, disable_elision: Option<&std::ffi::OsStr>) -> bool {
+    !direct_publish || disable_elision.is_some_and(|value| value == "1")
+}
+
 // ---------------------------------------------------------------------------
 // Arming
 // ---------------------------------------------------------------------------
@@ -713,6 +717,15 @@ fn speculative_main(
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
+    // Decide before blocking on stdin, outside the scored interval. When the
+    // direct publisher owns success, main never receives the seed and cannot
+    // consume speculative block state; every failure marks the adoption state
+    // dead before forwarding. Keep the incumbent publication only for the
+    // adoption route or the diagnostic kill switch.
+    let retain_blocks = retain_adoption_state(
+        direct_proof_path.is_some(),
+        std::env::var_os("FLOCK_NO_DIRECT_ENDPOINT_ELIDE").as_deref(),
+    );
 
     // Untimed: prove once on THIS thread before touching stdin, so that the
     // speculative (timed) prove does not run on a cold thread. The prover's
@@ -810,7 +823,7 @@ fn speculative_main(
                 first: gen_block(init, 0),
                 last: gen_block(init, n - 1),
             };
-            {
+            if retain_blocks {
                 let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
                 state.seed_at = Some(seed_at);
                 state.blocks_at = Some(std::time::Instant::now());
@@ -829,7 +842,7 @@ fn speculative_main(
             // still exactly correct, just slower.
             Arc::new(generate_compressions_par(log2_size, seed))
         };
-        {
+        if retain_blocks {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.seed_at = Some(seed_at);
             state.blocks_at = Some(std::time::Instant::now());
@@ -1093,6 +1106,16 @@ mod tests {
         assert!(inline_block_gen_decision(true, Some(OsStr::new(""))));
         // The shipped default: cleared environment + verified generator.
         assert!(inline_block_gen_decision(true, None));
+    }
+
+    #[test]
+    fn seed_pipe_direct_state_elision_preserves_fallbacks() {
+        use std::ffi::OsStr;
+        assert!(!retain_adoption_state(true, None));
+        assert!(retain_adoption_state(false, None));
+        assert!(retain_adoption_state(true, Some(OsStr::new("1"))));
+        assert!(!retain_adoption_state(true, Some(OsStr::new("0"))));
+        assert!(retain_adoption_state(false, Some(OsStr::new("0"))));
     }
 
     /// Endpoint gate and full gate must accept and reject the same inputs, and
