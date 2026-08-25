@@ -3192,7 +3192,14 @@ impl Blake3Setup {
             // makes the realised count come from the guard rather than from
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
+            // None. The protected wrapper already performs one full untimed
+            // prove of its own before it publishes the ready file, and the
+            // speculative thread performs another on the thread that runs the
+            // timed prove. This loop's passes are the ones on top of those two,
+            // and they are the ones the low-variance metric ranks below the
+            // source without them. Zero here leaves both of the structural
+            // warm-up proves in place and removes only the surplus.
+            const EXTRA_WARMUP_PROVES: usize = 0;
             const EXTRA_WARMUP_BUDGET: std::time::Duration =
                 std::time::Duration::from_secs(45);
             let warmup_started = std::time::Instant::now();
