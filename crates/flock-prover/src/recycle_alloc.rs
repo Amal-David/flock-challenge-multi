@@ -86,22 +86,44 @@ fn align64_enabled() -> bool {
 /// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
 /// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
 /// never collide with the freelist link word at `aligned + 0`.
+///
+/// Blocks of 2 MiB and up get the same treatment at transparent-huge-page
+/// granularity instead. Ubuntu ships THP in `madvise` mode and the prover
+/// advises its multi-MB buffers, but the kernel can only back a 2 MiB-aligned
+/// region with a huge page: a buffer that starts at an arbitrary offset loses
+/// its head and its tail to 4 KiB pages, and -- because the recycler hands the
+/// same blocks back for the life of the process -- loses them on every prove.
 const ALIGN_SLACK: usize = 64;
+const HUGE: usize = 2 << 20;
+
+/// Alignment this allocator gives a block of this size.
+#[inline]
+const fn align_for(size: usize) -> usize {
+    if size >= HUGE { HUGE } else { 64 }
+}
+
+/// Over-allocation that guarantees [`align_for`]. A pure function of the
+/// requested size, so `dealloc` reconstructs the layout `alloc` handed out.
+#[inline]
+const fn slack_for(size: usize) -> usize {
+    if size >= HUGE { HUGE } else { ALIGN_SLACK }
+}
 
 #[inline]
 fn adjusted(layout: &Layout) -> Layout {
     // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
     // caller could have constructed, and 16 is a power of two.
-    Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
+    Layout::from_size_align(layout.size() + slack_for(layout.size()), MAX_ALIGN).unwrap()
 }
 
 #[inline]
-unsafe fn align_up(base: *mut u8) -> *mut u8 {
+unsafe fn align_up(base: *mut u8, size: usize) -> *mut u8 {
     if base.is_null() {
         return base;
     }
-    let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
+    let a = align_for(size);
+    let aligned = ((base as usize + 8 + a - 1) & !(a - 1)) as *mut u8;
+    // SAFETY: aligned - base is in [8, align_for(size)] ⊆ the slack the caller
     // over-allocated, and aligned - 8 >= base.
     unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
     aligned
@@ -112,7 +134,7 @@ unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
     // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
     // intact (freelist links live at ptr + 0 and never touch it).
     let off = unsafe { *(ptr.sub(8) as *const usize) };
-    debug_assert!((8..=ALIGN_SLACK).contains(&off));
+    debug_assert!((8..=HUGE).contains(&off));
     unsafe { ptr.sub(off) }
 }
 
@@ -158,7 +180,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                return unsafe { align_up(System.alloc(adjusted(&layout)), layout.size()) };
             }
         }
         unsafe { System.alloc(layout) }
@@ -175,7 +197,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout)), layout.size()) };
             }
         }
         unsafe { System.alloc_zeroed(layout) }
@@ -206,6 +228,25 @@ mod tests {
     /// freelist, and grown through realloc — returns a 64-aligned pointer
     /// with intact contents. (The switch-off arm can't be covered in the
     /// same process: the latch resolves once.)
+    #[test]
+    fn huge_class_is_2mib_aligned_and_roundtrips() {
+        for i in 0..4usize {
+            let n = (2 << 20) + 4096 * i + 128;
+            let v = vec![7u8; n];
+            assert_eq!(v.as_ptr() as usize % (2 << 20), 0, "fresh huge alloc n={n}");
+            drop(v);
+            let v2 = vec![9u8; n];
+            assert_eq!(v2.as_ptr() as usize % (2 << 20), 0, "recycled huge alloc n={n}");
+            assert!(v2.iter().all(|&b| b == 9), "contents survive recycle n={n}");
+            drop(v2);
+        }
+        // A block just under the threshold keeps the 64-byte class.
+        let n = (2 << 20) - 64;
+        let v = vec![3u8; n];
+        assert_eq!(v.as_ptr() as usize % 64, 0);
+        drop(v);
+    }
+
     #[test]
     fn recyclable_class_is_64_aligned_and_roundtrips() {
         for i in 0..4usize {
