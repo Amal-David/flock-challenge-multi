@@ -77,6 +77,52 @@ fn align64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ALIGN64").is_none())
 }
 
+/// RecycleAlloc hugepage *hint only* (no MADV_COLLAPSE).
+///
+/// 8355ee5 shipped HUGEPAGE+COLLAPSE on fresh System.alloc and rejected
+/// -0.98% vs crown (1,461,997) — inside same-tree noise, not a promotion.
+/// Collapse is the synchronous page-table walk; this follow-up keeps the
+/// MADV_HUGEPAGE mark (Ubuntu 24.04 is madvise-mode THP) so khugepaged can
+/// still collapse off the clock, and drops COLLAPSE so we never walk PTEs
+/// on a first-alloc that leaked into a timed trial.
+/// Freelist pops are not advised. `FLOCK_NO_RECYCLE_HUGEPAGES=1` disables.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn advise_fresh(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if ptr.is_null() || bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("FLOCK_NO_RECYCLE_HUGEPAGES").is_some()) {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = (ptr as usize).saturating_add(bytes);
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_HUGEPAGE: usize = 14;
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_HUGEPAGE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn advise_fresh(_ptr: *mut u8, _bytes: usize) {}
+
 /// Every large prover buffer historically landed `16 mod 64` (glibc mmap
 /// chunk header), which the hot kernels pay for three ways: every wide
 /// load/store on these buffers is a cache-line split, non-temporal 64-byte
@@ -158,10 +204,14 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                let p = unsafe { align_up(System.alloc(adjusted(&layout))) };
+                advise_fresh(p, layout.size());
+                return p;
             }
         }
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        advise_fresh(p, layout.size());
+        p
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -175,10 +225,14 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                let p = unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                advise_fresh(p, layout.size());
+                return p;
             }
         }
-        unsafe { System.alloc_zeroed(layout) }
+        let p = unsafe { System.alloc_zeroed(layout) };
+        advise_fresh(p, layout.size());
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
