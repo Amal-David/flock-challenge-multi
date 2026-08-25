@@ -6435,9 +6435,42 @@ impl SumcheckProver {
         &self.f
     }
 
+    /// Consume the final witness buffer without cloning when it is owned.
+    /// Arena-backed fallback geometries must copy because the arena, rather
+    /// than this view, owns their allocation and is released with the prover.
+    fn take_final_f(&mut self) -> Vec<F128> {
+        match std::mem::take(&mut self.f) {
+            FoldBuf::Owned(values) => values,
+            FoldBuf::Arena { ptr, len } => {
+                // SAFETY: the region remains owned by `self.fold_arena`, which
+                // is still live for this entire copy; `ptr,len` are the exact
+                // bounds established by `FoldArena::carve_pair`.
+                unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) }.to_vec()
+            }
+        }
+    }
+
     pub fn transcript(&self) -> &[SumcheckMessage] {
         &self.transcript
     }
+
+    /// Move the completed transcript into the proof instead of cloning it.
+    fn take_transcript(&mut self) -> Vec<SumcheckMessage> {
+        std::mem::take(&mut self.transcript)
+    }
+}
+
+#[inline]
+fn final_state_move_selected(disabled: bool) -> bool {
+    !disabled
+}
+
+#[inline]
+fn final_state_move_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        final_state_move_selected(std::env::var_os("FLOCK_NO_LIG_FINAL_STATE_MOVE").is_some())
+    });
+    *ON
 }
 
 // ===================================================================
@@ -7396,7 +7429,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         if i == r - 1 {
-            let yr = sc_prover.f().to_vec();
+            let yr = if final_state_move_enabled() {
+                sc_prover.take_final_f()
+            } else {
+                sc_prover.f().to_vec()
+            };
             for v in &yr {
                 challenger.observe_f128(*v);
             }
@@ -7462,6 +7499,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
+            let sumcheck_transcript = if final_state_move_enabled() {
+                sc_prover.take_transcript()
+            } else {
+                sc_prover.transcript().to_vec()
+            };
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -7472,7 +7514,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: sc_prover.transcript().to_vec(),
+                sumcheck_transcript,
                 grinding_nonces,
                 ood_values,
                 fold_grinding_nonces,
@@ -9191,6 +9233,60 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_state_move_preserves_owned_allocations_and_arena_fallback_bytes() {
+        assert!(final_state_move_selected(false));
+        assert!(!final_state_move_selected(true));
+
+        let f: Vec<F128> = (0..8)
+            .map(|i| F128::new(i as u64 + 1, !(i as u64)))
+            .collect();
+        let basis: Vec<F128> = (0..8)
+            .map(|i| F128::new(3 * i as u64 + 7, 5 * i as u64 + 11))
+            .collect();
+        let expected_f = f.clone();
+        let (mut owned, _) = SumcheckProver::new(f, basis, F128::new(13, 17));
+        let expected_transcript = owned.transcript().to_vec();
+        let f_ptr = owned.f().as_ptr();
+        let transcript_ptr = owned.transcript().as_ptr();
+
+        let moved_f = owned.take_final_f();
+        let moved_transcript = owned.take_transcript();
+        assert_eq!(moved_f, expected_f);
+        assert_eq!(moved_transcript, expected_transcript);
+        assert_eq!(moved_f.as_ptr(), f_ptr, "owned f unexpectedly copied");
+        assert_eq!(
+            moved_transcript.as_ptr(),
+            transcript_ptr,
+            "owned transcript unexpectedly copied"
+        );
+        assert!(owned.f().is_empty());
+        assert!(owned.transcript().is_empty());
+
+        // Exercise the lifetime-sensitive fallback independently: an arena
+        // view must be copied before its backing storage can be poisoned or
+        // released with the prover.
+        let mut arena_backing = expected_f.clone();
+        let arena_ptr = std::ptr::NonNull::new(arena_backing.as_mut_ptr()).unwrap();
+        let mut arena_backed = SumcheckProver {
+            f: FoldBuf::Arena {
+                ptr: arena_ptr,
+                len: arena_backing.len(),
+            },
+            combined_basis: FoldBuf::Owned(Vec::new()),
+            fold_arena: None,
+            t_r: F128::ZERO,
+            transcript: expected_transcript.clone(),
+            pending_glue: None,
+            pending_ood_eq: None,
+        };
+        let copied_f = arena_backed.take_final_f();
+        assert_eq!(copied_f, expected_f);
+        assert_ne!(copied_f.as_ptr(), arena_ptr.as_ptr());
+        arena_backing.fill(F128::ZERO);
+        assert_eq!(copied_f, expected_f, "arena fallback aliased poisoned storage");
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
