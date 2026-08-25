@@ -73,6 +73,7 @@
 //!   speculative run (two concurrent proofs would race for the process-global
 //!   scratch pools).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -542,14 +543,37 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
-fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
-    let (proof, commitment, _) = out;
-    let bundle = R1csProofBundleLigerito { commitment, proof };
+struct PreparedProofFile {
+    final_path: PathBuf,
+    temporary_path: PathBuf,
+    file: std::fs::File,
+}
+
+fn prepare_direct_proof(path: PathBuf) -> std::io::Result<PreparedProofFile> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
-    std::fs::rename(temporary, path)
+    let temporary_path = PathBuf::from(temporary);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary_path)?;
+    Ok(PreparedProofFile {
+        final_path: path,
+        temporary_path,
+        file,
+    })
+}
+
+fn publish_direct_proof(prepared: &mut PreparedProofFile, out: ProveOut) -> std::io::Result<()> {
+    let (proof, commitment, _) = out;
+    let bundle = R1csProofBundleLigerito { commitment, proof };
+    publish_prepared_bytes(prepared, &bundle.to_bytes())
+}
+
+fn publish_prepared_bytes(prepared: &mut PreparedProofFile, bytes: &[u8]) -> std::io::Result<()> {
+    prepared.file.write_all(bytes)?;
+    std::fs::rename(&prepared.temporary_path, &prepared.final_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -614,8 +638,15 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     } else {
         prefaulted_blocks(1usize << log2_size)
     };
-    let direct_proof_path =
-        (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none()).then_some(proof_path);
+    // Opening and truncating the temporary file can require pathname lookup,
+    // inode allocation, and descriptor setup. Do it during the untimed arm so
+    // the scored publish tail contains only serialization, writes, and rename.
+    // Any preparation failure keeps the existing adoption fallback intact.
+    let prepared_proof = (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none())
+        .then(|| prepare_direct_proof(proof_path))
+        .transpose()
+        .ok()
+        .flatten();
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -662,7 +693,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
                 run,
                 scratch,
                 inline,
-                direct_proof_path,
+                prepared_proof,
                 warm_tx,
             )
         });
@@ -709,10 +740,11 @@ fn speculative_main(
     run: fn(usize, BlockSource<'_>) -> ProveOut,
     scratch: Vec<Compression>,
     inline: bool,
-    direct_proof_path: Option<PathBuf>,
+    prepared_proof: Option<PreparedProofFile>,
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
+    let mut prepared_proof = prepared_proof;
 
     // Untimed: prove once on THIS thread before touching stdin, so that the
     // speculative (timed) prove does not run on a cold thread. The prover's
@@ -792,7 +824,7 @@ fn speculative_main(
     // The adoption fallback must receive the seed immediately. Direct
     // publication deliberately keeps main blocked so its redundant serial
     // generator consumes no timed-window CPU or memory bandwidth.
-    if direct_proof_path.is_none() && !forward_and_close(writer, &line) {
+    if prepared_proof.is_none() && !forward_and_close(writer, &line) {
         mark_dead();
         return;
     }
@@ -839,10 +871,10 @@ fn speculative_main(
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
 
-    match (direct_proof_path.as_deref(), outcome) {
-        (Some(path), Ok(out)) => {
+    match (prepared_proof.as_mut(), outcome) {
+        (Some(prepared), Ok(out)) => {
             let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_direct_proof(path, out)
+                publish_direct_proof(prepared, out)
             }))
             .is_ok_and(|result| result.is_ok());
             if published {
@@ -1181,5 +1213,29 @@ mod tests {
             close(fds[0]);
             close(fds[1]);
         }
+    }
+
+    #[test]
+    fn seed_pipe_prepared_proof_truncates_and_publishes_atomically() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "flock-prepared-proof-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+
+        std::fs::write(&temporary, b"stale proof bytes").expect("seed stale temporary file");
+        let mut prepared = prepare_direct_proof(path.clone()).expect("prepare proof file");
+        assert_eq!(prepared.file.metadata().expect("metadata").len(), 0);
+        publish_prepared_bytes(&mut prepared, b"new proof").expect("publish prepared proof");
+        assert_eq!(std::fs::read(&path).expect("read published proof"), b"new proof");
+        assert!(!temporary.exists());
+
+        std::fs::remove_file(path).expect("remove test proof");
     }
 }
