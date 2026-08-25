@@ -409,6 +409,41 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// Set once the untimed warm-up proved that [`generate_compressions_par`]
 /// reproduces the protected generator at the ranked size on this build.
 static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
+/// True only while the seed-pipe thread executes the one measured proof that
+/// it will publish directly. Warm-up proves and every ordinary caller leave
+/// this false, so their working sets continue to return to the process pools.
+static DIRECT_CLEANUP_ELIDE: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+pub(crate) fn direct_cleanup_elide_active() -> bool {
+    DIRECT_CLEANUP_ELIDE.load(Ordering::Relaxed)
+}
+
+struct DirectCleanupElideGuard {
+    active: bool,
+}
+
+impl DirectCleanupElideGuard {
+    fn new(active: bool) -> Self {
+        if active {
+            debug_assert!(!DIRECT_CLEANUP_ELIDE.swap(true, Ordering::Relaxed));
+        }
+        Self { active }
+    }
+}
+
+impl Drop for DirectCleanupElideGuard {
+    fn drop(&mut self) {
+        if self.active {
+            DIRECT_CLEANUP_ELIDE.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_direct_cleanup_elide_scope() -> impl Drop {
+    DirectCleanupElideGuard::new(true)
+}
 
 /// May the speculative run read its blocks straight from the closed form
 /// instead of materializing them?
@@ -616,6 +651,10 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     };
     let direct_proof_path =
         (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none()).then_some(proof_path);
+    // Read during untimed arm. The ranked harness clears the environment, so
+    // the measured direct prove elides terminal pool returns by default.
+    let direct_cleanup_elide = direct_proof_path.is_some()
+        && std::env::var_os("FLOCK_NO_DIRECT_CLEANUP_ELIDE").is_none();
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -663,6 +702,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
                 scratch,
                 inline,
                 direct_proof_path,
+                direct_cleanup_elide,
                 warm_tx,
             )
         });
@@ -710,6 +750,7 @@ fn speculative_main(
     scratch: Vec<Compression>,
     inline: bool,
     direct_proof_path: Option<PathBuf>,
+    direct_cleanup_elide: bool,
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
@@ -798,6 +839,10 @@ fn speculative_main(
     }
 
     let seed_at = std::time::Instant::now();
+    // The scope begins only after all untimed warm-up proves and ends even if
+    // the measured prove panics. The prover reads this once at its terminal
+    // ownership boundary.
+    let cleanup_scope = DirectCleanupElideGuard::new(direct_cleanup_elide);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Inline path: nothing is materialized except the two blocks the O(1)
         // adoption gate reads. Everything else is evaluated inside witgen from
@@ -838,6 +883,7 @@ fn speculative_main(
         }
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
+    drop(cleanup_scope);
 
     match (direct_proof_path.as_deref(), outcome) {
         (Some(path), Ok(out)) => {

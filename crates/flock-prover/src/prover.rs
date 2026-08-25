@@ -564,11 +564,24 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     };
     let claim = R1csClaim { ab, c };
     flock_core::gaptime::mark("proof assembled");
-    drop(s_hat_v_ab);
-    drop(s_hat_v_c);
-    flock_core::gaptime::mark("s_hat_v dropped");
-    drop(prover_data);
-    flock_core::gaptime::mark("prover_data dropped");
+    if crate::seed_pipe::direct_cleanup_elide_active() {
+        // A successful direct publication is the terminal action of this
+        // one-shot worker. The harness reclaims the process immediately after
+        // the atomic proof rename, so returning its last working set through
+        // three process-global pools cannot serve another prove. Keep the
+        // allocations owned until process teardown instead of paying those
+        // pool locks on the proof-to-file critical path.
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+        flock_core::gaptime::mark("terminal working set retained");
+    } else {
+        drop(s_hat_v_ab);
+        drop(s_hat_v_c);
+        flock_core::gaptime::mark("s_hat_v dropped");
+        drop(prover_data);
+        flock_core::gaptime::mark("prover_data dropped");
+    }
     (proof, commitment, claim)
 }
 

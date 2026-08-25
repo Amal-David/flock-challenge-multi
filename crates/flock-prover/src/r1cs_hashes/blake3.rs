@@ -4649,6 +4649,48 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
+    /// The one-shot direct publisher may retain its terminal working set for
+    /// process teardown. That ownership shortcut must leave proof bytes,
+    /// commitment, claim, and verifier behavior identical to ordinary pool
+    /// returns.
+    #[test]
+    #[ignore]
+    fn prove_fast_ligerito_direct_cleanup_elide_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0xd1ec_7c1e_a0);
+        let blocks: Vec<Compression> = (0..256)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, 0u64, 64u32, 11u32)
+            })
+            .collect();
+
+        let mut ch_regular = FsChallenger::new(b"flock-direct-cleanup-v0");
+        let (proof_regular, commitment_regular, claim_regular) =
+            setup.prove_fast(&blocks, &mut ch_regular);
+
+        let cleanup_scope = crate::seed_pipe::test_direct_cleanup_elide_scope();
+        let mut ch_terminal = FsChallenger::new(b"flock-direct-cleanup-v0");
+        let (proof_terminal, commitment_terminal, claim_terminal) =
+            setup.prove_fast(&blocks, &mut ch_terminal);
+        drop(cleanup_scope);
+
+        assert_eq!(commitment_regular.root, commitment_terminal.root);
+        assert_eq!(claim_regular, claim_terminal);
+        assert_eq!(
+            bincode::serialize(&proof_regular).unwrap(),
+            bincode::serialize(&proof_terminal).unwrap(),
+            "terminal cleanup ownership changed proof bytes"
+        );
+        let mut ch_v = FsChallenger::new(b"flock-direct-cleanup-v0");
+        let claim_v = setup
+            .verify(&commitment_terminal, &proof_terminal, &mut ch_v)
+            .unwrap_or_else(|e| panic!("terminal cleanup proof rejected: {e:?}"));
+        assert_eq!(claim_terminal, claim_v);
+    }
+
     /// Transcript oracle for the opt-in merged pcs-combine kernel: at m = 29
     /// (2^15 blocks — the smallest shape where the merged path's
     /// `b >= 2048` gate opens), the proof produced with
