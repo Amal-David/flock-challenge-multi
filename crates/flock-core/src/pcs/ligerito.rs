@@ -4547,6 +4547,19 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// Coarse phase overlap for the one ranked direct-fold4 shape. The kill
+/// switch is resolved once per process, before either phase DAG is scheduled.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn mdf4_phase_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PHASE_OVERLAP").is_none());
+    *ON
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -4630,6 +4643,135 @@ fn materialize_direct_fold4(
     let deferred_reduce = super::fold_deferred_reduce_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
+    // The ranked shape has two independent whole phases: f streams the packed
+    // witness while b repeatedly folds a table-hot claim. Put both phase DAGs
+    // in the same Rayon pool so the scheduler can overlap their disjoint
+    // resources. Keep this exact: other shapes retain the incumbent fused
+    // block schedule below, including all portable and ordinary-basis paths.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if mdf4_phase_overlap_enabled()
+        && deferred_reduce
+        && !has_ordinary
+        && claims.len() == 2
+        && block_len == 8192
+        && out_len == 256 * 8192
+    {
+        rayon::join(
+            || {
+                folded_f
+                    .par_chunks_mut(block_len)
+                    .enumerate()
+                    .for_each(|(block, f_out)| {
+                        let start = 16 * block * block_len;
+                        let f_in = &packed_witness[start..start + 16 * block_len];
+                        crate::field::f128_slice::fold16_banked(
+                            f_in,
+                            f_out,
+                            &fold_weight,
+                        );
+                    });
+            },
+            || {
+                folded_b
+                    .par_chunks_mut(block_len)
+                    .enumerate()
+                    .map_init(
+                        || vec![F128::ZERO; table_len],
+                        |table, (block, b_out)| {
+                            let first = &claims[0];
+                            super::ring_switch::compose_block_table(
+                                &direct_tables[0],
+                                first.eq_hi[block],
+                                table,
+                            );
+                            let mut s = 0usize;
+                            while s + 3 < block_len {
+                                b_out[s] =
+                                    super::ring_switch::fold_one_slot(first.eq_lo[s], table);
+                                b_out[s + 1] =
+                                    super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
+                                b_out[s + 2] =
+                                    super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
+                                b_out[s + 3] =
+                                    super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
+                                s += 4;
+                            }
+                            while s < block_len {
+                                b_out[s] =
+                                    super::ring_switch::fold_one_slot(first.eq_lo[s], table);
+                                s += 1;
+                            }
+
+                            let second = &claims[1];
+                            super::ring_switch::compose_block_table(
+                                &direct_tables[1],
+                                second.eq_hi[block],
+                                table,
+                            );
+                            let mut s = 0usize;
+                            while s + 3 < block_len {
+                                b_out[s] +=
+                                    super::ring_switch::fold_one_slot(second.eq_lo[s], table);
+                                b_out[s + 1] +=
+                                    super::ring_switch::fold_one_slot(second.eq_lo[s + 1], table);
+                                b_out[s + 2] +=
+                                    super::ring_switch::fold_one_slot(second.eq_lo[s + 2], table);
+                                b_out[s + 3] +=
+                                    super::ring_switch::fold_one_slot(second.eq_lo[s + 3], table);
+                                s += 4;
+                            }
+                            while s < block_len {
+                                b_out[s] +=
+                                    super::ring_switch::fold_one_slot(second.eq_lo[s], table);
+                                s += 1;
+                            }
+                        },
+                    )
+                    .for_each(drop);
+            },
+        );
+
+        let (u_0, u_2) = folded_b
+            .par_chunks(block_len)
+            .zip(folded_f.par_chunks(block_len))
+            .map(|(b_out, f_out)| {
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: target features cfg-guaranteed; f_out/b_out
+                    // have equal length (block_len, a multiple of 2).
+                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    let mut k = 0;
+                    while k + 1 < f_out.len() {
+                        let f0 = f_out[k];
+                        let f1 = f_out[k + 1];
+                        let b0 = b_out[k];
+                        let b1 = b_out[k + 1];
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                        k += 2;
+                    }
+                    (u0, u2)
+                }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+        crate::scratch::give_f128(packed_witness);
+        if has_ordinary {
+            crate::scratch::give_f128(ordinary_basis);
+        }
+        return (folded_f, folded_b, SumcheckMessage { u_0, u_2 });
+    }
     let mid_len = if has_ordinary || !deferred_reduce {
         4 * SUB
     } else {
