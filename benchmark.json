@@ -14,6 +14,7 @@
       "setupCommand": ["bash", "-lc", "./setup.sh"],
       "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
       "scorePath": "score.json",
+      "minScoreImprovementBips": 100,
       "maxSubmissionBytes": 8388608,
       "runner": {
         "provider": "github-actions",
