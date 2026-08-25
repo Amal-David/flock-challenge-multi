@@ -617,8 +617,30 @@ fn note_merkle_calibration(
     ));
 }
 
-/// Hash the CPU-owned leaf chunks after the NTT: wide pool, atomic chunk
-/// cursor. The GPU and this join write **disjoint** `tree[..n_leaves]`
+/// Whether a hop to [`wide_hash_pool`] can buy anything from where we stand.
+///
+/// That pool exists to reach logical cores the global pool does not span --
+/// on a heterogeneous host the global pool is built over the performance
+/// cores, and the efficiency cores would otherwise idle through bulk hashing.
+/// When the global pool already spans every logical CPU the two pools have
+/// the same width, and the hop is pure loss: an injector round trip and a
+/// blocking latch at each end, a second set of workers for the scheduler to
+/// place, and -- because the global pool is the one that is pinned to a CPU
+/// per worker -- the loss of that pinning for the section being hopped into.
+///
+/// Bulk leaf hashing is the section where the pinning matters most. The deep
+/// pass hashes as the NTT finishes, so the bytes about to be hashed are the
+/// bytes the pinned workers just wrote; hashing them from a second, unpinned
+/// set of threads hands each chunk to whichever CPU the scheduler picks
+/// rather than to the one whose caches already hold it.
+fn wider_than_current_pool() -> Option<&'static rayon::ThreadPool> {
+    std::thread::available_parallelism()
+        .is_ok_and(|n| n.get() > rayon::current_num_threads())
+        .then(wide_hash_pool)
+}
+
+/// Hash the CPU-owned leaf chunks after the NTT: widest useful pool, atomic
+/// chunk cursor. The GPU and this join write **disjoint** `tree[..n_leaves]`
 /// sub-slices — chunk ownership was fixed when each chunk either was or was
 /// not committed to the GPU during the deep pass.
 fn cpu_join_hash_leaves(
@@ -630,7 +652,7 @@ fn cpu_join_hash_leaves(
 ) {
     let cursor = AtomicUsize::new(0);
     let base = leaves_out.as_mut_ptr() as usize;
-    wide_hash_pool().broadcast(|_| {
+    let claim = |_: rayon::BroadcastContext<'_>| {
         loop {
             let i = cursor.fetch_add(1, Ordering::Relaxed);
             let Some(r) = ranges.get(i) else { break };
@@ -647,7 +669,17 @@ fn cpu_join_hash_leaves(
                 kind,
             );
         }
-    });
+    };
+    match wider_than_current_pool() {
+        Some(pool) => {
+            pool.broadcast(claim);
+        }
+        // Same width: stay on the pool we are already on, keep its pinning,
+        // and skip both injector hops.
+        None => {
+            rayon::broadcast(claim);
+        }
+    }
 }
 
 /// `FLOCK_NO_MERKLE_SUBTREE_PARENTS=1` disables the in-callback subtree fold
