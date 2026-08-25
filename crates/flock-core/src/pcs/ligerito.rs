@@ -2820,16 +2820,38 @@ fn window_slots(nwin: usize, processed: Vec<(usize, Vec<F128>)>) -> Vec<Option<V
 /// ([`crate::alloc_uninit_vec`]'s write-before-read contract is discharged by
 /// the partition), which deletes the serial 16 MiB zero pass and spreads the
 /// first-touch page faults across the rayon pool instead of one thread.
+
+/// `FLOCK_SPARSE_PAR=1` restores the parallel window / densify passes in the
+/// sparse-prefix transpose. Default: serial. The window/densify element
+/// counts are 77-256, below the ~25-30us/task rayon dispatch cost measured on
+/// the 9950X3D (openserial AB, this session); serial is byte-identical
+/// (window order irrelevant — `window_slots` scatters by window index — and
+/// densify writes are positional).
+fn sparse_fill_serial_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SPARSE_PAR").is_none());
+    *ON
+}
+
 fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> Vec<F128> {
     use rayon::prelude::*;
     debug_assert_eq!(slots.len(), n >> k);
     let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(1usize << k)
-        .zip(slots.into_par_iter())
-        .for_each(|(dst, src)| match src {
-            Some(buf) => dst.copy_from_slice(&buf),
-            None => dst.fill(F128::ZERO),
-        });
+    if sparse_fill_serial_enabled() {
+        for (dst, src) in data.chunks_mut(1usize << k).zip(slots.into_iter()) {
+            match src {
+                Some(buf) => dst.copy_from_slice(&buf),
+                None => dst.fill(F128::ZERO),
+            }
+        }
+    } else {
+        data.par_chunks_mut(1usize << k)
+            .zip(slots.into_par_iter())
+            .for_each(|(dst, src)| match src {
+                Some(buf) => dst.copy_from_slice(&buf),
+                None => dst.fill(F128::ZERO),
+            });
+    }
     data
 }
 
@@ -3132,11 +3154,8 @@ fn transpose_forward_ntt_sparse_inner(
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
-        runs.par_iter()
-            .map_init(
-                Vec::<F128>::new,
-                |scratch, &(rs, re)| {
+    let win_task = |scratch: &mut Vec<F128>, &(rs, re): &(usize, usize)| -> (usize, Vec<F128>) {
+
                 let first = order[rs] as usize;
                 let w = positions[first] >> k;
                     let nnz = re - rs;
@@ -3189,8 +3208,18 @@ fn transpose_forward_ntt_sparse_inner(
                     buf[positions[i] & wmask] += values[i];
                 }
                 transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-                },
-            )
+    };
+    let processed: Vec<(usize, Vec<F128>)> = if fill {
+        if sparse_fill_serial_enabled() {
+            let mut scratch = Vec::<F128>::new();
+            runs.iter().map(|r| win_task(&mut scratch, r)).collect()
+        } else {
+            runs.par_iter().map_init(Vec::<F128>::new, &win_task).collect()
+        }
+    } else if sparse_fill_serial_enabled() {
+        win_vec
+            .into_iter()
+            .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
             .collect()
     } else {
         win_vec
