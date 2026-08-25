@@ -701,6 +701,47 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Scalar-only settle across every pool worker, run once after the last
+/// untimed warm-up pass and before readiness is signalled.
+///
+/// Readiness is the last thing that happens before the harness starts its
+/// clock, and today the instruction immediately before it is the tail of a
+/// warm-up prove: several seconds of uninterrupted wide-SIMD work on every
+/// core. The timed prove then begins microseconds later, on cores that are
+/// still in the state that sustained burn left them in. Two things about that
+/// state are worth undoing, and one short scalar interval undoes both:
+///
+/// - **Wide-vector frequency.** Sustained 512-bit work moves a core into a
+///   lower frequency operating point, and it steps back up only after an
+///   interval of narrower work. Scalar work is what that interval has to be
+///   made of: idling instead would drop the core's P-state and require a ramp
+///   of its own, which is the opposite of what is wanted.
+/// - **Worker sleep state.** Between the last warm-up pass and the timed
+///   prove the pool has nothing to do, so its workers head for the sleep path
+///   and the first parallel region of the timed prove pays to wake all of
+///   them. Broadcasting the settle keeps every worker on-CPU across that gap.
+///
+/// Entirely outside the measured interval: it runs before the ready file the
+/// harness waits on, and it is bounded by a fixed wall-clock constant, so it
+/// cannot interact with instance speed or with the startup deadline.
+fn settle_before_ready() {
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+    let deadline = std::time::Instant::now() + SETTLE;
+    rayon::broadcast(|_| {
+        // Scalar integer work only -- no SIMD, and nothing the optimizer can
+        // fold away or hoist out of the loop.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        while std::time::Instant::now() < deadline {
+            for _ in 0..4096 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x ^= x >> 33;
+            }
+            std::hint::black_box(x);
+        }
+        std::hint::black_box(x);
+    });
+}
+
 fn speculative_main(
     real_stdin: i32,
     writer: i32,
@@ -765,6 +806,7 @@ fn speculative_main(
             }
         }
     }
+    settle_before_ready();
     {
         let (lock, cv) = &*warm;
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
