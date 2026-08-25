@@ -217,12 +217,9 @@ struct PreEncodedPrefix {
     /// The commitment's Merkle root. Two distinct proves sharing a root would
     /// be a hash collision, so a root match pins the stash to this prove.
     root: flock_core::merkle::Hash,
-    /// bincode-fixint encoded lengths of commitment / zerocheck / lincheck,
-    /// re-derived from the candidate bundle at publish via `serialized_size`
-    /// (same default fixint config as `serialize_into`).
-    sec_lens: [u64; 3],
-    /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
-    /// bundle so the publish-tail `pcs_open` append never reallocates.
+    /// Encoded header and three prefix sections, with capacity already
+    /// covering the full bundle so the publish-tail `pcs_open` append never
+    /// reallocates.
     bytes: Vec<u8>,
 }
 
@@ -255,36 +252,27 @@ pub fn stash_pre_encoded_prefix(
     // append extends this exact Vec, so it must never need to grow.
     let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
     write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
-    let mut sec_lens = [0u64; 3];
-    let mut mark = bytes.len();
     bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
-    sec_lens[0] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
     bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
-    sec_lens[1] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
     bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
-    sec_lens[2] = (bytes.len() - mark) as u64;
     // Assignment-only critical section — nothing that can panic runs while
     // the guard is held, so the lock cannot poison. A poisoned lock
     // (unreachable in practice) skips the stash; publish then full-encodes.
     if let Ok(mut slot) = PRE_ENCODED.lock() {
         *slot = Some(PreEncodedPrefix {
             root: commitment.root,
-            sec_lens,
             bytes,
         });
     }
 }
 
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
+/// Take the stash iff its commitment root matches `bundle`. The stash is
+/// created from the exact commitment/zerocheck/lincheck values that are moved
+/// into this bundle while its PCS open runs, and the prover never overlaps two
+/// opens. A different proof with the same root would require a Merkle hash
+/// collision, the same identity boundary already trusted by verification.
+/// Root-only matching deletes three publish-tail `serialized_size` traversals.
+/// `None` (full-encode fallback) on no stash, disable, poison, or mismatch.
 fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
     if !pre_encode_enabled() {
         return None;
@@ -293,16 +281,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
+    Some(stash.bytes)
 }
 
 // ---------------------------------------------------------------------------
