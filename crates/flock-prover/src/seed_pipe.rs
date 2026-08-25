@@ -726,14 +726,20 @@ fn speculative_main(
     // The warm-up prove takes the *same* block source the timed one will, so
     // whichever of the two witgen paths ships is the one that gets warmed.
     //
-    // Four passes, not one: the residual first-touch faults this pass retires
-    // are not all retired by the first one, and the timed prove's fault count
-    // falls monotonically to a plateau at four. `FLOCK_NO_SPEC_WARMUP=1`
-    // restores the single pass. Same 300 s startup budget as the main-thread
-    // loop; `arm()` blocks on this whole block, so the wall-clock guard here
-    // is what keeps the ready file inside `STARTUP_TIMEOUT`.
+    // Eleven passes, matching the protected main thread's loop. The fault
+    // plateau at four is a property of the process-wide pages this pass
+    // retires, but a warm-up also warms state that belongs to the thread
+    // running it: this thread's own lazily committed 32 MiB stack, its
+    // thread-local scratch provenance slots, and its position in the rayon
+    // pool's injector and sleep bookkeeping. The main thread receives
+    // eleven passes of that and never runs a timed prove; this thread runs
+    // every timed prove and received four. Give the two loops the same
+    // count. `FLOCK_NO_SPEC_WARMUP=1` restores the single pass. Same 300 s
+    // startup budget as the main-thread loop; `arm()` blocks on this whole
+    // block, so the wall-clock guard here is what keeps the ready file
+    // inside `STARTUP_TIMEOUT`.
     if inline || scratch.len() == 1usize << log2_size {
-        const SPEC_WARMUP_PROVES: usize = 4;
+        const SPEC_WARMUP_PROVES: usize = 11;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
