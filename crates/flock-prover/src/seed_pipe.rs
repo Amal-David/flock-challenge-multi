@@ -542,13 +542,16 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
-fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
+fn encode_direct_proof(out: ProveOut) -> Vec<u8> {
     let (proof, commitment, _) = out;
-    let bundle = R1csProofBundleLigerito { commitment, proof };
+    R1csProofBundleLigerito { commitment, proof }.to_bytes()
+}
+
+fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
+    std::fs::write(&temporary, encode_direct_proof(out))?;
     std::fs::rename(temporary, path)
 }
 
@@ -723,15 +726,17 @@ fn speculative_main(
     // pass the speculative prove gave back the whole head start. `arm()`
     // blocks until this finishes, so it lands before the ready file.
     //
-    // The warm-up prove takes the *same* block source the timed one will, so
-    // whichever of the two witgen paths ships is the one that gets warmed.
+    // The warm-up proof takes the same block source the timed one will. The
+    // direct path also consumes the last proof's pre-encoded prefix and runs
+    // the exact final bundle encoder. The resulting fully touched 460 KiB Vec
+    // is dropped into this thread's exact-size recycle allocator before
+    // readiness, so the timed prefix stash reuses resident pages instead of
+    // faulting the untouched capacity while appending `pcs_open`.
     //
-    // Four passes, not one: the residual first-touch faults this pass retires
-    // are not all retired by the first one, and the timed prove's fault count
-    // falls monotonically to a plateau at four. `FLOCK_NO_SPEC_WARMUP=1`
-    // restores the single pass. Same 300 s startup budget as the main-thread
-    // loop; `arm()` blocks on this whole block, so the wall-clock guard here
-    // is what keeps the ready file inside `STARTUP_TIMEOUT`.
+    // Four passes, not one: residual first-touch faults are not all retired by
+    // the first pass and plateau at four. `FLOCK_NO_SPEC_WARMUP=1` restores one
+    // pass. `arm()` blocks here, and the wall-clock guard keeps readiness
+    // inside the protected harness's startup timeout.
     if inline || scratch.len() == 1usize << log2_size {
         const SPEC_WARMUP_PROVES: usize = 4;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
@@ -741,8 +746,10 @@ fn speculative_main(
         } else {
             SPEC_WARMUP_PROVES
         };
+        let prewarm_publish = direct_proof_path.is_some()
+            && std::env::var("FLOCK_NO_DIRECT_PUBLISH_PREWARM").map_or(true, |v| v != "1");
         let warmup_started = std::time::Instant::now();
-        for _ in 0..spec_warmup_proves {
+        for warmup_index in 0..spec_warmup_proves {
             let t0 = std::time::Instant::now();
             let warm_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let src = if inline {
@@ -751,7 +758,15 @@ fn speculative_main(
                     fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
                     BlockSource::Slice(&scratch)
                 };
-                let _ = std::hint::black_box(run(setup_addr, src));
+                let out = run(setup_addr, src);
+                let should_prewarm = prewarm_publish
+                    && (warmup_index + 1 == spec_warmup_proves
+                        || warmup_started.elapsed() >= SPEC_WARMUP_BUDGET);
+                if should_prewarm {
+                    let _ = std::hint::black_box(encode_direct_proof(out));
+                } else {
+                    let _ = std::hint::black_box(out);
+                }
             }))
             .is_ok();
             if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
