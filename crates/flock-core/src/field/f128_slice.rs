@@ -210,6 +210,33 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     }
 }
 
+/// Same field values as [`fold4_nested`]. On AVX-512 x86 the four-lane
+/// body publishes with XMM `MOVNTDQ` (see [`x86_64::fold4_nested_nt`]);
+/// every other build is a straight call of [`fold4_nested`].
+#[inline]
+pub(crate) fn fold4_nested_nt(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    assert_eq!(
+        src.len(),
+        4 * dst.len(),
+        "fold4 source must contain four elements for every destination slot"
+    );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: same gate and length contract as [`fold4_nested`].
+    unsafe {
+        x86_64::fold4_nested_nt(src, dst, r0, r1);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    fold4_nested(src, dst, r0, r1);
+}
+
 #[cfg(test)]
 mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar

@@ -5860,6 +5860,16 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// `FLOCK_NO_DF8_FOLD4_NT=1` restores write-allocate `storeu` of DirectFold8's
+/// f-side `fold4_nested` dest (exact same-binary A/B). Ranked env is cleared,
+/// so XMM `MOVNTDQ` publish runs. Mid `m4` stays temporal — the next nested
+/// fold reads it in L1.
+fn df8_fold4_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_FOLD4_NT").is_none());
+    *ON
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5992,6 +6002,7 @@ fn materialize_direct_fold8(
                 // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
                 // count versus three nested passes while keeping bounded
                 // scratch and eliminating the scalar 64-product chain.
+                let nt_out = df8_fold4_nt_enabled();
                 let mut slot = 0usize;
                 while slot < block_len {
                     let n = SUB.min(block_len - slot);
@@ -5999,9 +6010,18 @@ fn materialize_direct_fold8(
                     crate::field::f128_slice::fold16_banked(
                         &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
+                    // Final f-side dest is not re-read in this task: the next
+                    // consumer is remaining sumcheck after the rayon join.
+                    // Mid `m4` stays on the temporal path above.
+                    if nt_out {
+                        crate::field::f128_slice::fold4_nested_nt(
+                            m4, &mut f_out[slot..slot + n], r4, r5,
+                        );
+                    } else {
+                        crate::field::f128_slice::fold4_nested(
+                            m4, &mut f_out[slot..slot + n], r4, r5,
+                        );
+                    }
                     if has_ordinary {
                         let m16 = &mut mid16[..16 * n];
                         crate::field::f128_slice::fold4_nested(
@@ -6013,6 +6033,12 @@ fn materialize_direct_fold8(
                         );
                     }
                     slot += n;
+                }
+                #[cfg(target_arch = "x86_64")]
+                if nt_out {
+                    // Drain WC before this task returns; the rayon join is
+                    // the later sumcheck's happens-before.
+                    unsafe { core::arch::x86_64::_mm_sfence() };
                 }
 
                 #[cfg(all(
