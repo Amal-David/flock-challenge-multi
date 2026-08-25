@@ -173,10 +173,26 @@ fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
     Some(((global + 2).min(available), available))
 }
 
+// ppx86-1: x86 phase-pool parity probe. The aarch64+macOS gate above was a
+// conservative Apple-Silicon carve-out, not a measured x86 negative; the
+// None-on-x86 fallback means the commit/zerocheck phases never get a wider
+// pool on the runner even when the cgroup exposes spare CPUs beyond
+// RAYON_NUM_THREADS. The available<=global guard still protects the
+// no-headroom case (behavior identical to the old None path when the runner
+// has no spare CPUs), so this only changes behavior when headroom exists.
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 fn phase_pool_widths(m: usize) -> Option<(usize, usize)> {
-    let _ = (m, PHASE_POOLS_DISABLE_ENV);
-    None
+    if m < 29 || std::env::var_os(PHASE_POOLS_DISABLE_ENV).is_some() {
+        return None;
+    }
+    let global = rayon::current_num_threads().max(1);
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(global);
+    if available <= global {
+        return None;
+    }
+    Some(((global + 2).min(available), available))
 }
 
 fn commit_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
