@@ -4547,6 +4547,20 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// Same-binary diagnostic gate for the ranked DirectFold4 f+b pipeline.
+/// `FLOCK_NO_MDF4_FB_PIPE=1` restores the incumbent serial f-then-b schedule.
+/// Resolved once before Rayon enters any block loop.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn mdf4_fb_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_FB_PIPE").is_none());
+    *ON
+}
+
 #[inline]
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
@@ -4628,6 +4642,32 @@ fn materialize_direct_fold4(
     // buffer is dead there — allocate it only when the nested b-side needs it.
     const SUB: usize = 256;
     let deferred_reduce = super::fold_deferred_reduce_enabled();
+    // The specialization is intentionally rank-exact: 512 MiB packed input,
+    // 256 blocks of 8192 outputs, exactly two direct claims, and no ordinary
+    // basis. Every other shape retains the existing materializer.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fb_pipe = mdf4_fb_pipe_enabled()
+        && deferred_reduce
+        && !has_ordinary
+        && claims.len() == 2
+        && block_len == 8192
+        && out_len == 256 * 8192;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let scratch_len = if fb_pipe { 2 * table_len } else { table_len };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let scratch_len = table_len;
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let mid_len = if has_ordinary || !deferred_reduce {
@@ -4646,35 +4686,74 @@ fn materialize_direct_fold4(
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || (vec![F128::ZERO; table_len], vec![F128::ZERO; mid_len]),
+            || (vec![F128::ZERO; scratch_len], vec![F128::ZERO; mid_len]),
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
-                // Head of the NEXT block's f-side slab, and how far into it
-                // the b-side loops below may walk. Null when there is no next
-                // block or the kill switch is set — the only check the loops
-                // make. `block + 1 < n_blocks` is exactly the condition that
-                // keeps the whole slab inside `packed_witness`:
-                // `16·(block+2)·block_len ≤ 16·n_blocks·block_len = len`.
+                // Checked view of the NEXT block's f-side slab. Last block and
+                // `FLOCK_NO_MDF4_PF=1` select `None`; otherwise both slice
+                // endpoints are bounded by `packed_witness.len()` because
+                // `block + 1 < n_blocks` implies block + 2 <= n_blocks.
                 #[cfg(target_arch = "x86_64")]
-                let (pf_base, pf_span) = if pf_on && block + 1 < n_blocks {
-                    // SAFETY: bounds argued above; `add` stays inside the
-                    // allocation and the pointer is never dereferenced.
-                    let p = unsafe { packed_witness.as_ptr().add(start + 16 * block_len) };
-                    (
-                        p.cast::<u8>(),
-                        16 * block_len * core::mem::size_of::<F128>(),
-                    )
+                let next_f_slab = if pf_on && block + 1 < n_blocks {
+                    let next_start = start + 16 * block_len;
+                    Some(&packed_witness[next_start..next_start + 16 * block_len])
                 } else {
-                    (core::ptr::null::<u8>(), 0usize)
+                    None
                 };
                 #[cfg(target_arch = "x86_64")]
+                let (pf_base, pf_span) = next_f_slab.map_or(
+                    (core::ptr::null::<u8>(), 0usize),
+                    |slab| (
+                        slab.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(slab),
+                    ),
+                );
+                #[cfg(target_arch = "x86_64")]
                 let mut pf_at = 0usize;
-                if deferred_reduce {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                let fb_pipelined = if fb_pipe {
+                    let (table0, table1) = scratch.split_at_mut(table_len);
+                    super::ring_switch::compose_block_table(
+                        &direct_tables[0],
+                        claims[0].eq_hi[block],
+                        table0,
+                    );
+                    super::ring_switch::compose_block_table(
+                        &direct_tables[1],
+                        claims[1].eq_hi[block],
+                        table1,
+                    );
+                    crate::field::f128_slice::fold16_banked_two_tables(
+                        f_in,
+                        f_out,
+                        &fold_weight,
+                        &claims[0].eq_lo,
+                        table0,
+                        &claims[1].eq_lo,
+                        table1,
+                        b_out,
+                        next_f_slab,
+                    );
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )))]
+                let fb_pipelined = false;
+                if !fb_pipelined && deferred_reduce {
                     // ---- f: 16:1 in one deferred-reduction pass (one reduce
                     // per output lane; same field element as the nested form).
                     crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
-                } else {
+                } else if !fb_pipelined {
                     // ---- f: 16:1 nested pair folds, sub-block at a time.
                     let mut slot = 0usize;
                     while slot < block_len {
@@ -4727,8 +4806,11 @@ fn materialize_direct_fold4(
                 // without the store. Existing 4-wide stride kept (not unrolled
                 // further; #120's 8-wide was cancelled with no official score).
                 let table = &mut scratch[..table_len];
-                let mut claims_iter = claims.iter().zip(direct_tables.iter());
-                if !has_ordinary {
+                let mut claims_iter = claims
+                    .iter()
+                    .zip(direct_tables.iter())
+                    .take(if fb_pipelined { 0 } else { claims.len() });
+                if !has_ordinary && !fb_pipelined {
                     let (first, first_table) = claims_iter
                         .next()
                         .expect("materialize_direct_fold4: claims non-empty");
