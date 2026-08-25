@@ -4546,6 +4546,23 @@ fn mdf4_pf_enabled() -> bool {
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PF").is_none());
     *ON
 }
+/// Same-binary kill switch for the exact ranked nibble-table pipeline. The
+/// caller additionally gates on two direct claims, no ordinary basis,
+/// deferred reduction, `block_len == 8192`, 256 blocks, and AVX-512 CLMUL.
+/// Any mismatch, including `FLOCK_NO_MDF4_NIBBLE_PIPE=1`, executes the
+/// incumbent f loop and serial claim-table b loops untouched.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn mdf4_nibble_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MDF4_NIBBLE_PIPE").is_none()
+    });
+    *ON
+}
+
 
 #[inline]
 fn eval_fold8_lookahead4(
@@ -4578,12 +4595,14 @@ fn eval_fold8_lookahead5(
 
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
-/// direct basis in ONE N→N/16 pass and emits the round-4 message. Both ranked
-/// claims are direct here (no ordinary basis), so the b side is two table-hot
-/// phases of `fold_one_slot` exactly like the fold2 materializer, at a quarter
-/// of the slots — first claim assigns (no memset of the uninit `take_f128`
-/// chunk), later claims add. The ranked f side is `fold16_banked` (deferred
-/// reduction); the nested pair-fold + mid buffer is only the fallback.
+/// direct basis in ONE N→N/16 pass and emits the round-4 message. At the exact
+/// ranked two-claim/no-ordinary/deferred 8192×256 shape, each block composes
+/// two 8 KiB nibble tables and the four-slot AVX-512 kernel interleaves one b
+/// slot after each four-bank f group. The 16 KiB lookup working set replaces
+/// two 64 KiB composed byte tables. Every other shape and the kill switch use
+/// the incumbent serial claim phases: first claim assigns (no memset of the
+/// uninit `take_f128` chunk), later claims add. The nested pair-fold + mid
+/// buffer remains the non-deferred fallback.
 fn materialize_direct_fold4(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -4623,6 +4642,7 @@ fn materialize_direct_fold4(
         claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
     }));
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
+    let nibble_table_len = super::ring_switch::FOLD_NIBBLE_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     // Ranked path has no ordinary basis and uses fold16_banked, so the mid
     // buffer is dead there — allocate it only when the nested b-side needs it.
@@ -4641,12 +4661,36 @@ fn materialize_direct_fold4(
     let pf_on = mdf4_pf_enabled();
     #[cfg(target_arch = "x86_64")]
     let n_blocks = out_len / block_len;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let nibble_pipe = mdf4_nibble_pipe_enabled()
+        && deferred_reduce
+        && !has_ordinary
+        && claims.len() == 2
+        && block_len == 8192
+        && n_blocks == 256;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let nibble_pipe = false;
+    // Exact arm: two disjoint 512-F128 (8 KiB) halves. Every other shape,
+    // including the kill switch, retains the incumbent 4096-F128 scratch.
+    let scratch_len = if nibble_pipe {
+        2 * nibble_table_len
+    } else {
+        table_len
+    };
     let (u_0, u_2) = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
         .enumerate()
         .map_init(
-            || (vec![F128::ZERO; table_len], vec![F128::ZERO; mid_len]),
+            || (vec![F128::ZERO; scratch_len], vec![F128::ZERO; mid_len]),
             |(scratch, mid), (block, (b_out, f_out))| {
                 let start = 16 * block * block_len;
                 let f_in = &packed_witness[start..start + 16 * block_len];
@@ -4670,11 +4714,46 @@ fn materialize_direct_fold4(
                 };
                 #[cfg(target_arch = "x86_64")]
                 let mut pf_at = 0usize;
-                if deferred_reduce {
+                if nibble_pipe {
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    {
+                        // The exact gate proves two claims and 8192 slots.
+                        // Split the 1024-F128 scratch into disjoint, explicitly
+                        // bounded 512-F128 (8 KiB) tables and compose both
+                        // before the single fused f/b traversal.
+                        let (table0, table1) =
+                            scratch[..2 * nibble_table_len].split_at_mut(nibble_table_len);
+                        super::ring_switch::compose_block_nibble_table(
+                            &direct_tables[0],
+                            claims[0].eq_hi[block],
+                            table0,
+                        );
+                        super::ring_switch::compose_block_nibble_table(
+                            &direct_tables[1],
+                            claims[1].eq_hi[block],
+                            table1,
+                        );
+                        crate::field::f128_slice::fold16_banked_nibble2(
+                            f_in,
+                            f_out,
+                            &fold_weight,
+                            &claims[0].eq_lo,
+                            &claims[1].eq_lo,
+                            table0,
+                            table1,
+                            b_out,
+                        );
+                    }
+                }
+                if !nibble_pipe && deferred_reduce {
                     // ---- f: 16:1 in one deferred-reduction pass (one reduce
                     // per output lane; same field element as the nested form).
                     crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
-                } else {
+                } else if !nibble_pipe {
                     // ---- f: 16:1 nested pair folds, sub-block at a time.
                     let mut slot = 0usize;
                     while slot < block_len {
@@ -4717,6 +4796,7 @@ fn materialize_direct_fold4(
                         slot += n;
                     }
                 }
+                if !nibble_pipe {
                 // ---- b: direct claims, one 64 KiB composed table live at a time.
                 // Ranked path: no ordinary basis. `take_f128` is write-before-read
                 // (stale/uninit), so the fold2 materializer's table-hot schedule
@@ -4794,6 +4874,7 @@ fn materialize_direct_fold4(
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         s += 1;
                     }
+                }
                 }
                 // Vectorized message-term reduction over the folded chunk.
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]

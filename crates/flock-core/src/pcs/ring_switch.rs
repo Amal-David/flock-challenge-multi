@@ -1937,6 +1937,9 @@ pub(crate) const FOLD_TABLE_TOTAL: usize = 16 * 256;
 const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
+/// Entries in the exact nibble-table encoding of a 128-column map:
+/// 16 byte positions × (16 low-nibble + 16 high-nibble subset sums).
+pub(crate) const FOLD_NIBBLE_TABLE_TOTAL: usize = FOLD_N_BYTES * 32;
 
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
@@ -2004,6 +2007,31 @@ pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
         block[0] = F128::ZERO;
         for v in 1..FOLD_TABLE_SIZE {
             block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+        }
+    }
+}
+/// Compose the map encoded by `base` with multiplication by `e_hi`, storing
+/// the result as two 16-entry nibble tables for each of the 16 input bytes.
+///
+/// Layout for byte `k` is `[low bits 0..3][high bits 4..7]`, each as all 16
+/// subset sums. Thus a byte lookup `v` is exactly
+/// `out[k·32 + (v & 15)] + out[k·32 + 16 + (v >> 4)]`. Every one of the 512
+/// entries is assigned before it is read, so recycled/dirty scratch is valid.
+#[inline(always)]
+pub(crate) fn compose_block_nibble_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
+    debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
+    debug_assert_eq!(out.len(), FOLD_NIBBLE_TABLE_TOTAL);
+    let cols = compose_block_cols(base, e_hi);
+    for byte in 0..FOLD_N_BYTES {
+        let block = &mut out[byte * 32..(byte + 1) * 32];
+        let col8 = &cols[byte * 8..byte * 8 + 8];
+        block[0] = F128::ZERO;
+        block[16] = F128::ZERO;
+        for value in 1usize..16 {
+            let prior = value & (value - 1);
+            let bit = value.trailing_zeros() as usize;
+            block[value] = block[prior] + col8[bit];
+            block[16 + value] = block[16 + prior] + col8[4 + bit];
         }
     }
 }
@@ -2117,6 +2145,29 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let r1 = q2 + q3;
     // Level 4.
     r0 + r1
+}
+/// Scalar oracle for the exact nibble-table encoding produced by
+/// [`compose_block_nibble_table`]. The 32 loads are accumulated in four
+/// independent chains and tree-combined, matching the lookup algebra used by
+/// the interleaved x86 kernel without imposing a serial 31-XOR dependency.
+#[inline(always)]
+pub(crate) fn fold_one_slot_nibble(elem: F128, tables: &[F128]) -> F128 {
+    debug_assert_eq!(tables.len(), FOLD_NIBBLE_TABLE_TOTAL);
+    let mut words = [elem.lo, elem.hi];
+    let mut acc = [F128::ZERO; 4];
+    let table = tables.as_ptr();
+    for byte in 0..FOLD_N_BYTES {
+        let value = words[byte >> 3] as u8;
+        words[byte >> 3] >>= 8;
+        let base = byte * 32;
+        // SAFETY: low/high nibble indices are each in 0..16. The largest
+        // address is `15·32 + 16 + 15 = 511`, inside the asserted 512 entries.
+        unsafe {
+            acc[byte & 3] += *table.add(base + (value & 0x0f) as usize);
+            acc[byte & 3] += *table.add(base + 16 + (value >> 4) as usize);
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
 }
 
 pub(crate) fn build_direct_fold8_table(
@@ -5164,6 +5215,52 @@ mod tests {
             assert_eq!(dirty, zeroed, "trial {trial}");
         }
     }
+    /// Exhaust every byte value at every byte position, then compare complete
+    /// randomized folds. The nibble composer is deliberately handed dirty
+    /// pooled scratch so this also proves its write-before-read contract.
+    #[test]
+    fn compose_block_nibble_table_matches_byte_table_and_ignores_stale_contents() {
+        let mut rng = Rng::new(0x4e49_4242_4c45);
+        for trial in 0..4 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_direct_fold8_table_from_generators(&generators);
+            let e_hi = rng.f128();
+            let mut bytes = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+            compose_block_table(&base, e_hi, &mut bytes);
+            let mut nibbles: Vec<F128> =
+                (0..FOLD_NIBBLE_TABLE_TOTAL).map(|_| rng.f128()).collect();
+            compose_block_nibble_table(&base, e_hi, &mut nibbles);
+            let mut zeroed_nibbles = vec![F128::ZERO; FOLD_NIBBLE_TABLE_TOTAL];
+            compose_block_nibble_table(&base, e_hi, &mut zeroed_nibbles);
+            assert_eq!(nibbles, zeroed_nibbles, "trial {trial} dirty scratch");
+
+            for byte in 0..FOLD_N_BYTES {
+                for value in 0usize..256 {
+                    let nibble_sum = nibbles[byte * 32 + (value & 15)]
+                        + nibbles[byte * 32 + 16 + (value >> 4)];
+                    assert_eq!(
+                        nibble_sum,
+                        bytes[byte * FOLD_TABLE_SIZE + value],
+                        "trial {trial} byte {byte} value {value}"
+                    );
+                }
+            }
+            for slot in 0..128 {
+                let x = rng.f128();
+                assert_eq!(
+                    fold_one_slot_nibble(x, &nibbles),
+                    fold_one_slot(x, &bytes),
+                    "trial {trial} slot {slot} byte oracle"
+                );
+                assert_eq!(
+                    fold_one_slot_nibble(x, &nibbles),
+                    fold_one_slot(x * e_hi, &base),
+                    "trial {trial} slot {slot} multiply oracle"
+                );
+            }
+        }
+    }
+
 
     /// Parallel one-mul doubling is bit-identical to the two-GHASH formula.
     #[test]

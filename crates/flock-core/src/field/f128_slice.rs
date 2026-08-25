@@ -593,6 +593,38 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
         }
     }
 }
+/// AVX-512 ranked DirectFold4 fast path: fold four f slots at a time while
+/// filling those four b slots from two exact 512-entry nibble tables.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn fold16_banked_nibble2(
+    src: &[F128],
+    f_dst: &mut [F128],
+    w: &[F128; 16],
+    b0: &[F128],
+    b1: &[F128],
+    table0: &[F128],
+    table1: &[F128],
+    b_dst: &mut [F128],
+) {
+    assert_eq!(src.len(), 16 * f_dst.len());
+    assert_eq!(b0.len(), f_dst.len());
+    assert_eq!(b1.len(), f_dst.len());
+    assert_eq!(b_dst.len(), f_dst.len());
+    assert!(f_dst.len().is_multiple_of(4));
+    assert_eq!(table0.len(), 512);
+    assert_eq!(table1.len(), 512);
+    // SAFETY: cfg supplies the ISA features; the assertions prove every
+    // source, destination, input, and table bound consumed by the kernel.
+    unsafe {
+        x86_64::fold16_banked_nibble2(src, f_dst, w, b0, b1, table0, table1, b_dst);
+    }
+}
+
 
 /// Bind one top-bit split in place: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.
 ///

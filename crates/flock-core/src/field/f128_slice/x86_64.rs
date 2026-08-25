@@ -239,6 +239,126 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         }
     }
 }
+/// Sum the two exact 512-entry nibble maps for one pair of direct-claim
+/// inputs. Four independent XOR chains expose lookup ILP; their final tree is
+/// algebraically identical to the 64 KiB byte-table folds.
+#[inline(always)]
+unsafe fn fold_nibble2_one(
+    a: F128,
+    b: F128,
+    table_a: *const F128,
+    table_b: *const F128,
+) -> F128 {
+    let mut aw = [a.lo, a.hi];
+    let mut bw = [b.lo, b.hi];
+    let mut acc = [F128::ZERO; 4];
+    for byte in 0..16 {
+        let av = aw[byte >> 3] as u8;
+        let bv = bw[byte >> 3] as u8;
+        aw[byte >> 3] >>= 8;
+        bw[byte >> 3] >>= 8;
+        let base = byte * 32;
+        // SAFETY: each nibble is in 0..16. The largest offset is
+        // `15·32 + 16 + 15 = 511`, inside each caller-proven 512-entry table.
+        unsafe {
+            let lane = &mut acc[byte & 3];
+            *lane += *table_a.add(base + (av & 15) as usize);
+            *lane += *table_a.add(base + 16 + (av >> 4) as usize);
+            *lane += *table_b.add(base + (bv & 15) as usize);
+            *lane += *table_b.add(base + 16 + (bv >> 4) as usize);
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+/// Ranked DirectFold4 kernel: retain the incumbent four-slot sixteen-bank
+/// transpose/CLMUL/deferred-reduce path, and after each four-bank group fill
+/// one corresponding `b` slot from both exact nibble tables.
+///
+/// The f-side intra-slab T0 prefetch is byte-for-byte the incumbent schedule.
+/// The specialized caller guarantees a four-slot multiple, so every f/b slot
+/// is assigned exactly once and no scalar tail or per-slot dispatch exists.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq`, `src.len() == 16 * f_dst.len()`,
+/// equal f/b/input lengths divisible by four, and two 512-entry tables.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold16_banked_nibble2(
+    src: &[F128],
+    f_dst: &mut [F128],
+    w: &[F128; 16],
+    b0: &[F128],
+    b1: &[F128],
+    table0: &[F128],
+    table1: &[F128],
+    b_dst: &mut [F128],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(src.len(), 16 * f_dst.len());
+    debug_assert_eq!(b0.len(), f_dst.len());
+    debug_assert_eq!(b1.len(), f_dst.len());
+    debug_assert_eq!(b_dst.len(), f_dst.len());
+    debug_assert!(f_dst.len().is_multiple_of(4));
+    debug_assert_eq!(table0.len(), 512);
+    debug_assert_eq!(table1.len(), 512);
+
+    // SAFETY: caller guarantees features and all bounds asserted above.
+    unsafe {
+        let wb: [__m512i; 16] = core::array::from_fn(|bank| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[bank].hi as i64, w[bank].lo as i64))
+        });
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(64);
+        let table0 = table0.as_ptr();
+        let table1 = table1.as_ptr();
+        let mut t = 0usize;
+        while t < f_dst.len() {
+            if pf_ahead != 0 {
+                let ahead = 16 * t + pf_ahead;
+                if ahead <= pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut line = 0usize;
+                    while line < 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(line));
+                        line += 64;
+                    }
+                }
+            }
+            let mut acc = WideGhashX4::zero();
+            for group in 0..4 {
+                let base = 16 * t + 4 * group;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc(u0, wb[4 * group]);
+                acc.mul_acc(u1, wb[4 * group + 1]);
+                acc.mul_acc(u2, wb[4 * group + 2]);
+                acc.mul_acc(u3, wb[4 * group + 3]);
+
+                b_dst[t + group] =
+                    fold_nibble2_one(b0[t + group], b1[t + group], table0, table1);
+            }
+            _mm512_storeu_si512(f_dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
+            t += 4;
+        }
+    }
+}
+
 
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
