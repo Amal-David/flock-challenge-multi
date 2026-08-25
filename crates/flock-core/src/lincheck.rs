@@ -1033,6 +1033,17 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_PAD_REDUCE=1` restores the full-k 64-column GFNI reduce,
+/// including blocks the sweep never wrote (honest zero padding). Default
+/// ON: reconstruct only `ceil(useful_bits / 64)` blocks; `out` is already
+/// zero, so skipped padding columns stay zero without a 1 KiB copy+XOR
+/// of never-written plane bytes.
+fn lc_pad_reduce_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PAD_REDUCE").is_none());
+    *ON
+}
+
 /// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
 /// chunk) the eight gathered+transposed stripe rows drain through
 /// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
@@ -1300,8 +1311,23 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
+    // Ranked useful_bits = 15409 of k = 16384: blocks 241..255 were never
+    // stored by `gfni_fold_tile` (they sit past the last 64-column group
+    // that touches a useful bit). Those plane bytes are the allocation
+    // zeros; reconstructing them copies+XORs 1 KiB of zeros per worker
+    // into F128 zeros `out` already holds. `FLOCK_NO_LC_PAD_REDUCE=1`
+    // walks every block.
     let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
+    let n_blocks = k / 64;
+    let n_reduce = if lc_pad_reduce_enabled() {
+        useful_bits.div_ceil(64).min(n_blocks)
+    } else {
+        n_blocks
+    };
+    out[..n_reduce * 64]
+        .par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
         acc.copy_from_slice(&planes[base..base + 1024]);
