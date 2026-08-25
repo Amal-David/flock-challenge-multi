@@ -31,3 +31,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+// resample of promoted bar tree (94eb4be): comment-only, zero code delta.
