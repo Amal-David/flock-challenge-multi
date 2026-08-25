@@ -733,7 +733,8 @@ fn speculative_main(
     // loop; `arm()` blocks on this whole block, so the wall-clock guard here
     // is what keeps the ready file inside `STARTUP_TIMEOUT`.
     if inline || scratch.len() == 1usize << log2_size {
-        const SPEC_WARMUP_PROVES: usize = 4;
+        // One, not four; see the matching change on the main-thread loop.
+        const SPEC_WARMUP_PROVES: usize = 1;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
