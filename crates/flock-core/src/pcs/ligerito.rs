@@ -4141,15 +4141,203 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+
+/// `FLOCK_NO_OPEN_NT_REG_PUB=1` restores the incumbent L1 stage bounce in
+/// [`fold_and_msg_chunk_nt_x86`]. Ranked: fold eight dest lanes in registers,
+/// NT-publish, WideGhash-accumulate `(u0,u2)` — no 32 KiB stage and no
+/// per-quad XMM extract of the message product. `85b0943` p10-won with
+/// register-publish then extracted every 4 lanes; this remake keeps the
+/// bounce deletion and defers reduction.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_nt_reg_pub_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_NT_REG_PUB").is_none());
+    *ON
+}
+
+/// Fold four dest lanes from eight source F128s: `even + r·(even⊕odd)`.
+///
+/// # Safety
+/// `avx512f`+`vpclmulqdq`; `src[2*(base+t) .. +8]` readable.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_pairs_x4(
+    src: *const F128,
+    base: usize,
+    t: usize,
+    r_bcast: core::arch::x86_64::__m512i,
+    idx_even: core::arch::x86_64::__m512i,
+    idx_odd: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    unsafe {
+        let s = 2 * (base + t);
+        let lo = _mm512_loadu_si512(src.add(s) as *const __m512i);
+        let hi = _mm512_loadu_si512(src.add(s + 4) as *const __m512i);
+        let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+        let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+        _mm512_xor_si512(even, ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)))
+    }
+}
+
+/// Publish four F128s from one ZMM. 16-aligned dest uses XMM NT streams;
+/// otherwise `storeu`.
+///
+/// # Safety
+/// `dst.add(t)` covers four F128s; NT arm requires 16-byte alignment.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn publish_f128x4(
+    dst: *mut F128,
+    t: usize,
+    v: core::arch::x86_64::__m512i,
+    nt: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let p = dst.add(t);
+        if nt {
+            let d = p as *mut __m128i;
+            _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
+            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        } else {
+            _mm512_storeu_si512(p as *mut __m512i, v);
+        }
+    }
+}
+
+/// Register-publish leaf, 8 dest lanes per step, WideGhash `(u0,u2)`.
+/// Deletes the 32 KiB stage. Does not extract a reduced product every
+/// four lanes (`85b0943`).
+///
+/// # Safety
+/// Same contract as [`fold_and_msg_chunk_nt_x86`] minus the stage buffers.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_nt_x86_reg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    let nt = (fc.as_mut_ptr() as usize).is_multiple_of(16)
+        && (bc.as_mut_ptr() as usize).is_multiple_of(16);
+
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+        let f_src = f.as_ptr();
+        let b_src = b.as_ptr();
+        let f_dst = fc.as_mut_ptr();
+        let b_dst = bc.as_mut_ptr();
+
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let lanes = len & !7;
+        let mut t = 0usize;
+        while t < lanes {
+            let f0 = fold_pairs_x4(f_src, base, t, r_bcast, idx_even, idx_odd);
+            let f1 = fold_pairs_x4(f_src, base, t + 4, r_bcast, idx_even, idx_odd);
+            let b0 = fold_pairs_x4(b_src, base, t, r_bcast, idx_even, idx_odd);
+            let b1 = fold_pairs_x4(b_src, base, t + 4, r_bcast, idx_even, idx_odd);
+            publish_f128x4(f_dst, t, f0, nt);
+            publish_f128x4(f_dst, t + 4, f1, nt);
+            publish_f128x4(b_dst, t, b0, nt);
+            publish_f128x4(b_dst, t + 4, b1, nt);
+
+            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
+            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
+            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
+            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            t += 8;
+        }
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        while t + 1 < len {
+            let s = 2 * (base + t);
+            let f0e = *f_src.add(s);
+            let f0o = *f_src.add(s + 1);
+            let f1e = *f_src.add(s + 2);
+            let f1o = *f_src.add(s + 3);
+            let b0e = *b_src.add(s);
+            let b0o = *b_src.add(s + 1);
+            let b1e = *b_src.add(s + 2);
+            let b1o = *b_src.add(s + 3);
+            let f0v = f0e + r * (f0e + f0o);
+            let f1v = f1e + r * (f1e + f1o);
+            let b0v = b0e + r * (b0e + b0o);
+            let b1v = b1e + r * (b1e + b1o);
+            if nt {
+                let fd = f_dst.add(t) as *mut __m128i;
+                let bd = b_dst.add(t) as *mut __m128i;
+                _mm_stream_si128(fd, _mm_set_epi64x(f0v.hi as i64, f0v.lo as i64));
+                _mm_stream_si128(fd.add(1), _mm_set_epi64x(f1v.hi as i64, f1v.lo as i64));
+                _mm_stream_si128(bd, _mm_set_epi64x(b0v.hi as i64, b0v.lo as i64));
+                _mm_stream_si128(bd.add(1), _mm_set_epi64x(b1v.hi as i64, b1v.lo as i64));
+            } else {
+                *f_dst.add(t) = f0v;
+                *f_dst.add(t + 1) = f1v;
+                *b_dst.add(t) = b0v;
+                *b_dst.add(t + 1) = b1v;
+            }
+            u0 += f0v * b0v;
+            u2 += (f0v + f1v) * (b0v + b1v);
+            t += 2;
+        }
+        if nt {
+            _mm_sfence();
+        }
+        (u0, u2)
+    }
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
+/// [`msg_reduce_avx512`] on the folded slices). Default: eight dest lanes
+/// in registers, NT-publish, WideGhash `(u0,u2)`. `FLOCK_NO_OPEN_NT_REG_PUB=1`
+/// restores the incumbent 32 KiB stage store, stage reload, and NT copy.
+/// Next reader is the following sumcheck round, after a Fiat–Shamir grind —
+/// DRAM-cold when `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
 ///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
@@ -4175,6 +4363,11 @@ unsafe fn fold_and_msg_chunk_nt_x86(
     debug_assert_eq!(bc.len(), len);
     debug_assert!(len <= stage_f.len() && len <= stage_b.len());
     debug_assert!(len.is_multiple_of(2));
+
+    if open_nt_reg_pub_enabled() {
+        let _ = (stage_f, stage_b);
+        return unsafe { fold_and_msg_chunk_nt_x86_reg(f, b, base, fc, bc, r) };
+    }
 
     crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
     crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
