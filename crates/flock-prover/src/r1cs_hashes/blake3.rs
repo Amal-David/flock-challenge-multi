@@ -3192,7 +3192,15 @@ impl Blake3Setup {
             // makes the realised count come from the guard rather than from
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
+            // Two, not eleven. The eleven-pass count was promoted on a single
+            // official sample, and the whole-run statistic that sample moved is
+            // dominated by draw-to-draw variance at this scale. The low-variance
+            // readout of the same runs -- the tenth-percentile trial latency,
+            // which tracks score at r = -0.955 while being far less
+            // tail-sensitive -- ranks added untimed passes below the source
+            // without them every time it has been measured. This restores the
+            // pre-promotion count so the comparison is made directly.
+            const EXTRA_WARMUP_PROVES: usize = 2;
             const EXTRA_WARMUP_BUDGET: std::time::Duration =
                 std::time::Duration::from_secs(45);
             let warmup_started = std::time::Instant::now();
