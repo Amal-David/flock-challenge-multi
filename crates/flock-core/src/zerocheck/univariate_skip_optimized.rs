@@ -2408,11 +2408,33 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             }
         }
     }
-    for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+    // `eq_hi` scale of already-F128 banks. Not plane-madd (`9bf1385` /
+    // cancelled `6438d581`): reconstruct stays a separate kernel. The AB
+    // half of this finish already has an add_scaled path in `ab_only`;
+    // this is the C4 + AB finish of `process_one_x_hi`.
+    if r1_eqfold_x4_enabled() {
+        crate::field::f128_slice::add_scaled(
+            &mut state.local_res_ab,
+            &state.partial_ab,
+            eq_hi_val,
+        );
         for q in 0..N_C_Q {
             for bank in 0..N_C_BANKS {
-                state.local_res_c4[q][bank][lane] += eq_hi_val * state.partial_c4[q][bank][lane];
+                crate::field::f128_slice::add_scaled(
+                    &mut state.local_res_c4[q][bank],
+                    &state.partial_c4[q][bank],
+                    eq_hi_val,
+                );
+            }
+        }
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+            for q in 0..N_C_Q {
+                for bank in 0..N_C_BANKS {
+                    state.local_res_c4[q][bank][lane] +=
+                        eq_hi_val * state.partial_c4[q][bank][lane];
+                }
             }
         }
     }
