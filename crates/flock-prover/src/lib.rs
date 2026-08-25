@@ -29,5 +29,6 @@ pub mod seed_pipe;
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // resample gtr r1 20260819-1220
 
+// layout-roll-2048: inert 2048-byte layout re-roll of bar tree; algorithm + proof bytes identical.
 #[used]
-static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+static LAYOUT_ROLL_2048: [u8; 2048] = [0u8; 2048];
