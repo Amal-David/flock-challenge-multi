@@ -3192,9 +3192,9 @@ impl Blake3Setup {
             // makes the realised count come from the guard rather than from
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
+            const EXTRA_WARMUP_PROVES: usize = 13;
             const EXTRA_WARMUP_BUDGET: std::time::Duration =
-                std::time::Duration::from_secs(45);
+                std::time::Duration::from_secs(120);
             let warmup_started = std::time::Instant::now();
             for _ in 0..EXTRA_WARMUP_PROVES {
                 let mut warm_challenger =
