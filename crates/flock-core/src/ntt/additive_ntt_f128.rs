@@ -266,6 +266,16 @@ fn ntt_direct_fused2_publish_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
 }
 
+/// `FLOCK_NO_NTT_SCATTER_SFENCE_HOIST=1` restores the per-task `_mm_sfence`
+/// after each seed-top NT publish. Default: fence once when the worker's
+/// staging buffer is dropped (rayon job / serial pass).
+#[inline]
+#[cfg(target_arch = "x86_64")]
+fn ntt_scatter_sfence_hoist_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_SFENCE_HOIST").is_some())
+}
+
 /// `FLOCK_NO_NTT_SEED_HOLD4=1` restores the two-gather seed step (sparse
 /// 2-layer then dense 2-layer, each loading the same four message rows).
 /// Default ON: one load, both staging groups from those registers.
@@ -736,6 +746,28 @@ fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
             let mut v = crate::alloc_uninit_vec::<F128>(n);
             v.fill(STAGING_POISON);
             v
+        }
+    }
+}
+
+/// Seed-top worker staging. On x86, Drop drains this thread's WC buffers of
+/// NT publishes unless `FLOCK_NO_NTT_SCATTER_SFENCE_HOIST` restores the
+/// per-task fence. Rayon `for_each_init` drops one of these per job.
+struct SeedTopNtBuf {
+    buf: Vec<F128>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for SeedTopNtBuf {
+    fn drop(&mut self) {
+        if ntt_scatter_sfence_hoist_disabled() {
+            return;
+        }
+        // SAFETY: sfence is x86_64 baseline. It orders this thread's prior
+        // MOVNTDQ against later same-thread loads of those addresses. The
+        // rayon join is the deep pass's cross-thread acquire.
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
         }
     }
 }
@@ -2110,9 +2142,11 @@ impl AdditiveNttF128 {
                             &tw4,
                         );
                     }
-                    // All 512 rows are published. Drain once for this r task;
-                    // the rayon join below is the deep pass's happens-before.
-                    core::arch::x86_64::_mm_sfence();
+                    // Per-task drain only under FLOCK_NO_NTT_SCATTER_SFENCE_HOIST;
+                    // SeedTopNtBuf Drop is the default WC drain.
+                    if ntt_scatter_sfence_hoist_disabled() {
+                        core::arch::x86_64::_mm_sfence();
+                    }
                     return;
                 }
                 // Layers 3..9 per block, in the staging block.
@@ -2156,9 +2190,9 @@ impl AdditiveNttF128 {
                             );
                         }
                     }
-                    // Drain the WC buffers before this task returns; the
-                    // rayon join below is the reader's happens-before edge.
-                    core::arch::x86_64::_mm_sfence();
+                    if ntt_scatter_sfence_hoist_disabled() {
+                        core::arch::x86_64::_mm_sfence();
+                    }
                     return;
                 }
                 for block in 0..8 {
@@ -2177,16 +2211,22 @@ impl AdditiveNttF128 {
         // Staging is write-before-read: the seed kernels write all 512 rows
         // (all lanes) before the layer loops read any of them, so the
         // 512 KiB zero-fill per init was dead work — rayon runs the
-        // initializer once per JOB, not per worker.
+        // initializer once per JOB, not per worker. SeedTopNtBuf Drop is
+        // the matching once-per-job NT sfence (kill switch: per-task).
         if sub_stride < PARALLEL_TASK_THRESHOLD {
-            let mut buf = staging_block(512, row_len);
+            let mut wrap = SeedTopNtBuf {
+                buf: staging_block(512, row_len),
+            };
             for r in 0..sub_stride {
-                task(&mut buf, r);
+                task(&mut wrap.buf, r);
             }
         } else {
-            (0..sub_stride)
-                .into_par_iter()
-                .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+            (0..sub_stride).into_par_iter().for_each_init(
+                || SeedTopNtBuf {
+                    buf: staging_block(512, row_len),
+                },
+                |wrap, r| task(&mut wrap.buf, r),
+            );
         }
     }
 
