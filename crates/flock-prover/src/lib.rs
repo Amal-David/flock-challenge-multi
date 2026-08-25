@@ -31,3 +31,9 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+// layout-roll-2048-on-bar: inert 2048-byte re-roll ON TOP of the promoted bar tree (94eb4be); zero algorithm delta.
+#[used]
+static LAYOUT_ROLL_2048: [u8; 2048] = [0u8; 2048];
+// resample-3: inert comment bump to re-arm the bar+2048 ticket (resample-2
+// used //! inner-doc comments after items, E0753, platform Setup failed);
+// zero algorithm delta (same tree as e5d3f2b, new HEAD for the refire).
