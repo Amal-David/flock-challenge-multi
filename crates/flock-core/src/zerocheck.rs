@@ -137,6 +137,15 @@ pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE6_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE7_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static ZC_CASCADE8_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// `FLOCK_NO_ZC_CASCADE4=1` stops the cascade after rounds 7+8 (the incumbent
 /// frontier behavior); the default runs one more composed pass over rounds
@@ -166,6 +175,40 @@ fn cascade5_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
+}
+
+/// Cascade levels 5 and 6 (rounds 13+14, 15+16) ship on: the kill switches
+/// restore the prior frontier (cascade5 = stop after rounds 11+12, cascade6
+/// = stop after 13+14). Same value-identity argument as the earlier levels —
+/// pure reassociation of exact F128 arithmetic, transcript order untouched —
+/// so the `prove_transcript_identical_*` tests cover both. Independent
+/// same-binary control; the ranked worker's cleared environment never sets
+/// them.
+#[inline]
+fn cascade6_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE6_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE6").is_some()
+}
+
+#[inline]
+fn cascade7_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE7_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE7").is_some()
+}
+
+#[inline]
+fn cascade8_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE8_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE8").is_some()
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -822,19 +865,37 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    // Levels 5 and 6 (rounds 13+14, 15+16) extend the same chain. Their
+    // parity weights r[k_skip+11] / r[k_skip+13] are sampled slots (the
+    // seven protocol constants end at k_skip+6), so they are non-zero except
+    // with probability 2^-128; the chain stops a level earlier otherwise.
+    // The n_mlv floors keep the last composed pass's input at 2^4 (16)
+    // elements with the same margin as the shipped level-3/4 gates.
+    let use_cascade6 =
+        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO && !cascade6_off();
+    let use_cascade7 =
+        use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO && !cascade7_off();
+    let use_cascade8 =
+        use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO && !cascade8_off();
     let n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
         use_cascade4,
         use_cascade5,
+        use_cascade6,
+        use_cascade7,
+        use_cascade8,
     ) {
         (false, ..) => 0,
         (true, false, ..) => 1,
         (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+        (true, true, true, false, _, _, _, _) => 3,
+        (true, true, true, true, false, _, _, _) => 4,
+        (true, true, true, true, true, false, _, _) => 5,
+        (true, true, true, true, true, true, false, _) => 6,
+        (true, true, true, true, true, true, true, false) => 7,
+        (true, true, true, true, true, true, true, true) => 8,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -1328,6 +1389,9 @@ mod tests {
             (17, false),
             (18, false),
             (19, false),
+            (20, false),
+            (22, false),
+            (24, false),
             (17, true),
             (18, true),
         ] {
@@ -1356,17 +1420,27 @@ mod tests {
             // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
             // nomat) forced-off flags.
             let arms = [
-                (false, false, false, false, false, false), // full: nomat sweep + every level
-                (false, false, false, false, false, true),  // materializing sweep + every level
-                (false, false, false, false, true, false),  // cascade capped at level 3
-                (false, false, false, true, true, false),   // capped at level 2 (frontier)
-                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
-                (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true),      // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),       // incumbent
+                // (la, c2, c3, c4, c5, c6, c7, c8, nomat) forced-off flags.
+                (false, false, false, false, false, false, false, false, false), // full
+                (false, false, false, false, false, false, false, false, true),  // materializing sweep + every level
+                (false, false, false, false, true, true, true, true, false),     // cascade capped at level 3
+                (false, false, false, true, true, true, true, true, false),      // capped at level 2 (frontier)
+                (false, false, true, true, true, true, true, true, false),       // nomat + lookahead + cascade2
+                (false, true, true, true, true, true, true, true, false),        // nomat + lookahead only
+                (false, true, true, true, true, true, true, true, true),         // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true, true, true, true),          // incumbent
+                (false, false, false, false, false, true, true, true, false),    // capped at level 4 (5 levels)
+                (false, false, false, false, false, false, true, true, false),   // capped at level 5 (6 levels)
+                (false, false, false, false, false, false, false, true, false),  // capped at level 6 (7 levels)
             ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 12 {
+            let all = if n_mlv >= 18 {
+                8
+            } else if n_mlv >= 16 {
+                7
+            } else if n_mlv >= 14 {
+                6
+            } else if n_mlv >= 12 {
                 5
             } else if n_mlv >= 10 {
                 4
@@ -1386,15 +1460,24 @@ mod tests {
                 1,
                 1,
                 0,
+                all.min(5),
+                all.min(6),
+                all.min(7),
             ];
-            let expect_nomat = [true, false, true, true, true, true, false, false];
+            let expect_nomat = [true, false, true, true, true, true, false, false, true, true, true];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, c6_off, c7_off, c8_off, nm_off)) in
+                arms.iter()
+                .enumerate()
+            {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
                 ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
+                ZC_CASCADE6_FORCED_OFF.store(c6_off, Ordering::Relaxed);
+                ZC_CASCADE7_FORCED_OFF.store(c7_off, Ordering::Relaxed);
+                ZC_CASCADE8_FORCED_OFF.store(c8_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1414,6 +1497,9 @@ mod tests {
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE6_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE7_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE8_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
