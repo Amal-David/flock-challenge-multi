@@ -61,6 +61,8 @@
 //! - `FLOCK_NO_SEED_PIPE=1` disables the full mechanism.
 //! - `FLOCK_NO_DIRECT_PROOF_PUBLISH=1` restores immediate seed forwarding and
 //!   adoption for exact same-binary diagnostics.
+//! - `FLOCK_NO_DIRECT_STREAM_PUBLISH=1` keeps direct publication but restores
+//!   the incumbent whole-Vec encode followed by `std::fs::write`.
 //! - The speculative body runs under `catch_unwind`; a panic forwards the
 //!   original seed and marks the pipe dead so the worker proves normally.
 //! - A direct write uses the worker's existing `proof.tmp` then atomic rename
@@ -542,13 +544,25 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
-fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
+fn direct_stream_publish_enabled() -> bool {
+    direct_stream_publish_decision(std::env::var_os("FLOCK_NO_DIRECT_STREAM_PUBLISH").as_deref())
+}
+
+fn direct_stream_publish_decision(kill: Option<&std::ffi::OsStr>) -> bool {
+    kill != Some(std::ffi::OsStr::new("1"))
+}
+
+fn publish_direct_proof(path: &Path, out: ProveOut, stream: bool) -> std::io::Result<()> {
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
+    if stream {
+        crate::proof_io::write_r1cs_bundle_streaming_to_file(&temporary, &bundle)?;
+    } else {
+        std::fs::write(&temporary, bundle.to_bytes())?;
+    }
     std::fs::rename(temporary, path)
 }
 
@@ -713,6 +727,9 @@ fn speculative_main(
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
+    // Read the same-binary kill switch before the untimed thread warm-up and
+    // before this thread touches the harness seed.
+    let stream_direct = direct_proof_path.is_some() && direct_stream_publish_enabled();
 
     // Untimed: prove once on THIS thread before touching stdin, so that the
     // speculative (timed) prove does not run on a cold thread. The prover's
@@ -798,6 +815,7 @@ fn speculative_main(
     }
 
     let seed_at = std::time::Instant::now();
+    let streaming_prefix = stream_direct.then(crate::proof_io::streaming_prefix_scope);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Inline path: nothing is materialized except the two blocks the O(1)
         // adoption gate reads. Everything else is evaluated inside witgen from
@@ -838,11 +856,15 @@ fn speculative_main(
         }
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
+    // Any prefix helper spawned by `run` has joined before the prove returns.
+    // Restore normal full-capacity pre-encoding before a failure can forward
+    // the seed and let the protected main thread re-prove.
+    drop(streaming_prefix);
 
     match (direct_proof_path.as_deref(), outcome) {
         (Some(path), Ok(out)) => {
             let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_direct_proof(path, out)
+                publish_direct_proof(path, out, stream_direct)
             }))
             .is_ok_and(|result| result.is_ok());
             if published {
@@ -1093,6 +1115,15 @@ mod tests {
         assert!(inline_block_gen_decision(true, Some(OsStr::new(""))));
         // The shipped default: cleared environment + verified generator.
         assert!(inline_block_gen_decision(true, None));
+    }
+
+    #[test]
+    fn direct_stream_publish_kill_is_exact() {
+        use std::ffi::OsStr;
+        assert!(direct_stream_publish_decision(None));
+        assert!(!direct_stream_publish_decision(Some(OsStr::new("1"))));
+        assert!(direct_stream_publish_decision(Some(OsStr::new("0"))));
+        assert!(direct_stream_publish_decision(Some(OsStr::new(""))));
     }
 
     /// Endpoint gate and full gate must accept and reject the same inputs, and

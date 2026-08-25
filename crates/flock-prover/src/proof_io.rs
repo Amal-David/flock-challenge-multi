@@ -29,7 +29,7 @@
 //! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
 //! ```
 
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,27 @@ impl R1csProofBundleLigerito {
         }
         out
     }
+
+    /// Write this bundle directly to a sink without materializing the full
+    /// encoded proof in a `Vec<u8>`. The dominant PCS section uses the same
+    /// flat, bincode-compatible encoder as [`Self::to_bytes`].
+    pub(crate) fn write_streaming<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        if let Some(prefix) = take_matching_pre_encoded(self) {
+            out.write_all(&prefix)?;
+        } else {
+            write_header_to(out, FLAVOR_R1CS_LIGERITO)?;
+            if fast_pcs_open_encode_enabled() {
+                serialize_into_io(out, &self.commitment)?;
+                serialize_into_io(out, &self.proof.zerocheck)?;
+                serialize_into_io(out, &self.proof.lincheck)?;
+            } else {
+                serialize_into_io(out, self)?;
+                return Ok(());
+            }
+        }
+        encode_pcs_open_to(out, &self.proof.pcs_open)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
@@ -232,6 +253,25 @@ struct PreEncodedPrefix {
 /// by the fingerprint and falls back to the full encode.
 static PRE_ENCODED: std::sync::Mutex<Option<PreEncodedPrefix>> = std::sync::Mutex::new(None);
 
+/// Direct publication streams the PCS tail, so retaining the normal 460 kB
+/// spare capacity in the prefix would keep the very allocation this path is
+/// meant to delete. The ranked worker has only one prove in flight; a scoped
+/// guard narrows the small-prefix policy to that direct prove.
+static STREAMING_PREFIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) struct StreamingPrefixGuard;
+
+impl Drop for StreamingPrefixGuard {
+    fn drop(&mut self) {
+        STREAMING_PREFIX.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) fn streaming_prefix_scope() -> StreamingPrefixGuard {
+    STREAMING_PREFIX.store(true, std::sync::atomic::Ordering::Release);
+    StreamingPrefixGuard
+}
+
 /// `FLOCK_NO_PRE_ENCODE=1` restores the incumbent single-shot bundle encode.
 /// The ranked harness `env_clear()`s, so pre-encode is the default.
 pub(crate) fn pre_encode_enabled() -> bool {
@@ -251,9 +291,15 @@ pub fn stash_pre_encoded_prefix(
     if !pre_encode_enabled() {
         return;
     }
-    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
-    // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
+    // The normal path reserves the entire output so `to_bytes` never grows.
+    // A direct streaming prove only retains the prefix bytes: its PCS tail is
+    // written into a bounded BufWriter instead of appended to this Vec.
+    let capacity = if STREAMING_PREFIX.load(std::sync::atomic::Ordering::Acquire) {
+        HEADER_LEN + 8 * 1024
+    } else {
+        HEADER_LEN + 460_000
+    };
+    let mut bytes = Vec::with_capacity(capacity);
     write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
     let mut sec_lens = [0u64; 3];
     let mut mark = bytes.len();
@@ -347,18 +393,21 @@ fn fast_pcs_open_encode_enabled() -> bool {
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
 fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
+    encode_pcs_open_to(out, p).expect("Vec writes cannot fail");
+}
+
+fn encode_pcs_open_to<W: Write>(out: &mut W, p: &BatchOpeningProofLigerito) -> io::Result<()> {
     if !fast_pcs_open_encode_enabled() {
-        bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
-        return;
+        return serialize_into_io(out, p);
     }
     let BatchOpeningProofLigerito {
         ring_switches,
         ligerito,
     } = p;
-    put_u64(out, ring_switches.len() as u64);
+    put_u64(out, ring_switches.len() as u64)?;
     for rs in ring_switches {
         let RingSwitchProof { s_hat_v } = rs;
-        put_f128_vec(out, s_hat_v);
+        put_f128_vec(out, s_hat_v)?;
     }
     let LigeritoProof {
         initial_root,
@@ -371,83 +420,85 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ood_values,
         fold_grinding_nonces,
     } = ligerito;
-    out.extend_from_slice(initial_root);
-    put_recursive_proof(out, initial_proof);
-    put_hash_vec(out, recursive_roots);
-    put_u64(out, recursive_proofs.len() as u64);
+    out.write_all(initial_root)?;
+    put_recursive_proof(out, initial_proof)?;
+    put_hash_vec(out, recursive_roots)?;
+    put_u64(out, recursive_proofs.len() as u64)?;
     for rp in recursive_proofs {
-        put_recursive_proof(out, rp);
+        put_recursive_proof(out, rp)?;
     }
     let FinalProof {
         yr,
         opened_rows,
         merkle_proof,
     } = final_proof;
-    put_f128_vec(out, yr);
-    put_rows(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
-    put_u64(out, sumcheck_transcript.len() as u64);
+    put_f128_vec(out, yr)?;
+    put_rows(out, opened_rows)?;
+    put_hash_vec(out, merkle_proof)?;
+    put_u64(out, sumcheck_transcript.len() as u64)?;
     for m in sumcheck_transcript {
         let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
+        put_f128(out, *u_0)?;
+        put_f128(out, *u_2)?;
     }
-    put_u64_vec(out, grinding_nonces);
-    put_f128_vec(out, ood_values);
-    put_u64_vec(out, fold_grinding_nonces);
+    put_u64_vec(out, grinding_nonces)?;
+    put_f128_vec(out, ood_values)?;
+    put_u64_vec(out, fold_grinding_nonces)
 }
 
-fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
+fn put_recursive_proof<W: Write>(out: &mut W, rp: &RecursiveProof) -> io::Result<()> {
     let RecursiveProof {
         opened_rows,
         merkle_proof,
     } = rp;
-    put_rows(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
+    put_rows(out, opened_rows)?;
+    put_hash_vec(out, merkle_proof)
 }
 
 #[inline]
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+fn put_u64<W: Write>(out: &mut W, v: u64) -> io::Result<()> {
+    out.write_all(&v.to_le_bytes())
 }
 
 #[inline]
-fn put_f128(out: &mut Vec<u8>, v: F128) {
-    put_u64(out, v.lo);
-    put_u64(out, v.hi);
+fn put_f128<W: Write>(out: &mut W, v: F128) -> io::Result<()> {
+    put_u64(out, v.lo)?;
+    put_u64(out, v.hi)
 }
 
 #[inline]
-fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
-    put_u64(out, v.len() as u64);
+fn put_f128_vec<W: Write>(out: &mut W, v: &[F128]) -> io::Result<()> {
+    put_u64(out, v.len() as u64)?;
     // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
     // (size 16, no padding), so on a little-endian target the in-memory bytes
     // of a slice are precisely the bincode-fixint encoding of its elements.
     // The fast path is compile-time gated to little-endian above.
     let bytes =
         unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
-    out.extend_from_slice(bytes);
+    out.write_all(bytes)
 }
 
 #[inline]
-fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
-    put_u64(out, v.len() as u64);
-    out.extend_from_slice(v.as_flattened());
+fn put_hash_vec<W: Write>(out: &mut W, v: &[MerkleHash]) -> io::Result<()> {
+    put_u64(out, v.len() as u64)?;
+    out.write_all(v.as_flattened())
 }
 
 #[inline]
-fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
-    put_u64(out, v.len() as u64);
+fn put_u64_vec<W: Write>(out: &mut W, v: &[u64]) -> io::Result<()> {
+    put_u64(out, v.len() as u64)?;
     for &x in v {
-        put_u64(out, x);
+        put_u64(out, x)?;
     }
+    Ok(())
 }
 
-fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
-    put_u64(out, rows.len() as u64);
+fn put_rows<W: Write>(out: &mut W, rows: &[Vec<F128>]) -> io::Result<()> {
+    put_u64(out, rows.len() as u64)?;
     for row in rows {
-        put_f128_vec(out, row);
+        put_f128_vec(out, row)?;
     }
+    Ok(())
 }
 
 impl ChainProofBundleLigerito {
@@ -472,6 +523,34 @@ fn write_header(out: &mut Vec<u8>, flavor: u8) {
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
     out.push(flavor);
+}
+
+fn write_header_to<W: Write>(out: &mut W, flavor: u8) -> io::Result<()> {
+    out.write_all(&MAGIC)?;
+    out.write_all(&[VERSION, flavor])
+}
+
+fn serialize_into_io<W: Write, T: Serialize + ?Sized>(out: &mut W, value: &T) -> io::Result<()> {
+    bincode::serialize_into(out, value).map_err(|error| match *error {
+        bincode::ErrorKind::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    })
+}
+
+/// Stream one R1CS bundle through a bounded userspace buffer. The 128 KiB
+/// buffer coalesces the flat encoder's small length fields while allowing its
+/// large F128/hash slices to remain bulk writes.
+pub(crate) fn write_r1cs_bundle_streaming_to_file<P: AsRef<Path>>(
+    path: P,
+    bundle: &R1csProofBundleLigerito,
+) -> io::Result<()> {
+    const STREAM_BUFFER_BYTES: usize = 128 * 1024;
+    let file = std::fs::File::create(path)?;
+    let mut out = io::BufWriter::with_capacity(STREAM_BUFFER_BYTES, file);
+    bundle.write_streaming(&mut out)?;
+    out.flush()?;
+    drop(out);
+    Ok(())
 }
 
 fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeError> {
@@ -569,6 +648,60 @@ mod tests {
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress, cv_to_phys_bits};
     use flock_core::challenger::FsChallenger;
 
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let n = bytes.len().min(self.max_write);
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailAfter {
+        remaining: usize,
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "injected failure"));
+            }
+            let n = bytes.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// SplitMix64.
     struct Rng(u64);
     impl Rng {
@@ -661,6 +794,37 @@ mod tests {
                 flat, incumbent,
                 "flat encoder diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
             );
+
+            // `write_all` must tolerate a sink that accepts only three bytes
+            // per call; this exercises every scalar and bulk field boundary.
+            let mut short = ShortWriter {
+                bytes: Vec::new(),
+                max_write: 3,
+            };
+            encode_pcs_open_to(&mut short, &proof).expect("short writes are retried");
+            assert_eq!(short.bytes, incumbent, "short-write sink diverged");
+
+            // A hard sink error is returned to the atomic publisher rather
+            // than converted into a partial-success proof.
+            let mut failing = FailAfter {
+                remaining: incumbent.len() / 2,
+            };
+            assert!(encode_pcs_open_to(&mut failing, &proof).is_err());
+
+            // The production-sized userspace buffer must coalesce the flat
+            // encoder's many logical writes into a bounded underlying count.
+            let mut counted = CountingWriter::default();
+            {
+                let mut buffered = io::BufWriter::with_capacity(128 * 1024, &mut counted);
+                encode_pcs_open_to(&mut buffered, &proof).expect("buffered encode");
+                buffered.flush().expect("buffered flush");
+            }
+            assert_eq!(counted.bytes, incumbent, "buffered sink diverged");
+            assert!(
+                counted.writes <= 2,
+                "small oracle unexpectedly expanded to {} underlying writes",
+                counted.writes
+            );
         }
     }
 
@@ -707,14 +871,72 @@ mod tests {
         let mut reference = Vec::new();
         write_header(&mut reference, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut reference, &bundle).expect("reference serialize");
-        assert_eq!(bytes, reference, "fast to_bytes diverged from single-shot bincode");
+        assert_eq!(
+            bytes, reference,
+            "fast to_bytes diverged from single-shot bincode"
+        );
+
+        let mut streamed = ShortWriter {
+            bytes: Vec::new(),
+            max_write: 7,
+        };
+        bundle
+            .write_streaming(&mut streamed)
+            .expect("whole-bundle short-write stream");
+        assert_eq!(streamed.bytes, reference, "streamed bundle diverged");
 
         // The pre-encoded-prefix path must also reproduce the same bytes.
-        stash_pre_encoded_prefix(&bundle.commitment, &bundle.proof.zerocheck, &bundle.proof.lincheck);
+        let streaming_scope = streaming_prefix_scope();
+        stash_pre_encoded_prefix(
+            &bundle.commitment,
+            &bundle.proof.zerocheck,
+            &bundle.proof.lincheck,
+        );
+        drop(streaming_scope);
+        let prefix_capacity = PRE_ENCODED
+            .lock()
+            .expect("prefix lock")
+            .as_ref()
+            .expect("prefix present")
+            .bytes
+            .capacity();
+        assert!(
+            prefix_capacity < 64 * 1024,
+            "streaming prefix retained whole-output capacity: {prefix_capacity}"
+        );
+        let mut streamed_stash = Vec::new();
+        bundle
+            .write_streaming(&mut streamed_stash)
+            .expect("stashed streaming encode");
+        assert_eq!(
+            streamed_stash, reference,
+            "stashed-prefix streaming encode diverged"
+        );
+
+        stash_pre_encoded_prefix(
+            &bundle.commitment,
+            &bundle.proof.zerocheck,
+            &bundle.proof.lincheck,
+        );
         assert_eq!(
             bundle.to_bytes(),
             reference,
             "stashed-prefix to_bytes diverged"
+        );
+
+        let mut counted = CountingWriter::default();
+        {
+            let mut buffered = io::BufWriter::with_capacity(128 * 1024, &mut counted);
+            bundle
+                .write_streaming(&mut buffered)
+                .expect("whole-bundle buffered stream");
+            buffered.flush().expect("whole-bundle buffered flush");
+        }
+        assert_eq!(counted.bytes, reference, "buffered bundle diverged");
+        assert!(
+            counted.writes <= 4,
+            "266 KiB proof expanded to {} underlying writes",
+            counted.writes
         );
 
         let bundle2 = R1csProofBundleLigerito::from_bytes(&bytes).expect("must round-trip");
@@ -750,6 +972,12 @@ mod tests {
         setup
             .verify(&bundle4.commitment, &bundle4.proof, &mut chv)
             .expect("verify after file round-trip");
+
+        let stream_path = std::env::temp_dir().join("flock-proofio-stream-roundtrip.bin");
+        write_r1cs_bundle_streaming_to_file(&stream_path, &bundle).expect("stream file write");
+        let stream_read_back = read_bytes_from_file(&stream_path).expect("stream file read");
+        let _ = std::fs::remove_file(&stream_path);
+        assert_eq!(stream_read_back, reference, "streamed file bytes diverged");
 
         eprintln!(
             "Ligerito R1csProofBundle: {} bytes ({:.1} KB)",
