@@ -370,11 +370,15 @@ pub fn prove_ligerito<Ch: Challenger>(
         precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
+    // The opener only borrows its two claims. Move them into the exact slice
+    // it consumes, then recover ownership for the returned public claim; this
+    // deletes two point-vector clones from the ranked open prologue.
+    let open_claims = [ab, c];
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
-        &[ab.clone(), c.clone()],
+        &open_claims,
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
@@ -386,6 +390,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         lincheck: lc_proof,
         pcs_open,
     };
+    let [ab, c] = open_claims;
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim)
 }
