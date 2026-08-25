@@ -796,6 +796,15 @@ fn spread_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_WIT_SKIP_STAGE=1` restores the spread drain's a/b staging stores
+/// and the matching staging reload in [`StepRows::publish`]. Ranked env is
+/// cleared, so offset-eligible windows skip that bounce.
+fn skip_stage_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIT_SKIP_STAGE").is_none());
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -923,11 +932,10 @@ unsafe fn emit_pair(
 /// One drain step's three destination rows, staged for publication BETWEEN
 /// block transforms by [`StreamProj::project_blocks`].
 ///
-/// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// z is always published from the drain-frame transpose arrays. a/b follow
+/// the same shape when [`skip_stage_enabled`]: `a_lo`/`b_lo` point at those
+/// arrays and `publish` does not reload the projection staging. Null
+/// `a_lo` restores the incumbent staging reload (`FLOCK_NO_WIT_SKIP_STAGE`).
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
@@ -935,6 +943,10 @@ struct StepRows {
     b: *mut u32,
     z_lo: *const V8,
     z_hi: *const V8,
+    a_lo: *const V8,
+    a_hi: *const V8,
+    b_lo: *const V8,
+    b_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -960,21 +972,31 @@ impl StepRows {
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
+            let (a_lo, a_hi) = if self.a_lo.is_null() {
+                let p = sa.add(j * STEP_WORDS);
+                (load_v8(p), load_v8(p.add(8)))
+            } else {
+                (*self.a_lo.add(j), *self.a_hi.add(j))
+            };
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
+            let (b_lo, b_hi) = if self.b_lo.is_null() {
+                let p = sb.add(j * STEP_WORDS);
+                (load_v8(p), load_v8(p.add(8)))
+            } else {
+                (*self.b_lo.add(j), *self.b_hi.add(j))
+            };
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1225,6 +1247,7 @@ impl Drain8<'_> {
             if self.wide_nt {
                 base |= 0x80;
             }
+            let skip_stage = skip_stage_enabled();
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
@@ -1241,18 +1264,23 @@ impl Drain8<'_> {
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                 let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
 
-                // Transpose the two ring sides first. a and b go straight
-                // into the projection's staging — which is both its input AND
-                // the bytes the main buffers get, so nothing is published yet.
+                // Transpose the two ring sides first. Offset-eligible windows
+                // never reload staging (`round1_ab_inner_window_from_offsets`
+                // consumes the arena), so skipping the a/b `store_v8`s deletes
+                // a 1 KiB bounce the kernel does not read. Static-B windows
+                // still stage: their kernel reads the 64-byte windows.
                 // Every packed row satisfies `z = a & b` and `tr8` is a bit
                 // permutation, so the Z rows are derived from the transposed
                 // A/B rows instead of transposing a third Z ring.
+                let store_ab = !skip_stage || !use_off;
                 let a_lo = tr8_chunk(self.ast, rw);
                 let a_hi = tr8_chunk(self.ast, rw + 8);
                 for r in 0..8 {
-                    let p = sa.add(r * STEP_WORDS);
-                    store_v8(p, a_lo[r]);
-                    store_v8(p.add(8), a_hi[r]);
+                    if store_ab {
+                        let p = sa.add(r * STEP_WORDS);
+                        store_v8(p, a_lo[r]);
+                        store_v8(p.add(8), a_hi[r]);
+                    }
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
                         widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
@@ -1261,9 +1289,11 @@ impl Drain8<'_> {
                 let b_lo = tr8_chunk(self.bs, rw);
                 let b_hi = tr8_chunk(self.bs, rw + 8);
                 for r in 0..8 {
-                    let p = sb.add(r * STEP_WORDS);
-                    store_v8(p, b_lo[r]);
-                    store_v8(p.add(8), b_hi[r]);
+                    if store_ab {
+                        let p = sb.add(r * STEP_WORDS);
+                        store_v8(p, b_lo[r]);
+                        store_v8(p.add(8), b_hi[r]);
+                    }
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
                         widen_off_half(
@@ -1302,6 +1332,26 @@ impl Drain8<'_> {
                     b: self.b.add(abs_word),
                     z_lo: z_lo.as_ptr(),
                     z_hi: z_hi.as_ptr(),
+                    a_lo: if skip_stage {
+                        a_lo.as_ptr()
+                    } else {
+                        core::ptr::null()
+                    },
+                    a_hi: if skip_stage {
+                        a_hi.as_ptr()
+                    } else {
+                        core::ptr::null()
+                    },
+                    b_lo: if skip_stage {
+                        b_lo.as_ptr()
+                    } else {
+                        core::ptr::null()
+                    },
+                    b_hi: if skip_stage {
+                        b_hi.as_ptr()
+                    } else {
+                        core::ptr::null()
+                    },
                     flags,
                 };
 
@@ -2084,6 +2134,53 @@ mod tests {
             return;
         }
         unsafe { tr8_check() }
+    }
+
+    /// The skip-stage publish arm reads the same V8s the incumbent reloads
+    /// from staging: transpose-array lanes equal the staged 64-byte windows.
+    #[test]
+    fn skip_stage_publish_sources_match_staging() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            let mut sa = [0u32; 8 * STEP_WORDS];
+            let mut sb = [0u32; 8 * STEP_WORDS];
+            let mut a_lo = [dup_u32(0); 8];
+            let mut a_hi = [dup_u32(0); 8];
+            let mut b_lo = [dup_u32(0); 8];
+            let mut b_hi = [dup_u32(0); 8];
+            for r in 0..8 {
+                let mut alo = [0u32; 8];
+                let mut ahi = [0u32; 8];
+                let mut blo = [0u32; 8];
+                let mut bhi = [0u32; 8];
+                for k in 0..8 {
+                    alo[k] = 0xA000_0000 | ((r as u32) << 8) | k as u32;
+                    ahi[k] = 0xA100_0000 | ((r as u32) << 8) | k as u32;
+                    blo[k] = 0xB000_0000 | ((r as u32) << 8) | k as u32;
+                    bhi[k] = 0xB100_0000 | ((r as u32) << 8) | k as u32;
+                }
+                a_lo[r] = load_v8(alo.as_ptr());
+                a_hi[r] = load_v8(ahi.as_ptr());
+                b_lo[r] = load_v8(blo.as_ptr());
+                b_hi[r] = load_v8(bhi.as_ptr());
+                let pa = sa.as_mut_ptr().add(r * STEP_WORDS);
+                let pb = sb.as_mut_ptr().add(r * STEP_WORDS);
+                store_v8(pa, a_lo[r]);
+                store_v8(pa.add(8), a_hi[r]);
+                store_v8(pb, b_lo[r]);
+                store_v8(pb.add(8), b_hi[r]);
+            }
+            for j in 0..8 {
+                let pa = sa.as_ptr().add(j * STEP_WORDS);
+                let pb = sb.as_ptr().add(j * STEP_WORDS);
+                assert_eq!(lanes(load_v8(pa)), lanes(a_lo[j]), "a_lo j={j}");
+                assert_eq!(lanes(load_v8(pa.add(8))), lanes(a_hi[j]), "a_hi j={j}");
+                assert_eq!(lanes(load_v8(pb)), lanes(b_lo[j]), "b_lo j={j}");
+                assert_eq!(lanes(load_v8(pb.add(8))), lanes(b_hi[j]), "b_hi j={j}");
+            }
+        }
     }
 
     unsafe fn tr8_check() {
