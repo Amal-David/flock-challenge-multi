@@ -31,3 +31,6 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+#[used]
+static VIBE_LAYOUT_RECLAIM_5: [u8; 11814] = [0u8; 11814];
