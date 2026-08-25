@@ -10,6 +10,23 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_FUSED4_WAVE8=1` restores the 16-slot row array held across
+/// all four layers. Default: layer 0 runs as eight 2-ZMM pairs into an L1
+/// tmp, then two independent 8-row inner waves. Eight live row ZMMs, same
+/// 32 butterflies, same destinations, same bytes.
+fn ntt_fused4_wave8_enabled() -> bool {
+    #[cfg(test)]
+    if FUSED4_WAVE8_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED4_WAVE8").is_none())
+}
+
+#[cfg(test)]
+static FUSED4_WAVE8_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -1089,6 +1106,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
+        macro_rules! butterfly8 {
+            ($vals:ident, $u:expr, $v:expr, $twiddle:expr) => {{
+                let new_u =
+                    _mm512_xor_si512($vals[$u], mul_x4::<false, DIET>($twiddle, $vals[$v]));
+                $vals[$v] = _mm512_xor_si512($vals[$v], new_u);
+                $vals[$u] = new_u;
+            }};
+        }
+
         while lane < lanes {
             if H != 0 {
                 let off = lane * core::mem::size_of::<F128>();
@@ -1101,43 +1127,104 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     }
                 }
             }
-            let mut values = [zero; 16];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
-            }
-
-            macro_rules! butterfly {
-                ($u:expr, $v:expr, $twiddle:expr) => {{
-                    let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
-                    values[$v] = _mm512_xor_si512(values[$v], new_u);
-                    values[$u] = new_u;
-                }};
-            }
-
-            let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
-            }
-            for s in 0..2 {
-                let twiddle = tw[1 + s];
-                for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+            if ntt_fused4_wave8_enabled() {
+                // Layer 0: eight independent (i, i+8) pairs, two live ZMMs.
+                // Results land in an L1 tmp; each 8-row half of layers 1–3
+                // then holds eight row ZMMs, never sixteen.
+                let mut tmp = [zero; 16];
+                let outer = tw[0];
+                for i in 0..8 {
+                    let mut u = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+                    let mut v = _mm512_loadu_si512(row(i + 8).add(lane) as *const __m512i);
+                    let new_u = _mm512_xor_si512(u, mul_x4::<false, DIET>(outer, v));
+                    v = _mm512_xor_si512(v, new_u);
+                    u = new_u;
+                    tmp[i] = u;
+                    tmp[i + 8] = v;
                 }
-            }
-            for s in 0..4 {
-                let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                // Wave 0: rows 0..8, layers 1–3.
+                {
+                    let mut vals = [
+                        tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7],
+                    ];
+                    for i in 0..4 {
+                        butterfly8!(vals, i, i + 4, tw[1]);
+                    }
+                    for i in 0..2 {
+                        butterfly8!(vals, i, i + 2, tw[3]);
+                    }
+                    for i in 0..2 {
+                        butterfly8!(vals, 4 + i, 4 + i + 2, tw[4]);
+                    }
+                    for s in 0..4 {
+                        butterfly8!(vals, 2 * s, 2 * s + 1, tw[7 + s]);
+                    }
+                    for i in 0..8 {
+                        _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, vals[i]);
+                    }
                 }
-            }
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
-            }
+                // Wave 1: rows 8..16, layers 1–3.
+                {
+                    let mut vals = [
+                        tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15],
+                    ];
+                    for i in 0..4 {
+                        butterfly8!(vals, i, i + 4, tw[2]);
+                    }
+                    for i in 0..2 {
+                        butterfly8!(vals, i, i + 2, tw[5]);
+                    }
+                    for i in 0..2 {
+                        butterfly8!(vals, 4 + i, 4 + i + 2, tw[6]);
+                    }
+                    for s in 0..4 {
+                        butterfly8!(vals, 2 * s, 2 * s + 1, tw[11 + s]);
+                    }
+                    for i in 0..8 {
+                        _mm512_storeu_si512(row(i + 8).add(lane) as *mut __m512i, vals[i]);
+                    }
+                }
+            } else {
+                let mut values = [zero; 16];
+                for (i, value) in values.iter_mut().enumerate() {
+                    *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+                }
 
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                macro_rules! butterfly {
+                    ($u:expr, $v:expr, $twiddle:expr) => {{
+                        let new_u = _mm512_xor_si512(
+                            values[$u],
+                            mul_x4::<false, DIET>($twiddle, values[$v]),
+                        );
+                        values[$v] = _mm512_xor_si512(values[$v], new_u);
+                        values[$u] = new_u;
+                    }};
+                }
+
+                let outer = tw[0];
+                for i in 0..8 {
+                    butterfly!(i, i + 8, outer);
+                }
+                for s in 0..2 {
+                    let twiddle = tw[1 + s];
+                    for i in 0..4 {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    }
+                }
+                for s in 0..4 {
+                    let twiddle = tw[3 + s];
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
+                }
+                for s in 0..8 {
+                    let twiddle = tw[7 + s];
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
+
+                for (i, value) in values.iter().enumerate() {
+                    _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                }
             }
             lane += 4;
         }
@@ -1578,6 +1665,52 @@ mod diet_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Default 8-row inner waves are byte-identical to the 16-slot array
+    /// body on the ranked 64-lane shape, a short tail, and both diet arms.
+    #[test]
+    fn fused4_wave8_matches_array() {
+        use std::sync::atomic::Ordering;
+        let mut next = rng(0xF04D_4A4E);
+        for (sixteenth, num_ntts, lanes) in [
+            (128usize, 64usize, 64usize),
+            (8, 64, 64),
+            (8, 64, 60),
+            (1, 64, 64),
+        ] {
+            let n = 16 * sixteenth * num_ntts;
+            let mut base = vec![F128::ZERO; n];
+            for v in base.iter_mut() {
+                *v = next();
+            }
+            let tw: [F128; 15] = core::array::from_fn(|_| next());
+            let run = |array: bool| {
+                FUSED4_WAVE8_TEST_OFF.store(array, Ordering::Relaxed);
+                let mut got = base.clone();
+                // SAFETY: test binary has avx512f+vpclmulqdq; 16 rows of
+                // `num_ntts` with stride `sixteenth`.
+                unsafe {
+                    butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                        got.as_mut_ptr(),
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        0,
+                        &tw,
+                        0,
+                    );
+                }
+                FUSED4_WAVE8_TEST_OFF.store(false, Ordering::Relaxed);
+                got
+            };
+            let wave = run(false);
+            let array = run(true);
+            assert_eq!(
+                wave, array,
+                "s16={sixteenth} nn={num_ntts} lanes={lanes}"
+            );
         }
     }
 
