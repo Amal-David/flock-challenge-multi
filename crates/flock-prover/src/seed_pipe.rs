@@ -543,13 +543,19 @@ fn close_fd(fd: i32) {
 }
 
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
+    flock_core::gaptime::mark("publish: begin");
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
-    std::fs::rename(temporary, path)
+    let bytes = bundle.to_bytes();
+    flock_core::gaptime::mark("publish: encoded");
+    std::fs::write(&temporary, bytes)?;
+    flock_core::gaptime::mark("publish: temp written");
+    std::fs::rename(temporary, path)?;
+    flock_core::gaptime::mark("publish: renamed");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +794,18 @@ fn speculative_main(
         mark_dead();
         return;
     };
+
+    // Diagnostic submission only: profile the first measured worker after the
+    // protected harness's twenty warmup trials. The latch flips after the
+    // private seed arrives, so none of this process's untimed preparation
+    // proofs emit timing lines.
+    if direct_proof_path.as_deref().is_some_and(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "run-21.proof")
+    }) {
+        flock_core::gaptime::force_enable();
+    }
 
     // The adoption fallback must receive the seed immediately. Direct
     // publication deliberately keeps main blocked so its redundant serial

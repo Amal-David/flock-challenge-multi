@@ -10,14 +10,20 @@
 //! it never mixes with bench stdout parsing.
 
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Cached `FLOCK_GAP_TIMING` presence. Read once per process.
+/// Cached environment control plus an explicit one-process diagnostic latch.
+static FORCED: AtomicBool = AtomicBool::new(false);
+
+pub fn force_enable() {
+    FORCED.store(true, Ordering::Relaxed);
+}
+
 pub fn enabled() -> bool {
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("FLOCK_GAP_TIMING").is_some());
-    *ON
+    *ON || FORCED.load(Ordering::Relaxed)
 }
 
 /// Process-wide monotonic epoch all marks are measured against.
