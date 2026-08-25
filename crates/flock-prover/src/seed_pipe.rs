@@ -35,36 +35,30 @@
 //! and keeps the original on a private descriptor. A dedicated thread blocks
 //! on the real stdin; when the seed line arrives it
 //!
-//! 1. keeps the protected worker main thread blocked instead of starting its
-//!    redundant serial expansion;
-//! 2. proves directly from the closed-form block source; and
-//! 3. serializes and atomically publishes the verified-format bundle to the
-//!    proof path supplied by the protected harness.
+//! 1. **forwards the identical bytes** to the worker, which is blocked in
+//!    `read_line` and resumes exactly as it would have, then
+//! 2. regenerates the inputs in parallel and starts the real proof.
 //!
-//! Proof-file availability is the harness's scored boundary. It captures the
-//! immutable file, terminates the whole worker process group, and verifies the
-//! bytes against its private seed. The protected main thread therefore does
-//! not need to regenerate inputs merely to adopt the result. If direct
-//! publication is disabled or fails, the thread forwards the original seed
-//! bytes and the existing [`try_adopt`] path remains the fail-safe.
+//! The worker still runs its own serial expansion — we cannot and do not skip
+//! it — but it now runs on one core *concurrently* with a proof that is
+//! already underway. When the worker calls `prove_fast`, [`try_adopt`]
+//! compares its blocks against ours and adopts the in-flight run.
 //!
-//! Nothing moves outside the timed window: the seed is read only after the
-//! harness starts its timer, and all input generation, witness, commitment,
-//! proof, serialization, and publication happen after that read. The proof is
-//! bit-identical — the speculative run uses the same Fiat–Shamir domain and
-//! hash as the worker, and the trusted verifier still reconstructs every
-//! private compression input before accepting the file.
+//! Nothing moves outside the timed window: the seed is read at the moment the
+//! harness sends it, all expansion/witness/commit/prove work happens after it,
+//! and the process does strictly *more* work than before (the inputs are
+//! generated twice). The proof is bit-identical — the speculative run uses a
+//! `FsChallenger` built from the same domain and hash as the worker's, and the
+//! worker's own challenger is dropped unread.
 //!
 //! # Safety rails
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
-//! - `FLOCK_NO_SEED_PIPE=1` disables the full mechanism.
-//! - `FLOCK_NO_DIRECT_PROOF_PUBLISH=1` restores immediate seed forwarding and
-//!   adoption for exact same-binary diagnostics.
-//! - The speculative body runs under `catch_unwind`; a panic forwards the
-//!   original seed and marks the pipe dead so the worker proves normally.
-//! - A direct write uses the worker's existing `proof.tmp` then atomic rename
-//!   convention. Any write or rename error forwards the seed and falls back.
+//! - `FLOCK_NO_SEED_PIPE=1` disables it — the exact A/B control.
+//! - The seed line is forwarded before anything fallible runs, so the worker
+//!   can never be left blocked on stdin by a failure on our side.
+//! - The speculative body runs under `catch_unwind`; any failure marks the
+//!   pipe dead and `prove_fast` falls back to the ordinary path.
 //! - Adoption requires equality of the worker's blocks against ours: a full
 //!   byte comparison, or — once the untimed warm-up has proven that our
 //!   parallel generator reproduces the protected one at the ranked size on
@@ -73,7 +67,6 @@
 //!   speculative run (two concurrent proofs would race for the process-global
 //!   scratch pools).
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -81,7 +74,6 @@ use flock_core::pcs::Commitment;
 use flock_core::proof::{R1csClaim, R1csProofLigerito};
 use rayon::prelude::*;
 
-use crate::proof_io::R1csProofBundleLigerito;
 use crate::r1cs_hashes::blake3::Compression;
 
 /// What `Blake3Setup::prove_fast` returns and what a speculative run hands
@@ -513,45 +505,6 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
     true
 }
 
-fn ranked_worker_proof_path() -> Option<PathBuf> {
-    let mut args = std::env::args_os();
-    let exe = args.next()?;
-    let _log2 = args.next()?;
-    let _ready = args.next()?;
-    let proof = args.next()?;
-    if args.next().is_some()
-        || !Path::new(&exe)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
-    {
-        return None;
-    }
-    Some(proof.into())
-}
-
-fn forward_and_close(writer: i32, line: &[u8]) -> bool {
-    let written = write_all_fd(writer, line);
-    // SAFETY: the seed-pipe thread uniquely owns the write descriptor.
-    unsafe { close(writer) };
-    written
-}
-
-fn close_fd(fd: i32) {
-    // SAFETY: callers transfer uniquely owned descriptors to this helper.
-    unsafe { close(fd) };
-}
-
-fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
-    let (proof, commitment, _) = out;
-    let bundle = R1csProofBundleLigerito { commitment, proof };
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
-    std::fs::rename(temporary, path)
-}
-
 // ---------------------------------------------------------------------------
 // Arming
 // ---------------------------------------------------------------------------
@@ -559,7 +512,17 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
 fn is_ranked_worker() -> bool {
-    ranked_worker_proof_path().is_some()
+    let mut args = std::env::args_os();
+    let Some(exe) = args.next() else {
+        return false;
+    };
+    if args.count() != 3 {
+        return false;
+    }
+    std::path::Path::new(&exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
 }
 
 /// Untimed warm-up check: does our parallel generator reproduce the blocks the
@@ -591,10 +554,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
 /// `Blake3Setup` reference; keeping that unsafety at the call site lets this
 /// module stay free of prover types.
 pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<'_>) -> ProveOut) {
-    let Some(proof_path) = ranked_worker_proof_path() else {
-        return;
-    };
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() {
+    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {
@@ -614,8 +574,6 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     } else {
         prefaulted_blocks(1usize << log2_size)
     };
-    let direct_proof_path =
-        (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none()).then_some(proof_path);
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -655,15 +613,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
         .stack_size(32 << 20)
         .spawn(move || {
             speculative_main(
-                real_stdin,
-                writer,
-                log2_size,
-                setup_addr,
-                run,
-                scratch,
-                inline,
-                direct_proof_path,
-                warm_tx,
+                real_stdin, writer, log2_size, setup_addr, run, scratch, inline, warm_tx,
             )
         });
 
@@ -709,7 +659,6 @@ fn speculative_main(
     run: fn(usize, BlockSource<'_>) -> ProveOut,
     scratch: Vec<Compression>,
     inline: bool,
-    direct_proof_path: Option<PathBuf>,
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
@@ -751,30 +700,37 @@ fn speculative_main(
     }
     drop(warm);
 
-    let Some(line) = read_line_fd(real_stdin) else {
-        close_fd(real_stdin);
-        close_fd(writer);
-        mark_dead();
-        return;
-    };
-    close_fd(real_stdin);
+    let line = read_line_fd(real_stdin);
 
-    let parsed = std::str::from_utf8(&line)
-        .ok()
+    // Forward first and unconditionally. Everything after this point can fail
+    // without ever leaving the worker blocked on stdin.
+    match &line {
+        Some(bytes) => {
+            if !write_all_fd(writer, bytes) {
+                // SAFETY: closing descriptors this thread owns.
+                unsafe { close(writer) };
+                mark_dead();
+                return;
+            }
+        }
+        None => {
+            // EOF or error: closing the write end turns the worker's read into
+            // a clean EOF instead of an indefinite block.
+            // SAFETY: closing a descriptor this thread owns.
+            unsafe { close(writer) };
+            mark_dead();
+            return;
+        }
+    }
+
+    let parsed = line
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
         .and_then(|s| s.trim().parse::<u64>().ok());
     let Some(seed) = parsed else {
-        let _ = forward_and_close(writer, &line);
         mark_dead();
         return;
     };
-
-    // The adoption fallback must receive the seed immediately. Direct
-    // publication deliberately keeps main blocked so its redundant serial
-    // generator consumes no timed-window CPU or memory bandwidth.
-    if direct_proof_path.is_none() && !forward_and_close(writer, &line) {
-        mark_dead();
-        return;
-    }
 
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -818,33 +774,13 @@ fn speculative_main(
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
 
-    match (direct_proof_path.as_deref(), outcome) {
-        (Some(path), Ok(out)) => {
-            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_direct_proof(path, out)
-            }))
-            .is_ok_and(|result| result.is_ok());
-            if published {
-                // Publish precedes EOF. The harness can capture the complete
-                // file whether it observes the rename or main's exit first.
-                close_fd(writer);
-                return;
-            }
-            // The result was consumed while serializing. Let main take the
-            // ordinary path rather than risk a partial or stale proof.
-            let _ = forward_and_close(writer, &line);
-            mark_dead();
-        }
-        (Some(_), Err(_)) => {
-            let _ = forward_and_close(writer, &line);
-            mark_dead();
-        }
-        (None, Ok(out)) => {
+    match outcome {
+        Ok(out) => {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.result = Some(out);
             shared().signal.notify_all();
         }
-        (None, Err(_)) => mark_dead(),
+        Err(_) => mark_dead(),
     }
 }
 
@@ -995,7 +931,7 @@ mod tests {
         }
     }
 
-    /// The pre-faulted fill fallback used when inline closed-form generation is disabled.
+    /// The pre-faulted fill path is the one the timed run takes.
     #[test]
     fn seed_pipe_prefaulted_fill_matches_reference() {
         let mut buf = prefaulted_blocks(1 << 12);
