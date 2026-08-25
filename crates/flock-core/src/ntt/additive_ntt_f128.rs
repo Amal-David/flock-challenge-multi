@@ -593,6 +593,17 @@ fn deep_pf_hint() -> u8 {
     *H
 }
 
+/// `FLOCK_NO_NTT_FUSED3_NEXT_PF=1` restores the fused-three deep sweep
+/// without software prefetch of the next eight-row group. Default: T0-hint
+/// that group's 8 KiB (ranked: 8 rows × 64 lanes) before the current
+/// group's twelve butterflies, so the next demand-load hits L1. Not the
+/// fused-four `deep_pf` path and not the dual-chunk / I-cache remake.
+#[cfg(target_arch = "x86_64")]
+fn fused3_next_pf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3_NEXT_PF").is_none())
+}
+
 /// Test-only latch forcing the generic (un-shaped) row-kernel dispatch, so a
 /// test can compare the shaped and generic forms in one process (the same
 /// pattern as [`KERNEL_DIET_TEST_OFF`]).
@@ -2747,6 +2758,29 @@ impl AdditiveNttF128 {
                                 tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
                             }
                             let block_start = block_in_sub * block_bytes;
+                            #[cfg(target_arch = "x86_64")]
+                            if fused3_next_pf_enabled() && block_in_sub + 1 < num_blocks_in_sub {
+                                // Next eight-row group is contiguous in
+                                // `sub_data`. 8 KiB at the ranked shape.
+                                // Prefetch before the mutable borrow of this
+                                // group so the two borrows do not overlap.
+                                let nxt = unsafe {
+                                    sub_data
+                                        .as_ptr()
+                                        .add((block_in_sub + 1) * block_bytes)
+                                        as *const i8
+                                };
+                                let nbytes = block_bytes * core::mem::size_of::<F128>();
+                                unsafe {
+                                    let mut off = 0usize;
+                                    while off < nbytes {
+                                        core::arch::x86_64::_mm_prefetch::<
+                                            { core::arch::x86_64::_MM_HINT_T0 },
+                                        >(nxt.add(off));
+                                        off += 64;
+                                    }
+                                }
+                            }
                             let block = &mut sub_data[block_start..block_start + block_bytes];
                             debug_assert_eq!(block.len(), 8 * num_ntts);
                             // SAFETY: `block` is eight consecutive rows of
