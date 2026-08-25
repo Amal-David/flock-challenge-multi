@@ -1505,6 +1505,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            witgen_simd::witgen_folder_fence_enabled(),
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -1674,6 +1675,26 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
 
+/// Per-Rayon-folder witness staging and NT-publication guard. Every store
+/// issued through one folder runs on that folder's worker thread; dropping
+/// the state there orders all of its NT stores before Rayon publishes the
+/// folder's completion. The kill-switch arm leaves `fence_on_drop` false and
+/// retains the historical per-GROUP fence in the item closure.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct AbWinFolder {
+    win: Vec<core::mem::MaybeUninit<AbWinLine>>,
+    fence_on_drop: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl Drop for AbWinFolder {
+    fn drop(&mut self) {
+        if self.fence_on_drop {
+            flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+        }
+    }
+}
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
@@ -1705,6 +1726,7 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    folder_fence: bool,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -1712,6 +1734,11 @@ fn generate_round1_inner_octa(
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
+    // Keep at least 128 blocks in one Rayon folder when folder fencing is
+    // enabled. Ranked 2^18 still exposes 2,048 stealable folders, while the
+    // folder guard amortizes one ordering fence across at least eight of the
+    // old 16-block fence sites. The kill switch restores a minimum of one.
+    const FOLDER_MIN_GROUPS: usize = 8;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
@@ -1728,7 +1755,7 @@ fn generate_round1_inner_octa(
     // either way at 512 MiB — so its dump streams too. Under `ab_nt` a/b
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
-    // Contract: one sfence per rayon task, below, before the task's release.
+    // Contract: one sfence per Rayon folder, before the folder's release.
     let abinner_nt =
         flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
@@ -1740,11 +1767,11 @@ fn generate_round1_inner_octa(
         .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
+        .with_min_len(if folder_fence { FOLDER_MIN_GROUPS } else { 1 })
         .for_each_init(
             || {
-                // Rayon splits this down to one bout per GROUP under stealing
-                // pressure, so the init runs about as often as the dump does —
-                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
+                // Rayon owns this state for a folder of GROUPs. Its init must
+                // not zero the 32 KiB: `MaybeUninit` keeps the raw
                 // allocation (64-aligned via `AbWinLine`) and skips the fill;
                 // the dump writes every window byte before the projection
                 // reads any.
@@ -1762,9 +1789,13 @@ fn generate_round1_inner_octa(
                     // `reserve_exact` guaranteed the capacity.
                     unsafe { v.set_len(want) };
                 }
-                v
+                AbWinFolder {
+                    win: v,
+                    fence_on_drop: folder_fence && (abinner_nt || z_nt || ab_nt),
+                }
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+            |folder, (g, (((z_out, a_out), b_out), ab_out))| {
+                let win = &mut folder.win;
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
@@ -1910,8 +1941,10 @@ fn generate_round1_inner_octa(
                         );
                     }
                 }
-                // Last NT store of the task in every arm — a/b's streams included.
-                if abinner_nt || z_nt || ab_nt {
+                // Kill-switch control: preserve the historical fence after
+                // every GROUP. The default folder guard fences once, after
+                // this worker has issued the last NT store in its folder.
+                if !folder_fence && (abinner_nt || z_nt || ab_nt) {
                     flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
                 }
             },
@@ -2206,6 +2239,16 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_ab_winstream_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_WINSTREAM").is_none());
+        *ON
+    }
+
+    /// `FLOCK_NO_WITGEN_FOLDER_FENCE=1` restores one `sfence` after every
+    /// 16-block GROUP. The default keeps at least eight GROUPs in a Rayon
+    /// folder and orders all of that worker's NT publications once when the
+    /// folder state is dropped, before Rayon releases its completion.
+    pub(crate) fn witgen_folder_fence_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_FOLDER_FENCE").is_none());
         *ON
     }
 
@@ -4160,7 +4203,15 @@ mod tests {
     fn round1_inner_octa_ab_nt_matches_across_elide_and_skip() {
         const F128_PER_BLOCK: usize = K / 128;
         const BYTES_PER_BLOCK: usize = K / 8;
-        for &(n_total, skip_blocks) in &[(8usize, 0usize), (16, 0), (32, 4), (48, 17)] {
+        // 1/8/16/17 full GROUPs pin the folder minimum and its one-GROUP
+        // remainder edge. Every arm is compared with the historical
+        // per-GROUP fence control in the same process.
+        for &(n_total, skip_blocks) in &[
+            (16usize, 0usize),
+            (128, 0),
+            (256, 4),
+            (272, 17),
+        ] {
             let mut rng = Rng::new(0x0C7A_E11D ^ n_total as u64);
             let mut mk = |n: usize| -> Vec<Compression> {
                 (0..n)
@@ -4195,6 +4246,7 @@ mod tests {
             let run = |src: &[Compression],
                        elide: [bool; 3],
                        ab_nt: bool,
+                       folder_fence: bool,
                        seed: Option<&(Vec<F128>, Vec<F128>, Vec<F128>)>|
              -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
                 let (mut z, mut a, mut b) = match seed {
@@ -4221,28 +4273,39 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    folder_fence,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
             };
 
-            let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], false, None);
-            let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, None);
+            let (z_r, a_r, b_r, ab_r) =
+                run(&blocks, [false; 3], false, false, None);
+            let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, false, None);
             let seed = (z_o, a_o, b_o);
             for &elide_on in &[false, true] {
                 for &ab_nt in &[false, true] {
-                    if !elide_on && !ab_nt {
-                        continue; // that IS the reference
+                    for &folder_fence in &[false, true] {
+                        if !elide_on && !ab_nt && !folder_fence {
+                            continue; // that IS the reference
+                        }
+                        let elide = [elide_on; 3];
+                        let (z, a, b, ab) = run(
+                            &blocks,
+                            elide,
+                            ab_nt,
+                            folder_fence,
+                            if elide_on { Some(&seed) } else { None },
+                        );
+                        let tag = format!(
+                            "n_total={n_total} skip={skip_blocks} elide={elide_on} \
+                             ab_nt={ab_nt} folder_fence={folder_fence}"
+                        );
+                        assert_eq!(z, z_r, "z mismatch, {tag}");
+                        assert_eq!(a, a_r, "a mismatch, {tag}");
+                        assert_eq!(b, b_r, "b mismatch, {tag}");
+                        assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
                     }
-                    let elide = [elide_on; 3];
-                    let (z, a, b, ab) =
-                        run(&blocks, elide, ab_nt, if elide_on { Some(&seed) } else { None });
-                    let tag =
-                        format!("n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}");
-                    assert_eq!(z, z_r, "z mismatch, {tag}");
-                    assert_eq!(a, a_r, "a mismatch, {tag}");
-                    assert_eq!(b, b_r, "b mismatch, {tag}");
-                    assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
                 }
             }
         }
