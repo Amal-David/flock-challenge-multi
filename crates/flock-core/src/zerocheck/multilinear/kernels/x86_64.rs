@@ -1071,6 +1071,16 @@ pub(crate) fn zc_r34_bcast_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R34_TILE_PIPE=1` restores the incumbent serial
+/// prefold-then-consume schedule before the rounds-3+4 hot loop. The ranked
+/// path otherwise ping-pongs two cache pairs and modulo-schedules the next
+/// tile's broadcast GFNI groups through the current tile's consumer.
+pub(crate) fn zc_r34_tile_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R34_TILE_PIPE").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
 /// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
 /// same-binary A/B; prefetch is architecturally invisible).
@@ -1524,6 +1534,34 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         };
         let pf_on = zc_pkt_pf_enabled();
         let pf_spread = zc_pkt_pf_spread_enabled();
+        // The only modulo-scheduled shape is the composed broadcast path with
+        // at least two complete 64-row tiles. Resolve the kill switch before
+        // either hot loop: disabled, non-composed, one-tile and tail-bearing
+        // calls retain the incumbent body below byte for byte.
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if c4_bcast
+            && zc_r34_tile_pipe_enabled()
+            && lo_size >= 16
+            && lo_size.is_multiple_of(8)
+        {
+            return fold2_from_packed_r34_tile_pipeline(
+                a_pkt,
+                b_pkt,
+                out_base,
+                a_out,
+                b_out,
+                eq_lo,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                nt_out,
+                cfold.unwrap(),
+                wtab,
+                wsplit,
+                pf_tiles,
+                pf_on,
+                pf_spread,
+            );
+        }
         let mut fa_store = FoldCache([F128::ZERO; 64]);
         let mut fb_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
@@ -2796,6 +2834,555 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
         }
         pass!(0);
         pass!(1);
+    }
+}
+
+/// Gathered broadcast octets for one side of the next rounds-3+4 tile.
+/// Kept in memory deliberately: the affine operands must be load-port
+/// broadcasts, not port-5 register permutations.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[repr(C, align(64))]
+struct R34BcastOcts([u64; 64]);
+
+/// Four running XOR-tree registers for one half of one side. The opaque
+/// memory round trip between bounded affine groups prevents these registers
+/// from extending the already-wide consumer live range.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[repr(C, align(64))]
+struct R34BcastAcc([core::arch::x86_64::__m512i; 4]);
+
+/// The gather half of [`gfni_fold64_rows_masked_c4_bcast`], with the same
+/// dead-line loads and byte/qword map. It runs once when a tile enters the
+/// alternate slot; the eight bounded affine groups consume the octets later.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn r34_bcast_gather(rows: *const u8, dead_lines: u8, octs: &mut R34BcastOcts) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        }
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let op = octs.0.as_mut_ptr();
+        let gather = |h: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+            let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+            let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+            let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+            let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+            let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+            let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+            let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+            let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+            let base = op.add(32 * h);
+            let oct = |a: usize, v: __m512i| {
+                _mm512_storeu_si512(
+                    base.add(8 * a) as *mut __m512i,
+                    _mm512_permutexvar_epi8(bt, v),
+                )
+            };
+            oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
+            oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
+            oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
+            oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+        };
+        gather(0, z[0], z[1], z[2], z[3]);
+        gather(1, z[4], z[5], z[6], z[7]);
+    }
+}
+
+/// Thirty-two affine instructions: two adjacent residues for both output-byte
+/// halves of one eight-output half-tile. `A0=0` starts the original XOR tree;
+/// `A0=2, FINISH=true` resumes it and emits exactly the incumbent two ZMMs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn r34_bcast_affine_group<const H: usize, const A0: usize, const FINISH: bool>(
+    octs: &R34BcastOcts,
+    m: &CFoldMats,
+    acc: &mut R34BcastAcc,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let rp = core::hint::black_box(octs.0.as_ptr());
+        let mp = core::hint::black_box(m.1.as_ptr() as *const u64);
+        let sp = core::hint::black_box(acc.0.as_mut_ptr());
+        let mut accp = if A0 == 0 {
+            [_mm512_setzero_si512(); 2]
+        } else {
+            [
+                _mm512_load_si512(sp.cast::<__m512i>()),
+                _mm512_load_si512(sp.add(1).cast::<__m512i>()),
+            ]
+        };
+        let mut accq = if A0 == 0 {
+            [_mm512_setzero_si512(); 2]
+        } else {
+            [
+                _mm512_load_si512(sp.add(2).cast::<__m512i>()),
+                _mm512_load_si512(sp.add(3).cast::<__m512i>()),
+            ]
+        };
+        for a in A0..A0 + 2 {
+            let b: [__m512i; 8] =
+                core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64));
+            for hh in 0..2usize {
+                let aff = |j: usize| {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        b[j],
+                        _mm512_loadu_si512(
+                            mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i,
+                        ),
+                    )
+                };
+                let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                if a == 0 {
+                    accp[hh] = v2;
+                    accq[hh] = v3;
+                } else {
+                    accp[hh] =
+                        _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
+                    accq[hh] = v3;
+                }
+            }
+        }
+        if FINISH {
+            #[rustfmt::skip]
+            const BT: [i8; 64] = [
+                0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+                2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+                4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+                6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+            ];
+            let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+            let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+            let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+            let a0 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[0], accq[0]));
+            let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
+            let dst = out as *mut __m512i;
+            _mm512_storeu_si512(
+                dst.add(2 * H),
+                _mm512_permutex2var_epi64(a0, il_lo, a1),
+            );
+            _mm512_storeu_si512(
+                dst.add(2 * H + 1),
+                _mm512_permutex2var_epi64(a0, il_hi, a1),
+            );
+        } else {
+            _mm512_store_si512(sp.cast::<__m512i>(), accp[0]);
+            _mm512_store_si512(sp.add(1).cast::<__m512i>(), accp[1]);
+            _mm512_store_si512(sp.add(2).cast::<__m512i>(), accq[0]);
+            _mm512_store_si512(sp.add(3).cast::<__m512i>(), accq[1]);
+        }
+    }
+}
+
+/// Test seam for the cache-producing half of the modulo schedule. Production
+/// reaches these same four groups through the ranked leaf, interspersed with
+/// publication and message work.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_staged_for_test(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::_mm512_setzero_si512;
+    unsafe {
+        let mut octs = R34BcastOcts([0u64; 64]);
+        let mut acc = R34BcastAcc([_mm512_setzero_si512(); 4]);
+        r34_bcast_gather(rows, dead_lines, &mut octs);
+        r34_bcast_affine_group::<0, 0, false>(&octs, m, &mut acc, out);
+        r34_bcast_affine_group::<0, 2, true>(&octs, m, &mut acc, out);
+        r34_bcast_affine_group::<1, 0, false>(&octs, m, &mut acc, out);
+        r34_bcast_affine_group::<1, 2, true>(&octs, m, &mut acc, out);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn r34_prefetch_part(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    xg: usize,
+    pf_tiles: usize,
+    spread: bool,
+    part: usize,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let (lo, hi) = if spread {
+            (2 * part, 2 * part + 2)
+        } else if part == 0 {
+            (0, 8)
+        } else {
+            (0, 0)
+        };
+        let next = (4 * xg + 64 * pf_tiles) * 8;
+        for l in lo..hi {
+            _mm_prefetch(
+                a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                _MM_HINT_T0,
+            );
+            _mm_prefetch(
+                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                _MM_HINT_T0,
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn r34_transpose4(
+    o0: core::arch::x86_64::__m512i,
+    o1: core::arch::x86_64::__m512i,
+    o2: core::arch::x86_64::__m512i,
+    o3: core::arch::x86_64::__m512i,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let q0 = _mm512_shuffle_i64x2::<0x44>(o0, o1);
+        let q1 = _mm512_shuffle_i64x2::<0xEE>(o0, o1);
+        let q2 = _mm512_shuffle_i64x2::<0x44>(o2, o3);
+        let q3 = _mm512_shuffle_i64x2::<0xEE>(o2, o3);
+        [
+            _mm512_shuffle_i64x2::<0x88>(q0, q2),
+            _mm512_shuffle_i64x2::<0xDD>(q0, q2),
+            _mm512_shuffle_i64x2::<0x88>(q1, q3),
+            _mm512_shuffle_i64x2::<0xDD>(q1, q3),
+        ]
+    }
+}
+
+/// Ranked rounds-3+4 modulo schedule. Prime slot 0 serially, then consume tile
+/// `T` while eight 32-affine groups fill slot `T+1`; the final iteration has
+/// no producer and drains slot `(tiles-1)&1`. The current tile is reloaded
+/// from its aligned cache after publication, so no next-tile output ZMM is
+/// held across consumer groups.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")]
+unsafe fn fold2_from_packed_r34_tile_pipeline(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: &CFoldMats,
+    wtab: Option<&[F128]>,
+    wsplit: bool,
+    pf_tiles: usize,
+    pf_on: bool,
+    pf_spread: bool,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    unsafe {
+        debug_assert!(eq_lo.len() >= 16 && eq_lo.len().is_multiple_of(8));
+        let tiles = eq_lo.len() / 8;
+        let mut a_cache = [
+            FoldCache([F128::ZERO; 64]),
+            FoldCache([F128::ZERO; 64]),
+        ];
+        let mut b_cache = [
+            FoldCache([F128::ZERO; 64]),
+            FoldCache([F128::ZERO; 64]),
+        ];
+        let mut next_a = R34BcastOcts([0u64; 64]);
+        let mut next_b = R34BcastOcts([0u64; 64]);
+        let z = _mm512_setzero_si512();
+        let mut affine_acc = R34BcastAcc([z; 4]);
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut tail = [F256Unreduced::ZERO; 8];
+        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+
+        // Prime: tile 0 is complete before its consumer starts.
+        let xg0 = out_base;
+        let dead0 = super::super::prefold_dead_line_mask_gated(
+            4 * xg0,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        );
+        gfni_fold64_rows_masked_c4_bcast(
+            a_pkt.add(4 * xg0 * 8),
+            cfold,
+            a_cache[0].0.as_mut_ptr(),
+            dead0,
+        );
+        gfni_fold64_rows_masked_c4_bcast(
+            b_pkt.add(4 * xg0 * 8),
+            cfold,
+            b_cache[0].0.as_mut_ptr(),
+            dead0,
+        );
+
+        for tile in 0..tiles {
+            let slot = tile & 1;
+            let next_slot = slot ^ 1;
+            let x_lo = 8 * tile;
+            let ol = 2 * x_lo;
+            let xg = out_base + ol;
+            let has_next = tile + 1 < tiles;
+            if has_next {
+                let next_xg = xg + 16;
+                let dead = super::super::prefold_dead_line_mask_gated(
+                    4 * next_xg,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+                r34_bcast_gather(a_pkt.add(4 * next_xg * 8), dead, &mut next_a);
+                r34_bcast_gather(b_pkt.add(4 * next_xg * 8), dead, &mut next_b);
+            }
+
+            if pf_on {
+                r34_prefetch_part(a_pkt, b_pkt, xg, pf_tiles, pf_spread, 0);
+            }
+            if has_next {
+                r34_bcast_affine_group::<0, 0, false>(
+                    &next_a,
+                    cfold,
+                    &mut affine_acc,
+                    a_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+            if pf_on {
+                r34_prefetch_part(a_pkt, b_pkt, xg, pf_tiles, pf_spread, 1);
+            }
+
+            // Publication order is identical to the incumbent: A groups
+            // 0..3, then B groups 0..3. Values are loaded from the completed
+            // current slot only; the alternate slot is producer-owned.
+            let ac = a_cache[slot].0.as_ptr();
+            let bc = b_cache[slot].0.as_ptr();
+            let ap = a_out.as_mut_ptr().add(ol);
+            let bp = b_out.as_mut_ptr().add(ol);
+            if nt_out {
+                stream_zmm_as_xmm4(ap, _mm512_loadu_si512(ac.cast::<__m512i>()));
+                stream_zmm_as_xmm4(ap.add(4), _mm512_loadu_si512(ac.add(4).cast::<__m512i>()));
+                stream_zmm_as_xmm4(ap.add(8), _mm512_loadu_si512(ac.add(8).cast::<__m512i>()));
+                stream_zmm_as_xmm4(ap.add(12), _mm512_loadu_si512(ac.add(12).cast::<__m512i>()));
+                stream_zmm_as_xmm4(bp, _mm512_loadu_si512(bc.cast::<__m512i>()));
+                stream_zmm_as_xmm4(bp.add(4), _mm512_loadu_si512(bc.add(4).cast::<__m512i>()));
+                stream_zmm_as_xmm4(bp.add(8), _mm512_loadu_si512(bc.add(8).cast::<__m512i>()));
+                stream_zmm_as_xmm4(bp.add(12), _mm512_loadu_si512(bc.add(12).cast::<__m512i>()));
+            } else {
+                _mm512_storeu_si512(ap.cast::<__m512i>(), _mm512_loadu_si512(ac.cast::<__m512i>()));
+                _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), _mm512_loadu_si512(ac.add(4).cast::<__m512i>()));
+                _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), _mm512_loadu_si512(ac.add(8).cast::<__m512i>()));
+                _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), _mm512_loadu_si512(ac.add(12).cast::<__m512i>()));
+                _mm512_storeu_si512(bp.cast::<__m512i>(), _mm512_loadu_si512(bc.cast::<__m512i>()));
+                _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), _mm512_loadu_si512(bc.add(4).cast::<__m512i>()));
+                _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), _mm512_loadu_si512(bc.add(8).cast::<__m512i>()));
+                _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), _mm512_loadu_si512(bc.add(12).cast::<__m512i>()));
+            }
+            if pf_on {
+                r34_prefetch_part(a_pkt, b_pkt, xg, pf_tiles, pf_spread, 2);
+            }
+
+            let [a0, a1, a2, a3] = r34_transpose4(
+                _mm512_loadu_si512(ac.cast::<__m512i>()),
+                _mm512_loadu_si512(ac.add(4).cast::<__m512i>()),
+                _mm512_loadu_si512(ac.add(8).cast::<__m512i>()),
+                _mm512_loadu_si512(ac.add(12).cast::<__m512i>()),
+            );
+            let [b0, b1, b2, b3] = r34_transpose4(
+                _mm512_loadu_si512(bc.cast::<__m512i>()),
+                _mm512_loadu_si512(bc.add(4).cast::<__m512i>()),
+                _mm512_loadu_si512(bc.add(8).cast::<__m512i>()),
+                _mm512_loadu_si512(bc.add(12).cast::<__m512i>()),
+            );
+            if has_next {
+                r34_bcast_affine_group::<0, 2, true>(
+                    &next_a,
+                    cfold,
+                    &mut affine_acc,
+                    a_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+            if pf_on {
+                r34_prefetch_part(a_pkt, b_pkt, xg, pf_tiles, pf_spread, 3);
+            }
+
+            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
+            } else {
+                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                if wsplit {
+                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                    (
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                    )
+                } else {
+                    (
+                        ghash_mul_x4(w, a0),
+                        ghash_mul_x4(w, a1),
+                        ghash_mul_x4(w, a2),
+                        ghash_mul_x4(w, a3),
+                    )
+                }
+            };
+            if has_next {
+                r34_bcast_affine_group::<1, 0, false>(
+                    &next_a,
+                    cfold,
+                    &mut affine_acc,
+                    a_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+            );
+            if has_next {
+                r34_bcast_affine_group::<1, 2, true>(
+                    &next_a,
+                    cfold,
+                    &mut affine_acc,
+                    a_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+            );
+            if has_next {
+                r34_bcast_affine_group::<0, 0, false>(
+                    &next_b,
+                    cfold,
+                    &mut affine_acc,
+                    b_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+
+            acc[4].mul_acc(a2w, b2);
+            if has_next {
+                r34_bcast_affine_group::<0, 2, true>(
+                    &next_b,
+                    cfold,
+                    &mut affine_acc,
+                    b_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            acc[5].mul_acc(e_aw, e_b);
+            if has_next {
+                r34_bcast_affine_group::<1, 0, false>(
+                    &next_b,
+                    cfold,
+                    &mut affine_acc,
+                    b_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+            acc[6].mul_acc(o_aw, o_b);
+            if has_next {
+                r34_bcast_affine_group::<1, 2, true>(
+                    &next_b,
+                    cfold,
+                    &mut affine_acc,
+                    b_cache[next_slot].0.as_mut_ptr(),
+                );
+            }
+            acc[7].mul_acc(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+            );
+        }
+
+        if nt_out {
+            _mm_sfence();
+        }
+        let mut out = [F128::ZERO; 8];
+        for i in 0..8 {
+            tail[i] ^= acc[i].fold();
+            out[i] = tail[i].reduce();
+        }
+        out
     }
 }
 

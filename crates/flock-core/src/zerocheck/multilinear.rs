@@ -5056,6 +5056,7 @@ mod tests {
         for dead in [0u8, 0b1000_0000, 0b1010_0101, 0b0000_0001, 0b1111_1110] {
             let mut c4 = [F128::ZERO; 64];
             let mut c4b = [F128::ZERO; 64];
+            let mut c4p = [F128::ZERO; 64];
             // SAFETY: as above; both kernels write sixteen F128s.
             unsafe {
                 kernels::x86_64::gfni_fold64_rows_masked_c4(
@@ -5070,8 +5071,15 @@ mod tests {
                     c4b.as_mut_ptr(),
                     dead,
                 );
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_staged_for_test(
+                    poisoned.as_ptr(),
+                    &cm,
+                    c4p.as_mut_ptr(),
+                    dead,
+                );
             }
             assert_eq!(c4b, c4, "c4 broadcast factorisation, dead={dead:#010b}");
+            assert_eq!(c4p, c4b, "staged c4 cache vs incumbent, dead={dead:#010b}");
         }
         // ... and both against the scalar composed fold on live rows.
         let mut c4 = [F128::ZERO; 64];
