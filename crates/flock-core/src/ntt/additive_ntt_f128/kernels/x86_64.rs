@@ -1255,6 +1255,25 @@ fn low_twiddle_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
 }
 
+/// `FLOCK_NO_NTT_FUSED3_LANE4=1` restores the dual-chunk fused-three vector
+/// body (two 4-lane groups, sixteen live row ZMMs). Default / ranked: one
+/// 4-lane eight-row step, eight live row ZMMs. The dual-chunk restore is
+/// outlined `#[inline(never)]` so it is not in the ranked I-cache footprint
+/// (`e64040a` kept both loops in one function and p10-won / median-lost).
+#[inline]
+fn ntt_fused3_lane4_enabled() -> bool {
+    #[cfg(test)]
+    if FUSED3_LANE4_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3_LANE4").is_none())
+}
+
+#[cfg(test)]
+static FUSED3_LANE4_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
 /// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
@@ -1279,6 +1298,12 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
+        if !ntt_fused3_lane4_enabled() {
+            butterfly_fused_3layer_rows_impl_dual::<DIET, LOW_INNER, NNC>(
+                ptr, num_ntts, dense_lanes, twiddles,
+            );
+            return;
+        }
         // Seven broadcasts (plus their x^64 companions under DIET) hoisted
         // out of the lane loop: 8 rows stay live in registers across all
         // three layers, so a row is loaded once and stored once for 12
@@ -1301,10 +1326,118 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 $values[$u] = new_u;
             }};
         }
-        // Two lane chunks per iteration: 16 live row registers + 14 twiddle
-        // registers still fit the 32 zmm file, and doubling the independent
-        // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
-        // the outstanding row misses.
+        // Ranked: 4-lane eight-row step only. Dual-chunk lives in the
+        // outlined restore (`butterfly_fused_3layer_rows_impl_dual`).
+        while lane + 4 <= dense_lanes {
+            let mut values = [zero; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            let outer = tw[0];
+            for i in 0..4 {
+                butterfly!(values, i, i + 4, outer, false);
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..2 {
+                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                }
+            }
+            for s in 0..4 {
+                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+            lane += 4;
+        }
+        while lane < dense_lanes {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+
+        // Published zero tail: rows 1, 3, 5, 7 are zero here, so only the
+        // four even rows are read and the deepest layer is a copy.
+        while lane + 4 <= num_ntts {
+            let mut values = [zero; 8];
+            for i in 0..4 {
+                values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
+            }
+            let outer = tw[0];
+            butterfly!(values, 0, 4, outer, false);
+            butterfly!(values, 2, 6, outer, false);
+            butterfly!(values, 0, 2, tw[1], LOW_INNER);
+            butterfly!(values, 4, 6, tw[2], LOW_INNER);
+            for i in 0..4 {
+                let v = values[2 * i];
+                _mm512_storeu_si512(row(2 * i).add(lane) as *mut __m512i, v);
+                _mm512_storeu_si512(row(2 * i + 1).add(lane) as *mut __m512i, v);
+            }
+            lane += 4;
+        }
+        while lane < num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer_zero_odd(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
+
+/// Kill-switch restore: dual-chunk (16 live row ZMMs) plus the 4-lane
+/// remainder and tails. Outlined so the ranked 8-ZMM body does not share
+/// an I-cache footprint with this live-set.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_rows_impl`]. `num_ntts` is
+/// already shape-substituted.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_3layer_rows_impl_dual<
+    const DIET: bool,
+    const LOW_INNER: bool,
+    const NNC: usize,
+>(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    use core::arch::x86_64::*;
+    let _ = NNC;
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        let mut tw = [(zero, zero); 7];
+        tw[0] = tw_x4::<false, DIET>(twiddles[0]);
+        for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
+            *slot = tw_x4::<LOW_INNER, DIET>(*value);
+        }
+        let row = |i: usize| ptr.add(i * num_ntts);
+        let mut lane = 0;
+
+        macro_rules! butterfly {
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
+                let new_u =
+                    _mm512_xor_si512($values[$u], mul_x4::<$low, DIET>($twiddle, $values[$v]));
+                $values[$v] = _mm512_xor_si512($values[$v], new_u);
+                $values[$u] = new_u;
+            }};
+        }
         macro_rules! butterfly2 {
             ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
                 for c in 0..2 {
@@ -1384,8 +1517,6 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             lane += 1;
         }
 
-        // Published zero tail: rows 1, 3, 5, 7 are zero here, so only the
-        // four even rows are read and the deepest layer is a copy.
         while lane + 4 <= num_ntts {
             let mut values = [zero; 8];
             for i in 0..4 {
@@ -1653,6 +1784,52 @@ mod diet_tests {
                     "num_ntts={num_ntts} dense={dense_lanes} diet={diet} low={low}"
                 );
             }
+        }
+    }
+
+
+    /// Default 4-lane eight-row body is byte-identical to the dual-chunk
+    /// kill-switch body on the ranked 64-lane shape and on a short tail.
+    #[test]
+    fn fused3_lane4_matches_dual_chunk() {
+        use std::sync::atomic::Ordering;
+        let mut next = rng(0x1A4E_4004);
+        for (num_ntts, dense_lanes) in [(64usize, 64usize), (64, 60), (64, 48), (67, 50)] {
+            let mut base = vec![F128::ZERO; 8 * num_ntts];
+            for v in base.iter_mut() {
+                *v = next();
+            }
+            for lane in dense_lanes..num_ntts {
+                for i in (1..8).step_by(2) {
+                    base[i * num_ntts + lane] = F128::ZERO;
+                }
+            }
+            let mut twiddles = [F128::ZERO; 7];
+            twiddles[0] = next();
+            for t in twiddles[1..].iter_mut() {
+                let v = next();
+                *t = F128 { lo: v.lo, hi: 0 };
+            }
+            let run = |dual: bool| {
+                FUSED3_LANE4_TEST_OFF.store(dual, Ordering::Relaxed);
+                let mut got = base.clone();
+                unsafe {
+                    butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                        got.as_mut_ptr(),
+                        num_ntts,
+                        dense_lanes,
+                        &twiddles,
+                    );
+                }
+                FUSED3_LANE4_TEST_OFF.store(false, Ordering::Relaxed);
+                got
+            };
+            let lane4 = run(false);
+            let dual = run(true);
+            assert_eq!(
+                lane4, dual,
+                "lane4 != dual-chunk num_ntts={num_ntts} dense={dense_lanes}"
+            );
         }
     }
 
