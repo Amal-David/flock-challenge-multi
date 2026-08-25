@@ -303,8 +303,28 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
 }
 
+/// `FLOCK_NO_LC_GFNI_PLANE2=1` restores the one-plane inner loop of
+/// [`gfni_fold_tile`] (exact same-binary A/B). Ranked env is cleared, so
+/// the two-plane loop runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn gfni_plane2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GFNI_PLANE2").is_none());
+    *ON
+}
+
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
+///
+/// Default: two independent planes per inner pass, so the eight stripe-row
+/// ZMMs feed two accumulators instead of sitting idle across fifteen of
+/// sixteen plane steps. XOR of disjoint planes commutes, so the stores are
+/// bit-identical to the one-plane loop. `FLOCK_NO_LC_GFNI_PLANE2=1` restores
+/// that loop.
 ///
 /// `seed_zero` replaces the first-tile `_mm512_loadu_si512` of a known-zero
 /// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
@@ -328,6 +348,47 @@ pub(crate) unsafe fn gfni_fold_tile(
     out_planes_ptr: *mut u8,
     seed_zero: bool,
 ) {
+    // SAFETY: forwarded; `PLANE2` only changes the plane-loop interleaving.
+    unsafe {
+        if gfni_plane2_enabled() {
+            gfni_fold_tile_impl::<true>(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            )
+        } else {
+            gfni_fold_tile_impl::<false>(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`gfni_fold_tile`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_impl<const PLANE2: bool>(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
@@ -340,25 +401,66 @@ pub(crate) unsafe fn gfni_fold_tile(
                 );
             }
             let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
-                    _mm512_setzero_si512()
-                } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
-                };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+            if PLANE2 {
+                let mut byte_k = 0usize;
+                while byte_k < 16 {
+                    let p0 = planes.add(byte_k * 64) as *mut __m512i;
+                    let p1 = planes.add((byte_k + 1) * 64) as *mut __m512i;
+                    let mut acc0 = if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(p0 as *const __m512i)
+                    };
+                    let mut acc1 = if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(p1 as *const __m512i)
+                    };
+                    for t in (0..8).step_by(2) {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t],
+                            _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                        );
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t + 1],
+                            _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                        );
+                        acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0, g1);
+                        let h0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t],
+                            _mm512_set1_epi64(mats[t * 16 + byte_k + 1] as i64),
+                        );
+                        let h1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t + 1],
+                            _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k + 1] as i64),
+                        );
+                        acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, h0, h1);
+                    }
+                    _mm512_storeu_si512(p0, acc0);
+                    _mm512_storeu_si512(p1, acc1);
+                    byte_k += 2;
                 }
-                _mm512_storeu_si512(plane_ptr, acc);
+            } else {
+                for byte_k in 0..16 {
+                    let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                    let mut acc = if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    };
+                    for t in (0..8).step_by(2) {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t],
+                            _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                        );
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t + 1],
+                            _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                        );
+                        acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                    }
+                    _mm512_storeu_si512(plane_ptr, acc);
+                }
             }
         }
     }
