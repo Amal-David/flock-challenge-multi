@@ -280,6 +280,20 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_STAGE_TAIL=1` restores 64-lane seed staging stores on
+/// odd rows. Default: clip the hold-4 seed kernel to `row_lanes` so the
+/// published zero suffix is not written into the 512-row scratch block.
+/// Fused-four already uses that bound; codeword publish is unchanged.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_seed_stage_tail_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_STAGE_TAIL").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -1976,6 +1990,14 @@ impl AdditiveNttF128 {
                         target_feature = "vpclmulqdq"
                     ))]
                     if !ntt_seed_hold4_disabled() {
+                        // `row_len` remains the message/staging stride.
+                        // `seed_lanes` is the store bound: 60 on ranked odd
+                        // rows, 64 otherwise (or always 64 under the kill).
+                        let seed_lanes = if ntt_seed_stage_tail_disabled() {
+                            row_len
+                        } else {
+                            lanes2
+                        };
                         kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
                             src,
                             block_size,
@@ -1984,6 +2006,7 @@ impl AdditiveNttF128 {
                             bufp.add((256 + kp) * row_len),
                             64,
                             row_len,
+                            seed_lanes,
                             seed_right,
                             &seed_dense,
                             pf_next,

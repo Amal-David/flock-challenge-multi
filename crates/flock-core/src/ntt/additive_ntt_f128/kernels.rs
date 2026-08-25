@@ -447,10 +447,13 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
 
 /// One four-row message load, both seed staging groups. x86 AVX-512 holds the
 /// four ZMMs; other builds run the two-call form (same bytes, two gathers).
+/// `num_ntts` is the row stride; `active_lanes <= num_ntts` is the store
+/// bound (ranked odd rows clip the published zero suffix).
 ///
 /// # Safety
 /// Union of the sparse-geo and dense-geo contracts on the shared source and
-/// the two destinations. Destinations must not alias.
+/// the two destinations. Destinations must not alias. `active_lanes` must not
+/// exceed `num_ntts`.
 #[cfg(any(
     all(target_arch = "aarch64", target_feature = "aes"),
     all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -465,6 +468,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     dst_dense: *mut F128,
     dst_quarter: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
@@ -483,6 +487,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
             dst_dense,
             dst_quarter,
             num_ntts,
+            active_lanes,
             right_twiddle,
             dense_tw,
             pf_src,
@@ -496,7 +501,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
         target_feature = "vpclmulqdq"
     )))]
     unsafe {
-        let _ = pf_src;
+        let _ = (pf_src, active_lanes);
         portable::butterfly_fused_2layer_row_from_sparse_geo(
             src,
             src_quarter,

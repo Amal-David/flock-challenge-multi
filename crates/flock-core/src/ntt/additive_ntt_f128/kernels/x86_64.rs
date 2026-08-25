@@ -749,10 +749,14 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
 /// four original ZMMs plus three sparse working copies plus twiddle
 /// broadcasts — not 32.
 ///
+/// `num_ntts` is the SoA row stride. `active_lanes` is the store bound:
+/// fused-four never reads past it, so clipping the published odd-row zero
+/// suffix deletes staging stores with no consumer.
+///
 /// # Safety
 /// Same geometry as the two-call form. `dst_sparse` / `dst_dense` must not
 /// alias `src` or each other. When `pf_src` is non-null, the four `pf_src`
-/// rows are valid.
+/// rows are valid. `active_lanes <= num_ntts`.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -764,6 +768,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     dst_dense: *mut F128,
     dst_quarter: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
@@ -778,6 +783,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 dst_dense,
                 dst_quarter,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 dense_tw,
                 pf_src,
@@ -791,6 +797,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 dst_dense,
                 dst_quarter,
                 num_ntts,
+                active_lanes,
                 right_twiddle,
                 dense_tw,
                 pf_src,
@@ -812,6 +819,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     dst_dense: *mut F128,
     dst_quarter: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
@@ -819,6 +827,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     use core::arch::x86_64::*;
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     let pf = !pf_src.is_null();
+    debug_assert!(active_lanes <= num_ntts);
     unsafe {
         let sparse_b = tw_x4::<false, DIET>(right_twiddle);
         let outer = tw_x4::<false, DIET>(t_outer);
@@ -828,7 +837,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
         let sp_row = |i: usize| dst_sparse.add((i * dst_quarter) * num_ntts);
         let dn_row = |i: usize| dst_dense.add((i * dst_quarter) * num_ntts);
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
-        let lanes = num_ntts & !3;
+        let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
             if pf {
@@ -872,7 +881,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
             _mm512_storeu_si512(dn_row(3).add(lane) as *mut __m512i, vd);
             lane += 4;
         }
-        while lane < num_ntts {
+        while lane < active_lanes {
             let a = *src_row(0).add(lane);
             let b = *src_row(1).add(lane);
             let c = *src_row(2).add(lane);
