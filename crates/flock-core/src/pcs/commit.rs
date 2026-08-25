@@ -353,11 +353,12 @@ fn finalize_commit(
                 return;
             }
             // The deep block-fused schedule retires sixteen 128-leaf blocks
-            // per 2048-leaf subgroup. Keep hashing each block's leaves at
-            // retirement for producer/consumer overlap, but fold parents
-            // only when the subgroup's final FIFO block arrives. At that
-            // point all 2048 leaf CVs are ready, so one depth-11 fold fills
-            // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
+            // per 2048-leaf subgroup, optionally as eight 16-leaf tiles
+            // (AVX-512 BLAKE3 width) so the hasher reads 16 KiB still in
+            // L1. Hash every callback. Fold parents only when the
+            // subgroup's final FIFO tile arrives. At that point all 2048
+            // leaf CVs are ready, so one depth-11 fold fills the BLAKE3
+            // SIMD lanes that sixteen depth-7 folds leave sparse.
             let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
             else {
                 return;
@@ -661,6 +662,7 @@ pub(crate) fn subtree_parents_enabled() -> bool {
 }
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
+const RANKED_PARENT_LEAF_TILE: usize = 16;
 const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
 
 /// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
@@ -697,17 +699,18 @@ fn subtree_parent_regroup_enabled(
 /// Select the leaf range whose local parents may now be folded.
 ///
 /// `None` means this is an intermediate block: its leaf CVs are complete, but
-/// parent folding waits for the subgroup's final FIFO block. Any unexpected
-/// callback geometry retains the incumbent per-range behavior.
+/// parent folding waits for the subgroup's final FIFO block. Ranked tiles
+/// are either the incumbent 128-leaf block or the 16-leaf fused-three pair
+/// (one AVX-512 BLAKE3 SIMD group). Any unexpected callback geometry
+/// retains the incumbent per-range behavior.
 #[inline]
 fn local_parent_fold_range(
     range: &core::ops::Range<usize>,
     regroup: bool,
 ) -> Option<core::ops::Range<usize>> {
-    if !regroup
-        || range.len() != RANKED_PARENT_BLOCK_LEAVES
-        || !range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
-    {
+    let len = range.len();
+    let ranked_tile = len == RANKED_PARENT_BLOCK_LEAVES || len == RANKED_PARENT_LEAF_TILE;
+    if !regroup || !ranked_tile || !range.start.is_multiple_of(len) {
         return Some(range.clone());
     }
     if !range.end.is_multiple_of(RANKED_PARENT_SUBGROUP_LEAVES) {
@@ -1280,6 +1283,15 @@ mod tests {
             local_parent_fold_range(&final_first, true),
             Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
         );
+        let tile = 0..RANKED_PARENT_LEAF_TILE;
+        assert_eq!(local_parent_fold_range(&tile, false), Some(tile.clone()));
+        assert_eq!(local_parent_fold_range(&tile, true), None);
+        let last_tile = RANKED_PARENT_SUBGROUP_LEAVES - RANKED_PARENT_LEAF_TILE
+            ..RANKED_PARENT_SUBGROUP_LEAVES;
+        assert_eq!(
+            local_parent_fold_range(&last_tile, true),
+            Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
+        );
         let unexpected = 0..256;
         assert_eq!(
             local_parent_fold_range(&unexpected, true),
@@ -1359,6 +1371,49 @@ mod tests {
             HashKind::Blake3,
         );
         assert_eq!(tree, oracle);
+
+        // 16-leaf tiles (two fused-three groups) must hash the same CVs and
+        // still fold parents once per 2048-leaf subgroup.
+        let mut tree16 = vec![[0u8; 32]; 2 * N_LEAVES - 1];
+        let mut parent16 = Vec::new();
+        for start in (0..N_LEAVES).step_by(RANKED_PARENT_LEAF_TILE) {
+            let range = start..start + RANKED_PARENT_LEAF_TILE;
+            merkle::hash_leaves_serial(
+                &bytes[range.start * LEAF_SIZE..range.end * LEAF_SIZE],
+                LEAF_SIZE,
+                &mut tree16[range.clone()],
+                HashKind::Blake3,
+            );
+            let Some(parent_range) = local_parent_fold_range(&range, true) else {
+                continue;
+            };
+            parent16.push(parent_range.clone());
+            let depth = parent_range.len().trailing_zeros() as usize;
+            let mut lvl_read_off = parent_range.start;
+            let mut lvl_read_len = parent_range.len();
+            for j in 1..=depth {
+                let nodes_j = N_LEAVES >> j;
+                let base_j = 2 * N_LEAVES - 2 * nodes_j;
+                let write_off = base_j + (parent_range.start >> j);
+                let write_len = parent_range.len() >> j;
+                let (before_write, write_and_after) = tree16.split_at_mut(write_off);
+                merkle::hash_pairs_level_serial(
+                    &before_write[lvl_read_off..lvl_read_off + lvl_read_len],
+                    &mut write_and_after[..write_len],
+                    HashKind::Blake3,
+                );
+                lvl_read_off = write_off;
+                lvl_read_len = write_len;
+            }
+        }
+        assert_eq!(parent16, parent_ranges);
+        build_upper_levels(
+            &mut tree16,
+            N_LEAVES,
+            N_LEAVES >> RANKED_PARENT_SUBGROUP_LEAVES.trailing_zeros(),
+            HashKind::Blake3,
+        );
+        assert_eq!(tree16, oracle);
     }
 
     /// The fused recursive-commit route (encode → per-sub-group serial leaves

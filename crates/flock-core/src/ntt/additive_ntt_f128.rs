@@ -332,6 +332,17 @@ fn deep_block_fuse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
 }
 
+/// `FLOCK_NO_NTT_FUSED3_LEAF16=1` restores the incumbent 128-leaf Merkle
+/// callback after each 128-row block. Default: after every two fused-three
+/// eight-row groups (16 leaves, 16 KiB) the leaf-hash callback runs while
+/// that slab is still L1-resident. Same leaves, same CVs; only when the
+/// already-correct hash reads the rows changes. Ranked BLAKE3 AVX-512
+/// `hash_many` inner width is 16, so one tile fills one SIMD group.
+fn ntt_fused3_leaf16_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3_LEAF16").is_none())
+}
+
 /// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
 /// when this machine or pool cannot be paired.
 ///
@@ -2616,6 +2627,7 @@ impl AdditiveNttF128 {
                 let dense_lanes = num_ntts - odd_tail;
                 #[cfg(test)]
                 FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let leaf16 = ntt_fused3_leaf16_enabled();
                 for b in 0..16usize {
                     let g4 = sub_idx * 16 + b;
                     let mut tw = [F128 { lo: 0, hi: 0 }; 15];
@@ -2648,22 +2660,41 @@ impl AdditiveNttF128 {
                         for s in 0..4 {
                             tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
                         }
-                        let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
-                        // SAFETY: eight consecutive rows of `num_ntts` lanes,
-                        // owned exclusively by this sub-group task; the zero
-                        // tail lives on odd rows exactly as in the sweep
-                        // schedule (blocks start at even global rows).
-                        unsafe {
-                            kernels::butterfly_fused_3layer_rows(
-                                eight.as_mut_ptr(),
-                                num_ntts,
-                                dense_lanes,
-                                &tw3,
-                            );
+                        {
+                            let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+                            // SAFETY: eight consecutive rows of `num_ntts` lanes,
+                            // owned exclusively by this sub-group task; the zero
+                            // tail lives on odd rows exactly as in the sweep
+                            // schedule (blocks start at even global rows).
+                            unsafe {
+                                kernels::butterfly_fused_3layer_rows(
+                                    eight.as_mut_ptr(),
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw3,
+                                );
+                            }
+                        }
+                        // Two fused-three groups = 16 consecutive leaves =
+                        // one AVX-512 BLAKE3 `hash_many` SIMD group, 16 KiB,
+                        // still inside L1d. Kill switch keeps the 128-leaf
+                        // block callback below.
+                        if leaf16 && (j & 1) == 1 {
+                            let j0 = j - 1;
+                            let lo = sub_idx * sub_size_positions
+                                + b * block_size4
+                                + j0 * 8;
+                            let off = j0 * 8 * num_ntts;
+                            cb(lo..lo + 16, &blk[off..off + 16 * num_ntts]);
                         }
                     }
-                    let lo = sub_idx * sub_size_positions + b * block_size4;
-                    cb(lo..lo + block_size4, &sub_data[b * block_bytes4..(b + 1) * block_bytes4]);
+                    if !leaf16 {
+                        let lo = sub_idx * sub_size_positions + b * block_size4;
+                        cb(
+                            lo..lo + block_size4,
+                            &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
+                        );
+                    }
                 }
                 return true;
             }
