@@ -742,6 +742,18 @@ fn speculative_main(
             SPEC_WARMUP_PROVES
         };
         let warmup_started = std::time::Instant::now();
+        // Untimed publish-path warm: serialize + write + rename the same way
+        // the timed direct publish will, so the ~437 KiB bundle buffer, the
+        // bincode writer, and the scratch-file pages are already resident
+        // before the harness seed arrives. Without this the timed
+        // `publish_direct_proof` is the only cold section left in the window
+        // (the warm-up proves never serialize). Errors are ignored - this is
+        // warm-up only and must never gate the timed path.
+        // `FLOCK_NO_PUBLISH_WARMUP=1` disables.
+        let publish_warm = direct_proof_path
+            .as_deref()
+            .filter(|_| std::env::var_os("FLOCK_NO_PUBLISH_WARMUP").is_none())
+            .map(|path| path.with_extension("warm"));
         for _ in 0..spec_warmup_proves {
             let t0 = std::time::Instant::now();
             let warm_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -751,7 +763,12 @@ fn speculative_main(
                     fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
                     BlockSource::Slice(&scratch)
                 };
-                let _ = std::hint::black_box(run(setup_addr, src));
+                let out = run(setup_addr, src);
+                if let Some(warm_path) = publish_warm.as_deref() {
+                    let _ = publish_direct_proof(warm_path, out);
+                    let _ = std::fs::remove_file(warm_path);
+                }
+                std::hint::black_box(());
             }))
             .is_ok();
             if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
