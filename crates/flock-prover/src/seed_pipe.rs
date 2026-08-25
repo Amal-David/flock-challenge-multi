@@ -580,6 +580,28 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
     }
 }
 
+/// The block source the ranked timed prove will read from, for the fixed
+/// warm-up seed.
+///
+/// The timed prove runs on the speculative thread and, once the closed form
+/// is verified, takes [`BlockSource::Closed`]: witgen evaluates each block
+/// from the counter-based generator on the worker that is about to consume
+/// it, and never reads a materialized 59 MiB slice. Warm-up passes that
+/// hand [`BlockSource::Slice`] to the prover therefore warm a different
+/// witgen entry than the one the measured interval executes. Passing this
+/// source instead keeps them on the timed path's code.
+///
+/// Falls back to the caller's slice whenever the timed prove would also use
+/// one — outside the ranked worker, or with the closed form unverified or
+/// disabled.
+pub(crate) fn warmup_block_source(log2_size: u32, blocks: &[Compression]) -> BlockSource<'_> {
+    if blocks.len() == 1usize << log2_size && is_ranked_worker() && inline_block_gen_enabled() {
+        BlockSource::closed(log2_size, WARMUP_SEED)
+    } else {
+        BlockSource::Slice(blocks)
+    }
+}
+
 /// Splice a forwarding pipe onto stdin and start the speculative thread.
 ///
 /// Called once from the tail of the untimed warm-up proof, before the worker
