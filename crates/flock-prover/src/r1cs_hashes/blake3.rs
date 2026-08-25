@@ -3164,16 +3164,15 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         // Counts *outer* entries only (the extra warm-up proves below go
-        // through `prove_fast_inner`), so in the ranked worker call 0 is the
-        // untimed warm-up and call 1 is the timed proof.
+        // through `prove_fast_inner`). Ranked call 0 is the untimed warm-up.
+        // Direct seed-pipe publication keeps main blocked afterward; call 1 is
+        // reached only by the adoption fallback or outside that ranked path.
         static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Seed pipelining: on the timed call the proof for these blocks may
-        // already be several milliseconds in flight on the seed-pipe thread,
-        // started the moment the harness wrote the seed instead of after the
-        // protected wrapper's serial expansion of it. Adoption is gated on an
-        // equality check of `blocks`; see `crate::seed_pipe`. Inert unless
-        // `arm_seed_pipe` ran at the tail of call 0.
+        // Adoption fallback: when direct publication is disabled or fails,
+        // the proof for these blocks may already be in flight on the seed-pipe
+        // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
+        // Inert unless `arm_seed_pipe` ran at the tail of call 0.
         if call > 0 {
             if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
                 return adopted;
