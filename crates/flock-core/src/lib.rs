@@ -90,7 +90,22 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// no arithmetic changes, proof bytes identical.
 pub(crate) mod topology_pool {
     /// "pin16" | "phys8"
-    pub(crate) const POOL_MODE: &str = "pin16";
+    // One worker per physical core instead of one per SMT thread.
+    //
+    // The ranked instance exposes sixteen logical CPUs over eight physical
+    // cores. The incumbent pool runs sixteen workers, so both siblings of every
+    // core are busy through the whole prove. Siblings share a core's vector
+    // units, its L1 and its L2; for work that is bound by 512-bit execution
+    // throughput or by L2 residency rather than by latency, a second thread on
+    // the same core adds contention without adding throughput. For work bound
+    // by memory latency it does the opposite. This prove is a mixture of both,
+    // and which way the mixture leans on this instance is not something a
+    // development host can answer -- no other machine has this core count, this
+    // cache geometry, and this vector unit.
+    //
+    // Pure scheduling: worker count and CPU affinity only. No arithmetic
+    // changes and the proof bytes are identical either way.
+    pub(crate) const POOL_MODE: &str = "phys8";
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
