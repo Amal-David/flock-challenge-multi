@@ -858,6 +858,15 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 #[inline(always)]
 unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     unsafe {
+        // Ablation: publish the witness stream with ordinary stores instead of
+        // streaming ones. Same bytes, same addresses, same order -- the only
+        // difference is that each destination line is now fetched for
+        // ownership before it is overwritten, so this stream costs a hidden
+        // DRAM read per line on top of its write.
+        let _ = wide_nt;
+        _mm256_storeu_si256(p.cast::<__m256i>(), v);
+        return;
+        #[allow(unreachable_code)]
         if wide_nt && p as usize % 32 == 0 {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
@@ -876,6 +885,12 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
 #[inline(always)]
 unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     unsafe {
+        // Same ablation as `stream_v8`.
+        let _ = wide_nt;
+        _mm256_storeu_si256(p.cast::<__m256i>(), va);
+        _mm256_storeu_si256(p.add(8).cast::<__m256i>(), vb);
+        return;
+        #[allow(unreachable_code)]
         #[cfg(target_feature = "avx512f")]
         if wide_nt && p as usize % 64 == 0 {
             let z = _mm512_castsi256_si512(va);
