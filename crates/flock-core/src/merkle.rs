@@ -29,7 +29,7 @@
 //! BLAKE3 uses the [`blake3`] crate and BLAKE3's own tree semantics: a leaf is
 //! a non-root chaining value, an internal node is a PARENT-flagged compression
 //! of its two children. Both go through the crate's SIMD compression entry
-//! point in [`BLAKE3_BATCH`]-wide calls, so the batch always fills the widest
+//! point in [`blake3_batch`]-wide calls, so the batch always fills the widest
 //! vector the machine has (4 under NEON, 8 under AVX2, 16 under AVX-512) —
 //! see the note above [`blake3_hash_many`] for why that API and how it is
 //! kept honest.
@@ -298,20 +298,36 @@ fn blake3_platform() -> blake3::platform::Platform {
     *PLATFORM.get_or_init(blake3::platform::Platform::detect)
 }
 
-/// Inputs handed to `hash_many` per call.
-///
-/// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
-/// entry can loop over several such groups. Four groups amortize the FFI and
-/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
-/// the established 16-input policy on non-x86 targets, where an M4 sweep found
-/// it marginally best and the SIMD width is only four.
+/// Capacity of the stack pointer array handed to `hash_many`. AVX-512's FFI
+/// processes sixteen messages per inner SIMD iteration. The ranked default
+/// batch is two groups (32) so a 1024-byte leaf run stays inside 48 KiB L1d;
+/// `FLOCK_NO_BLAKE3_BATCH32=1` restores four groups (64). Non-x86 keeps 16.
 #[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
+const BLAKE3_BATCH_CAP: usize = 64;
 #[cfg(not(target_arch = "x86_64"))]
-const BLAKE3_BATCH: usize = 16;
+const BLAKE3_BATCH_CAP: usize = 16;
+
+/// Inputs per `hash_many` call. Ranked x86 default 32 (two AVX-512 groups,
+/// 32 KiB of 1024-byte leaves). Kill switch restores 64.
+#[cfg(target_arch = "x86_64")]
+fn blake3_batch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var_os("FLOCK_NO_BLAKE3_BATCH32").is_some() {
+            64
+        } else {
+            32
+        }
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn blake3_batch() -> usize {
+    16
+}
 
 /// Drive `hash_many` over `data`, a run of `out.len()` contiguous `N`-byte
-/// messages, in [`BLAKE3_BATCH`]-wide calls. `flags`/`start`/`end` select the
+/// messages, in [`blake3_batch`]-wide calls. `flags`/`start`/`end` select the
 /// node type (chunk vs parent).
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
@@ -326,16 +342,14 @@ fn blake3_hash_many<const N: usize>(
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
-    for (outs, msgs) in out
-        .chunks_mut(BLAKE3_BATCH)
-        .zip(data.chunks(BLAKE3_BATCH * N))
-    {
+    let batch = blake3_batch();
+    for (outs, msgs) in out.chunks_mut(batch).zip(data.chunks(batch * N)) {
         let n = outs.len();
         // Fill a stack array of input pointers. Slot 0 seeds the array so the
         // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
         // holds a valid reference rather than uninitialized memory.
         let first: &[u8; N] = msgs[..N].try_into().unwrap();
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        let mut inputs: [&[u8; N]; BLAKE3_BATCH_CAP] = [first; BLAKE3_BATCH_CAP];
         for (i, slot) in inputs[..n].iter_mut().enumerate() {
             *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
         }
@@ -1218,10 +1232,10 @@ mod tests {
     /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
-        // Node counts chosen around `BLAKE3_BATCH` (64): a single node, a
-        // partial batch, exactly one batch, one past it, and several batches
-        // with a partial tail. A width bug in the batch loop shows up here.
-        let counts = [1usize, 5, 63, 64, 65, 200];
+        // Node counts chosen around both batch widths (32 default, 64 kill
+        // switch): a single node, a partial batch, exactly one of each
+        // width, one past each, and several batches with a partial tail.
+        let counts = [1usize, 5, 31, 32, 33, 63, 64, 65, 200];
 
         // Parents.
         for n in counts {
