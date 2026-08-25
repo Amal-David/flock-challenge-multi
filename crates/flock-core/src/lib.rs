@@ -165,9 +165,37 @@ pub(crate) mod topology_pool {
             // Worker → CPU map: cores first (sibling 0 of each core), then the
             // second siblings; phys8 uses only the first half.
             let mut order: Vec<usize> = Vec::with_capacity(logical);
-            for s in 0..2 {
+            if POOL_MODE == "phys8" {
+                // One worker per physical core: first sibling of each.
+                for s in 0..2 {
+                    for g in &groups {
+                        order.push(g[s]);
+                    }
+                }
+            } else {
+                // Sibling-adjacent: workers 2k and 2k+1 share one
+                // physical core, and therefore its L1d and its L2.
+                //
+                // Rayon splits a parallel range into contiguous chunks and
+                // hands them out in worker order, so adjacent worker
+                // indices get adjacent data. Under the cores-first map
+                // those two neighbours sit on two different physical
+                // cores and each pulls its own lines; under this map they
+                // share a cache, so the second one's chunk arrives partly
+                // prefetched by the first and the shared L2 holds one
+                // contiguous span instead of two disjoint ones. The
+                // prove's dominant kernels are exactly that shape: long
+                // contiguous sweeps over the witness, the codeword and
+                // the fold buffers.
+                //
+                // The cores-first map was chosen so a partially-idle pool
+                // still spreads over cores. At the ranked shape the pool
+                // is not partially idle: the harness pins the worker count
+                // to the logical CPU count and the kernels saturate it.
                 for g in &groups {
-                    order.push(g[s]);
+                    for &cpu in g {
+                        order.push(cpu);
+                    }
                 }
             }
             let n = if POOL_MODE == "phys8" { cores } else { logical };
