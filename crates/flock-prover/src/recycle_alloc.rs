@@ -77,6 +77,75 @@ fn align64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ALIGN64").is_none())
 }
 
+/// RecycleAlloc-only huge-page advise. `alloc_uninit_vec` already hints
+/// `MADV_HUGEPAGE` on typed scratch; this covers the residual GlobalAlloc
+/// path (regular `Vec`s, proof buffers, first System.alloc of a size class)
+/// that never goes through that helper. Ubuntu 24.04 THP is `madvise` mode,
+/// so without a hint those 32 MB–1 GB blocks stay on 4 KiB pages for every
+/// strided NTT/zerocheck sweep.
+///
+/// `collapse` is `MADV_COLLAPSE` (Linux 6.1+, value 25): a synchronous
+/// collapse of the mapping onto 2 MiB pages. It is ONLY passed on a fresh
+/// `System.alloc` miss, never on a freelist pop — collapse in the timed
+/// window would walk page tables on a 100-trial critical path. The ranked
+/// extra-warmup proves allocate every recyclable size class untimed, so the
+/// cost sits entirely before the ready file. Errors ignored (ENOMEM, old
+/// kernels, already-huge). `FLOCK_NO_RECYCLE_HUGEPAGES=1` disables both
+/// hints for same-binary A/B; the ranked worker's cleared env never sets it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn advise_fresh(ptr: *mut u8, bytes: usize, collapse: bool) {
+    const HUGE: usize = 1 << 21;
+    if ptr.is_null() || bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("FLOCK_NO_RECYCLE_HUGEPAGES").is_some()) {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = (ptr as usize).saturating_add(bytes);
+    if end <= start {
+        return;
+    }
+    let len = end - start;
+    const SYS_MADVISE: usize = 28;
+    const MADV_HUGEPAGE: usize = 14;
+    const MADV_COLLAPSE: usize = 25;
+    // SAFETY: range is inside the just-allocated System block; neither
+    // MADV_HUGEPAGE nor MADV_COLLAPSE changes contents, only page size.
+    unsafe {
+        let mut ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") len,
+            in("rdx") MADV_HUGEPAGE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        let _ = ret;
+        if collapse {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SYS_MADVISE as isize => ret,
+                in("rdi") start,
+                in("rsi") len,
+                in("rdx") MADV_COLLAPSE,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+            let _ = ret;
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn advise_fresh(_ptr: *mut u8, _bytes: usize, _collapse: bool) {}
+
 /// Every large prover buffer historically landed `16 mod 64` (glibc mmap
 /// chunk header), which the hot kernels pay for three ways: every wide
 /// load/store on these buffers is a cache-line split, non-temporal 64-byte
@@ -158,10 +227,14 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                let p = unsafe { align_up(System.alloc(adjusted(&layout))) };
+                advise_fresh(p, layout.size(), true);
+                return p;
             }
         }
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        advise_fresh(p, layout.size(), false);
+        p
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -175,10 +248,14 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                let p = unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                advise_fresh(p, layout.size(), true);
+                return p;
             }
         }
-        unsafe { System.alloc_zeroed(layout) }
+        let p = unsafe { System.alloc_zeroed(layout) };
+        advise_fresh(p, layout.size(), false);
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
