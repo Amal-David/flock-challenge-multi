@@ -1255,6 +1255,26 @@ fn low_twiddle_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
 }
 
+/// `FLOCK_NO_NTT_FUSED3_LANE4=1` restores the dual-chunk fused-three vector
+/// body (two independent 4-lane groups, sixteen live row ZMMs plus the
+/// fourteen hoisted twiddle ZMMs). Default: one 4-lane group, eight live
+/// row ZMMs. Same 12 butterflies, same destinations, same bytes — only the
+/// vector-step width changes, so the 16-slot row file never shares the 32
+/// zmm entries with the twiddle broadcasts. Read once per process.
+#[inline]
+fn ntt_fused3_lane4_enabled() -> bool {
+    #[cfg(test)]
+    if FUSED3_LANE4_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3_LANE4").is_none())
+}
+
+#[cfg(test)]
+static FUSED3_LANE4_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
 /// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
@@ -1301,10 +1321,9 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 $values[$u] = new_u;
             }};
         }
-        // Two lane chunks per iteration: 16 live row registers + 14 twiddle
-        // registers still fit the 32 zmm file, and doubling the independent
-        // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
-        // the outstanding row misses.
+        // Dual-chunk (sixteen live row ZMMs) is the kill-switch body. The
+        // ranked path uses the 4-lane eight-row step below: eight live row
+        // ZMMs, same load-once/store-once contract, no extra staging bounce.
         macro_rules! butterfly2 {
             ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
                 for c in 0..2 {
@@ -1318,6 +1337,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }};
         }
 
+        if !ntt_fused3_lane4_enabled() {
         while lane + 8 <= dense_lanes {
             let mut values = [[zero; 8]; 2];
             for (c, chunk) in values.iter_mut().enumerate() {
@@ -1346,6 +1366,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 }
             }
             lane += 8;
+        }
         }
         while lane + 4 <= dense_lanes {
             let mut values = [zero; 8];
@@ -1653,6 +1674,53 @@ mod diet_tests {
                     "num_ntts={num_ntts} dense={dense_lanes} diet={diet} low={low}"
                 );
             }
+        }
+    }
+
+    /// Default 4-lane eight-row body is byte-identical to the dual-chunk
+    /// kill-switch body on the ranked 64-lane shape and on a short tail.
+    #[test]
+    fn fused3_lane4_matches_dual_chunk() {
+        use std::sync::atomic::Ordering;
+        let mut next = rng(0x1A4E_4004);
+        for (num_ntts, dense_lanes) in [(64usize, 64usize), (64, 60), (64, 48), (67, 50)] {
+            let mut base = vec![F128::ZERO; 8 * num_ntts];
+            for v in base.iter_mut() {
+                *v = next();
+            }
+            for lane in dense_lanes..num_ntts {
+                for i in (1..8).step_by(2) {
+                    base[i * num_ntts + lane] = F128::ZERO;
+                }
+            }
+            let mut twiddles = [F128::ZERO; 7];
+            twiddles[0] = next();
+            for t in twiddles[1..].iter_mut() {
+                let v = next();
+                *t = F128 { lo: v.lo, hi: 0 };
+            }
+            let run = |dual: bool| {
+                FUSED3_LANE4_TEST_OFF.store(dual, Ordering::Relaxed);
+                let mut got = base.clone();
+                // SAFETY: test binary has avx512f+vpclmulqdq; eight rows;
+                // inner twiddles are high-limb zero.
+                unsafe {
+                    butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                        got.as_mut_ptr(),
+                        num_ntts,
+                        dense_lanes,
+                        &twiddles,
+                    );
+                }
+                FUSED3_LANE4_TEST_OFF.store(false, Ordering::Relaxed);
+                got
+            };
+            let lane4 = run(false);
+            let dual = run(true);
+            assert_eq!(
+                lane4, dual,
+                "lane4 != dual-chunk num_ntts={num_ntts} dense={dense_lanes}"
+            );
         }
     }
 
