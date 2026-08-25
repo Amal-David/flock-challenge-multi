@@ -160,6 +160,25 @@ fn fold16_pf_ahead() -> usize {
     *D
 }
 
+/// `FLOCK_NO_FOLD16_W4=1` restores hoisting all sixteen weight broadcasts
+/// into ZMMs before the destination loop (the incumbent 16-slot `wb`
+/// file). Default: each 4-bank group materialises its four broadcasts
+/// locally, so at most four weight ZMMs share the file with the unreduced
+/// accumulator. Same 16 × 4 CLMUL, same bytes.
+fn fold16_w4_enabled() -> bool {
+    #[cfg(test)]
+    if FOLD16_W4_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_W4").is_none());
+    *ON
+}
+
+#[cfg(test)]
+static FOLD16_W4_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
@@ -174,14 +193,39 @@ fn fold16_pf_ahead() -> usize {
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
+    // SAFETY: forwarded caller contract; LOCAL_W only changes which ZMMs
+    // hold the same sixteen broadcasts.
+    unsafe {
+        if fold16_w4_enabled() {
+            fold16_banked_impl::<true>(src, dst, w);
+        } else {
+            fold16_banked_impl::<false>(src, dst, w);
+        }
+    }
+}
+
+/// `LOCAL_W`: four broadcasts per 4-bank group. Otherwise the incumbent
+/// sixteen-slot hoist.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold16_banked_impl<const LOCAL_W: bool>(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
+        let bcast = |b: usize| {
             _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
-        });
+        };
+        let wb: [__m512i; 16] = if LOCAL_W {
+            [_mm512_setzero_si512(); 16]
+        } else {
+            core::array::from_fn(bcast)
+        };
         // 4×4 transpose of 128-bit lanes: stage-1 index vectors interleave
         // lanes {0,1} / {2,3} of two inputs; stage 2 gathers lanes {0,1} /
         // {2,3} of the two stage-1 results.
@@ -221,10 +265,14 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
                 let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
                 let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                let w0 = if LOCAL_W { bcast(4 * g) } else { wb[4 * g] };
+                let w1 = if LOCAL_W { bcast(4 * g + 1) } else { wb[4 * g + 1] };
+                let w2 = if LOCAL_W { bcast(4 * g + 2) } else { wb[4 * g + 2] };
+                let w3 = if LOCAL_W { bcast(4 * g + 3) } else { wb[4 * g + 3] };
+                acc.mul_acc(u0, w0);
+                acc.mul_acc(u1, w1);
+                acc.mul_acc(u2, w2);
+                acc.mul_acc(u3, w3);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
@@ -498,5 +546,48 @@ pub(super) unsafe fn bind_both_and_msg_split(
         e1_acc ^= e1_wide.fold();
         einf_acc ^= einf_wide.fold();
         (e1_acc.reduce(), einf_acc.reduce())
+    }
+}
+
+#[cfg(test)]
+mod fold16_w4_tests {
+    use super::*;
+    use crate::field::F128;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn fold16_w4_matches_hoisted_broadcasts() {
+        let mut state = 0xF01D_16_W4u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 64, 257] {
+            let src: Vec<F128> = (0..16 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let run = |hoist: bool| {
+                FOLD16_W4_TEST_OFF.store(hoist, Ordering::Relaxed);
+                let mut got = vec![F128::ZERO; n];
+                // SAFETY: this module compiles only with avx512f+vpclmulqdq.
+                unsafe {
+                    fold16_banked(&src, &mut got, &w);
+                }
+                FOLD16_W4_TEST_OFF.store(false, Ordering::Relaxed);
+                got
+            };
+            let local = run(false);
+            let hoist = run(true);
+            assert_eq!(local, hoist, "n={n}");
+        }
     }
 }
