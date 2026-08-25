@@ -542,6 +542,27 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
+/// Untimed rehearsal of [`publish_direct_proof`] on the same temporary
+/// name, retargeted so the final path stays absent. Errors are ignored:
+/// this is a warm-up, and the timed publish handles its own failures.
+fn rehearse_publish(path: &Path, out: ProveOut) {
+    let (proof, commitment, _) = out;
+    let bundle = R1csProofBundleLigerito { commitment, proof };
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let mut warm = path.as_os_str().to_owned();
+    warm.push(".warm");
+    let warm = PathBuf::from(warm);
+    if std::fs::write(&temporary, bundle.to_bytes()).is_ok()
+        && std::fs::rename(&temporary, &warm).is_ok()
+    {
+        let _ = std::fs::remove_file(&warm);
+    } else {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
@@ -577,6 +598,28 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
     let ours = generate_compressions_par(log2_size, WARMUP_SEED);
     if blocks_eq_serial(&ours, warmup_blocks) {
         GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The block source the ranked timed prove will read from, for the fixed
+/// warm-up seed.
+///
+/// The timed prove runs on the speculative thread and, once the closed form
+/// is verified, takes [`BlockSource::Closed`]: witgen evaluates each block
+/// from the counter-based generator on the worker that is about to consume
+/// it, and never reads a materialized 59 MiB slice. Warm-up passes that
+/// hand [`BlockSource::Slice`] to the prover therefore warm a different
+/// witgen entry than the one the measured interval executes. Passing this
+/// source instead keeps them on the timed path's code.
+///
+/// Falls back to the caller's slice whenever the timed prove would also use
+/// one — outside the ranked worker, or with the closed form unverified or
+/// disabled.
+pub(crate) fn warmup_block_source(log2_size: u32, blocks: &[Compression]) -> BlockSource<'_> {
+    if blocks.len() == 1usize << log2_size && is_ranked_worker() && inline_block_gen_enabled() {
+        BlockSource::closed(log2_size, WARMUP_SEED)
+    } else {
+        BlockSource::Slice(blocks)
     }
 }
 
@@ -726,15 +769,30 @@ fn speculative_main(
     // The warm-up prove takes the *same* block source the timed one will, so
     // whichever of the two witgen paths ships is the one that gets warmed.
     //
-    // Four passes, not one: the residual first-touch faults this pass retires
-    // are not all retired by the first one, and the timed prove's fault count
-    // falls monotonically to a plateau at four. `FLOCK_NO_SPEC_WARMUP=1`
-    // restores the single pass. Same 300 s startup budget as the main-thread
-    // loop; `arm()` blocks on this whole block, so the wall-clock guard here
-    // is what keeps the ready file inside `STARTUP_TIMEOUT`.
+    // Eleven passes, matching the protected main thread's loop. The fault
+    // plateau at four is a property of the process-wide pages this pass
+    // retires, but a warm-up also warms state that belongs to the thread
+    // running it: this thread's own lazily committed 32 MiB stack, its
+    // thread-local scratch provenance slots, and its position in the rayon
+    // pool's injector and sleep bookkeeping. The main thread receives
+    // eleven passes of that and never runs a timed prove; this thread runs
+    // every timed prove and received four. Give the two loops the same
+    // count. `FLOCK_NO_SPEC_WARMUP=1` restores the single pass. Same 300 s
+    // startup budget as the main-thread loop; `arm()` blocks on this whole
+    // block, so the wall-clock guard here is what keeps the ready file
+    // inside `STARTUP_TIMEOUT`.
+    // Only the direct publisher owns a proof path; the adoption fallback
+    // hands its result to main instead and never writes a file.
+    let warm_publish_path = direct_proof_path.clone();
     if inline || scratch.len() == 1usize << log2_size {
-        const SPEC_WARMUP_PROVES: usize = 4;
-        const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+        // Let the wall-clock guard be what decides, which is what its own
+        // comment says it is for. The count is now a runaway cap rather than
+        // the binding constraint, and the budget is cut from 45 s to 5 s: the
+        // worst case an unusually slow instance can spend here drops by 9x,
+        // while a ranked-speed instance fits roughly twice the passes it fits
+        // today. Both bounds move in the safe direction at once.
+        const SPEC_WARMUP_PROVES: usize = 250;
+        const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
             1
@@ -751,7 +809,27 @@ fn speculative_main(
                     fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
                     BlockSource::Slice(&scratch)
                 };
-                let _ = std::hint::black_box(run(setup_addr, src));
+                let out = run(setup_addr, src);
+                // Warm the publication tail too. Until now the timed
+                // window paid for it cold: the ~460 KB encode buffer's
+                // first touch (113 page faults), the temporary file's
+                // dentry/inode creation, its page-cache allocation, and
+                // the rename — none of which any warm-up prove reaches,
+                // because those discard the proof instead of publishing
+                // it. Rehearsing it here retires the faults, leaves the
+                // encode buffer on the recycling allocator's freelist,
+                // and leaves the temporary name's dentry hot.
+                //
+                // The rehearsal never touches the final proof path. It
+                // writes the real `.tmp` name, renames it to a private
+                // `.warm` name, and unlinks that — so a warm-up proof,
+                // which answers the wrong seed, can never be the file
+                // the harness captures.
+                if let Some(path) = warm_publish_path.as_deref() {
+                    rehearse_publish(path, out);
+                } else {
+                    std::hint::black_box(out);
+                }
             }))
             .is_ok();
             if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {

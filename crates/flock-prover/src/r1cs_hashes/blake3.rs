@@ -3181,6 +3181,13 @@ impl Blake3Setup {
                 return adopted;
             }
         }
+        // Decide the closed form BEFORE the untimed passes below, not after
+        // them: the answer selects which witgen entry those passes warm.
+        // The check is the same one the tail used to run, moved earlier, and
+        // it is a no-op outside the ranked worker.
+        if call == 0 && self.n_blocks.is_power_of_two() {
+            crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
+        }
         static EXTRA_WARMUP_DONE: AtomicBool = AtomicBool::new(false);
         if self.r1cs.m >= 29
             && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
@@ -3192,9 +3199,12 @@ impl Blake3Setup {
             // makes the realised count come from the guard rather than from
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
+            // Budget-bound rather than count-bound; see the matching change
+            // on the speculative loop. 5 s caps what a slow instance can
+            // spend, and a ranked-speed instance uses the whole budget.
+            const EXTRA_WARMUP_PROVES: usize = 250;
             const EXTRA_WARMUP_BUDGET: std::time::Duration =
-                std::time::Duration::from_secs(45);
+                std::time::Duration::from_secs(5);
             let warmup_started = std::time::Instant::now();
             for _ in 0..EXTRA_WARMUP_PROVES {
                 let mut warm_challenger =
@@ -3202,7 +3212,7 @@ impl Blake3Setup {
                         self.pcs_params.merkle_hash
                     });
                 let _ = std::hint::black_box(self.prove_fast_inner(
-                    crate::seed_pipe::BlockSource::Slice(blocks),
+                    crate::seed_pipe::warmup_block_source(self.n_blocks_log() as u32, blocks),
                     &mut warm_challenger,
                 ));
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
@@ -3219,9 +3229,6 @@ impl Blake3Setup {
             // and only then touches `io::stdin()`, so the splice lands outside
             // every measured interval and before the wrapper's `BufReader`
             // binds a descriptor.
-            if self.n_blocks.is_power_of_two() {
-                crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
-            }
             self.arm_seed_pipe();
         }
         out
