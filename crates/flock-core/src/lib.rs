@@ -202,10 +202,21 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
     if bytes < HUGE {
         return;
     }
-    static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
-    if *DISABLED {
-        return;
+    // Ablation: the advice is withheld unconditionally, so the prover's
+    // multi-megabyte buffers stay on 4 KiB pages. The ranked environment is
+    // cleared, so the kill switch below can never be set there and the
+    // mechanism cannot be sampled through it; withholding the advice in the
+    // source is the only way to measure what it is worth on this instance.
+    // Every allocation is otherwise identical -- same sizes, same alignment,
+    // same contents, same order -- so the difference is page size alone.
+    return;
+    #[allow(unreachable_code)]
+    {
+        static DISABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
+        if *DISABLED {
+            return;
+        }
     }
     const PAGE: usize = 4096;
     let start = (ptr as usize).next_multiple_of(PAGE);
