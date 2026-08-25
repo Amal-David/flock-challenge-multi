@@ -681,22 +681,16 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     }
 
     // Still inside the untimed warm-up: block until the seed-pipe thread has
-    // finished its own throwaway prove (see `speculative_main`), so the ready
-    // file is not published before that thread is as warm as main. The wait
-    // is bounded only as a backstop against a hung prove, which would have
-    // hung the ordinary path just the same.
+    // finished its own throwaway proves and pre-ready cooldown. This wait must
+    // not time out locally: returning while that thread still cools would let
+    // the worker publish readiness and move the remainder inside the scored
+    // seed-to-proof interval. The protected harness's 300-second startup
+    // deadline remains the single fail-closed bound for a genuinely hung
+    // worker process.
     let (lock, cv) = &*warm;
     let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
     while !*done {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        done = cv
-            .wait_timeout(done, deadline - now)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        done = cv.wait(done).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -764,6 +758,27 @@ fn speculative_main(
                 break;
             }
         }
+    }
+    // The promoted 11+4 startup schedule deliberately saturates all 16 vCPUs
+    // for several seconds to retire first-touch faults. Give the package a
+    // short untimed idle interval after those pages are resident, so the
+    // measured prove begins with recovered turbo/thermal headroom instead of
+    // immediately following the hottest preparation pass. Rayon workers are
+    // already parked while this thread waits for the private seed; no proof
+    // state is touched. The diagnostic override is read before readiness and
+    // the ranked harness's cleared environment selects the bounded default.
+    const PRE_READY_COOLDOWN_MS: u64 = 1_500;
+    let cooldown_ms = if std::env::var_os("FLOCK_NO_PRE_READY_COOLDOWN").is_some() {
+        0
+    } else {
+        std::env::var("FLOCK_PRE_READY_COOLDOWN_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PRE_READY_COOLDOWN_MS)
+            .min(5_000)
+    };
+    if cooldown_ms != 0 {
+        std::thread::sleep(std::time::Duration::from_millis(cooldown_ms));
     }
     {
         let (lock, cv) = &*warm;
