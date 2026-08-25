@@ -400,6 +400,56 @@ pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) 
     }
 }
 
+/// `dst[i] ^= a[i] ^ b[i]` for `len` bytes. `len` must be a multiple of 64.
+///
+/// `VPTERNLOGD` immediate `0x96` is XOR of three operands (Intel SDM).
+/// Bit-identical to two [`xor_bytes_avx512`] calls. Two-ZMM unroll keeps
+/// six live ZMMs — dest pair, `a` pair, `b` pair — not a 16/24-acc hold.
+///
+/// # Safety
+/// `dst`, `a`, and `b` must each cover `len` bytes; `len % 64 == 0`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn xor_bytes_avx512_x2(
+    dst: *mut u8,
+    a: *const u8,
+    b: *const u8,
+    len: usize,
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(len % 64, 0);
+    // SAFETY: caller guarantees `len` bytes at all three pointers.
+    unsafe {
+        let mut i = 0;
+        while i + 128 <= len {
+            let d0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+            let d1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
+            let a0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
+            let a1 = _mm512_loadu_si512(a.add(i + 64) as *const __m512i);
+            let b0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
+            let b1 = _mm512_loadu_si512(b.add(i + 64) as *const __m512i);
+            _mm512_storeu_si512(
+                dst.add(i) as *mut __m512i,
+                _mm512_ternarylogic_epi64::<0x96>(d0, a0, b0),
+            );
+            _mm512_storeu_si512(
+                dst.add(i + 64) as *mut __m512i,
+                _mm512_ternarylogic_epi64::<0x96>(d1, a1, b1),
+            );
+            i += 128;
+        }
+        if i < len {
+            let d = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+            let x = _mm512_loadu_si512(a.add(i) as *const __m512i);
+            let y = _mm512_loadu_si512(b.add(i) as *const __m512i);
+            _mm512_storeu_si512(
+                dst.add(i) as *mut __m512i,
+                _mm512_ternarylogic_epi64::<0x96>(d, x, y),
+            );
+        }
+    }
+}
+
 /// x86 single-matrix inner kernel — SSE2 mirror of
 /// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
 /// `BLOCK_K = 8` block of i_inner positions, keeping all 8 F128 accumulators in

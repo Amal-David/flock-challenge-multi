@@ -1018,6 +1018,16 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_XOR3=1` restores pairing the 15 sibling XOR-merges as
+/// fifteen `xor_bytes_avx512` calls. Default: each pair of siblings is
+/// one `VPTERNLOGD` 0x96 (`dst ^= a ^ b`), then one leftover pairwise
+/// XOR when `n_workers` is even. Same bytes, half the merge stores.
+fn lc_xor3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_XOR3").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
 /// per-chunk `Instant::now()` probes inside the block-major sweep (the
 /// incumbent behaviour, and the way to get the tables / transpose+read /
@@ -1305,13 +1315,31 @@ fn fold_block_major_gfni(
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
         acc.copy_from_slice(&planes[base..base + 1024]);
-        for w in 1..n_workers {
+        let mut w = 1usize;
+        if lc_xor3_enabled() {
+            while w + 1 < n_workers {
+                let a = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+                let b = &planes[(w + 1) * k * 16 + base..(w + 1) * k * 16 + base + 1024];
+                // SAFETY: all three 1024-byte slabs; VPTERNLOG 0x96 is XOR3.
+                unsafe {
+                    kernels::xor_bytes_avx512_x2(
+                        acc.as_mut_ptr(),
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        1024,
+                    );
+                }
+                w += 2;
+            }
+        }
+        while w < n_workers {
             let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
             // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
             // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
             unsafe {
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
+            w += 1;
         }
         for (col, slot) in o.iter_mut().enumerate() {
             let mut lo = 0u64;
