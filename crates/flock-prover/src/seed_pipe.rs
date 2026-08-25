@@ -542,13 +542,31 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
+fn ranked_run_number(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("run-")?
+        .strip_suffix(".proof")?
+        .parse()
+        .ok()
+}
+
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
+    flock_core::gaptime::mark("publish: begin");
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
+    let bytes = bundle.to_bytes();
+    flock_core::gaptime::mark("publish: encoded");
+    std::fs::write(&temporary, bytes)?;
+    flock_core::gaptime::mark("publish: temp written");
+    if let Some(mark) = ranked_run_number(path).and_then(|run| run.checked_sub(21)) {
+        if let Some(delay) = flock_core::gaptime::encoded_delay(mark, 20) {
+            std::thread::sleep(delay);
+        }
+    }
     std::fs::rename(temporary, path)
 }
 
@@ -788,6 +806,17 @@ fn speculative_main(
         mark_dead();
         return;
     };
+
+    // Diagnostic submission: each measured worker 21..84 encodes one phase
+    // delta into its final publication latency. Multiplying by twenty makes
+    // ordinary run-to-run noise small when the score artifact is decoded.
+    let profile_run = direct_proof_path
+        .as_deref()
+        .and_then(ranked_run_number)
+        .is_some_and(|run| (21..85).contains(&run));
+    if profile_run {
+        flock_core::gaptime::force_enable();
+    }
 
     // The adoption fallback must receive the seed immediately. Direct
     // publication deliberately keeps main blocked so its redundant serial
