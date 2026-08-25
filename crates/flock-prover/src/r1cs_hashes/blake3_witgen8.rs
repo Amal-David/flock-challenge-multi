@@ -94,7 +94,23 @@ type V8 = __m256i;
 /// Slice callers retain the original borrowed-input route verbatim.
 pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
-    Closed { init: u64, base: usize },
+    Closed { first: u64 },
+}
+
+const CLOSED_BLOCK_STRIDE: u64 = crate::seed_pipe::GOLDEN
+    .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+const CLOSED_OCTA_STRIDE: u64 = CLOSED_BLOCK_STRIDE.wrapping_mul(8);
+
+/// SplitMix state immediately before the first draw of `base`.
+#[inline(always)]
+pub(crate) const fn closed_first(init: u64, base: usize) -> u64 {
+    init.wrapping_add((base as u64).wrapping_mul(CLOSED_BLOCK_STRIDE))
+}
+
+/// Advance a closed octa's first lane to the adjacent eight-block octa.
+#[inline(always)]
+pub(crate) const fn next_closed_octa_first(first: u64) -> u64 {
+    first.wrapping_add(CLOSED_OCTA_STRIDE)
 }
 
 struct PreparedInputs {
@@ -166,11 +182,9 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 /// above; Sapphire Rapids uses the eight-lane AVX-512DQ implementation below.
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
-unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+unsafe fn prepare_closed_inputs(first: u64) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
-        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
+        let stride = CLOSED_BLOCK_STRIDE;
         let mut states = [
             _mm256_setr_epi64x(
                 first as i64,
@@ -231,11 +245,9 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+unsafe fn prepare_closed_inputs(first: u64) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
-        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
+        let stride = CLOSED_BLOCK_STRIDE;
         let mut state = _mm512_setr_epi64(
             first as i64,
             first.wrapping_add(stride) as i64,
@@ -1626,7 +1638,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                     flags: load_v8(fl_a.as_ptr()),
                 }
             }
-            OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+            OctaInputs::Closed { first } => prepare_closed_inputs(first),
         };
         let cv_v = prepared.cv;
         let m = prepared.message;
@@ -2011,25 +2023,30 @@ mod tests {
                 (0x0123_4567_89AB_CDEF, 17),
                 (u64::MAX - 31, (1 << 18) - 8),
             ] {
-                let got = prepare_closed_inputs(init, base);
-                let cv: [[u32; 8]; 8] = got.cv.map(|v| lanes(v));
-                let message: [[u32; 8]; 16] = got.message.map(|v| lanes(v));
-                let counter_lo = lanes(got.counter_lo);
-                let counter_hi = lanes(got.counter_hi);
-                let block_len = lanes(got.block_len);
-                let flags = lanes(got.flags);
-                for lane in 0..8 {
-                    let expected = crate::seed_pipe::gen_block(init, base + lane);
-                    for word in 0..8 {
-                        assert_eq!(cv[word][lane], expected.0[word]);
+                let first = closed_first(init, base);
+                let second = next_closed_octa_first(first);
+                assert_eq!(second, closed_first(init, base + 8));
+                for (octa_base, octa_first) in [(base, first), (base + 8, second)] {
+                    let got = prepare_closed_inputs(octa_first);
+                    let cv: [[u32; 8]; 8] = got.cv.map(|v| lanes(v));
+                    let message: [[u32; 8]; 16] = got.message.map(|v| lanes(v));
+                    let counter_lo = lanes(got.counter_lo);
+                    let counter_hi = lanes(got.counter_hi);
+                    let block_len = lanes(got.block_len);
+                    let flags = lanes(got.flags);
+                    for lane in 0..8 {
+                        let expected = crate::seed_pipe::gen_block(init, octa_base + lane);
+                        for word in 0..8 {
+                            assert_eq!(cv[word][lane], expected.0[word]);
+                        }
+                        for word in 0..16 {
+                            assert_eq!(message[word][lane], expected.1[word]);
+                        }
+                        assert_eq!(counter_lo[lane], expected.2 as u32);
+                        assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
+                        assert_eq!(block_len[lane], expected.3);
+                        assert_eq!(flags[lane], expected.4);
                     }
-                    for word in 0..16 {
-                        assert_eq!(message[word][lane], expected.1[word]);
-                    }
-                    assert_eq!(counter_lo[lane], expected.2 as u32);
-                    assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
-                    assert_eq!(block_len[lane], expected.3);
-                    assert_eq!(flags[lane], expected.4);
                 }
             }
         }

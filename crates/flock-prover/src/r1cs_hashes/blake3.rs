@@ -1790,9 +1790,20 @@ fn generate_round1_inner_octa(
                 // token-verified constant chunks of a/b/z; the windows are
                 // always written in full.
                 unsafe {
+                    // A closed GROUP contains two adjacent octas. Derive the
+                    // first state once, then advance it by 8 * 25 SplitMix
+                    // steps for the second instead of rebuilding both from
+                    // `(init, base)` inside the W8 kernel.
+                    let (closed_first, closed_second) = match blocks {
+                        crate::seed_pipe::BlockSource::Closed { init, .. } => {
+                            let first = blake3_witgen8::closed_first(init, GROUP * g);
+                            (first, blake3_witgen8::next_closed_octa_first(first))
+                        }
+                        crate::seed_pipe::BlockSource::Slice(_) => (0, 0),
+                    };
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
-                        // Lead 2: a full closed-form octa carries only init/base
+                        // Lead 2: a full closed-form octa carries only its first state
                         // into the witness kernel, which generates all 25 draws
                         // directly in word-major SIMD lanes. Slice input still
                         // borrows in place; only a ragged closed octa uses the
@@ -1804,10 +1815,15 @@ fn generate_round1_inner_octa(
                                     s.get(base + j).unwrap_or(padding)
                                 }))
                             }
-                            crate::seed_pipe::BlockSource::Closed { init, len }
+                            crate::seed_pipe::BlockSource::Closed { len, .. }
                                 if base + SIMD <= len =>
                             {
-                                blake3_witgen8::OctaInputs::Closed { init, base }
+                                let first = if half == 0 {
+                                    closed_first
+                                } else {
+                                    closed_second
+                                };
+                                blake3_witgen8::OctaInputs::Closed { first }
                             }
                             crate::seed_pipe::BlockSource::Closed { init, len } => {
                                 staged = std::array::from_fn(|j| {
