@@ -573,6 +573,35 @@ pub(super) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super
     }
 }
 
+/// Reassemble one byte-plane bank and XOR `scale * lane` into `partial`.
+/// Byte-identical to [`c_plane_bank_to_f128`] then `add_scaled`.
+#[inline]
+pub(super) fn c_plane_bank_madd(
+    bank_planes: &[u8; 16 * 64],
+    partial: &mut [super::F128; 64],
+    scale: super::F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate supplies the features; both arrays are fixed-size.
+    unsafe {
+        x86_64::c_plane_bank_madd_x86_avx512(bank_planes, partial, scale);
+        return;
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let mut bank_f128 = [super::F128::ZERO; 64];
+        c_plane_bank_to_f128(bank_planes, &mut bank_f128);
+        crate::field::f128_slice::add_scaled(partial, &bank_f128, scale);
+    }
+}
+
 /// Ascending bulk fetch of one four-window C group into the worker staging
 /// buffer; see the kernel.
 #[cfg(all(

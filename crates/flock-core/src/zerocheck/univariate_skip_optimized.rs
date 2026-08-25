@@ -2866,26 +2866,33 @@ fn process_one_x_hi_ab_only(
         }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
-        // Plane-major → F128 through the same vectorized kernel the C drain
-        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
-        // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
-        // shared `add_scaled` leaf, which selects the architecture kernel.
-        let mut bank_f128 = [F128::ZERO; ELL];
-        let wide = r1_eqfold_x4_enabled();
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
-            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            if wide {
-                crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
-                    &bank_f128,
-                    *eq_bot_val,
-                );
-            } else {
-                for lane in 0..ELL {
-                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+        // Plane-major → F128. Default madd keeps the 64 lanes in
+        // ZMMs and XORs eq_bot*lane into partial_ab (no 1 KiB stack bank).
+        if r1_plane_madd_enabled() {
+            for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+                let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_madd(bank, &mut state.partial_ab, *eq_bot_val);
+            }
+        } else {
+            let mut bank_f128 = [F128::ZERO; ELL];
+            let wide = r1_eqfold_x4_enabled();
+            for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+                let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
+                if wide {
+                    crate::field::f128_slice::add_scaled(
+                        &mut state.partial_ab,
+                        &bank_f128,
+                        *eq_bot_val,
+                    );
+                } else {
+                    for lane in 0..ELL {
+                        state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+                    }
                 }
             }
         }
@@ -2907,6 +2914,15 @@ fn process_one_x_hi_ab_only(
 fn r1_eqfold_x4_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_EQFOLD_X4").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_R1_PLANE_MADD=1` restores the 1 KiB stack bank between plane
+/// reassembly and `add_scaled` on the round-1 AB band tail. Default: the
+/// same XOR terms without that store-reload. Ranked env is cleared.
+fn r1_plane_madd_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_PLANE_MADD").is_none());
     *ON
 }
 
