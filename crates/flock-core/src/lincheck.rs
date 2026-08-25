@@ -1018,6 +1018,16 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_REDUCE_UNINIT=1` restores zeroing the 1 KiB stack acc and
+/// `vec![F128::ZERO; k]` in the GFNI reduce. Default: copy worker 0 over
+/// uninit acc (every byte overwritten) and `alloc_uninit_vec` for `out`
+/// (every column reconstructed). Does **not** XOR into worker 0 (`1d64070`).
+fn lc_reduce_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_UNINIT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
 /// per-chunk `Instant::now()` probes inside the block-major sweep (the
 /// incumbent behaviour, and the way to get the tables / transpose+read /
@@ -1300,11 +1310,28 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
+    let mut out: Vec<F128> = if lc_reduce_uninit_enabled() {
+        crate::alloc_uninit_vec(k)
+    } else {
+        vec![F128::ZERO; k]
+    };
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
-        let mut acc = [0u8; 1024];
-        acc.copy_from_slice(&planes[base..base + 1024]);
+        let mut acc = if lc_reduce_uninit_enabled() {
+            let mut slot = core::mem::MaybeUninit::<[u8; 1024]>::uninit();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    planes.as_ptr().add(base),
+                    slot.as_mut_ptr() as *mut u8,
+                    1024,
+                );
+                slot.assume_init()
+            }
+        } else {
+            let mut z = [0u8; 1024];
+            z.copy_from_slice(&planes[base..base + 1024]);
+            z
+        };
         for w in 1..n_workers {
             let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
             // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
