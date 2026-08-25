@@ -31,3 +31,5 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+// flock-cycle resample fc-b-8251932: independent official timing sample of the promoted source; no executable change.
