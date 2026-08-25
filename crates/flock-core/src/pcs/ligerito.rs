@@ -4141,20 +4141,207 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+/// `FLOCK_NO_OPEN_NT_REG_PUB=1` restores the incumbent L1 stage bounce in
+/// [`fold_and_msg_chunk_nt_x86`]: `fold_pairs` stores a 32 KiB scratch,
+/// `msg_reduce_avx512` reloads it, then XMM NT copies the same bytes to dest.
+/// Ranked env is cleared, so the fused register-publish path runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_nt_reg_pub_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_NT_REG_PUB").is_none());
+    *ON
+}
+
+/// Fold four dest lanes from eight source F128s: `even + r·(even⊕odd)`.
+/// Same permute body as [`crate::field::f128_slice::fold_pairs`].
+///
+/// # Safety
+/// `avx512f`+`vpclmulqdq`; `src[2*(base+t) .. +8]` readable.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_pairs_x4(
+    src: *const F128,
+    base: usize,
+    t: usize,
+    r_bcast: core::arch::x86_64::__m512i,
+    idx_even: core::arch::x86_64::__m512i,
+    idx_odd: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    unsafe {
+        let s = 2 * (base + t);
+        let lo = _mm512_loadu_si512(src.add(s) as *const __m512i);
+        let hi = _mm512_loadu_si512(src.add(s + 4) as *const __m512i);
+        let even = _mm512_permutex2var_epi64(lo, idx_even, hi);
+        let odd = _mm512_permutex2var_epi64(lo, idx_odd, hi);
+        _mm512_xor_si512(even, ghash_mul_x4(r_bcast, _mm512_xor_si512(even, odd)))
+    }
+}
+
+/// Publish four F128s from one ZMM. 16-aligned dest uses XMM NT streams
+/// (pool/arena slices land 16 mod 64); otherwise `storeu`.
+///
+/// # Safety
+/// `dst.add(t)` covers four F128s; NT arm requires 16-byte alignment.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn publish_f128x4(
+    dst: *mut F128,
+    t: usize,
+    v: core::arch::x86_64::__m512i,
+    nt: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let p = dst.add(t);
+        if nt {
+            let d = p as *mut __m128i;
+            _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
+            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        } else {
+            _mm512_storeu_si512(p as *mut __m512i, v);
+        }
+    }
+}
+
+/// Fused NT leaf: fold in registers, NT-publish dest, message from the same
+/// ZMMs. Deletes the 32 KiB L1 stage store+reload+copy. Peak named live set
+/// is eight ZMMs (broadcast `r`, even/odd indices, swapped-pair index,
+/// folded f, folded b, packed f, packed b — product reuses a packed slot).
+///
+/// # Safety
+/// Same contract as [`fold_and_msg_chunk_nt_x86`] minus the stage buffers.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_nt_x86_reg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    let nt = (fc.as_mut_ptr() as usize).is_multiple_of(16)
+        && (bc.as_mut_ptr() as usize).is_multiple_of(16);
+
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
+
+        let f_src = f.as_ptr();
+        let b_src = b.as_ptr();
+        let f_dst = fc.as_mut_ptr();
+        let b_dst = bc.as_mut_ptr();
+
+        let xmm_f128 = |x: __m128i| F128 {
+            lo: _mm_cvtsi128_si64(x) as u64,
+            hi: _mm_extract_epi64::<1>(x) as u64,
+        };
+
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        let lanes = len & !3;
+        let mut t = 0usize;
+        while t < lanes {
+            let fv = fold_pairs_x4(f_src, base, t, r_bcast, idx_even, idx_odd);
+            let bv = fold_pairs_x4(b_src, base, t, r_bcast, idx_even, idx_odd);
+            publish_f128x4(f_dst, t, fv, nt);
+            publish_f128x4(b_dst, t, bv, nt);
+
+            // packed = [v0, v2, v0+v1, v2+v3]: even dest slots feed u0,
+            // pair-sums feed u2. One reduced 4-lane product, then XOR the
+            // two even lanes into u0 and the two pair-sum lanes into u2.
+            let fs = _mm512_xor_si512(fv, _mm512_permutexvar_epi64(perm_swap, fv));
+            let bs = _mm512_xor_si512(bv, _mm512_permutexvar_epi64(perm_swap, bv));
+            let pf = _mm512_permutex2var_epi64(fv, idx_even, fs);
+            let pb = _mm512_permutex2var_epi64(bv, idx_even, bs);
+            let prod = ghash_mul_x4(pf, pb);
+            let p0 = _mm512_extracti32x4_epi32::<0>(prod);
+            let p1 = _mm512_extracti32x4_epi32::<1>(prod);
+            let p2 = _mm512_extracti32x4_epi32::<2>(prod);
+            let p3 = _mm512_extracti32x4_epi32::<3>(prod);
+            u0 += xmm_f128(_mm_xor_si128(p0, p1));
+            u2 += xmm_f128(_mm_xor_si128(p2, p3));
+            t += 4;
+        }
+        while t + 1 < len {
+            let s = 2 * (base + t);
+            let f0e = *f_src.add(s);
+            let f0o = *f_src.add(s + 1);
+            let f1e = *f_src.add(s + 2);
+            let f1o = *f_src.add(s + 3);
+            let b0e = *b_src.add(s);
+            let b0o = *b_src.add(s + 1);
+            let b1e = *b_src.add(s + 2);
+            let b1o = *b_src.add(s + 3);
+            let f0 = f0e + r * (f0e + f0o);
+            let f1 = f1e + r * (f1e + f1o);
+            let b0 = b0e + r * (b0e + b0o);
+            let b1 = b1e + r * (b1e + b1o);
+            if nt {
+                let fd = f_dst.add(t) as *mut __m128i;
+                let bd = b_dst.add(t) as *mut __m128i;
+                _mm_stream_si128(fd, _mm_set_epi64x(f0.hi as i64, f0.lo as i64));
+                _mm_stream_si128(fd.add(1), _mm_set_epi64x(f1.hi as i64, f1.lo as i64));
+                _mm_stream_si128(bd, _mm_set_epi64x(b0.hi as i64, b0.lo as i64));
+                _mm_stream_si128(bd.add(1), _mm_set_epi64x(b1.hi as i64, b1.lo as i64));
+            } else {
+                *f_dst.add(t) = f0;
+                *f_dst.add(t + 1) = f1;
+                *b_dst.add(t) = b0;
+                *b_dst.add(t + 1) = b1;
+            }
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            t += 2;
+        }
+        if nt {
+            _mm_sfence();
+        }
+        (u0, u2)
+    }
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
+/// [`msg_reduce_avx512`] on the folded slices). Default: fold four dest
+/// lanes in registers, NT-publish those lanes, accumulate `(u0,u2)` from
+/// the same ZMMs — no L1 stage. `FLOCK_NO_OPEN_NT_REG_PUB=1` restores the
+/// incumbent 32 KiB stage store, stage reload, and NT copy.
 ///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
 /// `<= stage_f.len()`. `f`/`b` contain `2 * (base + fc.len())` elements.
-/// `stage_*` are write-before-read scratch owned by this worker.
+/// `stage_*` are write-before-read scratch owned by this worker (used only
+/// on the kill-switch restore).
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4175,6 +4362,12 @@ unsafe fn fold_and_msg_chunk_nt_x86(
     debug_assert_eq!(bc.len(), len);
     debug_assert!(len <= stage_f.len() && len <= stage_b.len());
     debug_assert!(len.is_multiple_of(2));
+
+    if open_nt_reg_pub_enabled() {
+        let _ = (stage_f, stage_b);
+        // SAFETY: same slice contract; fused arm does not read the stage.
+        return unsafe { fold_and_msg_chunk_nt_x86_reg(f, b, base, fc, bc, r) };
+    }
 
     crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
     crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
@@ -4370,17 +4563,22 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "vpclmulqdq"
             ))]
             if use_nt {
-                // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
-                // reused scratch; dest sees only the NT publish.
+                // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
+                // geometry matches fold_and_msg_lsb's even-length
+                // power-of-two split.
+                if open_nt_reg_pub_enabled() {
+                    // Fold + message from registers; dest sees only the NT
+                    // publish. No 32 KiB L1 stage.
+                    return unsafe { fold_and_msg_chunk_nt_x86_reg(f, b, base, fc, bc, r) };
+                }
+                // Incumbent: per-worker L1 stage; dest sees only the NT publish.
                 return OPEN_NT_STAGE.with(|cell| {
                     let mut st = cell.borrow_mut();
                     if st.0.len() < CHUNK {
                         st.0 = crate::alloc_uninit_vec(CHUNK);
                         st.1 = crate::alloc_uninit_vec(CHUNK);
                     }
-                    // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
-                    // geometry matches fold_and_msg_lsb's even-length
-                    // power-of-two split; stage capacity is CHUNK.
+                    // SAFETY: stage capacity is CHUNK.
                     unsafe {
                         let (sf, sb) = &mut *st;
                         fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
