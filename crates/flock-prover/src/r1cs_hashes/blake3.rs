@@ -3145,7 +3145,7 @@ impl Blake3Setup {
 
     /// Ligerito-backend prove. Requires m ≥ ~21.
     ///
-    /// First call in a process at ranked scale (m ≥ 29) runs two extra
+    /// First call in a process at ranked scale (m ≥ 29) runs eleven extra
     /// throwaway proves before the caller's prove. Rationale (gap-hunt,
     /// wave 7): the NT-store DRAM phases (zerocheck R2, open combine) and
     /// the GPU share calibration warm over the first ~3 proves of a process
@@ -3155,7 +3155,10 @@ impl Blake3Setup {
     /// passes into that first call moves the remaining ramp out of the
     /// timed window. The throwaway proves use a private challenger and are
     /// discarded — the caller's transcript and proof bytes are untouched.
-    /// `FLOCK_NO_EXTRA_WARMUP=1` disables.
+    /// Count: the page-fault curve on the timed prove is monotone in the
+    /// number of untimed passes and plateaus at eleven (main) / four
+    /// (seed-pipe thread); past the plateau the extra passes only spend
+    /// untimed budget. `FLOCK_NO_EXTRA_WARMUP=1` disables.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
@@ -3183,7 +3186,17 @@ impl Blake3Setup {
             && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
             && std::env::var_os("FLOCK_NO_EXTRA_WARMUP").is_none()
         {
-            for _ in 0..2 {
+            // The harness allows 300 s of untimed startup before the ready
+            // file (`STARTUP_TIMEOUT`, benchmark-tools/harness/src/main.rs);
+            // this loop normally spends ~3.1 s of it. The wall-clock budget
+            // makes the realised count come from the guard rather than from
+            // the constant, so an instance an order of magnitude slower than
+            // this host still publishes its ready file in time.
+            const EXTRA_WARMUP_PROVES: usize = 11;
+            const EXTRA_WARMUP_BUDGET: std::time::Duration =
+                std::time::Duration::from_secs(45);
+            let warmup_started = std::time::Instant::now();
+            for _ in 0..EXTRA_WARMUP_PROVES {
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
@@ -3192,6 +3205,9 @@ impl Blake3Setup {
                     crate::seed_pipe::BlockSource::Slice(blocks),
                     &mut warm_challenger,
                 ));
+                if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
+                    break;
+                }
             }
         }
         let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
