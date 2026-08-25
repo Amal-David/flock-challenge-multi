@@ -88,6 +88,36 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    // SAFETY: forwarded; `NT = false` is the incumbent `storeu` publish.
+    unsafe { fold4_nested_impl::<false>(src, dst, r0, r1) }
+}
+
+/// Same butterflies as [`fold4_nested`]; publishes `dst` with XMM `MOVNTDQ`
+/// when the pointer is 16-byte aligned (the pool/scratch lineage on this
+/// crate). Same trap as seed-top `publish_row_nt`: large vectors land 16
+/// mod 64, so a 64-byte gate in front of `_mm512_stream_si512` would
+/// silently never fire.
+///
+/// # Safety
+/// Same contract as [`fold4_nested`]. Caller issues `_mm_sfence` before a
+/// same-thread read of `dst`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold4_nested_nt(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    // SAFETY: forwarded; `NT = true` only changes the store opcode.
+    unsafe { fold4_nested_impl::<true>(src, dst, r0, r1) }
+}
+
+/// `NT = true` streams each 16-byte lane; `NT = false` is `_mm512_storeu`.
+///
+/// # Safety
+/// Same contract as [`fold4_nested`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold4_nested_impl<const NT: bool>(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+) {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -98,6 +128,7 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
         // Same even/odd 128-bit-lane selectors as `fold_pairs`.
         let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let idx_odd = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        let nt_ok = NT && (dst.as_mut_ptr() as usize).is_multiple_of(16);
         let lanes = dst.len() & !3;
         let mut t = 0;
         while t < lanes {
@@ -125,7 +156,15 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             let low = _mm512_permutex2var_epi64(mid01, idx_even, mid23);
             let high = _mm512_permutex2var_epi64(mid01, idx_odd, mid23);
             let out = _mm512_xor_si512(low, ghash_mul_x4(r1_bcast, _mm512_xor_si512(low, high)));
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+            if nt_ok {
+                let d = dst.as_mut_ptr().add(t) as *mut __m128i;
+                _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(out));
+                _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(out));
+                _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(out));
+                _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(out));
+            } else {
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+            }
             t += 4;
         }
         while t < dst.len() {
@@ -135,7 +174,13 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             let a3 = src[4 * t + 3];
             let low = a0 + r0 * (a0 + a1);
             let high = a2 + r0 * (a2 + a3);
-            dst[t] = low + r1 * (low + high);
+            let v = low + r1 * (low + high);
+            if nt_ok {
+                let d = dst.as_mut_ptr().add(t) as *mut __m128i;
+                _mm_stream_si128(d, _mm_set_epi64x(v.hi as i64, v.lo as i64));
+            } else {
+                dst[t] = v;
+            }
             t += 1;
         }
     }
