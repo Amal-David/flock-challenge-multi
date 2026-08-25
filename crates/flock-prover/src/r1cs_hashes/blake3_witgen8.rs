@@ -95,6 +95,11 @@ type V8 = __m256i;
 pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
     Closed { init: u64, base: usize },
+    /// Ranked closed-form input with its eight SplitMix lanes retained by the
+    /// owning Rayon folder. The caller seeks at a folder/task discontinuity;
+    /// consecutive octas advance with one vector add instead of rebuilding
+    /// the lane bases from `(init, base)`.
+    ClosedCursor(&'a mut ClosedOctaCursor),
 }
 
 struct PreparedInputs {
@@ -104,6 +109,22 @@ struct PreparedInputs {
     counter_hi: V8,
     block_len: V8,
     flags: V8,
+}
+
+/// Rolling eight-block closed-form generator state.
+///
+/// `state` is the SplitMix state immediately before the first draw of the
+/// octa at `next_base`. After the 25 draws for that octa, every lane has
+/// advanced by one block stride; adding another seven strides positions all
+/// eight lanes at the next octa. A stolen/non-contiguous Rayon item calls
+/// [`Self::seek`] and reconstructs the exact closed form.
+pub(crate) struct ClosedOctaCursor {
+    init: u64,
+    next_base: usize,
+    #[cfg(target_feature = "avx512dq")]
+    state: __m512i,
+    #[cfg(not(target_feature = "avx512dq"))]
+    states: [__m256i; 2],
 }
 
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
@@ -167,36 +188,7 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
-    unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
-        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
-        let mut states = [
-            _mm256_setr_epi64x(
-                first as i64,
-                first.wrapping_add(stride) as i64,
-                first.wrapping_add(stride.wrapping_mul(2)) as i64,
-                first.wrapping_add(stride.wrapping_mul(3)) as i64,
-            ),
-            _mm256_setr_epi64x(
-                first.wrapping_add(stride.wrapping_mul(4)) as i64,
-                first.wrapping_add(stride.wrapping_mul(5)) as i64,
-                first.wrapping_add(stride.wrapping_mul(6)) as i64,
-                first.wrapping_add(stride.wrapping_mul(7)) as i64,
-            ),
-        ];
-        let cv = std::array::from_fn(|_| next_generator_draw(&mut states));
-        let message = std::array::from_fn(|_| next_generator_draw(&mut states));
-        let counter_lo = next_generator_draw(&mut states);
-        PreparedInputs {
-            cv,
-            message,
-            counter_lo,
-            counter_hi: _mm256_setzero_si256(),
-            block_len: _mm256_set1_epi32(64),
-            flags: _mm256_set1_epi32(11),
-        }
-    }
+    unsafe { ClosedOctaCursor::new(init, base).next_prepared() }
 }
 
 #[cfg(target_feature = "avx512dq")]
@@ -229,35 +221,113 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     }
 }
 
+impl ClosedOctaCursor {
+    #[inline(always)]
+    pub(crate) unsafe fn new(init: u64, base: usize) -> Self {
+        unsafe {
+            let stride = crate::seed_pipe::GOLDEN
+                .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+            let first = init.wrapping_add((base as u64).wrapping_mul(stride));
+            #[cfg(target_feature = "avx512dq")]
+            {
+                Self {
+                    init,
+                    next_base: base,
+                    state: _mm512_setr_epi64(
+                        first as i64,
+                        first.wrapping_add(stride) as i64,
+                        first.wrapping_add(stride.wrapping_mul(2)) as i64,
+                        first.wrapping_add(stride.wrapping_mul(3)) as i64,
+                        first.wrapping_add(stride.wrapping_mul(4)) as i64,
+                        first.wrapping_add(stride.wrapping_mul(5)) as i64,
+                        first.wrapping_add(stride.wrapping_mul(6)) as i64,
+                        first.wrapping_add(stride.wrapping_mul(7)) as i64,
+                    ),
+                }
+            }
+            #[cfg(not(target_feature = "avx512dq"))]
+            {
+                Self {
+                    init,
+                    next_base: base,
+                    states: [
+                        _mm256_setr_epi64x(
+                            first as i64,
+                            first.wrapping_add(stride) as i64,
+                            first.wrapping_add(stride.wrapping_mul(2)) as i64,
+                            first.wrapping_add(stride.wrapping_mul(3)) as i64,
+                        ),
+                        _mm256_setr_epi64x(
+                            first.wrapping_add(stride.wrapping_mul(4)) as i64,
+                            first.wrapping_add(stride.wrapping_mul(5)) as i64,
+                            first.wrapping_add(stride.wrapping_mul(6)) as i64,
+                            first.wrapping_add(stride.wrapping_mul(7)) as i64,
+                        ),
+                    ],
+                }
+            }
+        }
+    }
+
+    /// Reposition only when a Rayon folder starts at a new range or a stolen
+    /// item is not the octa immediately following the previous one.
+    #[inline(always)]
+    pub(crate) unsafe fn seek(&mut self, init: u64, base: usize) {
+        if self.init != init || self.next_base != base {
+            *self = unsafe { Self::new(init, base) };
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn next_prepared(&mut self) -> PreparedInputs {
+        unsafe {
+            #[cfg(target_feature = "avx512dq")]
+            let (cv, message, counter_lo) = (
+                std::array::from_fn(|_| next_generator_draw(&mut self.state)),
+                std::array::from_fn(|_| next_generator_draw(&mut self.state)),
+                next_generator_draw(&mut self.state),
+            );
+            #[cfg(not(target_feature = "avx512dq"))]
+            let (cv, message, counter_lo) = (
+                std::array::from_fn(|_| next_generator_draw(&mut self.states)),
+                std::array::from_fn(|_| next_generator_draw(&mut self.states)),
+                next_generator_draw(&mut self.states),
+            );
+
+            // Twenty-five draws advanced lane j from block (base+j) to
+            // (base+j+1). Seven more block strides reach (base+8+j), the
+            // first state of the following octa.
+            let stride = crate::seed_pipe::GOLDEN
+                .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+            let jump = stride.wrapping_mul(7) as i64;
+            #[cfg(target_feature = "avx512dq")]
+            {
+                self.state = _mm512_add_epi64(self.state, _mm512_set1_epi64(jump));
+            }
+            #[cfg(not(target_feature = "avx512dq"))]
+            {
+                let jump = _mm256_set1_epi64x(jump);
+                self.states[0] = _mm256_add_epi64(self.states[0], jump);
+                self.states[1] = _mm256_add_epi64(self.states[1], jump);
+            }
+            self.next_base = self.next_base.wrapping_add(8);
+
+            PreparedInputs {
+                cv,
+                message,
+                counter_lo,
+                counter_hi: _mm256_setzero_si256(),
+                block_len: _mm256_set1_epi32(64),
+                flags: _mm256_set1_epi32(11),
+            }
+        }
+    }
+}
+
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
-    unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
-        let first = init.wrapping_add((base as u64).wrapping_mul(stride));
-        let mut state = _mm512_setr_epi64(
-            first as i64,
-            first.wrapping_add(stride) as i64,
-            first.wrapping_add(stride.wrapping_mul(2)) as i64,
-            first.wrapping_add(stride.wrapping_mul(3)) as i64,
-            first.wrapping_add(stride.wrapping_mul(4)) as i64,
-            first.wrapping_add(stride.wrapping_mul(5)) as i64,
-            first.wrapping_add(stride.wrapping_mul(6)) as i64,
-            first.wrapping_add(stride.wrapping_mul(7)) as i64,
-        );
-        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let counter_lo = next_generator_draw(&mut state);
-        PreparedInputs {
-            cv,
-            message,
-            counter_lo,
-            counter_hi: _mm256_setzero_si256(),
-            block_len: _mm256_set1_epi32(64),
-            flags: _mm256_set1_epi32(11),
-        }
-    }
+    unsafe { ClosedOctaCursor::new(init, base).next_prepared() }
 }
 
 #[inline(always)]
@@ -1627,6 +1697,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 }
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+            OctaInputs::ClosedCursor(cursor) => cursor.next_prepared(),
         };
         let cv_v = prepared.cv;
         let m = prepared.message;
@@ -1825,6 +1896,30 @@ mod tests {
         out
     }
 
+    unsafe fn assert_closed_prepared(got: PreparedInputs, init: u64, base: usize) {
+        unsafe {
+            let cv: [[u32; 8]; 8] = got.cv.map(|v| lanes(v));
+            let message: [[u32; 8]; 16] = got.message.map(|v| lanes(v));
+            let counter_lo = lanes(got.counter_lo);
+            let counter_hi = lanes(got.counter_hi);
+            let block_len = lanes(got.block_len);
+            let flags = lanes(got.flags);
+            for lane in 0..8 {
+                let expected = crate::seed_pipe::gen_block(init, base + lane);
+                for word in 0..8 {
+                    assert_eq!(cv[word][lane], expected.0[word]);
+                }
+                for word in 0..16 {
+                    assert_eq!(message[word][lane], expected.1[word]);
+                }
+                assert_eq!(counter_lo[lane], expected.2 as u32);
+                assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
+                assert_eq!(block_len[lane], expected.3);
+                assert_eq!(flags[lane], expected.4);
+            }
+        }
+    }
+
     /// Compile every W8 offset/width specialization used by the witness and
     /// compare its high-aligned VBMI2 state transition with an independent
     /// scalar bitstream append.  Bit-basis inputs include the deliberately
@@ -2012,25 +2107,39 @@ mod tests {
                 (u64::MAX - 31, (1 << 18) - 8),
             ] {
                 let got = prepare_closed_inputs(init, base);
-                let cv: [[u32; 8]; 8] = got.cv.map(|v| lanes(v));
-                let message: [[u32; 8]; 16] = got.message.map(|v| lanes(v));
-                let counter_lo = lanes(got.counter_lo);
-                let counter_hi = lanes(got.counter_hi);
-                let block_len = lanes(got.block_len);
-                let flags = lanes(got.flags);
-                for lane in 0..8 {
-                    let expected = crate::seed_pipe::gen_block(init, base + lane);
-                    for word in 0..8 {
-                        assert_eq!(cv[word][lane], expected.0[word]);
-                    }
-                    for word in 0..16 {
-                        assert_eq!(message[word][lane], expected.1[word]);
-                    }
-                    assert_eq!(counter_lo[lane], expected.2 as u32);
-                    assert_eq!(counter_hi[lane], (expected.2 >> 32) as u32);
-                    assert_eq!(block_len[lane], expected.3);
-                    assert_eq!(flags[lane], expected.4);
+                assert_closed_prepared(got, init, base);
+            }
+        }
+    }
+
+    #[test]
+    fn closed_octa_cursor_rolls_and_reseeks_exactly() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            for &(init, start) in &[
+                (0u64, 0usize),
+                (0x0123_4567_89AB_CDEF, 24),
+                (u64::MAX - 31, (1 << 18) - 64),
+            ] {
+                let mut cursor = ClosedOctaCursor::new(init, start);
+                for step in 0..4 {
+                    let base = start + 8 * step;
+                    assert_closed_prepared(cursor.next_prepared(), init, base);
                 }
+                // Discontinuous Rayon ownership must reconstruct the exact
+                // lane bases, then resume rolling from that point.
+                let jump = start + 48;
+                cursor.seek(init, jump);
+                assert_closed_prepared(cursor.next_prepared(), init, jump);
+                assert_closed_prepared(cursor.next_prepared(), init, jump + 8);
+
+                // A new closed source on a recycled folder state is also a
+                // mandatory reseed, even when the numeric base is unchanged.
+                let next_init = init.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                cursor.seek(next_init, jump);
+                assert_closed_prepared(cursor.next_prepared(), next_init, jump);
             }
         }
     }

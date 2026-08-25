@@ -1505,6 +1505,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            witgen_simd::closed_input_cursor_enabled(),
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -1705,6 +1706,7 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    closed_cursor_enabled: bool,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -1762,9 +1764,9 @@ fn generate_round1_inner_octa(
                     // `reserve_exact` guaranteed the capacity.
                     unsafe { v.set_len(want) };
                 }
-                v
+                (v, None::<blake3_witgen8::ClosedOctaCursor>)
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+            |(win, closed_cursor), (g, (((z_out, a_out), b_out), ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
@@ -1783,6 +1785,29 @@ fn generate_round1_inner_octa(
                 } else {
                     None
                 };
+                let group_base = GROUP * g;
+                let cursor_init = match blocks {
+                    crate::seed_pipe::BlockSource::Closed { init, len }
+                        if closed_cursor_enabled && group_base + n_here <= len =>
+                    {
+                        Some(init)
+                    }
+                    _ => None,
+                };
+                if let Some(init) = cursor_init {
+                    // SAFETY: this function is compiled only for the AVX2
+                    // octa path. A Rayon folder may resume at a stolen range;
+                    // seek reconstructs the exact lane bases in that case.
+                    unsafe {
+                        match closed_cursor {
+                            Some(cursor) => cursor.seek(init, group_base),
+                            None => {
+                                *closed_cursor =
+                                    Some(blake3_witgen8::ClosedOctaCursor::new(init, group_base));
+                            }
+                        }
+                    }
+                }
                 // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
                 // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
                 // contiguous 512-word blocks disjoint from every witness buffer.
@@ -1803,6 +1828,13 @@ fn generate_round1_inner_octa(
                                 blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
                                     s.get(base + j).unwrap_or(padding)
                                 }))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { .. }
+                                if cursor_init.is_some() =>
+                            {
+                                blake3_witgen8::OctaInputs::ClosedCursor(
+                                    closed_cursor.as_mut().expect("cursor initialized above"),
+                                )
                             }
                             crate::seed_pipe::BlockSource::Closed { init, len }
                                 if base + SIMD <= len =>
@@ -2206,6 +2238,16 @@ pub(crate) mod witgen_simd {
     pub(crate) fn witgen_ab_winstream_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_WINSTREAM").is_none());
+        *ON
+    }
+
+    /// `FLOCK_NO_CLOSED_INPUT_CURSOR=1` restores reconstruction of the eight
+    /// SplitMix lane bases for every closed-form octa. By default a Rayon
+    /// folder retains those lanes and advances them across consecutive octas;
+    /// a stolen or non-contiguous item seeks back to the exact closed form.
+    pub(crate) fn closed_input_cursor_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_CLOSED_INPUT_CURSOR").is_none());
         *ON
     }
 
@@ -4221,6 +4263,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    false,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
@@ -4366,6 +4409,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Same-binary oracle for the rolling closed-input cursor and its kill
+    /// fallback. Multiple Rayon items exercise both consecutive octas and
+    /// folder/task discontinuities; every witness and projection byte must
+    /// remain identical to per-octa closed-form reconstruction.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn round1_inner_closed_cursor_matches_per_octa_fallback() {
+        const N_TOTAL: usize = 256;
+        const F128_PER_BLOCK: usize = K / 128;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        let log2 = N_TOTAL.ilog2();
+        let seed = 0xC105_EDC0_1250_5EEDu64;
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(
+            K_SKIP,
+            flock_core::field::F8::ZERO,
+        );
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            K_SKIP,
+            flock_core::field::F8(1u8 << K_SKIP),
+        );
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let run = |cursor_enabled: bool| {
+            let n_f128 = N_TOTAL * F128_PER_BLOCK;
+            let mut z = vec![F128::ZERO; n_f128];
+            let mut a = vec![F128::ZERO; n_f128];
+            let mut b = vec![F128::ZERO; n_f128];
+            let mut ab_inner =
+                flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+                    N_TOTAL * BYTES_PER_BLOCK,
+                );
+            ab_inner.set_invalid_prefix_bytes(0);
+            generate_round1_inner_octa(
+                crate::seed_pipe::BlockSource::closed(log2, seed),
+                0,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                [false; 3],
+                true,
+                cursor_enabled,
+            );
+            let ab = ab_inner.as_bytes_mut().to_vec();
+            (z, a, b, ab)
+        };
+
+        let fallback = run(false);
+        let cursor = run(true);
+        assert_eq!(cursor.0, fallback.0, "z differs from kill fallback");
+        assert_eq!(cursor.1, fallback.1, "a differs from kill fallback");
+        assert_eq!(cursor.2, fallback.2, "b differs from kill fallback");
+        assert_eq!(cursor.3, fallback.3, "ab_inner differs from kill fallback");
     }
 
     /// The closed form must also survive the padding regime: when the block
