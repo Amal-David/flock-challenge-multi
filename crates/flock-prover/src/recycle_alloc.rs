@@ -16,6 +16,15 @@ const RECYCLE_MIN: usize = 32 * 1024;
 const MAX_ALIGN: usize = 16;
 const MAX_CLASSES: usize = 512;
 
+/// One size class. Padded to a cache line: the table is probed and mutated
+/// concurrently by every prover thread, and two classes sharing a line put
+/// their `size` word and their freelist mutex in the same coherence unit.
+/// A thread taking one class's lock then invalidates the line another
+/// thread is reading its `size` from, and two threads holding different
+/// locks ping the line between their cores on every push and pop. The
+/// large-buffer classes the prove cycle hammers are adjacent in the probe
+/// order, so they are exactly the ones that collide.
+#[repr(align(64))]
 struct Class {
     size: AtomicUsize,
     head: Mutex<usize>,
