@@ -229,6 +229,41 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     }
 }
 
+/// Produce four consecutive protected-generator draws while exposing their
+/// SplitMix chains as independent AVX-512 work. The scalar recurrence is only
+/// `state += GOLDEN`; mixing never feeds back, so all four states derive from
+/// the same base and may execute in parallel.
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn next_generator_draw4(state: &mut __m512i) -> [V8; 4] {
+    unsafe {
+        let base = *state;
+        let s1 = _mm512_add_epi64(
+            base,
+            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
+        );
+        let s2 = _mm512_add_epi64(
+            base,
+            _mm512_set1_epi64(crate::seed_pipe::GOLDEN.wrapping_mul(2) as i64),
+        );
+        let s3 = _mm512_add_epi64(
+            base,
+            _mm512_set1_epi64(crate::seed_pipe::GOLDEN.wrapping_mul(3) as i64),
+        );
+        let s4 = _mm512_add_epi64(
+            base,
+            _mm512_set1_epi64(crate::seed_pipe::GOLDEN.wrapping_mul(4) as i64),
+        );
+        *state = s4;
+        [
+            _mm512_cvtepi64_epi32(mix_u64x8(s1)),
+            _mm512_cvtepi64_epi32(mix_u64x8(s2)),
+            _mm512_cvtepi64_epi32(mix_u64x8(s3)),
+            _mm512_cvtepi64_epi32(mix_u64x8(s4)),
+        ]
+    }
+}
+
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
@@ -246,13 +281,18 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
             first.wrapping_add(stride.wrapping_mul(6)) as i64,
             first.wrapping_add(stride.wrapping_mul(7)) as i64,
         );
-        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let counter_lo = next_generator_draw(&mut state);
+        let [cv0, cv1, cv2, cv3] = next_generator_draw4(&mut state);
+        let [cv4, cv5, cv6, cv7] = next_generator_draw4(&mut state);
+        let [m0, m1, m2, m3] = next_generator_draw4(&mut state);
+        let [m4, m5, m6, m7] = next_generator_draw4(&mut state);
+        let [m8, m9, m10, m11] = next_generator_draw4(&mut state);
+        let [m12, m13, m14, m15] = next_generator_draw4(&mut state);
         PreparedInputs {
-            cv,
-            message,
-            counter_lo,
+            cv: [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7],
+            message: [
+                m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
+            ],
+            counter_lo: next_generator_draw(&mut state),
             counter_hi: _mm256_setzero_si256(),
             block_len: _mm256_set1_epi32(64),
             flags: _mm256_set1_epi32(11),
