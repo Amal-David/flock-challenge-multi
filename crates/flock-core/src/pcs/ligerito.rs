@@ -3643,7 +3643,7 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
         }
         // Chunked parallel reduce; each chunk length is a multiple of 8 when
         // possible so the AVX-512 body stays saturated.
-        const CHUNK: usize = 2048;
+        const CHUNK: usize = 1024;
         let (u_0, u_2) = f
             .par_chunks(CHUNK)
             .zip(b.par_chunks(CHUNK))
@@ -3719,7 +3719,7 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
             let (u_0, u_2, y) = unsafe { msg_reduce_eval_avx512(f, b) };
             return (SumcheckMessage { u_0, u_2 }, y);
         }
-        const CHUNK: usize = 2048;
+        const CHUNK: usize = 1024;
         let (u_0, u_2, y) = f
             .par_chunks(CHUNK)
             .zip(b.par_chunks(CHUNK))
@@ -5819,21 +5819,22 @@ fn fold_direct_fold8_factors_and_message(
     claims: &mut [super::ring_switch::DirectFold8Factors],
     challenge: F128,
 ) -> SumcheckMessage {
-    let (u0, u2) = if claims.len() == 2 {
-        let (left, right) = claims.split_at_mut(1);
-        let (a, b) = rayon::join(
-            || fold_one_direct_fold8_claim_and_message(&mut left[0], challenge),
-            || fold_one_direct_fold8_claim_and_message(&mut right[0], challenge),
-        );
-        (a.0 + b.0, a.1 + b.1)
-    } else {
-        claims.iter_mut().fold((F128::ZERO, F128::ZERO), |mut total, claim| {
+    // Sequential on the calling thread, for every claim count. The ranked
+    // shape binds exactly two claims and this runs five times per proof, on
+    // the Fiat-Shamir spine. The incumbent `rayon::join` split a per-round
+    // bind whose two halves are smaller than a scope push plus the wake of a
+    // parked worker, and the spine waits for both ends regardless, so the
+    // split bought latency it could not hide. Value-identical to the join
+    // arm: the claims are disjoint, F128 addition is XOR, and this is the
+    // accumulation order the join arm already used.
+    let (u0, u2) = claims
+        .iter_mut()
+        .fold((F128::ZERO, F128::ZERO), |mut total, claim| {
             let part = fold_one_direct_fold8_claim_and_message(claim, challenge);
             total.0 += part.0;
             total.1 += part.1;
             total
-        })
-    };
+        });
     SumcheckMessage { u_0: u0, u_2: u2 }
 }
 
@@ -5950,6 +5951,18 @@ fn materialize_direct_fold8(
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
+    /// `RecycleAlloc` (`flock-prover/src/recycle_alloc.rs`) only hands back
+    /// 64-byte-aligned pointers for allocations of at least `RECYCLE_MIN`
+    /// = 32 KiB; anything smaller goes straight to the system allocator and
+    /// lands 16 mod 64 (that file's own doc records the 16-mod-64 history and
+    /// the three costs it pays). The per-job `mid4` staging buffer below is
+    /// `4 * SUB` F128 = 16 KiB, i.e. it sits UNDER the gate, so every wide
+    /// load and store the 64->4->1 fold makes against it is a cache-line
+    /// split. Ask for the gate's own minimum instead so the buffer lands in
+    /// the aligned class. CAPACITY ONLY: the kernels below still address
+    /// exactly `4 * n` elements with `n <= SUB`, so no value, no element and
+    /// no order changes.
+    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     let stats = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
@@ -5975,7 +5988,7 @@ fn materialize_direct_fold8(
                         pooled,
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
-                    crate::scratch::LocalBuf::new(4 * SUB, pooled),
+                    crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled),
                     crate::scratch::LocalBuf::new(if b_gfni_on { 64 } else { 0 }, pooled),
                 )
             },
