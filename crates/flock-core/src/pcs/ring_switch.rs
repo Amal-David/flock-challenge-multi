@@ -2625,6 +2625,14 @@ fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 /// kernels defer the F2-linear reduction (`reduce(Σ) = Σ reduce`), so all
 /// results are bit-identical to the scalar order. Read once per process.
 /// `FLOCK_NO_RS_TAIL_PAR=1` restores the exact incumbent sequential tail.
+#[inline]
+fn rs_elide_dead_basis_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none()
+    });
+    *ON
+}
+
 fn rs_tail_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_TAIL_PAR").is_none());
@@ -3061,6 +3069,26 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_precomputed_elidable(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        challenger,
+        false,
+    )
+}
+
+/// As [`prove_batched_padded_with_precomputed`], with an additional promise
+/// that the exact DirectFold8 consumer will not read `rs_eq_ind` values.
+pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+    basis_elidable: bool,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace = std::env::var("PCS_TRACE").is_ok();
     let n = x_outers.len();
@@ -3130,8 +3158,31 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
+    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
+        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .collect();
+    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
+        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
+        .collect();
+    let all_claims_yield_fold8 = use_split
+        && !x_outers.is_empty()
+        && kinds.iter().all(|k| matches!(k, Kind::Dense(_)))
+        && dense_suffixes.iter().all(|s| s.len() >= 6)
+        && (0..n).all(|i| {
+            precomputed_s_hat_v
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|p| p.len() == 64 * n_packed)
+        });
+    let elide_basis = basis_elidable
+        && all_claims_yield_fold8
+        && dense_needs_fold.is_empty()
+        && sparse_needs_fold.is_empty()
+        && crate::pcs::ranked_direct_fold8_enabled()
+        && rs_elide_dead_basis_enabled();
     let t = std::time::Instant::now();
-    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
+    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split && !elide_basis {
         dense_suffixes
             .iter()
             .map(|s| build_eq_split(s, split_n_lo(s.len())))
@@ -3167,12 +3218,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
-        .collect();
-    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
-        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
-        .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
@@ -3433,11 +3478,21 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         // table so pcs's combine folds each slot directly into
                         // `b_combined` (no 2^(m-7) materialize + readback). The
                         // table build is the only work done here (16·256 adds).
-                        let (eq_lo, eq_hi) = &dense_splits[d];
-                        RsEqInd::DeferredDense {
-                            eq_lo: eq_lo.clone(),
-                            eq_hi: eq_hi.clone(),
-                            table,
+                        if elide_basis {
+                            let n_lo = split_n_lo(dense_suffixes[d].len());
+                            let n_hi = dense_suffixes[d].len() - n_lo;
+                            RsEqInd::DeferredDense {
+                                eq_lo: vec![F128::ZERO; 1usize << n_lo],
+                                eq_hi: vec![F128::ZERO; 1usize << n_hi],
+                                table,
+                            }
+                        } else {
+                            let (eq_lo, eq_hi) = &dense_splits[d];
+                            RsEqInd::DeferredDense {
+                                eq_lo: eq_lo.clone(),
+                                eq_hi: eq_hi.clone(),
+                                table,
+                            }
                         }
                     } else {
                         RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))

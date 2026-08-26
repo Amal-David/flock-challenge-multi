@@ -61,6 +61,35 @@ fn ranked_direct_fold4_precompute_enabled(
         && r1cs.k_log >= pcs::LOG_PACKING + 4
 }
 
+/// Memoised [`BlockR1cs::c0_is_identity`].
+///
+/// The identity check walks every `c_0` row even though it is a fixed
+/// statement property. Key the cached answer by the statement digest so the
+/// timed ranked proof pays only a warm digest comparison. The kill switch
+/// preserves the incumbent walk for same-binary A/B validation.
+fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1CS_C0_ID_CACHE").is_none()
+    });
+    if !*ON {
+        return r1cs.c0_is_identity();
+    }
+    static CACHE: std::sync::Mutex<Option<([u8; 32], bool)>> =
+        std::sync::Mutex::new(None);
+    let digest = r1cs.statement_digest();
+    let mut slot = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_digest, value)) = *slot {
+        if cached_digest == digest {
+            return value;
+        }
+    }
+    let value = r1cs.c0_is_identity();
+    *slot = Some((digest, value));
+    value
+}
+
 /// Exact-shape gate for deriving identity C from one block-major outer fold of
 /// the witness instead of draining it into 32 field banks in zerocheck round
 /// one. Deliberately narrower than the generic DirectFold4 gate — the shortcut
@@ -80,7 +109,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_skip == zerocheck::K_SKIP
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-        && r1cs.c0_is_identity()
+        && c0_is_identity_cached(r1cs)
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
@@ -320,7 +349,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     // a = A·z, b = B·z; for the C = I convention c aliases z.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
+    let c_packed_f128: Vec<F128> = if c0_is_identity_cached(r1cs) {
         Vec::new()
     } else {
         r1cs.apply_c_packed(&z_packed)

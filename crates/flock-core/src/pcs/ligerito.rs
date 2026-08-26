@@ -5860,6 +5860,303 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// Exact ranked selector for overlapping the L1 commitment with the final
+/// DirectFold8 basis materialization. The split kernel below deliberately
+/// implements only the production two-claim GFNI geometry; every other
+/// shape, platform, hash, or either kill switch retains the fused
+/// [`materialize_direct_fold8`] path verbatim.
+#[inline]
+fn ranked_open_l1_pipe_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    packed_witness_len: usize,
+    ordinary_basis_len: usize,
+    claims: &[super::ring_switch::DirectFold8Factors],
+) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let gfni_kernel_enabled = direct_fold8_b_gfni_enabled();
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let gfni_kernel_enabled = false;
+
+    gfni_kernel_enabled
+        && std::env::var_os("FLOCK_NO_OPEN_L1_PIPE").is_none()
+        && log_n == 25
+        && packed_witness_len == (1usize << 25)
+        && ordinary_basis_len == 0
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_ks.first() == Some(&3)
+        && config.log_inv_rates.first() == Some(&1)
+        && config.log_inv_rates.get(1) == Some(&2)
+        && config.merkle_hash == HashKind::Blake3
+        && claims.len() == 2
+        && claims.iter().all(|claim| {
+            claim.eq_lo.len() == (1usize << 11)
+                && claim.eq_hi.len() == (1usize << 8)
+                && claim.a_state.len() == (64usize << super::LOG_PACKING)
+                && claim.w_state.len() == (64usize << super::LOG_PACKING)
+        })
+}
+
+/// Fold only the witness side of the ranked DirectFold8 materializer. Once
+/// this returns, `folded_f` is immutable and can feed both the L1 encoder and
+/// M6's read-only product reduction concurrently.
+fn materialize_direct_fold8_witness(
+    packed_witness: Vec<F128>,
+    challenges: [F128; 6],
+    block_len: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    assert!(packed_witness.len().is_multiple_of(64));
+    let [_, _, _, _, r4, r5] = challenges;
+    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
+        let mut weight = F128::ONE;
+        for (bit, &challenge) in challenges[..4].iter().enumerate() {
+            weight *= if (bank >> bit) & 1 == 0 {
+                F128::ONE + challenge
+            } else {
+                challenge
+            };
+        }
+        weight
+    });
+
+    let out_len = packed_witness.len() / 64;
+    assert!(block_len > 0 && out_len.is_multiple_of(block_len));
+    let mut folded_f = crate::scratch::take_f128(out_len);
+    const SUB: usize = 256;
+    folded_f
+        .par_chunks_mut(block_len)
+        .enumerate()
+        .for_each_init(
+            || {
+                crate::scratch::LocalBuf::new(
+                    4 * SUB,
+                    crate::scratch::fold_buf_pool_enabled(),
+                )
+            },
+            |mid4, (block, f_out)| {
+                let start = 64 * block * block_len;
+                let f_in = &packed_witness[start..start + 64 * block_len];
+                let mut slot = 0usize;
+                while slot < block_len {
+                    let n = SUB.min(block_len - slot);
+                    let m4 = &mut mid4[..4 * n];
+                    crate::field::f128_slice::fold16_banked(
+                        &f_in[64 * slot..64 * (slot + n)],
+                        m4,
+                        &fold16_weight,
+                    );
+                    crate::field::f128_slice::fold4_nested(
+                        m4,
+                        &mut f_out[slot..slot + n],
+                        r4,
+                        r5,
+                    );
+                    slot += n;
+                }
+            },
+        );
+    crate::scratch::give_f128(packed_witness);
+    folded_f
+}
+
+/// Materialize the ranked two-claim DirectFold8 basis with the incumbent
+/// GFNI kernel and fuse M6 against an already-complete, immutable `folded_f`.
+/// This is intentionally not a general replacement for
+/// [`materialize_direct_fold8`]; the exact selector above proves every
+/// geometry and target-feature precondition before this function is called.
+fn materialize_direct_fold8_ranked_basis_and_message(
+    ordinary_basis: Vec<F128>,
+    mut folded_b: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    folded_f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        use crate::zerocheck::multilinear::kernels::x86_64::{
+            build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+        };
+        use rayon::prelude::*;
+
+        assert!(ordinary_basis.is_empty());
+        assert_eq!(claims.len(), 2);
+        let direct_tables: Vec<Vec<F128>> = claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect();
+        let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
+            .par_iter()
+            .map(|claim| {
+                (
+                    claim.eq_lo.iter().map(|x| x.lo).collect(),
+                    claim.eq_lo.iter().map(|x| x.hi).collect(),
+                )
+            })
+            .collect();
+
+        let block_len = claims[0].eq_lo.len();
+        assert!(block_len.is_multiple_of(64));
+        assert_eq!(folded_f.len(), block_len * claims[0].eq_hi.len());
+        assert!(claims.iter().all(|claim| {
+            claim.eq_lo.len() == block_len
+                && claim.eq_hi.len() * block_len == folded_f.len()
+        }));
+
+        assert_eq!(folded_b.len(), folded_f.len());
+        let stats = folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks(block_len))
+            .enumerate()
+            .map_init(
+                || {
+                    crate::scratch::LocalBuf::new(
+                        64,
+                        crate::scratch::fold_buf_pool_enabled(),
+                    )
+                },
+                |gfni_tmp, (block, (b_out, f_block))| {
+                    let (claim0, claim1) = (&claims[0], &claims[1]);
+                    let cols0 = super::ring_switch::compose_block_cols(
+                        &direct_tables[0],
+                        claim0.eq_hi[block],
+                    );
+                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let cols1 = super::ring_switch::compose_block_cols(
+                        &direct_tables[1],
+                        claim1.eq_hi[block],
+                    );
+                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    for slot in (0..block_len).step_by(64) {
+                        // SAFETY: the exact selector pins two complete 64-slot
+                        // GFNI rows and this cfg supplies every ISA feature.
+                        unsafe {
+                            gfni_fold64_four_maps_staged(
+                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_lo,
+                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_hi,
+                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_lo,
+                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_hi,
+                                b_out.as_mut_ptr().add(slot),
+                                gfni_tmp.as_mut_ptr().cast(),
+                            );
+                        }
+                    }
+                    // SAFETY: cfg-guaranteed AVX-512 + VPCLMUL; both slices
+                    // have the same even power-of-two length.
+                    unsafe { msg_reduce_avx512(f_block, b_out) }
+                },
+            )
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+
+        crate::scratch::give_f128(ordinary_basis);
+        return (
+            folded_b,
+            SumcheckMessage {
+                u_0: stats.0,
+                u_2: stats.1,
+            },
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    {
+        let _ = (ordinary_basis, folded_b, claims, challenges, folded_f);
+        unreachable!("ranked L1 pipeline called without its GFNI target features")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_direct_fold8_with_l1_pipe(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    log_msg_cols_1: usize,
+    log_num_interleaved_1: usize,
+    log_inv_rate_1: usize,
+    merkle_hash: HashKind,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    SumcheckMessage,
+    LigeroWitness,
+    std::time::Duration,
+) {
+    let block_len = claims[0].eq_lo.len();
+    let folded_f = materialize_direct_fold8_witness(packed_witness, challenges, block_len);
+    // Resolve the smaller B buffer before the branches race for the shared
+    // scratch pool; the L1 encoder can then take its larger codeword buffer
+    // independently while this buffer is filled in place.
+    let folded_b = crate::scratch::take_f128(folded_f.len());
+    let (basis_and_msg, commit_and_elapsed) = rayon::join(
+        || {
+            materialize_direct_fold8_ranked_basis_and_message(
+                ordinary_basis,
+                folded_b,
+                claims,
+                challenges,
+                &folded_f,
+            )
+        },
+        || {
+            let started = std::time::Instant::now();
+            let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+            let witness = ligero_commit(
+                &folded_f,
+                log_msg_cols_1,
+                log_num_interleaved_1,
+                log_inv_rate_1,
+                &ntt_1,
+                merkle_hash,
+            );
+            (witness, started.elapsed())
+        },
+    );
+    let (folded_b, msg) = basis_and_msg;
+    let (wtns_1, commit_elapsed) = commit_and_elapsed;
+    (folded_f, folded_b, msg, wtns_1, commit_elapsed)
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7026,6 +7323,20 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     } else if direct_mode {
         assert!(initial_k >= 2, "direct AB fold2 needs two initial rounds");
     }
+    let direct_fold8_l1_pipe = direct_fold8.as_ref().is_some_and(|claims| {
+        ranked_open_l1_pipe_enabled(
+            config,
+            log_n,
+            packed_witness.len(),
+            b_initial.len(),
+            claims,
+        )
+    });
+    let n1 = log_n - initial_k;
+    let log_num_interleaved_1 = config.recursive_ks[0];
+    assert!(n1 >= log_num_interleaved_1);
+    let log_msg_cols_1 = n1 - log_num_interleaved_1;
+    let log_inv_rate_1 = config.log_inv_rates[1];
     let mut packed_witness = Some(packed_witness);
     let mut b_initial = Some(b_initial);
     let mut direct_fold2 = direct_fold2;
@@ -7061,6 +7372,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
+    let mut early_wtns_1: Option<LigeroWitness> = None;
+    let mut early_l1_commit_elapsed = std::time::Duration::ZERO;
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     let mut direct_r0 = None;
     let mut direct_msg1 = None;
@@ -7095,36 +7408,54 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     r,
                 )
             } else {
-                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
-                    let (f8, b8, msg) = materialize_direct_fold8(
+                let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                let challenges = [
+                    fold4_challenges[0],
+                    fold4_challenges[1],
+                    fold4_challenges[2],
+                    fold4_challenges[3],
+                    fold4_challenges[4],
+                    r,
+                ];
+                let (f8, b8, msg) = if direct_fold8_l1_pipe {
+                    let (f8, b8, msg, wtns_1, commit_elapsed) =
+                        materialize_direct_fold8_with_l1_pipe(
+                            packed_witness.take().unwrap(),
+                            b_initial.take().unwrap(),
+                            &direct,
+                            challenges,
+                            log_msg_cols_1,
+                            log_num_interleaved_1,
+                            log_inv_rate_1,
+                            config.merkle_hash,
+                        );
+                    early_wtns_1 = Some(wtns_1);
+                    early_l1_commit_elapsed = commit_elapsed;
+                    (f8, b8, msg)
+                } else {
+                    materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
                         &direct,
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            fold4_challenges[3],
-                            fold4_challenges[4],
-                            r,
-                        ],
-                    );
-                    sc_prover = Some(SumcheckProver::new_after_direct_fold8(
-                        f8,
-                        b8,
-                        target,
-                        [
-                            start_msg,
-                            fold4_msgs[0],
-                            fold4_msgs[1],
-                            fold4_msgs[2],
-                            fold4_msgs[3],
-                            fold4_msgs[4],
-                            msg,
-                        ],
-                        fold_arena.take(),
-                    ));
-                    msg
+                        challenges,
+                    )
+                };
+                sc_prover = Some(SumcheckProver::new_after_direct_fold8(
+                    f8,
+                    b8,
+                    target,
+                    [
+                        start_msg,
+                        fold4_msgs[0],
+                        fold4_msgs[1],
+                        fold4_msgs[2],
+                        fold4_msgs[3],
+                        fold4_msgs[4],
+                        msg,
+                    ],
+                    fold_arena.take(),
+                ));
+                msg
             };
             fold4_challenges.push(r);
             fold4_msgs.push(msg);
@@ -7222,24 +7553,30 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut sc_prover = sc_prover.expect("direct state must materialize during the initial rounds");
 
     // Commit f^1 = folded packed witness as wtns_1.
-    let n1 = log_n - initial_k;
-    let log_num_interleaved_1 = config.recursive_ks[0];
-    assert!(n1 >= log_num_interleaved_1);
-    let log_msg_cols_1 = n1 - log_num_interleaved_1;
-    let log_inv_rate_1 = config.log_inv_rates[1];
-    let _t = std::time::Instant::now();
-    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let wtns_1 = ligero_commit(
-        sc_prover.f(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
-    if trace {
-        t_commits += _t.elapsed();
-    }
+    // The ranked DirectFold8 path has already built this witness in parallel
+    // with B-GFNI + M6. Crucially, only the work moved: M6 was observed in
+    // the loop above, and the L1 root still enters the transcript here.
+    let wtns_1 = if let Some(wtns_1) = early_wtns_1 {
+        if trace {
+            t_commits += early_l1_commit_elapsed;
+        }
+        wtns_1
+    } else {
+        let _t = std::time::Instant::now();
+        let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+        let wtns_1 = ligero_commit(
+            sc_prover.f(),
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        );
+        if trace {
+            t_commits += _t.elapsed();
+        }
+        wtns_1
+    };
     challenger.observe_bytes(&wtns_1.root());
 
     let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
