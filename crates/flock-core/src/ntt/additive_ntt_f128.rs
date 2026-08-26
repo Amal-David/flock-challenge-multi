@@ -2289,7 +2289,16 @@ impl AdditiveNttF128 {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .filter(|v| (14..=24).contains(v))
-                    .unwrap_or(21)
+                    // 2^22, not 2^21. Moving this constant one step the
+                    // other way -- to 2^20, which fits a core's two pinned SMT
+                    // sub-groups into its shared 2 MiB L2 -- cost 17.7% on this
+                    // instance. A decomposition parameter with that much
+                    // leverage is worth sampling on both sides before it is
+                    // assumed to sit at its optimum: the same step size in the
+                    // opposite direction takes one whole-buffer layer OUT of
+                    // the top, at the cost of sub-groups that no longer fit a
+                    // private L2 and must be absorbed by the last level.
+                    .unwrap_or(22)
             });
             *V
         };
