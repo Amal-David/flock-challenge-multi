@@ -2529,7 +2529,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
         target_feature = "gfni"
     ))]
     let eq_fold_state = (ab_eq_fold_gfni_enabled() && eq.n_lo >= 2).then(|| {
-        let bank_bits = eq.n_lo.saturating_sub(5).max(1);
+        let bank_bits = eq.n_lo.saturating_sub(7).max(1).min(5);
         let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
         let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
@@ -2960,7 +2960,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     ))]
     let eq_fold_state = (ab_eq_fold_gfni_enabled() && eq.n_lo >= 2).then(|| {
-        let bank_bits = eq.n_lo.saturating_sub(5).max(1);
+        let bank_bits = eq.n_lo.saturating_sub(7).max(1).min(5);
         let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
         let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);

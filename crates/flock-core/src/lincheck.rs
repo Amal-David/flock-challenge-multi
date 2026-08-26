@@ -947,7 +947,7 @@ fn lc_gather4_enabled() -> bool {
 /// same-binary A/B; the overlap changes scheduling only).
 fn lc_alpha_overlap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ALPHA_OVERLAP").is_none());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_FORCE_LC_ALPHA_OVERLAP").is_some());
     *ON
 }
 
@@ -1152,7 +1152,7 @@ fn fold_block_major_gfni(
                                                     .as_ptr()
                                                     .add((outer_base + r) * chunks_per_block + qn)
                                                     .cast::<i8>(),
-                                                core::arch::x86_64::_MM_HINT_T0,
+                                                core::arch::x86_64::_MM_HINT_NTA,
                                             );
                                         }
                                     }
@@ -1168,7 +1168,7 @@ fn fold_block_major_gfni(
                                                 .as_ptr()
                                                 .add((next_base + r) * chunks_per_block + q)
                                                 .cast::<i8>(),
-                                            core::arch::x86_64::_MM_HINT_T0,
+                                            core::arch::x86_64::_MM_HINT_NTA,
                                         );
                                     }
                                 }
@@ -1206,7 +1206,7 @@ fn fold_block_major_gfni(
                                                         .as_ptr()
                                                         .add((outer_base + r) * chunks_per_block + qn)
                                                         .cast::<i8>(),
-                                                    core::arch::x86_64::_MM_HINT_T0,
+                                                    core::arch::x86_64::_MM_HINT_NTA,
                                                 );
                                             }
                                         }
@@ -1251,7 +1251,7 @@ fn fold_block_major_gfni(
                                                 .as_ptr()
                                                 .add((next_base + r) * chunks_per_block + q)
                                                 .cast::<i8>(),
-                                            core::arch::x86_64::_MM_HINT_T0,
+                                            core::arch::x86_64::_MM_HINT_NTA,
                                         );
                                     }
                                 }
