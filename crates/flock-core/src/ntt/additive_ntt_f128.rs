@@ -474,7 +474,24 @@ mod affinity {
     }
 }
 
-/// One finished block handed from a butterfly worker to its paired
+/// Test-only queue-depth override for the paired deep pass (0 = use the
+/// production default). A depth of 1 forces every enqueue after the first
+/// to stall, exercising the producer steal path deterministically.
+#[cfg(all(target_os = "linux", test))]
+static DEEP_SPLIT_TEST_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Successful producer steals (stall-side block hashes).
+#[cfg(all(target_os = "linux", test))]
+static DEEP_SPLIT_STEAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Endgame drain claims by consumers whose own queue drained first.
+#[cfg(all(target_os = "linux", test))]
+static DEEP_SPLIT_DRAIN_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One deep block handed from a butterfly worker to its paired
 /// leaf-hash worker: where the block starts in the codeword, how many
 /// elements it holds, and the leaf range it covers.
 #[cfg(target_os = "linux")]
@@ -546,6 +563,25 @@ impl DeepQueue {
         self.head.store(h + 1, Ordering::Release);
         true
     }
+
+    /// [`Self::push`] without waiting: false means the queue is `depth`
+    /// full (or the consumer is gone); the caller decides whether to steal
+    /// work, spin, or fall back.
+    fn try_push(&self, b: DeepBlock, depth: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        if h - self.tail.load(Ordering::Acquire) >= depth {
+            return false;
+        }
+        // SAFETY: the slot is free (checked above) and only this producer
+        // writes it.
+        unsafe {
+            *self.slots[h % Self::CAP].get() = b;
+        }
+        self.head.store(h + 1, Ordering::Release);
+        true
+    }
+
     fn pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
         let t = self.tail.load(Ordering::Relaxed);
@@ -569,6 +605,128 @@ impl DeepQueue {
             std::hint::spin_loop();
         }
     }
+}
+
+/// Global claim board for deep blocks whose leaf hashing can be done by ANY
+/// worker of the paired schedule.
+///
+/// Why: at the ranked shape the paired split's eight BLAKE3 consumers are the
+/// phase bottleneck (~32 µs per 128 KiB block vs ~12 µs per block of
+/// butterfly production), so producers spend most of the deep pass spun idle
+/// on full [`DeepQueue`]s while their hashing capacity — and the producers'
+/// own spare cycles — go unused. The board hands every finished-but-unhashed
+/// block a single-ownership claim: a producer whose push would block hashes
+/// the oldest claimable block instead of spinning, and a consumer whose queue
+/// is drained joins the board until every block is hashed. Leaves are written
+/// by index into disjoint per-block tree slices, so any owner assignment that
+/// hashes each block exactly once produces byte-identical trees.
+///
+/// CAS protocol: `claim` flips the block's done bit 0→1 exactly once; only
+/// the winner hashes it. `mark_ready` is stored with Release AFTER the
+/// producing worker published the block, so an Acquire load of the bit also
+/// orders the producer's codeword writes before the stealer's reads.
+#[cfg(target_os = "linux")]
+struct DeepStealBoard {
+    /// ready bit per block ordinal: the block is fully produced.
+    ready: Vec<std::sync::atomic::AtomicU64>,
+    /// done bit per block ordinal: claimed (CAS winner must hash it).
+    done: Vec<std::sync::atomic::AtomicU64>,
+    /// Blocks hashed so far; reaches `total_blocks` exactly once.
+    done_count: std::sync::atomic::AtomicUsize,
+    /// Scan start hint; purely a heuristic, never a correctness bound.
+    cursor: std::sync::atomic::AtomicUsize,
+    total_blocks: usize,
+    /// Set when a pair is torn down by a panic, so drain loops bail out
+    /// instead of waiting for a `done_count` that will never arrive.
+    aborted: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl DeepStealBoard {
+    fn new(total_blocks: usize) -> Self {
+        let words = total_blocks.div_ceil(64);
+        Self {
+            ready: (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            done: (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            done_count: std::sync::atomic::AtomicUsize::new(0),
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            total_blocks,
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn mark_ready(&self, t: usize) {
+        use std::sync::atomic::Ordering;
+        self.ready[t / 64].fetch_or(1 << (t % 64), Ordering::Release);
+    }
+
+    #[inline]
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Single-ownership claim for STEALERS: requires the ready bit (the
+    /// stealer's happens-before with the producer's codeword writes is the
+    /// ready release), then flips the done bit 0→1 exactly once.
+    #[inline]
+    fn claim(&self, t: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.is_ready(t) {
+            return false;
+        }
+        self.done[t / 64]
+            .fetch_or(1 << (t % 64), Ordering::AcqRel)
+            & (1 << (t % 64))
+            == 0
+    }
+
+    /// Single-ownership claim for the RING CONSUMER of block `t`. The ring's
+    /// release/acquire pair already ordered the producer's writes, so —
+    /// unlike [`Self::claim`] — this must not depend on the ready bit,
+    /// which the producer stores only after `try_push` returns and a fast
+    /// consumer could pop in between.
+    #[inline]
+    fn claim_popped(&self, t: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.done[t / 64]
+            .fetch_or(1 << (t % 64), Ordering::AcqRel)
+            & (1 << (t % 64))
+            == 0
+    }
+
+    #[inline]
+    fn is_ready(&self, t: usize) -> bool {
+        self.ready[t / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (t % 64)) != 0
+    }
+
+    #[inline]
+    fn complete(&self) {
+        self.done_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Claim the oldest ready, unclaimed block, or `None` if there is none
+    /// right now. Scans forward from the cursor hint; contention between
+    /// scanners costs failed CASes only.
+    fn claim_oldest(&self) -> Option<usize> {
+        let mut t = self.cursor.load(std::sync::atomic::Ordering::Relaxed).min(self.total_blocks);
+        while t < self.total_blocks {
+            if self.is_ready(t) && self.claim(t) {
+                return Some(t);
+            }
+            t += 1;
+        }
+        None
+    }
+}
+
+/// `FLOCK_NO_NTT_DEEP_STEAL=1` keeps stalled producers spinning on full
+/// queues and ends consumers at their own queue drain (the incumbent
+/// schedule), in the same binary. Read once per process.
+#[cfg(target_os = "linux")]
+fn deep_steal_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_STEAL").is_some())
 }
 
 /// Line-hint level for the deep pass's fused-four row driver under the
@@ -2851,7 +3009,15 @@ impl AdditiveNttF128 {
                     let cb = on_sub_done.expect("big implies a callback");
                     let n_subs = n_total / sub_bytes;
                     let n_pairs = pairs.len();
-                    let depth = deep_split_depth();
+                    #[allow(unused_mut)]
+                    let mut depth = deep_split_depth();
+                    #[cfg(test)]
+                    {
+                        let forced = DEEP_SPLIT_TEST_DEPTH.load(Ordering::Relaxed);
+                        if forced != 0 {
+                            depth = select_deep_split_depth(Some(forced));
+                        }
+                    }
                     let hint = deep_pf_hint();
                     let queues: Vec<DeepQueue> =
                         (0..n_pairs).map(|_| DeepQueue::new()).collect();
@@ -2860,6 +3026,47 @@ impl AdditiveNttF128 {
                     let deep_sub = &deep_sub;
                     let queues = &queues;
                     let next_sub = &next_sub;
+
+                    // Producer/consumer rebalance (see `DeepStealBoard`): at
+                    // the ranked geometry the leaf-hash consumers are the
+                    // phase bottleneck and producers idle on full queues, so
+                    // stalled producers and drained consumers hash claimable
+                    // blocks themselves. Every block is still hashed exactly
+                    // once (CAS single ownership), leaves are written by
+                    // index into disjoint slices, and the callback contract
+                    // ("only touch the given range") is preserved — so the
+                    // tree bytes are identical to the incumbent schedule.
+                    // `FLOCK_NO_NTT_DEEP_STEAL=1` restores it verbatim.
+                    let steal = (!deep_steal_disabled()).then(|| {
+                        DeepStealBoard::new(n_subs * 16)
+                    });
+                    let blocks_per_sub = 16usize;
+                    let block_positions = sub_size_positions / blocks_per_sub;
+                    debug_assert_eq!(block_positions * blocks_per_sub, sub_size_positions);
+
+                    // Hash one block's leaf range, claiming single ownership
+                    // through the board. Returns false when another worker
+                    // owns it. SAFETY (of the read): the producing worker
+                    // finished the block's codeword writes before publishing
+                    // it — ordered to the claimer either by the ring's
+                    // release/acquire pair or by the board's ready bit.
+                    let hash_claimed =
+                        |t: usize, cb: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)| {
+                            let g = t / blocks_per_sub;
+                            let j = t % blocks_per_sub;
+                            let lo = g * sub_size_positions + j * block_positions;
+                            // SAFETY: `t < n_subs*16`, so the slice lies
+                            // inside `data`; distinct `t` select disjoint
+                            // row ranges.
+                            let blk = unsafe {
+                                std::slice::from_raw_parts(
+                                    (base_addr as *const F128).add(lo * num_ntts),
+                                    block_positions * num_ntts,
+                                )
+                            };
+                            cb(lo..lo + block_positions, blk);
+                        };
+
                     rayon::broadcast(|ctx| {
                         let idx = ctx.index();
                         if idx >= 2 * n_pairs {
@@ -2880,6 +3087,7 @@ impl AdditiveNttF128 {
                             saved: affinity::Mask,
                             q: &'a DeepQueue,
                             producer: bool,
+                            abort: Option<&'a DeepStealBoard>,
                         }
                         impl Drop for Guard<'_> {
                             fn drop(&mut self) {
@@ -2889,6 +3097,9 @@ impl AdditiveNttF128 {
                                 } else {
                                     self.q.gone.store(true, Ordering::Release);
                                 }
+                                if let Some(board) = self.abort {
+                                    board.aborted.store(true, Ordering::Release);
+                                }
                                 affinity::set(&self.saved);
                             }
                         }
@@ -2896,6 +3107,7 @@ impl AdditiveNttF128 {
                             saved: affinity::get(),
                             q,
                             producer,
+                            abort: steal.as_ref(),
                         };
                         affinity::pin(cpu);
                         if producer {
@@ -2906,8 +3118,53 @@ impl AdditiveNttF128 {
                                     lo: range.start,
                                     hi: range.end,
                                 };
-                                if !q.push(b, depth) {
-                                    cb(range, blk);
+                                match steal.as_ref() {
+                                    None => {
+                                        if !q.push(b, depth) {
+                                            cb(range, blk);
+                                        }
+                                    }
+                                    Some(board) => {
+                                        debug_assert_eq!(range.len(), block_positions);
+                                        let g = range.start / sub_size_positions;
+                                        let j =
+                                            (range.start % sub_size_positions) / block_positions;
+                                        let t = g * blocks_per_sub + j;
+                                        loop {
+                                            if q.try_push(b, depth) {
+                                                break;
+                                            }
+                                            if q.gone.load(Ordering::Acquire) {
+                                                // Consumer gone (panic unwind):
+                                                // hash it here, then publish it
+                                                // as already done — ready goes
+                                                // out LAST so no claimer can
+                                                // win a stale block.
+                                                cb(range, blk);
+                                                board.done[t / 64]
+                                                    .fetch_or(1 << (t % 64), Ordering::AcqRel);
+                                                board.complete();
+                                                board.mark_ready(t);
+                                                return;
+                                            }
+                                            // Queue full: the paired consumer
+                                            // is `depth` blocks behind, so
+                                            // this worker's cycles are free —
+                                            // spend them on the oldest ready,
+                                            // unclaimed block instead of
+                                            // spinning.
+                                            if let Some(s) = board.claim_oldest() {
+                                                hash_claimed(s, cb);
+                                                board.complete();
+                                                #[cfg(test)]
+                                                DEEP_SPLIT_STEAL_HITS
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            } else {
+                                                std::hint::spin_loop();
+                                            }
+                                        }
+                                        board.mark_ready(t);
+                                    }
                                 }
                             };
                             loop {
@@ -2944,7 +3201,44 @@ impl AdditiveNttF128 {
                                         b.len_f128,
                                     )
                                 };
-                                cb(b.lo..b.hi, blk);
+                                match steal.as_ref() {
+                                    None => cb(b.lo..b.hi, blk),
+                                    Some(board) => {
+                                        let g = b.lo / sub_size_positions;
+                                        let j =
+                                            (b.lo % sub_size_positions) / block_positions;
+                                        let t = g * blocks_per_sub + j;
+                                        if board.claim_popped(t) {
+                                            cb(b.lo..b.hi, blk);
+                                            board.complete();
+                                        }
+                                        // else: a stalled producer already
+                                        // hashed it — the tree bytes are
+                                        // identical either way.
+                                    }
+                                }
+                            }
+                            // The paired producer retired its last sub-group.
+                            // Other pairs may still be producing, and every
+                            // block must be hashed exactly once before this
+                            // pass reports done — join the global drain.
+                            if let Some(board) = steal.as_ref() {
+                                while board.done_count.load(Ordering::Acquire)
+                                    < board.total_blocks
+                                {
+                                    if board.is_aborted() {
+                                        break;
+                                    }
+                                    if let Some(s) = board.claim_oldest() {
+                                        hash_claimed(s, cb);
+                                        board.complete();
+                                        #[cfg(test)]
+                                        DEEP_SPLIT_DRAIN_HITS
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        std::hint::spin_loop();
+                                    }
+                                }
                             }
                         }
                     });
@@ -4550,6 +4844,131 @@ mod tests {
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
             }
+        }
+    }
+
+    /// The sibling-paired deep pass with the producer/consumer steal board
+    /// must produce byte-identical codewords AND Merkle trees to the
+    /// unsplit schedule: leaves are written by index, every block is hashed
+    /// exactly once (CAS claim), and any owner assignment yields the same
+    /// bytes. Geometry log_d=18 / num_ntts=64 gives `big` (n_total = 2^24)
+    /// with `fuse_blocks` (n_top = log_d - 11); a queue depth of 1 forces a
+    /// stall on every enqueue after the first, so the producer steal path is
+    /// exercised deterministically. Like the ranked worker, the encodes run
+    /// on a PLAIN thread whose ambient global rayon pool covers exact SMT
+    /// sibling pairs (`install` would run them on a worker and the split's
+    /// non-worker gate would correctly decline); skips when the host has no
+    /// pairable pool.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn deep_split_steal_matches_unsplit_encode_and_tree() {
+        use crate::merkle::{self, HashKind};
+        use std::sync::atomic::Ordering;
+
+        let log_d = 18usize;
+        let num_ntts = 64usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x57EA1);
+        let codeword_len = (1usize << log_d) * num_ntts;
+        let msg_len = codeword_len >> 1;
+        let msg = rand_vec(&mut rng, msg_len);
+        // One leaf per codeword POSITION (rate-1/2: positions = 2^log_d).
+        let n_leaves = 1usize << log_d;
+        let leaf_size = num_ntts * core::mem::size_of::<F128>();
+        let kind = HashKind::Blake3;
+
+        // Best-effort size the ambient pool to 16 logical CPUs before its
+        // first use; a no-op if another test initialized rayon first (the
+        // pairs check below then decides).
+        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+            // SAFETY: single-threaded test setup, before any rayon use; the
+            // env var has no other readers in this process at this point.
+            unsafe { std::env::set_var("RAYON_NUM_THREADS", "16") };
+        }
+        let msg = std::sync::Arc::new(msg);
+        let handle = {
+            let msg = std::sync::Arc::clone(&msg);
+            std::thread::spawn(move || {
+                // Plain thread: current_thread_index() is None here, exactly
+                // like the ranked worker's commit call site.
+                if deep_split_pairs().is_none() {
+                    return false;
+                }
+                let mut reference = junk_vec(codeword_len);
+                let mut candidate = junk_vec(codeword_len);
+                let mut tree: Vec<merkle::Hash> = vec![[0u8; 32]; 2 * n_leaves - 1];
+                let steals_before = DEEP_SPLIT_STEAL_HITS.load(Ordering::Relaxed);
+                let drains_before = DEEP_SPLIT_DRAIN_HITS.load(Ordering::Relaxed);
+                ntt.rs_encode_interleaved(&msg, &mut reference, num_ntts);
+                let ref_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        reference.as_ptr() as *const u8,
+                        reference.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                let ref_tree = merkle::merkle_tree(ref_bytes, n_leaves, kind);
+                {
+                    let tree_addr = tree.as_mut_ptr() as usize;
+                    let _depth_guard = DepthOverride::new();
+                    ntt.rs_encode_interleaved_on_range_done(
+                        &msg,
+                        &mut candidate,
+                        num_ntts,
+                        &|range: core::ops::Range<usize>, sub_data: &[F128]| {
+                            let bytes: &[u8] = unsafe {
+                                core::slice::from_raw_parts(
+                                    sub_data.as_ptr() as *const u8,
+                                    sub_data.len() * core::mem::size_of::<F128>(),
+                                )
+                            };
+                            // SAFETY: disjoint per-block leaf ranges of
+                            // `tree`.
+                            let out = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (tree_addr as *mut merkle::Hash).add(range.start),
+                                    range.len(),
+                                )
+                            };
+                            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+                        },
+                    );
+                }
+                assert!(
+                    DEEP_SPLIT_STEAL_HITS.load(Ordering::Relaxed) > steals_before,
+                    "producer steal path never engaged"
+                );
+                eprintln!(
+                    "deep-split steal: producer_steals={} consumer_drain_claims={}",
+                    DEEP_SPLIT_STEAL_HITS.load(Ordering::Relaxed) - steals_before,
+                    DEEP_SPLIT_DRAIN_HITS.load(Ordering::Relaxed) - drains_before,
+                );
+                assert_eq!(candidate, reference, "steal-split codeword != unsplit");
+                // The streamed callback writes LEAVES only; fold the parent
+                // levels exactly like finalize_commit does, then compare.
+                crate::pcs::commit::build_upper_levels(&mut tree, n_leaves, n_leaves, kind);
+                assert_eq!(tree, ref_tree, "steal-split streamed tree != unsplit tree");
+                true
+            })
+        };
+        if !handle.join().unwrap() {
+            eprintln!("deep-split steal: skipped (no SMT-pairable global pool)");
+        }
+    }
+    /// RAII for [`DEEP_SPLIT_TEST_DEPTH`].
+    struct DepthOverride;
+    impl Drop for DepthOverride {
+        fn drop(&mut self) {
+            DEEP_SPLIT_TEST_DEPTH.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    impl DepthOverride {
+        fn new() -> Self {
+            let forced = std::env::var("FLOCK_TEST_SPLIT_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            DEEP_SPLIT_TEST_DEPTH.store(forced, std::sync::atomic::Ordering::Relaxed);
+            Self
         }
     }
 
