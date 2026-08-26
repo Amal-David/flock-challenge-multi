@@ -240,6 +240,134 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// One table fold, kept local to the combined field kernel so the PCS table
+/// representation does not create a field-to-PCS dependency. This is the
+/// same 16 little-endian byte loads and four-level XOR tree as
+/// `ring_switch::fold_one_slot`.
+#[inline(always)]
+unsafe fn fold_table_slot(elem: F128, tables: *const F128) -> F128 {
+    let lo = elem.lo.to_le_bytes();
+    let hi = elem.hi.to_le_bytes();
+    // SAFETY: byte values are in 0..256, so all offsets are in 0..4096.
+    let (l0, l1, l2, l3, l4, l5, l6, l7, h0, h1, h2, h3, h4, h5, h6, h7) = unsafe {
+        (
+            *tables.add(lo[0] as usize),
+            *tables.add(256 + lo[1] as usize),
+            *tables.add(2 * 256 + lo[2] as usize),
+            *tables.add(3 * 256 + lo[3] as usize),
+            *tables.add(4 * 256 + lo[4] as usize),
+            *tables.add(5 * 256 + lo[5] as usize),
+            *tables.add(6 * 256 + lo[6] as usize),
+            *tables.add(7 * 256 + lo[7] as usize),
+            *tables.add(8 * 256 + hi[0] as usize),
+            *tables.add(9 * 256 + hi[1] as usize),
+            *tables.add(10 * 256 + hi[2] as usize),
+            *tables.add(11 * 256 + hi[3] as usize),
+            *tables.add(12 * 256 + hi[4] as usize),
+            *tables.add(13 * 256 + hi[5] as usize),
+            *tables.add(14 * 256 + hi[6] as usize),
+            *tables.add(15 * 256 + hi[7] as usize),
+        )
+    };
+    let p0 = l0 + l1;
+    let p1 = l2 + l3;
+    let p2 = l4 + l5;
+    let p3 = l6 + l7;
+    let p4 = h0 + h1;
+    let p5 = h2 + h3;
+    let p6 = h4 + h5;
+    let p7 = h6 + h7;
+    let q0 = p0 + p1;
+    let q1 = p2 + p3;
+    let q2 = p4 + p5;
+    let q3 = p6 + p7;
+    (q0 + q1) + (q2 + q3)
+}
+
+/// Ranked DirectFold4 kernel: fold one four-slot f-side quad while issuing
+/// both direct claims' byte-table loads between the four bank groups.
+///
+/// The f-side instruction sequence is the same sixteen `WideGhashX4::mul_acc`
+/// calls and one deferred reduction as [`fold16_banked`]. Each bank group is
+/// followed by one complete output slot from both claims, letting their
+/// independent table-load/XOR trees issue across VPCLMUL latency without
+/// carrying eight scalar accumulators between groups. Both 64 KiB tables must
+/// already be composed for this block.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq`, matching slice lengths, four
+/// output slots per iteration, and two 4096-entry composed tables.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold16_banked_two_tables(
+    src: &[F128],
+    f_dst: &mut [F128],
+    w: &[F128; 16],
+    eq0: &[F128],
+    table0: &[F128],
+    eq1: &[F128],
+    table1: &[F128],
+    b_dst: &mut [F128],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(src.len(), 16 * f_dst.len());
+    debug_assert_eq!(eq0.len(), f_dst.len());
+    debug_assert_eq!(eq1.len(), f_dst.len());
+    debug_assert_eq!(b_dst.len(), f_dst.len());
+    debug_assert_eq!(table0.len(), 16 * 256);
+    debug_assert_eq!(table1.len(), 16 * 256);
+    debug_assert!(f_dst.len().is_multiple_of(4));
+
+    // SAFETY: caller guarantees the target features and all bounds above.
+    unsafe {
+        let wb: [__m512i; 16] = core::array::from_fn(|b| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        });
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let table0_ptr = table0.as_ptr();
+        let table1_ptr = table1.as_ptr();
+        let mut t = 0usize;
+        while t < f_dst.len() {
+            let mut f_acc = WideGhashX4::zero();
+
+            for g in 0..4 {
+                // v_s = banks 4g..4g+3 of slot t+s.
+                let base = 16 * t + 4 * g;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                f_acc.mul_acc(u0, wb[4 * g]);
+                f_acc.mul_acc(u1, wb[4 * g + 1]);
+                f_acc.mul_acc(u2, wb[4 * g + 2]);
+                f_acc.mul_acc(u3, wb[4 * g + 3]);
+
+                // One complete b output per bank group keeps only the current
+                // pair of table trees live while the f accumulator remains in
+                // zmm registers; all four slots and both claims are covered.
+                let slot = t + g;
+                b_dst[slot] = fold_table_slot(eq0[slot], table0_ptr)
+                    + fold_table_slot(eq1[slot], table1_ptr);
+            }
+
+            _mm512_storeu_si512(f_dst.as_mut_ptr().add(t) as *mut __m512i, f_acc.reduce_lanes());
+            t += 4;
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.

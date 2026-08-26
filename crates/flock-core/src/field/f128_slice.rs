@@ -258,6 +258,55 @@ mod tests {
         }
     }
 
+    /// The ranked combined helper must be byte-for-byte the incumbent
+    /// `fold16_banked` followed by the same two `fold_one_slot` results.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold16_banked_two_tables_matches_serial_oracle() {
+        use super::*;
+        let mut state = 0xFB_16_2C_1A_1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let n = 12usize;
+        let src: Vec<F128> =
+            (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+        let w: [F128; 16] =
+            core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+        let eq0: Vec<F128> =
+            (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+        let eq1: Vec<F128> =
+            (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+        let table0: Vec<F128> =
+            (0..16 * 256).map(|_| F128 { lo: next(), hi: next() }).collect();
+        let table1: Vec<F128> =
+            (0..16 * 256).map(|_| F128 { lo: next(), hi: next() }).collect();
+
+        let mut want_f = vec![F128::ZERO; n];
+        fold16_banked(&src, &mut want_f, &w);
+        let want_b: Vec<F128> = (0..n)
+            .map(|i| {
+                crate::pcs::ring_switch::fold_one_slot(eq0[i], &table0)
+                    + crate::pcs::ring_switch::fold_one_slot(eq1[i], &table1)
+            })
+            .collect();
+
+        let mut got_f = vec![F128::ZERO; n];
+        let mut got_b = vec![F128::ZERO; n];
+        fold16_banked_two_tables(
+            &src, &mut got_f, &w, &eq0, &table0, &eq1, &table1, &mut got_b,
+        );
+        assert_eq!(got_f, want_f);
+        assert_eq!(got_b, want_b);
+    }
+
     /// The PCS open-phase materializers hand these two folds a RECYCLED
     /// destination (`crate::scratch::LocalBuf`), so both must write every
     /// output slot before reading it — the result may not depend on what an
@@ -591,6 +640,43 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             }
             *value = v;
         }
+    }
+}
+
+/// Ranked x86 DirectFold4 seam: the same sixteen-bank f fold as
+/// [`fold16_banked`], interleaved with two already-composed b-table folds.
+///
+/// This is deliberately unavailable to portable callers: the materializer
+/// selects it only for the exact four-slot, two-direct-claim SPR shape.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn fold16_banked_two_tables(
+    src: &[F128],
+    f_dst: &mut [F128],
+    w: &[F128; 16],
+    eq0: &[F128],
+    table0: &[F128],
+    eq1: &[F128],
+    table1: &[F128],
+    b_dst: &mut [F128],
+) {
+    assert_eq!(src.len(), 16 * f_dst.len());
+    assert_eq!(eq0.len(), f_dst.len());
+    assert_eq!(eq1.len(), f_dst.len());
+    assert_eq!(b_dst.len(), f_dst.len());
+    assert_eq!(table0.len(), 16 * 256);
+    assert_eq!(table1.len(), 16 * 256);
+    assert!(f_dst.len().is_multiple_of(4));
+    // SAFETY: the cfg gate supplies the CPU features; the checks above supply
+    // every source, destination, and table bound used by the four-slot body.
+    unsafe {
+        x86_64::fold16_banked_two_tables(
+            src, f_dst, w, eq0, table0, eq1, table1, b_dst,
+        );
     }
 }
 
