@@ -1,4 +1,4 @@
-use super::super::{build_sum_table, F128};
+use super::super::{F128, build_sum_table};
 
 /// GFNI twin of [`partial_fold_packed_z_x86_tiled_padded`]: each stripe's
 /// 256-entry sum table is F2-linear (`T[0] = 0`, XOR-composed from the eight
