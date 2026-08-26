@@ -1678,6 +1678,18 @@ pub(crate) unsafe fn stage_c_group_x86_avx512(src: &[u8], dst: &mut [u8; 4 * 16 
     }
 }
 
+/// Ranked default walks the fused GFNI C drain bank-outer so the 16 plane
+/// RMWs are one contiguous 1 KiB stream per bank (`plane_banks` layout is
+/// `[q][bank][byte-plane][lane]`). `FLOCK_NO_ZC_FOLD4_BANK=1` restores the
+/// incumbent plane-outer nest (1 KiB-strided stores across banks). Algebra
+/// is identical: F₂ XOR of the same affine products. Resolved once per
+/// process; the ranked worker's cleared env never sets the kill switch.
+pub(crate) fn fold4_bank_outer_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD4_BANK").is_none());
+    *ON
+}
+
 /// Fused GFNI DirectFold4 C drain — the last gather-style kernel of round 1.
 ///
 /// The incumbent path per four-window group is: 64 `bit_transpose_64bytes`
@@ -1767,17 +1779,39 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
             }
             // One VGF2P8AFFINEQB per (mask half, output byte plane); both
             // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
-            for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+            // Layout `[q][bank][plane][64]`: bank-outer makes 16 RMWs a
+            // contiguous 1 KiB stream. Kill switch restores plane-outer.
+            if fold4_bank_outer_enabled() {
                 for bank in 0..N_C_BANKS {
-                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
-                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
-                    let ptr = planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
-                    _mm512_storeu_si512(
-                        ptr,
-                        _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
-                    );
+                    let mask0 = masks[0][bank];
+                    let mask1 = masks[1][bank];
+                    let bank_off = (q * N_C_BANKS + bank) * 16;
+                    for plane in 0..16usize {
+                        let m_lo = _mm512_set1_epi64(mats[plane] as i64);
+                        let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                        let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(mask0, m_lo);
+                        let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(mask1, m_hi);
+                        let ptr = planes.add((bank_off + plane) * ELL) as *mut __m512i;
+                        _mm512_storeu_si512(
+                            ptr,
+                            _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
+                        );
+                    }
+                }
+            } else {
+                for plane in 0..16usize {
+                    let m_lo = _mm512_set1_epi64(mats[plane] as i64);
+                    let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                    for bank in 0..N_C_BANKS {
+                        let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
+                        let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
+                        let ptr = planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL)
+                            as *mut __m512i;
+                        _mm512_storeu_si512(
+                            ptr,
+                            _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
+                        );
+                    }
                 }
             }
         }
