@@ -10,6 +10,15 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// Two independent 4-lane `mul_x4` products per iteration so SPR p0 and p5
+/// can retire companion diet-CLMUL chains together. The algebra is unchanged.
+/// `FLOCK_NO_NTT_MUL_UNROLL2=1` restores one product per iteration.
+#[inline]
+fn mul_unroll2_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_UNROLL2").is_some())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -112,6 +121,24 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
         let tw = tw_x4::<LOW, DIET>(twiddle);
         let lanes = top.len() & !3;
         let mut i = 0;
+        if !mul_unroll2_disabled() {
+            let lanes8 = top.len() & !7;
+            while i < lanes8 {
+                let top0 = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+                let bot0 = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+                let top1 = _mm512_loadu_si512(top.as_ptr().add(i + 4) as *const __m512i);
+                let bot1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4) as *const __m512i);
+                let new_top0 = _mm512_xor_si512(top0, mul_x4::<LOW, DIET>(tw, bot0));
+                let new_top1 = _mm512_xor_si512(top1, mul_x4::<LOW, DIET>(tw, bot1));
+                let new_bot0 = _mm512_xor_si512(bot0, new_top0);
+                let new_bot1 = _mm512_xor_si512(bot1, new_top1);
+                _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, new_top0);
+                _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot0);
+                _mm512_storeu_si512(top.as_mut_ptr().add(i + 4) as *mut __m512i, new_top1);
+                _mm512_storeu_si512(bot.as_mut_ptr().add(i + 4) as *mut __m512i, new_bot1);
+                i += 8;
+            }
+        }
         while i < lanes {
             let top_lanes = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let bot_lanes = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
@@ -199,6 +226,55 @@ unsafe fn butterfly_fused_2layer_impl<
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
         let lanes = a.len() & !3;
         let mut i = 0;
+        if !mul_unroll2_disabled() {
+            let lanes8 = a.len() & !7;
+            while i < lanes8 {
+                let mut va0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+                let mut vb0 = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+                let mut vc0 = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
+                let mut vd0 = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
+                let mut va1 = _mm512_loadu_si512(a.as_ptr().add(i + 4) as *const __m512i);
+                let mut vb1 = _mm512_loadu_si512(b.as_ptr().add(i + 4) as *const __m512i);
+                let mut vc1 = _mm512_loadu_si512(c.as_ptr().add(i + 4) as *const __m512i);
+                let mut vd1 = _mm512_loadu_si512(d.as_ptr().add(i + 4) as *const __m512i);
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+
+                _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va0);
+                _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb0);
+                _mm512_storeu_si512(c.as_mut_ptr().add(i) as *mut __m512i, vc0);
+                _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd0);
+                _mm512_storeu_si512(a.as_mut_ptr().add(i + 4) as *mut __m512i, va1);
+                _mm512_storeu_si512(b.as_mut_ptr().add(i + 4) as *mut __m512i, vb1);
+                _mm512_storeu_si512(c.as_mut_ptr().add(i + 4) as *mut __m512i, vc1);
+                _mm512_storeu_si512(d.as_mut_ptr().add(i + 4) as *mut __m512i, vd1);
+                i += 8;
+            }
+        }
         while i < lanes {
             let mut va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let mut vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
@@ -694,6 +770,51 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        if !mul_unroll2_disabled() {
+            let lanes8 = num_ntts & !7;
+            while lane < lanes8 {
+                if PF {
+                    let off = lane * core::mem::size_of::<F128>();
+                    for i in 0..4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off + 64));
+                    }
+                }
+                let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+                let mut vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+                let mut vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+                let mut vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+                let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+                let mut vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+                let mut vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+                let mut vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+                // t_outer = 0, t_inner_a = 0: a stays a. Two independent products.
+                vc0 = _mm512_xor_si512(vc0, va0);
+                vc1 = _mm512_xor_si512(vc1, va1);
+                vd0 = _mm512_xor_si512(vd0, vb0);
+                vd1 = _mm512_xor_si512(vd1, vb1);
+                vb0 = _mm512_xor_si512(vb0, va0);
+                vb1 = _mm512_xor_si512(vb1, va1);
+
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+
+                _mm512_storeu_si512(dst_row(0).add(lane) as *mut __m512i, va0);
+                _mm512_storeu_si512(dst_row(1).add(lane) as *mut __m512i, vb0);
+                _mm512_storeu_si512(dst_row(2).add(lane) as *mut __m512i, vc0);
+                _mm512_storeu_si512(dst_row(3).add(lane) as *mut __m512i, vd0);
+                _mm512_storeu_si512(dst_row(0).add(lane + 4) as *mut __m512i, va1);
+                _mm512_storeu_si512(dst_row(1).add(lane + 4) as *mut __m512i, vb1);
+                _mm512_storeu_si512(dst_row(2).add(lane + 4) as *mut __m512i, vc1);
+                _mm512_storeu_si512(dst_row(3).add(lane + 4) as *mut __m512i, vd1);
+                lane += 8;
+            }
+        }
         while lane < lanes {
             if PF {
                 let off = lane * core::mem::size_of::<F128>();
