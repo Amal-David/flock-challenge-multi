@@ -213,7 +213,15 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
     unsafe {
         // Row r's columns q..q+3 in one wide load (64-aligned in production —
         // the pool's recyclable class — but loadu tolerates test vectors).
-        let ld = |r: usize| _mm512_loadu_si512(z_ptr.add(r * stride) as *const __m512i);
+        // Non-temporal streaming loads bypass L1/L2/L3 cache pollution across 512 MiB witness z.
+        let ld = |r: usize| {
+            let p = z_ptr.add(r * stride) as *const __m512i;
+            if (p as usize) % 64 == 0 {
+                _mm512_stream_load_si512(p)
+            } else {
+                _mm512_loadu_si512(p)
+            }
+        };
         let r = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6), ld(7)];
         // 4×4 transpose of 128-bit lanes: cols[c] = lanes {row0..row3 at c}.
         #[inline(always)]
