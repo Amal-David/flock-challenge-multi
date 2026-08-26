@@ -1953,6 +1953,13 @@ impl AdditiveNttF128 {
                 for k in 0..64 {
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
+                    // Same-page hint for r+1 (1 KiB ahead in every plane).
+                    // Complements the next-k hint below; grain-4 tiles make
+                    // this the row the same worker will load next.
+                    #[cfg(target_arch = "x86_64")]
+                    if pf_dist != 0 && r + 1 < sub_stride {
+                        pf_msg_rows(src, r_s + 1, block_size, row_len, 2);
+                    }
                     // One line per lane step from inside the kernel, or the
                     // whole burst up front; never both.
                     let mut pf_next: *const F128 = core::ptr::null();
@@ -2178,15 +2185,39 @@ impl AdditiveNttF128 {
         // (all lanes) before the layer loops read any of them, so the
         // 512 KiB zero-fill per init was dead work — rayon runs the
         // initializer once per JOB, not per worker.
+        //
+        // Ranked shape: each `r` gathers four message rows 128 MiB apart
+        // (planes q=0..3 at stride B·row_len). Consecutive `r` sit 1 KiB
+        // apart in the *same* 4 KiB pages. Grain-1 rayon tasks spray those
+        // 256 pages across the 16 workers and thrash the DTLB. Tile by 4
+        // so one worker owns a full page in every plane before moving on.
+        // `FLOCK_NO_NTT_SEED_RTILE=1` restores grain-1.
+        let r_tile = if std::env::var_os("FLOCK_NO_NTT_SEED_RTILE").is_some() {
+            1
+        } else {
+            4
+        };
         if sub_stride < PARALLEL_TASK_THRESHOLD {
             let mut buf = staging_block(512, row_len);
             for r in 0..sub_stride {
                 task(&mut buf, r);
             }
-        } else {
+        } else if r_tile <= 1 {
             (0..sub_stride)
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+        } else {
+            let n_tiles = sub_stride.div_ceil(r_tile);
+            (0..n_tiles).into_par_iter().for_each_init(
+                || staging_block(512, row_len),
+                |buf, t| {
+                    let r0 = t * r_tile;
+                    let end = (r0 + r_tile).min(sub_stride);
+                    for r in r0..end {
+                        task(buf, r);
+                    }
+                },
+            );
         }
     }
 
