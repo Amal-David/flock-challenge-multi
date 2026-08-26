@@ -86,22 +86,75 @@ fn align64_enabled() -> bool {
 /// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
 /// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
 /// never collide with the freelist link word at `aligned + 0`.
+/// Cache colouring for the multi-megabyte class.
+///
+/// The system allocator serves blocks this size by mapping them, and
+/// consecutive maps land adjacent, so successive large buffers differ in
+/// address by exactly their own size — a power of two at every size this
+/// prover uses. Buffers that differ by a large power of two are congruent
+/// modulo the cache's index bits: they compete for the same sets, and a prove
+/// that sweeps several of them together pays conflict misses on top of the
+/// capacity misses its working set already costs.
+///
+/// The cost of that congruence is measured rather than assumed. Pinning the
+/// whole large class into one contiguous 2 MiB-aligned arena — the maximally
+/// congruent arrangement — came out **1.64% slower** on the ranked instance
+/// than leaving the addresses to the system allocator. This walks the same
+/// axis the other way: give each successive large block a different page
+/// offset within its first huge page, so the live set spreads across the index
+/// bits instead of stacking on them.
+///
+/// The colour is a multiple of the page size, so it preserves the 64-byte
+/// alignment the wide kernels need and the page alignment the huge-page advice
+/// needs, and it rides in the same slack and the same back-offset word the
+/// existing alignment already uses. Blocks below the threshold are untouched:
+/// they are too small for their spacing to be a large power of two, and the
+/// slack would be a large fraction of the block.
+const HUGE: usize = 2 << 20;
+const COLOURS: usize = 64;
+const COLOUR_STEP: usize = 4096;
+const COLOUR_SPAN: usize = COLOURS * COLOUR_STEP;
+static COLOUR: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn colour_for(size: usize) -> usize {
+    if size < HUGE {
+        return 0;
+    }
+    (COLOUR.fetch_add(1, Release) % COLOURS) * COLOUR_STEP
+}
+
+#[inline]
+const fn slack_for(size: usize) -> usize {
+    if size >= HUGE { COLOUR_STEP + COLOUR_SPAN } else { ALIGN_SLACK }
+}
+
+/// Large blocks are rounded to a page, not just to a line: the colour is a
+/// page multiple, so page-aligning the base is what makes the colours land on
+/// distinct page offsets, and it also stops the huge-page advice losing the
+/// leading partial page it currently rounds past.
+#[inline]
+const fn align_of_class(size: usize) -> usize {
+    if size >= HUGE { COLOUR_STEP } else { 64 }
+}
+
 const ALIGN_SLACK: usize = 64;
 
 #[inline]
 fn adjusted(layout: &Layout) -> Layout {
     // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
     // caller could have constructed, and 16 is a power of two.
-    Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
+    Layout::from_size_align(layout.size() + slack_for(layout.size()), MAX_ALIGN).unwrap()
 }
 
 #[inline]
-unsafe fn align_up(base: *mut u8) -> *mut u8 {
+unsafe fn align_up(base: *mut u8, size: usize) -> *mut u8 {
     if base.is_null() {
         return base;
     }
-    let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
+    let a = align_of_class(size);
+    let aligned = ((base as usize + 8 + colour_for(size) + a - 1) & !(a - 1)) as *mut u8;
+    // SAFETY: aligned - base is in [8, slack_for(size)] ⊆ the slack the caller
     // over-allocated, and aligned - 8 >= base.
     unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
     aligned
@@ -112,7 +165,7 @@ unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
     // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
     // intact (freelist links live at ptr + 0 and never touch it).
     let off = unsafe { *(ptr.sub(8) as *const usize) };
-    debug_assert!((8..=ALIGN_SLACK).contains(&off));
+    debug_assert!((8..=COLOUR_STEP + COLOUR_SPAN).contains(&off));
     unsafe { ptr.sub(off) }
 }
 
@@ -158,7 +211,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                return unsafe { align_up(System.alloc(adjusted(&layout)), layout.size()) };
             }
         }
         unsafe { System.alloc(layout) }
@@ -175,7 +228,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout)), layout.size()) };
             }
         }
         unsafe { System.alloc_zeroed(layout) }
@@ -207,6 +260,46 @@ mod tests {
     /// with intact contents. (The switch-off arm can't be covered in the
     /// same process: the latch resolves once.)
     #[test]
+    fn huge_blocks_are_coloured_and_roundtrip() {
+        // Successive large blocks must not all land on the same page offset,
+        // and every one of them must still satisfy the alignment the wide
+        // kernels rely on and survive a recycle intact.
+        let mut offsets = std::collections::HashSet::new();
+        let mut kept = Vec::new();
+        for i in 0..8usize {
+            let n = (2 << 20) + 4096 * i;
+            let v = vec![0xC3u8; n];
+            let a = v.as_ptr() as usize;
+            assert_eq!(a % 64, 0, "huge block {i} lost 64-byte alignment");
+            assert_eq!(a % 4096, 0, "huge block {i} lost page alignment");
+            offsets.insert(a % super::COLOUR_SPAN);
+            assert!(v.iter().all(|&b| b == 0xC3), "huge block {i} contents wrong");
+            kept.push(v);
+        }
+        assert!(offsets.len() > 1, "every huge block took the same colour");
+        drop(kept);
+        // Recycled blocks keep their colour and stay usable.
+        for i in 0..8usize {
+            let n = (2 << 20) + 4096 * i;
+            let mut v = vec![5u8; n];
+            assert_eq!(v.as_ptr() as usize % 64, 0, "recycled huge block {i} misaligned");
+            assert!(v.iter().all(|&b| b == 5));
+            v[n - 1] = 6;
+            assert_eq!(v[n - 1], 6);
+        }
+        // Below the threshold nothing is coloured and the block is unchanged.
+        let small = vec![2u8; (2 << 20) - 4096];
+        assert_eq!(small.as_ptr() as usize % 64, 0);
+        assert!(small.iter().all(|&b| b == 2));
+        // Growth across the threshold goes alloc -> copy -> free; the free must
+        // recover the right base for a block that was coloured on the way in.
+        let mut g: Vec<u8> = vec![1u8; 1 << 16];
+        g.resize(6 << 20, 2);
+        assert_eq!(g[0], 1);
+        assert_eq!(g[(6 << 20) - 1], 2);
+    }
+
+#[test]
     fn recyclable_class_is_64_aligned_and_roundtrips() {
         for i in 0..4usize {
             let n = 32 * 1024 + 4096 * i + 128;
