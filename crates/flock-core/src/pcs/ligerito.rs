@@ -1759,6 +1759,43 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
     s * s + s_at_root * s
 }
 
+/// Serial Montgomery batch inversion for the short deterministic denominator
+/// vectors used by Ligerito basis induction. A zero input stays zero, matching
+/// the previous element-wise inversion contract.
+fn batch_inverse_or_zero(values: &[F128]) -> Vec<F128> {
+    if values.len() < 2 {
+        return values
+            .iter()
+            .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+            .collect();
+    }
+
+    let mut inverses = vec![F128::ZERO; values.len()];
+    let Some(first_nonzero) = values.iter().position(|v| !v.is_zero()) else {
+        return inverses;
+    };
+    let mut product = values[first_nonzero];
+    for index in first_nonzero + 1..values.len() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] = product;
+        product *= value;
+    }
+    let mut suffix_inverse = product.inv();
+    for index in (first_nonzero + 1..values.len()).rev() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] *= suffix_inverse;
+        suffix_inverse *= value;
+    }
+    inverses[first_nonzero] = suffix_inverse;
+    inverses
+}
+
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
 /// Only depends on `log_n`, so callers cache.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
@@ -2068,10 +2105,7 @@ pub(crate) fn induce_sumcheck_poly(
     };
 
     // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    let inv_sks_vks = batch_inverse_or_zero(sks_vks);
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -3583,6 +3617,7 @@ fn gpu_merkle_tree_for_open(
 //     running := running + α·to_glue. New sum-claim becomes T_r + α·h.
 
 /// (u_0, u_2) per round — what the prover sends.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,
@@ -4209,13 +4244,20 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+thread_local! {
+    /// Per-worker folded ordinary-basis stage for the ranked lazy-OOD fold.
+    /// Reused across chunks so deferring glue introduces no timed allocation.
+    static OOD_DEFER_STAGE: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    fold_and_msg_lsb_inner(f, b, r, arena, None)
+    fold_and_msg_lsb_inner(f, b, r, arena, None, None)
 }
 
 /// Core fold with an optional retained equality correction. The correction is
@@ -4229,11 +4271,15 @@ fn fold_and_msg_lsb_inner(
     r: F128,
     arena: Option<&mut FoldArena>,
     lazy_ood: Option<(&[F128], &[F128], F128)>,
+    deferred_basis: Option<(&[F128], F128)>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
+    if let Some((basis, _)) = deferred_basis {
+        assert_eq!(basis.len(), n, "deferred basis length changed");
+    }
     let half = n / 2;
     if let Some((eq_lo, eq_hi, _)) = lazy_ood {
         assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
@@ -4251,7 +4297,13 @@ fn fold_and_msg_lsb_inner(
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
             nf.push(f0 + r * (f0 + f1));
-            nb.push(b0 + r * (b0 + b1));
+            let mut folded_b = b0 + r * (b0 + b1);
+            if let Some((basis, alpha)) = deferred_basis {
+                let d0 = basis[2 * j];
+                let d1 = basis[2 * j + 1];
+                folded_b += alpha * (d0 + r * (d0 + d1));
+            }
+            nb.push(folded_b);
         }
         if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
             for (j, value) in nb.iter_mut().enumerate() {
@@ -4413,6 +4465,21 @@ fn fold_and_msg_lsb_inner(
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            if let Some((basis, alpha)) = deferred_basis {
+                OOD_DEFER_STAGE.with(|cell| {
+                    let mut stage = cell.borrow_mut();
+                    if stage.len() < len {
+                        stage.resize(len, F128::ZERO);
+                    }
+                    crate::field::f128_slice::fold_pairs(
+                        basis,
+                        base,
+                        &mut stage[..len],
+                        r,
+                    );
+                    crate::field::f128_slice::add_scaled(bc, &stage[..len], alpha);
+                });
+            }
             if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
                 let scale = gamma * eq_hi[ci];
                 crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
@@ -5784,6 +5851,14 @@ fn ranked_deep_lazy_ood_eq_selected(
         && config.log_inv_rates.first() == Some(&1)
 }
 
+/// Apple retained the second traversal fusion only at the ranked L2/L3
+/// dimensions. x86's existing factorized OOD path remains broader (L2-L5),
+/// but the new ordinary-basis deferral is deliberately exact and auditable.
+#[inline]
+fn ranked_defer_ordinary_glue(lazy_deep_ood: bool, n_level: usize) -> bool {
+    lazy_deep_ood && matches!(n_level, 16 | 13)
+}
+
 enum PendingOodEq {
     Introduced {
         eq_lo: Vec<F128>,
@@ -5860,6 +5935,7 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -6129,6 +6205,9 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// Ordinary induced basis whose target update is complete but whose dense
+    /// pointwise add is fused into the already-pending lazy-OOD fold.
+    pending_fold_basis: Option<(Vec<F128>, F128)>,
     /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
     /// next fold consumes its glued correction.
     pending_ood_eq: Option<PendingOodEq>,
@@ -6144,6 +6223,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_fold_basis: None,
             pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
@@ -6181,6 +6261,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            pending_fold_basis: None,
             pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
@@ -6202,6 +6283,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            pending_fold_basis: None,
             pending_ood_eq: None,
         }
     }
@@ -6221,6 +6303,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            pending_fold_basis: None,
             pending_ood_eq: None,
         }
     }
@@ -6240,6 +6323,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            pending_fold_basis: None,
             pending_ood_eq: None,
         }
     }
@@ -6250,13 +6334,17 @@ impl SumcheckProver {
         // [`fold_and_msg_lsb`].
         assert!(self.pending_glue.is_none(), "fold before ordinary glue");
         let pending_ood = self.pending_ood_eq.take();
-        let (nf, nb, msg) = match pending_ood {
-            Some(PendingOodEq::Glued {
-                eq_lo,
-                eq_hi,
-                z_0,
-                beta,
-            }) => {
+        let deferred_basis = self.pending_fold_basis.take();
+        let (nf, nb, msg) = match (pending_ood, deferred_basis) {
+            (
+                Some(PendingOodEq::Glued {
+                    eq_lo,
+                    eq_hi,
+                    z_0,
+                    beta,
+                }),
+                deferred_basis,
+            ) => {
                 // Folding eq([z0, z_tail], ·) at LSB challenge r leaves
                 // (1 + z0 + r) * eq(z_tail, ·) in characteristic two.
                 let gamma = beta * (F128::ONE + z_0 + r);
@@ -6266,12 +6354,16 @@ impl SumcheckProver {
                     r,
                     self.fold_arena.as_mut(),
                     Some((&eq_lo, &eq_hi, gamma)),
+                    deferred_basis
+                        .as_ref()
+                        .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
                 )
             }
-            Some(PendingOodEq::Introduced { .. }) => {
+            (Some(PendingOodEq::Introduced { .. }), _) => {
                 panic!("fold before factorized OOD glue")
             }
-            None => fold_and_msg_lsb(
+            (None, Some(_)) => panic!("deferred ordinary glue without lazy OOD fold"),
+            (None, None) => fold_and_msg_lsb(
                 &self.f,
                 &self.combined_basis,
                 r,
@@ -6305,6 +6397,7 @@ impl SumcheckProver {
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
+        assert!(self.pending_fold_basis.is_none(), "introduction across deferred glue");
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
@@ -6319,6 +6412,7 @@ impl SumcheckProver {
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
         assert_eq!(b_new.len(), self.f.len());
+        assert!(self.pending_fold_basis.is_none(), "introduction across deferred glue");
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
@@ -6336,6 +6430,7 @@ impl SumcheckProver {
         if z.is_empty()
             || expected_len != Some(self.f.len())
             || self.pending_glue.is_some()
+            || self.pending_fold_basis.is_some()
             || self.pending_ood_eq.is_some()
         {
             return None;
@@ -6364,6 +6459,7 @@ impl SumcheckProver {
             self.pending_glue.is_none(),
             "factorized OOD glue across ordinary pending glue"
         );
+        assert!(self.pending_fold_basis.is_none(), "factorized OOD glue across deferred glue");
         let pending = self
             .pending_ood_eq
             .take()
@@ -6390,6 +6486,7 @@ impl SumcheckProver {
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
+        assert!(self.pending_fold_basis.is_none(), "ordinary glue across deferred glue");
         let (b_new, h_new) = self
             .pending_glue
             .take()
@@ -6429,6 +6526,24 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+    }
+
+    /// Update the target immediately while postponing the dense basis add to
+    /// the already-pending factorized-OOD fold. This preserves transcript and
+    /// arithmetic order but removes a standalone full-table traversal.
+    fn glue_deferred_into_lazy_ood_fold(&mut self, alpha: F128) {
+        assert!(
+            matches!(self.pending_ood_eq, Some(PendingOodEq::Glued { .. })),
+            "deferred glue requires a glued lazy OOD term"
+        );
+        assert!(self.pending_fold_basis.is_none(), "more than one deferred glue");
+        let (b_new, h_new) = self
+            .pending_glue
+            .take()
+            .expect("deferred glue without introduce_new");
+        assert_eq!(b_new.len(), self.combined_basis.len());
+        self.t_r += alpha * h_new;
+        self.pending_fold_basis = Some((b_new, alpha));
     }
 
     pub fn f(&self) -> &[F128] {
@@ -7363,7 +7478,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    sc_prover.glue(beta_0);
+    if lazy_l1_ood {
+        sc_prover.glue_deferred_into_lazy_ood_fold(beta_0);
+    } else {
+        sc_prover.glue(beta_0);
+    }
     if trace {
         t_intro_glue += _t.elapsed();
     }
@@ -7501,17 +7620,22 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_bytes(&root_next);
         recursive_roots.push(root_next);
 
+        let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
+            config,
+            log_n,
+            n_next,
+            ood_count(i + 2),
+            sc_prover.f().len(),
+            direct_fold4_mode || direct_fold8_mode,
+        );
+        // Apple retained this second fusion only for the ranked L2/L3 shapes.
+        // Keep x86's broader L2-L5 lazy-OOD selector intact, while avoiding an
+        // unmeasured semantic expansion of the deferred ordinary-glue change.
+        let defer_deep_ordinary_glue = ranked_defer_ordinary_glue(lazy_deep_ood, n_next);
+
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
         {
             let _t = std::time::Instant::now();
-            let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
-                config,
-                log_n,
-                n_next,
-                ood_count(i + 2),
-                sc_prover.f().len(),
-                direct_fold4_mode || direct_fold8_mode,
-            );
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
                 // The exact ranked deep levels retain eq(z[1..], ·) as
@@ -7634,7 +7758,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        sc_prover.glue(beta_i);
+        if defer_deep_ordinary_glue {
+            sc_prover.glue_deferred_into_lazy_ood_fold(beta_i);
+        } else {
+            sc_prover.glue(beta_i);
+        }
         if trace {
             t_intro_glue += _t.elapsed();
         }
@@ -9191,6 +9319,53 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_inverse_or_zero_matches_scalar_and_preserves_positions() {
+        use crate::challenger::Challenger;
+
+        let assert_matches = |values: &[F128]| {
+            let expected: Vec<F128> = values
+                .iter()
+                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+                .collect();
+            let actual = batch_inverse_or_zero(values);
+            assert_eq!(actual, expected);
+            for (&value, &inverse) in values.iter().zip(&actual) {
+                if value.is_zero() {
+                    assert_eq!(inverse, F128::ZERO);
+                } else {
+                    assert_eq!(value * inverse, F128::ONE);
+                }
+            }
+        };
+
+        for values in [
+            vec![],
+            vec![F128::ZERO],
+            vec![F128::ONE],
+            vec![F128::ZERO, F128::ZERO],
+            vec![F128::ZERO, F128::generator(), F128::ZERO],
+            vec![F128::generator(), F128::ZERO, F128::ONE],
+        ] {
+            assert_matches(&values);
+        }
+
+        let mut rng = crate::challenger::RandomChallenger::new(0xB47C_1A5E);
+        for &len in &[2usize, 3, 8, 17, 26, 33] {
+            let mut values: Vec<F128> = (0..len).map(|_| rng.sample_f128()).collect();
+            for i in (1..len).step_by(5) {
+                values[i] = F128::ZERO;
+            }
+            assert_matches(&values);
+        }
+
+        for log_n in 0..=25usize {
+            let sks_vks = eval_sk_at_vks(log_n);
+            assert!(sks_vks.iter().all(|v| !v.is_zero()), "log_n={log_n}");
+            assert_matches(&sks_vks);
+        }
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
@@ -10952,7 +11127,7 @@ mod tests {
         assert_eq!(eq_lo.len(), 2048);
         let gamma = beta * (F128::ONE + z[0] + r);
         let (got_f, got_b, got_msg) =
-            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
         assert_eq!(&*got_f, &*want_f);
         assert_eq!(&*got_b, &*want_b);
         assert_eq!(got_msg, want_msg);
@@ -10993,7 +11168,7 @@ mod tests {
         let lazy_ordinary = lazy.introduce_new(ordinary, ordinary_claim);
         assert_eq!(lazy_ordinary, dense_ordinary);
         dense.glue(alpha);
-        lazy.glue(alpha);
+        lazy.glue_deferred_into_lazy_ood_fold(alpha);
 
         assert_eq!(lazy.fold(r), dense.fold(r));
         assert_eq!(&*lazy.f, &*dense.f);
@@ -11076,7 +11251,7 @@ mod tests {
             let mut eq_hi = build_eq_table(&z[1 + split..]);
             let gamma = beta * (F128::ONE + z[0] + r);
             let (got_f, got_b, got_msg) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
             assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
             assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
             assert_eq!(got_msg, want_msg, "next-round message d={d}");
@@ -11084,7 +11259,7 @@ mod tests {
             // Negative control: one corrupted high weight must not still match.
             eq_hi[0] += F128::ONE;
             let (_, bad_b, _) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), None);
             assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
         }
     }
@@ -11092,11 +11267,11 @@ mod tests {
     /// Exercise the prover state machine at the deep shapes across the
     /// operation that sits between a level's OOD glue and its consuming fold:
     /// the level's ordinary induced-basis introduce/glue. Covers both the
-    /// serial (d = 10) and parallel (d = 16) fold paths.
+    /// two ranked L2/L3 shapes.
     #[test]
     fn deep_lazy_ood_state_machine_matches_dense_across_ordinary_glue() {
         use crate::challenger::Challenger;
-        for &d in &[10usize, 16] {
+        for &d in &[13usize, 16] {
             let n = 1usize << d;
             let mut ch = crate::challenger::RandomChallenger::new(0xDEE9_57A7 ^ d as u64);
             let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
@@ -11124,7 +11299,7 @@ mod tests {
             let lazy_ordinary = lazy.introduce_new(ordinary, ordinary_claim);
             assert_eq!(lazy_ordinary, dense_ordinary);
             dense.glue(alpha);
-            lazy.glue(alpha);
+            lazy.glue_deferred_into_lazy_ood_fold(alpha);
 
             assert_eq!(lazy.fold(r), dense.fold(r), "d={d}");
             assert_eq!(&*lazy.f, &*dense.f, "d={d}");
@@ -11159,6 +11334,18 @@ mod tests {
         assert!(!selected(25, 19, 1, 1 << 19, true, true, false));
         assert!(!selected(25, 15, 1, 1 << 15, true, true, false));
         assert!(!selected(25, 4, 1, 1 << 4, true, true, false));
+    }
+
+    #[test]
+    fn deferred_ordinary_glue_hits_ranked_l2_l3_only() {
+        for n_level in 0usize..=25 {
+            assert_eq!(
+                ranked_defer_ordinary_glue(true, n_level),
+                matches!(n_level, 16 | 13),
+                "n_level={n_level}"
+            );
+            assert!(!ranked_defer_ordinary_glue(false, n_level));
+        }
     }
 
     /// The cache-blocked transpose schedule must be BYTE-identical to the

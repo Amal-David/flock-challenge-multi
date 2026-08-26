@@ -343,6 +343,18 @@ fn fast_pcs_open_encode_enabled() -> bool {
         && *ON.get_or_init(|| std::env::var("FLOCK_NO_FAST_ENCODE").map_or(true, |v| v != "1"))
 }
 
+/// Literal rollback for the contiguous sumcheck/nonce tail copies.
+fn flat_tail_bulk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_TAIL_BULK").map_or(true, |v| v != "1"))
+}
+
+/// Literal rollback for the one-reservation ragged-row encoder.
+fn flat_rows_bulk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_ROWS_BULK").map_or(true, |v| v != "1"))
+}
+
 /// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
@@ -386,12 +398,7 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
     put_f128_vec(out, yr);
     put_rows(out, opened_rows);
     put_hash_vec(out, merkle_proof);
-    put_u64(out, sumcheck_transcript.len() as u64);
-    for m in sumcheck_transcript {
-        let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
-    }
+    put_sumcheck_vec(out, sumcheck_transcript);
     put_u64_vec(out, grinding_nonces);
     put_f128_vec(out, ood_values);
     put_u64_vec(out, fold_grinding_nonces);
@@ -436,17 +443,93 @@ fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
 }
 
 #[inline]
+fn put_sumcheck_vec(out: &mut Vec<u8>, v: &[SumcheckMessage]) {
+    put_u64(out, v.len() as u64);
+    if flat_tail_bulk_enabled() {
+        const {
+            assert!(std::mem::size_of::<SumcheckMessage>() == 2 * std::mem::size_of::<F128>());
+            assert!(std::mem::align_of::<SumcheckMessage>() == std::mem::align_of::<F128>());
+            assert!(std::mem::offset_of!(SumcheckMessage, u_0) == 0);
+            assert!(std::mem::offset_of!(SumcheckMessage, u_2) == std::mem::size_of::<F128>());
+        }
+        // SAFETY: SumcheckMessage is repr(C), two adjacent F128 values, and
+        // this flat encoder is enabled only on little-endian targets.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.extend_from_slice(bytes);
+    } else {
+        for m in v {
+            let SumcheckMessage { u_0, u_2 } = m;
+            put_f128(out, *u_0);
+            put_f128(out, *u_2);
+        }
+    }
+}
+
+#[inline]
 fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
+    if flat_tail_bulk_enabled() {
+        // SAFETY: u64 slices have no padding and this path is little-endian.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.extend_from_slice(bytes);
+    } else {
+        for &x in v {
+            put_u64(out, x);
+        }
     }
 }
 
 fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
-    put_u64(out, rows.len() as u64);
-    for row in rows {
-        put_f128_vec(out, row);
+    if !flat_rows_bulk_enabled() {
+        put_u64(out, rows.len() as u64);
+        for row in rows {
+            put_f128_vec(out, row);
+        }
+        return;
+    }
+
+    const LEN_BYTES: usize = std::mem::size_of::<u64>();
+    let encoded_len = rows
+        .iter()
+        .try_fold(LEN_BYTES, |len, row| {
+            len.checked_add(LEN_BYTES)?
+                .checked_add(std::mem::size_of_val(row.as_slice()))
+        })
+        .expect("row encoding length overflow");
+    let old_len = out.len();
+    let new_len = old_len
+        .checked_add(encoded_len)
+        .expect("proof encoding length overflow");
+    out.reserve(encoded_len);
+
+    // SAFETY: reserve exposes encoded_len writable bytes. The same checked
+    // terms determine every copy and all bytes are initialized before set_len.
+    unsafe {
+        let dst = out.as_mut_ptr().add(old_len);
+        let mut written = 0usize;
+        let nrows = (rows.len() as u64).to_le_bytes();
+        std::ptr::copy_nonoverlapping(nrows.as_ptr(), dst.add(written), LEN_BYTES);
+        written += LEN_BYTES;
+        for row in rows {
+            let row_len = (row.len() as u64).to_le_bytes();
+            std::ptr::copy_nonoverlapping(row_len.as_ptr(), dst.add(written), LEN_BYTES);
+            written += LEN_BYTES;
+            let row_bytes = std::mem::size_of_val(row.as_slice());
+            if row_bytes != 0 {
+                std::ptr::copy_nonoverlapping(
+                    row.as_ptr().cast::<u8>(),
+                    dst.add(written),
+                    row_bytes,
+                );
+                written += row_bytes;
+            }
+        }
+        debug_assert_eq!(written, encoded_len);
+        out.set_len(new_len);
     }
 }
 
