@@ -2182,12 +2182,13 @@ pub(crate) fn induce_sumcheck_poly(
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let tb_x64 = ghash_shift64_x4(tb);
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2195,7 +2196,7 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let nb = _mm512_xor_si512(vb, ghash_mul_x4_split(vs, tb, tb_x64));
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -3788,18 +3789,16 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         debug_assert_eq!(f.len(), 2 * weights.len());
         let mut a_acc = WideGhashX4::zero();
         let mut s_acc = WideGhashX4::zero();
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
         let lanes = weights.len() & !3;
         let mut j = 0usize;
         while j < lanes {
             let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
             let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
             let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let sum = _mm512_permutex2var_epi64(f0_sum, idx_even, f1_sum);
+            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
             a_acc.mul_acc(even, w);
             s_acc.mul_acc(sum, w);
             j += 4;
@@ -3951,13 +3950,6 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     let mut u0_acc = WideGhashX4::zero();
     let mut u2_acc = WideGhashX4::zero();
 
-    // idx_even: pick 128-bit lanes {0, 2} from reg0 and {0, 2} from reg1
-    // → [reg0[0], reg0[2], reg1[0], reg1[2]] (even-indexed F128 elements).
-    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-    // perm_swap: swap adjacent 128-bit lanes (0↔1, 2↔3) within a register.
-    // After XOR with original, every lane holds a pair sum.
-    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
     let mut k = 0;
     while k < lanes {
         // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
@@ -3967,18 +3959,18 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
         let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
         // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
         u0_acc.mul_acc(f_even, b_even);
 
         // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
         //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
         u2_acc.mul_acc(f_sum, b_sum);
 
         k += 8;
@@ -4024,9 +4016,6 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
         let mut u2_acc = WideGhashX4::zero();
         let mut y_acc = WideGhashX4::zero();
 
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
         let mut k = 0;
         while k < lanes {
             let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
@@ -4034,16 +4023,16 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
             let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
@@ -4215,7 +4204,7 @@ fn fold_and_msg_lsb(
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    fold_and_msg_lsb_inner(f, b, r, arena, None)
+    fold_and_msg_lsb_inner(f, b, r, arena, None, &[])
 }
 
 /// Core fold with an optional retained equality correction. The correction is
@@ -4229,6 +4218,7 @@ fn fold_and_msg_lsb_inner(
     r: F128,
     arena: Option<&mut FoldArena>,
     lazy_ood: Option<(&[F128], &[F128], F128)>,
+    glues: &[(Vec<F128>, F128)],
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
@@ -4251,7 +4241,13 @@ fn fold_and_msg_lsb_inner(
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
             nf.push(f0 + r * (f0 + f1));
-            nb.push(b0 + r * (b0 + b1));
+            let mut val_b = b0 + r * (b0 + b1);
+            for (g_b, g_alpha) in glues {
+                let g0 = g_b[2 * j];
+                let g1 = g_b[2 * j + 1];
+                val_b += *g_alpha * (g0 + r * (g0 + g1));
+            }
+            nb.push(val_b);
         }
         if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
             for (j, value) in nb.iter_mut().enumerate() {
@@ -4297,7 +4293,8 @@ fn fold_and_msg_lsb_inner(
     // local-diagnostics kill switch; the ranked worker's cleared environment
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt = lazy_ood.is_none()
+    let use_nt = glues.is_empty()
+        && lazy_ood.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
@@ -4309,7 +4306,8 @@ fn fold_and_msg_lsb_inner(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let use_nt = lazy_ood.is_none()
+    let use_nt = glues.is_empty()
+        && lazy_ood.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
@@ -4319,7 +4317,7 @@ fn fold_and_msg_lsb_inner(
     // (statically true under `-C target-cpu=native` on every Apple Silicon
     // target this ships to; other builds keep the previous leaf).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa = lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
+    let use_soa = glues.is_empty() && lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
         static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
         });
@@ -4413,6 +4411,14 @@ fn fold_and_msg_lsb_inner(
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            for (g_b, g_alpha) in glues {
+                let alpha = *g_alpha;
+                for j in 0..len {
+                    let g0 = g_b[2 * (base + j)];
+                    let g1 = g_b[2 * (base + j) + 1];
+                    bc[j] += alpha * (g0 + r * (g0 + g1));
+                }
+            }
             if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
                 let scale = gamma * eq_hi[ci];
                 crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
@@ -4547,34 +4553,6 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
-#[inline]
-fn eval_fold8_lookahead4(
-    coefficients: &super::Fold8Lookahead4,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..81], &[r0, r1, r2, r3]),
-        u_2: eval_quadratic_tensor(&coefficients[81..], &[r0, r1, r2, r3]),
-    }
-}
-
-#[inline]
-fn eval_fold8_lookahead5(
-    coefficients: &super::Fold8Lookahead5,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-    r4: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..243], &[r0, r1, r2, r3, r4]),
-        u_2: eval_quadratic_tensor(&coefficients[243..], &[r0, r1, r2, r3, r4]),
-    }
-}
 
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
@@ -6129,6 +6107,7 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    queued_glues: Vec<(Vec<F128>, F128)>,
     /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
     /// next fold consumes its glued correction.
     pending_ood_eq: Option<PendingOodEq>,
@@ -6144,6 +6123,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
@@ -6181,6 +6161,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
@@ -6202,6 +6183,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6221,6 +6203,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6240,6 +6223,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6249,6 +6233,7 @@ impl SumcheckProver {
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
         assert!(self.pending_glue.is_none(), "fold before ordinary glue");
+        let glues = std::mem::take(&mut self.queued_glues);
         let pending_ood = self.pending_ood_eq.take();
         let (nf, nb, msg) = match pending_ood {
             Some(PendingOodEq::Glued {
@@ -6266,16 +6251,19 @@ impl SumcheckProver {
                     r,
                     self.fold_arena.as_mut(),
                     Some((&eq_lo, &eq_hi, gamma)),
+                    &glues,
                 )
             }
             Some(PendingOodEq::Introduced { .. }) => {
                 panic!("fold before factorized OOD glue")
             }
-            None => fold_and_msg_lsb(
+            None => fold_and_msg_lsb_inner(
                 &self.f,
                 &self.combined_basis,
                 r,
                 self.fold_arena.as_mut(),
+                None,
+                &glues,
             ),
         };
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
@@ -6386,14 +6374,8 @@ impl SumcheckProver {
         });
     }
 
-    /// Combine the introduced basis into `combined_basis` with separation α.
-    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
-    pub fn glue(&mut self, alpha: F128) {
+    fn eager_glue_apply(&mut self, b_new: &[F128], alpha: F128) {
         use rayon::prelude::*;
-        let (b_new, h_new) = self
-            .pending_glue
-            .take()
-            .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -6407,7 +6389,7 @@ impl SumcheckProver {
                 let acc: &mut [F128] = &mut self.combined_basis;
                 if acc.len() < PAR_THRESHOLD {
                     // SAFETY: features cfg-guaranteed; equal lengths.
-                    unsafe { glue_block_x4(acc, &b_new, alpha) };
+                    unsafe { glue_block_x4(acc, b_new, alpha) };
                 } else {
                     acc.par_chunks_mut(CHUNK)
                         .zip(b_new.par_chunks(CHUNK))
@@ -6428,7 +6410,21 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
+    }
+
+    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    pub fn glue(&mut self, alpha: F128) {
+        let (b_new, h_new) = self
+            .pending_glue
+            .take()
+            .expect("glue without introduce_new");
         self.t_r += alpha * h_new;
+        if std::env::var_os("FLOCK_NO_DEFERRED_GLUE").is_some() {
+            self.eager_glue_apply(&b_new, alpha);
+        } else {
+            self.queued_glues.push((b_new, alpha));
+        }
     }
 
     pub fn f(&self) -> &[F128] {
@@ -6744,8 +6740,6 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
         challenger,
     )
 }
@@ -6778,8 +6772,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
-        None,
-        None,
         None,
         None,
         None,
@@ -6819,8 +6811,6 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         Some(round1_lookahead),
-        None,
-        None,
         None,
         None,
         Some(direct),
@@ -6867,8 +6857,6 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         Some(round2_lookahead),
         Some(round3_lookahead),
         None,
-        None,
-        None,
         Some(direct),
         None,
         fold_arena,
@@ -6910,8 +6898,6 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
         Some(direct),
         fold_arena,
         challenger,
@@ -6930,8 +6916,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
     round3_lookahead: Option<super::Fold4Lookahead3>,
-    round4_lookahead: Option<super::Fold8Lookahead4>,
-    round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
@@ -10952,7 +10936,7 @@ mod tests {
         assert_eq!(eq_lo.len(), 2048);
         let gamma = beta * (F128::ONE + z[0] + r);
         let (got_f, got_b, got_msg) =
-            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
         assert_eq!(&*got_f, &*want_f);
         assert_eq!(&*got_b, &*want_b);
         assert_eq!(got_msg, want_msg);
@@ -11076,7 +11060,7 @@ mod tests {
             let mut eq_hi = build_eq_table(&z[1 + split..]);
             let gamma = beta * (F128::ONE + z[0] + r);
             let (got_f, got_b, got_msg) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
             assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
             assert_eq!(got_msg, want_msg, "next-round message d={d}");
@@ -11084,7 +11068,7 @@ mod tests {
             // Negative control: one corrupted high weight must not still match.
             eq_hi[0] += F128::ONE;
             let (_, bad_b, _) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
         }
     }
