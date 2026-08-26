@@ -1002,6 +1002,24 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LINCHECK_GT_FUSE=1` restores the two-instruction gather/transpose
+/// (permutex2var lo/hi split + vpermb byte transpose) in the ranked GFNI
+/// gather kernels. The fused arm ships on: one VPERMT2B with a static
+/// 128-byte index replaces the split+byte-transpose composition, cutting
+/// p5 permute uops per 4-column visit. Bit-identical bytes (asserted by
+/// `gather_transpose_stripe_matches_scalar`); resolved once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lincheck_gt_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_GT_FUSE").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {

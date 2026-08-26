@@ -151,33 +151,84 @@ pub(crate) unsafe fn gather_transpose_stripe_x86(z_ptr: *const F128, stride: usi
             let a = _mm512_inserti32x4::<2>(a, ld(6));
             _mm512_inserti32x4::<3>(a, ld(7))
         };
-        // Split into lo-qwords (lane r's .lo at qword r) and hi-qwords.
-        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        let zlo = _mm512_permutex2var_epi64(z0, lo_idx, z1);
-        let zhi = _mm512_permutex2var_epi64(z0, hi_idx, z1);
-        // Byte transpose 8x8 (out byte c*8+r = in byte r*8+c), then per-qword
-        // 8x8 bit transpose via the affine identity.
+        // Fused lo/hi split + 8x8 byte transpose in ONE VPERMT2B per half:
+        // the old permutex2var (lo/hi qword split across z0|z1) composed with
+        // the 8x8 vpermb byte transpose is exactly a byte permutation of the
+        // 128-byte concat(z0, z1), expressed by a static 128-byte index.
+        // Bit-identical: verified against the two-instruction form by
+        // gather_transpose_stripe_matches_scalar.
         #[repr(C, align(64))]
-        struct BIdx([u8; 64]);
-        static BIDX: BIdx = {
+        struct FusedIdx([u8; 64]);
+        static FLO: FusedIdx = {
             let mut t = [0u8; 64];
             let mut i = 0;
             while i < 64 {
-                // Lane order pre-reversed: the affine bit-transpose reads
-                // A.byte[7 - i], so out byte j bit i = A.byte[7-i].bit[j] —
-                // feeding lane (7 - r) at byte r cancels the reversal.
-                t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                let r = 7 - i % 8;
+                t[i] = if r < 4 {
+                    (16 * r + i / 8) as u8
+                } else {
+                    (128 + 16 * (r - 4) + i / 8) as u8
+                };
                 i += 1;
             }
-            BIdx(t)
+            FusedIdx(t)
         };
-        let bidx = _mm512_load_si512(BIDX.0.as_ptr() as *const __m512i);
+        static FHI: FusedIdx = {
+            let mut t = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                let r = 7 - i % 8;
+                t[i] = if r < 4 {
+                    (16 * r + 8 + i / 8) as u8
+                } else {
+                    (128 + 16 * (r - 4) + 8 + i / 8) as u8
+                };
+                i += 1;
+            }
+            FusedIdx(t)
+        };
         let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
-        let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
-        let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
-        _mm512_storeu_si512(out as *mut __m512i, t_lo);
-        _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+        if super::super::lincheck_gt_fuse_enabled() {
+            let f_lo = _mm512_load_si512(FLO.0.as_ptr() as *const __m512i);
+            let f_hi = _mm512_load_si512(FHI.0.as_ptr() as *const __m512i);
+            let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
+                ident,
+                _mm512_permutex2var_epi8(z0, f_lo, z1),
+            );
+            let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
+                ident,
+                _mm512_permutex2var_epi8(z0, f_hi, z1),
+            );
+            _mm512_storeu_si512(out as *mut __m512i, t_lo);
+            _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+        } else {
+            let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+            let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+            let zlo = _mm512_permutex2var_epi64(z0, lo_idx, z1);
+            let zhi = _mm512_permutex2var_epi64(z0, hi_idx, z1);
+            #[repr(C, align(64))]
+            struct BIdx([u8; 64]);
+            static BIDX: BIdx = {
+                let mut t = [0u8; 64];
+                let mut i = 0;
+                while i < 64 {
+                    t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                    i += 1;
+                }
+                BIdx(t)
+            };
+            let bidx = _mm512_load_si512(BIDX.0.as_ptr() as *const __m512i);
+            let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
+                ident,
+                _mm512_permutexvar_epi8(bidx, zlo),
+            );
+            let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
+                ident,
+                _mm512_permutexvar_epi8(bidx, zhi),
+            );
+            _mm512_storeu_si512(out as *mut __m512i, t_lo);
+            _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+        }
     }
 }
 
@@ -234,31 +285,83 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86(
         }
         let z0s = tr4(r[0], r[1], r[2], r[3]); // per column: rows 0..3
         let z1s = tr4(r[4], r[5], r[6], r[7]); // per column: rows 4..7
-        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        #[repr(C, align(64))]
-        struct BIdx4([u8; 64]);
-        static BIDX4: BIdx4 = {
-            let mut t = [0u8; 64];
-            let mut i = 0;
-            while i < 64 {
-                t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
-                i += 1;
-            }
-            BIdx4(t)
-        };
-        let bidx = _mm512_load_si512(BIDX4.0.as_ptr() as *const __m512i);
         let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
-        for c in 0..4 {
-            let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
-            let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
-            let t_lo =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
-            let t_hi =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
-            let dst = out.add(c * out_stride);
-            _mm512_storeu_si512(dst as *mut __m512i, t_lo);
-            _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
+        if super::super::lincheck_gt_fuse_enabled() {
+            #[repr(C, align(64))]
+            struct FusedIdx([u8; 64]);
+            static FLO: FusedIdx = {
+                let mut t = [0u8; 64];
+                let mut i = 0;
+                while i < 64 {
+                    let r = 7 - i % 8;
+                    t[i] = if r < 4 {
+                        (16 * r + i / 8) as u8
+                    } else {
+                        (128 + 16 * (r - 4) + i / 8) as u8
+                    };
+                    i += 1;
+                }
+                FusedIdx(t)
+            };
+            static FHI: FusedIdx = {
+                let mut t = [0u8; 64];
+                let mut i = 0;
+                while i < 64 {
+                    let r = 7 - i % 8;
+                    t[i] = if r < 4 {
+                        (16 * r + 8 + i / 8) as u8
+                    } else {
+                        (128 + 16 * (r - 4) + 8 + i / 8) as u8
+                    };
+                    i += 1;
+                }
+                FusedIdx(t)
+            };
+            let f_lo = _mm512_load_si512(FLO.0.as_ptr() as *const __m512i);
+            let f_hi = _mm512_load_si512(FHI.0.as_ptr() as *const __m512i);
+            for c in 0..4 {
+                let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    ident,
+                    _mm512_permutex2var_epi8(z0s[c], f_lo, z1s[c]),
+                );
+                let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    ident,
+                    _mm512_permutex2var_epi8(z0s[c], f_hi, z1s[c]),
+                );
+                let dst = out.add(c * out_stride);
+                _mm512_storeu_si512(dst as *mut __m512i, t_lo);
+                _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
+            }
+        } else {
+            let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+            let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+            #[repr(C, align(64))]
+            struct BIdx4([u8; 64]);
+            static BIDX4: BIdx4 = {
+                let mut t = [0u8; 64];
+                let mut i = 0;
+                while i < 64 {
+                    t[i] = ((7 - i % 8) * 8 + i / 8) as u8;
+                    i += 1;
+                }
+                BIdx4(t)
+            };
+            let bidx = _mm512_load_si512(BIDX4.0.as_ptr() as *const __m512i);
+            for c in 0..4 {
+                let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
+                let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
+                let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    ident,
+                    _mm512_permutexvar_epi8(bidx, zlo),
+                );
+                let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    ident,
+                    _mm512_permutexvar_epi8(bidx, zhi),
+                );
+                let dst = out.add(c * out_stride);
+                _mm512_storeu_si512(dst as *mut __m512i, t_lo);
+                _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
+            }
         }
     }
 }
