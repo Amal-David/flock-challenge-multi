@@ -507,7 +507,14 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
+    // Four, not eight. The producer and its paired consumer are pinned to
+    // the two SMT threads of one physical core and share that core's 2 MiB
+    // L2, so this depth is exactly how much finished codeword sits between
+    // them competing with the butterfly worker's own working set. Eight was
+    // chosen to cover the fused tail's production burst; on an instance whose
+    // rate is set by memory rather than by the vector units, covering the
+    // burst is worth less than keeping the handoff resident.
+    const DEFAULT_DEPTH: usize = 4;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
@@ -3802,7 +3809,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deep_split_depth_default_override_and_clamp() {
-        assert_eq!(select_deep_split_depth(None), 8);
+        assert_eq!(select_deep_split_depth(None), DeepQueue::DEFAULT_DEPTH);
         assert_eq!(select_deep_split_depth(Some(0)), 1);
         assert_eq!(select_deep_split_depth(Some(1)), 1);
         assert_eq!(select_deep_split_depth(Some(7)), 7);
