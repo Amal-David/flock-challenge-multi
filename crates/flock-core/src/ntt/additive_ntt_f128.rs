@@ -593,6 +593,71 @@ fn deep_pf_hint() -> u8 {
     *H
 }
 
+/// Static producer-assist table for the sibling-paired deep pass (see the
+/// enqueue closure at the paired-split call site): entry `j` says whether a
+/// producer hashes its own `j`-th retired block of a sub-group instead of
+/// handing it to the SMT-sibling consumer.
+///
+/// Why: at the ranked shape the eight leaf-hash consumers are the phase
+/// bottleneck (~32 µs per 128 KiB block vs ~12 µs of butterfly production),
+/// so producers idle-spin on full queues for most of the deep pass. The
+/// assist moves a FIXED, owner-computed subset of the hash work onto those
+/// otherwise-idle producers. It is race-free by construction — no claim
+/// board, no counters, no cross-worker handoff beyond the incumbent SPSC
+/// ring: each producer touches only blocks it produced itself (it wrote
+/// their codeword bytes), writes leaves by index into disjoint tree slices,
+/// and never assists on a sub-group's FINAL block, which must ride the ring
+/// so the commit callback's parent-fold trigger fires exactly once, on the
+/// consumer, exactly as in the incumbent schedule. The consumer's Acquire on
+/// the final block's publish orders every earlier producer store (including
+/// assisted leaf writes) before its fold reads them.
+///
+/// Default: 5 of 16 blocks (`j % 3 == 2` → 2, 5, 8, 11, 14), matching the
+/// measured produce:hash cost ratio (~12:32 µs) at the ranked geometry.
+/// `FLOCK_NTT_DEEP_ASSIST_FRAC=k` takes the first k entries of a fixed
+/// spread order instead (0 = incumbent; diagnostics). Read once per process.
+/// `FLOCK_NO_DEEP_STATIC_ASSIST=1` restores the all-enqueue schedule in the
+/// same binary.
+#[cfg(target_os = "linux")]
+fn deep_static_assist() -> &'static [bool; 16] {
+    #[cfg(test)]
+    if DEEP_ASSIST_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return &[false; 16];
+    }
+    static A: std::sync::LazyLock<[bool; 16]> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_DEEP_STATIC_ASSIST").is_some() {
+            return [false; 16];
+        }
+        let frac = std::env::var("FLOCK_NTT_DEEP_ASSIST_FRAC")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5)
+            .min(15);
+        // Fixed spread order over the non-final ordinals: widest spacing
+        // first, so every prefix of the order is spread across the sub-group
+        // and the final block (15) is never eligible.
+        const ORDER: [usize; 15] = [2, 5, 8, 11, 14, 1, 4, 7, 10, 13, 3, 6, 9, 12, 0];
+        let mut t = [false; 16];
+        for &j in ORDER.iter().take(frac) {
+            t[j] = true;
+        }
+        t
+    });
+    &A
+}
+
+/// Test-only latch forcing the assist off (see [`deep_static_assist`] and
+/// [`DEEP_ASSIST_TEST_HITS`]); same one-process A/B pattern as
+/// [`KERNEL_DIET_TEST_OFF`].
+#[cfg(all(target_os = "linux", test))]
+static DEEP_ASSIST_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only counter of producer-assisted block hashes (engagement check).
+#[cfg(all(target_os = "linux", test))]
+static DEEP_ASSIST_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Test-only latch forcing the generic (un-shaped) row-kernel dispatch, so a
 /// test can compare the shaped and generic forms in one process (the same
 /// pattern as [`KERNEL_DIET_TEST_OFF`]).
@@ -2899,7 +2964,38 @@ impl AdditiveNttF128 {
                         };
                         affinity::pin(cpu);
                         if producer {
+                            // Static assist table (see `deep_static_assist`):
+                            // which of a sub-group's block ordinals a producer
+                            // hashes itself. Plain reads, no coordination —
+                            // the decision depends only on this producer's own
+                            // callback range.
+                            let assist = deep_static_assist();
                             let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
+                                // Assist arm: hash THIS producer's own retired
+                                // block right here when its ordinal is one of
+                                // the precomputed assist slots AND it is not
+                                // the sub-group's final block (that one must
+                                // ride the ring so the commit callback's
+                                // parent-fold trigger fires exactly once, on
+                                // the consumer, exactly as in the incumbent
+                                // schedule). SAFETY: this thread produced the
+                                // block (its codeword writes are complete and
+                                // ordered before any later ring publish), and
+                                // `cb` writes leaves by index into the
+                                // sub-range owned by this block — disjoint
+                                // from every other worker's slice.
+                                if range.len() < sub_size_positions
+                                    && range.end % sub_size_positions != 0
+                                    && range.start.is_multiple_of(range.len())
+                                {
+                                    let j = (range.start % sub_size_positions) / range.len();
+                                    if j < assist.len() && assist[j] {
+                                        #[cfg(test)]
+                                        DEEP_ASSIST_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+                                        cb(range, blk);
+                                        return;
+                                    }
+                                }
                                 let b = DeepBlock {
                                     ptr: blk.as_ptr() as usize,
                                     len_f128: blk.len(),
@@ -3864,6 +3960,147 @@ mod tests {
         }
         assert_eq!(queue.head.load(Ordering::Relaxed), N);
         assert_eq!(queue.tail.load(Ordering::Relaxed), N);
+    }
+
+    /// RAII for [`DEEP_ASSIST_TEST_OFF`].
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    struct AssistOffGuard(bool);
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    impl AssistOffGuard {
+        fn new(off: bool) -> Self {
+            DEEP_ASSIST_TEST_OFF.store(off, std::sync::atomic::Ordering::Relaxed);
+            Self(off)
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    impl Drop for AssistOffGuard {
+        fn drop(&mut self) {
+            DEEP_ASSIST_TEST_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The sibling-paired deep pass with the static producer assist must
+    /// produce byte-identical codewords AND Merkle trees to the unsplit
+    /// schedule: a producer hashes only blocks IT retired (its own codeword
+    /// writes are complete), never a sub-group's final block (that one rides
+    /// the ring so the consumer-side parent-fold trigger fires exactly once),
+    /// and leaves are written by index into disjoint slices — so any
+    /// owner assignment yields the same bytes. Both arms run in one process
+    /// against one unsplit oracle: assist ON must engage (counter advances),
+    /// assist OFF is the incumbent parity arm.
+    ///
+    /// Geometry log_d=18 / num_ntts=64 gives `big` (n_total = 2^24) with
+    /// `fuse_blocks` (forced under cfg(test)); sixteen 128-leaf blocks per
+    /// sub-group make the default table ({2,5,8,11,14}) fire deterministically.
+    /// Like the ranked worker, the encodes run on a PLAIN thread whose
+    /// ambient global rayon pool covers exact SMT sibling pairs (`install`
+    /// would run them on a worker and the split's non-worker gate would
+    /// correctly decline); skips when the host has no pairable pool.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn deep_split_static_assist_matches_unsplit_encode_and_tree() {
+        use crate::merkle::{self, HashKind};
+        use std::sync::atomic::Ordering;
+
+        let log_d = 18usize;
+        let num_ntts = 64usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x57EA2);
+        let codeword_len = (1usize << log_d) * num_ntts;
+        let msg_len = codeword_len >> 1;
+        let msg = rand_vec(&mut rng, msg_len);
+        // One leaf per codeword POSITION (rate-1/2: positions = 2^log_d).
+        let n_leaves = 1usize << log_d;
+        let leaf_size = num_ntts * core::mem::size_of::<F128>();
+        let kind = HashKind::Blake3;
+
+        // Best-effort size the ambient pool to 16 logical CPUs before its
+        // first use; a no-op if another test initialized rayon first (the
+        // pairs check below then decides).
+        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+            // SAFETY: single-threaded test setup, before any rayon use; the
+            // env var has no other readers in this process at this point.
+            unsafe { std::env::set_var("RAYON_NUM_THREADS", "16") };
+        }
+        let msg = std::sync::Arc::new(msg);
+        let handle = {
+            let msg = std::sync::Arc::clone(&msg);
+            std::thread::spawn(move || {
+                // Plain thread: current_thread_index() is None here, exactly
+                // like the ranked worker's commit call site.
+                if deep_split_pairs().is_none() {
+                    return false;
+                }
+                let mut reference = junk_vec(codeword_len);
+                ntt.rs_encode_interleaved(&msg, &mut reference, num_ntts);
+                let ref_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        reference.as_ptr() as *const u8,
+                        reference.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                let ref_tree = merkle::merkle_tree(ref_bytes, n_leaves, kind);
+
+                let run_arm = |assist_on: bool| -> (Vec<F128>, Vec<merkle::Hash>, usize) {
+                    let _off = AssistOffGuard::new(!assist_on);
+                    let hits_before = DEEP_ASSIST_TEST_HITS.load(Ordering::Relaxed);
+                    let mut candidate = junk_vec(codeword_len);
+                    let mut tree: Vec<merkle::Hash> = vec![[0u8; 32]; 2 * n_leaves - 1];
+                    let tree_addr = tree.as_mut_ptr() as usize;
+                    ntt.rs_encode_interleaved_on_range_done(
+                        &msg,
+                        &mut candidate,
+                        num_ntts,
+                        &|range: core::ops::Range<usize>, sub_data: &[F128]| {
+                            let bytes: &[u8] = unsafe {
+                                core::slice::from_raw_parts(
+                                    sub_data.as_ptr() as *const u8,
+                                    sub_data.len() * core::mem::size_of::<F128>(),
+                                )
+                            };
+                            // SAFETY: disjoint per-block leaf ranges of
+                            // `tree`, owned by whoever runs the callback.
+                            let out = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (tree_addr as *mut merkle::Hash).add(range.start),
+                                    range.len(),
+                                )
+                            };
+                            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+                        },
+                    );
+                    // The streamed callback writes LEAVES only; fold the
+                    // parent levels exactly like finalize_commit does.
+                    crate::pcs::commit::build_upper_levels(&mut tree, n_leaves, n_leaves, kind);
+                    (
+                        candidate,
+                        tree,
+                        DEEP_ASSIST_TEST_HITS.load(Ordering::Relaxed) - hits_before,
+                    )
+                };
+
+                let (cand_on, tree_on, hits) = run_arm(true);
+                assert!(hits > 0, "static producer assist never engaged");
+                let (cand_off, tree_off, _) = run_arm(false);
+                assert_eq!(
+                    cand_on, reference,
+                    "assist-split codeword != unsplit oracle"
+                );
+                assert_eq!(tree_on, ref_tree, "assist-split streamed tree != oracle");
+                assert_eq!(
+                    cand_off, reference,
+                    "incumbent-split codeword != unsplit oracle"
+                );
+                assert_eq!(tree_off, ref_tree, "incumbent-split streamed tree != oracle");
+                eprintln!("deep-split static assist: engaged_blocks={hits}");
+                true
+            })
+        };
+        if !handle.join().unwrap() {
+            eprintln!("deep-split static assist: skipped (no SMT-pairable global pool)");
+        }
     }
 
     struct Rng(u64);
