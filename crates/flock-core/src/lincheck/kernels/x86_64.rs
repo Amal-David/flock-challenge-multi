@@ -604,6 +604,25 @@ pub(crate) fn build_nibble_tables(eq8: &[F128; 8], out: &mut NibbleTables) {
     }
 }
 
+/// Ranked default splits the 128-column fold into two 64-column half-passes so
+/// only 16 SoA accumulators are live at once (8 lo + 8 hi) instead of 32, halving
+/// register pressure in the AVX-512 kernel (32 acc + 8 table ZMMs exceed the
+/// 32-register architectural file and force stack spills every stripe). Algebra
+/// identical: per-group stripe order is unchanged, table loads are L1-resident.
+/// `FLOCK_NO_LINCHECK_HALFCHUNK=1` restores the incumbent single-pass form for
+/// local A/B; the ranked worker's cleared env never sets it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(crate) fn lincheck_halfchunk_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LINCHECK_HALFCHUNK").is_none()
+    });
+    *ON
+}
+
 /// AVX-512 accumulate for one (full 8-stripe tile, 128-column chunk):
 /// `partial[b] += Σ_t T_t[transposed[t*128 + b]]` for `b < chunk_bits`.
 ///
@@ -632,7 +651,99 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
     debug_assert_eq!(nib.len(), STRIPES);
     debug_assert!(chunk_bits <= 128 && partial.len() >= chunk_bits);
     let n_groups = chunk_bits.div_ceil(8);
-    // SoA accumulators for the 128 columns: [lo qwords; 16 groups][hi; 16].
+
+    // Ranked default: two 64-column half-passes, each with a 16-ZMM SoA acc
+    // (8 lo groups + 8 hi groups). The incumbent single pass needs 32 ZMMs of
+    // accumulators across the whole stripe loop plus the 8 per-stripe table
+    // ZMMs, which exceeds the 32-register AVX-512 file and spills every
+    // stripe. The half-chunk pass keeps 16 acc + 8 tables + working set
+    // within the architectural file. Same per-group stripe order, so the
+    // XOR accumulation is bit-identical; table loads repeat per pass but are
+    // 512 B per stripe, L1-resident.
+    if lincheck_halfchunk_enabled() {
+        let pass_groups = n_groups.div_ceil(2);
+        for pass in 0..2usize {
+            let g0 = pass * pass_groups;
+            let g1 = n_groups.min(g0 + pass_groups);
+            if g0 >= g1 {
+                break;
+            }
+            let mut acc = [_mm512_setzero_si512(); 16];
+            unsafe {
+                let nib_mask = _mm512_set1_epi64(0xF);
+                for t in 0..STRIPES {
+                    let tp = nib.as_ptr().add(t) as *const u64;
+                    let tl_lo0 = _mm512_loadu_si512(tp as *const __m512i);
+                    let tl_lo1 = _mm512_loadu_si512(tp.add(8) as *const __m512i);
+                    let tl_hi0 = _mm512_loadu_si512(tp.add(16) as *const __m512i);
+                    let tl_hi1 = _mm512_loadu_si512(tp.add(24) as *const __m512i);
+                    let th_lo0 = _mm512_loadu_si512(tp.add(32) as *const __m512i);
+                    let th_lo1 = _mm512_loadu_si512(tp.add(40) as *const __m512i);
+                    let th_hi0 = _mm512_loadu_si512(tp.add(48) as *const __m512i);
+                    let th_hi1 = _mm512_loadu_si512(tp.add(56) as *const __m512i);
+                    let row = transposed.as_ptr().add(t * 128);
+                    for g in g0..g1 {
+                        let gi = g - g0;
+                        let idx8 = _mm_loadl_epi64(row.add(g * 8) as *const __m128i);
+                        let idx = _mm512_cvtepu8_epi64(idx8);
+                        let n0 = _mm512_and_si512(idx, nib_mask);
+                        let n1 = _mm512_srli_epi64::<4>(idx);
+                        let lo = _mm512_xor_si512(
+                            _mm512_permutex2var_epi64(tl_lo0, n0, tl_lo1),
+                            _mm512_permutex2var_epi64(th_lo0, n1, th_lo1),
+                        );
+                        let hi = _mm512_xor_si512(
+                            _mm512_permutex2var_epi64(tl_hi0, n0, tl_hi1),
+                            _mm512_permutex2var_epi64(th_hi0, n1, th_hi1),
+                        );
+                        acc[gi] = _mm512_xor_si512(acc[gi], lo);
+                        acc[8 + gi] = _mm512_xor_si512(acc[8 + gi], hi);
+                    }
+                }
+                // Interleave SoA → AoS and XOR into `partial` (F128 = lo || hi LE).
+                let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+                let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+                let base = partial.as_mut_ptr() as *mut u64;
+                for gi in 0..(g1 - g0) {
+                    let g = g0 + gi;
+                    let aos0 = _mm512_permutex2var_epi64(acc[gi], idx0, acc[8 + gi]);
+                    let aos1 = _mm512_permutex2var_epi64(acc[gi], idx1, acc[8 + gi]);
+                    let cols = (chunk_bits - g * 8).min(8);
+                    let p = base.add(g * 16);
+                    if cols == 8 {
+                        let p0 = p as *mut __m512i;
+                        let p1 = p.add(8) as *mut __m512i;
+                        _mm512_storeu_si512(p0, _mm512_xor_si512(_mm512_loadu_si512(p0), aos0));
+                        _mm512_storeu_si512(p1, _mm512_xor_si512(_mm512_loadu_si512(p1), aos1));
+                    } else {
+                        // Tail group: 2 qwords per column; aos0 covers columns 0..4,
+                        // aos1 columns 4..8 of this group.
+                        let q = 2 * cols; // qwords to touch
+                        let m0: __mmask8 = if q >= 8 {
+                            0xFF
+                        } else {
+                            ((1u16 << q) - 1) as u8
+                        };
+                        let m1: __mmask8 = if q <= 8 {
+                            0
+                        } else {
+                            ((1u16 << (q - 8)) - 1) as u8
+                        };
+                        let pi = p as *mut i64;
+                        let v0 = _mm512_maskz_loadu_epi64(m0, pi);
+                        _mm512_mask_storeu_epi64(pi, m0, _mm512_xor_si512(v0, aos0));
+                        if m1 != 0 {
+                            let v1 = _mm512_maskz_loadu_epi64(m1, pi.add(8));
+                            _mm512_mask_storeu_epi64(pi.add(8), m1, _mm512_xor_si512(v1, aos1));
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Incumbent single-pass form (kill-switch path).
     let mut acc = [_mm512_setzero_si512(); 32];
     unsafe {
         let nib_mask = _mm512_set1_epi64(0xF);
