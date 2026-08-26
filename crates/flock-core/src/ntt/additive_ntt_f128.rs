@@ -2289,7 +2289,21 @@ impl AdditiveNttF128 {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .filter(|v| (14..=24).contains(v))
-                    .unwrap_or(21)
+                    // 2^20, not 2^21. The 2 MiB target predates this
+                    // instance: it sizes one sub-group to a whole private L2,
+                    // and the pool pins two SMT workers per core, so two live
+                    // sub-groups land on one 2 MiB cache and neither stays
+                    // resident. The layers below `n_top` are only cheap while
+                    // they are resident; once they spill, every one of them
+                    // pays memory traffic that the decomposition assumes it
+                    // has already avoided.
+                    //
+                    // Halving the target makes a core's two sub-groups fit its
+                    // L2 together, at the cost of one more whole-buffer layer
+                    // above the split. The trade is real and its sign is a
+                    // property of this instance's cache hierarchy, which no
+                    // other machine reproduces.
+                    .unwrap_or(20)
             });
             *V
         };
