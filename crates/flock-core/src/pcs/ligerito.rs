@@ -4215,7 +4215,7 @@ fn fold_and_msg_lsb(
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    fold_and_msg_lsb_inner(f, b, r, arena, None)
+    fold_and_msg_lsb_inner(f, b, r, arena, None, &[])
 }
 
 /// Core fold with an optional retained equality correction. The correction is
@@ -4229,6 +4229,7 @@ fn fold_and_msg_lsb_inner(
     r: F128,
     arena: Option<&mut FoldArena>,
     lazy_ood: Option<(&[F128], &[F128], F128)>,
+    glues: &[(Vec<F128>, F128)],
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
@@ -4251,7 +4252,13 @@ fn fold_and_msg_lsb_inner(
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
             nf.push(f0 + r * (f0 + f1));
-            nb.push(b0 + r * (b0 + b1));
+            let mut val_b = b0 + r * (b0 + b1);
+            for (g_b, g_alpha) in glues {
+                let g0 = g_b[2 * j];
+                let g1 = g_b[2 * j + 1];
+                val_b += *g_alpha * (g0 + r * (g0 + g1));
+            }
+            nb.push(val_b);
         }
         if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
             for (j, value) in nb.iter_mut().enumerate() {
@@ -4297,7 +4304,8 @@ fn fold_and_msg_lsb_inner(
     // local-diagnostics kill switch; the ranked worker's cleared environment
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_nt = lazy_ood.is_none()
+    let use_nt = glues.is_empty()
+        && lazy_ood.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
@@ -4309,7 +4317,8 @@ fn fold_and_msg_lsb_inner(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let use_nt = lazy_ood.is_none()
+    let use_nt = glues.is_empty()
+        && lazy_ood.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
@@ -4319,7 +4328,7 @@ fn fold_and_msg_lsb_inner(
     // (statically true under `-C target-cpu=native` on every Apple Silicon
     // target this ships to; other builds keep the previous leaf).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa = lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
+    let use_soa = glues.is_empty() && lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
         static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
         });
@@ -4413,6 +4422,14 @@ fn fold_and_msg_lsb_inner(
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            for (g_b, g_alpha) in glues {
+                let alpha = *g_alpha;
+                for j in 0..len {
+                    let g0 = g_b[2 * (base + j)];
+                    let g1 = g_b[2 * (base + j) + 1];
+                    bc[j] += alpha * (g0 + r * (g0 + g1));
+                }
+            }
             if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
                 let scale = gamma * eq_hi[ci];
                 crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
@@ -6129,6 +6146,7 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    queued_glues: Vec<(Vec<F128>, F128)>,
     /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
     /// next fold consumes its glued correction.
     pending_ood_eq: Option<PendingOodEq>,
@@ -6144,6 +6162,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
@@ -6181,6 +6200,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
@@ -6202,6 +6222,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6221,6 +6242,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6240,6 +6262,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6249,6 +6272,7 @@ impl SumcheckProver {
         // message in one parallel pass (was three passes). See
         // [`fold_and_msg_lsb`].
         assert!(self.pending_glue.is_none(), "fold before ordinary glue");
+        let glues = std::mem::take(&mut self.queued_glues);
         let pending_ood = self.pending_ood_eq.take();
         let (nf, nb, msg) = match pending_ood {
             Some(PendingOodEq::Glued {
@@ -6266,16 +6290,19 @@ impl SumcheckProver {
                     r,
                     self.fold_arena.as_mut(),
                     Some((&eq_lo, &eq_hi, gamma)),
+                    &glues,
                 )
             }
             Some(PendingOodEq::Introduced { .. }) => {
                 panic!("fold before factorized OOD glue")
             }
-            None => fold_and_msg_lsb(
+            None => fold_and_msg_lsb_inner(
                 &self.f,
                 &self.combined_basis,
                 r,
                 self.fold_arena.as_mut(),
+                None,
+                &glues,
             ),
         };
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
@@ -6386,14 +6413,8 @@ impl SumcheckProver {
         });
     }
 
-    /// Combine the introduced basis into `combined_basis` with separation α.
-    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
-    pub fn glue(&mut self, alpha: F128) {
+    fn eager_glue_apply(&mut self, b_new: &[F128], alpha: F128) {
         use rayon::prelude::*;
-        let (b_new, h_new) = self
-            .pending_glue
-            .take()
-            .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -6407,7 +6428,7 @@ impl SumcheckProver {
                 let acc: &mut [F128] = &mut self.combined_basis;
                 if acc.len() < PAR_THRESHOLD {
                     // SAFETY: features cfg-guaranteed; equal lengths.
-                    unsafe { glue_block_x4(acc, &b_new, alpha) };
+                    unsafe { glue_block_x4(acc, b_new, alpha) };
                 } else {
                     acc.par_chunks_mut(CHUNK)
                         .zip(b_new.par_chunks(CHUNK))
@@ -6428,7 +6449,21 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
+    }
+
+    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    pub fn glue(&mut self, alpha: F128) {
+        let (b_new, h_new) = self
+            .pending_glue
+            .take()
+            .expect("glue without introduce_new");
         self.t_r += alpha * h_new;
+        if std::env::var_os("FLOCK_NO_DEFERRED_GLUE").is_some() {
+            self.eager_glue_apply(&b_new, alpha);
+        } else {
+            self.queued_glues.push((b_new, alpha));
+        }
     }
 
     pub fn f(&self) -> &[F128] {
@@ -10952,7 +10987,7 @@ mod tests {
         assert_eq!(eq_lo.len(), 2048);
         let gamma = beta * (F128::ONE + z[0] + r);
         let (got_f, got_b, got_msg) =
-            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
         assert_eq!(&*got_f, &*want_f);
         assert_eq!(&*got_b, &*want_b);
         assert_eq!(got_msg, want_msg);
@@ -11076,7 +11111,7 @@ mod tests {
             let mut eq_hi = build_eq_table(&z[1 + split..]);
             let gamma = beta * (F128::ONE + z[0] + r);
             let (got_f, got_b, got_msg) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
             assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
             assert_eq!(got_msg, want_msg, "next-round message d={d}");
@@ -11084,7 +11119,7 @@ mod tests {
             // Negative control: one corrupted high weight must not still match.
             eq_hi[0] += F128::ONE;
             let (_, bad_b, _) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
         }
     }
