@@ -137,9 +137,7 @@ pub(super) unsafe fn butterfly_fused_2layer(
     t_inner_b: F128,
 ) {
     // SAFETY: forwarded caller contract.
-    unsafe {
-        butterfly_fused_2layer_gen::<false, false>(a, b, c, d, t_outer, t_inner_a, t_inner_b)
-    }
+    unsafe { butterfly_fused_2layer_gen::<false, false>(a, b, c, d, t_outer, t_inner_a, t_inner_b) }
 }
 
 /// # Safety
@@ -304,12 +302,7 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
     // multiply selection exactly; it remains outside the lane loop.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_publish_nt_impl::<
-                OUTER_LOW,
-                INNER_LOW,
-                false,
-                ALIGNED_ZMM,
-            >(
+            butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, false, ALIGNED_ZMM>(
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
             )
         } else {
@@ -419,9 +412,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
 ) {
     // SAFETY: forwarded caller contract; identical geometry on both sides.
     unsafe {
-        butterfly_fused_2layer_row_from_geo(
-            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
-        )
+        butterfly_fused_2layer_row_from_geo(src, quarter, r, dst, quarter, r, num_ntts, twiddles)
     }
 }
 
@@ -447,11 +438,25 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     unsafe {
         if mul_diet_disabled() {
             butterfly_fused_2layer_row_from_geo_impl::<false>(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                src,
+                src_quarter,
+                src_r,
+                dst,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                twiddles,
             )
         } else {
             butterfly_fused_2layer_row_from_geo_impl::<true>(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                src,
+                src_quarter,
+                src_r,
+                dst,
+                dst_quarter,
+                dst_r,
+                num_ntts,
+                twiddles,
             )
         }
     }
@@ -1195,16 +1200,28 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     unsafe {
         match (mul_diet_disabled(), low_inner) {
             (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
-                ptr, num_ntts, dense_lanes, twiddles,
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
             ),
             (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
-                ptr, num_ntts, dense_lanes, twiddles,
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
             ),
             (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
-                ptr, num_ntts, dense_lanes, twiddles,
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
             ),
             (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
-                ptr, num_ntts, dense_lanes, twiddles,
+                ptr,
+                num_ntts,
+                dense_lanes,
+                twiddles,
             ),
         }
     }
@@ -1229,18 +1246,18 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     // substitutes an equal runtime value in the same impl body.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
-            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN>(
-                ptr, NN, dense_lanes, twiddles,
-            ),
-            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN>(
-                ptr, NN, dense_lanes, twiddles,
-            ),
-            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN>(
-                ptr, NN, dense_lanes, twiddles,
-            ),
-            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, NN>(
-                ptr, NN, dense_lanes, twiddles,
-            ),
+            (true, false) => {
+                butterfly_fused_3layer_rows_impl::<false, false, NN>(ptr, NN, dense_lanes, twiddles)
+            }
+            (true, true) => {
+                butterfly_fused_3layer_rows_impl::<false, true, NN>(ptr, NN, dense_lanes, twiddles)
+            }
+            (false, false) => {
+                butterfly_fused_3layer_rows_impl::<true, false, NN>(ptr, NN, dense_lanes, twiddles)
+            }
+            (false, true) => {
+                butterfly_fused_3layer_rows_impl::<true, true, NN>(ptr, NN, dense_lanes, twiddles)
+            }
         }
     }
 }
@@ -1441,7 +1458,10 @@ mod diet_tests {
         const INNER_LOW: bool,
         const DIET: bool,
         const ALIGNED_ZMM: bool,
-    >(lanes: usize, residue: usize) {
+    >(
+        lanes: usize,
+        residue: usize,
+    ) {
         use core::arch::x86_64::_mm_sfence;
 
         let seed = 0xD1EC_7000
@@ -1520,12 +1540,7 @@ mod diet_tests {
         // 16-byte aligned and cover 64 elements, and the two allocations do not
         // overlap. The task-level production caller owns the same sfence.
         unsafe {
-            butterfly_fused_2layer_publish_nt_impl::<
-                OUTER_LOW,
-                INNER_LOW,
-                DIET,
-                ALIGNED_ZMM,
-            >(
+            butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, DIET, ALIGNED_ZMM>(
                 src.as_ptr(),
                 64,
                 dst_a,
@@ -1617,7 +1632,10 @@ mod diet_tests {
                     *value = want[i * num_ntts + lane];
                 }
                 if lane < dense_lanes {
-                    crate::ntt::additive_ntt_f128::kernels::portable::butterfly_fused_3layer(&mut values, &twiddles);
+                    crate::ntt::additive_ntt_f128::kernels::portable::butterfly_fused_3layer(
+                        &mut values,
+                        &twiddles,
+                    );
                 } else {
                     crate::ntt::additive_ntt_f128::kernels::portable::butterfly_fused_3layer_zero_odd(&mut values, &twiddles);
                 }
@@ -1635,16 +1653,28 @@ mod diet_tests {
                 unsafe {
                     match (diet, low) {
                         (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                            got.as_mut_ptr(),
+                            num_ntts,
+                            dense_lanes,
+                            &twiddles,
                         ),
                         (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                            got.as_mut_ptr(),
+                            num_ntts,
+                            dense_lanes,
+                            &twiddles,
                         ),
                         (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                            got.as_mut_ptr(),
+                            num_ntts,
+                            dense_lanes,
+                            &twiddles,
                         ),
                         (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
-                            got.as_mut_ptr(), num_ntts, dense_lanes, &twiddles,
+                            got.as_mut_ptr(),
+                            num_ntts,
+                            dense_lanes,
+                            &twiddles,
                         ),
                     }
                 }
@@ -1810,8 +1840,7 @@ mod diet_tests {
 
             // --- fused two-layer, in place --------------------------------
             let (t_outer, t_a, t_b) = (next(), next(), next());
-            let rows: Vec<Vec<F128>> =
-                (0..4).map(|_| (0..len).map(|_| next()).collect()).collect();
+            let rows: Vec<Vec<F128>> = (0..4).map(|_| (0..len).map(|_| next()).collect()).collect();
             let run_fused2 = |diet: bool| {
                 let mut r = rows.clone();
                 let (a, rest) = r.split_at_mut(1);

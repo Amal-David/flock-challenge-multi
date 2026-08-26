@@ -1,0 +1,24 @@
+--- crates/flock-core/src/pcs.rs
++++ crates/flock-core/src/pcs.rs
+@@ -598,7 +598,6 @@
+ /// The returned lookaheads are respectively uni-, bi-, tri-, quadri-, and
+ /// quintivariate quadratics in the already-sampled challenges.
+-#[cfg(any())]
+ pub(crate) fn messages_from_direct_products_fold8(
+     factors: &[ring_switch::DirectFold8Factors],
+ ) -> (
+@@ -611,7 +610,13 @@
+ ) {
+     let mut h = [F128::ZERO; 4096];
+     for claim in factors {
+-        for (out, value) in h.iter_mut().zip(claim.products) {
+-            *out += value;
++        let n = claim.a_state.len() / 64;
++        for e in 0..64 {
++            let a_e = &claim.a_state[e * n..(e + 1) * n];
++            for d in 0..64 {
++                let w_d = &claim.w_state[d * n..(d + 1) * n];
++                h[e * 64 + d] += ring_switch::inner_product(a_e, w_d);
++            }
+         }
+     }
