@@ -346,7 +346,15 @@ fn deep_block_fuse_enabled() -> bool {
 #[cfg(target_os = "linux")]
 fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
     static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_DEEP_SPLIT").is_some() {
+        // Ablation: the pairing is withheld, so the deep pass runs its
+        // alternating schedule -- every worker doing its own butterflies and
+        // then its own leaf hashing -- instead of one butterfly worker per
+        // physical core handing finished blocks to a hash worker on that
+        // core's SMT sibling. Leaves are written by index, so the leaf order
+        // is unchanged either way. The ranked environment is cleared, so the
+        // kill switch below can never be set there and the mechanism cannot
+        // be sampled through it.
+        if true || std::env::var_os("FLOCK_NO_NTT_DEEP_SPLIT").is_some() {
             return None;
         }
         let n = rayon::current_num_threads();
