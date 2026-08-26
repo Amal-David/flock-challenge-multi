@@ -80,6 +80,57 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Exact same-binary rollback for sharing the parity-weight inverse between
+/// `kappa = (1 + r) / r` and the deferred-lookahead rescale. Only the literal
+/// value `1` restores the incumbent two independent `F128::inv` calls.
+pub const ENV_NO_ZC_DUP_INV_ELIDE: &str = "FLOCK_NO_ZC_DUP_INV_ELIDE";
+
+#[inline]
+fn dup_inv_elide_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Thread-local so exact tests can exercise both arms without mutating the
+    /// process environment or racing unrelated tests. The selector is resolved
+    /// before any Rayon work is launched.
+    static DUP_INV_ELIDE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn dup_inv_elide_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = DUP_INV_ELIDE_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !dup_inv_elide_disabled_value(std::env::var_os(ENV_NO_ZC_DUP_INV_ELIDE).as_deref())
+    });
+    *ON
+}
+
+/// Cold incumbent arm. Keeping it out of line leaves one inversion loop in
+/// each ranked caller while the kill switch still executes the original two
+/// independent inversions in the same binary.
+#[cold]
+#[inline(never)]
+fn duplicate_lookahead_inv_factors(r: F128) -> (F128, F128) {
+    ((F128::ONE + r) * r.inv(), r.inv())
+}
+
+#[inline(always)]
+fn lookahead_inv_factors(r: F128) -> (F128, F128) {
+    if dup_inv_elide_enabled() {
+        let r_inv = r.inv();
+        ((F128::ONE + r) * r_inv, r_inv)
+    } else {
+        duplicate_lookahead_inv_factors(r)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GFNI prefold dead-line plan (x86 round-2 / cascade-L1 batch folds).
 // ---------------------------------------------------------------------------
@@ -1355,8 +1406,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
     assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
-    let kappa = (F128::ONE + r1) * r1.inv();
-    let r1_inv = r1.inv();
+    let (kappa, r1_inv) = lookahead_inv_factors(r1);
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
@@ -1574,8 +1624,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
-    let r_inv = r.inv();
+    let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
@@ -2505,8 +2554,7 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
-    let r_inv = r.inv();
+    let (kappa, r_inv) = lookahead_inv_factors(r);
 
     let chunk_in = 8 * lo_size;
     let chunk_out = 2 * lo_size;
@@ -4345,6 +4393,125 @@ mod tests {
             assert_eq!((m4_ref, mi4_ref), (m4_nm, mi4_nm), "round-4 msg m={m} padded={padded}");
             assert_eq!(la5_ref, la5_nm, "round-5 coeffs m={m} padded={padded}");
         }
+    }
+
+    #[test]
+    fn duplicate_inv_elide_kill_switch_parser() {
+        use std::ffi::OsStr;
+
+        assert!(dup_inv_elide_disabled_value(Some(OsStr::new("1"))));
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("01")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(!dup_inv_elide_disabled_value(value));
+        }
+    }
+
+    /// Exercise the incumbent two-inversion arm and the shared-inverse arm on
+    /// each production-ranked caller: no-materialize round two, packed level
+    /// zero, and the plain cascade. Every table, message and lookahead
+    /// coefficient must remain byte-for-byte identical.
+    #[test]
+    fn duplicate_inv_elide_plain_packed_nomat_exact_oracle() {
+        const K_SKIP: usize = 6;
+        let m = 16usize;
+        let mut rng = Rng::new(0xD09_1A5E);
+        let (a_packed, b_packed, padding) = lookahead_witness(&mut rng, m, true);
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let mut mlv = rng.f128_vec(m - K_SKIP);
+        mlv[0] = F128::ONE;
+        if mlv[1] == F128::ZERO {
+            mlv[1] = F128::ONE;
+        }
+
+        // Materialize once only to supply the plain cascade's honest input;
+        // this fallback-only producer deliberately retains its two inversions.
+        let (a2, b2, _, _, _) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+            &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+        );
+        let n = 1usize << (m - K_SKIP);
+        let rho1 = rng.f128();
+        let rho2 = rng.f128();
+        let mut r_next4 = vec![F128::ONE; m - K_SKIP - 2];
+        r_next4[1..].copy_from_slice(&mlv[3..]);
+        if r_next4[1] == F128::ZERO {
+            r_next4[1] = F128::ONE;
+        }
+
+        DUP_INV_ELIDE_TEST_OVERRIDE.with(|slot| slot.set(Some(false)));
+        let nomat_incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded(
+            &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+        );
+        let mut packed_a_incumbent = vec![F128::ZERO; n / 4];
+        let mut packed_b_incumbent = vec![F128::ZERO; n / 4];
+        let packed_incumbent = fold2_from_packed_and_round_pair_lookahead_into(
+            &a_packed,
+            &b_packed,
+            m,
+            K_SKIP,
+            &table,
+            &padding,
+            &mut packed_a_incumbent,
+            &mut packed_b_incumbent,
+            rho1,
+            rho2,
+            &r_next4,
+        );
+        let mut plain_a_incumbent = vec![F128::ZERO; n / 4];
+        let mut plain_b_incumbent = vec![F128::ZERO; n / 4];
+        let plain_incumbent = fold2_plain_and_round_pair_lookahead_into(
+            &a2,
+            &b2,
+            &mut plain_a_incumbent,
+            &mut plain_b_incumbent,
+            rho1,
+            rho2,
+            &r_next4,
+        );
+
+        DUP_INV_ELIDE_TEST_OVERRIDE.with(|slot| slot.set(Some(true)));
+        let nomat_shared = uni_skip_round_pair_lookahead_nomat_packed_padded(
+            &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+        );
+        let mut packed_a_shared = vec![F128::ZERO; n / 4];
+        let mut packed_b_shared = vec![F128::ZERO; n / 4];
+        let packed_shared = fold2_from_packed_and_round_pair_lookahead_into(
+            &a_packed,
+            &b_packed,
+            m,
+            K_SKIP,
+            &table,
+            &padding,
+            &mut packed_a_shared,
+            &mut packed_b_shared,
+            rho1,
+            rho2,
+            &r_next4,
+        );
+        let mut plain_a_shared = vec![F128::ZERO; n / 4];
+        let mut plain_b_shared = vec![F128::ZERO; n / 4];
+        let plain_shared = fold2_plain_and_round_pair_lookahead_into(
+            &a2,
+            &b2,
+            &mut plain_a_shared,
+            &mut plain_b_shared,
+            rho1,
+            rho2,
+            &r_next4,
+        );
+        DUP_INV_ELIDE_TEST_OVERRIDE.with(|slot| slot.set(None));
+
+        assert_eq!(nomat_shared, nomat_incumbent, "nomat round-two output");
+        assert_eq!(packed_a_shared, packed_a_incumbent, "packed a output");
+        assert_eq!(packed_b_shared, packed_b_incumbent, "packed b output");
+        assert_eq!(packed_shared, packed_incumbent, "packed message/lookahead");
+        assert_eq!(plain_a_shared, plain_a_incumbent, "plain a output");
+        assert_eq!(plain_b_shared, plain_b_incumbent, "plain b output");
+        assert_eq!(plain_shared, plain_incumbent, "plain message/lookahead");
     }
 
     /// AVX-512 packed→composed kernel vs the portable reference on one chunk,
