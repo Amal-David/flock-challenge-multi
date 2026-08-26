@@ -114,7 +114,13 @@ fn nomat_off() -> bool {
     if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
+    // Ablation: the sweeping no-materialize round-two path is withheld, so
+    // round two builds the dense F128 views the way it did before that path
+    // existed. The ranked environment is cleared, so the kill switch below
+    // can never be set there and the mechanism cannot be sampled through it.
+    // Everything else is unchanged; the difference is how many bytes round
+    // two moves to compute the same messages.
+    true || std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
