@@ -2220,8 +2220,17 @@ pub(crate) mod witgen_simd {
         // published profiles measured NT witness publishes as a loss on
         // Sapphire Rapids, so the default matches the scalar driver's plain
         // stores. `FLOCK_WITGEN_SIMD_NT=1` enables the NT drains for A/B.
+        // Re-measurement, opted in at the source. The profile this default
+        // was set from predates the fused a/b drain that now publishes those
+        // two streams non-temporally: when it was taken, a, b and z all wrote
+        // temporally and competed for the same cache, so bypassing the cache
+        // for one of them changed a different balance than it changes now.
+        // With a and b already streaming, z is the one remaining large write
+        // that still pays write-allocate, and direct ablation on this instance
+        // priced the a/b streaming at 2.41% -- so the sign of the z decision
+        // is worth re-establishing rather than inherited.
         static NT: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_SIMD_NT").is_some());
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_SIMD_NT").is_none());
         *NT
     }
 
