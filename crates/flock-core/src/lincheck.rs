@@ -1002,6 +1002,19 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LINCHECK_GT_FUSE=1` keeps the existing VPERMT2Q + VPERMB
+/// gather-transpose leaf. The default VPERMT2B leaf fuses those two dynamic
+/// permutes; dispatch happens before the const-generic block-major sweep so
+/// neither generated hot loop pays a per-gather branch.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lincheck_gt_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LINCHECK_GT_FUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    });
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -1049,7 +1062,7 @@ fn fold_untimed_enabled() -> bool {
     target_feature = "gfni"
 ))]
 #[allow(clippy::too_many_arguments)]
-fn fold_block_major_gfni(
+fn fold_block_major_gfni<const GT_FUSE: bool>(
     z_packed: &[F128],
     k: usize,
     chunks_per_block: usize,
@@ -1178,7 +1191,7 @@ fn fold_block_major_gfni(
                             // single gathers would read; each column slab is
                             // 1024 writable bytes of `transposed`.
                             unsafe {
-                                kernels::gather_transpose_stripe4_x86(
+                                kernels::gather_transpose_stripe4_x86::<GT_FUSE>(
                                     z_packed.as_ptr().add(outer_base * chunks_per_block + q),
                                     chunks_per_block,
                                     transposed.as_mut_ptr().add(t * 128),
@@ -1260,7 +1273,7 @@ fn fold_block_major_gfni(
                             // + q are the exact indices the scalar gather
                             // reads; output is 128 bytes of `transposed`.
                             unsafe {
-                                kernels::gather_transpose_stripe_x86(
+                                kernels::gather_transpose_stripe_x86::<GT_FUSE>(
                                     z_packed.as_ptr().add(outer_base * chunks_per_block + q),
                                     chunks_per_block,
                                     transposed.as_mut_ptr().add(t * 128),
@@ -1386,7 +1399,22 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     ))]
     if block_major_gfni_enabled() && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0 && k_log >= 6 {
         let _ = (trace_fold, timing);
-        return fold_block_major_gfni(
+        #[cfg(target_feature = "avx512vbmi")]
+        if lincheck_gt_fuse_enabled() {
+            return fold_block_major_gfni::<true>(
+                z_packed,
+                k,
+                chunks_per_block,
+                useful_bits,
+                useful_chunks,
+                n_workers,
+                tiles_per_worker,
+                n_tiles,
+                dynamic,
+                &eq8_at,
+            );
+        }
+        return fold_block_major_gfni::<false>(
             z_packed,
             k,
             chunks_per_block,
@@ -3403,9 +3431,23 @@ mod tests {
             let mut got = [0xA5u8; 128];
             // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
             unsafe {
-                kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
+                kernels::gather_transpose_stripe_x86::<true>(
+                    z.as_ptr(),
+                    stride,
+                    got.as_mut_ptr(),
+                );
             }
             assert_eq!(want, got, "stride {stride}");
+            let mut incumbent = [0x3Cu8; 128];
+            // SAFETY: same bounds as the fused leaf above.
+            unsafe {
+                kernels::gather_transpose_stripe_x86::<false>(
+                    z.as_ptr(),
+                    stride,
+                    incumbent.as_mut_ptr(),
+                );
+            }
+            assert_eq!(want, incumbent, "incumbent stride {stride}");
         }
         // Four-column twin: identical bytes to four single calls at q..q+4,
         // each landing in its own out-stride slab.
@@ -3417,7 +3459,7 @@ mod tests {
                     // SAFETY: rows r*stride + q + c are in bounds by the
                     // vector's +4 slack; each destination is 128 bytes.
                     unsafe {
-                        kernels::gather_transpose_stripe_x86(
+                        kernels::gather_transpose_stripe_x86::<true>(
                             z.as_ptr().add(q + c),
                             stride,
                             want.as_mut_ptr().add(c * 1024),
@@ -3427,7 +3469,7 @@ mod tests {
                 let mut got = [0x5Au8; 4 * 1024];
                 // SAFETY: as above; out_stride 1024 covers four 128-byte slabs.
                 unsafe {
-                    kernels::gather_transpose_stripe4_x86(
+                    kernels::gather_transpose_stripe4_x86::<true>(
                         z.as_ptr().add(q),
                         stride,
                         got.as_mut_ptr(),
@@ -3439,6 +3481,23 @@ mod tests {
                         want[c * 1024..c * 1024 + 128],
                         got[c * 1024..c * 1024 + 128],
                         "stride {stride} q {q} col {c}"
+                    );
+                }
+                let mut incumbent = [0xC3u8; 4 * 1024];
+                // SAFETY: same inputs and output slabs as the fused leaf.
+                unsafe {
+                    kernels::gather_transpose_stripe4_x86::<false>(
+                        z.as_ptr().add(q),
+                        stride,
+                        incumbent.as_mut_ptr(),
+                        1024,
+                    );
+                }
+                for c in 0..4 {
+                    assert_eq!(
+                        want[c * 1024..c * 1024 + 128],
+                        incumbent[c * 1024..c * 1024 + 128],
+                        "incumbent stride {stride} q {q} col {c}"
                     );
                 }
             }
