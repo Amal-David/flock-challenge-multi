@@ -909,7 +909,10 @@ fn seed_pf_params() -> (usize, usize, bool) {
                 .unwrap_or(d)
         };
         (
-            g("FLOCK_NTT_SEED_PF_DIST", 1),
+            // Default 4: hide SPR DRAM on the next 4 KiB page at grain-1.
+            // seed-rtile-4 (steal x4) scored 1,446,049 (-4.96%); do not coarsen.
+            // FLOCK_NTT_SEED_PF_DIST=1 restores the bar default.
+            g("FLOCK_NTT_SEED_PF_DIST", 4),
             g("FLOCK_NTT_SEED_PF_LINES", 8),
             std::env::var_os("FLOCK_NO_NTT_SEED_PF_SPREAD").is_none(),
         )
