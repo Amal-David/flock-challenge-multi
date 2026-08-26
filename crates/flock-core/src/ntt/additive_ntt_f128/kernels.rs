@@ -200,34 +200,26 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     // zero-high-limb preconditions of the selected specializations.
     unsafe {
         match (outer_low, inner_low) {
-            (false, false) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                false,
-                false,
-                ALIGNED_ZMM,
-            >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            ),
-            (false, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                false,
-                true,
-                ALIGNED_ZMM,
-            >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            ),
-            (true, false) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                true,
-                false,
-                ALIGNED_ZMM,
-            >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            ),
-            (true, true) => x86_64::butterfly_fused_2layer_publish_nt_gen::<
-                true,
-                true,
-                ALIGNED_ZMM,
-            >(
-                src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
-            ),
+            (false, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<false, false, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (false, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<true, false, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
         }
     }
 }
@@ -302,7 +294,14 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: cfg gate guarantees the required target features.
     unsafe {
         x86_64::butterfly_fused_2layer_row_from_geo(
-            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            twiddles,
         );
     }
 
@@ -314,7 +313,14 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_2layer_row_from_geo(
-            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            twiddles,
         );
     }
 }
@@ -808,7 +814,6 @@ pub(super) unsafe fn seed_fused_2layer_row_group_nt(
     }
 }
 
-
 #[cfg(test)]
 mod low_twiddle_tests {
     use super::*;
@@ -834,11 +839,25 @@ mod low_twiddle_tests {
         let mut next = rng(0xA11CE_5EED);
         for _ in 0..4096 {
             let a = next();
-            let b = F128 { lo: next().lo, hi: 0 };
-            assert_eq!(crate::field::gf2_128::mul_low_rhs(a, b), a * b, "a={a:?} b={b:?}");
+            let b = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            assert_eq!(
+                crate::field::gf2_128::mul_low_rhs(a, b),
+                a * b,
+                "a={a:?} b={b:?}"
+            );
         }
         for a in [F128::ZERO, F128::ONE, next()] {
-            for b in [F128::ZERO, F128::ONE, F128 { lo: u64::MAX, hi: 0 }] {
+            for b in [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: 0,
+                },
+            ] {
                 assert_eq!(crate::field::gf2_128::mul_low_rhs(a, b), a * b);
             }
         }
@@ -850,7 +869,10 @@ mod low_twiddle_tests {
     fn row_pair_low_matches_general() {
         let mut next = rng(0xB0B_5EED);
         for len in [1usize, 3, 4, 7, 8, 64] {
-            let twiddle = F128 { lo: next().lo, hi: 0 };
+            let twiddle = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
             let top: Vec<F128> = (0..len).map(|_| next()).collect();
             let bot: Vec<F128> = (0..len).map(|_| next()).collect();
 
@@ -886,11 +908,19 @@ mod low_twiddle_tests {
     fn fused_2layer_low_matches_general() {
         let mut next = rng(0xC0FFEE_5EED);
         for len in [1usize, 4, 5, 64] {
-            let t_outer = F128 { lo: next().lo, hi: 0 };
-            let t_a = F128 { lo: next().lo, hi: 0 };
-            let t_b = F128 { lo: next().lo, hi: 0 };
-            let rows: Vec<Vec<F128>> =
-                (0..4).map(|_| (0..len).map(|_| next()).collect()).collect();
+            let t_outer = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let t_a = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let t_b = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let rows: Vec<Vec<F128>> = (0..4).map(|_| (0..len).map(|_| next()).collect()).collect();
 
             let run = |outer_low: bool, inner_low: bool| -> Vec<Vec<F128>> {
                 let mut r: Vec<Vec<F128>> = rows.clone();
@@ -933,7 +963,11 @@ mod low_twiddle_tests {
 
             let reference = run(false, false);
             for (o, i) in [(false, true), (true, false), (true, true)] {
-                assert_eq!(run(o, i), reference, "len={len} outer_low={o} inner_low={i}");
+                assert_eq!(
+                    run(o, i),
+                    reference,
+                    "len={len} outer_low={o} inner_low={i}"
+                );
             }
         }
     }
