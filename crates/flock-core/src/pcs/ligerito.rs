@@ -4215,7 +4215,7 @@ fn fold_and_msg_lsb(
     r: F128,
     arena: Option<&mut FoldArena>,
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
-    fold_and_msg_lsb_inner(f, b, r, arena, None)
+    fold_and_msg_lsb_inner(f, b, r, arena, None, &[])
 }
 
 /// Core fold with an optional retained equality correction. The correction is
@@ -4223,12 +4223,18 @@ fn fold_and_msg_lsb(
 /// `nb[j] += gamma * eq_hi[j / eq_lo.len()] * eq_lo[j % eq_lo.len()]`.
 /// The ranked path fixes `eq_lo.len() == CHUNK`, so one high-factor scale is
 /// hoisted per Rayon task and the low table stays in L1.
+///
+/// `glues` carries deferred ordinary glues (`(b_new, α)` pairs from
+/// [`SumcheckProver::glue`]); each contributes
+/// `nb[j] += α · (bn[2j] + r·(bn[2j] + bn[2j+1]))` — exactly the term the
+/// incumbent eager `combined_basis += α·b_new` pass produced before folding.
 fn fold_and_msg_lsb_inner(
     f: &[F128],
     b: &[F128],
     r: F128,
     arena: Option<&mut FoldArena>,
     lazy_ood: Option<(&[F128], &[F128], F128)>,
+    glues: &[(Vec<F128>, F128)],
 ) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
@@ -4239,6 +4245,9 @@ fn fold_and_msg_lsb_inner(
         assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
         assert!(eq_hi.len().is_power_of_two());
         assert_eq!(half, eq_lo.len() * eq_hi.len());
+    }
+    for (g_basis, _) in glues {
+        assert_eq!(g_basis.len(), n);
     }
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
@@ -4256,6 +4265,13 @@ fn fold_and_msg_lsb_inner(
         if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
             for (j, value) in nb.iter_mut().enumerate() {
                 *value += gamma * eq_hi[j / eq_lo.len()] * eq_lo[j % eq_lo.len()];
+            }
+        }
+        for (g_basis, g_alpha) in glues {
+            for (j, value) in nb.iter_mut().enumerate() {
+                let e0 = g_basis[2 * j];
+                let e1 = g_basis[2 * j + 1];
+                *value += *g_alpha * (e0 + r * (e0 + e1));
             }
         }
         // Same AVX-512 message reduce used on the parallel path.
@@ -4298,6 +4314,7 @@ fn fold_and_msg_lsb_inner(
     // never sets it.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_nt = lazy_ood.is_none()
+        && glues.is_empty()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
@@ -4310,6 +4327,7 @@ fn fold_and_msg_lsb_inner(
         target_feature = "vpclmulqdq"
     ))]
     let use_nt = lazy_ood.is_none()
+        && glues.is_empty()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
@@ -4319,7 +4337,8 @@ fn fold_and_msg_lsb_inner(
     // (statically true under `-C target-cpu=native` on every Apple Silicon
     // target this ships to; other builds keep the previous leaf).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_soa = lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
+    let use_soa =
+        lazy_ood.is_none() && glues.is_empty() && cfg!(target_feature = "sha3") && {
         static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
         });
@@ -4416,6 +4435,16 @@ fn fold_and_msg_lsb_inner(
             if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
                 let scale = gamma * eq_hi[ci];
                 crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
+            }
+            for (g_basis, g_alpha) in glues {
+                // Same source contract as `fold_pairs`: output position
+                // (base + j) consumes the pair at elements 2(base+j),
+                // 2(base+j)+1.
+                for (j, v) in bc[..len].iter_mut().enumerate() {
+                    let e0 = g_basis[2 * (base + j)];
+                    let e1 = g_basis[2 * (base + j) + 1];
+                    *v += *g_alpha * (e0 + r * (e0 + e1));
+                }
             }
             #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
             {
@@ -6114,6 +6143,18 @@ fn materialize_direct_fold8(
     )
 }
 
+/// Deferred ordinary glue (`FLOCK_NO_DEFERRED_GLUE=1` restores the incumbent
+/// eager `combined_basis += α·b_new` read-modify-write pass in
+/// [`SumcheckProver::glue`]). The deferred form queues `(b_new, α)` and folds
+/// it inside the next [`SumcheckProver::fold`] pass; fold is bilinear in the
+/// basis operand over GF(2¹²⁸), so both forms produce identical field
+/// elements and byte-identical transcripts. Read once per process.
+#[inline]
+fn deferred_glue_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DEFERRED_GLUE").is_none())
+}
+
 pub struct SumcheckProver {
     f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -6129,6 +6170,14 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// Deferred ordinary glues (`FLOCK_NO_DEFERRED_GLUE=1` restores the
+    /// incumbent eager combine): each `(b_new, α)` waits here and its
+    /// `α · pair-fold(b_new)` is added to `nb` inside the NEXT [`Self::fold`]
+    /// pass instead of `glue` running a standalone `combined_basis += α·b_new`
+    /// read-modify-write pass. Fold is GF(2¹²⁸)-bilinear in the basis operand,
+    /// so `fold_r(cb + Σαₖ·bnₖ) == fold_r(cb) + Σαₖ·fold_r(bnₖ)` exactly —
+    /// identical field elements, byte-identical transcripts.
+    queued_glues: Vec<(Vec<F128>, F128)>,
     /// The ranked L1 OOD equality remains as 2^11 × 2^7 factors until the
     /// next fold consumes its glued correction.
     pending_ood_eq: Option<PendingOodEq>,
@@ -6144,6 +6193,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
@@ -6181,6 +6231,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         };
         inst.transcript.push(first_msg);
@@ -6202,6 +6253,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6221,6 +6273,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6240,6 +6293,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            queued_glues: Vec::new(),
             pending_ood_eq: None,
         }
     }
@@ -6247,8 +6301,12 @@ impl SumcheckProver {
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
-        // [`fold_and_msg_lsb`].
+        // [`fold_and_msg_lsb`]. Deferred ordinary glues ride the same pass:
+        // their α-scaled pair-folds are added to nb in-kernel (the incumbent
+        // eager form pre-combined them into combined_basis before this call;
+        // fold's GF(2)-bilinearity makes the two bit-identical).
         assert!(self.pending_glue.is_none(), "fold before ordinary glue");
+        let queued_glues = std::mem::take(&mut self.queued_glues);
         let pending_ood = self.pending_ood_eq.take();
         let (nf, nb, msg) = match pending_ood {
             Some(PendingOodEq::Glued {
@@ -6266,18 +6324,22 @@ impl SumcheckProver {
                     r,
                     self.fold_arena.as_mut(),
                     Some((&eq_lo, &eq_hi, gamma)),
+                    &queued_glues,
                 )
             }
             Some(PendingOodEq::Introduced { .. }) => {
                 panic!("fold before factorized OOD glue")
             }
-            None => fold_and_msg_lsb(
+            None => fold_and_msg_lsb_inner(
                 &self.f,
                 &self.combined_basis,
                 r,
                 self.fold_arena.as_mut(),
+                None,
+                &queued_glues,
             ),
         };
+        drop(queued_glues);
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
         // pool (same ownership as the Drop impl) so the next round's
         // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
@@ -6388,13 +6450,28 @@ impl SumcheckProver {
 
     /// Combine the introduced basis into `combined_basis` with separation α.
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    ///
+    /// Default (deferred) form: only `T_r` updates here — the `(b_new, α)`
+    /// pair is queued and its fold-side contribution lands inside the NEXT
+    /// [`Self::fold`] pass, deleting one full-length `combined_basis`
+    /// read-modify-write pass and its rayon fork/join per recursive level
+    /// from the serial Fiat–Shamir chain. Bit-identical to the eager combine:
+    /// for every j,
+    /// `fold_r(cb + α·bn)[j] = fold_r(cb)[j] + α·fold_r(bn)[j]` exactly, so
+    /// the folded state and every downstream message byte are unchanged.
+    /// `FLOCK_NO_DEFERRED_GLUE=1` restores the incumbent eager pass verbatim.
     pub fn glue(&mut self, alpha: F128) {
-        use rayon::prelude::*;
         let (b_new, h_new) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
+        self.t_r += alpha * h_new;
+        if deferred_glue_enabled() {
+            self.queued_glues.push((b_new, alpha));
+            return;
+        }
+        use rayon::prelude::*;
         const PAR_THRESHOLD: usize = 4096;
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
         let x4 = open_ood_x4_enabled();
@@ -6428,7 +6505,6 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
-        self.t_r += alpha * h_new;
     }
 
     pub fn f(&self) -> &[F128] {
@@ -10952,7 +11028,7 @@ mod tests {
         assert_eq!(eq_lo.len(), 2048);
         let gamma = beta * (F128::ONE + z[0] + r);
         let (got_f, got_b, got_msg) =
-            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+            fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
         assert_eq!(&*got_f, &*want_f);
         assert_eq!(&*got_b, &*want_b);
         assert_eq!(got_msg, want_msg);
@@ -11076,7 +11152,7 @@ mod tests {
             let mut eq_hi = build_eq_table(&z[1 + split..]);
             let gamma = beta * (F128::ONE + z[0] + r);
             let (got_f, got_b, got_msg) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_eq!(&*got_f, &*want_f, "folded witness d={d}");
             assert_eq!(&*got_b, &*want_b, "corrected basis d={d}");
             assert_eq!(got_msg, want_msg, "next-round message d={d}");
@@ -11084,7 +11160,7 @@ mod tests {
             // Negative control: one corrupted high weight must not still match.
             eq_hi[0] += F128::ONE;
             let (_, bad_b, _) =
-                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
+                fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)), &[]);
             assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
         }
     }
@@ -11131,6 +11207,120 @@ mod tests {
             assert_eq!(&*lazy.combined_basis, &*dense.combined_basis, "d={d}");
             assert_eq!(lazy.t_r, dense.t_r, "d={d}");
             assert_eq!(lazy.transcript, dense.transcript, "d={d}");
+        }
+    }
+
+    /// Deferred ordinary glue must be indistinguishable from the incumbent
+    /// eager `combined_basis += α·b_new` combine: same folded witness, basis,
+    /// target, transcript messages, and next-round message, across the serial
+    /// (d = 10) and parallel (d = 16) fold paths — including TWO glues stacked
+    /// onto one consuming fold (the multi-sample dense-OOD stacking shape).
+    /// The oracle materializes the eager semantics by hand with
+    /// `partial_eval_lsb_one` / `add_scaled`, which is exactly what the
+    /// incumbent `glue` body computed.
+    #[test]
+    fn deferred_glue_matches_eager_reference_across_fold_paths() {
+        use crate::challenger::Challenger;
+        for &d in &[10usize, 16] {
+            let n = 1usize << d;
+            let mut ch = crate::challenger::RandomChallenger::new(0xDEFE_10AD ^ d as u64);
+            let f: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let g1: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let g2: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let a1 = ch.sample_f128();
+            let a2 = ch.sample_f128();
+            let r0 = ch.sample_f128();
+            let r1 = ch.sample_f128();
+            let target = ch.sample_f128();
+
+            // Manual eager reference: exactly what the incumbent glue body
+            // plus the fused fold produced, step for step.
+            let mut ref_f = f.clone();
+            let mut ref_cb = b.clone();
+            let expect_start = round_msg_lsb(&ref_f, &ref_cb);
+
+            let (mut p, start) = SumcheckProver::new(f, b, target);
+            assert_eq!(start, expect_start);
+
+            // Fold, then stack TWO deferred glues onto one consuming fold.
+            let m = p.fold(r0);
+            partial_eval_lsb_one(&mut ref_f, r0);
+            partial_eval_lsb_one(&mut ref_cb, r0);
+            // The introduced bases must live at the prover's post-fold dim,
+            // and their claimed sums must be the true inner products so the
+            // verifier replay below has teeth.
+            let mut g1 = g1;
+            let mut g2 = g2;
+            partial_eval_lsb_one(&mut g1, r0);
+            partial_eval_lsb_one(&mut g2, r0);
+            let h1: F128 = ref_f
+                .iter()
+                .zip(g1.iter())
+                .map(|(&x, &y)| x * y)
+                .fold(F128::ZERO, |a, v| a + v);
+            let h2: F128 = ref_f
+                .iter()
+                .zip(g2.iter())
+                .map(|(&x, &y)| x * y)
+                .fold(F128::ZERO, |a, v| a + v);
+            assert_eq!(m, round_msg_lsb(&ref_f, &ref_cb), "fold(r0) msg d={d}");
+            assert_eq!(&*p.f, &ref_f[..], "f after fold d={d}");
+            assert_eq!(&*p.combined_basis, &ref_cb[..], "cb after fold d={d}");
+
+            p.introduce_new(g1.clone(), h1);
+            p.glue(a1);
+            p.introduce_new(g2.clone(), h2);
+            p.glue(a2);
+            // Eager oracle: materialize both combines now, then fold once.
+            let mut eager_cb = ref_cb.clone();
+            crate::field::f128_slice::add_scaled(&mut eager_cb, &g1, a1);
+            crate::field::f128_slice::add_scaled(&mut eager_cb, &g2, a2);
+            // The prover's t_r accumulates glue claims only (challenge folding
+            // lives in the verifier replay below).
+            let want_t_r = target + a1 * h1 + a2 * h2;
+            // Queued form: nothing observable may have moved yet.
+            assert_eq!(
+                &*p.combined_basis,
+                &ref_cb[..],
+                "deferral leaked into combined_basis early d={d}"
+            );
+            assert_eq!(p.t_r, want_t_r, "t_r diverged at glue d={d}");
+
+            let m = p.fold(r1);
+            partial_eval_lsb_one(&mut eager_cb, r1);
+            partial_eval_lsb_one(&mut ref_f, r1);
+            assert_eq!(m, round_msg_lsb(&ref_f, &eager_cb), "consuming fold msg d={d}");
+            assert_eq!(&*p.f, &ref_f[..], "f after consuming fold d={d}");
+            assert_eq!(
+                &*p.combined_basis,
+                &eager_cb[..],
+                "deferred glues did not ride the fold d={d}"
+            );
+            assert_eq!(p.t_r, want_t_r, "t_r diverged after fold d={d}");
+
+            // Verifier replay with teeth. Transcript: 0 start, 1 fold(r0),
+            // 2 intro(g1), 3 intro(g2), 4 fold(r1).
+            let msgs = p.transcript().to_vec();
+            assert_eq!(msgs.len(), 5, "transcript shape changed");
+            let q0 = RoundQuad::from_msg(msgs[0], target);
+            assert_eq!(q0.eval(F128::ZERO) + q0.eval(F128::ONE), target);
+            let t1 = q0.eval(r0);
+            let q1 = RoundQuad::from_msg(msgs[1], t1);
+            assert_eq!(q1.eval(F128::ZERO) + q1.eval(F128::ONE), t1);
+            let qi1 = RoundQuad::from_msg(msgs[2], h1);
+            assert_eq!(qi1.eval(F128::ZERO) + qi1.eval(F128::ONE), h1);
+            let qi2 = RoundQuad::from_msg(msgs[3], h2);
+            assert_eq!(qi2.eval(F128::ZERO) + qi2.eval(F128::ONE), h2);
+            // Combined quad claim entering the consuming fold; msgs[4] must
+            // satisfy the sumcheck identity against it.
+            let combined_claim = q1.eval(r1) + a1 * qi1.eval(r1) + a2 * qi2.eval(r1);
+            let q4 = RoundQuad::from_msg(msgs[4], combined_claim);
+            assert_eq!(
+                q4.eval(F128::ZERO) + q4.eval(F128::ONE),
+                combined_claim,
+                "consuming fold ignored a deferred glue d={d}"
+            );
         }
     }
 
