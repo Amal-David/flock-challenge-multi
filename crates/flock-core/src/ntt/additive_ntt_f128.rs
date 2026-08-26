@@ -288,6 +288,9 @@ static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
 /// Test-only counters: how many times each fused pass actually ran (so the
 /// equality tests can assert they exercised the fused route, not a fallback).
 #[cfg(test)]
+static TOP_FUSION8_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
 static TOP_FUSION_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
@@ -1646,6 +1649,148 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// [`Self::top_fused6_pass`] widened to eight layers.
+    ///
+    /// Same shape, one level deeper: the task stages 256 rows instead of 64
+    /// (`S = B / 256`) and runs two fused-four kernels instead of a
+    /// fused-four followed by a fused-two.
+    ///
+    /// - layers `layer..layer+4` (fused-four, stride `16S`): the sixteen
+    ///   staging rows `{j, j+16, …, j+240}` for each `j ∈ 0..16`, which is the
+    ///   incumbent fused-four row group `r + j·S`;
+    /// - layers `layer+4..layer+8` (fused-four, stride `S`): the sixteen
+    ///   contiguous staging rows `16m..16m+16` for each `m ∈ 0..16`, whose
+    ///   block index at `layer+4` is `block·16 + m` — the same index the
+    ///   six-layer pass gives its fused-two quads.
+    ///
+    /// The point is the sub-group size below the cut, not the top itself. The
+    /// six-layer pass already retires the whole top in one read and one write
+    /// of each row; taking eight layers keeps that property while moving the
+    /// split two layers deeper, so each cache-resident sub-group is a quarter
+    /// of its former size. Two SMT siblings pinned to one core then hold both
+    /// of their sub-groups in that core's L2 instead of contending for it.
+    ///
+    /// Byte-identical to the incumbent schedule by construction: the same
+    /// kernels over the same row sets, the same twiddles indexed by the same
+    /// block arithmetic, and the same lane bounds under the same even-stride
+    /// guards. Rows are staged whole, so structurally zero tail lanes round
+    /// trip unchanged.
+    fn top_fused8_pass(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        layer: usize,
+        log_d: usize,
+        odd_tail: usize,
+    ) {
+        use rayon::prelude::*;
+        #[cfg(test)]
+        TOP_FUSION8_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(layer + 8 <= log_d);
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 8; // S
+        debug_assert!(sub_stride >= 1);
+        let stride_hi = 16 * sub_stride; // data-row stride of the first kernel
+        let lanes_hi_tail = if stride_hi.is_multiple_of(2) { odd_tail } else { 0 };
+        let lanes_lo_tail = if sub_stride.is_multiple_of(2) { odd_tail } else { 0 };
+
+        // Per-block twiddles for the first fused-four (layer..layer+4).
+        let tw_hi: Vec<[F128; 15]> = (0..num_blocks)
+            .map(|block| Self::fused4_twiddles(self, layer, block))
+            .collect();
+        // Per (block, m) twiddles for the second fused-four
+        // (layer+4..layer+8); the layer+4 block index is block·16 + m.
+        let tw_lo: Vec<[F128; 15]> = (0..num_blocks * 16)
+            .map(|i| Self::fused4_twiddles(self, layer + 4, i))
+            .collect();
+
+        let base_addr = data.as_mut_ptr() as usize;
+        let n_tasks = num_blocks * sub_stride;
+        let row_len = num_ntts;
+        let task = |buf: &mut Vec<F128>, idx: usize| {
+            let block = idx / sub_stride;
+            let r = idx % sub_stride;
+            let block_start = block * block_bytes;
+            let lanes_lo = row_lanes(r, num_ntts, lanes_lo_tail);
+            // SAFETY: rows `block_start + (r + k·S)·num_ntts`, k ∈ 0..256, lie
+            // inside block `block` of `data`; distinct (block, r) select
+            // pairwise-disjoint row sets, so no two concurrent tasks touch the
+            // same element. `buf` is this worker's private staging block.
+            unsafe {
+                let base = base_addr as *mut F128;
+                let row_ptr = |k: usize| base.add(block_start + (r + k * sub_stride) * row_len);
+                for k in 0..256 {
+                    core::ptr::copy_nonoverlapping(
+                        row_ptr(k),
+                        buf.as_mut_ptr().add(k * row_len),
+                        row_len,
+                    );
+                }
+                let tw = &tw_hi[block];
+                for j in 0..16 {
+                    let lanes_hi = row_lanes(r + j * sub_stride, num_ntts, lanes_hi_tail);
+                    kernels::butterfly_fused_4layer_row(
+                        buf.as_mut_ptr(),
+                        16,
+                        row_len,
+                        lanes_hi,
+                        j,
+                        tw,
+                    );
+                }
+                for m in 0..16 {
+                    let tw = &tw_lo[block * 16 + m];
+                    kernels::butterfly_fused_4layer_row(
+                        buf.as_mut_ptr().add(16 * m * row_len),
+                        1,
+                        row_len,
+                        lanes_lo,
+                        0,
+                        tw,
+                    );
+                }
+                for k in 0..256 {
+                    core::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(k * row_len),
+                        row_ptr(k),
+                        row_len,
+                    );
+                }
+            }
+        };
+
+        const PARALLEL_TASK_THRESHOLD: usize = 32;
+        if n_tasks < PARALLEL_TASK_THRESHOLD {
+            let mut buf = staging_block(256, row_len);
+            for idx in 0..n_tasks {
+                task(&mut buf, idx);
+            }
+        } else {
+            (0..n_tasks)
+                .into_par_iter()
+                .for_each_init(|| staging_block(256, row_len), |buf, idx| task(buf, idx));
+        }
+    }
+
+    /// The fifteen twiddles a fused-four kernel needs for levels
+    /// `layer..layer+4` under block index `block` at `layer`.
+    fn fused4_twiddles(&self, layer: usize, block: usize) -> [F128; 15] {
+        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+        tw[0] = self.twiddle(layer, block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer + 3, 8 * block + s);
+        }
+        tw
+    }
+
     /// [`Self::top_fused6_pass`] for layers 3..9 with the rate-1/2 seed
     /// (layers 1–2, out of place from `msg`) folded into the same task, so
     /// the codeword is written exactly once — already at layer 9 — instead of
@@ -2289,7 +2434,19 @@ impl AdditiveNttF128 {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .filter(|v| (14..=24).contains(v))
-                    .unwrap_or(21)
+                    // 2^19, paired with the eight-layer top pass below.
+                    // The six-layer pass already retires the whole top in one
+                    // read and one write of each row, so the split's position
+                    // is decided by what happens BELOW it: at 2 MiB a core's
+                    // two pinned SMT workers hold two 2 MiB sub-groups in one
+                    // 2 MiB L2 and neither stays resident. Eight top layers
+                    // move the split two layers deeper at no extra pass, which
+                    // quarters the sub-group to 512 KiB -- both siblings then
+                    // fit. Moving the split without widening the pass is what
+                    // the 2^20 sample already measured, and it lost by 17.7%:
+                    // the extra whole-buffer pass dominates. This changes the
+                    // split and the pass width together.
+                    .unwrap_or(19)
             });
             *V
         };
@@ -2430,6 +2587,9 @@ impl AdditiveNttF128 {
                 self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
                 crate::gaptime::mark("ntt: seed+top fused pass done");
                 layer += 6;
+            } else if top_fusion_ok && layer + 7 < n_top && block_size >= 256 {
+                self.top_fused8_pass(data, num_ntts, layer, log_d, odd_tail);
+                layer += 8;
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
                 layer += 6;
@@ -4601,6 +4761,45 @@ mod tests {
     /// pool raises `n_top` to 9 so `start_layer = 3` reproduces the ranked top
     /// structure (fused layers 3..8, then deep 9..) at 1/8 of the size.
     #[test]
+    #[ignore] // 384 MB of buffers plus a scalar reference transform
+    fn top_fused8_runs_and_retires_the_whole_top() {
+        use std::sync::atomic::Ordering;
+        // The eight-layer pass exists to move the top/deep split two layers
+        // deeper without adding a whole-buffer pass, so two dispatch
+        // properties have to hold: it runs, and no narrower top pass runs
+        // beside it. That second half is what "the whole top in one read and
+        // one write of each row" means, and it is the reason the split can
+        // move at all.
+        //
+        // The smallest shape that exercises it is fixed by the split
+        // constant: the top is eight layers over sub-groups of that size, so
+        // the buffer is 2^27 elements' worth of bytes however the lanes are
+        // divided. Hence the size, and hence #[ignore].
+        let (log_d, num_ntts, start_layer) = (18usize, 32usize, 0usize);
+        let n_top = AdditiveNttF128::interleaved_n_top(log_d, num_ntts);
+        assert_eq!(n_top, 8, "shape ({log_d}, {num_ntts}) does not give an eight-layer top");
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x5F89_A1C3);
+        let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+        let before8 = TOP_FUSION8_HITS.load(Ordering::Relaxed);
+        let before6 = TOP_FUSION_HITS.load(Ordering::Relaxed);
+        let mut candidate = original.clone();
+        ntt.forward_transform_interleaved_parallel_from_layer(&mut candidate, num_ntts, start_layer);
+        assert!(
+            TOP_FUSION8_HITS.load(Ordering::Relaxed) > before8,
+            "the eight-layer top pass did not run"
+        );
+        assert_eq!(
+            TOP_FUSION_HITS.load(Ordering::Relaxed),
+            before6,
+            "a narrower top pass ran beside it"
+        );
+        let mut expected = original;
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, num_ntts, start_layer);
+        assert!(candidate == expected, "eight-layer top pass changed the transform");
+    }
+
+        #[test]
     fn top_fusion_matches_incumbent_schedule() {
         use std::sync::atomic::Ordering;
         let mut rng = Rng::new(0x70F6);
@@ -4627,7 +4826,7 @@ mod tests {
                     start_layer,
                 );
                 TOP_FUSION_TEST_OFF.store(false, Ordering::Relaxed);
-                let hits_before = TOP_FUSION_HITS.load(Ordering::Relaxed);
+                let hits_before = TOP_FUSION_HITS.load(Ordering::Relaxed) + TOP_FUSION8_HITS.load(Ordering::Relaxed);
                 let mut candidate = original.clone();
                 ntt.forward_transform_interleaved_parallel_from_layer(
                     &mut candidate,
@@ -4635,7 +4834,7 @@ mod tests {
                     start_layer,
                 );
                 assert!(
-                    TOP_FUSION_HITS.load(Ordering::Relaxed) > hits_before,
+                    TOP_FUSION_HITS.load(Ordering::Relaxed) + TOP_FUSION8_HITS.load(Ordering::Relaxed) > hits_before,
                     "top fusion did not run at log_d={log_d} num_ntts={num_ntts} start={start_layer}"
                 );
                 (control, candidate)
@@ -4757,7 +4956,7 @@ mod tests {
                     covered.fetch_add(range.len(), Ordering::Relaxed);
                 });
                 assert!(
-                    SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) > hits_before,
+                    SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) + TOP_FUSION8_HITS.load(Ordering::Relaxed) > hits_before,
                     "seed fusion did not run at log_d={log_d} num_ntts={num_ntts}"
                 );
                 (control, candidate, covered.load(Ordering::Relaxed) == 1 << log_d)
@@ -4892,14 +5091,14 @@ mod tests {
                     ntt.rs_encode_interleaved(&msg, &mut encoded, num_ntts);
                     let seed_fired = SEED_TOP_FUSION_HITS.load(Ordering::Relaxed) > seed_before;
 
-                    let top_before = TOP_FUSION_HITS.load(Ordering::Relaxed);
+                    let top_before = TOP_FUSION_HITS.load(Ordering::Relaxed) + TOP_FUSION8_HITS.load(Ordering::Relaxed);
                     let mut forward = dense.clone();
                     ntt.forward_transform_interleaved_parallel_from_layer(
                         &mut forward,
                         num_ntts,
                         0,
                     );
-                    let top_fired = TOP_FUSION_HITS.load(Ordering::Relaxed) > top_before;
+                    let top_fired = TOP_FUSION_HITS.load(Ordering::Relaxed) + TOP_FUSION8_HITS.load(Ordering::Relaxed) > top_before;
                     (encoded, forward, seed_fired, top_fired)
                 });
                 STAGING_INIT_TEST_MODE.store(0, Ordering::SeqCst);
@@ -5104,7 +5303,11 @@ mod tests {
             (13usize, 4usize, 0usize, 4usize),
             (13, 8, 0, 4),
             (13, 8, 2, 4),
-            (15, 64, 0, 4),
+            // Wide-lane shape. Its deep depth is set by the sub-group split
+            // constant and the lane count together, so it moves when that
+            // constant does; sixteen lanes is the wide shape that keeps this
+            // list at an eleven-layer deep region.
+            (15, 16, 0, 4),
         ] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
