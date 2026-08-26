@@ -471,7 +471,11 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn rename(oldpath: *const u8, newpath: *const u8) -> i32;
 }
+
+static DIRECT_TMP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static DIRECT_PATHS: Mutex<Option<(Vec<u8>, Vec<u8>)>> = Mutex::new(None);
 
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
 /// hard error.
@@ -545,10 +549,26 @@ fn close_fd(fd: i32) {
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
+    let bytes = bundle.to_bytes();
+    let fd = DIRECT_TMP_FD.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        let written = write_all_fd(fd, &bytes);
+        unsafe { close(fd) };
+        if written {
+            if let Ok(guard) = DIRECT_PATHS.lock() {
+                if let Some((ref c_tmp, ref c_path)) = *guard {
+                    let ret = unsafe { rename(c_tmp.as_ptr(), c_path.as_ptr()) };
+                    if ret == 0 {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, bundle.to_bytes())?;
+    std::fs::write(&temporary, bytes)?;
     std::fs::rename(temporary, path)
 }
 
@@ -616,6 +636,30 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     };
     let direct_proof_path =
         (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none()).then_some(proof_path);
+    if let Some(ref p) = direct_proof_path {
+        let mut tmp = p.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp_path = PathBuf::from(tmp);
+        let mut p_bytes = p.to_string_lossy().as_bytes().to_vec();
+        p_bytes.push(0);
+        let mut tmp_bytes = tmp_path.to_string_lossy().as_bytes().to_vec();
+        tmp_bytes.push(0);
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+        {
+            #[cfg(unix)]
+            {
+                use std::os::fd::IntoRawFd;
+                DIRECT_TMP_FD.store(file.into_raw_fd(), Ordering::SeqCst);
+            }
+        }
+        if let Ok(mut guard) = DIRECT_PATHS.lock() {
+            *guard = Some((tmp_bytes, p_bytes));
+        }
+    }
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.

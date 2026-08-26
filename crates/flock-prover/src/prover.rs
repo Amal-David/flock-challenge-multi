@@ -366,8 +366,13 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
+    let inner_rest_tail = if lc_claim.r_inner_rest.is_empty() {
+        &[][..]
+    } else {
+        &lc_claim.r_inner_rest[1..]
+    };
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, inner_rest_tail);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(

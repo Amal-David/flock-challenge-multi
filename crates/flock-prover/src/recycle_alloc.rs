@@ -5,26 +5,61 @@
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
 
+use core::cell::UnsafeCell;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
 use std::sync::atomic::{
-    AtomicUsize,
-    Ordering::{Acquire, Release},
+    AtomicBool, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
 };
 
 const RECYCLE_MIN: usize = 32 * 1024;
 const MAX_ALIGN: usize = 16;
 const MAX_CLASSES: usize = 512;
 
+struct SpinLock {
+    locked: AtomicBool,
+}
+
+impl SpinLock {
+    const fn new() -> Self {
+        Self { locked: AtomicBool::new(false) }
+    }
+
+    #[inline(always)]
+    fn lock(&self) -> SpinGuard<'_> {
+        while self.locked.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+            while self.locked.load(Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+        SpinGuard { lock: self }
+    }
+}
+
+struct SpinGuard<'a> {
+    lock: &'a SpinLock,
+}
+
+impl<'a> Drop for SpinGuard<'a> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Release);
+    }
+}
+
+#[repr(align(64))]
 struct Class {
     size: AtomicUsize,
-    head: Mutex<usize>,
+    lock: SpinLock,
+    head: UnsafeCell<usize>,
 }
+unsafe impl Sync for Class {}
 
 #[allow(clippy::declare_interior_mutable_const)]
 const EMPTY: Class = Class {
     size: AtomicUsize::new(0),
-    head: Mutex::new(0),
+    lock: SpinLock::new(),
+    head: UnsafeCell::new(0),
 };
 static CLASSES: [Class; MAX_CLASSES] = [EMPTY; MAX_CLASSES];
 
@@ -121,7 +156,8 @@ fn pop(size: usize) -> *mut u8 {
     let Some(i) = find_class(size, false) else {
         return core::ptr::null_mut();
     };
-    let mut head = CLASSES[i].head.lock().unwrap();
+    let _guard = CLASSES[i].lock.lock();
+    let head = unsafe { &mut *CLASSES[i].head.get() };
     let top = *head;
     if top == 0 {
         return core::ptr::null_mut();
@@ -135,7 +171,8 @@ fn push(ptr: *mut u8, size: usize) -> bool {
     let Some(i) = find_class(size, true) else {
         return false;
     };
-    let mut head = CLASSES[i].head.lock().unwrap();
+    let _guard = CLASSES[i].lock.lock();
+    let head = unsafe { &mut *CLASSES[i].head.get() };
     unsafe { *(ptr as *mut usize) = *head };
     *head = ptr as usize;
     true
