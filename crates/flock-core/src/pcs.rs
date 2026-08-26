@@ -780,16 +780,30 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
+    // `basis_elidable` is exactly the `direct_common` predicate evaluated
+    // below, minus the parts that depend on ring_switch's own output. If it
+    // holds AND every claim comes back with a direct_fold8 bundle and a
+    // DeferredDense rs_eq_ind, `use_direct_fold8` is taken, `direct_count ==
+    // n_rs` filters every claim out of both `rs_baked` and `rs_deferred`,
+    // `direct_c_stats` is None and `b_combined` stays empty -- so no
+    // `rs_eq_ind` basis factor is read anywhere. ring_switch decides the
+    // second half of that antecedent itself and skips building them.
+    let basis_elidable = cfg!(target_arch = "x86_64")
+        && n_rs == 2
+        && n_pd == 0
+        && packed_witness.len() == (1usize << 25)
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
+        ring_switch::prove_batched_padded_with_precomputed_elidable(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
             challenger,
+            basis_elidable,
         )
     } else {
         (Vec::new(), Vec::new())
