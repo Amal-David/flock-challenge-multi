@@ -30,4 +30,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // resample gtr r1 20260819-1220
 
 #[used]
-static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+static LAYOUT_ROLL_201: [u8; 6440] = [0u8; 6440];
