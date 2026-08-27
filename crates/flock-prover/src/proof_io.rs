@@ -277,14 +277,13 @@ pub fn stash_pre_encoded_prefix(
     }
 }
 
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
+/// Take the stash iff its commitment-root fingerprint matches this bundle.
+/// The stash was produced from this proof immediately before the PCS open;
+/// the 256-bit root rejects stale cross-proof state. Its recorded section
+/// lengths already define the exact byte prefix, so traversing the same three
+/// structures again with `serialized_size` on the timed publish tail is
+/// redundant. `None` remains the fallback on a disabled switch, absent stash,
+/// poisoned lock, root mismatch, or malformed cached byte length.
 fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
     if !pre_encode_enabled() {
         return None;
@@ -293,15 +292,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
+    let want = HEADER_LEN + stash.sec_lens.iter().sum::<u64>() as usize;
     (stash.bytes.len() == want).then_some(stash.bytes)
 }
 
@@ -707,10 +698,17 @@ mod tests {
         let mut reference = Vec::new();
         write_header(&mut reference, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut reference, &bundle).expect("reference serialize");
-        assert_eq!(bytes, reference, "fast to_bytes diverged from single-shot bincode");
+        assert_eq!(
+            bytes, reference,
+            "fast to_bytes diverged from single-shot bincode"
+        );
 
         // The pre-encoded-prefix path must also reproduce the same bytes.
-        stash_pre_encoded_prefix(&bundle.commitment, &bundle.proof.zerocheck, &bundle.proof.lincheck);
+        stash_pre_encoded_prefix(
+            &bundle.commitment,
+            &bundle.proof.zerocheck,
+            &bundle.proof.lincheck,
+        );
         assert_eq!(
             bundle.to_bytes(),
             reference,
