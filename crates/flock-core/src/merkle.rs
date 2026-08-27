@@ -548,9 +548,20 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
+                // The ranked pool has two SMT workers on each of eight physical
+                // cores. Keep the well-amortized 1024-parent tasks while they
+                // already expose at least one task per core; only split the
+                // 2K/4K-parent levels enough to use all eight cores. More than
+                // eight tiny tasks made the prior 32-way adaptive proposal pay
+                // scheduler and hash_many setup without adding physical cores.
+                let group = if rayon::current_num_threads() == 16 {
+                    (write.len() / 8).clamp(256, BLAKE3_GROUP)
+                } else {
+                    BLAKE3_GROUP
+                };
                 write
-                    .par_chunks_mut(BLAKE3_GROUP)
-                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .par_chunks_mut(group)
+                    .zip(read_bytes.par_chunks(group * 64))
                     .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }
@@ -1061,16 +1072,27 @@ mod tests {
             ntt.rs_encode_interleaved(&msg, &mut cw, num_ntts);
             let reps = 10;
             let t = std::time::Instant::now();
-            for _ in 0..reps { ntt.rs_encode_interleaved(&msg, &mut cw, num_ntts); }
+            for _ in 0..reps {
+                ntt.rs_encode_interleaved(&msg, &mut cw, num_ntts);
+            }
             let plain = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
             let t = std::time::Instant::now();
-            for _ in 0..reps { fill_merkle_tree(&mut tree, unsafe { core::slice::from_raw_parts(cw.as_ptr() as *const u8, cw.len() * 16) }, n_leaves, HashKind::Blake3); }
+            for _ in 0..reps {
+                fill_merkle_tree(
+                    &mut tree,
+                    unsafe { core::slice::from_raw_parts(cw.as_ptr() as *const u8, cw.len() * 16) },
+                    n_leaves,
+                    HashKind::Blake3,
+                );
+            }
             let merkle = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
             let ranges = std::sync::atomic::AtomicUsize::new(0);
             let t = std::time::Instant::now();
             for _ in 0..reps {
                 ranges.store(0, std::sync::atomic::Ordering::Relaxed);
-                ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw, num_ntts, &|_r, _d| { ranges.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+                ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw, num_ntts, &|_r, _d| {
+                    ranges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
             }
             let hooked = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
             let n_ranges = ranges.load(std::sync::atomic::Ordering::Relaxed);
@@ -1078,11 +1100,23 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..reps {
                 ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw, num_ntts, &|r, d| {
-                    let bytes = unsafe { core::slice::from_raw_parts(d.as_ptr() as *const u8, d.len() * 16) };
-                    let out = unsafe { core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(r.start), r.len()) };
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(d.as_ptr() as *const u8, d.len() * 16)
+                    };
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(r.start),
+                            r.len(),
+                        )
+                    };
                     hash_leaves_serial(bytes, leaf, out, HashKind::Blake3);
                 });
-                crate::pcs::commit::build_upper_levels(&mut tree, n_leaves, n_leaves, HashKind::Blake3);
+                crate::pcs::commit::build_upper_levels(
+                    &mut tree,
+                    n_leaves,
+                    n_leaves,
+                    HashKind::Blake3,
+                );
             }
             let fused = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
             eprintln!(
@@ -1099,7 +1133,9 @@ mod tests {
         for log_leaves in [10usize, 12, 14, 16, 18] {
             let n = 1usize << log_leaves;
             let leaf = 128usize;
-            let data: Vec<u8> = (0..n * leaf).map(|i| (i as u32).wrapping_mul(2654435761) as u8).collect();
+            let data: Vec<u8> = (0..n * leaf)
+                .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+                .collect();
             let mut tree = vec![Hash::default(); 2 * n - 1];
             // warm
             fill_merkle_tree(&mut tree, &data, n, HashKind::Blake3);
@@ -1125,7 +1161,6 @@ mod tests {
             );
         }
     }
-
 
     use super::*;
 
@@ -1325,13 +1360,41 @@ mod tests {
             (16, 64, &[0..4, 4..8, 8..12, 12..16]),
             (16, 64, &[0..1, 1..3, 3..8, 8..16]),
             (256, 64, &[0..32, 32..64, 64..128, 128..192, 192..256]),
-            (256, 1024, &[0..32, 32..64, 64..96, 96..128, 128..160, 160..192, 192..224, 224..256]),
-            (1024, 1024, &[
-                0..128, 128..256, 256..384, 384..512, 512..640, 640..768, 768..896, 896..1024,
-            ]),
+            (
+                256,
+                1024,
+                &[
+                    0..32,
+                    32..64,
+                    64..96,
+                    96..128,
+                    128..160,
+                    160..192,
+                    192..224,
+                    224..256,
+                ],
+            ),
+            (
+                1024,
+                1024,
+                &[
+                    0..128,
+                    128..256,
+                    256..384,
+                    384..512,
+                    512..640,
+                    640..768,
+                    768..896,
+                    896..1024,
+                ],
+            ),
         ];
         for &(n_leaves, leaf_size, ranges) in cases {
-            let data = random_data(n_leaves, leaf_size, 0x51EA_u64.wrapping_mul(n_leaves as u64));
+            let data = random_data(
+                n_leaves,
+                leaf_size,
+                0x51EA_u64.wrapping_mul(n_leaves as u64),
+            );
             for kind in KINDS {
                 let oneshot = merkle_tree(&data, n_leaves, kind);
                 let streamed = merkle_tree_streaming(&data, n_leaves, kind, ranges.iter().cloned());
