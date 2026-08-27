@@ -5948,6 +5948,7 @@ fn materialize_direct_fold8(
         Vec::new()
     };
 
+    let rowpack = crate::pcs::seed_rowpack_live(packed_witness.len());
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
@@ -6031,9 +6032,19 @@ fn materialize_direct_fold8(
                 while slot < block_len {
                     let n = SUB.min(block_len - slot);
                     let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
+                    if rowpack {
+                        crate::field::f128_slice::fold16_banked_packpos(
+                            &packed_witness,
+                            block * block_len + slot,
+                            n,
+                            m4,
+                            &fold16_weight,
+                        );
+                    } else {
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                        );
+                    }
                     crate::field::f128_slice::fold4_nested(
                         m4, &mut f_out[slot..slot + n], r4, r5,
                     );

@@ -543,15 +543,32 @@ impl StreamProj<'_> {
 struct Drain8<'t> {
     ast: *mut V8,
     bs: *mut V8,
+    /// Global z buffer (u32 view), not an 8-block slice. Rowpack stores
+    /// scatter through [`z_u32_index`].
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    /// Global block index of row r=0 of this octa.
+    block0: usize,
+    rowpack: bool,
     win_ab: Option<(*mut u32, *mut u32)>,
     proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
     wide_nt: bool,
     spread: bool,
+}
+
+/// u32 index of `abs_word` in R1CS block `block` inside z.
+#[inline(always)]
+fn z_u32_index(block: usize, abs_word: usize, rowpack: bool) -> usize {
+    if !rowpack {
+        return block * U32_PER_BLOCK + abs_word;
+    }
+    // Two NTT rows per block, 256 u32 per 64-lane row.
+    let pos = 2 * block + abs_word / 256;
+    let word = abs_word % 256;
+    flock_core::pcs::pack_seed_pos(pos) * 256 + word
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -931,6 +948,9 @@ unsafe fn emit_pair(
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
+    z_block0: usize,
+    z_abs_word: usize,
+    z_rowpack: bool,
     a: *mut u32,
     b: *mut u32,
     z_lo: *const V8,
@@ -951,8 +971,13 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let zp = self.z.add(z_u32_index(
+                self.z_block0 + j,
+                self.z_abs_word,
+                self.z_rowpack,
+            ));
             emit_pair(
-                self.z.add(o),
+                zp,
                 *self.z_lo.add(j),
                 *self.z_hi.add(j),
                 f & 1 != 0,
@@ -1046,6 +1071,8 @@ impl Drain8<'_> {
         b_carry: Option<(*mut u32, usize)>,
         a_rows: (*const u32, usize),
         z_dst: *mut u32,
+        block0: usize,
+        rowpack: bool,
         abs_word: usize,
         ring_word: usize,
         z_g1: usize,
@@ -1093,7 +1120,7 @@ impl Drain8<'_> {
                     (_, false, false) => {}
                 }
 
-                let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
+                let zp = z_dst.add(z_u32_index(block0 + r, abs_word, rowpack));
                 match (z_nt, z_lo_live, z_hi_live) {
                     (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
                     (true, true, false) => stream_v8(zp, z_lo, wide_nt),
@@ -1169,6 +1196,8 @@ impl Drain8<'_> {
                         Some((sb, STEP_WORDS)),
                         (sa, STEP_WORDS),
                         self.z,
+                        self.block0,
+                        self.rowpack,
                         abs_word,
                         rw,
                         z_g1,
@@ -1297,7 +1326,10 @@ impl Drain8<'_> {
                     flags |= 0x20;
                 }
                 let rows = StepRows {
-                    z: self.z.add(abs_word),
+                    z: self.z,
+                    z_block0: self.block0,
+                    z_abs_word: abs_word,
+                    z_rowpack: self.rowpack,
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
                     z_lo: z_lo.as_ptr(),
@@ -1350,6 +1382,8 @@ impl Drain8<'_> {
                             Some((win_b.add(abs_word), U32_PER_BLOCK)),
                             (win_a.add(abs_word), U32_PER_BLOCK),
                             self.z,
+                            self.block0,
+                            self.rowpack,
                             abs_word,
                             rw,
                             z_g1,
@@ -1384,6 +1418,8 @@ impl Drain8<'_> {
                             None,
                             (a_rows, STEP_WORDS),
                             self.z,
+                            self.block0,
+                            self.rowpack,
                             abs_word,
                             rw,
                             z_g1,
@@ -1538,6 +1574,8 @@ unsafe fn dump_elide_win(
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: OctaInputs<'_>,
     z: *mut u32,
+    block0: usize,
+    rowpack: bool,
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
@@ -1666,6 +1704,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z,
             a,
             b,
+            block0,
+            rowpack,
             win_ab,
             proj,
             elide,

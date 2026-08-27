@@ -594,6 +594,46 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     }
 }
 
+/// Sixteen-bank fold where position `start_pos + t` lives at
+/// [`crate::pcs::pack_seed_pos`]`(start_pos + t) · 64` in `src`.
+/// `dst.len() == 4 * n`, `src` is the full packed witness.
+pub(crate) fn fold16_banked_packpos(
+    src: &[F128],
+    start_pos: usize,
+    n: usize,
+    dst: &mut [F128],
+    w: &[F128; 16],
+) {
+    assert_eq!(dst.len(), 4 * n);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::fold16_banked_packpos(src, start_pos, n, dst, w);
+        return;
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for slot in 0..n {
+            let phys = crate::pcs::pack_seed_pos(start_pos + slot);
+            let row = &src[phys * 64..phys * 64 + 64];
+            for k in 0..4 {
+                let mut v = F128::ZERO;
+                for bnk in 0..16 {
+                    v += w[bnk] * row[16 * k + bnk];
+                }
+                dst[4 * slot + k] = v;
+            }
+        }
+    }
+}
+
 /// Bind one top-bit split in place: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.
 ///
 /// The pair members live in two separate contiguous runs (top-bit split),

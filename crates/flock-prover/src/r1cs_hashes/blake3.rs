@@ -1735,8 +1735,14 @@ fn generate_round1_inner_octa(
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     let win_plan = flock_core::zerocheck::univariate_skip_optimized::
         prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
-    z.par_chunks_mut(group_f128)
-        .zip(a.par_chunks_mut(group_f128))
+    let z_addr = z.as_mut_ptr() as usize;
+    let rowpack = flock_core::pcs::seed_rowpack_live(z.len());
+    // Const-elide of z assumes block-major chunk offsets. Rowpack scatters
+    // those chunks; a token hit would skip the wrong physical words.
+    let elide = [elide[0] && !rowpack, elide[1], elide[2]];
+    // Do not par_chunks z when rowpack: 16 consecutive R1CS blocks are no
+    // longer 16 contiguous 2 KiB runs. a/b stay block-major.
+    a.par_chunks_mut(group_f128)
         .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
@@ -1764,8 +1770,8 @@ fn generate_round1_inner_octa(
                 }
                 v
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
-                let n_here = z_out.len() / F128_PER_BLOCK;
+            |win, (g, ((a_out, b_out), ab_out))| {
+                let n_here = a_out.len() / F128_PER_BLOCK;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
@@ -1845,7 +1851,9 @@ fn generate_round1_inner_octa(
                         });
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
-                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            (z_addr as *mut u32),
+                            base,
+                            rowpack,
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
                             win_ab,

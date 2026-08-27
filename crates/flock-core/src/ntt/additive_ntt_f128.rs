@@ -1995,15 +1995,25 @@ impl AdditiveNttF128 {
         let src = msg.as_ptr() as usize;
         let dst = codeword.as_mut_ptr() as usize;
         let msg_len = msg.len();
+        // Ranked dump emits z in seed-row order; only the SOURCE rows move.
+        // The codeword stays pos-major (`dst` quarter/r unchanged).
+        let rowpack = crate::pcs::seed_rowpack_live(msg.len());
+        let src_q = if rowpack { 1usize } else { quarter };
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         let use_nt = blocks == 2
             && num_ntts % 8 == 0
             && num_ntts <= kernels::SEED_NT_MAX_NTTS
             && dst % 128 == 0
             && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
-            && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
+            && std::env::var_os("FLOCK_NO_SEED_NT").is_none()
+            && !rowpack;
         let twiddles = &twiddles;
         let seed_row = |r| unsafe {
+            let src_r = if rowpack {
+                crate::pcs::pack_seed_pos(r)
+            } else {
+                r
+            };
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             if use_nt {
                 kernels::seed_fused_2layer_row_group_nt(
@@ -2022,21 +2032,25 @@ impl AdditiveNttF128 {
             // every layer (each layer's twiddle row starts at 0), so it takes
             // the sparse kernel. The remaining blocks reuse the same four
             // source rows, which stay in L1 across the block loop.
-            kernels::butterfly_fused_2layer_row_from_sparse(
+            kernels::butterfly_fused_2layer_row_from_sparse_geo(
                 src as *const F128,
+                src_q,
+                src_r,
                 dst as *mut F128,
                 quarter,
-                num_ntts,
                 r,
+                num_ntts,
                 twiddles[0][2],
             );
             for (b, tw) in twiddles.iter().enumerate().skip(1) {
-                kernels::butterfly_fused_2layer_row_from(
+                kernels::butterfly_fused_2layer_row_from_geo(
                     src as *const F128,
+                    src_q,
+                    src_r,
                     (dst as *mut F128).add(b * msg_len),
                     quarter,
-                    num_ntts,
                     r,
+                    num_ntts,
                     tw,
                 );
             }
@@ -2570,10 +2584,14 @@ impl AdditiveNttF128 {
         //
         // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
         // `bufp` addresses the 512 staging rows that only this task writes.
+        let rowpack = crate::pcs::seed_rowpack_live(msg.len());
+        let src_q = if rowpack { 1usize } else { block_size };
         let seed = |bufp: *mut F128, r: usize| {
             unsafe {
                 let src = src_addr as *const F128;
                 // Seed: 64 row groups → staging rows [block][k].
+                // Under seed-rowpack the four planes `r_s + i·B` are consecutive
+                // physical rows `4·r_s + i`, so HOLD4's src_quarter is 1.
                 //
                 // The four message rows a step reads are asked for a fixed
                 // number of steps ahead. The hints move no data of their own
@@ -2581,10 +2599,11 @@ impl AdditiveNttF128 {
                 #[cfg(target_arch = "x86_64")]
                 if pf_dist != 0 {
                     for k in 0..pf_dist.min(64) {
+                        let rr = r + k * sub_stride;
                         pf_msg_rows(
                             src,
-                            r + k * sub_stride,
-                            block_size,
+                            if rowpack { crate::pcs::pack_seed_pos(rr) } else { rr },
+                            src_q,
                             row_len,
                             pf_lines,
                         );
@@ -2592,6 +2611,11 @@ impl AdditiveNttF128 {
                 }
                 for k in 0..64 {
                     let r_s = r + k * sub_stride;
+                    let src_r = if rowpack {
+                        crate::pcs::pack_seed_pos(r_s)
+                    } else {
+                        r_s
+                    };
                     let kp = perm(k);
                     // One line per lane step from inside the kernel, or the
                     // whole burst up front; never both.
@@ -2599,12 +2623,17 @@ impl AdditiveNttF128 {
                     #[cfg(target_arch = "x86_64")]
                     if pf_dist != 0 && k + pf_dist < 64 {
                         if pf_spread {
-                            pf_next = src.add((r_s + pf_dist * sub_stride) * row_len);
+                            let nxt = r_s + pf_dist * sub_stride;
+                            pf_next = src.add(
+                                (if rowpack { crate::pcs::pack_seed_pos(nxt) } else { nxt })
+                                    * row_len,
+                            );
                         } else {
+                            let nxt = r_s + pf_dist * sub_stride;
                             pf_msg_rows(
                                 src,
-                                r_s + pf_dist * sub_stride,
-                                block_size,
+                                if rowpack { crate::pcs::pack_seed_pos(nxt) } else { nxt },
+                                src_q,
                                 row_len,
                                 pf_lines,
                             );
@@ -2618,8 +2647,8 @@ impl AdditiveNttF128 {
                     if !ntt_seed_hold4_disabled() {
                         kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add(kp * row_len),
                             bufp.add((256 + kp) * row_len),
                             64,
@@ -2631,8 +2660,8 @@ impl AdditiveNttF128 {
                     } else if pf_next.is_null() {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add(kp * row_len),
                             64,
                             0,
@@ -2641,8 +2670,8 @@ impl AdditiveNttF128 {
                         );
                         kernels::butterfly_fused_2layer_row_from_geo(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add((256 + kp) * row_len),
                             64,
                             0,
@@ -2652,8 +2681,8 @@ impl AdditiveNttF128 {
                     } else {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add(kp * row_len),
                             64,
                             0,
@@ -2663,8 +2692,8 @@ impl AdditiveNttF128 {
                         );
                         kernels::butterfly_fused_2layer_row_from_geo(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add((256 + kp) * row_len),
                             64,
                             0,
@@ -2681,8 +2710,8 @@ impl AdditiveNttF128 {
                         if pf_next.is_null() {
                             kernels::butterfly_fused_2layer_row_from_sparse_geo(
                                 src,
-                                block_size,
-                                r_s,
+                                src_q,
+                                src_r,
                                 bufp.add(kp * row_len),
                                 64,
                                 0,
@@ -2692,8 +2721,8 @@ impl AdditiveNttF128 {
                         } else {
                             kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
                                 src,
-                                block_size,
-                                r_s,
+                                src_q,
+                                src_r,
                                 bufp.add(kp * row_len),
                                 64,
                                 0,
@@ -2704,8 +2733,8 @@ impl AdditiveNttF128 {
                         }
                         kernels::butterfly_fused_2layer_row_from_geo(
                             src,
-                            block_size,
-                            r_s,
+                            src_q,
+                            src_r,
                             bufp.add((256 + kp) * row_len),
                             64,
                             0,

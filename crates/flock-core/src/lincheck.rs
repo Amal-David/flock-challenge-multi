@@ -1062,6 +1062,11 @@ fn fold_block_major_gfni(
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
 ) -> Vec<F128> {
     use rayon::prelude::*;
+    let rowpack = crate::pcs::seed_rowpack_live(z_packed.len());
+    let zidx = |outer: usize, q: usize| {
+        crate::pcs::block_major_index(outer, q, chunks_per_block, rowpack)
+    };
+    let row_stride = zidx(1, 0) - zidx(0, 0);
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
     // Same total footprint as the F128 partials (k*16 bytes per worker).
@@ -1150,7 +1155,7 @@ fn fold_block_major_gfni(
                                             core::arch::x86_64::_mm_prefetch(
                                                 z_packed
                                                     .as_ptr()
-                                                    .add((outer_base + r) * chunks_per_block + qn)
+                                                    .add(zidx(outer_base + r, qn))
                                                     .cast::<i8>(),
                                                 core::arch::x86_64::_MM_HINT_T0,
                                             );
@@ -1166,7 +1171,7 @@ fn fold_block_major_gfni(
                                         core::arch::x86_64::_mm_prefetch(
                                             z_packed
                                                 .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
+                                                .add(zidx(next_base + r, q))
                                                 .cast::<i8>(),
                                             core::arch::x86_64::_MM_HINT_T0,
                                         );
@@ -1179,8 +1184,8 @@ fn fold_block_major_gfni(
                             // 1024 writable bytes of `transposed`.
                             unsafe {
                                 kernels::gather_transpose_stripe4_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
-                                    chunks_per_block,
+                                    z_packed.as_ptr().add(zidx(outer_base, q)),
+                                    row_stride,
                                     transposed.as_mut_ptr().add(t * 128),
                                     1024,
                                 );
@@ -1204,7 +1209,7 @@ fn fold_block_major_gfni(
                                                 core::arch::x86_64::_mm_prefetch(
                                                     z_packed
                                                         .as_ptr()
-                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .add(zidx(outer_base + r, qn))
                                                         .cast::<i8>(),
                                                     core::arch::x86_64::_MM_HINT_T0,
                                                 );
@@ -1249,7 +1254,7 @@ fn fold_block_major_gfni(
                                         core::arch::x86_64::_mm_prefetch(
                                             z_packed
                                                 .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
+                                                .add(zidx(next_base + r, q))
                                                 .cast::<i8>(),
                                             core::arch::x86_64::_MM_HINT_T0,
                                         );
@@ -1261,15 +1266,15 @@ fn fold_block_major_gfni(
                             // reads; output is 128 bytes of `transposed`.
                             unsafe {
                                 kernels::gather_transpose_stripe_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
-                                    chunks_per_block,
+                                    z_packed.as_ptr().add(zidx(outer_base, q)),
+                                    row_stride,
                                     transposed.as_mut_ptr().add(t * 128),
                                 );
                             }
                             continue;
                         }
                         let lanes: [F128; 8] = std::array::from_fn(|r| {
-                            z_packed[(outer_base + r) * chunks_per_block + q]
+                            z_packed[zidx(outer_base + r, q)]
                         });
                         transpose_8_f128s_to_128_bytes(
                             &lanes,
@@ -1349,6 +1354,10 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     let n_outer = 1usize << n_log;
     let chunks_per_block = k / 128;
     assert_eq!(z_packed.len(), n_outer * chunks_per_block);
+    let rowpack = crate::pcs::seed_rowpack_live(z_packed.len());
+    let zidx = |outer: usize, q: usize| {
+        crate::pcs::block_major_index(outer, q, chunks_per_block, rowpack)
+    };
     assert!(n_log >= 3, "need n_outer >= 8 for byte groups");
     assert!(useful_bits <= k);
 
@@ -1538,7 +1547,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
                         for t in 0..tile_stripes {
                             let outer_base = 8 * (stripe_base + t);
                             let lanes: [F128; 8] = std::array::from_fn(|r| {
-                                z_packed[(outer_base + r) * chunks_per_block + q]
+                                z_packed[zidx(outer_base + r, q)]
                             });
                             transpose_8_f128s_to_128_bytes(
                                 &lanes,

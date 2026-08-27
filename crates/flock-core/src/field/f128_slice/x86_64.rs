@@ -240,6 +240,58 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// [`fold16_banked`] with seed-row packed positions: row `t` is
+/// `src[pack_seed_pos(start_pos + t) * 64 .. + 64]`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `dst.len() == 4 * n`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold16_banked_packpos(
+    src: &[F128],
+    start_pos: usize,
+    n: usize,
+    dst: &mut [F128],
+    w: &[F128; 16],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use crate::pcs::pack_seed_pos;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(dst.len(), 4 * n);
+    unsafe {
+        let wb: [__m512i; 16] = core::array::from_fn(|b| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        });
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        for slot in 0..n {
+            let row = src.as_ptr().add(pack_seed_pos(start_pos + slot) * 64);
+            // One position: 64 F128 → 4 dests. Same body as fold16_banked at t=0.
+            let mut acc = WideGhashX4::zero();
+            for g in 0..4 {
+                let a0 = _mm512_loadu_si512(row.add(4 * g) as *const __m512i);
+                let a1 = _mm512_loadu_si512(row.add(16 + 4 * g) as *const __m512i);
+                let a2 = _mm512_loadu_si512(row.add(32 + 4 * g) as *const __m512i);
+                let a3 = _mm512_loadu_si512(row.add(48 + 4 * g) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc(u0, wb[4 * g]);
+                acc.mul_acc(u1, wb[4 * g + 1]);
+                acc.mul_acc(u2, wb[4 * g + 2]);
+                acc.mul_acc(u3, wb[4 * g + 3]);
+            }
+            _mm512_storeu_si512(dst.as_mut_ptr().add(4 * slot) as *mut __m512i, acc.reduce_lanes());
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.

@@ -29,7 +29,10 @@ pub mod tensor_algebra;
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
 };
-pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
+pub use pack::{
+    LOG_PACKING, RANKED_N_PACKED, RANKED_SEED_B, block_major_index, pack_seed_pos,
+    pack_witness, seed_rowpack_live, unpack_seed_pos, unpack_witness,
+};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;

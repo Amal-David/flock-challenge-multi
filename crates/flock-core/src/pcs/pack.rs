@@ -28,6 +28,53 @@ pub const LOG_PACKING: usize = 7;
 /// Packing width (number of bits per F_{2^128} element).
 pub const PACKING_WIDTH: usize = 1 << LOG_PACKING;
 
+/// Ranked BLAKE3 `z_packed` length (`m=32`, 64-lane SoA).
+pub const RANKED_N_PACKED: usize = 1 << 25;
+/// Message positions at the ranked shape (`num_ntts = 64`).
+pub const RANKED_N_MSG_POS: usize = RANKED_N_PACKED / 64;
+/// Seed-row group size `B = 2^(log_d − 3)` = `n_msg / 4`.
+pub const RANKED_SEED_B: usize = RANKED_N_MSG_POS / 4;
+
+/// `FLOCK_NO_NTT_SEED_ROWPACK=1` keeps the canonical pos-major dump.
+/// Default ON only at [`RANKED_N_PACKED`]: permute message `pos` so HOLD4's
+/// four rows `r_s + i·B` become four consecutive 1 KiB SoA rows.
+/// Read once per process.
+pub fn seed_rowpack_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_SEED_ROWPACK").is_none()
+    });
+    *ON
+}
+
+/// True only on the ranked dump/seed/lincheck/open shape.
+#[inline]
+pub fn seed_rowpack_live(n_packed: usize) -> bool {
+    n_packed == RANKED_N_PACKED && seed_rowpack_enabled()
+}
+
+/// `pos = r_s + i·B` → physical `4·r_s + i`, `i ∈ 0..4`, `r_s ∈ 0..B`.
+#[inline(always)]
+pub const fn pack_seed_pos(pos: usize) -> usize {
+    ((pos & (RANKED_SEED_B - 1)) << 2) | (pos / RANKED_SEED_B)
+}
+
+/// Inverse of [`pack_seed_pos`].
+#[inline(always)]
+pub const fn unpack_seed_pos(phys: usize) -> usize {
+    (phys >> 2) + (phys & 3) * RANKED_SEED_B
+}
+
+/// Block-major `(outer, q)` F128 index. `q ∈ 0..128` is two 64-lane NTT rows.
+#[inline(always)]
+pub fn block_major_index(outer: usize, q: usize, chunks_per_block: usize, rowpack: bool) -> usize {
+    if !rowpack {
+        return outer * chunks_per_block + q;
+    }
+    debug_assert_eq!(chunks_per_block, 128);
+    let pos = 2 * outer + q / 64;
+    pack_seed_pos(pos) * 64 + (q % 64)
+}
+
 /// Pack a Boolean witness `z` of length `2^m` into `2^(m − LOG_PACKING)`
 /// F_{2^128} elements.
 ///
