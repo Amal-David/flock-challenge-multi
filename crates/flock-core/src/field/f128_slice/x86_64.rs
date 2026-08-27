@@ -44,8 +44,7 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
     debug_assert_eq!(dst.len(), addend.len());
     // SAFETY: caller supplies target features and equal slice lengths.
     unsafe {
-        let scale_x4 =
-            _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
         let lanes = dst.len() & !3;
         let mut i = 0usize;
         while i < lanes {
@@ -255,7 +254,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4, WideGhashX4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(f.len(), b.len());
@@ -315,11 +314,9 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         while t < half {
             let source = 2 * t;
             let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
-            let f1 = *f_ptr.add(source + 2)
-                + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
+            let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
             let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let b1 = *b_ptr.add(source + 2)
-                + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
             *f_ptr.add(t) = f0;
             *f_ptr.add(t + 1) = f1;
             *b_ptr.add(t) = b0;
@@ -383,8 +380,8 @@ pub(super) unsafe fn msg_split_half(
     zlo: &[F128],
     n: usize,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
     use crate::field::gf2_128::F256Unreduced;
+    use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees features and that every slice covers `n`.
@@ -399,10 +396,7 @@ pub(super) unsafe fn msg_split_half(
             e1_wide.mul_acc(ch, zh);
             let cl = _mm512_loadu_si512(clo.as_ptr().add(i) as *const __m512i);
             let zl = _mm512_loadu_si512(zlo.as_ptr().add(i) as *const __m512i);
-            einf_wide.mul_acc(
-                _mm512_xor_si512(ch, cl),
-                _mm512_xor_si512(zh, zl),
-            );
+            einf_wide.mul_acc(_mm512_xor_si512(ch, cl), _mm512_xor_si512(zh, zl));
             i += 4;
         }
         let mut e1_acc = F256Unreduced::ZERO;
@@ -442,8 +436,8 @@ pub(super) unsafe fn bind_both_and_msg_split(
     r: F128,
     n: usize,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4, WideGhashX4};
     use crate::field::gf2_128::F256Unreduced;
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees features and that every slice covers `n`.
@@ -474,10 +468,7 @@ pub(super) unsafe fn bind_both_and_msg_split(
             _mm512_storeu_si512(zq1.as_mut_ptr().add(i) as *mut __m512i, zhi);
 
             e1_wide.mul_acc(hi, zhi);
-            einf_wide.mul_acc(
-                _mm512_xor_si512(hi, lo),
-                _mm512_xor_si512(zhi, zlo),
-            );
+            einf_wide.mul_acc(_mm512_xor_si512(hi, lo), _mm512_xor_si512(zhi, zlo));
             i += 4;
         }
         let mut e1_acc = F256Unreduced::ZERO;
