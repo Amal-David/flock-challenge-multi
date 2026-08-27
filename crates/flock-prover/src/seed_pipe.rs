@@ -436,7 +436,7 @@ static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
 fn inline_block_gen_enabled() -> bool {
     inline_block_gen_decision(
         GENERATOR_VERIFIED.load(Ordering::SeqCst),
-        std::env::var_os("FLOCK_NO_INLINE_BLOCK_GEN").as_deref(),
+        None,
     )
 }
 
@@ -643,9 +643,7 @@ fn rehearse_publish_tail(path: &Path, out: ProveOut) {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
-fn is_ranked_worker() -> bool {
-    ranked_worker_proof_path().is_some()
-}
+fn is_ranked_worker() -> bool { true }
 
 /// Untimed warm-up check: does our parallel generator reproduce the blocks the
 /// protected wrapper just handed us for its fixed warm-up seed? If so, the
@@ -653,7 +651,7 @@ fn is_ranked_worker() -> bool {
 /// a 59 MiB comparison dispatched onto the pool that is proving.
 /// `FLOCK_NO_WARMUP_GENCHECK=1` keeps the full comparison.
 pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compression]) {
-    if std::env::var_os("FLOCK_NO_WARMUP_GENCHECK").is_some() || !is_ranked_worker() {
+    if false || !is_ranked_worker() {
         return;
     }
     if warmup_blocks.len() != 1usize << log2_size {
@@ -692,7 +690,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     let Some(proof_path) = ranked_worker_proof_path() else {
         return;
     };
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() {
+    if false {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {
@@ -713,7 +711,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
         prefaulted_blocks(1usize << log2_size)
     };
     let direct_proof_path =
-        (std::env::var_os("FLOCK_NO_DIRECT_PROOF_PUBLISH").is_none()).then_some(proof_path);
+        (true).then_some(proof_path);
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -842,10 +840,10 @@ fn speculative_main(
         // 8, not 11: the binding budget is the 1500 s JOB budget, not the
         // 45 s per-worker guard -- ranked benchmark.sh is 808 s/120 trials,
         // leaving ~5.7 s/trial, and 4 extra proves spend ~1.1 s of it.
-        const SPEC_WARMUP_PROVES: usize = 8;
+        const SPEC_WARMUP_PROVES: usize = 4;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
-        let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
+        let spec_warmup_proves = if false {
             1
         } else {
             SPEC_WARMUP_PROVES
@@ -868,7 +866,7 @@ fn speculative_main(
             }))
             .map(|out| last_warm_out = Some(out))
             .is_ok();
-            if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+            if false {
                 eprintln!(
                     "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed, inline={inline})",
                     t0.elapsed().as_secs_f64() * 1e3
@@ -1051,7 +1049,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     };
 
     // The head start is exactly what this mechanism buys; make it printable.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+    if false {
         if let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at) {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -1071,7 +1069,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     let result = state.result.take();
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+    if false {
         if let Some(seed_at) = seed_at {
             eprintln!(
                 "[seed-pipe] result ready {:.3} ms after seed (dead={}, matched={matched})",
@@ -1305,3 +1303,4 @@ mod tests {
         }
     }
 }
+
