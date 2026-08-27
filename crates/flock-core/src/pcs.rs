@@ -422,7 +422,11 @@ fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
         let period = 3 * stride;
         for block in (0..values.len()).step_by(period) {
             for offset in 0..stride {
-                let indices = [block + offset, block + stride + offset, block + 2 * stride + offset];
+                let indices = [
+                    block + offset,
+                    block + stride + offset,
+                    block + 2 * stride + offset,
+                ];
                 let coefficients = quadratic_coefficients([
                     values[indices[0]],
                     values[indices[1]],
@@ -535,10 +539,7 @@ pub(crate) fn messages_from_direct_products_fold4(
 /// Selected banks always form a subcube, so the product sum iterates set
 /// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
 /// F128 adds total — scalar-negligible).
-fn direct_fold8_message_coefficients(
-    h: &[F128; 4096],
-    round: usize,
-) -> (Vec<F128>, Vec<F128>) {
+fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F128>, Vec<F128>) {
     debug_assert!(round < 6);
     let grid_len = 3usize.pow(round as u32);
     let mut endpoints = vec![F128::ZERO; 2 * grid_len];
@@ -698,7 +699,6 @@ fn direct_ab_claim_mix_supported(
                 && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
     )
 }
-
 
 #[inline]
 fn direct_all_claim_mix_supported(
@@ -939,16 +939,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = direct_fold8
-        .as_ref()
-        .map_or_else(
-            || {
-                direct_fold4
-                    .as_ref()
-                    .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
-            },
-            Vec::len,
-        );
+    let direct_count = direct_fold8.as_ref().map_or_else(
+        || {
+            direct_fold4
+                .as_ref()
+                .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
+        },
+        Vec::len,
+    );
 
     let direct_c_stats = if use_direct_c {
         match &rs_results[1].1.rs_eq_ind {
@@ -1013,15 +1011,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let mut b_combined: Vec<F128> = if use_direct_c
-        || use_direct_all
-        || use_direct_fold4
-        || use_direct_fold8
-    {
-        Vec::new()
-    } else {
-        crate::scratch::take_f128(l)
-    };
+    let mut b_combined: Vec<F128> =
+        if use_direct_c || use_direct_all || use_direct_fold4 || use_direct_fold8 {
+            Vec::new()
+        } else {
+            crate::scratch::take_f128(l)
+        };
     crate::gaptime::mark("open: b_combined taken");
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
@@ -1041,129 +1036,121 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && rs_deferred.len() + direct_count == rs_results.len()
         && pd_dense.is_empty();
 
-    let ((mut round0_u0, mut round0_u2), mut round1_lookahead) =
-        in_wide_combine_pool(l, || if use_direct_fold8 {
-        // M0 comes from the cached factor-state statistics below; subsequent
-        // initial messages are generated online after each sampled challenge.
-        ((F128::ZERO, F128::ZERO), None)
-    } else if use_direct_fold4 {
-        // All four initial messages come from retained product matrices.
-        ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
-    } else if use_direct_all {
-        ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
-    } else if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
-        let (prime, lookahead) = deferred_stats_lookahead(
-            packed_witness,
-            eq_lo,
-            eq_hi,
-            table,
-        );
-        (prime, Some(lookahead))
-    } else if use_fast {
-        let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
-        debug_assert!(b >= 2 && b.is_multiple_of(2));
-        debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        // aarch64 ranked path: accumulate the leading claims into a 64 KiB
-        // per-task stage and publish the final (s0, s1) pairs with `stnp q,q`
-        // (see `fused_fast_combine_staged_nt`) — kills the 512 MiB
-        // write-allocate read on the cold b_combined lines. Value-identical
-        // to `fused_fast_combine`; `FLOCK_NO_BCOMB_NT` is a local-diagnostics
-        // escape hatch (the ranked worker's cleared environment never sets it).
-        // COMBINE-MERGE AUTOPSY (2026-07-28, M4 Max, m=32, b=4096, paired
-        // same-session A/B, PCS_TRACE combine ms over 6 opens each):
-        //   staged two-pass (this default):        22.3-27.0 ms
-        //   fused2 single-pass (no stage, static
-        //     tables, 2 mult+fold per elem):        25.5-27.5 ms
-        //   merged (per-block composed tables,
-        //     0 mults, 1 fused pass):               33.3-42.0 ms
-        // The phase sits at the ONE-64KiB-table-live L1 floor: co-residing
-        // both claims' random-access tables (128 KiB = all of L1d, on top of
-        // the eq_lo/witness streams) thrashes, and the merged kernel's
-        // per-block 128 KiB table rebuild adds stores that dwarf the two
-        // saved GF mults/elem. Fewer fold evaluations per element is
-        // algebraically impossible for the production claim pair: the ab
-        // point (lincheck + AB-sumcheck challenges) and the c point (the
-        // zerocheck eq challenge r_rest) share no coordinates, so the two
-        // folds never share an argument (see fused_fast_combine_merged_nt
-        // docs for the exact non-commuting step). FLOCK_COMBINE_MERGE=1
-        // opts back into the merged kernel for re-measurement.
-        #[cfg(target_arch = "aarch64")]
-        let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
-            if rs_deferred.len() <= 2
-                && b >= MERGE_MIN_BLOCK
-                && std::env::var_os("FLOCK_COMBINE_MERGE").is_some()
-            {
-                fused_fast_combine_merged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
-            } else {
-                fused_fast_combine_staged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
-            }
-        } else {
-            fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b)
-        };
-        #[cfg(not(target_arch = "aarch64"))]
-        let (prime, lookahead) = if use_direct_ab {
-            let (prime, lookahead) = fused_fast_combine_lookahead(
-                &mut b_combined,
-                packed_witness,
-                &rs_deferred,
-                b,
-            );
+    let ((mut round0_u0, mut round0_u2), mut round1_lookahead) = in_wide_combine_pool(l, || {
+        if use_direct_fold8 {
+            // M0 comes from the cached factor-state statistics below; subsequent
+            // initial messages are generated online after each sampled challenge.
+            ((F128::ZERO, F128::ZERO), None)
+        } else if use_direct_fold4 {
+            // All four initial messages come from retained product matrices.
+            ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
+        } else if use_direct_all {
+            ((F128::ZERO, F128::ZERO), Some([F128::ZERO; 6]))
+        } else if let Some((eq_lo, eq_hi, table)) = direct_c_stats {
+            let (prime, lookahead) = deferred_stats_lookahead(packed_witness, eq_lo, eq_hi, table);
             (prime, Some(lookahead))
+        } else if use_fast {
+            let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
+            debug_assert!(b >= 2 && b.is_multiple_of(2));
+            debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+            // aarch64 ranked path: accumulate the leading claims into a 64 KiB
+            // per-task stage and publish the final (s0, s1) pairs with `stnp q,q`
+            // (see `fused_fast_combine_staged_nt`) — kills the 512 MiB
+            // write-allocate read on the cold b_combined lines. Value-identical
+            // to `fused_fast_combine`; `FLOCK_NO_BCOMB_NT` is a local-diagnostics
+            // escape hatch (the ranked worker's cleared environment never sets it).
+            // COMBINE-MERGE AUTOPSY (2026-07-28, M4 Max, m=32, b=4096, paired
+            // same-session A/B, PCS_TRACE combine ms over 6 opens each):
+            //   staged two-pass (this default):        22.3-27.0 ms
+            //   fused2 single-pass (no stage, static
+            //     tables, 2 mult+fold per elem):        25.5-27.5 ms
+            //   merged (per-block composed tables,
+            //     0 mults, 1 fused pass):               33.3-42.0 ms
+            // The phase sits at the ONE-64KiB-table-live L1 floor: co-residing
+            // both claims' random-access tables (128 KiB = all of L1d, on top of
+            // the eq_lo/witness streams) thrashes, and the merged kernel's
+            // per-block 128 KiB table rebuild adds stores that dwarf the two
+            // saved GF mults/elem. Fewer fold evaluations per element is
+            // algebraically impossible for the production claim pair: the ab
+            // point (lincheck + AB-sumcheck challenges) and the c point (the
+            // zerocheck eq challenge r_rest) share no coordinates, so the two
+            // folds never share an argument (see fused_fast_combine_merged_nt
+            // docs for the exact non-commuting step). FLOCK_COMBINE_MERGE=1
+            // opts back into the merged kernel for re-measurement.
+            #[cfg(target_arch = "aarch64")]
+            let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
+                if rs_deferred.len() <= 2
+                    && b >= MERGE_MIN_BLOCK
+                    && std::env::var_os("FLOCK_COMBINE_MERGE").is_some()
+                {
+                    fused_fast_combine_merged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+                } else {
+                    fused_fast_combine_staged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+                }
+            } else {
+                fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b)
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let (prime, lookahead) = if use_direct_ab {
+                let (prime, lookahead) =
+                    fused_fast_combine_lookahead(&mut b_combined, packed_witness, &rs_deferred, b);
+                (prime, Some(lookahead))
+            } else {
+                (
+                    fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b),
+                    None,
+                )
+            };
+            #[cfg(target_arch = "aarch64")]
+            let lookahead = None;
+            (prime, lookahead)
         } else {
-            (
-                fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b),
-                None,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let lookahead = None;
-        (prime, lookahead)
-    } else {
-        // General path (mixed / sparse / packed-direct): materialize any
-        // deferred-dense claims (parallel block fold), then the per-element
-        // combine over all dense buffers + packed-direct, matching the
-        // original behavior.
-        let materialized: Vec<Vec<F128>> = rs_results
-            .iter()
-            .filter_map(|(_, o)| match &o.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
-                _ => None,
-            })
-            .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
-        rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
-        let prime = b_combined
-            .par_chunks_mut(2)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let mut b0 = F128::ZERO;
-                let mut b1 = F128::ZERO;
-                for v in rs_dense_all.iter() {
-                    b0 += v[2 * i];
-                    b1 += v[2 * i + 1];
-                }
-                for (v, g) in pd_dense.iter() {
-                    b0 += *g * v[2 * i];
-                    b1 += *g * v[2 * i + 1];
-                }
-                chunk[0] = b0;
-                chunk[1] = b1;
-                let a0 = packed_witness[2 * i];
-                let a1 = packed_witness[2 * i + 1];
-                (a0 * b0, (a0 + a1) * (b0 + b1))
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            );
-        for v in materialized {
-            crate::scratch::give_f128(v);
+            // General path (mixed / sparse / packed-direct): materialize any
+            // deferred-dense claims (parallel block fold), then the per-element
+            // combine over all dense buffers + packed-direct, matching the
+            // original behavior.
+            let materialized: Vec<Vec<F128>> = rs_results
+                .iter()
+                .filter_map(|(_, o)| match &o.rs_eq_ind {
+                    ring_switch::RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                    } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                    _ => None,
+                })
+                .collect();
+            let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+            rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
+            let prime = b_combined
+                .par_chunks_mut(2)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut b0 = F128::ZERO;
+                    let mut b1 = F128::ZERO;
+                    for v in rs_dense_all.iter() {
+                        b0 += v[2 * i];
+                        b1 += v[2 * i + 1];
+                    }
+                    for (v, g) in pd_dense.iter() {
+                        b0 += *g * v[2 * i];
+                        b1 += *g * v[2 * i + 1];
+                    }
+                    chunk[0] = b0;
+                    chunk[1] = b1;
+                    let a0 = packed_witness[2 * i];
+                    let a1 = packed_witness[2 * i + 1];
+                    (a0 * b0, (a0 + a1) * (b0 + b1))
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                );
+            for v in materialized {
+                crate::scratch::give_f128(v);
+            }
+            (prime, None)
         }
-        (prime, None)
     });
     crate::gaptime::mark("open: combine kernel done");
 
@@ -2091,15 +2078,10 @@ mod tests {
                 })
                 .collect();
             let mut got_basis = vec![F128::ZERO; l];
-            let (got_round0, got_lookahead) = fused_fast_combine_lookahead(
-                &mut got_basis,
-                &packed_witness,
-                &deferred,
-                b,
-            );
+            let (got_round0, got_lookahead) =
+                fused_fast_combine_lookahead(&mut got_basis, &packed_witness, &deferred, b);
             let mut want_basis = vec![F128::ZERO; l];
-            let want_round0 =
-                fused_fast_combine(&mut want_basis, &packed_witness, &deferred, b);
+            let want_round0 = fused_fast_combine(&mut want_basis, &packed_witness, &deferred, b);
             let (oracle_round0, oracle_lookahead) =
                 round0_and_round1_lookahead(&packed_witness, &want_basis);
             assert_eq!(got_basis, want_basis);
@@ -2169,10 +2151,7 @@ mod tests {
             *out += value;
         }
         assert_eq!(
-            messages_from_direct_products(&[
-                make_factors(products_ab),
-                make_factors(products_c),
-            ]),
+            messages_from_direct_products(&[make_factors(products_ab), make_factors(products_c),]),
             round0_and_round1_lookahead(&witness, &combined_basis),
         );
     }
@@ -2223,7 +2202,10 @@ mod tests {
                 fused_fast_combine_merged_nt(&mut b_merged, &packed_witness, &rs_deferred, b);
 
             assert_eq!(b_ref, b_merged, "b={b} n_hi={n_hi} claims={n_claims}");
-            assert_eq!(prime_ref, prime_merged, "b={b} n_hi={n_hi} claims={n_claims}");
+            assert_eq!(
+                prime_ref, prime_merged,
+                "b={b} n_hi={n_hi} claims={n_claims}"
+            );
 
             let mut b_staged = vec![F128::ZERO; l];
             let prime_staged =
