@@ -95,19 +95,26 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
         );
 
     // One transpose back to F128 columns at the very end.
-    let mut out = vec![F128::ZERO; k];
+    let mut out = crate::alloc_uninit_f128_vec(k);
     for b in 0..k / 64 {
         let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
+        for g in 0..8 {
+            let mut r_lo = [0u64; 8];
+            let mut r_hi = [0u64; 8];
             for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                let off_lo = base + byte * 64 + g * 8;
+                let off_hi = base + (byte + 8) * 64 + g * 8;
+                r_lo[byte] = u64::from_le_bytes(planes[off_lo..off_lo + 8].try_into().unwrap());
+                r_hi[byte] = u64::from_le_bytes(planes[off_hi..off_hi + 8].try_into().unwrap());
             }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+            let t_lo = crate::lincheck::transpose_8x8_bytes(r_lo);
+            let t_hi = crate::lincheck::transpose_8x8_bytes(r_hi);
+            for c in 0..8 {
+                out[b * 64 + g * 8 + c] = F128 {
+                    lo: t_lo[c],
+                    hi: t_hi[c],
+                };
             }
-            out[b * 64 + col] = F128 { lo, hi };
         }
     }
     out

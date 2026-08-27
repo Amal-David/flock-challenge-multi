@@ -1043,6 +1043,29 @@ fn fold_untimed_enabled() -> bool {
 /// past `useful_bits` land on index bytes that are ZERO in memory (r1cs
 /// zero padding) through a linear map with no constant — contributing
 /// nothing, exactly like the masked stores they replace.
+#[inline(always)]
+pub(crate) fn transpose_8x8_bytes(mut r: [u64; 8]) -> [u64; 8] {
+    const M1: u64 = 0x00FF00FF00FF00FF;
+    for i in (0..8).step_by(2) {
+        let t = ((r[i] >> 8) ^ r[i + 1]) & M1;
+        r[i + 1] ^= t;
+        r[i] ^= t << 8;
+    }
+    const M2: u64 = 0x0000FFFF0000FFFF;
+    for i in [0, 1, 4, 5] {
+        let t = ((r[i] >> 16) ^ r[i + 2]) & M2;
+        r[i + 2] ^= t;
+        r[i] ^= t << 16;
+    }
+    const M4: u64 = 0x00000000FFFFFFFF;
+    for i in 0..4 {
+        let t = ((r[i] >> 32) ^ r[i + 4]) & M4;
+        r[i + 4] ^= t;
+        r[i] ^= t << 32;
+    }
+    r
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1300,7 +1323,7 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
+    let mut out = crate::alloc_uninit_f128_vec(k);
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
@@ -1313,16 +1336,23 @@ fn fold_block_major_gfni(
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
-        for (col, slot) in o.iter_mut().enumerate() {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+        for g in 0..8 {
+            let mut r_lo = [0u64; 8];
+            let mut r_hi = [0u64; 8];
+            for b in 0..8 {
+                let off_lo = b * 64 + g * 8;
+                let off_hi = (b + 8) * 64 + g * 8;
+                r_lo[b] = u64::from_le_bytes(acc[off_lo..off_lo + 8].try_into().unwrap());
+                r_hi[b] = u64::from_le_bytes(acc[off_hi..off_hi + 8].try_into().unwrap());
             }
-            for byte in 8..16 {
-                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+            let t_lo = transpose_8x8_bytes(r_lo);
+            let t_hi = transpose_8x8_bytes(r_hi);
+            for c in 0..8 {
+                o[g * 8 + c] = F128 {
+                    lo: t_lo[c],
+                    hi: t_hi[c],
+                };
             }
-            *slot = F128 { lo, hi };
         }
     });
     out
