@@ -14,6 +14,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Runtime check: is the AVX2 instruction set available on this CPU?
+///
+/// Used by the BLAKE3 Merkle parent-node compress helper in `crate::merkle`
+/// to gate the `#[target_feature(enable = "avx2")]` 2-way interleaved
+/// compress kernel. Falls back to the crate-default `blake3::platform`
+/// batched path on CPUs without AVX2. `is_x86_feature_detected!` is a
+/// one-time `cpuid` cached by libstd, so the branch is effectively free
+/// after the first call. No-op (`false`) on non-x86_64 targets.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx2_detected() -> bool {
+    is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn avx2_detected() -> bool {
+    false
+}
+
 /// Which hash function backs a component.
 ///
 /// `Sha256` is the default, so existing serialized params and configs that
