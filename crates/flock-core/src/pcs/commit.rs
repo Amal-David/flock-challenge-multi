@@ -19,8 +19,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -315,12 +315,8 @@ fn finalize_commit(
     // upper-level build runs — those levels are simply rewritten, so a partial
     // local fold is never wrong, only wasted.
     let subtree_parents = subtree_parents_enabled();
-    let regroup_subtree_parents = subtree_parent_regroup_enabled(
-        n_leaves,
-        num_ntts,
-        leaf_size,
-        kind,
-    );
+    let regroup_subtree_parents =
+        subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
@@ -518,8 +514,7 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
         // delete.
         let mut best: Option<usize> = None;
         for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= total_nodes
-                && best.is_none_or(|b| v.capacity() < pool[b].capacity())
+            if v.capacity() >= total_nodes && best.is_none_or(|b| v.capacity() < pool[b].capacity())
             {
                 best = Some(i);
             }
@@ -654,9 +649,8 @@ fn cpu_join_hash_leaves(
 /// (exact A/B control: the full upper-level build then runs as before).
 /// Resolved once per process.
 pub(crate) fn subtree_parents_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none());
     *ON
 }
 
@@ -688,9 +682,8 @@ fn subtree_parent_regroup_enabled(
     leaf_size: usize,
     kind: HashKind,
 ) -> bool {
-    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some()
-    });
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some());
     subtree_parent_regroup_selected(n_leaves, num_ntts, leaf_size, kind, *DISABLED)
 }
 
@@ -773,15 +766,12 @@ pub(crate) fn fused_encode_leaves_subtree(
             return;
         }
         let len = range.len();
-        let depth = if len.is_power_of_two()
-            && len >= 2
-            && range.start % len == 0
-            && n_leaves % len == 0
-        {
-            len.trailing_zeros() as usize
-        } else {
-            0
-        };
+        let depth =
+            if len.is_power_of_two() && len >= 2 && range.start % len == 0 && n_leaves % len == 0 {
+                len.trailing_zeros() as usize
+            } else {
+                0
+            };
         let seen = match local_levels.compare_exchange(
             usize::MAX,
             depth,
@@ -1232,41 +1222,11 @@ mod tests {
             false,
         ));
         for selected in [
-            subtree_parent_regroup_selected(
-                (1 << 20) - 1,
-                64,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                32,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                512,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Sha256,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Blake3,
-                true,
-            ),
+            subtree_parent_regroup_selected((1 << 20) - 1, 64, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 32, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 512, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Sha256, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Blake3, true),
         ] {
             assert!(!selected);
         }
@@ -1281,10 +1241,7 @@ mod tests {
             Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
         );
         let unexpected = 0..256;
-        assert_eq!(
-            local_parent_fold_range(&unexpected, true),
-            Some(unexpected),
-        );
+        assert_eq!(local_parent_fold_range(&unexpected, true), Some(unexpected),);
 
         const N_LEAVES: usize = 2 * RANKED_PARENT_SUBGROUP_LEAVES;
         const LEAF_SIZE: usize = 1024;
@@ -1343,10 +1300,8 @@ mod tests {
             }
             calls
         };
-        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES)
-            + platform_calls(8_192);
-        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES)
-            + platform_calls(512);
+        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES) + platform_calls(8_192);
+        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES) + platform_calls(512);
         assert_eq!(
             (old_calls, new_calls, old_calls - new_calls),
             (90_627, 67_107, 23_520),
@@ -1414,10 +1369,20 @@ mod tests {
                 let mut cw_b = vec![F128::new(u64::MAX, u64::MAX); n_leaves * num_ntts];
                 let mut tree_b: Vec<Hash> = vec![[0xAAu8; 32]; 2 * n_leaves - 1];
                 let folded = fused_encode_leaves_subtree(
-                    &ntt, &msg, &mut cw_b, num_ntts, &mut tree_b, n_leaves, leaf, kind,
+                    &ntt,
+                    &msg,
+                    &mut cw_b,
+                    num_ntts,
+                    &mut tree_b,
+                    n_leaves,
+                    leaf,
+                    kind,
                 );
                 build_upper_levels(&mut tree_b, n_leaves, n_leaves >> folded, kind);
-                assert_eq!(cw_a, cw_b, "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}");
+                assert_eq!(
+                    cw_a, cw_b,
+                    "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}"
+                );
                 assert_eq!(
                     tree_a, tree_b,
                     "tree log_d={log_d} n={num_ntts} rate={log_inv_rate} kind={kind:?} folded={folded}"
@@ -1425,7 +1390,6 @@ mod tests {
             }
         }
     }
-
 
     use super::*;
 
