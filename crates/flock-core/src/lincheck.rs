@@ -2325,6 +2325,65 @@ pub fn prepare_last_rho_z_fold(
     LastRhoZFoldGuard
 }
 
+/// `FLOCK_NO_LC_SMT_PIN=1` leaves the leftover z-fold helper unpinned.
+/// Default: pin it to an allowed secondary SMT sibling so it cannot migrate
+/// onto a primary Rayon worker. Fail-open if topology/affinity is missing.
+/// Read once per helper thread (the env latch is process-lifetime).
+#[cfg(target_os = "linux")]
+fn lc_smt_pin_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SMT_PIN").is_none());
+    *ON
+}
+
+#[cfg(target_os = "linux")]
+fn pin_last_rho_to_secondary_smt() {
+    if !lc_smt_pin_enabled() {
+        return;
+    }
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
+    }
+
+    let mut allowed = [0u64; 16];
+    // SAFETY: valid 1024-bit output mask for this helper thread.
+    if unsafe {
+        sched_getaffinity(0, core::mem::size_of_val(&allowed), allowed.as_mut_ptr())
+    } != 0
+    {
+        return;
+    }
+    // The topology pool selects the lower-numbered CPU of each sibling pair
+    // first. Find an allowed CPU which is not that pair's first member.
+    let cpu = (0..1024).find(|&cpu| {
+        if allowed[cpu / 64] & (1u64 << (cpu % 64)) == 0 {
+            return false;
+        }
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        );
+        let Ok(list) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let first = list
+            .trim()
+            .split([',', '-'])
+            .next()
+            .and_then(|s| s.parse::<usize>().ok());
+        first.is_some_and(|first| first != cpu)
+    });
+    let Some(cpu) = cpu else {
+        return;
+    };
+    let mut mask = [0u64; 16];
+    mask[cpu / 64] = 1u64 << (cpu % 64);
+    // SAFETY: this changes affinity only for the calling helper thread.
+    unsafe {
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+    }
+}
+
 /// Start today's one-shot z-fold. Compute only — no observe/sample.
 ///
 /// No-op unless this thread prepared a BlockMajor fold **and** `mlv` is
@@ -2361,6 +2420,12 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let handle = std::thread::Builder::new()
         .name("flock-last-rho-z-fold".into())
         .spawn(move || {
+            // The global Rayon pool orders primary hardware threads before
+            // SMT siblings. Keep this overlap helper on an allowed secondary
+            // sibling so it cannot migrate across a primary prover worker.
+            #[cfg(target_os = "linux")]
+            pin_last_rho_to_secondary_smt();
+
             // SAFETY: [`prepare_last_rho_z_fold`] contract — `z` is live,
             // unmutated, and not aliased for writes (`C` aliases `z` but
             // the leftover fold starts after the last ρ, when C is no

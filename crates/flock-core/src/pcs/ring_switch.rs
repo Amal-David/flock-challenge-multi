@@ -2722,6 +2722,16 @@ fn direct_fold8_states_seq(
 /// independent (each is a pure function of its own `low_eq[d]` / bank
 /// stripe), the bit-major gather writes disjoint 64-lane rows, and the
 /// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
+/// `FLOCK_NO_RS_STATES_INPLACE=1` restores the join + 128 row-`Vec`s form.
+/// Default writes bit-major in place (two full-width par regions, no join,
+/// no 2 KiB row mallocs). Value-identical: each lane/bit slot is a pure
+/// function of one `d_low` / bank stripe. Read once per process.
+fn rs_states_inplace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_STATES_INPLACE").is_none());
+    *ON
+}
+
 fn direct_fold8_states_par(
     fold8: &[F128],
     low_eq: &[F128; 64],
@@ -2729,41 +2739,80 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
+    if !rs_states_inplace_enabled() {
+        let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|d_low| {
+                        let mut row = Vec::with_capacity(n_packed);
+                        let mut basis_product = low_eq[d_low];
                         row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                .collect()
-        },
-    );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    w_state
-        .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
-        .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
-            for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
-                a_row[lane] = a_rows[lane][bit];
+                        for _ in 1..n_packed {
+                            basis_product = crate::field::mul_by_x(basis_product);
+                            row.push(fold_one_slot(basis_product, table));
+                        }
+                        row
+                    })
+                    .collect()
+            },
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
+                    .collect()
+            },
+        );
+        let mut w_state = vec![F128::ZERO; 64 * n_packed];
+        let mut a_state = vec![F128::ZERO; 64 * n_packed];
+        w_state
+            .par_chunks_mut(64)
+            .zip(a_state.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(bit, (w_row, a_row))| {
+                for lane in 0..64 {
+                    w_row[lane] = w_rows[lane][bit];
+                    a_row[lane] = a_rows[lane][bit];
+                }
+            });
+        let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+        return (a_state, w_state, round0);
+    }
+
+    // In-place bit-major: each `d_low` writes column `d_low` of `w_state`,
+    // each bank `e` writes column `e` of `a_state`. Disjoint stores, so the
+    // two regions can run at full width one after the other without a join
+    // and without 128 intermediate 2 KiB row allocations.
+    let mut w_state = crate::scratch::take_f128(64 * n_packed);
+    let mut a_state = crate::scratch::take_f128(64 * n_packed);
+    let wp = w_state.as_mut_ptr() as usize;
+    let ap = a_state.as_mut_ptr() as usize;
+    let low = *low_eq;
+    (0..64usize).into_par_iter().for_each(|d_low| {
+        let w = wp as *mut F128;
+        let mut basis_product = low[d_low];
+        // SAFETY: unique writer for column `d_low`; every slot of that
+        // column is written before `w_state` is read below.
+        unsafe {
+            *w.add(d_low) = fold_one_slot(basis_product, table);
+        }
+        for bit in 1..n_packed {
+            basis_product = crate::field::mul_by_x(basis_product);
+            unsafe {
+                *w.add(bit * 64 + d_low) = fold_one_slot(basis_product, table);
             }
-        });
+        }
+    });
+    (0..64usize).into_par_iter().for_each(|e| {
+        let a = ap as *mut F128;
+        let row = tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]);
+        for (bit, value) in row.into_iter().enumerate() {
+            // SAFETY: unique writer for column `e`.
+            unsafe {
+                *a.add(bit * 64 + e) = value;
+            }
+        }
+    });
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }

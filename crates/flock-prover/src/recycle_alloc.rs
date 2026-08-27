@@ -4,6 +4,14 @@
 //! returned to the system allocator. The ranked worker performs an untimed warm proof
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
+//!
+//! Ranked default also parks 1 KiB..32 KiB exact-size classes (`FLOCK_NO_RECYCLE_SMALL=1`
+//! restores the 32 KiB floor). Those sizes are the remaining 16-mod-64 ZMM
+//! scratch (16 KiB GFNI SoA rows, 1 KiB opened-row gathers, 4–16 KiB induce
+//! windows): under the 32 KiB gate they go to glibc and land 16 mod 64, so
+//! every wide load/store is a cache-line split. The latch is only armed on a
+//! 1 KiB..32 KiB allocation; `var_os` itself allocates tinier and takes the
+//! System arm, so initialization cannot re-enter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -13,6 +21,7 @@ use std::sync::atomic::{
 };
 
 const RECYCLE_MIN: usize = 32 * 1024;
+const RECYCLE_SMALL: usize = 1024;
 const MAX_ALIGN: usize = 16;
 const MAX_CLASSES: usize = 512;
 
@@ -61,9 +70,26 @@ fn find_class(size: usize, insert: bool) -> Option<usize> {
     None
 }
 
+/// `FLOCK_NO_RECYCLE_SMALL=1` keeps the 32 KiB floor. Latched only from a
+/// mid-size allocation (see module docs).
+#[inline]
+fn recycle_small_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_RECYCLE_SMALL").is_none())
+}
+
 #[inline]
 fn recyclable(layout: &Layout) -> bool {
-    layout.size() >= RECYCLE_MIN && layout.align() <= MAX_ALIGN
+    if layout.align() > MAX_ALIGN {
+        return false;
+    }
+    if layout.size() >= RECYCLE_MIN {
+        return true;
+    }
+    if layout.size() < RECYCLE_SMALL {
+        return false;
+    }
+    recycle_small_enabled()
 }
 
 /// `FLOCK_NO_ALIGN64=1` restores raw System pointers for the recyclable
