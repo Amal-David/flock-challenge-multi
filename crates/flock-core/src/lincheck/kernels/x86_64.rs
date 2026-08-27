@@ -95,22 +95,99 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
         );
 
     // One transpose back to F128 columns at the very end.
-    let mut out = vec![F128::ZERO; k];
+    let mut out = crate::alloc_uninit_vec::<F128>(k);
     for b in 0..k / 64 {
         let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
-            }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            out[b * 64 + col] = F128 { lo, hi };
+        unsafe {
+            unpack_16_planes_64_cols_avx512(planes.as_ptr().add(base), out.as_mut_ptr().add(b * 64));
         }
     }
     out
+}
+
+/// Transpose 16 byte-planes of 64 bytes each into 64 F128 elements.
+///
+/// Layout in `acc`:
+/// Plane 0..7: bytes 0..7 of elements (8 * 64 bytes)
+/// Plane 8..15: bytes 8..15 of elements (8 * 64 bytes)
+///
+/// For each of 8 groups of 8 columns (elements):
+/// Uses `_mm512_permutexvar_epi8` for 8x8 byte transpose,
+/// and `_mm512_permutex2var_epi64` to interleave lo and hi qwords into F128 elements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi")]
+pub(crate) unsafe fn unpack_16_planes_64_cols_avx512(acc: *const u8, out: *mut F128) {
+    use core::arch::x86_64::*;
+
+    #[repr(C, align(64))]
+    struct Perm([u8; 64]);
+    static PERM: Perm = {
+        let mut t = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            t[i] = ((i % 8) * 8 + i / 8) as u8;
+            i += 1;
+        }
+        Perm(t)
+    };
+    let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
+    let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+    let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+
+    for g in 0..8 {
+        let ptr_lo = acc.add(g * 8);
+        let x0 = ptr_lo.cast::<u64>().read_unaligned() as i64;
+        let x1 = ptr_lo.add(64).cast::<u64>().read_unaligned() as i64;
+        let x2 = ptr_lo.add(128).cast::<u64>().read_unaligned() as i64;
+        let x3 = ptr_lo.add(192).cast::<u64>().read_unaligned() as i64;
+        let x4 = ptr_lo.add(256).cast::<u64>().read_unaligned() as i64;
+        let x5 = ptr_lo.add(320).cast::<u64>().read_unaligned() as i64;
+        let x6 = ptr_lo.add(384).cast::<u64>().read_unaligned() as i64;
+        let x7 = ptr_lo.add(448).cast::<u64>().read_unaligned() as i64;
+        let z_lo = _mm512_set_epi64(x7, x6, x5, x4, x3, x2, x1, x0);
+        let lo_trans = _mm512_permutexvar_epi8(perm, z_lo);
+
+        let ptr_hi = acc.add(512 + g * 8);
+        let y0 = ptr_hi.cast::<u64>().read_unaligned() as i64;
+        let y1 = ptr_hi.add(64).cast::<u64>().read_unaligned() as i64;
+        let y2 = ptr_hi.add(128).cast::<u64>().read_unaligned() as i64;
+        let y3 = ptr_hi.add(192).cast::<u64>().read_unaligned() as i64;
+        let y4 = ptr_hi.add(256).cast::<u64>().read_unaligned() as i64;
+        let y5 = ptr_hi.add(320).cast::<u64>().read_unaligned() as i64;
+        let y6 = ptr_hi.add(384).cast::<u64>().read_unaligned() as i64;
+        let y7 = ptr_hi.add(448).cast::<u64>().read_unaligned() as i64;
+        let z_hi = _mm512_set_epi64(y7, y6, y5, y4, y3, y2, y1, y0);
+        let hi_trans = _mm512_permutexvar_epi8(perm, z_hi);
+
+        let f128_0 = _mm512_permutex2var_epi64(lo_trans, idx0, hi_trans);
+        let f128_1 = _mm512_permutex2var_epi64(lo_trans, idx1, hi_trans);
+
+        _mm512_storeu_si512(out.add(g * 8) as *mut __m512i, f128_0);
+        _mm512_storeu_si512(out.add(g * 8 + 4) as *mut __m512i, f128_1);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    not(target_feature = "avx512vbmi")
+))]
+pub(crate) unsafe fn unpack_16_planes_64_cols_avx512(acc: *const u8, out: *mut F128) {
+    for col in 0..64 {
+        let mut lo = 0u64;
+        let mut hi = 0u64;
+        for byte in 0..8 {
+            lo |= (*acc.add(byte * 64 + col) as u64) << (8 * byte);
+        }
+        for byte in 8..16 {
+            hi |= (*acc.add(byte * 64 + col) as u64) << (8 * (byte - 8));
+        }
+        *out.add(col) = F128 { lo, hi };
+    }
 }
 
 /// Fused gather + bit-transpose of one stripe: eight strided F128 lanes go

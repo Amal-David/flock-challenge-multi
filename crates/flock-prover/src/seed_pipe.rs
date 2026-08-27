@@ -574,11 +574,12 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&temporary)?;
     file.write_all(&bytes)?;
-    file.set_len(bytes.len() as u64)?;
+    std::fs::rename(&temporary, path)?;
     drop(file);
-    std::fs::rename(temporary, path)
+    Ok(())
 }
 
 /// Rehearse the publication tail during the UNTIMED window.

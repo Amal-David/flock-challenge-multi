@@ -1033,6 +1033,43 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+static GFNI_PLANES_POOL: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn take_gfni_planes(len: usize) -> Vec<u8> {
+    if let Ok(mut pool) = GFNI_PLANES_POOL.lock() {
+        if pool.capacity() >= len {
+            let mut v = std::mem::take(&mut *pool);
+            v.resize(len, 0);
+            v.fill(0);
+            return v;
+        }
+    }
+    vec![0u8; len]
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn give_gfni_planes(v: Vec<u8>) {
+    if let Ok(mut pool) = GFNI_PLANES_POOL.lock() {
+        if pool.capacity() < v.capacity() {
+            *pool = v;
+        }
+    }
+}
+
 /// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
 /// chunk) the eight gathered+transposed stripe rows drain through
 /// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
@@ -1065,7 +1102,7 @@ fn fold_block_major_gfni(
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
     // Same total footprint as the F128 partials (k*16 bytes per worker).
-    let mut planes = vec![0u8; n_workers * k * 16];
+    let mut planes = take_gfni_planes(n_workers * k * 16);
     planes
         .par_chunks_mut(k * 16)
         .enumerate()
@@ -1300,7 +1337,7 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
+    let mut out = crate::alloc_uninit_vec::<F128>(k);
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
@@ -1313,18 +1350,11 @@ fn fold_block_major_gfni(
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
-        for (col, slot) in o.iter_mut().enumerate() {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
-            }
-            for byte in 8..16 {
-                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            *slot = F128 { lo, hi };
+        unsafe {
+            kernels::unpack_16_planes_64_cols_avx512(acc.as_ptr(), o.as_mut_ptr());
         }
     });
+    give_gfni_planes(planes);
     out
 }
 
