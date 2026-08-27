@@ -3181,19 +3181,6 @@ impl Blake3Setup {
                 return adopted;
             }
         }
-        // HOISTED (was below, after the loop and the final warm-up prove).
-        // This is the call that sets `GENERATOR_VERIFIED`, which decides
-        // whether the *timed* prove supplies witgen from `BlockSource::Closed`
-        // (the ranked fast arm, `seed_pipe.rs`) or from the `Slice` fallback.
-        // Running it here, before the untimed passes, lets those passes warm
-        // the same supply path the measured interval will take. Its argument
-        // is the wrapper's `blocks` slice, untouched by this reordering, so
-        // the adoption gate sees bit-identical input and reaches a
-        // bit-identical verdict -- only its position moves. Legal here: it
-        // depends on nothing the loop produces.
-        if call == 0 && self.n_blocks.is_power_of_two() {
-            crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
-        }
         static EXTRA_WARMUP_DONE: AtomicBool = AtomicBool::new(false);
         if self.r1cs.m >= 29
             && !EXTRA_WARMUP_DONE.swap(true, Ordering::Relaxed)
@@ -3208,29 +3195,16 @@ impl Blake3Setup {
             const EXTRA_WARMUP_PROVES: usize = 11;
             const EXTRA_WARMUP_BUDGET: std::time::Duration =
                 std::time::Duration::from_secs(45);
-            // Warm the supply path the timed prove will actually run. When
-            // the generator verified above, the scored prove evaluates blocks
-            // from the closed form on the consuming worker; proving these
-            // passes from `Slice` warmed a materialized-vector path the
-            // measured interval never enters. Falls back to `Slice` exactly
-            // when the timed prove would also use `Slice`, so the two always
-            // agree. These proves are thrown away (private challenger,
-            // black-boxed and dropped), so this cannot move a proof byte.
-            let warm_source = if self.n_blocks.is_power_of_two() {
-                crate::seed_pipe::warmup_block_source(self.n_blocks.trailing_zeros())
-            } else {
-                None
-            }
-            .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
             let warmup_started = std::time::Instant::now();
             for _ in 0..EXTRA_WARMUP_PROVES {
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
-                let _ = std::hint::black_box(
-                    self.prove_fast_inner(warm_source, &mut warm_challenger),
-                );
+                let _ = std::hint::black_box(self.prove_fast_inner(
+                    crate::seed_pipe::BlockSource::Slice(blocks),
+                    &mut warm_challenger,
+                ));
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
                 }
@@ -3245,8 +3219,9 @@ impl Blake3Setup {
             // and only then touches `io::stdin()`, so the splice lands outside
             // every measured interval and before the wrapper's `BufReader`
             // binds a descriptor.
-            // `verify_generator_at_warmup` was hoisted above the untimed
-            // warm-up loop; `arm_seed_pipe` still reads the verdict it set.
+            if self.n_blocks.is_power_of_two() {
+                crate::seed_pipe::verify_generator_at_warmup(self.n_blocks.trailing_zeros(), blocks);
+            }
             self.arm_seed_pipe();
         }
         out

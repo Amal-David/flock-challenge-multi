@@ -94,10 +94,60 @@ pub const SMALL_CHAL_F8: [u8; 3] = [0xF7, 0x53, 0xB5];
 /// `C_s` as an F_8 value. Verified empirically by the C++ project.
 pub const C_S_F8: u8 = 0x1C;
 
+/// Multiplicative inverse of [`C_S_F8`] in the AES `F_8` subfield.
+///
+/// `0x1c * 0xff = 1` modulo `x^8 + x^4 + x^3 + x + 1`. Because [`phi8`]
+/// is a field embedding, `phi8(0xff)` is exactly `phi8(0x1c)^{-1}` in
+/// `F_128`. Keeping the inverse in the subfield deletes the generic 127-step
+/// Fermat inversion from the ranked identity-C finish.
+pub const C_S_INV_F8: u8 = 0xFF;
+
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
 /// between this optimized output and the naive output.
 pub fn c_s_f128() -> F128 {
     phi8(F8(C_S_F8))
+}
+
+/// `C_s^{-1}` obtained in the embedded `F_8` subfield.
+#[inline]
+pub fn c_s_inv_f128() -> F128 {
+    phi8(F8(C_S_INV_F8))
+}
+
+/// Exact same-binary rollback for the ranked identity-C subfield inverse.
+/// Only the literal value `1` restores the incumbent per-proof Fermat
+/// inversion; all other values leave the constant-time subfield load active.
+const ENV_NO_ZC_C_S_SUBFIELD_INV: &str = "FLOCK_NO_ZC_C_S_SUBFIELD_INV";
+
+#[inline]
+fn c_s_subfield_inv_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+fn c_s_subfield_inv_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !c_s_subfield_inv_disabled_value(
+            std::env::var_os(ENV_NO_ZC_C_S_SUBFIELD_INV).as_deref(),
+        )
+    });
+    *ON
+}
+
+/// Cold incumbent arm retained for exact same-binary rollback.
+#[cold]
+#[inline(never)]
+fn c_s_inv_fermat_fallback() -> F128 {
+    c_s_f128().inv()
+}
+
+#[inline(always)]
+fn c_s_inv_for_identity_c() -> F128 {
+    if c_s_subfield_inv_enabled() {
+        c_s_inv_f128()
+    } else {
+        c_s_inv_fermat_fallback()
+    }
 }
 
 /// The three F_128 small challenges (embeddings of [`SMALL_CHAL_F8`]) — caller
@@ -3164,7 +3214,7 @@ pub fn round1_c_fold4_from_block_major_z(
     // bit at the original C point recovers C's 64 S-domain evaluations.
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
+    let c_s_inv = c_s_inv_for_identity_c();
     for lane in 0..ELL {
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
@@ -3235,6 +3285,40 @@ mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
+
+    #[test]
+    fn c_s_subfield_inverse_matches_fermat_exhaustively() {
+        use std::ffi::OsStr;
+
+        // Prove the embedding/inversion identity for every nonzero F_8
+        // element, not only for the selected protocol constant.
+        for value in 1u16..=u8::MAX as u16 {
+            let a8 = F8(value as u8);
+            let inv8 = a8.inv();
+            assert_eq!(a8 * inv8, F8::ONE, "F8 inverse value={value:#04x}");
+            assert_eq!(
+                phi8(inv8),
+                phi8(a8).inv(),
+                "embedded inverse value={value:#04x}"
+            );
+        }
+
+        assert_eq!(F8(C_S_F8).inv(), F8(C_S_INV_F8));
+        assert_eq!(c_s_f128() * c_s_inv_f128(), F128::ONE);
+        assert_eq!(c_s_inv_f128(), c_s_inv_fermat_fallback());
+
+        assert!(c_s_subfield_inv_disabled_value(Some(OsStr::new("1"))));
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("01")),
+            Some(OsStr::new("true")),
+            Some(OsStr::new(" 1")),
+        ] {
+            assert!(!c_s_subfield_inv_disabled_value(value));
+        }
+    }
 
     /// The gated identity-C outer fold must match the incumbent
     /// dense-eq-table oracle bit-for-bit — on the ranked `n_log = 18`

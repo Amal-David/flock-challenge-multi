@@ -240,6 +240,226 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Direct 64-bank pad-57 fold, eight output slots per pass. The four even
+/// slots consume every bank; the four odd slots consume banks 0..56 and never
+/// load the structural-zero tail 57..63. Each high group keeps one even and
+/// one odd [`WideGhashX4`] live so their sixteen low-bank weights are shared,
+/// then the two high challenges are applied after the four group reductions.
+/// The ranked block issues `255 * 124 = 31_620` default hints. The chunked
+/// #1472 fallback resets lookahead eight times and issues `8 * 248 * 16 =
+/// 31_744`, so the net delta is only 124 hints per block (31_744 hints, about
+/// 1.94 MiB of hinted address footprint, over the whole proof); demand-load
+/// and `mid4` traffic accounting is intentionally kept separate.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq`, `src.len() == 64 * dst.len()`,
+/// and `dst.len()` is a multiple of eight.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold64_banked_pad57_pairs(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, WideGhashX4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    debug_assert!(dst.len().is_multiple_of(8));
+
+    // SAFETY: the caller provides the feature and slice-geometry contracts.
+    unsafe {
+        // Resolve the diagnostics selector before any wide live range exists;
+        // the LazyLock cold path therefore has no ZMM state to preserve.
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(512);
+        let r4v = _mm512_broadcast_i32x4(_mm_set_epi64x(r4.hi as i64, r4.lo as i64));
+        let r5v = _mm512_broadcast_i32x4(_mm_set_epi64x(r5.hi as i64, r5.lo as i64));
+        let tr1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let tr1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let tr2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let tr2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let interleave_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let interleave_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+
+        macro_rules! weight_vec {
+            ($bank:expr) => {{
+                // Keep one broadcast live at a time. A volatile 128-bit read
+                // prevents loop-invariant hoisting of all sixteen ZMM weights
+                // into spills while preserving the tiny read-only table value.
+                let weight = core::ptr::read_volatile(
+                    w.as_ptr().add($bank).cast::<__m128i>(),
+                );
+                _mm512_broadcast_i32x4(weight)
+            }};
+        }
+        macro_rules! load_bank_quad {
+            ($t:expr, $parity:expr, $high:expr, $quad:expr) => {{
+                let base = 64 * ($t + $parity) + 16 * $high + 4 * $quad;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 128) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 256) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 384) as *const __m512i);
+                let p0 = _mm512_permutex2var_epi64(a0, tr1_lo, a1);
+                let p1 = _mm512_permutex2var_epi64(a0, tr1_hi, a1);
+                let p2 = _mm512_permutex2var_epi64(a2, tr1_lo, a3);
+                let p3 = _mm512_permutex2var_epi64(a2, tr1_hi, a3);
+                (
+                    _mm512_permutex2var_epi64(p0, tr2_lo, p2),
+                    _mm512_permutex2var_epi64(p0, tr2_hi, p2),
+                    _mm512_permutex2var_epi64(p1, tr2_lo, p3),
+                    _mm512_permutex2var_epi64(p1, tr2_hi, p3),
+                )
+            }};
+        }
+        macro_rules! full_pair_group {
+            ($t:expr, $high:expr) => {{
+                let mut even_acc = WideGhashX4::zero();
+                let mut odd_acc = WideGhashX4::zero();
+                let mut quad = 0usize;
+                while quad < 4 {
+                    let (e0, e1, e2, e3) = load_bank_quad!($t, 0, $high, quad);
+                    let (o0, o1, o2, o3) = load_bank_quad!($t, 1, $high, quad);
+                    let wb0 = weight_vec!(4 * quad);
+                    even_acc.mul_acc(e0, wb0);
+                    odd_acc.mul_acc(o0, wb0);
+                    let wb1 = weight_vec!(4 * quad + 1);
+                    even_acc.mul_acc(e1, wb1);
+                    odd_acc.mul_acc(o1, wb1);
+                    let wb2 = weight_vec!(4 * quad + 2);
+                    even_acc.mul_acc(e2, wb2);
+                    odd_acc.mul_acc(o2, wb2);
+                    let wb3 = weight_vec!(4 * quad + 3);
+                    even_acc.mul_acc(e3, wb3);
+                    odd_acc.mul_acc(o3, wb3);
+                    quad += 1;
+                }
+                (even_acc.reduce_lanes(), odd_acc.reduce_lanes())
+            }};
+        }
+        macro_rules! bind_pair {
+            ($lo:expr, $hi:expr, $r:expr) => {{
+                _mm512_xor_si512($lo, ghash_mul_x4($r, _mm512_xor_si512($lo, $hi)))
+            }};
+        }
+        macro_rules! prefetch_high_group {
+            ($base:expr, $high:expr) => {{
+                if pf_ahead != 0 && $base <= pf_limit {
+                    let mut slot = 0usize;
+                    while slot < 8 {
+                        let group = $base + 64 * slot + 16 * $high;
+                        let mut line = 0usize;
+                        while line < 4 {
+                            // Odd high-group line three is banks 60..63: the
+                            // only wholly-dead cache line in the pad57 shape.
+                            // A non-output-aligned diagnostics override has no
+                            // provable future parity, so it keeps all hints.
+                            let dead_line = pf_ahead.is_multiple_of(64)
+                                && $high == 3
+                                && line == 3
+                                && (($base / 64 + slot) & 1 == 1);
+                            if !dead_line {
+                                _mm_prefetch::<_MM_HINT_T0>(
+                                    src.as_ptr().add(group + 4 * line).cast::<i8>(),
+                                );
+                            }
+                            line += 1;
+                        }
+                        slot += 1;
+                    }
+                }
+            }};
+        }
+
+        let mut t = 0usize;
+        while t < dst.len() {
+            let pf_base = 64 * t + pf_ahead;
+            prefetch_high_group!(pf_base, 0);
+            let (even0, odd0) = full_pair_group!(t, 0);
+            prefetch_high_group!(pf_base, 1);
+            let (even1, odd1) = full_pair_group!(t, 1);
+            let even_low = bind_pair!(even0, even1, r4v);
+            let odd_low = bind_pair!(odd0, odd1, r4v);
+
+            prefetch_high_group!(pf_base, 2);
+            let (even2, odd2) = full_pair_group!(t, 2);
+
+            // High group three: even slots still consume all sixteen banks.
+            // Odd slots consume banks 48..55 through two ordinary transposes,
+            // then bank 56 through four scalar 128-bit loads and inserts. No
+            // load spans any odd bank in 57..63.
+            prefetch_high_group!(pf_base, 3);
+            let (even3, odd3) = {
+                let mut even_acc = WideGhashX4::zero();
+                let mut odd_acc = WideGhashX4::zero();
+                let mut quad = 0usize;
+                while quad < 2 {
+                    let (e0, e1, e2, e3) = load_bank_quad!(t, 0, 3, quad);
+                    let (o0, o1, o2, o3) = load_bank_quad!(t, 1, 3, quad);
+                    let wb0 = weight_vec!(4 * quad);
+                    even_acc.mul_acc(e0, wb0);
+                    odd_acc.mul_acc(o0, wb0);
+                    let wb1 = weight_vec!(4 * quad + 1);
+                    even_acc.mul_acc(e1, wb1);
+                    odd_acc.mul_acc(o1, wb1);
+                    let wb2 = weight_vec!(4 * quad + 2);
+                    even_acc.mul_acc(e2, wb2);
+                    odd_acc.mul_acc(o2, wb2);
+                    let wb3 = weight_vec!(4 * quad + 3);
+                    even_acc.mul_acc(e3, wb3);
+                    odd_acc.mul_acc(o3, wb3);
+                    quad += 1;
+                }
+
+                let (e8, e9, e10, e11) = load_bank_quad!(t, 0, 3, 2);
+                let odd56 = {
+                    let base = 64 * (t + 1) + 56;
+                    let load = |offset: usize| {
+                        _mm_loadu_si128(src.as_ptr().add(base + offset) as *const __m128i)
+                    };
+                    let v = _mm512_castsi128_si512(load(0));
+                    let v = _mm512_inserti32x4::<1>(v, load(128));
+                    let v = _mm512_inserti32x4::<2>(v, load(256));
+                    _mm512_inserti32x4::<3>(v, load(384))
+                };
+                let wb8 = weight_vec!(8);
+                even_acc.mul_acc(e8, wb8);
+                odd_acc.mul_acc(odd56, wb8);
+                let wb9 = weight_vec!(9);
+                even_acc.mul_acc(e9, wb9);
+                let wb10 = weight_vec!(10);
+                even_acc.mul_acc(e10, wb10);
+                let wb11 = weight_vec!(11);
+                even_acc.mul_acc(e11, wb11);
+
+                let (e12, e13, e14, e15) = load_bank_quad!(t, 0, 3, 3);
+                let wb12 = weight_vec!(12);
+                even_acc.mul_acc(e12, wb12);
+                let wb13 = weight_vec!(13);
+                even_acc.mul_acc(e13, wb13);
+                let wb14 = weight_vec!(14);
+                even_acc.mul_acc(e14, wb14);
+                let wb15 = weight_vec!(15);
+                even_acc.mul_acc(e15, wb15);
+
+                (even_acc.reduce_lanes(), odd_acc.reduce_lanes())
+            };
+
+            let even_high = bind_pair!(even2, even3, r4v);
+            let odd_high = bind_pair!(odd2, odd3, r4v);
+            let even = bind_pair!(even_low, even_high, r5v);
+            let odd = bind_pair!(odd_low, odd_high, r5v);
+            let out0 = _mm512_permutex2var_epi64(even, interleave_lo, odd);
+            let out1 = _mm512_permutex2var_epi64(even, interleave_hi, odd);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out0);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, out1);
+            t += 8;
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.

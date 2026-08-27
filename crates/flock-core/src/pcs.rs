@@ -37,6 +37,47 @@ use crate::field::F128;
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
+/// Pure half of the ranked pad-57 capability selector. The shape is trusted
+/// only when it is derived from the caller's [`PaddingSpec`]; lengths alone
+/// must never opt an arbitrary DirectFold8 opening into the sparse-tail fold.
+#[inline]
+fn direct_fold8_pad57_capability_for(
+    padding: &PaddingSpec,
+    packed_witness_len: usize,
+    initial_k: usize,
+    killed: bool,
+) -> bool {
+    cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && packed_witness_len == (1usize << 25)
+        && initial_k == 6
+        && !killed
+}
+
+#[inline]
+fn direct_fold8_pad57_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+fn direct_fold8_pad57_capability(
+    padding: &PaddingSpec,
+    packed_witness_len: usize,
+    initial_k: usize,
+) -> bool {
+    // Literal-one kill: an accidental non-"1" value does not silently alter
+    // the ranked binary's production path. Read once and allocate nothing.
+    static KILLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let value = std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAD57");
+        direct_fold8_pad57_disabled_value(value.as_deref())
+    });
+    direct_fold8_pad57_capability_for(padding, packed_witness_len, initial_k, *KILLED)
+}
+
 /// Batched opening proof: ring-switching frontend + Ligerito backend.
 /// The combined `b_combined` + target_combined feed
 /// [`ligerito::recursive_prover_with_basis`] (see ligerito module docs).
@@ -150,6 +191,11 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         "ligerito log_inv_rates[0] ({}) must match PcsParams.log_inv_rate ({}) for L0 reuse",
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
+    let direct_fold8_pad57 = direct_fold8_pad57_capability(
+        padding,
+        packed_witness.len(),
+        lig_config.initial_k,
+    );
 
     // Fold arena: all `initial_k` L0 fold rounds' output sizes are known
     // right now — allocate one exact-size arena (2·(l − l/2^k) F128s; 1008 MiB
@@ -198,6 +244,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             packed_witness,
             combined.b_combined,
             direct,
+            direct_fold8_pad57,
             combined.target_combined,
             &prover_data.codeword,
             &*prover_data.merkle_tree,
@@ -1989,6 +2036,58 @@ mod tests {
     use crate::challenger::FsChallenger;
     use crate::zerocheck::multilinear::lagrange_weights_naive;
     use crate::zerocheck::univariate_skip::build_eq;
+
+    #[test]
+    fn direct_fold8_pad57_capability_requires_every_trusted_fact() {
+        let exact = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let compiled = cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ));
+        assert_eq!(
+            direct_fold8_pad57_capability_for(&exact, 1usize << 25, 6, false),
+            compiled,
+        );
+        assert!(!direct_fold8_pad57_capability_for(
+            &PaddingSpec {
+                k_log: 13,
+                ..exact
+            },
+            1usize << 25,
+            6,
+            false,
+        ));
+        assert!(!direct_fold8_pad57_capability_for(
+            &PaddingSpec {
+                useful_bits_per_block: 15_408,
+                ..exact
+            },
+            1usize << 25,
+            6,
+            false,
+        ));
+        assert!(!direct_fold8_pad57_capability_for(
+            &PaddingSpec {
+                useful_bits_per_block: 15_410,
+                ..exact
+            },
+            1usize << 25,
+            6,
+            false,
+        ));
+        assert!(!direct_fold8_pad57_capability_for(&exact, (1usize << 25) - 1, 6, false));
+        assert!(!direct_fold8_pad57_capability_for(&exact, 1usize << 25, 5, false));
+        assert!(!direct_fold8_pad57_capability_for(&exact, 1usize << 25, 6, true));
+
+        for open in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!direct_fold8_pad57_disabled_value(open.map(std::ffi::OsStr::new)));
+        }
+        assert!(direct_fold8_pad57_disabled_value(Some(std::ffi::OsStr::new("1"))));
+    }
 
     struct Rng(u64);
     impl Rng {

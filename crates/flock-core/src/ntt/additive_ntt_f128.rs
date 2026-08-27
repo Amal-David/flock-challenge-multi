@@ -944,545 +944,6 @@ unsafe fn pf_msg_rows(
     }
 }
 
-// ---------------------------------------------------------------------------
-// `F ‖ (M+P)` role split for the seed+top fused pass.
-// ---------------------------------------------------------------------------
-
-/// SMT sibling pairs for the seed+top pass's `F ‖ (M+P)` role split, or `None`
-/// when this machine or pool cannot be paired.
-///
-/// The split runs the seed gather (`M`) and the fused-two NT publish (`P`) on
-/// one logical CPU of each physical core, and the fused-four staging fold
-/// (`F`) on that core's SMT sibling, instead of every worker running all three
-/// phases itself. Every task still writes exactly the codeword rows it wrote
-/// before, computed by the same kernels with the same twiddles in the same
-/// per-row order — only which logical CPU issues them changes — so the
-/// codeword is byte-identical either way.
-/// `FLOCK_NO_NTT_ST_FMP=1` restores the every-worker-does-everything schedule
-/// in the same binary.
-///
-/// Deliberately its own resolver rather than a share of [`deep_split_pairs`]:
-/// the deep split ships and is worth 1.7% of prove, and nothing in this pass
-/// may be able to perturb it. Resolved once per process; requires an even pool
-/// that covers exactly one logical CPU per sibling of each core, all inside
-/// this process's affinity set.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn st_fmp_pairs() -> Option<&'static Vec<(usize, usize)>> {
-    static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_ST_FMP").is_some() {
-            return None;
-        }
-        let n = rayon::current_num_threads();
-        if n % 2 != 0 || n < 4 {
-            return None;
-        }
-        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n / 2);
-        let mut seen = vec![false; n];
-        for c in 0..n {
-            if seen[c] {
-                continue;
-            }
-            let list = std::fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
-            ))
-            .ok()?;
-            let mut ids = Vec::new();
-            for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
-            }
-            if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
-                return None;
-            }
-            seen[c] = true;
-            seen[ids[1]] = true;
-            pairs.push((ids[0], ids[1]));
-        }
-        if pairs.len() != n / 2 {
-            return None;
-        }
-        let mask = affinity::get();
-        for c in 0..n {
-            if mask[c / 64] & (1u64 << (c % 64)) == 0 {
-                return None;
-            }
-        }
-        Some(pairs)
-    });
-    P.as_ref()
-}
-
-/// One seed+top pass at a time may take over the pool, exactly as for the deep
-/// pass: two overlapping `rayon::broadcast` calls would interleave the two
-/// roles across passes. The second pass falls back to the unsplit schedule.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-static ST_FMP_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Releases [`ST_FMP_BUSY`] on the way out, including on unwind.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-struct StFmpClaim;
-
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-impl StFmpClaim {
-    fn take() -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        ST_FMP_BUSY
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-impl Drop for StFmpClaim {
-    fn drop(&mut self) {
-        ST_FMP_BUSY.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Hard bound on staging blocks in flight per core (also the mailbox length).
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-const ST_FMP_CAP: usize = 4;
-
-/// Staging blocks a physical core rotates through under the split.
-///
-/// **Two, and two is the whole footprint argument.** Today `for_each_init`
-/// hands each of the sixteen rayon workers its own `staging_block(512,
-/// row_len)` — 512 rows x 64 F128 x 16 B = 512 KiB — so a physical core holds
-/// **1 MiB** of staging between its two SMT siblings. Under the split only the
-/// M+P sibling allocates, and it allocates `nbuf` blocks: at `nbuf = 2` that is
-/// **1 MiB per core, identical to today**, so the fold sibling sees exactly the
-/// shared L2 it sees now. Three blocks would buy pipeline slack at 1.5 MiB of a
-/// 2 MiB L2, which is unmeasured territory (`killed.md:5525` measured +3.26% at
-/// the 2 MiB cliff), so three is a diagnostic, never a default.
-/// `FLOCK_NTT_ST_FMP_BUFS` overrides it. One is never allowed: it would
-/// serialise the pair back into today's chain. Read once per process — never
-/// from inside a loop.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline]
-fn select_st_fmp_bufs(requested: Option<usize>) -> usize {
-    requested.unwrap_or(2).clamp(2, ST_FMP_CAP)
-}
-
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-fn st_fmp_bufs() -> usize {
-    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        select_st_fmp_bufs(
-            std::env::var("FLOCK_NTT_ST_FMP_BUFS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok()),
-        )
-    });
-    *N
-}
-
-/// Handoff state for one physical core under the `F ‖ (M+P)` split.
-///
-/// **There is no ring and no completion flag.** Three monotone counters, each
-/// with exactly one writer, and a task-index mailbox per staging slot:
-///
-/// * `seeded` — tasks the M+P sibling has finished seeding. Written by MP only.
-/// * `folded` — tasks the F sibling has finished folding. Written by F only.
-/// * `total`  — `seeded`'s FINAL value, `usize::MAX` until MP has claimed its
-///   last task. Written by MP only, once, after its last `seeded` store.
-///
-/// The termination signal is therefore a **count, not a boolean**, and that is
-/// the structural reason this cannot lose a task. The deep pass's first ring
-/// signalled completion with a `done` flag and dropped the producer's last
-/// block in one run out of eight (`killed.md:5584`), because a consumer could
-/// observe `done` while its view of `head` was stale. Here a stale `seeded`
-/// read alongside a fresh `total` read can only ever yield `total <= i`, and
-/// `total <= i` is the *true* statement "task `i` was never claimed" — it is
-/// independent of how stale `seeded` is. No recheck is needed, and none is
-/// possible to forget.
-///
-/// `slot_r[s]` is the task index living in staging slot `s`. MP writes it
-/// before the `seeded` release that hands the slot over; F reads it after the
-/// matching acquire. MP does not rewrite it until it has acquired the `folded`
-/// release that hands the slot back.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[repr(align(64))]
-struct StFmpPair {
-    seeded: std::sync::atomic::AtomicUsize,
-    folded: std::sync::atomic::AtomicUsize,
-    total: std::sync::atomic::AtomicUsize,
-    /// Base of the M+P sibling's staging allocation, published before the
-    /// first `seeded` store.
-    bufp: std::sync::atomic::AtomicUsize,
-    /// The F sibling has left its loop (normally, or because it is unwinding).
-    /// Only ever read to break a wait that would otherwise never end.
-    f_gone: std::sync::atomic::AtomicBool,
-    slot_r: [std::cell::UnsafeCell<usize>; ST_FMP_CAP],
-}
-
-// SAFETY: `slot_r[s]` is written only by the M+P sibling, and only while it
-// owns slot `s` — i.e. before the `seeded` release that hands `s` over, and
-// after the `folded` acquire that hands it back. The F sibling reads it only
-// between those two edges. Every other field is atomic.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-unsafe impl Sync for StFmpPair {}
-
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-impl StFmpPair {
-    fn new() -> Self {
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-        Self {
-            seeded: AtomicUsize::new(0),
-            folded: AtomicUsize::new(0),
-            total: AtomicUsize::new(usize::MAX),
-            bufp: AtomicUsize::new(0),
-            f_gone: AtomicBool::new(false),
-            slot_r: [const { std::cell::UnsafeCell::new(0) }; ST_FMP_CAP],
-        }
-    }
-
-    /// Wait until the F sibling has folded at least `k` tasks. Returns false
-    /// only if F left without reaching `k`, which can happen only when F is
-    /// unwinding out of a panic.
-    fn wait_folded(&self, k: usize) -> bool {
-        use std::sync::atomic::Ordering;
-        loop {
-            if self.folded.load(Ordering::Acquire) >= k {
-                return true;
-            }
-            if self.f_gone.load(Ordering::Acquire) {
-                // F's last `folded` store is released before it sets
-                // `f_gone`, and this acquire synchronises with that release,
-                // so this single re-read observes F's final count. (The deep
-                // pass's first ring is the recorded cost of omitting exactly
-                // this re-read.)
-                return self.folded.load(Ordering::Acquire) >= k;
-            }
-            std::hint::spin_loop();
-        }
-    }
-}
-
-/// Run the seed+top fused pass on the sibling-paired `F ‖ (M+P)` schedule, or
-/// return false to leave the caller on the unsplit one.
-///
-/// `seed` gathers task `r` into a staging block; `fold` runs that block's
-/// fused-four layers in place; `publish` streams it to the codeword. Back to
-/// back on one worker they are byte for byte what the unsplit `task` does.
-///
-/// Tasks are claimed off ONE atomic counter by the M+P sibling, exactly as
-/// rayon's own scheduler would hand them out, so the codeword rows a core
-/// owns are as disjoint as before and cross-core load balance is preserved;
-/// the claimed index travels to the F sibling through the same release /
-/// acquire edge as the staging data.
-///
-/// `#[inline(never)]` deliberately: `seed_top_fused8_pass` is inlined into the
-/// NTT's parallel driver, and letting the pairing, the pinning and the handoff
-/// inline there too grew that ~36 KB function by 3,360 bytes on the previous
-/// lane's build (`killed.md:5588`, the outlining trap) for code that runs once
-/// per proof. Out of line it costs one call.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[inline(never)]
-fn st_fmp_run(
-    n_tasks: usize,
-    row_len: usize,
-    seed: &(dyn Fn(*mut F128, usize) + Sync),
-    fold: &(dyn Fn(*mut F128, usize) + Sync),
-    publish: &(dyn Fn(*mut F128, usize) + Sync),
-) -> bool {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let Some(pairs) = st_fmp_pairs() else {
-        return false;
-    };
-    let n_pairs = pairs.len();
-    let nbuf = st_fmp_bufs();
-    // The broadcast must cover the whole pool, this call must own the pool
-    // (not be nested inside another rayon region), and there must be enough
-    // tasks for the pipeline to fill.
-    if n_pairs * 2 != rayon::current_num_threads()
-        || n_tasks < 4 * nbuf * n_pairs
-        || rayon::current_thread_index().is_some()
-    {
-        return false;
-    }
-    let Some(_claim) = StFmpClaim::take() else {
-        return false;
-    };
-    // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
-    // worker runs under `env_clear()`, so this is compiled in and dead there.
-    {
-        static DBG: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ST_FMP_DEBUG").is_some());
-        if *DBG {
-            eprintln!(
-                "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len}"
-            );
-        }
-    }
-    let stride = 512 * row_len;
-    let states: Vec<StFmpPair> = (0..n_pairs).map(|_| StFmpPair::new()).collect();
-    let next = AtomicUsize::new(0);
-    let states = &states;
-    let next = &next;
-    rayon::broadcast(|ctx| {
-        let idx = ctx.index();
-        if idx >= 2 * n_pairs {
-            return;
-        }
-        // Sibling `.0` of each core seeds and publishes; sibling `.1` folds.
-        let is_mp = idx < n_pairs;
-        let slot = if is_mp { idx } else { idx - n_pairs };
-        let st = &states[slot];
-        let cpu = if is_mp { pairs[slot].0 } else { pairs[slot].1 };
-        // Restores this worker's original CPU set even if the body unwinds.
-        // Declared FIRST so it drops LAST.
-        struct EndGuard {
-            saved: affinity::Mask,
-        }
-        impl Drop for EndGuard {
-            fn drop(&mut self) {
-                affinity::set(&self.saved);
-            }
-        }
-        let _end = EndGuard {
-            saved: affinity::get(),
-        };
-        affinity::pin(cpu);
-
-        if !is_mp {
-            // ---- the F sibling: fold only ----
-            // Announces its exit on EVERY path, including a panic, so the M+P
-            // sibling can never wait on a fold that will not arrive and can
-            // never free the staging under a live reader.
-            struct FGuard<'a> {
-                st: &'a StFmpPair,
-            }
-            impl Drop for FGuard<'_> {
-                fn drop(&mut self) {
-                    self.st
-                        .f_gone
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-            let _fg = FGuard { st };
-            let mut i = 0usize;
-            loop {
-                loop {
-                    if st.seeded.load(Ordering::Acquire) > i {
-                        break;
-                    }
-                    // `total` is the FINAL value of `seeded`. `total <= i`
-                    // therefore means "task `i` was never claimed", whatever
-                    // this thread's view of `seeded` happens to be — so this
-                    // exit cannot race a late publication.
-                    if st.total.load(Ordering::Acquire) <= i {
-                        return;
-                    }
-                    std::hint::spin_loop();
-                }
-                let bufp = st.bufp.load(Ordering::Acquire) as *mut F128;
-                let s = i % nbuf;
-                // SAFETY: the acquire above synchronises with the M+P
-                // sibling's release after it finished seeding slot `s` for
-                // task `i`, so every staging byte this fold reads is
-                // published; and that sibling cannot reuse slot `s` until it
-                // acquires the `folded` release below.
-                unsafe {
-                    fold(bufp.add(s * stride), *st.slot_r[s].get());
-                }
-                st.folded.store(i + 1, Ordering::Release);
-                i += 1;
-            }
-        }
-
-        // ---- the M+P sibling: seed, then publish what F has folded ----
-        // `nbuf` back-to-back 512-row staging blocks; the pair works on two of
-        // them at a time.
-        let mut staging = staging_block(512 * nbuf, row_len);
-        let bufp = staging.as_mut_ptr();
-        st.bufp.store(bufp as usize, Ordering::Release);
-        // Declared AFTER the staging allocation so it drops BEFORE it: on a
-        // panic the fold sibling may still be reading a published block, and
-        // freeing the staging under it is exactly the class of fault that
-        // shows up as a wrong digest once in a while and never in a timing.
-        struct DrainGuard<'a> {
-            st: &'a StFmpPair,
-        }
-        impl Drop for DrainGuard<'_> {
-            fn drop(&mut self) {
-                use std::sync::atomic::Ordering;
-                // Whatever happened, no further task will be seeded, and this
-                // is the count that says so.
-                self.st
-                    .total
-                    .store(self.st.seeded.load(Ordering::Relaxed), Ordering::Release);
-                while !self.st.f_gone.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-        let _drain = DrainGuard { st };
-        let mut i = 0usize;
-        loop {
-            let r = next.fetch_add(1, Ordering::Relaxed);
-            if r >= n_tasks {
-                break;
-            }
-            if i >= nbuf {
-                // Slot `i % nbuf` still holds task `i - nbuf`. Publishing it
-                // is what frees the slot, so it must happen before the seed.
-                let j = i - nbuf;
-                if !st.wait_folded(j + 1) {
-                    // Only reachable when the fold sibling panicked; that
-                    // panic is already unwinding and `rayon::broadcast`
-                    // propagates it to the caller, so no proof is produced
-                    // from the partial codeword this leaves behind.
-                    return;
-                }
-                // SAFETY: `staging` holds `nbuf` blocks of `512 * row_len`
-                // F128s; the acquire in `wait_folded` synchronises with the
-                // fold sibling's release for task `j`, so every byte it wrote
-                // is visible here, and it will not touch slot `j % nbuf`
-                // again until this thread republishes it below.
-                unsafe {
-                    publish(bufp.add((j % nbuf) * stride), *st.slot_r[j % nbuf].get());
-                }
-            }
-            let s = i % nbuf;
-            // SAFETY: slot `s` is free — for `i < nbuf` it has never been
-            // used, and otherwise its previous occupant was just published.
-            unsafe {
-                seed(bufp.add(s * stride), r);
-                *st.slot_r[s].get() = r;
-            }
-            st.seeded.store(i + 1, Ordering::Release);
-            i += 1;
-        }
-        // No more tasks: publish the count first so the fold sibling can
-        // leave, then drain the blocks still in flight.
-        st.total.store(i, Ordering::Release);
-        for j in i.saturating_sub(nbuf)..i {
-            if !st.wait_folded(j + 1) {
-                return;
-            }
-            // SAFETY: as above; slot `j % nbuf` was last written for task `j`
-            // (the next write to it would have been task `j + nbuf`, which
-            // was never claimed).
-            unsafe {
-                publish(bufp.add((j % nbuf) * stride), *st.slot_r[j % nbuf].get());
-            }
-        }
-    });
-    true
-}
-
-
-/// The fused-four half of [`AdditiveNttF128::seed_top_direct_fused2_publish`]:
-/// layers 3..7 of all eight blocks of one ranked `r` task, in the staging
-/// block, and nothing else.
-///
-/// Splitting the fused loop's two halves across the eight blocks is
-/// value-identical to interleaving them: block `b`'s fused-four writes only
-/// block `b`'s 64 staging rows and block `b`'s fused-two reads only those
-/// rows, so the blocks are independent and their relative order is free. Row
-/// for row, twiddle for twiddle, this is the same computation in the same
-/// per-row order.
-///
-/// # Safety
-/// `bufp` owns 512 seeded staging rows of `row_len` elements.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[allow(clippy::too_many_arguments)]
-#[inline]
-unsafe fn st_fmp_fold4(
-    bufp: *mut F128,
-    row_len: usize,
-    sub_stride: usize,
-    r: usize,
-    lanes4_tail: usize,
-    stage_perm: bool,
-    tw4: &[[F128; 15]],
-) {
-    let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
-    // SAFETY: forwarded contract; each block's fused-four group is confined to
-    // that block's own 64 staging rows.
-    unsafe {
-        for block in 0..8 {
-            let region = bufp.add(block * 64 * row_len);
-            let tw = &tw4[block];
-            for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                kernels::butterfly_fused_4layer_row(
-                    region.add(j * g4_base * row_len),
-                    g4_stride,
-                    row_len,
-                    lanes4,
-                    0,
-                    tw,
-                );
-            }
-        }
-    }
-}
-
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
@@ -1924,9 +1385,10 @@ impl AdditiveNttF128 {
     /// half then follows its own fused two-layer twiddle tree.
     ///
     /// x86 uses the AVX-512 row-from pair when `avx512f+vpclmulqdq` is
-    /// available (regular stores, 4-lane `ghash_mul_x4`; portable otherwise).
-    /// Apple may publish with `stnp` unless `FLOCK_NO_SEED_NT` is set. Do not
-    /// lift `seed_fused_2layer_row_group_nt`.
+    /// available (4-lane `ghash_mul_x4`; portable otherwise). Both x86 and
+    /// Apple may publish with non-temporal stores unless `FLOCK_NO_SEED_NT`
+    /// is set — the destination is next read by a later transform pass, so
+    /// write-allocate is waste. Do not lift `seed_fused_2layer_row_group_nt`.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -1985,12 +1447,11 @@ impl AdditiveNttF128 {
         // from L1 while limiting live state to four F128 values.
         //
         // On the ranked shape the destination rows are cold and next read a
-        // full sweep later, so the staged kernel routes the eight output rows
-        // through an 8 KiB stack block and publishes them with q-form `stnp`
-        // 32 B pairs at full-line granularity, skipping the write-allocate
-        // read of the ~1 GiB destination. Requires whole-line coverage
-        // (num_ntts % 8, 128 B-aligned halves). `FLOCK_NO_SEED_NT` is a
-        // local-diagnostics kill switch; the ranked worker's cleared
+        // later transform pass. Apple publishes both rate-1/2 halves via
+        // q-form `stnp` (8 KiB stack staging). x86 publishes every block with
+        // XMM `MOVNTDQ` from the same four-row kernels, skipping the
+        // write-allocate RFO of each recursive codeword. `FLOCK_NO_SEED_NT`
+        // is a local-diagnostics kill switch; the ranked worker's cleared
         // environment never sets it.
         let src = msg.as_ptr() as usize;
         let dst = codeword.as_mut_ptr() as usize;
@@ -2001,7 +1462,13 @@ impl AdditiveNttF128 {
             && num_ntts <= kernels::SEED_NT_MAX_NTTS
             && dst % 128 == 0
             && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
-            && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
+            && seed_nt_enabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let use_nt = dst % 16 == 0 && num_ntts.is_multiple_of(4) && seed_nt_enabled();
         let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2016,6 +1483,32 @@ impl AdditiveNttF128 {
                     twiddles[0][2],
                     &twiddles[1],
                 );
+                return;
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                kernels::butterfly_fused_2layer_row_from_sparse_nt(
+                    src as *const F128,
+                    dst as *mut F128,
+                    quarter,
+                    num_ntts,
+                    r,
+                    twiddles[0][2],
+                );
+                for (b, tw) in twiddles.iter().enumerate().skip(1) {
+                    kernels::butterfly_fused_2layer_row_from_nt(
+                        src as *const F128,
+                        (dst as *mut F128).add(b * msg_len),
+                        quarter,
+                        num_ntts,
+                        r,
+                        tw,
+                    );
+                }
                 return;
             }
             // Block 0's layer-`k` and first layer-`k+1` twiddles are ZERO for
@@ -2043,11 +1536,55 @@ impl AdditiveNttF128 {
         };
 
         const PARALLEL_ROW_THRESHOLD: usize = 256;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        struct SeedNtFence;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        impl Drop for SeedNtFence {
+            fn drop(&mut self) {
+                // Drain this worker's WC buffers. The rayon join is the
+                // later transform's happens-before; this is the same-thread
+                // drain Intel's NT contract asks for.
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
+        }
         if quarter < PARALLEL_ROW_THRESHOLD {
             for r in 0..quarter {
                 seed_row(r);
             }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
         } else {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                (0..quarter)
+                    .into_par_iter()
+                    .for_each_init(|| SeedNtFence, |_, r| seed_row(r));
+            } else {
+                (0..quarter).into_par_iter().for_each(seed_row);
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
             (0..quarter).into_par_iter().for_each(seed_row);
         }
     }
@@ -2312,7 +1849,8 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 64 || lanes4_tail == 4);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
-        let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
+        let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
+            if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
 
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
@@ -2332,134 +1870,32 @@ impl AdditiveNttF128 {
                         tw,
                     );
                 }
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
-                );
-            }
-        }
-    }
-
-    /// The fused-two publish half of [`Self::seed_top_direct_fused2_publish`]:
-    /// the final quad butterflies of all eight blocks of one ranked `r` task,
-    /// streamed straight from registers to the codeword.
-    ///
-    /// Split out for the `F ‖ (M+P)` sibling schedule (see `st_fmp_run`), which
-    /// runs `st_fmp_fold4` on one logical CPU and this on its SMT sibling. Same
-    /// quads, same twiddles, same destination rows in the same order as the
-    /// fused form; the eight blocks are independent, so running all their folds
-    /// before all their publishes changes no value.
-    ///
-    /// # Safety
-    ///
-    /// Exact ranked geometry, as [`Self::seed_top_direct_fused2_publish`]:
-    /// `bufp` owns 512 staging rows of 64 elements whose fused-four layers are
-    /// already applied; `base` owns the disjoint 2^20x64 codeword; distinct
-    /// concurrent `r` tasks select disjoint destination rows. When
-    /// `ALIGNED_ZMM`, `base` must be 64-byte aligned; otherwise 16-byte.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    unsafe fn seed_top_direct_publish2<const ALIGNED_ZMM: bool>(
-        &self,
-        bufp: *mut F128,
-        base: *mut F128,
-        row_len: usize,
-        block_size: usize,
-        sub_stride: usize,
-        r: usize,
-        lanes2: usize,
-        stage_perm: bool,
-    ) {
-        debug_assert_eq!(row_len, 64);
-        debug_assert_eq!(block_size, 1 << 17);
-        debug_assert_eq!(sub_stride, 1 << 11);
-        debug_assert!(lanes2 == 60 || lanes2 == 64);
-        debug_assert_eq!(base as usize % 16, 0);
-        debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
-        // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
-        // final consumer of its four staging rows; the 16 quads partition the
-        // block's 64 logical rows, and the 8 blocks partition the task's 512.
-        unsafe {
-            for block in 0..8 {
-                let region = bufp.add(block * 64 * row_len);
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
-                );
-            }
-        }
-    }
-
-
-    /// Publish one block's sixteen final fused-two quads straight from
-    /// registers to the codeword.
-    ///
-    /// **`#[inline(never)]` is load-bearing, not stylistic.** The seed+top
-    /// `F ‖ (M+P)` split gives the publish loop a second caller — the split's
-    /// publish half beside the unsplit fused task. At two callers LLVM stops
-    /// inlining `butterfly_fused_2layer_publish_nt`, which would put a
-    /// ten-argument call (four destination pointers and three 16-byte twiddles)
-    /// on the ranked publish path 128 times per task where the incumbent has
-    /// none. Keeping the two callers' shared code in ONE out-of-line body
-    /// leaves that kernel with exactly one call site, so it is inlined here
-    /// exactly as it was inlined into the fused task before the split existed,
-    /// and the only call the split adds is per BLOCK — eight per task, not 128.
-    ///
-    /// # Safety
-    /// `region` owns block `block`'s 64 staging rows of `row_len` elements
-    /// with its fused-four layers already applied; `base` owns the disjoint
-    /// codeword; the contract is otherwise
-    /// [`Self::seed_top_direct_fused2_publish`]'s, forwarded.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    #[inline(never)]
-    unsafe fn seed_top_publish2_block<const ALIGNED_ZMM: bool>(
-        &self,
-        region: *mut F128,
-        base: *mut F128,
-        block: usize,
-        row_len: usize,
-        block_size: usize,
-        sub_stride: usize,
-        r: usize,
-        lanes2: usize,
-        stage_perm: bool,
-    ) {
-        let g2_stride: usize = if stage_perm { 16 } else { 1 };
-        // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
-        // final consumer of its four staging rows, and the 16 quads partition
-        // this block's 64 logical rows.
-        unsafe {
-            for m in 0..16 {
-                let outer_block = block * 16 + m;
-                let t_outer = self.twiddle(3 + 4, outer_block);
-                let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
-                let k = 4 * m;
-                let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
-                let step = g2_stride * row_len;
-                let dst = |k: usize| {
-                    base.add(seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len)
-                };
-                kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
-                    p,
-                    step,
-                    dst(k),
-                    dst(k + 1),
-                    dst(k + 2),
-                    dst(k + 3),
-                    lanes2,
-                    t_outer,
-                    t_inner_a,
-                    t_inner_b,
-                );
+                for m in 0..16 {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.twiddle(3 + 4, outer_block);
+                    let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
+                    let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+                    let k = 4 * m;
+                    let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
+                    let step = g2_stride * row_len;
+                    let dst = |k: usize| {
+                        base.add(
+                            seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len,
+                        )
+                    };
+                    kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
+                        p,
+                        step,
+                        dst(k),
+                        dst(k + 1),
+                        dst(k + 2),
+                        dst(k + 3),
+                        lanes2,
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                    );
+                }
             }
         }
     }
@@ -2562,17 +1998,17 @@ impl AdditiveNttF128 {
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);
         let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
             if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
-        // The seed half (`M`) of one task: 64 row groups gathered out of
-        // `msg` into the 512 staging rows. Split out from `task` so the
-        // sibling-paired schedule (see `st_fmp_run`) can run it on a different
-        // logical CPU from the fused-four fold; the unsplit `task` below opens
-        // with it and is otherwise byte for byte what it was.
-        //
-        // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
-        // `bufp` addresses the 512 staging rows that only this task writes.
-        let seed = |bufp: *mut F128, r: usize| {
+        let task = |buf: &mut Vec<F128>, r: usize| {
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside
+            // `msg`; codeword rows `block·B + r + k·S` are inside `data`;
+            // distinct `r` select pairwise-disjoint codeword row sets, so no two
+            // concurrent tasks write the same element. `buf` (512 rows) is this
+            // worker's private staging block.
             unsafe {
                 let src = src_addr as *const F128;
+                let base = base_addr as *mut F128;
+                let bufp = buf.as_mut_ptr();
                 // Seed: 64 row groups → staging rows [block][k].
                 //
                 // The four message rows a step reads are asked for a fixed
@@ -2714,18 +2150,6 @@ impl AdditiveNttF128 {
                         );
                     }
                 }
-            }
-        };
-        let task = |buf: &mut Vec<F128>, r: usize| {
-            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
-            let bufp = buf.as_mut_ptr();
-            seed(bufp, r);
-            // SAFETY: codeword rows `block·B + r + k·S` are inside `data`;
-            // distinct `r` select pairwise-disjoint codeword row sets, so no two
-            // concurrent tasks write the same element. `buf` (512 rows) is this
-            // worker's private staging block.
-            unsafe {
-                let base = base_addr as *mut F128;
                 #[cfg(all(
                     target_arch = "x86_64",
                     target_feature = "avx512f",
@@ -2825,55 +2249,6 @@ impl AdditiveNttF128 {
             }
         };
 
-        // The two halves of one task's post-seed work, split at the exact seam
-        // the co-residency measurement priced: the fused-four staging fold
-        // (`F`) and the fused-two NT publish (`P`). Only the ranked
-        // `direct_publish` geometry is split; every other shape keeps the
-        // fused `task` above verbatim.
-        #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        let fold4 = |bufp: *mut F128, r: usize| {
-            // SAFETY: `bufp` addresses the 512 seeded staging rows of task
-            // `r`; this half writes nothing outside them.
-            unsafe {
-                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4);
-            }
-        };
-        #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ))]
-        let publish2 = |bufp: *mut F128, r: usize| {
-            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
-            // SAFETY: forwarded ranked-shape contract, identical to the fused
-            // call in `task`: `bufp` holds task `r`'s 512 folded staging rows
-            // and `base` owns the disjoint codeword, whose rows for distinct
-            // `r` are pairwise disjoint.
-            unsafe {
-                let base = base_addr as *mut F128;
-                if direct_publish_zmm {
-                    self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
-                    );
-                } else {
-                    self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
-                    );
-                }
-                // All 512 rows of this task are published. Drain the WC
-                // buffers here, exactly as the fused path does per task; the
-                // rayon join below is the reader's happens-before edge.
-                core::arch::x86_64::_mm_sfence();
-            }
-        };
-
-
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // (all lanes) before the layer loops read any of them, so the
@@ -2885,20 +2260,6 @@ impl AdditiveNttF128 {
                 task(&mut buf, r);
             }
         } else {
-            // Sibling-paired schedule: on each physical core one logical CPU
-            // seeds and publishes while its SMT sibling runs the fused-four
-            // fold, instead of both alternating all three phases. Falls
-            // through to the unsplit schedule whenever the machine, the pool,
-            // the shape or the kill switch says no.
-            #[cfg(all(
-                target_os = "linux",
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2) {
-                return;
-            }
             (0..sub_stride)
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
@@ -4324,6 +3685,15 @@ fn rate_seed_disabled() -> bool {
     *OFF
 }
 
+/// `FLOCK_NO_SEED_NT=1` restores write-allocate stores in
+/// [`AdditiveNttF128::seed_layers_pair_from_msg`]. Read once per process;
+/// default ON (the ranked worker clears its env).
+fn seed_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SEED_NT").is_none());
+    *ON
+}
+
 /// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
 /// the zero-padded transform's initial copy-only layers.
 fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
@@ -4511,124 +3881,6 @@ mod tests {
                 core::ptr::addr_of!(queue.tail) as usize / CACHE_LINE,
                 addr / CACHE_LINE
             );
-        }
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn st_fmp_bufs_default_override_and_clamp() {
-        assert_eq!(select_st_fmp_bufs(None), 2);
-        assert_eq!(select_st_fmp_bufs(Some(0)), 2);
-        assert_eq!(select_st_fmp_bufs(Some(1)), 2);
-        assert_eq!(select_st_fmp_bufs(Some(2)), 2);
-        assert_eq!(select_st_fmp_bufs(Some(3)), 3);
-        assert_eq!(select_st_fmp_bufs(Some(ST_FMP_CAP)), ST_FMP_CAP);
-        assert_eq!(select_st_fmp_bufs(Some(ST_FMP_CAP + 1)), ST_FMP_CAP);
-        assert_eq!(select_st_fmp_bufs(Some(usize::MAX)), ST_FMP_CAP);
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn st_fmp_pair_state_is_one_cache_line_aligned() {
-        const CACHE_LINE: usize = 64;
-        assert_eq!(core::mem::align_of::<StFmpPair>() % CACHE_LINE, 0);
-        // Distinct cores must not share a line, or the two handoff counters of
-        // one pair would ping-pong against another pair's.
-        let v: Vec<StFmpPair> = (0..4).map(|_| StFmpPair::new()).collect();
-        for w in v.windows(2) {
-            let a = core::ptr::addr_of!(w[0]) as usize;
-            let b = core::ptr::addr_of!(w[1]) as usize;
-            assert_ne!(a / CACHE_LINE, b / CACHE_LINE);
-        }
-    }
-
-    /// **The digest gate in miniature.** Runs the real `st_fmp_run` schedule
-    /// with stamped payloads instead of butterflies, and asserts the three
-    /// properties whose failure would show up in production as a wrong proof
-    /// once in a while and never in a timing:
-    ///
-    ///  1. every task is seeded, folded and published EXACTLY once;
-    ///  2. the fold always observes its own task's seed (never a stale slot,
-    ///     never a neighbour's task);
-    ///  3. the publish always observes its own task's fold.
-    ///
-    /// (2) and (3) are the buffer-reuse race: they fail the moment the seeder
-    /// refills a staging block the folder is still reading, or the publisher
-    /// reads one the folder has not finished. Repeated over every legal buffer
-    /// count so the slot ring is exercised at each modulus.
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn st_fmp_split_hands_every_task_over_exactly_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let Some(pairs) = st_fmp_pairs() else {
-            // Not an SMT-pairable pool; the schedule never engages here.
-            return;
-        };
-        let n_pairs = pairs.len();
-        const ROW_LEN: usize = 4;
-        let n_tasks = 64 * n_pairs;
-        for nbuf in 2..=ST_FMP_CAP {
-            // `st_fmp_run` reads the buffer count from the process-cached
-            // `st_fmp_bufs()`, so drive the modulus through the same clamp the
-            // production path uses and assert the schedule at whatever it
-            // resolved to as well.
-            let _ = select_st_fmp_bufs(Some(nbuf));
-            for rep in 0..16 {
-                let seeded: Vec<AtomicUsize> = (0..n_tasks).map(|_| AtomicUsize::new(0)).collect();
-                let folded: Vec<AtomicUsize> = (0..n_tasks).map(|_| AtomicUsize::new(0)).collect();
-                let published: Vec<AtomicUsize> =
-                    (0..n_tasks).map(|_| AtomicUsize::new(0)).collect();
-                let stamp = |r: usize| F128 { lo: r as u64 + 1, hi: rep as u64 + 1 };
-                let cooked = |r: usize| F128 { lo: !(r as u64), hi: rep as u64 + 1 };
-                let seed = |p: *mut F128, r: usize| {
-                    seeded[r].fetch_add(1, Ordering::Relaxed);
-                    // SAFETY: `p` is this task's staging block, 512 * ROW_LEN
-                    // elements, owned by the seeder until it publishes it.
-                    unsafe {
-                        *p = stamp(r);
-                        *p.add(1) = F128 { lo: 0, hi: 0 };
-                        *p.add(511 * ROW_LEN) = stamp(r);
-                    }
-                };
-                let fold = |p: *mut F128, r: usize| {
-                    // SAFETY: handed over by the seeder's release.
-                    unsafe {
-                        assert_eq!(*p, stamp(r), "fold saw a stale or foreign seed");
-                        assert_eq!(*p.add(511 * ROW_LEN), stamp(r), "fold saw a torn block");
-                        *p.add(1) = cooked(r);
-                    }
-                    folded[r].fetch_add(1, Ordering::Relaxed);
-                };
-                let publish = |p: *mut F128, r: usize| {
-                    // SAFETY: handed back by the folder's release.
-                    unsafe {
-                        assert_eq!(*p, stamp(r), "publish saw a stale or foreign seed");
-                        assert_eq!(*p.add(1), cooked(r), "publish saw an unfolded block");
-                    }
-                    published[r].fetch_add(1, Ordering::Relaxed);
-                };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish));
-                for r in 0..n_tasks {
-                    assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
-                    assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
-                    assert_eq!(published[r].load(Ordering::Relaxed), 1, "task {r} published");
-                }
-            }
         }
     }
 

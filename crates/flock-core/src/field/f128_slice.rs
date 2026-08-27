@@ -553,6 +553,99 @@ mod tests {
             assert_eq!(got, via_pairs, "two-pass pairs n={n}");
         }
     }
+
+    /// The pad57 leaf equals both its literal 64/57 oracle and the incumbent
+    /// full64 fold16+fold4 route when the trusted odd tail is structurally zero.
+    #[test]
+    fn fold64_banked_pad57_pairs_matches_full64_on_zero_tail() {
+        let mut state = 0x57A1_64BA_0C1E_F00D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [8usize, 16, 40, 2_048] {
+            let mut src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            for slot in (1..n).step_by(2) {
+                src[64 * slot + 57..64 * slot + 64].fill(F128::ZERO);
+            }
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let r4 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let r5 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let mut got = vec![F128::ZERO; n];
+            let mut oracle = vec![F128::ZERO; n];
+            let mut mid4 = vec![F128::ZERO; 4 * n];
+            let mut incumbent = vec![F128::ZERO; n];
+            fold64_banked_pad57_pairs(&src, &mut got, &w, r4, r5);
+            fold64_banked_pad57_pairs_scalar(&src, &mut oracle, &w, r4, r5);
+            fold16_banked(&src, &mut mid4, &w);
+            fold4_nested(&mid4, &mut incumbent, r4, r5);
+            assert_eq!(got, oracle, "specialized/scalar n={n}");
+            assert_eq!(got, incumbent, "specialized/full64 n={n}");
+        }
+    }
+
+    /// Poisoning the seven promised-zero odd banks must distinguish the
+    /// specialized contract from the ordinary full64 route. This prevents a
+    /// future refactor from silently turning the PaddingSpec gate into a
+    /// length-only optimization.
+    #[test]
+    fn fold64_banked_pad57_pairs_ignores_only_promised_odd_tail() {
+        let n = 8usize;
+        let mut src = vec![F128::ZERO; 64 * n];
+        for slot in (1..n).step_by(2) {
+            src[64 * slot + 57..64 * slot + 64].fill(F128::ONE);
+        }
+        let w = [F128::ONE; 16];
+        let mut specialized = vec![F128::ZERO; n];
+        let mut mid4 = vec![F128::ZERO; 4 * n];
+        let mut full64 = vec![F128::ZERO; n];
+        fold64_banked_pad57_pairs(&src, &mut specialized, &w, F128::ONE, F128::ONE);
+        fold16_banked(&src, &mut mid4, &w);
+        fold4_nested(&mid4, &mut full64, F128::ONE, F128::ONE);
+        assert_eq!(specialized, vec![F128::ZERO; n]);
+        for slot in 0..n {
+            assert_eq!(full64[slot], if slot & 1 == 0 { F128::ZERO } else { F128::ONE });
+        }
+        assert_ne!(specialized, full64);
+    }
+
+    /// Bank 56 is the final live odd-bank sentinel. It must be loaded through
+    /// the four-XMM assembly path, while only 57..63 are eligible to disappear.
+    #[test]
+    fn fold64_banked_pad57_pairs_keeps_odd_bank56() {
+        let n = 8usize;
+        let mut src = vec![F128::ZERO; 64 * n];
+        for slot in (1..n).step_by(2) {
+            src[64 * slot + 56] = F128::ONE;
+        }
+        let w = [F128::ONE; 16];
+        let mut specialized = vec![F128::ZERO; n];
+        let mut mid4 = vec![F128::ZERO; 4 * n];
+        let mut full64 = vec![F128::ZERO; n];
+        fold64_banked_pad57_pairs(&src, &mut specialized, &w, F128::ONE, F128::ONE);
+        fold16_banked(&src, &mut mid4, &w);
+        fold4_nested(&mid4, &mut full64, F128::ONE, F128::ONE);
+        assert_eq!(specialized, full64);
+        for slot in (1..n).step_by(2) {
+            assert_eq!(specialized[slot], F128::ONE, "odd bank56 slot={slot}");
+        }
+    }
 }
 
 /// Sixteen-bank weighted fold: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
@@ -591,6 +684,85 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             }
             *value = v;
         }
+    }
+}
+
+/// Ranked pad-57 witness fold: bind 64 banks directly into pairs of output
+/// slots. Even slots contain all 64 banks; odd slots have structural zeroes in
+/// banks 57..63 and therefore consume only the first 57. `w` binds the low
+/// four bank bits and `r4` / `r5` bind the two high bits.
+///
+/// The caller must derive the permission to use this shape from the trusted
+/// [`crate::zerocheck::PaddingSpec`]. This helper deliberately accepts no
+/// inferred length-only selector: unusual DirectFold8 shapes stay on the
+/// ordinary full-64 fold.
+#[inline]
+pub(crate) fn fold64_banked_pad57_pairs(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "pad57 fold source must contain 64 banks per destination slot"
+    );
+    assert!(
+        dst.len().is_multiple_of(8),
+        "pad57 fold requires complete eight-output groups"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg provides the target features and the assertions above pin
+    // the exact source/output geometry used by the kernel.
+    unsafe {
+        x86_64::fold64_banked_pad57_pairs(src, dst, w, r4, r5);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    fold64_banked_pad57_pairs_scalar(src, dst, w, r4, r5);
+}
+
+/// Straight reduced oracle for [`fold64_banked_pad57_pairs`]. Kept separate so
+/// tests can compare the specialized x86 kernel with the literal 64/57 sums.
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))
+))]
+pub(super) fn fold64_banked_pad57_pairs_scalar(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    assert_eq!(src.len(), 64 * dst.len());
+    assert!(dst.len().is_multiple_of(8));
+    for (slot, value) in dst.iter_mut().enumerate() {
+        let mut group = [F128::ZERO; 4];
+        for high in 0..4 {
+            let live = if slot & 1 == 1 && high == 3 { 9 } else { 16 };
+            for bank in 0..live {
+                group[high] += w[bank] * src[64 * slot + 16 * high + bank];
+            }
+        }
+        let low = group[0] + r4 * (group[0] + group[1]);
+        let high = group[2] + r4 * (group[2] + group[3]);
+        *value = low + r5 * (low + high);
     }
 }
 

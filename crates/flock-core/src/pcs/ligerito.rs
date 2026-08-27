@@ -5861,6 +5861,27 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     });
     *ON
 }
+
+/// Secondary lock for the pad-57 materializer. The upstream capability proves
+/// the trusted PaddingSpec and ranked witness/config shape; this lock proves
+/// that the actual DirectFold8 state still has the exact two-claim, no-ordinary
+/// 2^19-by-2^11 geometry before any sparse-tail load is skipped.
+#[inline]
+fn direct_fold8_pad57_shape_for(
+    capability: bool,
+    claims_len: usize,
+    has_ordinary: bool,
+    out_len: usize,
+    block_len: usize,
+    all_eq_hi_256: bool,
+) -> bool {
+    capability
+        && claims_len == 2
+        && !has_ordinary
+        && out_len == (1usize << 19)
+        && block_len == (1usize << 11)
+        && all_eq_hi_256
+}
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5872,6 +5893,7 @@ fn materialize_direct_fold8(
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
+    pad57_capability: bool,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -5927,6 +5949,27 @@ fn materialize_direct_fold8(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    let pad57_on = direct_fold8_pad57_shape_for(
+        pad57_capability,
+        claims.len(),
+        has_ordinary,
+        out_len,
+        block_len,
+        claims.iter().all(|claim| claim.eq_hi.len() == (1usize << 8)),
+    );
+    if open_timing() {
+        static PAD57_HITS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let hits = if pad57_on {
+            PAD57_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        } else {
+            PAD57_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        eprintln!(
+            "[direct-fold8] pad57={pad57_on} hits={hits} claims={} ordinary={has_ordinary} out={out_len} block={block_len}",
+            claims.len(),
+        );
+    }
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5988,30 +6031,15 @@ fn materialize_direct_fold8(
                         pooled,
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
-                    crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled),
-                    // `gfni_tmp` sits under the SAME sub-`RECYCLE_MIN` gate
-                    // `mid4` above does, and the staged GFNI kernel hammers it
-                    // with ZMM `storeu`/`loadu`: at 64 F128 = 1 KiB it goes to
-                    // the system allocator and lands 16 mod 64, so every 64 B
-                    // ZMM access against it straddles two cache lines.
-                    //
-                    // The size arithmetic is NOT `mid4`'s. `mid4` is 16 KiB and
-                    // crosses a 32 KiB threshold, i.e. 2x. This buffer is 1 KiB,
-                    // so asking for the gate's minimum inflates it 32x. That is
-                    // affordable here for one specific reason: the pooled arm is
-                    // `take_local_f128`, which recycles a per-thread allocation
-                    // and does NOT zero it (`scratch.rs`; the unpooled kill-switch
-                    // arm's `vec![F128::ZERO; n]` is not the ranked path). So the
-                    // inflation costs one 32 KiB reservation per thread ONCE,
-                    // 512 KiB across 16 threads, and the kernel still touches only
-                    // the first 1 KiB -- the resident cache footprint is unchanged,
-                    // which is what `killed.md:2170`'s L1D lesson actually cares
-                    // about. CAPACITY ONLY: the kernel still addresses exactly the
-                    // same 64 elements, so no value, element or order changes.
                     crate::scratch::LocalBuf::new(
-                        if b_gfni_on { (64usize).max(ALIGN64_MIN_F128) } else { 0 },
+                        if pad57_on {
+                            0
+                        } else {
+                            (4 * SUB).max(ALIGN64_MIN_F128)
+                        },
                         pooled,
                     ),
+                    crate::scratch::LocalBuf::new(if b_gfni_on { 64 } else { 0 }, pooled),
                 )
             },
             |(scratch, mid16, mid4, gfni_tmp), (block, (b_out, f_out))| {
@@ -6023,31 +6051,46 @@ fn materialize_direct_fold8(
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                if pad57_on {
+                    // Trusted padding says odd output slots have only 57 live
+                    // banks. The direct kernel removes the mid4 write+read and
+                    // the seven dead odd-bank loads: 92 MiB less logical/L1
+                    // traffic at the ranked shape. Of the 28 MiB skipped source
+                    // loads, exactly 16 MiB are wholly-dead cache lines; the
+                    // bank-56 scalar load still fetches banks 57..59, and the
+                    // physical DRAM delta remains cache-state-dependent.
+                    crate::field::f128_slice::fold64_banked_pad57_pairs(
+                        f_in,
+                        f_out,
+                        &fold16_weight,
+                        r4,
+                        r5,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
-                        let m16 = &mut mid16[..16 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                } else {
+                    // #1472 fallback: deferred-reduction 16-bank fold followed
+                    // by one nested fold4, 64 -> 4 -> 1, through aligned mid4.
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
+                        let m4 = &mut mid4[..4 * n];
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
                         );
-                        crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
                         crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
+                            m4, &mut f_out[slot..slot + n], r4, r5,
                         );
+                        if has_ordinary {
+                            let m16 = &mut mid16[..16 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
+                            crate::field::f128_slice::fold4_nested(
+                                m4, &mut b_out[slot..slot + n], r4, r5,
+                            );
+                        }
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -6921,6 +6964,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold8Factors>,
+    pad57_capability: bool,
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
@@ -6947,7 +6991,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         None,
         None,
         None,
-        Some(direct),
+        Some((direct, pad57_capability)),
         fold_arena,
         challenger,
     )
@@ -6969,7 +7013,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
-    direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
+    direct_fold8: Option<(Vec<super::ring_switch::DirectFold8Factors>, bool)>,
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
@@ -7123,14 +7167,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _tf = std::time::Instant::now();
         let msg = if direct_fold8_mode && j < 6 {
             let msg = if j < 5 {
-                fold_direct_fold8_factors_and_message(
-                    direct_fold8
-                        .as_mut()
-                        .expect("direct-fold8 factors remain live through round five"),
-                    r,
-                )
+                let direct = &mut direct_fold8
+                    .as_mut()
+                    .expect("direct-fold8 factors remain live through round five")
+                    .0;
+                fold_direct_fold8_factors_and_message(direct, r)
             } else {
-                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                    let (direct, pad57_capability) =
+                        direct_fold8.take().expect("direct-fold8 factors consumed once");
                     let (f8, b8, msg) = materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
@@ -7143,6 +7187,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             fold4_challenges[4],
                             r,
                         ],
+                        pad57_capability,
                     );
                     sc_prover = Some(SumcheckProver::new_after_direct_fold8(
                         f8,
@@ -9226,6 +9271,18 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_fold8_pad57_shape_rejects_every_near_miss() {
+        let exact = || direct_fold8_pad57_shape_for(true, 2, false, 1 << 19, 1 << 11, true);
+        assert!(exact());
+        assert!(!direct_fold8_pad57_shape_for(false, 2, false, 1 << 19, 1 << 11, true));
+        assert!(!direct_fold8_pad57_shape_for(true, 1, false, 1 << 19, 1 << 11, true));
+        assert!(!direct_fold8_pad57_shape_for(true, 2, true, 1 << 19, 1 << 11, true));
+        assert!(!direct_fold8_pad57_shape_for(true, 2, false, (1 << 19) - 1, 1 << 11, true));
+        assert!(!direct_fold8_pad57_shape_for(true, 2, false, 1 << 19, (1 << 11) - 1, true));
+        assert!(!direct_fold8_pad57_shape_for(true, 2, false, 1 << 19, 1 << 11, false));
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
@@ -12106,6 +12163,7 @@ mod tests {
             poly,
             Vec::new(),
             direct,
+            false,
             target,
             &wtns_0.mat,
             &wtns_0.tree,
