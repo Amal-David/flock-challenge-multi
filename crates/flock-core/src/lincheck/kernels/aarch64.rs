@@ -1,4 +1,4 @@
-use super::super::{build_sum_table, F128};
+use super::super::{F128, build_sum_table};
 
 const NEON_TILE_T: usize = 8;
 
