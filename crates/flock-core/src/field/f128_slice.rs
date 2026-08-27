@@ -226,8 +226,16 @@ mod tests {
             state
         };
         for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
-            let src: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
-            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let src: Vec<F128> = (0..16 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
             let mut got = vec![F128::ZERO; n];
             fold16_banked(&src, &mut got, &w);
             for t in 0..n {
@@ -239,7 +247,12 @@ mod tests {
             }
         }
         // Degenerate weights: one-hot, all-zero, all-one.
-        let src: Vec<F128> = (0..16 * 8).map(|i| F128 { lo: i as u64 * 7 + 1, hi: (i as u64) << 40 }).collect();
+        let src: Vec<F128> = (0..16 * 8)
+            .map(|i| F128 {
+                lo: i as u64 * 7 + 1,
+                hi: (i as u64) << 40,
+            })
+            .collect();
         for b0 in 0..16 {
             let mut w = [F128::ZERO; 16];
             w[b0] = F128::ONE;
@@ -253,7 +266,9 @@ mod tests {
         let mut got = vec![F128::ZERO; 8];
         fold16_banked(&src, &mut got, &w);
         for t in 0..8 {
-            let want = src[16 * t..16 * t + 16].iter().fold(F128::ZERO, |a, &b| a + b);
+            let want = src[16 * t..16 * t + 16]
+                .iter()
+                .fold(F128::ZERO, |a, &b| a + b);
             assert_eq!(got[t], want);
         }
     }
@@ -275,18 +290,50 @@ mod tests {
             state
         };
         for n in [1usize, 4, 5, 64, 257] {
-            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
-            let src16: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let src16: Vec<F128> = (0..16 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             let mut zeroed = vec![F128::ZERO; n];
-            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut dirty: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             fold16_banked(&src16, &mut zeroed, &w);
             fold16_banked(&src16, &mut dirty, &w);
             assert_eq!(dirty, zeroed, "fold16_banked n={n}");
 
-            let (r0, r1) = (F128 { lo: next(), hi: next() }, F128 { lo: next(), hi: next() });
-            let src4: Vec<F128> = (0..4 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let (r0, r1) = (
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+            );
+            let src4: Vec<F128> = (0..4 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             let mut zeroed = vec![F128::ZERO; n];
-            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut dirty: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             fold4_nested(&src4, &mut zeroed, r0, r1);
             fold4_nested(&src4, &mut dirty, r0, r1);
             assert_eq!(dirty, zeroed, "fold4_nested n={n}");
@@ -334,7 +381,6 @@ mod tests {
             assert_eq!(b_got, b_want, "folded b n={n}");
         }
     }
-
 
     /// The three split-half leaves match the straightforward scalar formulas
     /// at lengths that hit the four-slot body, every tail residue, and the
@@ -402,7 +448,11 @@ mod tests {
                 weinf += (hi + lo) * (zh + zl);
             }
             assert_eq!(got, (we1, weinf), "fused message n={n}");
-            assert_eq!((gc0, gc1, gz0, gz1), (wc0, wc1, wz0, wz1), "fused tables n={n}");
+            assert_eq!(
+                (gc0, gc1, gz0, gz1),
+                (wc0, wc1, wz0, wz1),
+                "fused tables n={n}"
+            );
         }
     }
 
@@ -601,7 +651,10 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
 /// Same char-2 one-mul identity either way.
 #[inline]
 pub(crate) fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
-    assert!(hi.len() >= lo.len(), "split bind needs one high slot per low");
+    assert!(
+        hi.len() >= lo.len(),
+        "split bind needs one high slot per low"
+    );
 
     #[cfg(all(
         target_arch = "x86_64",
