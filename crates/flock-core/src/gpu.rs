@@ -1870,8 +1870,9 @@ mod tests {
     use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
     use crate::zerocheck::univariate_skip::{SplitEqGhash, pack_bits};
     use crate::zerocheck::univariate_skip_optimized::{
-        K_SKIP, N_INNER, WorkerStateWithSHatV, build_b_med_counts, convert_table, d_inv,
-        medium_challenges_ghash, process_one_x_hi_with_s_hat_v, small_challenges_ghash,
+        K_SKIP, N_INNER, WorkerStateWithSHatV, build_b_med_counts, build_c_mask_tables,
+        convert_table, d_inv, medium_challenges_ghash, process_one_x_hi_with_s_hat_v,
+        small_challenges_ghash,
     };
     use crate::zerocheck::PaddingSpec;
     use crate::field::F8;
@@ -2244,6 +2245,7 @@ mod tests {
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
         let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let mask_tables = build_c_mask_tables(&eq_lo_scaled);
 
         // CPU: one x_hi (= 0) into a fresh state ⇒ `local_res_*` hold exactly
         // that x_hi's eq_hi-folded partials.
@@ -2261,6 +2263,7 @@ mod tests {
             &eq_lo_scaled,
             eq.hi[0],
             convert,
+            &mask_tables,
             &mut state,
         );
 
@@ -2283,8 +2286,8 @@ mod tests {
         let got = job.finish().expect("GPU share must complete");
 
         assert_eq!(got.res_ab, state.local_res_ab, "AB bank mismatch");
-        assert_eq!(got.res_c0, state.local_res_c_s_0, "C bank 0 mismatch");
-        assert_eq!(got.res_c1, state.local_res_c_s_1, "C bank 1 mismatch");
+        assert_eq!(got.res_c0, state.local_res_c_s[0], "C bank 0 mismatch");
+        assert_eq!(got.res_c1, state.local_res_c_s[1], "C bank 1 mismatch");
     }
 
     /// CPU reference for a whole-range GPU share: serial accumulation of
@@ -2303,6 +2306,7 @@ mod tests {
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
         let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        let mask_tables = build_c_mask_tables(&eq_lo_scaled);
         let mut state = WorkerStateWithSHatV::new();
         for x_hi in 0..(1usize << eq.n_hi) {
             process_one_x_hi_with_s_hat_v(
@@ -2318,6 +2322,7 @@ mod tests {
                 &eq_lo_scaled,
                 eq.hi[x_hi],
                 convert,
+                &mask_tables,
                 &mut state,
             );
         }
@@ -2364,11 +2369,11 @@ mod tests {
             "AB mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
         assert_eq!(
-            got.res_c0, state.local_res_c_s_0,
+            got.res_c0, state.local_res_c_s[0],
             "C bank 0 mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
         assert_eq!(
-            got.res_c1, state.local_res_c_s_1,
+            got.res_c1, state.local_res_c_s[1],
             "C bank 1 mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
     }
