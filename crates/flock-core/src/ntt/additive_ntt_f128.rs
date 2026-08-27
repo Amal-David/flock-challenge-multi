@@ -206,10 +206,7 @@ static ZERO_ODD_TAIL_LANES: std::sync::atomic::AtomicUsize =
 /// `FLOCK_NO_ZERO_LANE_SKIP=1` restores the dense butterfly in the same
 /// binary, so a candidate/control pair differs only in this dispatch.
 #[inline]
-fn zero_lane_skip_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_LANE_SKIP").is_some())
-}
+fn zero_lane_skip_disabled() -> bool { false }
 
 /// `FLOCK_NO_NTT_TOP_FUSION=1` restores the incumbent two-pass top-layer
 /// schedule (fused-four sweep, then fused-two sweep) in the same binary; the
@@ -217,20 +214,10 @@ fn zero_lane_skip_disabled() -> bool {
 /// `FLOCK_NO_NTT_LONE_TOP_BUMP=1` restores the incumbent `n_top` choice when
 /// exactly one top layer would remain (diagnostics; the ranked worker's
 /// cleared env never sets it).
-fn ntt_lone_top_bump_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LONE_TOP_BUMP").is_some())
-}
+fn ntt_lone_top_bump_disabled() -> bool { false }
 
 /// [`AdditiveNttF128::top_fused6_pass`].
-fn ntt_top_fusion_disabled() -> bool {
-    #[cfg(test)]
-    if TOP_FUSION_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_TOP_FUSION").is_some())
-}
+fn ntt_top_fusion_disabled() -> bool { false }
 
 /// Test-only latch: forces the incumbent top schedule without touching the
 /// process environment, so one process can compare both schedules.
@@ -243,14 +230,7 @@ static TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
 /// task ([`AdditiveNttF128::seed_top_fused8_pass`]) so the codeword is
 /// written once, already at layer 9. Independent of `FLOCK_NO_NTT_TOP_FUSION`
 /// (which disables both).
-fn ntt_seed_top_fusion_disabled() -> bool {
-    #[cfg(test)]
-    if SEED_TOP_FUSION_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
-}
+fn ntt_seed_top_fusion_disabled() -> bool { false }
 
 /// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
 /// fused-two scratch stores followed by the separate non-temporal scatter.
@@ -261,10 +241,7 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-fn ntt_direct_fused2_publish_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
-}
+fn ntt_direct_fused2_publish_disabled() -> bool { false }
 
 /// `FLOCK_NO_NTT_SEED_HOLD4=1` restores the two-gather seed step (sparse
 /// 2-layer then dense 2-layer, each loading the same four message rows).
@@ -275,10 +252,7 @@ fn ntt_direct_fused2_publish_disabled() -> bool {
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-fn ntt_seed_hold4_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
-}
+fn ntt_seed_hold4_disabled() -> bool { false }
 
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
@@ -303,34 +277,20 @@ static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
 ///  * the deep tail runs one fused-**three** sweep instead of a fused-two
 ///    sweep followed by a single-layer sweep (see `deep_sub`), so the tail
 ///    layers cost one row load + one row store instead of two of each.
-fn ntt_kernel_diet_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_KERNEL_DIET").is_some())
-}
+fn ntt_kernel_diet_disabled() -> bool { false }
 
 /// Kernel-diet part 1: snap the odd-row lane bound to whole SIMD groups.
 /// `FLOCK_NO_NTT_LANE_ROUND=1` disables just this half (diagnostics; the
 /// shipped switch is `FLOCK_NO_NTT_KERNEL_DIET`, which disables both).
 #[inline]
-fn ntt_lane_round_disabled() -> bool {
-    #[cfg(test)]
-    if KERNEL_DIET_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0 {
-        return true;
-    }
-    static OFF: OnceLock<bool> = OnceLock::new();
-    ntt_kernel_diet_disabled()
-        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LANE_ROUND").is_some())
-}
+fn ntt_lane_round_disabled() -> bool { false }
 
 /// Kernel-diet part 2: fuse the three-layer deep tail into one sweep.
 /// `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1` restores the sweep-per-stage deep-layer
 /// schedule (three full passes over each sub-group plus the Merkle callback
 /// read) instead of the block-fused single pass (exact same-binary A/B).
 #[inline]
-fn deep_block_fuse_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
-}
+fn deep_block_fuse_enabled() -> bool { true }
 
 /// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
 /// when this machine or pool cannot be paired.
@@ -617,27 +577,11 @@ static NTT_SHAPED_TEST_OFF: std::sync::atomic::AtomicBool =
     )),
     allow(dead_code)
 )]
-fn ntt_shaped_enabled() -> bool {
-    #[cfg(test)]
-    if NTT_SHAPED_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_SHAPED").is_none());
-    *ON
-}
+fn ntt_shaped_enabled() -> bool { true }
 
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
 #[inline]
-fn ntt_fused3_disabled() -> bool {
-    #[cfg(test)]
-    if KERNEL_DIET_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0 {
-        return true;
-    }
-    static OFF: OnceLock<bool> = OnceLock::new();
-    ntt_kernel_diet_disabled()
-        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3").is_some())
-}
+fn ntt_fused3_disabled() -> bool { false }
 
 /// Test-only latch for the kernel diet (see [`TOP_FUSION_TEST_OFF`]).
 /// Bit 0 disables the lane rounding, bit 1 the fused-three deep tail, so one
@@ -2211,20 +2155,12 @@ impl AdditiveNttF128 {
     /// stores in the seed-fused top pass (exact same-binary A/B); the ranked
     /// worker's cleared env never sets it.
     #[cfg(target_arch = "x86_64")]
-    fn scatter_nt_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_SCATTER_NT").is_none());
-        *ON
-    }
+    fn scatter_nt_enabled() -> bool { true }
 
     /// `FLOCK_NO_NTT_STAGE_PERM=1` restores the natural `[block][k]` staging
     /// order in the same binary (exact same-binary A/B); the ranked worker's
     /// cleared env never sets it.
-    fn stage_perm_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_STAGE_PERM").is_none());
-        *ON
-    }
+    fn stage_perm_enabled() -> bool { true }
 
     /// Publish one staging row to the codeword with non-temporal stores.
     ///
@@ -4311,18 +4247,12 @@ fn log2_pow2(n: usize) -> usize {
     all(target_arch = "x86_64", target_feature = "pclmulqdq"),
 ))]
 #[inline]
-fn rate_half_seed_disabled() -> bool {
-    std::env::var_os("FLOCK_NO_RATE_HALF_SEED").is_some()
-}
+fn rate_half_seed_disabled() -> bool { false }
 
 /// `FLOCK_NO_NTT_RATE_SEED=1` restores `replicate_message_fill` + a transform
 /// from layer `log_inv_rate` for rate ≤ 1/4 encodes. Read once per process;
 /// default ON (the ranked worker clears its env).
-fn rate_seed_disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RATE_SEED").is_some());
-    *OFF
-}
+fn rate_seed_disabled() -> bool { false }
 
 /// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
 /// the zero-padded transform's initial copy-only layers.

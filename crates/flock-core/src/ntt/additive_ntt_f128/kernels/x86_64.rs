@@ -5,10 +5,7 @@ use crate::field::F128;
 /// differs only in the twiddle-product form. Read once, outside every lane
 /// loop.
 #[inline]
-fn mul_diet_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
-}
+fn mul_diet_disabled() -> bool { false }
 
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
@@ -1269,10 +1266,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 /// candidate/control pair differs only in the product form. Read once,
 /// outside every lane loop.
 #[inline]
-fn low_twiddle_fused3_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
-}
+fn low_twiddle_fused3_disabled() -> bool { false }
 
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
