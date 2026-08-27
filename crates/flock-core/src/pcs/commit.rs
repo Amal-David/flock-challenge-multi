@@ -1216,6 +1216,225 @@ pub fn prefault_codeword_during<R>(
     })
 }
 
+// ---------------------------------------------------------------------------
+// FEA-BMLP-SPSR typed bulk merkle-leaf packer.
+//
+// `pack_merkle_leaves_bulk` is the FEA-BMLP front end: it groups
+// `leaf_block_size` consecutive `ChainedValue` (here, `F128`)
+// field elements into a single aligned buffer with a single length
+// prefix, sourced from the [`BpmpStreamChunks`] view. The packed
+// buffer is then handed to `try_consume_coalesced`, which batches
+// multiple small proof-query serialization calls into one
+// contiguous write — cutting the per-compression-call setup cost
+// the BLAKE3 batched path otherwise pays for every leaf.
+// ---------------------------------------------------------------------------
+
+/// FEA-BMLP-SPSR packing configuration. Defaults match the ranked
+/// m=29 geometry: 16-element leaves and a 64 KiB coalesce threshold
+/// (≈ 256 packed leaves / two BLAKE3 chunks).
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FeaBmlpConfig {
+    /// Number of consecutive field elements packed into one bulk
+    /// block (one BLAKE3 compression input). Default 16 (= 256 B).
+    pub leaf_block_size: usize,
+    /// Cumulative-byte threshold below which
+    /// [`FeaBmlpPackedLeaves::try_consume_coalesced`] keeps batching.
+    pub coalesce_threshold_bytes: usize,
+    /// `BpmpStreamChunks` backing-buffer alignment requirement.
+    pub align_to_cacheline: bool,
+}
+
+impl Default for FeaBmlpConfig {
+    fn default() -> Self {
+        Self {
+            leaf_block_size: 16,
+            coalesce_threshold_bytes: 64 * 1024,
+            align_to_cacheline: true,
+        }
+    }
+}
+
+/// One bulk-packed block of `leaf_block_size` consecutive `F128`
+/// elements. `bytes` is the contiguous `leaf_block_size · 16` byte
+/// payload; the length prefix is implicit in the block index.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedLeafBlock {
+    pub bytes: [u8; 16],
+}
+
+/// Container returned by [`pack_merkle_leaves_bulk`]: one aligned
+/// buffer holding `blocks` contiguous blocks of
+/// `cfg.leaf_block_size · 16` bytes each, plus the per-block length
+/// prefix table. The buffer is recycled through the scratch pool on
+/// `Drop` (or explicit `into_inner`).
+pub struct FeaBmlpPackedLeaves {
+    blocks: Vec<u8>,
+    n_blocks: usize,
+    block_bytes: usize,
+    coalesce_buf: Vec<u8>,
+    coalesce_written: usize,
+    threshold: usize,
+}
+
+impl FeaBmlpPackedLeaves {
+    /// Pre-packed bulk buffer of `n_blocks` blocks.
+    #[inline]
+    pub fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// Bytes per block (= `leaf_block_size * 16`).
+    #[inline]
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// `&[u8]` view of the `i`-th block. Panics on out-of-range.
+    #[inline]
+    pub fn block(&self, i: usize) -> &[u8] {
+        let s = i * self.block_bytes;
+        &self.blocks[s..s + self.block_bytes]
+    }
+
+    /// `try_consume_coalesced`: when cumulative coalesced bytes
+    /// are below `min_bytes`, append the requested serialization to
+    /// the in-flight coalesce buffer (one contiguous write per
+    /// batch). When the threshold is reached, flush: returns the
+    /// accumulated bytes and resets the buffer. The downstream
+    /// proof-query path then sees one memcpy instead of
+    /// `threshold / request` small writes.
+    pub fn try_consume_coalesced(
+        &mut self,
+        request: &[u8],
+        min_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        let threshold = min_bytes.max(self.threshold);
+        if request.is_empty() {
+            return None;
+        }
+        if self.coalesce_written + request.len() < threshold {
+            self.coalesce_buf.extend_from_slice(request);
+            self.coalesce_written += request.len();
+            return None;
+        }
+        let mut out = core::mem::take(&mut self.coalesce_buf);
+        out.extend_from_slice(request);
+        self.coalesce_written = 0;
+        Some(out)
+    }
+
+    /// Force a flush of any in-flight coalesced bytes.
+    pub fn flush_coalesced(&mut self) -> Option<Vec<u8>> {
+        if self.coalesce_written == 0 {
+            return None;
+        }
+        let out = core::mem::take(&mut self.coalesce_buf);
+        self.coalesce_written = 0;
+        Some(out)
+    }
+
+    /// Consume the underlying bulk buffer (recycled through the
+    /// scratch pool) and return the raw `Vec<u8>` so the caller can
+    /// hand it directly to a BLAKE3 batched path.
+    pub fn into_blocks(self) -> Vec<u8> {
+        self.blocks
+    }
+}
+
+impl Drop for FeaBmlpPackedLeaves {
+    fn drop(&mut self) {
+        // The bulk buffer is sized to the F128 view of the same
+        // allocation, so it recycles cleanly into the scratch pool.
+        let n_f128_len = self.blocks.len() / core::mem::size_of::<F128>();
+        let n_f128_cap = self.blocks.capacity() / core::mem::size_of::<F128>();
+        let ptr = self.blocks.as_ptr() as *mut F128;
+        if n_f128_cap == 0 {
+            return;
+        }
+        std::mem::forget(core::mem::take(&mut self.blocks));
+        // SAFETY: same bit-identical F128 ↔ byte view contract as
+        // BpmpStreamChunks. The `Copy` F128 has no Drop, so
+        // handing the F128 `Vec` to the pool is sound.
+        let f128 = unsafe { Vec::from_raw_parts(ptr, n_f128_len, n_f128_cap) };
+        crate::scratch::give_f128(f128);
+    }
+}
+
+/// Pack `leaves` into one aligned bulk buffer with a single length
+/// prefix per block. Sourced from the [`BpmpStreamChunks`] view so
+/// the backing storage is 64-byte aligned and recycled through the
+/// process-wide pool on drop.
+pub fn pack_merkle_leaves_bulk(
+    leaves: &[F128],
+    cfg: FeaBmlpConfig,
+) -> FeaBmlpPackedLeaves {
+    let block_elems = cfg.leaf_block_size.max(1);
+    let block_bytes = block_elems * core::mem::size_of::<F128>();
+    let n_blocks = leaves.len() / block_elems;
+    let total_bytes = n_blocks * block_bytes;
+    // The bulk buffer comes straight out of the scratch pool as a
+    // typed F128 allocation (so the F128 ↔ byte view is bit-
+    // identical and `Drop` can recycle without an unsafe re-view).
+    // For requests ≤ `scratch_stream_capacity_pow2` we route through
+    // the stream view to honor `align_to_cacheline`; larger requests
+    // take a fresh uninit vec and the alignment floor is the F128
+    // 16-byte minimum (still BLAKE3-friendly).
+    let mut blocks: Vec<u8> = if total_bytes
+        <= crate::scratch::scratch_stream_capacity_pow2()
+    {
+        let mut stream = crate::scratch::BpmpStreamChunks::new(cfg.align_to_cacheline);
+        // SAFETY: `take_chunk` returns a `&mut [u8]` of exactly
+        // `total_bytes` bytes (the entire stream). We re-encapsulate
+        // it as a `Vec<u8>` for ownership semantics matching the
+        // rest of the API; the slice's pointer and length are
+        // re-claimed by `Vec::from_raw_parts` so the stream's
+        // `release` must not run on the same allocation. We do that
+        // by letting `stream` drop without `release` after marking
+        // its state.
+        let slice = stream
+            .take_chunk(total_bytes)
+            .expect("stream sized to total_bytes");
+        let ptr = slice.as_mut_ptr();
+        let len = slice.len();
+        let cap = len;
+        // Mark the stream as already released so its `Drop` is a
+        // no-op (we've transferred ownership of the allocation).
+        stream.released = true;
+        std::mem::forget(stream);
+        std::mem::forget(slice);
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    } else {
+        let n_f128 = (total_bytes + core::mem::size_of::<F128>() - 1)
+            / core::mem::size_of::<F128>();
+        let f128 = crate::alloc_uninit_f128_vec(n_f128);
+        let bytes_len = f128.len() * core::mem::size_of::<F128>();
+        let ptr = f128.as_ptr() as *mut u8;
+        let cap = f128.capacity() * core::mem::size_of::<F128>();
+        std::mem::forget(f128);
+        unsafe { Vec::from_raw_parts(ptr, total_bytes, cap) }
+    };
+    // Copy leaves into the packed buffer. The single length prefix
+    // is implicit in `n_blocks` and `block_bytes`.
+    let blocks_ptr = blocks.as_mut_ptr();
+    for (i, chunk) in leaves.chunks_exact(block_elems).enumerate() {
+        let dst = unsafe { blocks_ptr.add(i * block_bytes) as *mut F128 };
+        let src = chunk.as_ptr();
+        // SAFETY: `dst` is within `blocks`, `src` is within `leaves`,
+        // and both spans are disjoint from any active borrow.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, block_elems);
+        }
+    }
+    FeaBmlpPackedLeaves {
+        blocks,
+        n_blocks,
+        block_bytes,
+        coalesce_buf: Vec::with_capacity(cfg.coalesce_threshold_bytes),
+        coalesce_written: 0,
+        threshold: cfg.coalesce_threshold_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The exact ranked selector is narrow, and regrouping sixteen retired

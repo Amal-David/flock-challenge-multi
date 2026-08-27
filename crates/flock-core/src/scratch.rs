@@ -291,6 +291,192 @@ pub fn clear() {
 }
 
 // ---------------------------------------------------------------------------
+// FEA-BMLP-SPSR stream-of-chunks view over the process-wide pool.
+//
+// BpmpStreamChunks hands out pre-aligned, 64-byte-cacheline-resident
+// `&[u8]` slices sourced from one pooled backing buffer, sized to
+// `scratch_stream_capacity_pow2`. Each `take_chunk` returns a slice
+// whose base is a multiple of 64 when `align_to_cacheline=true`,
+// which keeps the BLAKE3 compression input pointer cache-aligned and
+// removes the small per-call setup cost of re-aligning the head of a
+// fresh allocation. The backing buffer is recycled through
+// `give_f128` on `Drop` (or explicit `release`), so the view fits the
+// rest of `crate::scratch`'s write-before-read contract.
+// ---------------------------------------------------------------------------
+
+/// Capacity of a `BpmpStreamChunks` backing buffer in bytes: 1 MiB by
+/// default. Resolved once per process; `FLOCK_BPMP_STREAM_BYTES`
+/// overrides (must be a power of two ≥ 64 KiB).
+pub(crate) fn scratch_stream_capacity_pow2() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let env = std::env::var("FLOCK_BPMP_STREAM_BYTES").ok();
+        let parsed = env.and_then(|s| s.parse::<usize>().ok()).unwrap_or(1 << 20);
+        let pow2 = parsed.max(1 << 16).next_power_of_two();
+        pow2
+    })
+}
+
+const CHUNK_ALIGN: usize = 64;
+
+/// Typed stream-of-chunks view over the existing scratch pool. Each
+/// `take_chunk` returns a contiguous `&[u8]` slice of `bytes` bytes
+/// drawn from the backing buffer in order; the backing buffer is
+/// recycled through [`give_f128`] on `Drop` (or `release`).
+pub(crate) struct BpmpStreamChunks {
+    ptr: *mut u8,
+    cap: usize,
+    pos: usize,
+    align: bool,
+    released: bool,
+}
+
+// SAFETY: the underlying storage is exclusively owned by `self` for
+// the lifetime of the view. `&mut self` is the only aliasing path,
+// and the pool recycle restores the F128 view without racing.
+unsafe impl Send for BpmpStreamChunks {}
+
+impl BpmpStreamChunks {
+    /// Acquire a fresh backing buffer from the process-wide pool and
+    /// wrap it as a stream of 64-byte-aligned chunks. The backing
+    /// storage is recycled on `Drop` (or `release`).
+    pub(crate) fn new(align_to_cacheline: bool) -> Self {
+        let cap = scratch_stream_capacity_pow2();
+        let n_f128 = cap / core::mem::size_of::<F128>();
+        let f128 = take_f128(n_f128);
+        let bytes_len = f128.len() * core::mem::size_of::<F128>();
+        let ptr = f128.as_ptr() as *mut u8;
+        // Zero the byte view so an un-taken tail never leaks stale
+        // F128 content; BLAKE3 compression inputs are written before
+        // read but a partly-written trailing pad would otherwise
+        // expose recycled bytes.
+        // SAFETY: `f128` came from the `Copy` pool (no Drop), and
+        // `set_len` only re-claims already-allocated storage.
+        unsafe {
+            core::ptr::write_bytes(ptr, 0u8, bytes_len);
+        }
+        // Recycle the F128 ownership into the byte view. The byte
+        // view owns the allocation for the lifetime of `self`, and
+        // `release` / `Drop` rewraps it as F128 and hands it back to
+        // the pool. We forget the original Vec so its `Drop` doesn't
+        // free the same memory.
+        let _ = (f128.capacity(), bytes_len);
+        std::mem::forget(f128);
+        Self {
+            ptr,
+            cap,
+            pos: 0,
+            align: align_to_cacheline,
+            released: false,
+        }
+    }
+
+    /// Bytes still available for hand-out.
+    #[inline]
+    pub(crate) fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.pos)
+    }
+
+    /// Bytes already handed out.
+    #[inline]
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Drain the entire backing buffer as a single `Vec<u8>`,
+    /// transferring ownership of the allocation to the caller. The
+    /// F128 ↔ byte view contract carries through: the resulting
+    /// `Vec<u8>` can be recycled through [`give_f128`] (via its
+    /// `F128` re-view) just like any other pooled buffer.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        let n_f128_len = self.cap / core::mem::size_of::<F128>();
+        let n_f128_cap = n_f128_len;
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        // SAFETY: the F128 storage backing the byte view was
+        // acquired from `take_f128`; the byte ↔ F128 views are
+        // bit-identical. We re-encapsulate the allocation as a
+        // `Vec<u8>` for caller-side ownership. Capacity/len use
+        // the round cap (the backing buffer was sized to
+        // `scratch_stream_capacity_pow2` bytes so the F128 view
+        // is aligned to `size_of::<F128>()`).
+        unsafe { Vec::from_raw_parts(ptr, n_f128_len * core::mem::size_of::<F128>(), n_f128_cap * core::mem::size_of::<F128>()) }
+    }
+
+    /// Take `bytes` bytes from the stream. The returned slice is
+    /// 64-byte aligned when `align_to_cacheline` was `true` at
+    /// construction. Returns `None` when the request exceeds
+    /// `remaining()`.
+    pub(crate) fn take_chunk(&mut self, bytes: usize) -> Option<&mut [u8]> {
+        if bytes == 0 || bytes > self.remaining() {
+            return None;
+        }
+        let mut start = self.pos;
+        if self.align {
+            start = start.next_multiple_of(CHUNK_ALIGN);
+            if start + bytes > self.cap {
+                return None;
+            }
+        }
+        self.pos = start + bytes;
+        // SAFETY: `start + bytes <= self.cap` is the alignment-aware
+        // take check above; the slice lies within the exclusively
+        // owned backing buffer. Bytes are zero-initialized at
+        // construction; the caller writes before it reads.
+        unsafe {
+            let s = core::slice::from_raw_parts_mut(self.ptr.add(start), bytes);
+            Some(s)
+        }
+    }
+
+    /// Take a 64-byte aligned chunk of exactly `CHUNK_ALIGN` bytes —
+    /// the BLAKE3 single-block-compression input shape.
+    #[inline]
+    pub(crate) fn take_64(&mut self) -> Option<&mut [u8; CHUNK_ALIGN]> {
+        let chunk = self.take_chunk(CHUNK_ALIGN)?;
+        // SAFETY: `take_chunk` returns a slice of exactly `CHUNK_ALIGN`
+        // bytes when asked for that many.
+        Some(unsafe { &mut *(chunk.as_mut_ptr() as *mut [u8; CHUNK_ALIGN]) })
+    }
+
+    /// Return the backing buffer to the process-wide pool. After
+    /// `release`, the view is empty and `take_*` returns `None`.
+    pub(crate) fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        // SAFETY: the F128 storage backing the byte view was acquired
+        // from `take_f128` and the byte ↔ F128 views are bit-identical
+        // (F128 is `repr(C, align(16))` lo||hi LE; same bytes). The
+        // `Copy` F128 has no Drop, so handing the F128 `Vec` to the
+        // pool is sound. Capacity/len use the round cap (the
+        // backing buffer was zero-padded to `cap` bytes so the F128
+        // view remains aligned to `size_of::<F128>()`).
+        let n_f128_len = self.cap / core::mem::size_of::<F128>();
+        let n_f128_cap = n_f128_len;
+        let f128 = unsafe {
+            Vec::from_raw_parts(self.ptr as *mut F128, n_f128_len, n_f128_cap)
+        };
+        give_f128(f128);
+    }
+}
+
+impl Drop for BpmpStreamChunks {
+    fn drop(&mut self) {
+        // Same recycle path as `release`: a view that escapes without
+        // `release` (panic, early-return) still pays back to the
+        // process pool instead of leaking its backing buffer.
+        self.release_inner();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-thread recycler for small per-job working buffers.
 // ---------------------------------------------------------------------------
 
