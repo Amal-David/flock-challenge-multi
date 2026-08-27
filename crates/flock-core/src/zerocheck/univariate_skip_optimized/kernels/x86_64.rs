@@ -43,11 +43,11 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
         let mask3 = _mm512_set1_epi64(0x00000000F0F0F0F0u64 as i64);
 
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<7>(y)), mask1);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<7>(t)));
+        y = _mm512_ternarylogic_epi32(y, t, _mm512_slli_epi64::<7>(t), 0x96);
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<14>(y)), mask2);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<14>(t)));
+        y = _mm512_ternarylogic_epi32(y, t, _mm512_slli_epi64::<14>(t), 0x96);
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<28>(y)), mask3);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<28>(t)));
+        y = _mm512_ternarylogic_epi32(y, t, _mm512_slli_epi64::<28>(t), 0x96);
 
         _mm512_storeu_si512(output.as_mut_ptr() as *mut __m512i, y);
     }
@@ -743,19 +743,17 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
                     } else {
                         _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
                     };
-                    los[group] = _mm512_xor_si512(
+                    los[group] = _mm512_ternarylogic_epi32(
                         los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
+                        lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
+                        lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
+                        0x96
                     );
-                    his[group] = _mm512_xor_si512(
+                    his[group] = _mm512_ternarylogic_epi32(
                         his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
+                        lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
+                        lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
+                        0x96
                     );
                 }
             }
@@ -876,9 +874,11 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
                         _mm512_i64gather_epi64::<8>(hi_indices, t_hi.as_ptr() as *const i64);
                     let partial_ptr =
                         bank.as_mut_ptr().add(lane_base + lane_in_group) as *mut __m512i;
-                    let updated = _mm512_xor_si512(
+                    let updated = _mm512_ternarylogic_epi32(
                         _mm512_loadu_si512(partial_ptr),
-                        _mm512_xor_si512(from_lo, from_hi),
+                        from_lo,
+                        from_hi,
+                        0x96
                     );
                     _mm512_storeu_si512(partial_ptr, updated);
                 }
@@ -1043,24 +1043,22 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
                     };
 
                     let los = _mm512_xor_si512(
-                        _mm512_xor_si512(
+                        _mm512_ternarylogic_epi32(
                             lookup8(n0_8, lut.lo_n0_lo.as_ptr()),
                             lookup8(n1_8, lut.lo_n1_lo.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
                             lookup8(n2_8, lut.hi_n0_lo.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_lo.as_ptr()),
+                            0x96
                         ),
+                        lookup8(n3_8, lut.hi_n1_lo.as_ptr())
                     );
                     let his = _mm512_xor_si512(
-                        _mm512_xor_si512(
+                        _mm512_ternarylogic_epi32(
                             lookup8(n0_8, lut.lo_n0_hi.as_ptr()),
                             lookup8(n1_8, lut.lo_n1_hi.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
                             lookup8(n2_8, lut.hi_n0_hi.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_hi.as_ptr()),
+                            0x96
                         ),
+                        lookup8(n3_8, lut.hi_n1_hi.as_ptr())
                     );
                     let (aos0, aos1) = interleave_aos(los, his);
                     let partial_ptr = bank.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;

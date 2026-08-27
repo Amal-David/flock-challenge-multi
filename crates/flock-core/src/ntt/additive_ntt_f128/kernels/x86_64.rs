@@ -115,8 +115,9 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
         while i < lanes {
             let top_lanes = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let bot_lanes = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
-            let new_top = _mm512_xor_si512(top_lanes, mul_x4::<LOW, DIET>(tw, bot_lanes));
-            let new_bot = _mm512_xor_si512(bot_lanes, new_top);
+            let m = mul_x4::<LOW, DIET>(tw, bot_lanes);
+            let new_top = _mm512_xor_si512(top_lanes, m);
+            let new_bot = _mm512_ternarylogic_epi32(bot_lanes, top_lanes, m, 0x96);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, new_top);
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot);
             i += 4;
@@ -205,18 +206,22 @@ unsafe fn butterfly_fused_2layer_impl<
             let mut vc = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
             let mut vd = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
-            vc = _mm512_xor_si512(vc, new_a);
+            let m_c = mul_x4::<OUTER_LOW, DIET>(outer, vc);
+            let new_a = _mm512_xor_si512(va, m_c);
+            vc = _mm512_ternarylogic_epi32(vc, va, m_c, 0x96);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
-            vd = _mm512_xor_si512(vd, new_b);
+            let m_d = mul_x4::<OUTER_LOW, DIET>(outer, vd);
+            let new_b = _mm512_xor_si512(vb, m_d);
+            vd = _mm512_ternarylogic_epi32(vd, vb, m_d, 0x96);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
-            vb = _mm512_xor_si512(vb, new_a);
+            let m_b = mul_x4::<INNER_LOW, DIET>(inner_a, vb);
+            let new_a = _mm512_xor_si512(va, m_b);
+            vb = _mm512_ternarylogic_epi32(vb, va, m_b, 0x96);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
-            vd = _mm512_xor_si512(vd, new_c);
+            let m_d2 = mul_x4::<INNER_LOW, DIET>(inner_b, vd);
+            let new_c = _mm512_xor_si512(vc, m_d2);
+            vd = _mm512_ternarylogic_epi32(vd, vc, m_d2, 0x96);
             vc = new_c;
 
             _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va);
@@ -365,18 +370,22 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             let mut vc = _mm512_loadu_si512(c.add(i) as *const __m512i);
             let mut vd = _mm512_loadu_si512(d.add(i) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
-            vc = _mm512_xor_si512(vc, new_a);
+            let m_c = mul_x4::<OUTER_LOW, DIET>(outer, vc);
+            let new_a = _mm512_xor_si512(va, m_c);
+            vc = _mm512_ternarylogic_epi32(vc, va, m_c, 0x96);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
-            vd = _mm512_xor_si512(vd, new_b);
+            let m_d = mul_x4::<OUTER_LOW, DIET>(outer, vd);
+            let new_b = _mm512_xor_si512(vb, m_d);
+            vd = _mm512_ternarylogic_epi32(vd, vb, m_d, 0x96);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
-            vb = _mm512_xor_si512(vb, new_a);
+            let m_b = mul_x4::<INNER_LOW, DIET>(inner_a, vb);
+            let new_a = _mm512_xor_si512(va, m_b);
+            vb = _mm512_ternarylogic_epi32(vb, va, m_b, 0x96);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
-            vd = _mm512_xor_si512(vd, new_c);
+            let m_d2 = mul_x4::<INNER_LOW, DIET>(inner_b, vd);
+            let new_c = _mm512_xor_si512(vc, m_d2);
+            vd = _mm512_ternarylogic_epi32(vd, vc, m_d2, 0x96);
             vc = new_c;
 
             stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
@@ -1960,3 +1969,4 @@ mod diet_tests {
         }
     }
 }
+
