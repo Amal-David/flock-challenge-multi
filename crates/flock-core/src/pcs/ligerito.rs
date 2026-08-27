@@ -2876,12 +2876,34 @@ fn singleton_uninit_enabled() -> bool {
 /// [`expand_singleton_into`] is write-complete, so the buffer may start
 /// uninitialized; `FLOCK_NO_LIG_SINGLETON_UNINIT=1` restores the incumbent
 /// zero-fill. Output bytes are identical either way.
+/// RecycleAlloc ALIGN64 only applies at ≥ 32 KiB. L2/L3 singleton windows
+/// are 4–16 KiB and land 16-mod-64, so every AVX-512 load/store in
+/// `transpose_butterfly_avx512` splits a line. Ask for the gate's minimum
+/// and truncate to `2^k`: capacity-only, write-complete contract unchanged.
+/// `FLOCK_NO_LIG_ALIGN64_PAD=1` restores exact-size allocs.
+fn lig_align64_pad_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_ALIGN64_PAD").is_none()
+    });
+    *ON
+}
+
+const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+
 fn take_singleton_buf(k: usize) -> Vec<F128> {
-    if singleton_uninit_enabled() {
-        crate::alloc_uninit_vec::<F128>(1usize << k)
+    let n = 1usize << k;
+    let cap = if lig_align64_pad_enabled() {
+        n.max(ALIGN64_MIN_F128)
     } else {
-        vec![F128::ZERO; 1usize << k]
-    }
+        n
+    };
+    let mut v = if singleton_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(cap)
+    } else {
+        vec![F128::ZERO; cap]
+    };
+    v.truncate(n);
+    v
 }
 
 /// Expand one nonzero at local index `p` through the window's `k` transpose
@@ -5938,10 +5960,21 @@ fn materialize_direct_fold8(
         claims
             .par_iter()
             .map(|claim| {
-                (
-                    claim.eq_lo.iter().map(|x| x.lo).collect(),
-                    claim.eq_lo.iter().map(|x| x.hi).collect(),
-                )
+                // 2048 × 8 B = 16 KiB per plane, under RecycleAlloc's 32 KiB
+                // ALIGN64 gate. Pad capacity to 32 KiB so `gfni_fold64_four_maps_staged`
+                // ZMM loadu hits a 64-aligned slab. Length stays `eq_lo.len()`.
+                // `FLOCK_NO_LIG_ALIGN64_PAD=1` restores exact-size collect.
+                let n = claim.eq_lo.len();
+                let cap = if lig_align64_pad_enabled() {
+                    n.max((32 * 1024) / core::mem::size_of::<u64>())
+                } else {
+                    n
+                };
+                let mut lo = Vec::with_capacity(cap);
+                let mut hi = Vec::with_capacity(cap);
+                lo.extend(claim.eq_lo.iter().map(|x| x.lo));
+                hi.extend(claim.eq_lo.iter().map(|x| x.hi));
+                (lo, hi)
             })
             .collect()
     } else {

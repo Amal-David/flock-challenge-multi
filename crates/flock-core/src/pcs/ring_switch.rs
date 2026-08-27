@@ -2635,6 +2635,23 @@ fn rs_elide_dead_basis_enabled() -> bool {
     *ON
 }
 
+/// Elide DirectFold2 / DirectFold4 factor bundles the consumer has proved
+/// it never reads. Ranked `open_batch` takes DirectFold8 whenever every
+/// claim yields a sixty-four-bank bundle (`all_claims_yield_fold8`) and
+/// `ranked_direct_fold8_enabled` is on; fold2/fold4 are then unread.
+/// Building them still pays two `table.clone`s, two `build_eq_split`s, the
+/// sequential 4×4×n_packed fold2 products, and — on the Fiat-Shamir spine
+/// after γs are sampled — `direct_fold4_products`' 16-wide `into_par_iter`
+/// per claim. `FLOCK_NO_RS_ELIDE_DEAD_FOLD24=1` restores the full build.
+/// Read once per process.
+#[inline]
+fn rs_elide_dead_fold24_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_FOLD24").is_none()
+    });
+    *ON
+}
+
 fn rs_tail_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_TAIL_PAR").is_none());
@@ -3426,6 +3443,13 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // route and the full-width ranked route (see `rs_tail_par_enabled`). The
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
+    // Same "pcs takes DirectFold8" predicate as `direct_fold8_all_claim_mix_supported`
+    // plus `ranked_direct_fold8_enabled`: fold2/fold4 never leave `claim_output`
+    // on that route. Independent of `elide_basis` (that one only skips the
+    // unread `rs_eq_ind` split). Kill `FLOCK_NO_RS_ELIDE_DEAD_FOLD24`.
+    let elide_fold24 = all_claims_yield_fold8
+        && crate::pcs::ranked_direct_fold8_enabled()
+        && rs_elide_dead_fold24_enabled();
     let claim_output = |i: usize,
                         w: ClaimWork,
                         g: F128|
@@ -3433,8 +3457,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
+            let direct_fold2 = if elide_fold24 {
+                None
+            } else {
             let wants_direct = w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1);
-            let direct_fold2 = match kinds[i] {
+            match kinds[i] {
                 Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
                     let suffix = dense_suffixes[d];
                     let low_eq: [F128; 4] = build_eq(&suffix[..2])
@@ -3468,8 +3495,12 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     })
                 }
                 _ => None,
+            }
             };
-            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
+            let direct_fold4 = if elide_fold24 {
+                None
+            } else {
+            match (kinds[i], w.s_hat_v_fold4.as_deref()) {
                 (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
                     let suffix = dense_suffixes[d];
                     let low_eq: [F128; 16] = build_eq(&suffix[..4])
@@ -3487,6 +3518,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     })
                 }
                 _ => None,
+            }
             };
             let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
                 (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
