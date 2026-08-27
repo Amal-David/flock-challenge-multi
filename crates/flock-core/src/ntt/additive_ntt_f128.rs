@@ -1095,7 +1095,15 @@ const ST_FMP_CAP: usize = 4;
 ))]
 #[inline]
 fn select_st_fmp_bufs(requested: Option<usize>) -> usize {
-    requested.unwrap_or(2).clamp(2, ST_FMP_CAP)
+    // Four, the top of the allowed range. The two-block default rests on a
+    // footprint argument that bounds the count from above — two blocks keep a
+    // core's staging at the 1 MiB the unsplit schedule already held — and the
+    // bound it actually establishes is a core's 2 MiB private L2, which is
+    // four blocks. Three was sampled on this instance and came out ahead of
+    // two; the neighbouring deep-split queue in this file tells the same
+    // story, level at four and 0.64% worse at two. This takes the rotation to
+    // where the footprint argument's own ceiling sits.
+    requested.unwrap_or(ST_FMP_CAP).clamp(2, ST_FMP_CAP)
 }
 
 #[cfg(all(
@@ -4522,7 +4530,7 @@ mod tests {
     ))]
     #[test]
     fn st_fmp_bufs_default_override_and_clamp() {
-        assert_eq!(select_st_fmp_bufs(None), 2);
+        assert_eq!(select_st_fmp_bufs(None), ST_FMP_CAP);
         assert_eq!(select_st_fmp_bufs(Some(0)), 2);
         assert_eq!(select_st_fmp_bufs(Some(1)), 2);
         assert_eq!(select_st_fmp_bufs(Some(2)), 2);
