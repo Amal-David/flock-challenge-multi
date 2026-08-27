@@ -393,9 +393,52 @@ pub(crate) fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
 
 /// Batched BLAKE3 parent nodes: `data` is `out.len()` contiguous 64-byte
 /// (left ‖ right) child pairs. Equivalent to [`blake3_parent_cv`] per node.
+///
+/// On x86_64 hosts with AVX2, runs of 4 parents are pushed through the
+/// `compress4_avx2` 4-way kernel exposed by `crate::hash::compress_in_place`.
+/// The tail (any remainder) and the entire path on non-x86_64 fall back to
+/// `blake3_hash_many`, which uses the crate's own SIMD-batched
+/// compression entry point. Both paths must agree with `blake3_parent_cv`
+/// (the spec); the `blake3_batched_matches_scalar_spec` test below is
+/// what holds them to it.
 #[inline]
 fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
-    blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
+    debug_assert_eq!(data.len(), out.len() * 64);
+    let n = out.len();
+    if n >= 4 {
+        // SAFETY: 4-wide lane stores use direct `out` writes; `out` is
+        // `&mut [Hash]`, so each slot is a 32-byte aligned, initialized,
+        // contiguous region.
+        let quad = n / 4;
+        let (quad_outs, tail_outs) = out.split_at_mut(quad * 4);
+        let (quad_data, tail_data) = data.split_at(quad * 4 * 64);
+        for (q_outs, q_data) in quad_outs
+            .chunks_mut(4)
+            .zip(quad_data.chunks(4 * 64))
+        {
+            let mut blocks = [[0u8; 64]; 4];
+            let mut cvs = [[0u32; 8]; 4];
+            for (s, slot) in q_data.chunks(64).enumerate() {
+                blocks[s].copy_from_slice(slot);
+            }
+            crate::hash::compress_in_place(&mut cvs, &blocks, 64, 0, BLAKE3_PARENT);
+            for s in 0..4 {
+                let mut cv_bytes = [0u8; 32];
+                for (k, w) in cvs[s].iter().enumerate() {
+                    cv_bytes[k * 4..k * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                q_outs[s] = cv_bytes;
+            }
+        }
+        // Tail (n % 4): anything left over goes through the existing
+        // SIMD-batched entry point so we never reimplement the non-4
+        // shape.
+        if !tail_outs.is_empty() {
+            blake3_hash_many::<64>(tail_data, tail_outs, BLAKE3_PARENT, 0, 0);
+        }
+    } else {
+        blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
+    }
 }
 
 /// Hash a run of `out.len()` equal-size leaves from `data` under `kind`.
