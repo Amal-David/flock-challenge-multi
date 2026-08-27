@@ -3788,18 +3788,16 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         debug_assert_eq!(f.len(), 2 * weights.len());
         let mut a_acc = WideGhashX4::zero();
         let mut s_acc = WideGhashX4::zero();
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
         let lanes = weights.len() & !3;
         let mut j = 0usize;
         while j < lanes {
             let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
             let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
             let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let sum = _mm512_permutex2var_epi64(f0_sum, idx_even, f1_sum);
+            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
             a_acc.mul_acc(even, w);
             s_acc.mul_acc(sum, w);
             j += 4;
@@ -3951,13 +3949,6 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     let mut u0_acc = WideGhashX4::zero();
     let mut u2_acc = WideGhashX4::zero();
 
-    // idx_even: pick 128-bit lanes {0, 2} from reg0 and {0, 2} from reg1
-    // → [reg0[0], reg0[2], reg1[0], reg1[2]] (even-indexed F128 elements).
-    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-    // perm_swap: swap adjacent 128-bit lanes (0↔1, 2↔3) within a register.
-    // After XOR with original, every lane holds a pair sum.
-    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
     let mut k = 0;
     while k < lanes {
         // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
@@ -3967,18 +3958,18 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
         let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
         // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
         u0_acc.mul_acc(f_even, b_even);
 
         // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
         //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
         u2_acc.mul_acc(f_sum, b_sum);
 
         k += 8;
@@ -4024,9 +4015,6 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
         let mut u2_acc = WideGhashX4::zero();
         let mut y_acc = WideGhashX4::zero();
 
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
         let mut k = 0;
         while k < lanes {
             let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
@@ -4034,16 +4022,16 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
             let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
@@ -4131,12 +4119,31 @@ fn open_ood_x4_enabled() -> bool {
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
+    // `_mm_loadu_si128` / `_mm512_loadu_si512` accept any src alignment.
     unsafe {
-        let s = src as *const __m128i;
-        let d = dst as *mut __m128i;
-        for i in 0..n {
-            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+        let mut s = src;
+        let mut d = dst;
+        let mut rem = n;
+
+        #[cfg(target_feature = "avx512f")]
+        {
+            // Peel until d is 64-byte aligned
+            while rem > 0 && ((d as usize) & 63) != 0 {
+                _mm_stream_si128(d as *mut __m128i, _mm_loadu_si128(s as *const __m128i));
+                s = s.add(1);
+                d = d.add(1);
+                rem -= 1;
+            }
+            // Stream 64 bytes (4 F128 elements) per instruction
+            while rem >= 4 {
+                _mm512_stream_si512(d as *mut __m512i, _mm512_loadu_si512(s as *const __m512i));
+                s = s.add(4);
+                d = d.add(4);
+                rem -= 4;
+            }
+        }
+        for i in 0..rem {
+            _mm_stream_si128(d.add(i) as *mut __m128i, _mm_loadu_si128(s.add(i) as *const __m128i));
         }
     }
 }
@@ -4146,7 +4153,7 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
 /// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
 /// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
+/// (no destination reload); the destination is published with AVX-512 streaming
 /// stores so each output line skips write-allocate RFO. Next reader is the
 /// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
 /// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
@@ -4190,7 +4197,6 @@ unsafe fn fold_and_msg_chunk_nt_x86(
         unsafe {
             publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
             publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
-            core::arch::x86_64::_mm_sfence();
         }
     } else {
         fc.copy_from_slice(&stage_f[..len]);
@@ -4445,6 +4451,16 @@ fn fold_and_msg_lsb_inner(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if use_nt {
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
@@ -5867,19 +5883,25 @@ fn direct_fold8_b_gfni_enabled() -> bool {
 /// 2^19 state — fused into the same pass; no lookahead follows because the
 /// initial cadence is exhausted (the fold2 pair of the fold4 route never
 /// runs and the 2^21/2^20 states never exist).
-fn materialize_direct_fold8(
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
+pub(crate) fn lig_l1_precommit_enabled() -> bool {
+    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if std::env::var("FLOCK_NO_LIG_L1_PRECOMMIT").is_ok() {
+            ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-    assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
-    assert!(packed_witness.len().is_multiple_of(64));
-    let [r0, r1, r2, r3, r4, r5] = challenges;
+fn materialize_direct_fold8_f(
+    packed_witness: Vec<F128>,
+    challenges: [F128; 6],
+    block_len: usize,
+    out_len: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let [_, _, _, _, r4, r5] = challenges;
     let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
         let mut weight = F128::ONE;
         for (bit, &challenge) in challenges[..4].iter().enumerate() {
@@ -5891,6 +5913,55 @@ fn materialize_direct_fold8(
         }
         weight
     });
+    let mut folded_f = crate::scratch::take_f128(out_len);
+    const SUB: usize = 256;
+    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+    folded_f
+        .par_chunks_mut(block_len)
+        .enumerate()
+        .map_init(
+            || {
+                let pooled = crate::scratch::fold_buf_pool_enabled();
+                crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled)
+            },
+            |mid4, (block, f_out)| {
+                let start = 64 * block * block_len;
+                let f_in = &packed_witness[start..start + 64 * block_len];
+                let mut slot = 0usize;
+                while slot < block_len {
+                    let n = SUB.min(block_len - slot);
+                    let m4 = &mut mid4[..4 * n];
+                    crate::field::f128_slice::fold16_banked(
+                        &f_in[64 * slot..64 * (slot + n)],
+                        m4,
+                        &fold16_weight,
+                    );
+                    crate::field::f128_slice::fold4_nested(
+                        m4,
+                        &mut f_out[slot..slot + n],
+                        r4,
+                        r5,
+                    );
+                    slot += n;
+                }
+            },
+        )
+        .count();
+    crate::scratch::give_f128(packed_witness);
+    folded_f
+}
+
+fn materialize_direct_fold8_b_and_msg(
+    folded_f: &[F128],
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    block_len: usize,
+    out_len: usize,
+) -> (Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+    let has_ordinary = !ordinary_basis.is_empty();
+    let [r0, r1, r2, r3, r4, r5] = challenges;
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5917,16 +5988,7 @@ fn materialize_direct_fold8(
         })
         .collect();
 
-    let out_len = packed_witness.len() / 64;
-    let block_len = claims[0].eq_lo.len();
-    assert!(block_len.is_multiple_of(4));
-    // The GFNI kernel owns complete 64-slot batches. Keep unusual DirectFold8
-    // geometries on the scalar path instead of reading through a short tail.
     let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
-    assert_eq!(out_len, block_len * claims[0].eq_hi.len());
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
-    }));
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5948,34 +6010,14 @@ fn materialize_direct_fold8(
         Vec::new()
     };
 
-    let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
-    /// `RecycleAlloc` (`flock-prover/src/recycle_alloc.rs`) only hands back
-    /// 64-byte-aligned pointers for allocations of at least `RECYCLE_MIN`
-    /// = 32 KiB; anything smaller goes straight to the system allocator and
-    /// lands 16 mod 64 (that file's own doc records the 16-mod-64 history and
-    /// the three costs it pays). The per-job `mid4` staging buffer below is
-    /// `4 * SUB` F128 = 16 KiB, i.e. it sits UNDER the gate, so every wide
-    /// load and store the 64->4->1 fold makes against it is a cache-line
-    /// split. Ask for the gate's own minimum instead so the buffer lands in
-    /// the aligned class. CAPACITY ONLY: the kernels below still address
-    /// exactly `4 * n` elements with `n <= SUB`, so no value, no element and
-    /// no order changes.
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     let stats = folded_b
         .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
+        .zip(folded_f.par_chunks(block_len))
         .enumerate()
         .map_init(
-            // Per-job working buffers, recycled through this thread's free
-            // list instead of being allocated, zeroed and freed once per job:
-            // rayon calls this init once per leaf job, i.e. inside the fold
-            // loop, and every one of the four is written before it is read
-            // (`compose_block_table` documents it for `scratch`; the fold
-            // kernels write every output slot; the GFNI kernel stores all
-            // sixteen planes before loading any). `FLOCK_NO_PCS_FOLD_BUF_POOL=1`
-            // restores the allocating form.
             || {
                 let pooled = crate::scratch::fold_buf_pool_enabled();
                 (
@@ -5989,25 +6031,6 @@ fn materialize_direct_fold8(
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
                     crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled),
-                    // `gfni_tmp` sits under the SAME sub-`RECYCLE_MIN` gate
-                    // `mid4` above does, and the staged GFNI kernel hammers it
-                    // with ZMM `storeu`/`loadu`: at 64 F128 = 1 KiB it goes to
-                    // the system allocator and lands 16 mod 64, so every 64 B
-                    // ZMM access against it straddles two cache lines.
-                    //
-                    // The size arithmetic is NOT `mid4`'s. `mid4` is 16 KiB and
-                    // crosses a 32 KiB threshold, i.e. 2x. This buffer is 1 KiB,
-                    // so asking for the gate's minimum inflates it 32x. That is
-                    // affordable here for one specific reason: the pooled arm is
-                    // `take_local_f128`, which recycles a per-thread allocation
-                    // and does NOT zero it (`scratch.rs`; the unpooled kill-switch
-                    // arm's `vec![F128::ZERO; n]` is not the ranked path). So the
-                    // inflation costs one 32 KiB reservation per thread ONCE,
-                    // 512 KiB across 16 threads, and the kernel still touches only
-                    // the first 1 KiB -- the resident cache footprint is unchanged,
-                    // which is what `killed.md:2170`'s L1D lesson actually cares
-                    // about. CAPACITY ONLY: the kernel still addresses exactly the
-                    // same 64 elements, so no value, element or order changes.
                     crate::scratch::LocalBuf::new(
                         if b_gfni_on { (64usize).max(ALIGN64_MIN_F128) } else { 0 },
                         pooled,
@@ -6017,28 +6040,17 @@ fn materialize_direct_fold8(
             |(scratch, mid16, mid4, gfni_tmp), (block, (b_out, f_out))| {
                 let _ = &gfni_tmp;
                 let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
                 let b_in: &[F128] = if has_ordinary {
                     &ordinary_basis[start..start + 64 * block_len]
                 } else {
                     &[]
                 };
-                // Deferred-reduction 16-bank fold followed by one nested
-                // fold4: 64 -> 4 -> 1. On SPR this halves the VPCLMUL issue
-                // count versus three nested passes while keeping bounded
-                // scratch and eliminating the scalar 64-product chain.
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
-                    if has_ordinary {
+                if has_ordinary {
+                    let mut slot = 0usize;
+                    while slot < block_len {
+                        let n = SUB.min(block_len - slot);
                         let m16 = &mut mid16[..16 * n];
+                        let m4 = &mut mid4[..4 * n];
                         crate::field::f128_slice::fold4_nested(
                             &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
                         );
@@ -6046,8 +6058,8 @@ fn materialize_direct_fold8(
                         crate::field::f128_slice::fold4_nested(
                             m4, &mut b_out[slot..slot + n], r4, r5,
                         );
+                        slot += n;
                     }
-                    slot += n;
                 }
 
                 #[cfg(all(
@@ -6074,8 +6086,6 @@ fn materialize_direct_fold8(
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
-                        // SAFETY: each packed-u64 row half supplies 512 bytes;
-                        // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
@@ -6122,8 +6132,6 @@ fn materialize_direct_fold8(
                 }
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
                 {
-                    // SAFETY: features cfg-guaranteed; slices are equal and
-                    // block_len is an even power of two.
                     unsafe { msg_reduce_avx512(f_out, b_out) }
                 }
                 #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
@@ -6137,16 +6145,44 @@ fn materialize_direct_fold8(
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
 
-    crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
     (
-        folded_f,
         folded_b,
         SumcheckMessage {
             u_0: stats.0,
             u_2: stats.1,
         },
     )
+}
+
+fn materialize_direct_fold8(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    assert!(!claims.is_empty());
+    let has_ordinary = !ordinary_basis.is_empty();
+    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
+    assert!(packed_witness.len().is_multiple_of(64));
+    let out_len = packed_witness.len() / 64;
+    let block_len = claims[0].eq_lo.len();
+    assert!(block_len.is_multiple_of(4));
+    assert_eq!(out_len, block_len * claims[0].eq_hi.len());
+    assert!(claims.iter().all(|claim| {
+        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
+    }));
+
+    let folded_f = materialize_direct_fold8_f(packed_witness, challenges, block_len, out_len);
+    let (folded_b, msg) = materialize_direct_fold8_b_and_msg(
+        &folded_f,
+        ordinary_basis,
+        claims,
+        challenges,
+        block_len,
+        out_len,
+    );
+    (folded_f, folded_b, msg)
 }
 
 pub struct SumcheckProver {
@@ -7103,6 +7139,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut round_diag: Vec<(f64, f64, bool)> = Vec::new();
     // (level, log_msg_cols, n_queries, ms, used_ntt)
     let mut induce_diag: Vec<(usize, usize, usize, f64, bool)> = Vec::new();
+    let mut precomputed_wtns_1: Option<LigeroWitness> = None;
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -7130,36 +7167,75 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     r,
                 )
             } else {
-                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
-                    let (f8, b8, msg) = materialize_direct_fold8(
-                        packed_witness.take().unwrap(),
-                        b_initial.take().unwrap(),
-                        &direct,
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            fold4_challenges[3],
-                            fold4_challenges[4],
-                            r,
-                        ],
+                let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
+                let challenges = [
+                    fold4_challenges[0],
+                    fold4_challenges[1],
+                    fold4_challenges[2],
+                    fold4_challenges[3],
+                    fold4_challenges[4],
+                    r,
+                ];
+                let pw = packed_witness.take().unwrap();
+                let bi = b_initial.take().unwrap();
+                let out_len = pw.len() / 64;
+                let block_len = direct[0].eq_lo.len();
+                let can_overlap = lig_l1_precommit_enabled()
+                    && bi.is_empty()
+                    && direct.len() == 2
+                    && block_len.is_multiple_of(64)
+                    && config.merkle_hash == HashKind::Blake3;
+
+                let (f8, b8, msg) = if can_overlap {
+                    let f8 = materialize_direct_fold8_f(pw, challenges, block_len, out_len);
+                    let n1 = log_n - initial_k;
+                    let log_num_interleaved_1 = config.recursive_ks[0];
+                    let log_msg_cols_1 = n1 - log_num_interleaved_1;
+                    let log_inv_rate_1 = config.log_inv_rates[1];
+                    let (wtns_1_early, (b8, msg)) = rayon::join(
+                        || {
+                            let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+                            ligero_commit(
+                                &f8,
+                                log_msg_cols_1,
+                                log_num_interleaved_1,
+                                log_inv_rate_1,
+                                &ntt_1,
+                                config.merkle_hash,
+                            )
+                        },
+                        || {
+                            materialize_direct_fold8_b_and_msg(
+                                &f8,
+                                bi,
+                                &direct,
+                                challenges,
+                                block_len,
+                                out_len,
+                            )
+                        },
                     );
-                    sc_prover = Some(SumcheckProver::new_after_direct_fold8(
-                        f8,
-                        b8,
-                        target,
-                        [
-                            start_msg,
-                            fold4_msgs[0],
-                            fold4_msgs[1],
-                            fold4_msgs[2],
-                            fold4_msgs[3],
-                            fold4_msgs[4],
-                            msg,
-                        ],
-                        fold_arena.take(),
-                    ));
-                    msg
+                    precomputed_wtns_1 = Some(wtns_1_early);
+                    (f8, b8, msg)
+                } else {
+                    materialize_direct_fold8(pw, bi, &direct, challenges)
+                };
+                sc_prover = Some(SumcheckProver::new_after_direct_fold8(
+                    f8,
+                    b8,
+                    target,
+                    [
+                        start_msg,
+                        fold4_msgs[0],
+                        fold4_msgs[1],
+                        fold4_msgs[2],
+                        fold4_msgs[3],
+                        fold4_msgs[4],
+                        msg,
+                    ],
+                    fold_arena.take(),
+                ));
+                msg
             };
             fold4_challenges.push(r);
             fold4_msgs.push(msg);
@@ -7263,15 +7339,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
-    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let wtns_1 = ligero_commit(
-        sc_prover.f(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
+    let wtns_1 = if let Some(pre) = precomputed_wtns_1.take() {
+        pre
+    } else {
+        let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+        ligero_commit(
+            sc_prover.f(),
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    };
     if trace {
         t_commits += _t.elapsed();
     }
