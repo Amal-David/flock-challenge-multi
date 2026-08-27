@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! `flock-prover`: the Apple-silicon-optimized end-to-end Flock prover.
 //!
 //! Builds on [`flock_core`] (the protocol library + verifier) with the
@@ -25,6 +26,7 @@ pub mod seed_pipe;
 /// Park ≥32 KiB blocks on exact-size freelists. Ranked runner does 20
 /// verified warm-ups then 100 measured runs, so timed proofs reuse resident
 /// pages for large allocs the typed scratch pools do not already cover.
+#[cfg(target_feature = "avx512f")]
 #[global_allocator]
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // resample gtr r1 20260819-1220

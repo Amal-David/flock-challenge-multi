@@ -59,6 +59,7 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[inline(always)]
 pub(crate) unsafe fn fold_and_message_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -186,6 +187,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     table_data: *const F128,
     mats: Option<&[u64; 128]>,
@@ -556,6 +558,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[inline(always)]
 pub(crate) unsafe fn fold2_and_message_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -715,6 +718,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[inline(always)]
 pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -1302,6 +1306,7 @@ unsafe fn transpose4_lanes(
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     table_data: *const F128,
     mats: Option<&[u64; 128]>,
@@ -1461,6 +1466,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     /// out-of-line body.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     unsafe fn groups_general(
         table_data: *const F128,
         a_pkt: *const u8,
@@ -1891,6 +1897,7 @@ pub(crate) fn build_row_fold_mats_from_cols(cols: &[F128]) -> [u64; 128] {
 // byte-identical to (`gfni_masked_prefold_matches_unpredicated_kernel`); the
 // hot paths call `gfni_fold64_rows_masked`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
@@ -1922,6 +1929,7 @@ pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     rows0: *const u8,
     mats0: &[u64; 128],
@@ -2088,6 +2096,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_four_maps_staged(
     rows0: *const u8,
     mats0: &[u64; 128],
@@ -2235,6 +2244,7 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows_masked(
     rows: *const u8,
     mats: &[u64; 128],
@@ -2269,6 +2279,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
 /// As [`gfni_fold64_rows_masked`].
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     rows: *const u8,
     mats: &[u64; 128],
@@ -2296,6 +2307,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 /// As [`gfni_fold64_rows_masked_tr`].
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     rows: *const u8,
     mats: &[u64; 128],
@@ -2466,6 +2478,7 @@ const SIGMA_C4: [i8; 64] = [
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     rows: *const u8,
     m: &CFoldMats,
@@ -2655,6 +2668,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
 // exactly the same footing and leaves the closure where it was.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     rows: *const u8,
     m: &CFoldMats,
@@ -2810,6 +2824,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn gfni_fold64_regs(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],
@@ -2832,6 +2847,7 @@ pub(crate) unsafe fn gfni_fold64_regs(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 unsafe fn gfni_fold64_regs_sigma(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],
@@ -2848,6 +2864,7 @@ unsafe fn gfni_fold64_regs_sigma(
 ))]
 #[target_feature(enable = "avx512f,gfni")]
 #[inline]
+#[inline(always)]
 unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],
@@ -3014,6 +3031,7 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(always)]
 unsafe fn gfni_fold64_regs_sigma_bcast(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],

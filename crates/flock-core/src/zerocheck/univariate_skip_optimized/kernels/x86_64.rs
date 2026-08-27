@@ -23,6 +23,7 @@ use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q}
     target_feature = "avx512vbmi"
 ))]
 #[target_feature(enable = "avx512vbmi,avx512bw,avx512f")]
+#[inline(always)]
 pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut [u8; 64]) {
     use core::arch::x86_64::*;
     // Gather index = NEON IDX0 ++ IDX1 ++ IDX2 ++ IDX3 (the 8×8 byte transpose).
@@ -60,6 +61,7 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
 #[allow(dead_code)] // unused in native AVX-512 builds; exercised by its oracle test
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
 #[target_feature(enable = "gfni,sse2")]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -151,6 +153,7 @@ pub(crate) fn urm_offw_enabled() -> bool {
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
+#[inline(always)]
 pub(crate) unsafe fn store_out64(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i, nt: u8) {
     use core::arch::x86_64::*;
     // SAFETY: `out` is 64 writable bytes; alignment per the `nt` contract.
@@ -176,6 +179,7 @@ pub(crate) unsafe fn store_out64(out: &mut [u8; 64], acc: core::arch::x86_64::__
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "avx512f,avx512bw")]
+#[inline(always)]
 unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i, nt: u8) {
     use core::arch::x86_64::*;
     // SAFETY: forwarded from [`store_out64`]'s contract.
@@ -212,6 +216,7 @@ unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -276,6 +281,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8, op: *mut u16) {
     use core::arch::x86_64::*;
     // SAFETY: forwarded from this function's contract.
@@ -306,6 +312,7 @@ pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8,
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     op: *const u16,
     out: &mut [u8; 64],
@@ -340,6 +347,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
+#[inline(always)]
 unsafe fn horner_2img_offw(
     imgs: (*const u8, *const u8),
     op: *const u16,
@@ -377,6 +385,7 @@ unsafe fn horner_2img_offw(
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 unsafe fn horner_2img_off_narrow(
     inv_table: &InvNttTableByteSingleGf8,
     op: *const u16,
@@ -409,6 +418,7 @@ unsafe fn horner_2img_off_narrow(
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -456,6 +466,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -523,6 +534,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_prepared(
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
+#[inline(always)]
 unsafe fn shift_reduce_inner_ab_x86_avx512_rows(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -574,6 +586,7 @@ unsafe fn shift_reduce_inner_ab_x86_avx512_rows(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -674,6 +687,7 @@ fn production_convert_nibble_lut() -> &'static ConvertNibbleLut {
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -793,6 +807,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
     c_block: &[u8; 16 * ELL],
     n_b_med: usize,
@@ -901,6 +916,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
     c_block: &[u8; 16 * ELL],
     n_b_med: usize,
@@ -930,6 +946,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
     c_block: &[u8; 16 * ELL],
     n_b_med: usize,
@@ -1086,6 +1103,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     chunk_c_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
@@ -1363,6 +1381,7 @@ mod tests {
 #[cold]
 #[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
 unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -1391,6 +1410,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_dynamic(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -1417,6 +1437,7 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
 unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -1479,6 +1500,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
 unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     mats: &[u64; 256],
@@ -1529,6 +1551,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
 ))]
 #[inline]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
@@ -1576,6 +1599,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     target_feature = "avx512vbmi"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[inline(always)]
 unsafe fn byte_transpose_8x64<const REV: bool>(
     rows: [core::arch::x86_64::__m512i; 8],
 ) -> [core::arch::x86_64::__m512i; 8] {
@@ -1661,6 +1685,7 @@ unsafe fn byte_transpose_8x64<const REV: bool>(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f")]
+#[inline(always)]
 pub(crate) unsafe fn stage_c_group_x86_avx512(src: &[u8], dst: &mut [u8; 4 * 16 * ELL]) {
     use core::arch::x86_64::*;
     debug_assert!(src.len() >= 4 * 16 * ELL);
@@ -1717,6 +1742,7 @@ pub(crate) unsafe fn stage_c_group_x86_avx512(src: &[u8], dst: &mut [u8; 4 * 16 
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[inline(always)]
 pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],
@@ -1801,6 +1827,7 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[inline(always)]
 pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
     bank_planes: &[u8; 16 * ELL],
     out: &mut [F128; ELL],
