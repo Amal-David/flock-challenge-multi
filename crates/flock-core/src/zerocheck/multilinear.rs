@@ -1168,8 +1168,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     // `eq₂(2y) = (1+r₁)·eq₃(y)` and `eq₂(2y+1) = r₁·eq₃(y)`: the sweep uses
     // the odd lane as the group's single weight and the two constants below
     // put every aggregate back on its own scale, once, off the hot path.
-    let kappa = (F128::ONE + r1) * r1.inv();
     let r1_inv = r1.inv();
+    let kappa = r1_inv + F128::ONE;
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
@@ -1355,8 +1355,8 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
     assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
-    let kappa = (F128::ONE + r1) * r1.inv();
     let r1_inv = r1.inv();
+    let kappa = r1_inv + F128::ONE;
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
@@ -1574,8 +1574,8 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
     let r_inv = r.inv();
+    let kappa = r_inv + F128::ONE;
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
@@ -2505,8 +2505,8 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
-    let kappa = (F128::ONE + r) * r.inv();
     let r_inv = r.inv();
+    let kappa = r_inv + F128::ONE;
 
     let chunk_in = 8 * lo_size;
     let chunk_out = 2 * lo_size;

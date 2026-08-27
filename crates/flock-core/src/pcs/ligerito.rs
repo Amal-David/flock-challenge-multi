@@ -3788,18 +3788,16 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         debug_assert_eq!(f.len(), 2 * weights.len());
         let mut a_acc = WideGhashX4::zero();
         let mut s_acc = WideGhashX4::zero();
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
         let lanes = weights.len() & !3;
         let mut j = 0usize;
         while j < lanes {
             let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
             let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
             let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let sum = _mm512_permutex2var_epi64(f0_sum, idx_even, f1_sum);
+            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
             a_acc.mul_acc(even, w);
             s_acc.mul_acc(sum, w);
             j += 4;
@@ -3951,13 +3949,6 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     let mut u0_acc = WideGhashX4::zero();
     let mut u2_acc = WideGhashX4::zero();
 
-    // idx_even: pick 128-bit lanes {0, 2} from reg0 and {0, 2} from reg1
-    // → [reg0[0], reg0[2], reg1[0], reg1[2]] (even-indexed F128 elements).
-    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-    // perm_swap: swap adjacent 128-bit lanes (0↔1, 2↔3) within a register.
-    // After XOR with original, every lane holds a pair sum.
-    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
     let mut k = 0;
     while k < lanes {
         // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
@@ -3967,18 +3958,18 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
         let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
         // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
         u0_acc.mul_acc(f_even, b_even);
 
         // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
         //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
         u2_acc.mul_acc(f_sum, b_sum);
 
         k += 8;
@@ -4024,9 +4015,6 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
         let mut u2_acc = WideGhashX4::zero();
         let mut y_acc = WideGhashX4::zero();
 
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
         let mut k = 0;
         while k < lanes {
             let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
@@ -4034,16 +4022,16 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
             let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
@@ -4131,12 +4119,31 @@ fn open_ood_x4_enabled() -> bool {
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
+    // `_mm_loadu_si128` / `_mm512_loadu_si512` accept any src alignment.
     unsafe {
-        let s = src as *const __m128i;
-        let d = dst as *mut __m128i;
-        for i in 0..n {
-            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+        let mut s = src;
+        let mut d = dst;
+        let mut rem = n;
+
+        #[cfg(target_feature = "avx512f")]
+        {
+            // Peel until d is 64-byte aligned
+            while rem > 0 && ((d as usize) & 63) != 0 {
+                _mm_stream_si128(d as *mut __m128i, _mm_loadu_si128(s as *const __m128i));
+                s = s.add(1);
+                d = d.add(1);
+                rem -= 1;
+            }
+            // Stream 64 bytes (4 F128 elements) per instruction
+            while rem >= 4 {
+                _mm512_stream_si512(d as *mut __m512i, _mm512_loadu_si512(s as *const __m512i));
+                s = s.add(4);
+                d = d.add(4);
+                rem -= 4;
+            }
+        }
+        for i in 0..rem {
+            _mm_stream_si128(d.add(i) as *mut __m128i, _mm_loadu_si128(s.add(i) as *const __m128i));
         }
     }
 }
@@ -4146,7 +4153,7 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
 /// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
 /// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
+/// (no destination reload); the destination is published with AVX-512 streaming
 /// stores so each output line skips write-allocate RFO. Next reader is the
 /// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
 /// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
@@ -4190,7 +4197,6 @@ unsafe fn fold_and_msg_chunk_nt_x86(
         unsafe {
             publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
             publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
-            core::arch::x86_64::_mm_sfence();
         }
     } else {
         fc.copy_from_slice(&stage_f[..len]);
@@ -4445,6 +4451,16 @@ fn fold_and_msg_lsb_inner(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if use_nt {
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
