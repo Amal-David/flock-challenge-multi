@@ -654,14 +654,14 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_x2(
             unsafe {
                 core::arch::asm!(
                     "/* pin {0:v} {1:v} {2:v} {3:v} {4:v} {5:v} {6:v} {7:v} */",
-                    inout(vreg) *a0,
-                    inout(vreg) *a1,
-                    inout(vreg) *a2,
-                    inout(vreg) *a3,
-                    inout(vreg) *a4,
-                    inout(vreg) *a5,
-                    inout(vreg) *a6,
-                    inout(vreg) *a7,
+                    inout(vreg) * a0,
+                    inout(vreg) * a1,
+                    inout(vreg) * a2,
+                    inout(vreg) * a3,
+                    inout(vreg) * a4,
+                    inout(vreg) * a5,
+                    inout(vreg) * a6,
+                    inout(vreg) * a7,
                     options(nostack, preserves_flags)
                 );
             }
