@@ -95,6 +95,7 @@ type V8 = __m256i;
 pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
     Closed { init: u64, base: usize },
+    ClosedIdx { init: u64, indices: [usize; 8] },
 }
 
 struct PreparedInputs {
@@ -199,6 +200,31 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     }
 }
 
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn prepare_closed_inputs_indices(init: u64, indices: [usize; 8]) -> PreparedInputs {
+    unsafe {
+        let stride = crate::seed_pipe::GOLDEN
+            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let at = |i: usize| init.wrapping_add((indices[i] as u64).wrapping_mul(stride));
+        let mut states = [
+            _mm256_setr_epi64x(at(0) as i64, at(1) as i64, at(2) as i64, at(3) as i64),
+            _mm256_setr_epi64x(at(4) as i64, at(5) as i64, at(6) as i64, at(7) as i64),
+        ];
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut states));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut states));
+        let counter_lo = next_generator_draw(&mut states);
+        PreparedInputs {
+            cv,
+            message,
+            counter_lo,
+            counter_hi: _mm256_setzero_si256(),
+            block_len: _mm256_set1_epi32(64),
+            flags: _mm256_set1_epi32(11),
+        }
+    }
+}
+
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
@@ -245,6 +271,37 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
             first.wrapping_add(stride.wrapping_mul(5)) as i64,
             first.wrapping_add(stride.wrapping_mul(6)) as i64,
             first.wrapping_add(stride.wrapping_mul(7)) as i64,
+        );
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
+        let counter_lo = next_generator_draw(&mut state);
+        PreparedInputs {
+            cv,
+            message,
+            counter_lo,
+            counter_hi: _mm256_setzero_si256(),
+            block_len: _mm256_set1_epi32(64),
+            flags: _mm256_set1_epi32(11),
+        }
+    }
+}
+
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn prepare_closed_inputs_indices(init: u64, indices: [usize; 8]) -> PreparedInputs {
+    unsafe {
+        let stride = crate::seed_pipe::GOLDEN
+            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let at = |i: usize| init.wrapping_add((indices[i] as u64).wrapping_mul(stride));
+        let mut state = _mm512_setr_epi64(
+            at(0) as i64,
+            at(1) as i64,
+            at(2) as i64,
+            at(3) as i64,
+            at(4) as i64,
+            at(5) as i64,
+            at(6) as i64,
+            at(7) as i64,
         );
         let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
         let message = std::array::from_fn(|_| next_generator_draw(&mut state));
@@ -417,6 +474,7 @@ const _RING_GEOMETRY: () = {
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
+    pub(crate) out_offsets: Option<[usize; 8]>,
     pub(crate) live: u32,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
@@ -490,9 +548,13 @@ impl StreamProj<'_> {
                     if live & (1 << j) == 0 {
                         continue;
                     }
+                    let out_off = self
+                        .out_offsets
+                        .as_ref()
+                        .map_or(j * BYTES_PER_BLOCK, |offsets| offsets[j]);
                     let out = &mut *self
                         .out
-                        .add(j * BYTES_PER_BLOCK + blk * 64)
+                        .add(out_off + blk * 64)
                         .cast::<[u8; 64]>();
                     round1_ab_inner_window_from_offsets(
                         &*op.add(j * ROUND1_AB_OFF_WORDS)
@@ -518,9 +580,13 @@ impl StreamProj<'_> {
                 }
                 let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
                 let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let out_off = self
+                    .out_offsets
+                    .as_ref()
+                    .map_or(j * BYTES_PER_BLOCK, |offsets| offsets[j]);
                 let out = &mut *self
                     .out
-                    .add(j * BYTES_PER_BLOCK + blk * 64)
+                    .add(out_off + blk * 64)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_with_images(
                     a_win,
@@ -546,6 +612,8 @@ struct Drain8<'t> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    offsets: [usize; 8],
+    z_local: Option<*mut u32>,
     win_ab: Option<(*mut u32, *mut u32)>,
     proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
@@ -933,6 +1001,8 @@ struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    offsets: [usize; 8],
+    z_local: Option<*mut u32>,
     z_lo: *const V8,
     z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
@@ -950,7 +1020,7 @@ impl StepRows {
         unsafe {
             let f = self.flags;
             let wide = f & 0x80 != 0;
-            let o = j * U32_PER_BLOCK;
+            let o = self.offsets[j];
             emit_pair(
                 self.z.add(o),
                 *self.z_lo.add(j),
@@ -960,6 +1030,17 @@ impl StepRows {
                 f & 0x40 != 0,
                 wide,
             );
+            if let Some(z_local) = self.z_local {
+                emit_pair(
+                    z_local.add(j * U32_PER_BLOCK),
+                    *self.z_lo.add(j),
+                    *self.z_hi.add(j),
+                    true,
+                    true,
+                    false,
+                    wide,
+                );
+            }
             let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
@@ -994,6 +1075,7 @@ impl Drain8<'_> {
     unsafe fn publish_step(
         stage: *const V8,
         dst: *mut u32,
+        offsets: &[usize; 8],
         carry: Option<(*mut u32, usize)>,
         abs_word: usize,
         ring_word: usize,
@@ -1014,7 +1096,7 @@ impl Drain8<'_> {
                     store_v8(p, lo_rows[r]);
                     store_v8(p.add(8), hi_rows[r]);
                 }
-                let p = dst.add(r * U32_PER_BLOCK + abs_word);
+                let p = dst.add(offsets[r] + abs_word);
                 match (nt, lo_live, hi_live) {
                     (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(p, lo_rows[r], wide_nt),
@@ -1046,6 +1128,8 @@ impl Drain8<'_> {
         b_carry: Option<(*mut u32, usize)>,
         a_rows: (*const u32, usize),
         z_dst: *mut u32,
+        offsets: &[usize; 8],
+        z_local: Option<*mut u32>,
         abs_word: usize,
         ring_word: usize,
         z_g1: usize,
@@ -1077,7 +1161,7 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi_rows[r]);
                 }
 
-                let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
+                let bp = b_dst.add(offsets[r] + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
                     (true, true, true) => {
                         stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
@@ -1093,7 +1177,7 @@ impl Drain8<'_> {
                     (_, false, false) => {}
                 }
 
-                let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
+                let zp = z_dst.add(offsets[r] + abs_word);
                 match (z_nt, z_lo_live, z_hi_live) {
                     (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
                     (true, true, false) => stream_v8(zp, z_lo, wide_nt),
@@ -1105,6 +1189,11 @@ impl Drain8<'_> {
                     (false, true, false) => store_v8(zp, z_lo),
                     (false, false, true) => store_v8(zp.add(8), z_hi),
                     (_, false, false) => {}
+                }
+                if let Some(local) = z_local {
+                    let lp = local.add(r * U32_PER_BLOCK + abs_word);
+                    store_v8(lp, z_lo);
+                    store_v8(lp.add(8), z_hi);
                 }
             }
         }
@@ -1155,6 +1244,7 @@ impl Drain8<'_> {
                     Self::publish_step(
                         self.ast,
                         self.a,
+                        &self.offsets,
                         Some((sa, STEP_WORDS)),
                         abs_word,
                         rw,
@@ -1169,6 +1259,8 @@ impl Drain8<'_> {
                         Some((sb, STEP_WORDS)),
                         (sa, STEP_WORDS),
                         self.z,
+                        &self.offsets,
+                        self.z_local,
                         abs_word,
                         rw,
                         z_g1,
@@ -1300,6 +1392,8 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
+                    offsets: self.offsets,
+                    z_local: self.z_local.map(|p| p.add(abs_word)),
                     z_lo: z_lo.as_ptr(),
                     z_hi: z_hi.as_ptr(),
                     flags,
@@ -1336,6 +1430,7 @@ impl Drain8<'_> {
                         Self::publish_step(
                             self.ast,
                             self.a,
+                            &self.offsets,
                             Some((win_a.add(abs_word), U32_PER_BLOCK)),
                             abs_word,
                             rw,
@@ -1350,6 +1445,8 @@ impl Drain8<'_> {
                             Some((win_b.add(abs_word), U32_PER_BLOCK)),
                             (win_a.add(abs_word), U32_PER_BLOCK),
                             self.z,
+                            &self.offsets,
+                            self.z_local,
                             abs_word,
                             rw,
                             z_g1,
@@ -1370,6 +1467,7 @@ impl Drain8<'_> {
                         Self::publish_step(
                             self.ast,
                             self.a,
+                            &self.offsets,
                             Some((a_rows, STEP_WORDS)),
                             abs_word,
                             rw,
@@ -1384,6 +1482,8 @@ impl Drain8<'_> {
                             None,
                             (a_rows, STEP_WORDS),
                             self.z,
+                            &self.offsets,
+                            self.z_local,
                             abs_word,
                             rw,
                             z_g1,
@@ -1546,6 +1646,38 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z_nt: bool,
 ) {
     unsafe {
+        build_octa_witness_ab_stream_elide_indexed(
+            inputs,
+            z,
+            a,
+            b,
+            std::array::from_fn(|j| j * U32_PER_BLOCK),
+            None,
+            win_ab,
+            proj,
+            elide,
+            z_nt,
+        );
+    }
+}
+
+/// Indexed-output form used by the ranked witness/NTT fusion. `offsets` are
+/// u32 offsets from each main destination base; `z_local`, when present,
+/// receives one complete contiguous eight-block Z octa.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide_indexed(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    offsets: [usize; 8],
+    z_local: Option<*mut u32>,
+    win_ab: Option<(*mut u32, *mut u32)>,
+    proj: Option<StreamProj<'_>>,
+    elide: [bool; 3],
+    z_nt: bool,
+) {
+    unsafe {
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -1627,6 +1759,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 }
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+            OctaInputs::ClosedIdx { init, indices } => {
+                prepare_closed_inputs_indices(init, indices)
+            }
         };
         let cv_v = prepared.cv;
         let m = prepared.message;
@@ -1666,6 +1801,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z,
             a,
             b,
+            offsets,
+            z_local,
             win_ab,
             proj,
             elide,
