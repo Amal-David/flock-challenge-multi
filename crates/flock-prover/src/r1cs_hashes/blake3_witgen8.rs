@@ -168,8 +168,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +204,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +215,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +224,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -1079,9 +1070,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1266,11 +1255,7 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
@@ -1310,7 +1295,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1676,8 +1665,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
