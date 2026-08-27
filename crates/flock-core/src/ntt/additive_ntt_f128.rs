@@ -332,6 +332,26 @@ fn deep_block_fuse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
 }
 
+/// Compact the ranked deep pass's first eight layers into eight 256 KiB
+/// stride-8 fibers. The incumbent first fused-four sweep addresses sixteen
+/// rows 128 KiB apart: one set in both Sapphire Rapids L1d and L2. Compacting
+/// a closed eight-layer fiber makes those rows adjacent and keeps the second
+/// fused-four sweep in the same private-L2 working set.
+///
+/// Exact-shape only. `FLOCK_NO_NTT_DEEP_TILE8=1` restores the in-place
+/// fused-four + per-128-row-block schedule in the same binary.
+#[inline]
+fn deep_tile8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_DEEP_TILE8").is_none());
+    cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && *ON
+}
+
 /// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
 /// when this machine or pool cannot be paired.
 ///
@@ -736,6 +756,82 @@ fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
             let mut v = crate::alloc_uninit_vec::<F128>(n);
             v.fill(STAGING_POISON);
             v
+        }
+    }
+}
+
+thread_local! {
+    /// One ranked 256-row deep tile per Rayon worker. Untimed proof passes
+    /// allocate and fault it before measurement; every later subgroup on the
+    /// same worker reuses the resident allocation.
+    static DEEP_TILE8_SCRATCH: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_deep_tile8_scratch<R>(row_len: usize, op: impl FnOnce(&mut [F128]) -> R) -> R {
+    const TILE_ROWS: usize = 256;
+    DEEP_TILE8_SCRATCH.with(|cell| {
+        let mut tile = cell.borrow_mut();
+        let want = TILE_ROWS * row_len;
+        if tile.len() != want {
+            *tile = staging_block(TILE_ROWS, row_len);
+        }
+        op(&mut tile)
+    })
+}
+
+/// Gather one low-three-bit fiber into a contiguous ranked tile.
+///
+/// # Safety
+/// `src` owns 2048 rows of 64 F128 values; `dst` owns 256 such rows,
+/// the regions do not overlap, and `r < 8`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn deep_tile8_gather_x86(src: *const F128, dst: *mut F128, r: usize) {
+    use core::arch::x86_64::*;
+    const NN: usize = 64;
+    const ROWS: usize = 256;
+    for k in 0..ROWS {
+        for lane in (0..NN).step_by(4) {
+            let value = unsafe {
+                _mm512_loadu_si512(src.add((r + 8 * k) * NN + lane) as *const __m512i)
+            };
+            unsafe {
+                _mm512_storeu_si512(dst.add(k * NN + lane) as *mut __m512i, value);
+            }
+        }
+    }
+}
+
+/// Scatter one contiguous ranked tile back to its canonical fiber.
+///
+/// # Safety
+/// `src` owns 256 rows of 64 F128 values; `dst` owns 2048 such rows,
+/// the regions do not overlap, and `r < 8`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn deep_tile8_scatter_x86(src: *const F128, dst: *mut F128, r: usize) {
+    use core::arch::x86_64::*;
+    const NN: usize = 64;
+    const ROWS: usize = 256;
+    for k in 0..ROWS {
+        for lane in (0..NN).step_by(4) {
+            let value =
+                unsafe { _mm512_loadu_si512(src.add(k * NN + lane) as *const __m512i) };
+            unsafe {
+                _mm512_storeu_si512(
+                    dst.add((r + 8 * k) * NN + lane) as *mut __m512i,
+                    value,
+                );
+            }
         }
     }
 }
@@ -1425,6 +1521,12 @@ fn st_fmp_run(
             unsafe {
                 publish(bufp.add((j % nbuf) * stride), *st.slot_r[j % nbuf].get());
             }
+        }
+        // The codeword is consumed only after the broadcast joins. One
+        // producer-final fence preserves that edge without draining the
+        // write-combining buffers after every independent 512 KiB task.
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
         }
     });
     true
@@ -2866,10 +2968,8 @@ impl AdditiveNttF128 {
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
                     );
                 }
-                // All 512 rows of this task are published. Drain the WC
-                // buffers here, exactly as the fused path does per task; the
-                // rayon join below is the reader's happens-before edge.
-                core::arch::x86_64::_mm_sfence();
+                // The paired producer fences once after all tasks, before the
+                // broadcast joins and the deep pass may read the codeword.
             }
         };
 
@@ -2902,6 +3002,142 @@ impl AdditiveNttF128 {
             (0..sub_stride)
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+        }
+    }
+
+    /// Apply ranked deep layers `n_top..n_top+8` through eight compact
+    /// stride-8 fibers.
+    ///
+    /// Layers 9..16 never change the low three position bits, so each set
+    /// `{r + 8k | k < 256}` is closed under all eight layers. Gathering that
+    /// set makes the first fused-four's 128 KiB row stride sixteen compact
+    /// rows and lets the second fused-four consume the same 256 KiB tile
+    /// before it leaves private L2. Scattering restores the canonical
+    /// position-major layout before layers 17..19 and Merkle hashing.
+    #[inline(never)]
+    fn deep_tile8_first_eight(
+        &self,
+        sub_idx: usize,
+        sub_data: &mut [F128],
+        tile: &mut [F128],
+        n_top: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+    ) {
+        const POSITIONS: usize = 2048;
+        const TILE_ROWS: usize = 256;
+        const N_TILES: usize = 8;
+        debug_assert_eq!(num_ntts, 64);
+        debug_assert_eq!(sub_data.len(), POSITIONS * num_ntts);
+        debug_assert_eq!(tile.len(), TILE_ROWS * num_ntts);
+
+        let mut tw_first = [F128 { lo: 0, hi: 0 }; 15];
+        tw_first[0] = self.twiddle(n_top, sub_idx);
+        for s in 0..2 {
+            tw_first[1 + s] = self.twiddle(n_top + 1, 2 * sub_idx + s);
+        }
+        for s in 0..4 {
+            tw_first[3 + s] = self.twiddle(n_top + 2, 4 * sub_idx + s);
+        }
+        for s in 0..8 {
+            tw_first[7 + s] = self.twiddle(n_top + 3, 8 * sub_idx + s);
+        }
+
+        let second_layer = n_top + 4;
+        let mut tw_second = [[F128 { lo: 0, hi: 0 }; 15]; 16];
+        for (block, tw) in tw_second.iter_mut().enumerate() {
+            let global = sub_idx * 16 + block;
+            tw[0] = self.twiddle(second_layer, global);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(second_layer + 1, 2 * global + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(second_layer + 2, 4 * global + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = self.twiddle(second_layer + 3, 8 * global + s);
+            }
+        }
+
+        for r in 0..N_TILES {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            unsafe {
+                deep_tile8_gather_x86(sub_data.as_ptr(), tile.as_mut_ptr(), r);
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            unsafe {
+                for k in 0..TILE_ROWS {
+                    core::ptr::copy_nonoverlapping(
+                        sub_data.as_ptr().add((r + N_TILES * k) * num_ntts),
+                        tile.as_mut_ptr().add(k * num_ntts),
+                        num_ntts,
+                    );
+                }
+            }
+
+            // Every original row in a fiber has the same parity.
+            let lanes = if r & 1 == 1 {
+                num_ntts - odd_tail
+            } else {
+                num_ntts
+            };
+            for q in 0..16 {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        tile.as_mut_ptr(),
+                        16,
+                        num_ntts,
+                        lanes,
+                        q,
+                        &tw_first,
+                    );
+                }
+            }
+            for (block, tw) in tw_second.iter().enumerate() {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        tile.as_mut_ptr().add(block * 16 * num_ntts),
+                        1,
+                        num_ntts,
+                        lanes,
+                        0,
+                        tw,
+                    );
+                }
+            }
+
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            unsafe {
+                deep_tile8_scatter_x86(tile.as_ptr(), sub_data.as_mut_ptr(), r);
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            unsafe {
+                for k in 0..TILE_ROWS {
+                    core::ptr::copy_nonoverlapping(
+                        tile.as_ptr().add(k * num_ntts),
+                        sub_data
+                            .as_mut_ptr()
+                            .add((r + N_TILES * k) * num_ntts),
+                        num_ntts,
+                    );
+                }
+            }
         }
     }
 
@@ -3285,6 +3521,8 @@ impl AdditiveNttF128 {
             && start_layer <= n_top
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
+        let use_tile8 =
+            fuse_blocks && sub_size_positions == 2048 && num_ntts == 64 && deep_tile8_enabled();
 
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
@@ -3293,9 +3531,13 @@ impl AdditiveNttF128 {
          -> bool {
             if fuse_blocks && block_cb.is_some() {
                 let cb = block_cb.unwrap();
-                // Sweep 1: fused-four over the whole sub-group (layers
-                // n_top..n_top+4) — verbatim the incumbent's first pass.
-                {
+                if use_tile8 {
+                    with_deep_tile8_scratch(num_ntts, |tile| {
+                        self.deep_tile8_first_eight(
+                            sub_idx, sub_data, tile, n_top, num_ntts, odd_tail,
+                        );
+                    });
+                } else {
                     let layer = n_top;
                     let block_size = 1usize << (log_d - layer);
                     let sixteenth = block_size >> 4;
@@ -3320,9 +3562,7 @@ impl AdditiveNttF128 {
                         hint,
                     );
                 }
-                // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
-                // (n_top+8..n_top+11), then the leaf callback, all while the
-                // 128-position block is cache-hot.
+
                 let layer4 = n_top + 4;
                 let block_size4 = 1usize << (log_d - layer4);
                 let block_bytes4 = block_size4 * num_ntts;
@@ -3333,26 +3573,28 @@ impl AdditiveNttF128 {
                 FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for b in 0..16usize {
                     let g4 = sub_idx * 16 + b;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer4, g4);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-                    }
-                    for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-                    }
                     let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-                    butterfly_interleaved_fused_4layer_rows(
-                        blk,
-                        &tw,
-                        sixteenth4,
-                        num_ntts,
-                        if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
-                        hint,
-                    );
+                    if !use_tile8 {
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                        tw[0] = self.twiddle(layer4, g4);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+                        }
+                        for s in 0..8 {
+                            tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+                        }
+                        butterfly_interleaved_fused_4layer_rows(
+                            blk,
+                            &tw,
+                            sixteenth4,
+                            num_ntts,
+                            if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
+                            hint,
+                        );
+                    }
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
                         let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
@@ -3366,7 +3608,7 @@ impl AdditiveNttF128 {
                         let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
                         // SAFETY: eight consecutive rows of `num_ntts` lanes,
                         // owned exclusively by this sub-group task; the zero
-                        // tail lives on odd rows exactly as in the sweep
+                        // tail lives on odd rows exactly as in the incumbent
                         // schedule (blocks start at even global rows).
                         unsafe {
                             kernels::butterfly_fused_3layer_rows(
@@ -3378,7 +3620,7 @@ impl AdditiveNttF128 {
                         }
                     }
                     let lo = sub_idx * sub_size_positions + b * block_size4;
-                    cb(lo..lo + block_size4, &sub_data[b * block_bytes4..(b + 1) * block_bytes4]);
+                    cb(lo..lo + block_size4, blk);
                 }
                 return true;
             }
@@ -4474,6 +4716,96 @@ mod tests {
                 let shaped = run(false);
                 assert_eq!(generic, shaped, "fused3 low={low} dense={dense}");
             }
+        }
+    }
+
+    #[test]
+    fn deep_tile8_first_eight_matches_in_place_sweeps() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        const LOG_D: usize = 20;
+        const N_TOP: usize = 9;
+        const NN: usize = 64;
+        const POSITIONS: usize = 2048;
+        const SUB_IDX: usize = 7;
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut seed = 0xd33f_71e8_5eed_cafeu64;
+
+        for odd_tail in [0usize, 4] {
+            let mut src: Vec<F128> = (0..POSITIONS * NN)
+                .map(|_| F128 {
+                    lo: next(&mut seed),
+                    hi: next(&mut seed),
+                })
+                .collect();
+            if odd_tail != 0 {
+                for row in (1..POSITIONS).step_by(2) {
+                    for lane in NN - odd_tail..NN {
+                        src[row * NN + lane] = F128::ZERO;
+                    }
+                }
+            }
+
+            let mut control = src.clone();
+            let mut tw_first = [F128::ZERO; 15];
+            tw_first[0] = ntt.twiddle(N_TOP, SUB_IDX);
+            for s in 0..2 {
+                tw_first[1 + s] = ntt.twiddle(N_TOP + 1, 2 * SUB_IDX + s);
+            }
+            for s in 0..4 {
+                tw_first[3 + s] = ntt.twiddle(N_TOP + 2, 4 * SUB_IDX + s);
+            }
+            for s in 0..8 {
+                tw_first[7 + s] = ntt.twiddle(N_TOP + 3, 8 * SUB_IDX + s);
+            }
+            butterfly_interleaved_fused_4layer_rows(
+                &mut control,
+                &tw_first,
+                128,
+                NN,
+                odd_tail,
+                0,
+            );
+            for block in 0..16 {
+                let global = SUB_IDX * 16 + block;
+                let mut tw = [F128::ZERO; 15];
+                tw[0] = ntt.twiddle(N_TOP + 4, global);
+                for s in 0..2 {
+                    tw[1 + s] = ntt.twiddle(N_TOP + 5, 2 * global + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = ntt.twiddle(N_TOP + 6, 4 * global + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = ntt.twiddle(N_TOP + 7, 8 * global + s);
+                }
+                let lo = block * 128 * NN;
+                butterfly_interleaved_fused_4layer_rows(
+                    &mut control[lo..lo + 128 * NN],
+                    &tw,
+                    8,
+                    NN,
+                    odd_tail,
+                    0,
+                );
+            }
+
+            let mut tiled = src;
+            let mut scratch = vec![F128::ZERO; 256 * NN];
+            ntt.deep_tile8_first_eight(
+                SUB_IDX,
+                &mut tiled,
+                &mut scratch,
+                N_TOP,
+                NN,
+                odd_tail,
+            );
+            assert_eq!(tiled, control, "odd_tail={odd_tail}");
         }
     }
 
