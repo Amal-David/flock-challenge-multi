@@ -68,6 +68,8 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
 }
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     // SAFETY: forwarded caller contract.
     unsafe { butterfly_row_pair_gen::<false>(top, bot, twiddle) }
@@ -79,6 +81,8 @@ pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twid
 /// Requires `avx512f` + `vpclmulqdq`; when `LOW`, `twiddle.hi == 0`.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_row_pair_gen<const LOW: bool>(
     top: &mut [F128],
     bot: &mut [F128],
@@ -127,6 +131,8 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
 
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer(
     a: &mut [F128],
     b: &mut [F128],
@@ -149,6 +155,8 @@ pub(super) unsafe fn butterfly_fused_2layer(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_gen<const OUTER_LOW: bool, const INNER_LOW: bool>(
     a: &mut [F128],
     b: &mut [F128],
@@ -284,6 +292,8 @@ unsafe fn stream_f128x4<const ALIGNED_ZMM: bool>(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
     const OUTER_LOW: bool,
     const INNER_LOW: bool,
@@ -409,6 +419,8 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
 /// Caller guarantees target features, valid non-aliasing src/dst rows, and
 /// disjoint destination row groups across concurrent calls.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from(
     src: *const F128,
     dst: *mut F128,
@@ -433,6 +445,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
 /// Same contract as [`butterfly_fused_2layer_row_from`].
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     src: *const F128,
     src_quarter: usize,
@@ -546,6 +560,8 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool>(
 /// # Safety
 /// Same contract as [`butterfly_fused_2layer_row_from`].
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     src: *const F128,
     dst: *mut F128,
@@ -576,6 +592,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
 /// Same contract as [`butterfly_fused_2layer_row_from`].
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     src: *const F128,
     src_quarter: usize,
@@ -626,6 +644,8 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
 /// inside the same source buffer.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     src: *const F128,
     src_quarter: usize,
@@ -756,6 +776,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<const DIET: bool, cons
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     src: *const F128,
     src_quarter: usize,
@@ -916,6 +938,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
@@ -958,6 +982,8 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 /// Same contract as [`butterfly_fused_4layer_row`]; in addition, row group
 /// `pf_r` must lie inside the same block.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     ptr: *mut F128,
     sixteenth: usize,
@@ -1007,6 +1033,8 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// Same contract as [`butterfly_fused_4layer_row_pf`], with
 /// `sixteenth == S16` and `num_ntts == NN`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     const S16: usize,
     const NN: usize,
@@ -1193,6 +1221,8 @@ unsafe fn butterfly_fused_4layer_row_impl<
 /// monomorphizations of a twelve-butterfly network into its own frame.
 #[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
     num_ntts: usize,
@@ -1237,6 +1267,8 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 /// Same contract as [`butterfly_fused_3layer_rows`], with `num_ntts == NN`.
 #[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+
+#[inline(always)]
 pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     ptr: *mut F128,
     dense_lanes: usize,
