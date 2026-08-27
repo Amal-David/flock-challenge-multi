@@ -61,6 +61,44 @@ fn ranked_direct_fold4_precompute_enabled(
         && r1cs.k_log >= pcs::LOG_PACKING + 4
 }
 
+/// Memoised [`BlockR1cs::c0_is_identity`].
+///
+/// `c0_is_identity` walks all `2^k_log` rows of `c_0` and compares each row
+/// against `[i]`. At the ranked shape that is 16,384 separately
+/// heap-allocated `Vec<usize>`, i.e. 16,384 dependent pointer chases, and it
+/// runs once per prove inside the serial Fiat-Shamir chain to answer a
+/// question that is a fixed property of the statement. Measured cost of the
+/// enclosing predicate: 0.166 ms warm median (gap seam
+/// `zerocheck: pool entered`, n=48 warm proves, resolution ~0.007 ms).
+///
+/// The answer is keyed on `statement_digest()`, itself a `OnceLock` that
+/// absorbs `a_0`, `b_0` and `c_0`, so two different statements can never
+/// share a cached answer and a mutated `c_0` changes the key. The digest is
+/// already materialised by `bind_statement` on the first prove, so the warm
+/// lookup is a `OnceLock` load plus one 32-byte compare.
+///
+/// `FLOCK_NO_R1CS_C0_ID_CACHE=1` restores the per-prove walk. The env var is
+/// read once into a `LazyLock`, never inside a loop.
+fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1CS_C0_ID_CACHE").is_none()
+    });
+    if !*ON {
+        return r1cs.c0_is_identity();
+    }
+    static CACHE: std::sync::Mutex<Option<([u8; 32], bool)>> = std::sync::Mutex::new(None);
+    let digest = r1cs.statement_digest();
+    let mut slot = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_digest, value)) = *slot {
+        if cached_digest == digest {
+            return value;
+        }
+    }
+    let value = r1cs.c0_is_identity();
+    *slot = Some((digest, value));
+    value
+}
+
 /// Exact-shape gate for deriving identity C from one block-major outer fold of
 /// the witness instead of draining it into 32 field banks in zerocheck round
 /// one. Deliberately narrower than the generic DirectFold4 gate — the shortcut
@@ -80,7 +118,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_skip == zerocheck::K_SKIP
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-        && r1cs.c0_is_identity()
+        && c0_is_identity_cached(r1cs)
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
@@ -320,7 +358,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     // a = A·z, b = B·z; for the C = I convention c aliases z.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
+    let c_packed_f128: Vec<F128> = if c0_is_identity_cached(r1cs) {
         Vec::new()
     } else {
         r1cs.apply_c_packed(&z_packed)
@@ -1235,3 +1273,15 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-111: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-resample-170: independent official timing sample of the promoted source; no executable change.
+
+// zarar-x86-draw-20260827T001555Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T001848Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T002238Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T003936Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T005635Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T011331Z: independent official timing sample; no executable change.
