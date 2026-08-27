@@ -15,6 +15,7 @@
 pub use flock_core::*;
 
 pub mod chain;
+pub mod compression;
 pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
