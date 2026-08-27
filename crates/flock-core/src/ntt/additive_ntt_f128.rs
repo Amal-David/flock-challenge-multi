@@ -1924,9 +1924,10 @@ impl AdditiveNttF128 {
     /// half then follows its own fused two-layer twiddle tree.
     ///
     /// x86 uses the AVX-512 row-from pair when `avx512f+vpclmulqdq` is
-    /// available (regular stores, 4-lane `ghash_mul_x4`; portable otherwise).
-    /// Apple may publish with `stnp` unless `FLOCK_NO_SEED_NT` is set. Do not
-    /// lift `seed_fused_2layer_row_group_nt`.
+    /// available (4-lane `ghash_mul_x4`; portable otherwise). Both x86 and
+    /// Apple may publish with non-temporal stores unless `FLOCK_NO_SEED_NT`
+    /// is set — the destination is next read by a later transform pass, so
+    /// write-allocate is waste. Do not lift `seed_fused_2layer_row_group_nt`.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -1985,12 +1986,11 @@ impl AdditiveNttF128 {
         // from L1 while limiting live state to four F128 values.
         //
         // On the ranked shape the destination rows are cold and next read a
-        // full sweep later, so the staged kernel routes the eight output rows
-        // through an 8 KiB stack block and publishes them with q-form `stnp`
-        // 32 B pairs at full-line granularity, skipping the write-allocate
-        // read of the ~1 GiB destination. Requires whole-line coverage
-        // (num_ntts % 8, 128 B-aligned halves). `FLOCK_NO_SEED_NT` is a
-        // local-diagnostics kill switch; the ranked worker's cleared
+        // later transform pass. Apple publishes both rate-1/2 halves via
+        // q-form `stnp` (8 KiB stack staging). x86 publishes every block with
+        // XMM `MOVNTDQ` from the same four-row kernels, skipping the
+        // write-allocate RFO of each recursive codeword. `FLOCK_NO_SEED_NT`
+        // is a local-diagnostics kill switch; the ranked worker's cleared
         // environment never sets it.
         let src = msg.as_ptr() as usize;
         let dst = codeword.as_mut_ptr() as usize;
@@ -2001,7 +2001,13 @@ impl AdditiveNttF128 {
             && num_ntts <= kernels::SEED_NT_MAX_NTTS
             && dst % 128 == 0
             && (msg_len * core::mem::size_of::<F128>()) % 128 == 0
-            && std::env::var_os("FLOCK_NO_SEED_NT").is_none();
+            && seed_nt_enabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let use_nt = dst % 16 == 0 && num_ntts.is_multiple_of(4) && seed_nt_enabled();
         let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2016,6 +2022,32 @@ impl AdditiveNttF128 {
                     twiddles[0][2],
                     &twiddles[1],
                 );
+                return;
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                kernels::butterfly_fused_2layer_row_from_sparse_nt(
+                    src as *const F128,
+                    dst as *mut F128,
+                    quarter,
+                    num_ntts,
+                    r,
+                    twiddles[0][2],
+                );
+                for (b, tw) in twiddles.iter().enumerate().skip(1) {
+                    kernels::butterfly_fused_2layer_row_from_nt(
+                        src as *const F128,
+                        (dst as *mut F128).add(b * msg_len),
+                        quarter,
+                        num_ntts,
+                        r,
+                        tw,
+                    );
+                }
                 return;
             }
             // Block 0's layer-`k` and first layer-`k+1` twiddles are ZERO for
@@ -2043,11 +2075,55 @@ impl AdditiveNttF128 {
         };
 
         const PARALLEL_ROW_THRESHOLD: usize = 256;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        struct SeedNtFence;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        impl Drop for SeedNtFence {
+            fn drop(&mut self) {
+                // Drain this worker's WC buffers. The rayon join is the
+                // later transform's happens-before; this is the same-thread
+                // drain Intel's NT contract asks for.
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
+        }
         if quarter < PARALLEL_ROW_THRESHOLD {
             for r in 0..quarter {
                 seed_row(r);
             }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
         } else {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_nt {
+                (0..quarter)
+                    .into_par_iter()
+                    .for_each_init(|| SeedNtFence, |_, r| seed_row(r));
+            } else {
+                (0..quarter).into_par_iter().for_each(seed_row);
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
             (0..quarter).into_par_iter().for_each(seed_row);
         }
     }
@@ -4322,6 +4398,15 @@ fn rate_seed_disabled() -> bool {
     static OFF: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RATE_SEED").is_some());
     *OFF
+}
+
+/// `FLOCK_NO_SEED_NT=1` restores write-allocate stores in
+/// [`AdditiveNttF128::seed_layers_pair_from_msg`]. Read once per process;
+/// default ON (the ranked worker clears its env).
+fn seed_nt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SEED_NT").is_none());
+    *ON
 }
 
 /// Fill `codeword` with power-of-two replicas of `msg`, the exact state after

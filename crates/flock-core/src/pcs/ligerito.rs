@@ -5989,25 +5989,9 @@ fn materialize_direct_fold8(
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
                     crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled),
-                    // `gfni_tmp` sits under the SAME sub-`RECYCLE_MIN` gate
-                    // `mid4` above does, and the staged GFNI kernel hammers it
-                    // with ZMM `storeu`/`loadu`: at 64 F128 = 1 KiB it goes to
-                    // the system allocator and lands 16 mod 64, so every 64 B
-                    // ZMM access against it straddles two cache lines.
-                    //
-                    // The size arithmetic is NOT `mid4`'s. `mid4` is 16 KiB and
-                    // crosses a 32 KiB threshold, i.e. 2x. This buffer is 1 KiB,
-                    // so asking for the gate's minimum inflates it 32x. That is
-                    // affordable here for one specific reason: the pooled arm is
-                    // `take_local_f128`, which recycles a per-thread allocation
-                    // and does NOT zero it (`scratch.rs`; the unpooled kill-switch
-                    // arm's `vec![F128::ZERO; n]` is not the ranked path). So the
-                    // inflation costs one 32 KiB reservation per thread ONCE,
-                    // 512 KiB across 16 threads, and the kernel still touches only
-                    // the first 1 KiB -- the resident cache footprint is unchanged,
-                    // which is what `killed.md:2170`'s L1D lesson actually cares
-                    // about. CAPACITY ONLY: the kernel still addresses exactly the
-                    // same 64 elements, so no value, element or order changes.
+                    // `gfni_tmp` sits under the same sub-`RECYCLE_MIN` gate as `mid4`.
+                    // The kernel touches only the first 64 elements; the larger capacity
+                    // selects the pool allocator’s 64-byte-aligned class.
                     crate::scratch::LocalBuf::new(
                         if b_gfni_on { (64usize).max(ALIGN64_MIN_F128) } else { 0 },
                         pooled,

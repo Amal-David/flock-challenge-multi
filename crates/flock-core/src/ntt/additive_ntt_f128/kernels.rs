@@ -272,6 +272,34 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
     }
 }
 
+/// NT-publish twin of [`butterfly_fused_2layer_row_from`]: XMM `MOVNTDQ`
+/// dest stores. x86 AVX-512 only; dest 16-byte aligned, `num_ntts` a
+/// multiple of 4.
+///
+/// # Safety
+/// Same as [`butterfly_fused_2layer_row_from`], plus the NT constraints.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_nt(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded; identical src/dst geometry.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_geo_nt(
+            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+        );
+    }
+}
+
 /// [`butterfly_fused_2layer_row_from`] with independent source/destination
 /// row geometry (source rows `i·src_quarter + src_r`, destination rows
 /// `i·dst_quarter + dst_r`).
@@ -572,7 +600,33 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
             num_ntts,
             r,
             right_twiddle,
-        )
+        );
+    }
+}
+
+/// NT-publish twin of [`butterfly_fused_2layer_row_from_sparse`].
+///
+/// # Safety
+/// Same as [`butterfly_fused_2layer_row_from_nt`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    right_twiddle: F128,
+) {
+    // SAFETY: forwarded; identical src/dst geometry.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_geo_nt(
+            src, quarter, r, dst, quarter, r, num_ntts, right_twiddle,
+        );
     }
 }
 
