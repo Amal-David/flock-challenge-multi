@@ -257,21 +257,45 @@ pub(crate) unsafe fn tail_fold_chunk_nt_neon(
             let pa = ghash_mul_vec2_neon(
                 [r_fold, r_fold],
                 [
-                    F128 { lo: ae0.lo ^ ao0.lo, hi: ae0.hi ^ ao0.hi },
-                    F128 { lo: ae1.lo ^ ao1.lo, hi: ae1.hi ^ ao1.hi },
+                    F128 {
+                        lo: ae0.lo ^ ao0.lo,
+                        hi: ae0.hi ^ ao0.hi,
+                    },
+                    F128 {
+                        lo: ae1.lo ^ ao1.lo,
+                        hi: ae1.hi ^ ao1.hi,
+                    },
                 ],
             );
             let pb = ghash_mul_vec2_neon(
                 [r_fold, r_fold],
                 [
-                    F128 { lo: be0.lo ^ bo0.lo, hi: be0.hi ^ bo0.hi },
-                    F128 { lo: be1.lo ^ bo1.lo, hi: be1.hi ^ bo1.hi },
+                    F128 {
+                        lo: be0.lo ^ bo0.lo,
+                        hi: be0.hi ^ bo0.hi,
+                    },
+                    F128 {
+                        lo: be1.lo ^ bo1.lo,
+                        hi: be1.hi ^ bo1.hi,
+                    },
                 ],
             );
-            let a0 = F128 { lo: ae0.lo ^ pa[0].lo, hi: ae0.hi ^ pa[0].hi };
-            let a1 = F128 { lo: ae1.lo ^ pa[1].lo, hi: ae1.hi ^ pa[1].hi };
-            let b0 = F128 { lo: be0.lo ^ pb[0].lo, hi: be0.hi ^ pb[0].hi };
-            let b1 = F128 { lo: be1.lo ^ pb[1].lo, hi: be1.hi ^ pb[1].hi };
+            let a0 = F128 {
+                lo: ae0.lo ^ pa[0].lo,
+                hi: ae0.hi ^ pa[0].hi,
+            };
+            let a1 = F128 {
+                lo: ae1.lo ^ pa[1].lo,
+                hi: ae1.hi ^ pa[1].hi,
+            };
+            let b0 = F128 {
+                lo: be0.lo ^ pb[0].lo,
+                hi: be0.hi ^ pb[0].hi,
+            };
+            let b1 = F128 {
+                lo: be1.lo ^ pb[1].lo,
+                hi: be1.hi ^ pb[1].hi,
+            };
 
             store_nt_q_pair(dst_a, vec_from_f128(a0), vec_from_f128(a1));
             store_nt_q_pair(dst_b, vec_from_f128(b0), vec_from_f128(b1));
