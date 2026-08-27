@@ -507,7 +507,12 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
+    // Four. Sampled on this instance at eight (incumbent), four (level) and
+    // two (0.64% worse). Four is the shallowest depth that is not a loss, and
+    // it holds the least finished codeword in the L2 the producer and its
+    // paired consumer share -- which matters more now that the seed-and-top
+    // split's staging rotation is one block deeper in the same cache.
+    const DEFAULT_DEPTH: usize = 4;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
@@ -1095,7 +1100,17 @@ const ST_FMP_CAP: usize = 4;
 ))]
 #[inline]
 fn select_st_fmp_bufs(requested: Option<usize>) -> usize {
-    requested.unwrap_or(2).clamp(2, ST_FMP_CAP)
+    // Three, not two. The two-block default rests on a footprint argument —
+    // it is the count that keeps a core's staging at the same 1 MiB the
+    // unsplit schedule already held. That argument bounds the count from
+    // above; it does not establish that the lower bound of the allowed range
+    // is where the optimum sits, and the neighbouring pipeline in this file
+    // says it is not: halving the deep split's queue from eight to four was
+    // level on the ranked instance, and halving it again to two cost 0.64%.
+    // Shallow hurt there, and the same producer/consumer shape is at work
+    // here. Three deepens this pipeline while leaving the staging at 1.5 MiB,
+    // still inside a core's private L2.
+    requested.unwrap_or(3).clamp(2, ST_FMP_CAP)
 }
 
 #[cfg(all(
@@ -4522,7 +4537,8 @@ mod tests {
     ))]
     #[test]
     fn st_fmp_bufs_default_override_and_clamp() {
-        assert_eq!(select_st_fmp_bufs(None), 2);
+        // The default is the tuned value; the clamp is what this pins.
+        assert_eq!(select_st_fmp_bufs(None), 3);
         assert_eq!(select_st_fmp_bufs(Some(0)), 2);
         assert_eq!(select_st_fmp_bufs(Some(1)), 2);
         assert_eq!(select_st_fmp_bufs(Some(2)), 2);
@@ -4635,7 +4651,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deep_split_depth_default_override_and_clamp() {
-        assert_eq!(select_deep_split_depth(None), 8);
+        assert_eq!(select_deep_split_depth(None), DeepQueue::DEFAULT_DEPTH);
         assert_eq!(select_deep_split_depth(Some(0)), 1);
         assert_eq!(select_deep_split_depth(Some(1)), 1);
         assert_eq!(select_deep_split_depth(Some(7)), 7);
