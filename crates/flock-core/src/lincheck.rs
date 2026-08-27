@@ -382,7 +382,7 @@ impl CscCircuit {
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).collect();
         }
-        let mut out = vec![F128::ZERO; self.n_cols];
+        let mut out = crate::alloc_uninit_f128_vec(self.n_cols);
         out.par_iter_mut()
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
@@ -773,6 +773,43 @@ fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
     crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
 }
 
+/// Byte selectors for the ranked gather/transpose `VPERMT2B` fusion.
+///
+/// A 512-bit `VPERMT2B` uses index bits 0..=5 for the byte offset and bit 6
+/// to choose its second 64-byte table; bit 7 is ignored. Rows 0..4 live in
+/// the first input ZMM and rows 4..8 in the second, with each F128 row laid
+/// out as eight low-limb bytes followed by eight high-limb bytes. The prior
+/// failed candidate used `128 + offset` for rows 4..8, which leaves bit 6
+/// clear and therefore selects the first table again. `64 + offset` is the
+/// required second-table encoding.
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )
+))]
+const fn gather_transpose_vpermt2b_indices(high: bool) -> [u8; 64] {
+    let mut indices = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        // The following GFNI affine transpose reads matrix byte `7 - row`,
+        // so feed the rows in reverse order to cancel that reversal.
+        let row = 7 - i % 8;
+        let byte_in_limb = i / 8;
+        let limb_offset = if high { 8 } else { 0 };
+        indices[i] = if row < 4 {
+            (16 * row + limb_offset + byte_in_limb) as u8
+        } else {
+            (64 + 16 * (row - 4) + limb_offset + byte_in_limb) as u8
+        };
+        i += 1;
+    }
+    indices
+}
+
 /// Direct partial fold from the canonical block-major F128 witness packing.
 /// This avoids materializing the equally-sized byte-stripe copy used by
 /// [`partial_fold_packed_z_fast`].
@@ -1002,6 +1039,36 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LINCHECK_GT_FUSE=1` restores the two-instruction
+/// gather/transpose composition (`VPERMT2Q` lo/hi split plus `VPERMB` byte
+/// transpose). The default uses one `VPERMT2B` per limb with the static
+/// selectors from [`gather_transpose_vpermt2b_indices`].
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )
+))]
+fn lincheck_gt_fuse_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lincheck_gt_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !lincheck_gt_fuse_disabled_value(std::env::var_os("FLOCK_NO_LINCHECK_GT_FUSE").as_deref())
+    });
+    *ON
+}
+
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
 /// per worker in the block-major sweep (exact A/B control).
 fn dynamic_tiles_enabled() -> bool {
@@ -1031,6 +1098,145 @@ fn fold_untimed_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none());
     *ON
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn gather_transpose_tile_scalar(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        let lanes: [F128; 8] =
+            std::array::from_fn(|r| z_packed[(outer_base + r) * chunks_per_block + q]);
+        transpose_8_f128s_to_128_bytes(&lanes, &mut transposed[t * 128..(t + 1) * 128]);
+    }
+}
+
+/// Gather and transpose one eight-stripe, four-column batch. `FUSE` makes
+/// the VPERMT2B/incumbent choice compile-time inside the small leaf while the
+/// caller keeps the runtime kill switch outside this eight-iteration loop.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gather_transpose_group4_x86<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    full_chunks: usize,
+    pf_far: bool,
+    pf_spread: bool,
+    pf_chunks: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        if pf_far && !pf_spread {
+            // These eight rows, pf_chunks chunks on: the lines this stripe
+            // demand-loads on a later grouped visit. Bounds keep every hint
+            // within a chunk the sweep will actually demand.
+            let qn = q + pf_chunks;
+            if qn <= full_chunks && qn < chunks_per_block {
+                unsafe {
+                    for r in 0..8 {
+                        core::arch::x86_64::_mm_prefetch(
+                            z_packed
+                                .as_ptr()
+                                .add((outer_base + r) * chunks_per_block + qn)
+                                .cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+        } else if pf_far {
+        } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            // One line per row covers all four columns.
+            unsafe {
+                for r in 0..8 {
+                    core::arch::x86_64::_mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        // SAFETY: rows (outer_base + r) * chunks_per_block + q + c for
+        // r in 0..8, c in 0..4 are the four full chunks selected by the
+        // caller; every column slab is 1024 writable bytes.
+        unsafe {
+            kernels::gather_transpose_stripe4_x86::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+                transposed.as_mut_ptr().add(t * 128),
+                1024,
+            );
+        }
+    }
+}
+
+/// Single-column counterpart of [`gather_transpose_group4_x86`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn gather_transpose_tile_x86<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        // Row-strided F128 loads defeat sequential hardware prefetch. Pull
+        // the next stripe into L1, without crossing a dynamically scheduled
+        // tile boundary.
+        if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            unsafe {
+                for r in 0..8 {
+                    core::arch::x86_64::_mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        // SAFETY: the caller's q is a live chunk, all eight row-strided
+        // F128 values are in bounds, and the destination stripe is 128 B.
+        unsafe {
+            kernels::gather_transpose_stripe_x86::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+                transposed.as_mut_ptr().add(t * 128),
+            );
+        }
+    }
 }
 
 /// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
@@ -1089,6 +1295,11 @@ fn fold_block_major_gfni(
             // scalar path stays as the kill-switch arm.
             #[cfg(target_feature = "avx512vbmi")]
             let gather_tr_fused = lc_gather_tr_enabled();
+            // Resolve the corrected VPERMT2B-vs-incumbent gate once per
+            // worker. The hot q loops branch once per eight-stripe batch;
+            // their const-generic leaf has no per-gather gate branch.
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather_tr_vpermt2b = lincheck_gt_fuse_enabled();
             // Grouped-gather prefetch distance, resolved once per worker
             // (never inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
@@ -1132,59 +1343,30 @@ fn fold_block_major_gfni(
                 if gather_tr_fused && lc_gather4_enabled() {
                     let full_chunks = useful_bits / 128;
                     while q + 4 <= full_chunks {
-                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                            let outer_base = 8 * (stripe_base + t);
-                            if pf_far && !pf_spread {
-                                // These eight rows, LC_ZFOLD_PF_CHUNKS chunks
-                                // on: the lines this stripe demand-loads two
-                                // grouped visits from now. Issued here, the
-                                // miss overlaps the current visit's GFNI fold.
-                                // `qn <= full_chunks` keeps the prefetch on
-                                // a line the sweep really demands; `qn <
-                                // chunks_per_block` keeps the address inside
-                                // the block for any (useful_bits, k) shape.
-                                let qn = q + pf_chunks;
-                                if qn <= full_chunks && qn < chunks_per_block {
-                                    unsafe {
-                                        for r in 0..8 {
-                                            core::arch::x86_64::_mm_prefetch(
-                                                z_packed
-                                                    .as_ptr()
-                                                    .add((outer_base + r) * chunks_per_block + qn)
-                                                    .cast::<i8>(),
-                                                core::arch::x86_64::_MM_HINT_T0,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else if pf_far {
-                            } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
-                                let next_base = 8 * (stripe_base + t + 1);
-                                // One line per row covers all four columns.
-                                unsafe {
-                                    for r in 0..8 {
-                                        core::arch::x86_64::_mm_prefetch(
-                                            z_packed
-                                                .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
-                                                .cast::<i8>(),
-                                            core::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                }
-                            }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q + c for c in 0..4 are the indices four
-                            // single gathers would read; each column slab is
-                            // 1024 writable bytes of `transposed`.
-                            unsafe {
-                                kernels::gather_transpose_stripe4_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
-                                    chunks_per_block,
-                                    transposed.as_mut_ptr().add(t * 128),
-                                    1024,
-                                );
-                            }
+                        if gather_tr_vpermt2b {
+                            gather_transpose_group4_x86::<true>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                full_chunks,
+                                pf_far,
+                                pf_spread,
+                                pf_chunks,
+                                &mut transposed,
+                            );
+                        } else {
+                            gather_transpose_group4_x86::<false>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                full_chunks,
+                                pf_far,
+                                pf_spread,
+                                pf_chunks,
+                                &mut transposed,
+                            );
                         }
                         for c in 0..4 {
                             // Spread delivery: the same eight-hints-per-stripe
@@ -1204,7 +1386,10 @@ fn fold_block_major_gfni(
                                                 core::arch::x86_64::_mm_prefetch(
                                                     z_packed
                                                         .as_ptr()
-                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .add(
+                                                            (outer_base + r) * chunks_per_block
+                                                                + qn,
+                                                        )
                                                         .cast::<i8>(),
                                                     core::arch::x86_64::_MM_HINT_T0,
                                                 );
@@ -1232,50 +1417,42 @@ fn fold_block_major_gfni(
                 while q < useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
-                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                        let outer_base = 8 * (stripe_base + t);
-                        #[cfg(target_feature = "avx512vbmi")]
-                        if gather_tr_fused {
-                            // The next stripe is eight row-strided F128 loads,
-                            // a pattern the sequential hardware prefetchers do
-                            // not discover. Pull it into L1 while VBMI/GFNI
-                            // consumes this stripe. Do not cross a tile: with
-                            // dynamic scheduling its successor may belong to a
-                            // different worker.
-                            if t + 1 < DIRECT_FOLD_TILE_STRIPES {
-                                let next_base = 8 * (stripe_base + t + 1);
-                                unsafe {
-                                    for r in 0..8 {
-                                        core::arch::x86_64::_mm_prefetch(
-                                            z_packed
-                                                .as_ptr()
-                                                .add((next_base + r) * chunks_per_block + q)
-                                                .cast::<i8>(),
-                                            core::arch::x86_64::_MM_HINT_T0,
-                                        );
-                                    }
-                                }
-                            }
-                            // SAFETY: rows (outer_base + r) * chunks_per_block
-                            // + q are the exact indices the scalar gather
-                            // reads; output is 128 bytes of `transposed`.
-                            unsafe {
-                                kernels::gather_transpose_stripe_x86(
-                                    z_packed.as_ptr().add(outer_base * chunks_per_block + q),
-                                    chunks_per_block,
-                                    transposed.as_mut_ptr().add(t * 128),
-                                );
-                            }
-                            continue;
+                    #[cfg(target_feature = "avx512vbmi")]
+                    if gather_tr_fused {
+                        if gather_tr_vpermt2b {
+                            gather_transpose_tile_x86::<true>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                &mut transposed,
+                            );
+                        } else {
+                            gather_transpose_tile_x86::<false>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                &mut transposed,
+                            );
                         }
-                        let lanes: [F128; 8] = std::array::from_fn(|r| {
-                            z_packed[(outer_base + r) * chunks_per_block + q]
-                        });
-                        transpose_8_f128s_to_128_bytes(
-                            &lanes,
-                            &mut transposed[t * 128..(t + 1) * 128],
+                    } else {
+                        gather_transpose_tile_scalar(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            &mut transposed,
                         );
                     }
+                    #[cfg(not(target_feature = "avx512vbmi"))]
+                    gather_transpose_tile_scalar(
+                        z_packed,
+                        chunks_per_block,
+                        stripe_base,
+                        q,
+                        &mut transposed,
+                    );
                     // SAFETY: `transposed` holds 8 stripes x 128 bytes at
                     // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
                     // the worker planes cover (2q + chunk blocks) * 1024
@@ -1300,7 +1477,7 @@ fn fold_block_major_gfni(
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
     // read+write pass — the class this arm deletes).
-    let mut out = vec![F128::ZERO; k];
+    let mut out = crate::alloc_uninit_f128_vec(k);
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         let base = blk * 1024;
         let mut acc = [0u8; 1024];
@@ -2064,9 +2241,8 @@ fn sumcheck_x4_enabled() -> bool {
 /// `FLOCK_NO_LC_SUMCHECK_PAR_FIX=1` restores the incumbent `half2`
 /// comparison for exact same-binary A/B. Read once per process; default ON.
 fn sumcheck_par_fix_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none());
     *ON
 }
 
@@ -2154,7 +2330,11 @@ fn sumcheck_bind_both_and_eval_next(
     // this fusion replaced; the incumbent compared `half2` (see
     // [`sumcheck_par_fix_enabled`]). Same field elements either way — the
     // choice only picks serial vs chunked execution.
-    let par_gate = if sumcheck_par_fix_enabled() { half } else { half2 };
+    let par_gate = if sumcheck_par_fix_enabled() {
+        half
+    } else {
+        half2
+    };
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
@@ -2970,7 +3150,10 @@ mod tests {
             bad_comb[len / 3] += F128::ONE;
             let mut bad_z = z.clone();
             let bad_msg = sumcheck_bind_both_and_eval_next(&mut bad_comb, &mut bad_z, r);
-            assert_ne!(bad_msg, want_msg, "corrupted table went undetected len={len}");
+            assert_ne!(
+                bad_msg, want_msg,
+                "corrupted table went undetected len={len}"
+            );
         }
     }
 
@@ -3383,6 +3566,118 @@ mod tests {
         }
     }
 
+    /// Scalar oracle for the exact `VPERMT2B` selector semantics used by the
+    /// fused gather/transpose. This test runs without AVX-512: it independently
+    /// models bits 0..=5 as the byte offset, bit 6 as the table selector, and
+    /// bit 7 as ignored. It covers both limbs, random tables, selector
+    /// boundaries, poisoned source tables, and four independent columns with
+    /// poisoned output-stride gaps.
+    #[test]
+    fn gather_transpose_vpermt2b_selector_oracle() {
+        fn permute2(a: &[u8; 64], indices: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                let index = indices[i];
+                let table = if index & 0x40 == 0 { a } else { b };
+                table[(index & 0x3f) as usize]
+            })
+        }
+
+        fn direct(a: &[u8; 64], b: &[u8; 64], high: bool) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                let row = 7 - i % 8;
+                let offset = 16 * (row % 4) + usize::from(high) * 8 + i / 8;
+                if row < 4 { a[offset] } else { b[offset] }
+            })
+        }
+
+        let lo = gather_transpose_vpermt2b_indices(false);
+        let hi = gather_transpose_vpermt2b_indices(true);
+        assert_eq!(lo[3], 64, "first byte selected from the second table");
+        assert_eq!(hi[56], 127, "largest legal 512-bit VPERMT2B index");
+        for (high, indices) in [(false, &lo), (true, &hi)] {
+            assert!(indices.iter().all(|&index| index & 0x80 == 0));
+            assert_eq!(
+                indices.iter().filter(|&&index| index & 0x40 != 0).count(),
+                32
+            );
+            for (i, &index) in indices.iter().enumerate() {
+                let row = 7 - i % 8;
+                let want_table = if row < 4 { 0 } else { 0x40 };
+                let want_offset = 16 * (row % 4) + usize::from(high) * 8 + i / 8;
+                assert_eq!(index & 0x40, want_table, "half={high} i={i} row={row}");
+                assert_eq!(
+                    index & 0x3f,
+                    want_offset as u8,
+                    "half={high} i={i} row={row}"
+                );
+            }
+        }
+
+        // Source poison catches the exact #1445 failure: 128+offset leaves
+        // selector bit 6 clear and incorrectly reads `a` for rows 4..8.
+        let a_poison = [0xA5; 64];
+        let b_poison = [0x5A; 64];
+        for (high, indices) in [(false, &lo), (true, &hi)] {
+            let want = direct(&a_poison, &b_poison, high);
+            assert_eq!(permute2(&a_poison, indices, &b_poison), want);
+            let mut broken = *indices;
+            for (i, index) in broken.iter_mut().enumerate() {
+                if 7 - i % 8 >= 4 {
+                    *index += 64; // the rejected candidate's 128+offset form
+                }
+            }
+            assert_ne!(permute2(&a_poison, &broken, &b_poison), want);
+        }
+
+        let mut rng = Rng::new(0x5650_4552_4D54_3242);
+        for _ in 0..64 {
+            let a: [u8; 64] = std::array::from_fn(|_| rng.next_u64() as u8);
+            let b: [u8; 64] = std::array::from_fn(|_| rng.next_u64() as u8);
+            assert_eq!(permute2(&a, &lo, &b), direct(&a, &b, false));
+            assert_eq!(permute2(&a, &hi, &b), direct(&a, &b, true));
+        }
+
+        // Four-column form: the SIMD tr4 network produces four independent
+        // (z0,z1) table pairs consumed by the same selectors. Model all four
+        // and prove that each 128-byte result stays inside its output slab.
+        const OUT_STRIDE: usize = 160;
+        const POISON: u8 = 0xD3;
+        let a4: [[u8; 64]; 4] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u8));
+        let b4: [[u8; 64]; 4] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u8));
+        let mut got = [POISON; 4 * OUT_STRIDE];
+        let mut want = [POISON; 4 * OUT_STRIDE];
+        for column in 0..4 {
+            let base = column * OUT_STRIDE;
+            got[base..base + 64].copy_from_slice(&permute2(&a4[column], &lo, &b4[column]));
+            got[base + 64..base + 128].copy_from_slice(&permute2(&a4[column], &hi, &b4[column]));
+            want[base..base + 64].copy_from_slice(&direct(&a4[column], &b4[column], false));
+            want[base + 64..base + 128].copy_from_slice(&direct(&a4[column], &b4[column], true));
+        }
+        assert_eq!(got, want);
+        for column in 0..4 {
+            let gap = &got[column * OUT_STRIDE + 128..(column + 1) * OUT_STRIDE];
+            assert!(gap.iter().all(|&byte| byte == POISON));
+        }
+    }
+
+    #[test]
+    fn lincheck_gt_fuse_kill_switch_parser() {
+        use std::ffi::OsStr;
+
+        assert!(lincheck_gt_fuse_disabled_value(Some(OsStr::new("1"))));
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("01")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(!lincheck_gt_fuse_disabled_value(value));
+        }
+    }
+
     /// The fused register gather+transpose must equal the scalar
     /// gather + `transpose_8_f128s_to_128_bytes` byte-for-byte, at several
     /// strides.
@@ -3400,46 +3695,70 @@ mod tests {
             let mut want = [0u8; 128];
             let lanes: [F128; 8] = std::array::from_fn(|r| z[r * stride]);
             transpose_8_f128s_to_128_bytes(&lanes, &mut want);
-            let mut got = [0xA5u8; 128];
-            // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
-            unsafe {
-                kernels::gather_transpose_stripe_x86(z.as_ptr(), stride, got.as_mut_ptr());
+            for fuse in [false, true] {
+                let mut got = [0xA5u8; 128];
+                // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
+                unsafe {
+                    if fuse {
+                        kernels::gather_transpose_stripe_x86::<true>(
+                            z.as_ptr(),
+                            stride,
+                            got.as_mut_ptr(),
+                        );
+                    } else {
+                        kernels::gather_transpose_stripe_x86::<false>(
+                            z.as_ptr(),
+                            stride,
+                            got.as_mut_ptr(),
+                        );
+                    }
+                }
+                assert_eq!(want, got, "stride {stride} fuse={fuse}");
             }
-            assert_eq!(want, got, "stride {stride}");
         }
-        // Four-column twin: identical bytes to four single calls at q..q+4,
-        // each landing in its own out-stride slab.
+        // Four-column twin: each arm must equal four independent scalar
+        // transposes at q..q+4, with every output-stride gap untouched.
         for stride in [4usize, 17, 128] {
             let z: Vec<F128> = (0..8 * stride + 4).map(|_| rng.f128()).collect();
             for q in [0usize, stride.saturating_sub(4).min(3)] {
                 let mut want = [0u8; 4 * 1024];
                 for c in 0..4 {
-                    // SAFETY: rows r*stride + q + c are in bounds by the
-                    // vector's +4 slack; each destination is 128 bytes.
+                    let lanes: [F128; 8] = std::array::from_fn(|r| z[r * stride + q + c]);
+                    transpose_8_f128s_to_128_bytes(&lanes, &mut want[c * 1024..c * 1024 + 128]);
+                }
+                for fuse in [false, true] {
+                    let mut got = [0x5Au8; 4 * 1024];
+                    // SAFETY: rows r*stride + q + c are in bounds; each
+                    // output-stride slab covers 128 writable bytes.
                     unsafe {
-                        kernels::gather_transpose_stripe_x86(
-                            z.as_ptr().add(q + c),
-                            stride,
-                            want.as_mut_ptr().add(c * 1024),
+                        if fuse {
+                            kernels::gather_transpose_stripe4_x86::<true>(
+                                z.as_ptr().add(q),
+                                stride,
+                                got.as_mut_ptr(),
+                                1024,
+                            );
+                        } else {
+                            kernels::gather_transpose_stripe4_x86::<false>(
+                                z.as_ptr().add(q),
+                                stride,
+                                got.as_mut_ptr(),
+                                1024,
+                            );
+                        }
+                    }
+                    for c in 0..4 {
+                        assert_eq!(
+                            want[c * 1024..c * 1024 + 128],
+                            got[c * 1024..c * 1024 + 128],
+                            "stride {stride} q {q} col {c} fuse={fuse}"
+                        );
+                        assert!(
+                            got[c * 1024 + 128..(c + 1) * 1024]
+                                .iter()
+                                .all(|&byte| byte == 0x5A)
                         );
                     }
-                }
-                let mut got = [0x5Au8; 4 * 1024];
-                // SAFETY: as above; out_stride 1024 covers four 128-byte slabs.
-                unsafe {
-                    kernels::gather_transpose_stripe4_x86(
-                        z.as_ptr().add(q),
-                        stride,
-                        got.as_mut_ptr(),
-                        1024,
-                    );
-                }
-                for c in 0..4 {
-                    assert_eq!(
-                        want[c * 1024..c * 1024 + 128],
-                        got[c * 1024..c * 1024 + 128],
-                        "stride {stride} q {q} col {c}"
-                    );
                 }
             }
         }
@@ -4088,7 +4407,9 @@ mod tests {
             x_outer: x_ab.x_outer.clone(),
         };
         assert!(matches!(
-            verify(m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch),
+            verify(
+                m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch
+            ),
             Err(VerifyError::BadInnerRestLength { .. })
         ));
 
