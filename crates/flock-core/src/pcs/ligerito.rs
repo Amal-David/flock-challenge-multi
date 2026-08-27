@@ -4131,12 +4131,31 @@ fn open_ood_x4_enabled() -> bool {
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
+    // `_mm_loadu_si128` / `_mm512_loadu_si512` accept any src alignment.
     unsafe {
-        let s = src as *const __m128i;
-        let d = dst as *mut __m128i;
-        for i in 0..n {
-            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+        let mut s = src;
+        let mut d = dst;
+        let mut rem = n;
+
+        #[cfg(target_feature = "avx512f")]
+        {
+            // Peel until d is 64-byte aligned
+            while rem > 0 && ((d as usize) & 63) != 0 {
+                _mm_stream_si128(d as *mut __m128i, _mm_loadu_si128(s as *const __m128i));
+                s = s.add(1);
+                d = d.add(1);
+                rem -= 1;
+            }
+            // Stream 64 bytes (4 F128 elements) per instruction
+            while rem >= 4 {
+                _mm512_stream_si512(d as *mut __m512i, _mm512_loadu_si512(s as *const __m512i));
+                s = s.add(4);
+                d = d.add(4);
+                rem -= 4;
+            }
+        }
+        for i in 0..rem {
+            _mm_stream_si128(d.add(i) as *mut __m128i, _mm_loadu_si128(s.add(i) as *const __m128i));
         }
     }
 }
@@ -4146,7 +4165,7 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
 /// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
 /// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
+/// (no destination reload); the destination is published with AVX-512 streaming
 /// stores so each output line skips write-allocate RFO. Next reader is the
 /// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
 /// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
@@ -4190,7 +4209,6 @@ unsafe fn fold_and_msg_chunk_nt_x86(
         unsafe {
             publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
             publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
-            core::arch::x86_64::_mm_sfence();
         }
     } else {
         fc.copy_from_slice(&stage_f[..len]);
@@ -4445,6 +4463,16 @@ fn fold_and_msg_lsb_inner(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if use_nt {
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
