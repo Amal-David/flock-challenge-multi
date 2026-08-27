@@ -27,11 +27,14 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    UniSkipFoldTable, eval_round3_lookahead, eval_round4_lookahead, eval_round5_poly,
+    fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into, fold2_plain_and_round_pair_lookahead_into,
-    fold2_plain_and_round4_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
-    round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
+    fold2_plain_and_round4_into, fold4_from_packed_and_round_pair_lookahead_into,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
+    uni_skip_round_pair_g4_nomat_packed_padded,
     uni_skip_round_pair_lookahead_nomat_packed_padded,
 };
 use univariate_skip_optimized::{
@@ -115,6 +118,13 @@ fn nomat_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
+}
+
+/// Restore the incumbent no-materialize sweep plus first packed composed pass.
+/// The four-rho bake is restricted further by its ranked cascade gate.
+#[inline]
+fn nomat_g4_off() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_NOMAT_G4").is_some()
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
@@ -692,10 +702,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     // round-five lookahead too, so it needs `r[k_skip+3] ≠ 0` (β₀ at the
     // ranked shape). Kill switch: FLOCK_NO_ZC_SWEEP_NOMAT.
     let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
+    let use_cascade2 =
+        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    // Ranked-only four-rho bake. Its G7 lookahead uses the next parity split;
+    // a zero weight or any other geometry stays on the incumbent nomat route.
+    let use_nomat_g4 = use_nomat
+        && use_cascade2
+        && m == 32
+        && k_skip == 6
+        && r[k_skip + 5] != F128::ZERO
+        && !nomat_g4_off();
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead, g4_data) = if use_nomat_g4 {
+        let (m1, mi, la3, la4, p5) = uni_skip_round_pair_g4_nomat_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (Vec::new(), Vec::new(), m1, mi, Some(la3), Some((la4, p5)))
+    } else if use_nomat {
         let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded(
             a_packed,
             b_packed,
@@ -705,18 +736,19 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
         );
-        (Vec::new(), Vec::new(), m1, mi, Some(la))
+        (Vec::new(), Vec::new(), m1, mi, Some(la), None)
     } else if use_lookahead {
-        let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-        );
-        (a, b, m1, mi, Some(la))
+        let (a, b, m1, mi, la) =
+            uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+            );
+        (a, b, m1, mi, Some(la), None)
     } else {
         let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
             a_packed,
@@ -727,7 +759,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
         );
-        (a, b, m1, mi, None)
+        (a, b, m1, mi, None, None)
     };
     crate::gaptime::mark("zc: round2 fused fold done");
 
@@ -763,11 +795,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // quarter-size table, so the scratch pair is taken at N/4 (the pool's
     // best-fit hands back the same 2^(m-7)-class buffer either way).
     //
-    // No-materialize: `a_mlv`/`b_mlv` are empty; the composed pass writes its
-    // N/4 outputs into freshly taken buffers and the scratch pair is sized for
-    // the fold after it (N/8).
+    // No-materialize: `a_mlv`/`b_mlv` are empty. The incumbent composed pass
+    // writes N/4 and needs N/8 scratch; the ranked four-rho bake writes N/16
+    // directly and needs N/32 for the first resumed fold.
     let n_in = 1usize << n_mlv;
-    let first_out = if use_nomat {
+    let first_out = if use_nomat_g4 {
+        n_in / 32
+    } else if use_nomat {
         n_in / 8
     } else if lookahead.is_some() {
         n_in / 4
@@ -802,8 +836,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     // continues from there. `n_mlv ≥ 7` (level 2) / `≥ 8` (level 3) keep
     // every composed input ≥ 16 and every eq split at lo_size ≥ 2.
     // Kill switches: FLOCK_NO_ZC_CASCADE2 / FLOCK_NO_ZC_CASCADE3.
-    let use_cascade2 =
-        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
     let use_cascade3 =
         use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
     // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain. Their
@@ -843,7 +875,64 @@ fn prove_packed_padded_inner<C: Challenger>(
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2·levels needs no other change.
     let mut la = lookahead;
-    for level in 0..n_levels {
+    let cascade_start = if let Some((la4, p5)) = g4_data {
+        // G3, G4 and G5 were all baked into the one round-two packed read.
+        // Evaluate and absorb them one at a time so the Fiat–Shamir sampling
+        // order remains exactly G2,ρ1,G3,ρ2,G4,ρ3,G5,ρ4.
+        let la3 = la.take().expect("four-rho bake without G3");
+        let (g3_1, g3_inf) = eval_round3_lookahead(&la3, mlv_rhos[0]);
+        multilinear_msgs.push((g3_1, g3_inf));
+        challenger.observe_f128(g3_1);
+        challenger.observe_f128(g3_inf);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let (g4_1, g4_inf) = eval_round4_lookahead(&la4, mlv_rhos[0], mlv_rhos[1]);
+        multilinear_msgs.push((g4_1, g4_inf));
+        challenger.observe_f128(g4_1);
+        challenger.observe_f128(g4_inf);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let (g5_1, g5_inf) =
+            eval_round5_poly(&p5, mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]);
+        multilinear_msgs.push((g5_1, g5_inf));
+        challenger.observe_f128(g5_1);
+        challenger.observe_f128(g5_inf);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let mut r_next6 = vec![F128::ONE; n_mlv - 4];
+        r_next6[1..].copy_from_slice(&r[k_skip + 5..]);
+        let mut a16 = crate::scratch::take_f128(n_in / 16);
+        let mut b16 = crate::scratch::take_f128(n_in / 16);
+        let t_round = std::time::Instant::now();
+        let (g6_1, g6_inf, la7) = fold4_from_packed_and_round_pair_lookahead_into(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            padding,
+            &mut a16,
+            &mut b16,
+            [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2], mlv_rhos[3]],
+            &r_next6,
+        );
+        a_mlv = a16;
+        b_mlv = b16;
+        if zc_timing {
+            tail_round_ms.push((n_mlv, t_round.elapsed().as_secs_f64() * 1e3));
+        }
+        multilinear_msgs.push((g6_1, g6_inf));
+        challenger.observe_f128(g6_1);
+        challenger.observe_f128(g6_inf);
+        mlv_rhos.push(challenger.sample_f128());
+        if n_levels > 2 {
+            la = Some(la7);
+        }
+        2
+    } else {
+        0
+    };
+    for level in cascade_start..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level]);
