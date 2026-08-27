@@ -3562,7 +3562,25 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // indexed collect preserves claim order on both routes, which is the same
     // equivalence the existing sequential kill-switch route already relies on
     // and that `direct_fold8_factor_tail_par_matches_seq` pins.
-    const TAIL_PAR_MIN_CLAIMS: usize = 4;
+    // Two, which is the ranked claim count. Below the threshold each claim
+    // runs on the calling thread in turn and owns the whole pool for its own
+    // inner work, so the production pair is processed strictly one after the
+    // other; at two, they are processed together with the pool divided
+    // between them.
+    //
+    // Which is faster is a property of how well this prove scales with
+    // threads, and that has been measured directly on the ranked instance:
+    // halving the pool from one worker per logical CPU to one per physical
+    // core costs **13.6%**, not the 50% a compute-bound prove would lose. The
+    // units are idle waiting on memory, so a claim given half the pool keeps
+    // roughly seven eighths of its throughput. Two claims run sequentially at
+    // full width therefore cost about twice one claim; run together at half
+    // width they cost about one and one seventh of it.
+    //
+    // The four-claim threshold assumes the opposite -- that with few claims,
+    // full-width sequential wins -- which is the right assumption on a machine
+    // whose parallel efficiency falls off sharply and the wrong one here.
+    const TAIL_PAR_MIN_CLAIMS: usize = 2;
     let n_claims = work.len();
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = if tail_par
         && n_claims >= TAIL_PAR_MIN_CLAIMS

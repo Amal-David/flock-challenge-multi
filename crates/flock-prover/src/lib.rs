@@ -27,7 +27,7 @@ pub mod seed_pipe;
 /// pages for large allocs the typed scratch pools do not already cover.
 #[global_allocator]
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
-// resample gtr r1 20260819-1220
+// claude-x86 r9 draw2 ring-switch tail parallel at two claims
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
