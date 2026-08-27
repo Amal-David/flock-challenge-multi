@@ -19,8 +19,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -241,6 +241,7 @@ pub(crate) fn wide_hash_pool() -> &'static rayon::ThreadPool {
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
+#[allow(clippy::collapsible_if)] // Keep the GPU fallback gate visibly nested.
 fn finalize_commit(
     mut codeword: Vec<F128>,
     z_packed: &[F128],
@@ -315,12 +316,8 @@ fn finalize_commit(
     // upper-level build runs — those levels are simply rewritten, so a partial
     // local fold is never wrong, only wasted.
     let subtree_parents = subtree_parents_enabled();
-    let regroup_subtree_parents = subtree_parent_regroup_enabled(
-        n_leaves,
-        num_ntts,
-        leaf_size,
-        kind,
-    );
+    let regroup_subtree_parents =
+        subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
@@ -335,7 +332,7 @@ fn finalize_commit(
             let bytes: &[u8] = unsafe {
                 core::slice::from_raw_parts(
                     sub_data.as_ptr() as *const u8,
-                    sub_data.len() * core::mem::size_of::<F128>(),
+                    core::mem::size_of_val(sub_data),
                 )
             };
             // SAFETY: each deep-pass sub-group maps to a disjoint leaf-index
@@ -365,8 +362,8 @@ fn finalize_commit(
             let len = parent_range.len();
             let depth = if len.is_power_of_two()
                 && len >= 2
-                && parent_range.start % len == 0
-                && n_leaves % len == 0
+                && parent_range.start.is_multiple_of(len)
+                && n_leaves.is_multiple_of(len)
             {
                 len.trailing_zeros() as usize
             } else {
@@ -518,8 +515,7 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
         // delete.
         let mut best: Option<usize> = None;
         for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= total_nodes
-                && best.is_none_or(|b| v.capacity() < pool[b].capacity())
+            if v.capacity() >= total_nodes && best.is_none_or(|b| v.capacity() < pool[b].capacity())
             {
                 best = Some(i);
             }
@@ -654,9 +650,8 @@ fn cpu_join_hash_leaves(
 /// (exact A/B control: the full upper-level build then runs as before).
 /// Resolved once per process.
 pub(crate) fn subtree_parents_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none());
     *ON
 }
 
@@ -688,9 +683,8 @@ fn subtree_parent_regroup_enabled(
     leaf_size: usize,
     kind: HashKind,
 ) -> bool {
-    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some()
-    });
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some());
     subtree_parent_regroup_selected(n_leaves, num_ntts, leaf_size, kind, *DISABLED)
 }
 
@@ -759,7 +753,7 @@ pub(crate) fn fused_encode_leaves_subtree(
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(
                 sub_data.as_ptr() as *const u8,
-                sub_data.len() * core::mem::size_of::<F128>(),
+                core::mem::size_of_val(sub_data),
             )
         };
         // SAFETY: each finalized sub-group maps to a disjoint leaf-index
@@ -775,8 +769,8 @@ pub(crate) fn fused_encode_leaves_subtree(
         let len = range.len();
         let depth = if len.is_power_of_two()
             && len >= 2
-            && range.start % len == 0
-            && n_leaves % len == 0
+            && range.start.is_multiple_of(len)
+            && n_leaves.is_multiple_of(len)
         {
             len.trailing_zeros() as usize
         } else {
@@ -854,6 +848,7 @@ pub(crate) fn build_upper_levels(
 /// yet, caller falls through to the pure-CPU path). Any failure AFTER the
 /// session starts is repaired here on the CPU (the codeword is always fully
 /// encoded by the CPU regardless of GPU health) and still returns `Some`.
+#[allow(clippy::ptr_arg)] // The owned Vec is pooled/truncated by this path.
 fn gpu_streamed_commit(
     ntt: &AdditiveNttF128,
     codeword: &mut Vec<F128>,
@@ -889,7 +884,7 @@ fn gpu_streamed_commit(
         gpu::merkle::begin(
             core::slice::from_raw_parts(cw_ptr, cw_len),
             leaf_size,
-            tree.as_mut_ptr() as *mut [u8; 32],
+            tree.as_mut_ptr(),
             tree.len(),
             stop_nodes,
         )
@@ -1104,7 +1099,7 @@ pub fn gpu_merkle_warmup_calibrate() {
             gpu::merkle::begin(
                 bytes,
                 leaf_size,
-                tree.as_mut_ptr() as *mut [u8; 32],
+                tree.as_mut_ptr(),
                 tree.len(),
                 2 * n_leaves, // leaves only — no parent levels in the probe
             )
@@ -1232,41 +1227,11 @@ mod tests {
             false,
         ));
         for selected in [
-            subtree_parent_regroup_selected(
-                (1 << 20) - 1,
-                64,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                32,
-                1024,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                512,
-                HashKind::Blake3,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Sha256,
-                false,
-            ),
-            subtree_parent_regroup_selected(
-                1 << 20,
-                64,
-                1024,
-                HashKind::Blake3,
-                true,
-            ),
+            subtree_parent_regroup_selected((1 << 20) - 1, 64, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 32, 1024, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 512, HashKind::Blake3, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Sha256, false),
+            subtree_parent_regroup_selected(1 << 20, 64, 1024, HashKind::Blake3, true),
         ] {
             assert!(!selected);
         }
@@ -1281,10 +1246,7 @@ mod tests {
             Some(0..RANKED_PARENT_SUBGROUP_LEAVES),
         );
         let unexpected = 0..256;
-        assert_eq!(
-            local_parent_fold_range(&unexpected, true),
-            Some(unexpected),
-        );
+        assert_eq!(local_parent_fold_range(&unexpected, true), Some(unexpected),);
 
         const N_LEAVES: usize = 2 * RANKED_PARENT_SUBGROUP_LEAVES;
         const LEAF_SIZE: usize = 1024;
@@ -1343,10 +1305,8 @@ mod tests {
             }
             calls
         };
-        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES)
-            + platform_calls(8_192);
-        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES)
-            + platform_calls(512);
+        let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES) + platform_calls(8_192);
+        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES) + platform_calls(512);
         assert_eq!(
             (old_calls, new_calls, old_calls - new_calls),
             (90_627, 67_107, 23_520),
@@ -1414,10 +1374,20 @@ mod tests {
                 let mut cw_b = vec![F128::new(u64::MAX, u64::MAX); n_leaves * num_ntts];
                 let mut tree_b: Vec<Hash> = vec![[0xAAu8; 32]; 2 * n_leaves - 1];
                 let folded = fused_encode_leaves_subtree(
-                    &ntt, &msg, &mut cw_b, num_ntts, &mut tree_b, n_leaves, leaf, kind,
+                    &ntt,
+                    &msg,
+                    &mut cw_b,
+                    num_ntts,
+                    &mut tree_b,
+                    n_leaves,
+                    leaf,
+                    kind,
                 );
                 build_upper_levels(&mut tree_b, n_leaves, n_leaves >> folded, kind);
-                assert_eq!(cw_a, cw_b, "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}");
+                assert_eq!(
+                    cw_a, cw_b,
+                    "codeword log_d={log_d} n={num_ntts} rate={log_inv_rate}"
+                );
                 assert_eq!(
                     tree_a, tree_b,
                     "tree log_d={log_d} n={num_ntts} rate={log_inv_rate} kind={kind:?} folded={folded}"
@@ -1425,7 +1395,6 @@ mod tests {
             }
         }
     }
-
 
     use super::*;
 

@@ -1444,8 +1444,10 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     // skip its projection here and mark the prefix invalid; round 1
     // recomputes it on CPU only if the GPU share fails to materialize.
     // `FLOCK_NO_AB_INNER_SKIP=1` kills the skip.
-    let skip_bytes = flock_core::zerocheck::univariate_skip_optimized::
-        planned_round1_gpu_prefix_bytes(K_LOG + n_blocks_log);
+    let skip_bytes =
+        flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        );
     assert_eq!(skip_bytes % BYTES_PER_BLOCK, 0);
     let skip_blocks = skip_bytes / BYTES_PER_BLOCK;
     let n_f128 = n_total * F128_PER_BLOCK;
@@ -1456,12 +1458,18 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
     // the incumbent full writes. Tagged takes go FIRST so z's untagged take
     // cannot consume a provenance-carrying buffer of the same size class.
-    let (mut a, a_tok) =
-        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128));
-    let (mut b, b_tok) =
-        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128));
-    let (mut z, z_tok) =
-        flock_core::scratch::take_f128_tagged(n_f128, witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128));
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
     let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
         n_total * BYTES_PER_BLOCK,
     );
@@ -1729,12 +1737,14 @@ fn generate_round1_inner_octa(
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
-    let abinner_nt =
-        flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
-        prepare_round1_ab_window_plan(inv_table, ab_inner_bytes, abinner_nt);
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner_bytes,
+        abinner_nt,
+    );
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -1952,9 +1962,9 @@ pub(crate) mod witgen_simd {
 
     #[cfg(target_arch = "aarch64")]
     use core::arch::aarch64::*;
+    use flock_core::bits::transpose_8_u64s_to_64_bytes;
     #[cfg(target_arch = "x86_64")]
     use lanes_x86::*;
-    use flock_core::bits::transpose_8_u64s_to_64_bytes;
 
     /// x86 lane-op compatibility layer: this module's NEON vocabulary mapped
     /// onto SSE2 intrinsics with identical per-lane semantics, so the 4-wide
@@ -2018,15 +2028,11 @@ pub(crate) mod witgen_simd {
         }
         #[inline(always)]
         pub(super) fn vtrn1q_u32(a: V4, b: V4) -> V4 {
-            unsafe {
-                _mm_unpacklo_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
-            }
+            unsafe { _mm_unpacklo_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b)) }
         }
         #[inline(always)]
         pub(super) fn vtrn2q_u32(a: V4, b: V4) -> V4 {
-            unsafe {
-                _mm_unpackhi_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b))
-            }
+            unsafe { _mm_unpackhi_epi64(_mm_unpacklo_epi32(a, b), _mm_unpackhi_epi32(a, b)) }
         }
         #[inline(always)]
         pub(super) fn vtrn1q_u64(a: V4, b: V4) -> V4 {
@@ -2068,7 +2074,6 @@ pub(crate) mod witgen_simd {
     }
     use std::sync::LazyLock;
 
-
     const U32_PER_BLOCK: usize = K / 32; // 512
     /// [`dump`] drains a block in 64 chunks of 8 u32 words (32 bytes).
     const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8; // 64
@@ -2107,12 +2112,21 @@ pub(crate) mod witgen_simd {
     const ELIDE_B_TAIL_CHUNK: usize = 59;
     /// Leading skippable chunks of b's MAX prefix: words 0..32.
     const ELIDE_B_PREFIX_CHUNKS: usize = 4;
+    // Retained as byte-granular geometry oracles for rollback and differential
+    // probes even though the ranked producer now works in whole dump chunks.
+    #[allow(dead_code)]
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
+    #[allow(dead_code)]
     const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
+    #[allow(dead_code)]
     const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
+    #[allow(dead_code)]
     const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
+    #[allow(dead_code)]
     const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
+    #[allow(dead_code)]
     const B_ZERO_START_BYTE: usize = USEFUL_BITS.div_ceil(8); // 1927
+    #[allow(dead_code)]
     const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
     const _ELIDE_GEOMETRY: () = {
         // Skipped zero-tail words start at or after the zero fill's first
@@ -2225,12 +2239,16 @@ pub(crate) mod witgen_simd {
         *NT
     }
 
+    // Retained as the scalar/NEON rollback selector oracle.
+    #[allow(dead_code)]
     fn z_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
         *ON
     }
 
+    // Retained for exact selector differential tests.
+    #[allow(dead_code)]
     #[inline(always)]
     pub(super) const fn select_z_nt(
         nt_enabled: bool,
@@ -2252,30 +2270,28 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        unsafe {
-            let t0 = vtrn1q_u32(w0, w1);
-            let t1 = vtrn2q_u32(w0, w1);
-            let t2 = vtrn1q_u32(w2, w3);
-            let t3 = vtrn2q_u32(w2, w3);
-            (
-                vreinterpretq_u32_u64(vtrn1q_u64(
-                    vreinterpretq_u64_u32(t0),
-                    vreinterpretq_u64_u32(t2),
-                )),
-                vreinterpretq_u32_u64(vtrn1q_u64(
-                    vreinterpretq_u64_u32(t1),
-                    vreinterpretq_u64_u32(t3),
-                )),
-                vreinterpretq_u32_u64(vtrn2q_u64(
-                    vreinterpretq_u64_u32(t0),
-                    vreinterpretq_u64_u32(t2),
-                )),
-                vreinterpretq_u32_u64(vtrn2q_u64(
-                    vreinterpretq_u64_u32(t1),
-                    vreinterpretq_u64_u32(t3),
-                )),
-            )
-        }
+        let t0 = vtrn1q_u32(w0, w1);
+        let t1 = vtrn2q_u32(w0, w1);
+        let t2 = vtrn1q_u32(w2, w3);
+        let t3 = vtrn2q_u32(w2, w3);
+        (
+            vreinterpretq_u32_u64(vtrn1q_u64(
+                vreinterpretq_u64_u32(t0),
+                vreinterpretq_u64_u32(t2),
+            )),
+            vreinterpretq_u32_u64(vtrn1q_u64(
+                vreinterpretq_u64_u32(t1),
+                vreinterpretq_u64_u32(t3),
+            )),
+            vreinterpretq_u32_u64(vtrn2q_u64(
+                vreinterpretq_u64_u32(t0),
+                vreinterpretq_u64_u32(t2),
+            )),
+            vreinterpretq_u32_u64(vtrn2q_u64(
+                vreinterpretq_u64_u32(t1),
+                vreinterpretq_u64_u32(t3),
+            )),
+        )
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -2315,7 +2331,6 @@ pub(crate) mod witgen_simd {
             core::arch::x86_64::_mm_sfence();
         }
     }
-
 
     /// NT 64-byte stripe chunk store (via an L1 stack bounce): the lincheck
     /// stripe passes the failed.md §14 never-read test (read ~85 ms later,
@@ -2493,14 +2508,12 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        unsafe {
-            let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
-            let carry = vandq_u32(left, right);
-            (sum, left, right, carry)
-        }
+        let sum = vaddq_u32(x, y);
+        let cin = veorq_u32(veorq_u32(sum, x), y);
+        let left = veorq_u32(x, cin);
+        let right = veorq_u32(y, cin);
+        let carry = vandq_u32(left, right);
+        (sum, left, right, carry)
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -2509,10 +2522,8 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        unsafe {
-            let v = veorq_u32(x, y);
-            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
-        }
+        let v = veorq_u32(x, y);
+        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
@@ -2521,7 +2532,7 @@ pub(crate) mod witgen_simd {
     /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
     /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
         inputs: [&Compression; 4],
         z: *mut u32,
@@ -2894,7 +2905,11 @@ pub(crate) mod witgen_simd {
                 let base = half * 4 * F128_PER_BLOCK;
                 let quad: [&Compression; 4] = std::array::from_fn(|j| {
                     let idx = first + j;
-                    if idx < n_blocks { &blocks[idx] } else { &padding }
+                    if idx < n_blocks {
+                        &blocks[idx]
+                    } else {
+                        &padding
+                    }
                 });
                 // SAFETY: each quad fully owns its four block slots in every
                 // buffer; groups are disjoint across workers.
@@ -2913,8 +2928,7 @@ pub(crate) mod witgen_simd {
             // Bit-transpose the 8 z chunks into the lincheck stripe while
             // they are L1-hot (identical bytes to the generic driver's
             // full-width stripe).
-            let stripe =
-                unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
+            let stripe = unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
@@ -3084,10 +3098,8 @@ impl Blake3Setup {
         // Gated to shapes where a GPU pipeline can actually engage; small
         // test setups skip all of it (and any machine without Metal exits
         // immediately inside the gpu module).
-        if r1cs.m >= 26 {
-            if flock_core::gpu::metal_available() {
-                flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
-            }
+        if r1cs.m >= 26 && flock_core::gpu::metal_available() {
+            flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
         }
         let pcs_params = PcsParams {
             m: r1cs.m,
@@ -3176,10 +3188,8 @@ impl Blake3Setup {
         // the proof for these blocks may already be in flight on the seed-pipe
         // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
         // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0 {
-            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
-                return adopted;
-            }
+        if call > 0 && let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
+            return adopted;
         }
         // HOISTED (was below, after the loop and the final warm-up prove).
         // This is the call that sets `GENERATOR_VERIFIED`, which decides
@@ -3206,8 +3216,7 @@ impl Blake3Setup {
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
             const EXTRA_WARMUP_PROVES: usize = 11;
-            const EXTRA_WARMUP_BUDGET: std::time::Duration =
-                std::time::Duration::from_secs(45);
+            const EXTRA_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
             // Warm the supply path the timed prove will actually run. When
             // the generator verified above, the scored prove evaluates blocks
             // from the closed form on the consuming worker; proving these
@@ -3228,9 +3237,8 @@ impl Blake3Setup {
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
-                let _ = std::hint::black_box(
-                    self.prove_fast_inner(warm_source, &mut warm_challenger),
-                );
+                let _ =
+                    std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
                 }
@@ -3738,7 +3746,10 @@ mod tests {
             assert_eq!(z_s, z_q, "z at n_log={n_log}, n_blocks={n_blocks}");
             assert_eq!(a_s, a_q, "a at n_log={n_log}, n_blocks={n_blocks}");
             assert_eq!(b_s, b_q, "b at n_log={n_log}, n_blocks={n_blocks}");
-            assert_eq!(stripe_s, stripe_q, "stripe at n_log={n_log}, n_blocks={n_blocks}");
+            assert_eq!(
+                stripe_s, stripe_q,
+                "stripe at n_log={n_log}, n_blocks={n_blocks}"
+            );
         }
     }
 
@@ -4204,12 +4215,9 @@ mod tests {
             let other = mk(n_total);
             let blocks = mk(n_total);
             let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
-            let ntt_s =
-                flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-            let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
-                K_SKIP,
-                flock_core::field::F8(1u8 << K_SKIP),
-            );
+            let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+            let ntt_l =
+                flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
             let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
             let n_f128 = n_total * F128_PER_BLOCK;
             let skip_bytes = skip_blocks * BYTES_PER_BLOCK;
@@ -4260,10 +4268,15 @@ mod tests {
                         continue; // that IS the reference
                     }
                     let elide = [elide_on; 3];
-                    let (z, a, b, ab) =
-                        run(&blocks, elide, ab_nt, if elide_on { Some(&seed) } else { None });
-                    let tag =
-                        format!("n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}");
+                    let (z, a, b, ab) = run(
+                        &blocks,
+                        elide,
+                        ab_nt,
+                        if elide_on { Some(&seed) } else { None },
+                    );
+                    let tag = format!(
+                        "n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}"
+                    );
                     assert_eq!(z, z_r, "z mismatch, {tag}");
                     assert_eq!(a, a_r, "a mismatch, {tag}");
                     assert_eq!(b, b_r, "b mismatch, {tag}");
@@ -4443,18 +4456,15 @@ mod tests {
         let m = K_LOG + n_log;
         assert_eq!(m, 20);
 
-        let (z1, a1, b1, mut ab) =
-            generate_witness_with_ab_packed_and_round1_inner(&blocks, n_log);
+        let (z1, a1, b1, mut ab) = generate_witness_with_ab_packed_and_round1_inner(&blocks, n_log);
         let (z2, a2, b2) = generate_witness_with_ab_packed(&blocks, n_log);
         assert_eq!(z1, z2, "z mismatch vs packed generator");
         assert_eq!(a1, a2, "a mismatch vs packed generator");
         assert_eq!(b1, b2, "b mismatch vs packed generator");
 
         let total_bytes = (1usize << m) / 8;
-        let a_bytes =
-            unsafe { std::slice::from_raw_parts(a1.as_ptr().cast::<u8>(), total_bytes) };
-        let b_bytes =
-            unsafe { std::slice::from_raw_parts(b1.as_ptr().cast::<u8>(), total_bytes) };
+        let a_bytes = unsafe { std::slice::from_raw_parts(a1.as_ptr().cast::<u8>(), total_bytes) };
+        let b_bytes = unsafe { std::slice::from_raw_parts(b1.as_ptr().cast::<u8>(), total_bytes) };
         let padding = flock_core::zerocheck::PaddingSpec {
             k_log: K_LOG,
             useful_bits_per_block: USEFUL_BITS,
@@ -4874,7 +4884,9 @@ mod tests {
         // And the published tail must agree with what the descriptor derives.
         assert_eq!(
             flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
-                NUM_NTTS, K_LOG, USEFUL_BITS,
+                NUM_NTTS,
+                K_LOG,
+                USEFUL_BITS,
             ),
             7,
         );
@@ -4892,7 +4904,10 @@ mod tests {
     #[test]
     #[ignore]
     fn bstatic_census() {
-        let n_log = std::env::var("CENSUS_LOG2").ok().and_then(|v| v.parse().ok()).unwrap_or(12usize);
+        let n_log = std::env::var("CENSUS_LOG2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12usize);
         let ranked_dist = std::env::var_os("CENSUS_RANDOM_META").is_none();
         let n_blocks = 1usize << n_log;
         let mut rng = Rng::new(0xCE75_0000 ^ n_log as u64);
@@ -4914,7 +4929,7 @@ mod tests {
         let b_bytes = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), b.len() * 16) };
         assert_eq!(a_bytes.len(), n_blocks * BYTES_PER_BLOCK);
         // per (w, b_med, K): (const_byte_mask, first_word) for a and b.
-        let mut census = |src: &[u8], name: &str| {
+        let census = |src: &[u8], name: &str| {
             let mut first = vec![0u64; 2 * 16 * 8];
             let mut varies = vec![0u8; 2 * 16 * 8]; // bit j set ⇒ byte j varies
             for blk in 0..n_blocks {
@@ -4940,7 +4955,10 @@ mod tests {
                 }
             }
             println!("// {name}: [[(mask, expected); 8]; 32] — blk = w*16 + b_med");
-            println!("pub(crate) static CENSUS_{}: [[(u64, u64); 8]; 32] = [", name.to_uppercase());
+            println!(
+                "pub(crate) static CENSUS_{}: [[(u64, u64); 8]; 32] = [",
+                name.to_uppercase()
+            );
             let mut n_static_bytes = 0usize;
             for blk in 0..32 {
                 println!("    [");
@@ -4954,12 +4972,19 @@ mod tests {
                     }
                     let exp = first[idx] & mask;
                     n_static_bytes += mask.count_ones() as usize / 8;
-                    println!("        (0x{mask:016x}, 0x{exp:016x}), // blk {blk} K{k}: {} static bytes", mask.count_ones() / 8);
+                    println!(
+                        "        (0x{mask:016x}, 0x{exp:016x}), // blk {blk} K{k}: {} static bytes",
+                        mask.count_ones() / 8
+                    );
                 }
                 println!("    ],");
             }
             println!("];");
-            println!("// {name}: {n_static_bytes} static bytes of {} ({:.1}%)", 32 * 8 * 8, 100.0 * n_static_bytes as f64 / 2048.0);
+            println!(
+                "// {name}: {n_static_bytes} static bytes of {} ({:.1}%)",
+                32 * 8 * 8,
+                100.0 * n_static_bytes as f64 / 2048.0
+            );
         };
         census(b_bytes, "b");
         census(a_bytes, "a");
