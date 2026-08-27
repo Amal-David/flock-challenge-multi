@@ -208,6 +208,20 @@ pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingl
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    if ell == 64
+        && super::univariate_skip_optimized::ntt_extend_f128_gfni_enabled()
+    {
+        return super::univariate_skip_optimized::ntt_extend_f128_vec_gfni(in_s, inv_table);
+    }
+
     let mut out = vec![F128::ZERO; ell];
     let n_chunks = inv_table.n_chunks;
 
