@@ -43,6 +43,18 @@ const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
 /// Words a drain step publishes at once — sixteen, which is exactly one
 /// 64-byte round-1 medium window per block.
 const STEP_WORDS: usize = 16;
+/// Round-1 medium windows that overlap the circuit's useful prefix.  The
+/// ranked BLAKE3 block has exactly one further 64-byte window, wholly inside
+/// structural zero padding.
+const AB_LIVE_WINDOWS: usize = USEFUL_BITS.div_ceil(STEP_WORDS * 32);
+const AB_WINDOWS_PER_BLOCK: usize = BYTES_PER_BLOCK / 64;
+const _AB_PADDING_WINDOW_GEOMETRY: () = {
+    assert!(AB_LIVE_WINDOWS == 31);
+    assert!(AB_WINDOWS_PER_BLOCK == 32);
+    assert!(AB_LIVE_WINDOWS + 1 == AB_WINDOWS_PER_BLOCK);
+    assert!((AB_LIVE_WINDOWS - 1) * STEP_WORDS * 32 < USEFUL_BITS);
+    assert!(AB_LIVE_WINDOWS * STEP_WORDS * 32 >= USEFUL_BITS);
+};
 /// u32s of the streaming projection's staging pair: one step's sixteen words
 /// for eight blocks, a side.
 pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
@@ -75,12 +87,12 @@ const _ELIDE_GEOMETRY: () = {
     // only while every elided PREFIX is pair-aligned. (Elided tails need no
     // such property: a half-covered trailing pair degrades to the same
     // single-chunk stream in both.)
-    assert!(DUMP_CHUNKS % 2 == 0);
-    assert!(ELIDE_B_PREFIX_CHUNKS % 2 == 0);
+    assert!(DUMP_CHUNKS.is_multiple_of(2));
+    assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
     // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
     // stays strictly inside the same content-independent constant run.
     assert!(ELIDE_B_TAIL_CHUNK_WIN >= ELIDE_B_TAIL_CHUNK);
-    assert!(ELIDE_B_TAIL_CHUNK_WIN % 2 == 0);
+    assert!(ELIDE_B_TAIL_CHUNK_WIN.is_multiple_of(2));
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
 
@@ -168,8 +180,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +216,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +227,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +236,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -298,6 +301,7 @@ fn xor_v8(a: V8, b: V8) -> V8 {
 /// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
 /// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
+#[allow(dead_code)]
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
     #[cfg(target_feature = "avx512vl")]
@@ -403,7 +407,7 @@ const _RING_GEOMETRY: () = {
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
     // Every epoch boundary is a whole number of drain steps.
-    assert!(RING_WORDS % STEP_WORDS == 0);
+    assert!(RING_WORDS.is_multiple_of(STEP_WORDS));
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
@@ -534,6 +538,34 @@ impl StreamProj<'_> {
             }
         }
     }
+
+    /// Publish the drain rows and initialise one padding-only output window
+    /// without entering the inverse-NTT/product kernel.  The output zero
+    /// stores retain `plan`'s store class, so this is byte- and ordering-
+    /// equivalent to the static-B kernel's all-zero result.
+    ///
+    /// # Safety
+    /// `blk` must be a complete 64-byte window of every selected output block;
+    /// `rows`, when present, must describe the staged drain step at `blk`.
+    #[inline(never)]
+    unsafe fn publish_zero_blocks(&self, blk: usize, rows: Option<StepRows>) {
+        unsafe {
+            let (sa, sb) = self.sides();
+            for j in 0..8usize {
+                if let Some(rows) = rows {
+                    rows.publish(j, sa, sb);
+                }
+                if self.live & (1 << j) == 0 {
+                    continue;
+                }
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + blk * 64)
+                    .cast::<[u8; 64]>();
+                self.plan.write_zero_window(out);
+            }
+        }
+    }
 }
 
 /// Rolling drain state shared by the A/B packed writers. The witness uses two
@@ -552,6 +584,7 @@ struct Drain8<'t> {
     z_nt: bool,
     wide_nt: bool,
     spread: bool,
+    skip_dead_ab_padding_window: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -588,21 +621,19 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t> {
+struct W8<'t, const FLUSH: bool> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
-    flush: bool,
 }
 
-impl<'t> W8<'t> {
+impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>) -> Self {
         Self {
             pending,
             stage,
             drain,
-            flush,
         }
     }
 
@@ -610,7 +641,7 @@ impl<'t> W8<'t> {
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
             store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
-            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
@@ -755,6 +786,7 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
 
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
 /// 32-byte block runs. Temporal stores only.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     unsafe {
@@ -796,6 +828,17 @@ fn spread_nt_enabled() -> bool {
     *ON
 }
 
+/// The final round-1 AB medium window starts after `USEFUL_BITS`, so the
+/// padding-aware consumer never reads it.  We must still initialise its
+/// scratch bytes, but can publish zero directly instead of re-proving that B
+/// is zero in the static-B transform.  The switch restores that transform.
+fn skip_dead_ab_padding_window_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_WITGEN_AB_PAD_WINDOW_SKIP").is_none()
+    });
+    *ON
+}
+
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -807,6 +850,7 @@ fn spread_nt_enabled() -> bool {
 /// Caller contract: destinations are not read again until after an
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
 /// task; same-thread reads are self-consistent regardless).
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
     unsafe {
@@ -858,7 +902,7 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 #[inline(always)]
 unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     unsafe {
-        if wide_nt && p as usize % 32 == 0 {
+        if wide_nt && (p as usize).is_multiple_of(32) {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -924,17 +968,14 @@ unsafe fn emit_pair(
 /// block transforms by [`StreamProj::project_blocks`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// are already in the projection's own staging (they are its input). The
+/// publisher loads each staged row once and derives z immediately, before the
+/// transform, so no separate z-row scratch has to survive the outlined call.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    z_lo: *const V8,
-    z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -951,30 +992,34 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
             emit_pair(
                 self.z.add(o),
-                *self.z_lo.add(j),
-                *self.z_hi.add(j),
+                and_v8(a_lo, b_lo),
+                and_v8(a_hi, b_hi),
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1079,9 +1124,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1178,7 +1221,12 @@ impl Drain8<'_> {
                         self.z_nt,
                         self.wide_nt,
                     );
-                    proj.project(abs_word / STEP_WORDS);
+                    let blk = abs_word / STEP_WORDS;
+                    if self.skip_dead_ab_padding_window && blk == AB_LIVE_WINDOWS {
+                        proj.publish_zero_blocks(blk, None);
+                    } else {
+                        proj.project(blk);
+                    }
                 }
                 return;
             }
@@ -1266,16 +1314,9 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
-
                 let g = abs_word / 8;
                 let mut flags = base;
                 if g < z_g1 {
@@ -1300,18 +1341,24 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    z_lo: z_lo.as_ptr(),
-                    z_hi: z_hi.as_ptr(),
                     flags,
                 };
 
-                proj.project_blocks(
-                    blk,
-                    plan,
-                    imgs,
-                    Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
-                );
+                if self.skip_dead_ab_padding_window && blk == AB_LIVE_WINDOWS {
+                    proj.publish_zero_blocks(blk, Some(rows));
+                } else {
+                    proj.project_blocks(
+                        blk,
+                        plan,
+                        imgs,
+                        Some(rows),
+                        if use_off {
+                            Some(op as *const u16)
+                        } else {
+                            None
+                        },
+                    );
+                }
             }
         }
     }
@@ -1422,6 +1469,7 @@ impl Drain8<'_> {
 /// AVX2 required. `dst` owns 8 contiguous `U32_PER_BLOCK`-word blocks and is
 /// 16-byte aligned; `win` owns 8 contiguous `U32_PER_BLOCK`-word blocks and
 /// is disjoint from `dst` and from `stage`.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt_win(
     stage: *const V8,
@@ -1466,6 +1514,7 @@ unsafe fn dump_range_nt_win(
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_elide(
     stage: *const V8,
@@ -1493,6 +1542,7 @@ unsafe fn dump_elide(
 
 /// [`dump_elide`]'s dual-destination form: same elide range selection, always
 /// non-temporal into `dst`, always FULL into `win`. See [`dump_range_nt_win`].
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_elide_win(
     stage: *const V8,
@@ -1672,12 +1722,13 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z_nt,
             wide_nt: wide_nt_enabled(),
             spread: spread_nt_enabled(),
+            skip_dead_ab_padding_window: skip_dead_ab_padding_window_enabled(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
@@ -1703,10 +1754,10 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
+        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -1881,11 +1932,10 @@ mod tests {
 
                 let sentinel = 0xA5A5_5A5A;
                 let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
+                let mut writer = W8::<false>::at(
                     stage.as_mut_ptr(),
                     dup_u32(pending_hi),
                     core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
                 );
                 unsafe {
                     writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
@@ -1989,11 +2039,10 @@ mod tests {
             // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
+            let mut writer = W8::<false>::at(
                 stage.as_mut_ptr(),
                 dup_u32(pending_low << 15),
                 core::ptr::null_mut::<Drain8<'static>>(),
-                false,
             );
             writer.finish();
             assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);
