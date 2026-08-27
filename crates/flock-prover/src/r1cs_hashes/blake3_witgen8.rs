@@ -168,8 +168,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +204,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +215,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +224,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -588,21 +579,19 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t> {
+struct W8<'t, const FLUSH: bool> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
-    flush: bool,
 }
 
-impl<'t> W8<'t> {
+impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>) -> Self {
         Self {
             pending,
             stage,
             drain,
-            flush,
         }
     }
 
@@ -610,7 +599,7 @@ impl<'t> W8<'t> {
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
             store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
-            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
@@ -710,16 +699,16 @@ macro_rules! pushf8 {
 }
 
 #[inline(always)]
-fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
+fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8) {
     // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
     // `left = x ^ cin` and `right = y ^ cin`, and both collapse algebraically
     // (`left = sum ^ y`, `right = sum ^ x`). Computing them off `sum` removes
     // the carry-in XOR chain entirely — bit-identical outputs, one op less.
+    // No caller consumes `left & right`, so do not compute that fourth result.
     let sum = add_v8(x, y);
     let left = xor_v8(sum, y);
     let right = xor_v8(sum, x);
-    let carry = and_v8(left, right);
-    (sum, left, right, carry)
+    (sum, left, right)
 }
 
 #[inline(always)]
@@ -1079,9 +1068,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1266,11 +1253,7 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
@@ -1310,7 +1293,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1676,8 +1663,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
@@ -1703,33 +1690,33 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
+        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
-                let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
+                let (t0, l0, r0) = add_carry_parts_v8(state[$la], state[$lb]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
+                let (a1, l1, r1) = add_carry_parts_v8(t0, m[$mx]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
-                let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
+                let (c1s, l2, r2) = add_carry_parts_v8(state[$lc], d1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
-                let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
+                let (t1, l3, r3) = add_carry_parts_v8(a1, b1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
+                let (a2, l4, r4) = add_carry_parts_v8(t1, m[$my]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
-                let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
+                let (c2s, l5, r5) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
@@ -1881,11 +1868,10 @@ mod tests {
 
                 let sentinel = 0xA5A5_5A5A;
                 let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
+                let mut writer = W8::<false>::at(
                     stage.as_mut_ptr(),
                     dup_u32(pending_hi),
                     core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
                 );
                 unsafe {
                     writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
@@ -1989,11 +1975,10 @@ mod tests {
             // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
+            let mut writer = W8::<false>::at(
                 stage.as_mut_ptr(),
                 dup_u32(pending_low << 15),
                 core::ptr::null_mut::<Drain8<'static>>(),
-                false,
             );
             writer.finish();
             assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);
