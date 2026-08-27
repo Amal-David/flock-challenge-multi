@@ -2182,12 +2182,13 @@ pub(crate) fn induce_sumcheck_poly(
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller carries the target features; slice bounds hold.
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let tb_x64 = ghash_shift64_x4(tb);
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -2195,7 +2196,7 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let vs = _mm512_xor_si512(va, vb);
             _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, vs);
-            let nb = _mm512_xor_si512(vb, ghash_mul_x4(tb, vs));
+            let nb = _mm512_xor_si512(vb, ghash_mul_x4_split(vs, tb, tb_x64));
             _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb);
             i += 4;
         }
@@ -2242,9 +2243,8 @@ fn tnt_pass_b_zero_selected(disabled: bool) -> bool {
 }
 
 fn tnt_pass_b_zero_enabled() -> bool {
-    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some()
-    });
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some());
     tnt_pass_b_zero_selected(*DISABLED)
 }
 
@@ -2632,18 +2632,22 @@ fn eq_split_x4_enabled() -> bool {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(out.len(), lo.len());
     // SAFETY: caller carries the target features; the slices are equal-length
     // and every offset below stays inside both.
     unsafe {
         let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
+        let eb_x64 = ghash_shift64_x4(eb);
         let lanes = out.len() & !3;
         let mut i = 0usize;
         while i < lanes {
             let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, ghash_mul_x4(eb, v));
+            _mm512_storeu_si512(
+                out.as_mut_ptr().add(i) as *mut __m512i,
+                ghash_mul_x4_split(v, eb, eb_x64),
+            );
             i += 4;
         }
         while i < out.len() {
@@ -2866,9 +2870,8 @@ fn transpose_forward_ntt_window_dense(
 /// `vec![F128::ZERO; _]` for exact same-binary A/B. Read once per process;
 /// default ON.
 fn singleton_uninit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LIG_SINGLETON_UNINIT").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_SINGLETON_UNINIT").is_none());
     *ON
 }
 
@@ -3134,63 +3137,60 @@ fn transpose_forward_ntt_sparse_inner(
     let _tw = std::time::Instant::now();
     let processed: Vec<(usize, Vec<F128>)> = if fill {
         runs.par_iter()
-            .map_init(
-                Vec::<F128>::new,
-                |scratch, &(rs, re)| {
+            .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
                 let first = order[rs] as usize;
                 let w = positions[first] >> k;
-                    let nnz = re - rs;
-                    if singleton_on && nnz <= multi_max {
-                        // Every nonzero expands separately; the sums XOR
-                        // together. F2-linearity: the transpose layers are
-                        // linear over F2, so T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ),
-                        // and F128 addition is XOR (order irrelevant).
-                        // Separate buffers are required — step s of an
-                        // expansion reads its own prefix.
-                        let mut buf = take_singleton_buf(k);
-                        expand_singleton_into(
+                let nnz = re - rs;
+                if singleton_on && nnz <= multi_max {
+                    // Every nonzero expands separately; the sums XOR
+                    // together. F2-linearity: the transpose layers are
+                    // linear over F2, so T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ),
+                    // and F128 addition is XOR (order irrelevant).
+                    // Separate buffers are required — step s of an
+                    // expansion reads its own prefix.
+                    let mut buf = take_singleton_buf(k);
+                    expand_singleton_into(
                         ntt,
                         log_d,
                         k,
                         w,
                         positions[first] & wmask,
                         values[first],
-                            &mut buf,
+                        &mut buf,
                     );
-                        if nnz > 1 {
-                            if scratch.len() < 1usize << k {
-                                *scratch = take_singleton_buf(k);
-                            }
-                            let scratch = &mut scratch[..1usize << k];
-                            for &i in &order[rs + 1..re] {
-                                let i = i as usize;
-                                expand_singleton_into(
-                                    ntt,
-                                    log_d,
-                                    k,
-                                    w,
-                                    positions[i] & wmask,
-                                    values[i],
-                                    scratch,
-                                );
-                                for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
-                                    *d += s;
-                                }
+                    if nnz > 1 {
+                        if scratch.len() < 1usize << k {
+                            *scratch = take_singleton_buf(k);
+                        }
+                        let scratch = &mut scratch[..1usize << k];
+                        for &i in &order[rs + 1..re] {
+                            let i = i as usize;
+                            expand_singleton_into(
+                                ntt,
+                                log_d,
+                                k,
+                                w,
+                                positions[i] & wmask,
+                                values[i],
+                                scratch,
+                            );
+                            for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
+                                *d += s;
                             }
                         }
-                        return (w, buf);
                     }
-                    // Past the cost boundary: incumbent dense window
-                    // (needs the zeroed allocation — only the nonzero slots
-                    // are scattered).
+                    return (w, buf);
+                }
+                // Past the cost boundary: incumbent dense window
+                // (needs the zeroed allocation — only the nonzero slots
+                // are scattered).
                 let mut buf = vec![F128::ZERO; 1 << k];
                 for &i in &order[rs..re] {
                     let i = i as usize;
                     buf[positions[i] & wmask] += values[i];
                 }
                 transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-                },
-            )
+            })
             .collect()
     } else {
         win_vec
@@ -3788,18 +3788,16 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         debug_assert_eq!(f.len(), 2 * weights.len());
         let mut a_acc = WideGhashX4::zero();
         let mut s_acc = WideGhashX4::zero();
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
         let lanes = weights.len() & !3;
         let mut j = 0usize;
         while j < lanes {
             let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
             let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
             let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let sum = _mm512_permutex2var_epi64(f0_sum, idx_even, f1_sum);
+            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
             a_acc.mul_acc(even, w);
             s_acc.mul_acc(sum, w);
             j += 4;
@@ -3951,13 +3949,6 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     let mut u0_acc = WideGhashX4::zero();
     let mut u2_acc = WideGhashX4::zero();
 
-    // idx_even: pick 128-bit lanes {0, 2} from reg0 and {0, 2} from reg1
-    // → [reg0[0], reg0[2], reg1[0], reg1[2]] (even-indexed F128 elements).
-    let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-    // perm_swap: swap adjacent 128-bit lanes (0↔1, 2↔3) within a register.
-    // After XOR with original, every lane holds a pair sum.
-    let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
     let mut k = 0;
     while k < lanes {
         // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
@@ -3967,18 +3958,18 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
         let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
         // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-        let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
         u0_acc.mul_acc(f_even, b_even);
 
         // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
         //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-        let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-        let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
         u2_acc.mul_acc(f_sum, b_sum);
 
         k += 8;
@@ -4024,9 +4015,6 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
         let mut u2_acc = WideGhashX4::zero();
         let mut y_acc = WideGhashX4::zero();
 
-        let idx_even = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
-        let perm_swap = _mm512_set_epi64(5, 4, 7, 6, 1, 0, 3, 2);
-
         let mut k = 0;
         while k < lanes {
             let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
@@ -4034,16 +4022,16 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
             let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-            let f_even = _mm512_permutex2var_epi64(f0, idx_even, f1);
-            let b_even = _mm512_permutex2var_epi64(b0, idx_even, b1);
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_permutexvar_epi64(perm_swap, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_permutexvar_epi64(perm_swap, f1));
-            let f_sum = _mm512_permutex2var_epi64(f0s, idx_even, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_permutexvar_epi64(perm_swap, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_permutexvar_epi64(perm_swap, b1));
-            let b_sum = _mm512_permutex2var_epi64(b0s, idx_even, b1s);
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
@@ -4081,13 +4069,14 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(acc.len(), src.len());
     // SAFETY: caller carries the target features; the slices are equal-length
     // and every offset below stays inside both.
     unsafe {
         let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+        let ab_x64 = ghash_shift64_x4(ab);
         let lanes = acc.len() & !3;
         let mut i = 0usize;
         while i < lanes {
@@ -4095,7 +4084,7 @@ unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
             let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
             _mm512_storeu_si512(
                 acc.as_mut_ptr().add(i) as *mut __m512i,
-                _mm512_xor_si512(a, ghash_mul_x4(ab, v)),
+                _mm512_xor_si512(a, ghash_mul_x4_split(v, ab, ab_x64)),
             );
             i += 4;
         }
@@ -4182,8 +4171,8 @@ unsafe fn fold_and_msg_chunk_nt_x86(
     // length (caller / debug_assert).
     let (u0, u2) = unsafe { msg_reduce_avx512(&stage_f[..len], &stage_b[..len]) };
 
-    let dst_aligned =
-        (fc.as_mut_ptr() as usize).is_multiple_of(16) && (bc.as_mut_ptr() as usize).is_multiple_of(16);
+    let dst_aligned = (fc.as_mut_ptr() as usize).is_multiple_of(16)
+        && (bc.as_mut_ptr() as usize).is_multiple_of(16);
     if dst_aligned {
         // SAFETY: dest slices are 16-aligned F128 buffers of length `len`;
         // stage is the just-written source of the same length.
@@ -4320,9 +4309,8 @@ fn fold_and_msg_lsb_inner(
     // target this ships to; other builds keep the previous leaf).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_soa = lazy_ood.is_none() && cfg!(target_feature = "sha3") && {
-        static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
-        });
+        static SOA: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none());
         *SOA
     };
     // Fold-output storage, in preference order:
@@ -4479,7 +4467,11 @@ fn eval_quadratic_tensor(coefficients: &[F128], challenges: &[F128]) -> F128 {
 }
 
 #[inline]
-fn eval_fold4_lookahead2(coefficients: &super::Fold4Lookahead2, r0: F128, r1: F128) -> SumcheckMessage {
+fn eval_fold4_lookahead2(
+    coefficients: &super::Fold4Lookahead2,
+    r0: F128,
+    r1: F128,
+) -> SumcheckMessage {
     SumcheckMessage {
         u_0: eval_quadratic_tensor(&coefficients[..9], &[r0, r1]),
         u_2: eval_quadratic_tensor(&coefficients[9..], &[r0, r1]),
@@ -4545,6 +4537,36 @@ fn mdf4_pf_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PF").is_none());
     *ON
+}
+
+/// Keep the measured T1 head stream and use otherwise-idle DRAM bandwidth
+/// during the b-side fold to stage two more slab eighths in LLC. The resulting
+/// three-eighth stream stays below the measured DRAM ceiling, while T2 avoids
+/// displacing the 64 KiB composed table from the worker's private L2.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mdf4_prefetch_llc_spread(pf_base: *const u8, pf_span: usize, pf_at: usize) {
+    debug_assert!(pf_at < pf_span);
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            pf_base.add(pf_at).cast::<i8>(),
+            core::arch::x86_64::_MM_HINT_T1,
+        );
+        let segment = pf_span / 8;
+        if pf_at < segment {
+            // `pf_at < segment` proves both addresses are below
+            // `3 * segment <= 3 * pf_span / 8`, so the hot path needs one
+            // bound check rather than one around every hint.
+            core::arch::x86_64::_mm_prefetch(
+                pf_base.add(pf_at + segment).cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T2,
+            );
+            core::arch::x86_64::_mm_prefetch(
+                pf_base.add(pf_at + 2 * segment).cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T2,
+            );
+        }
+    }
 }
 
 #[inline]
@@ -4732,25 +4754,15 @@ fn materialize_direct_fold4(
                     let (first, first_table) = claims_iter
                         .next()
                         .expect("materialize_direct_fold4: claims non-empty");
-                    super::ring_switch::compose_block_table(
-                        first_table,
-                        first.eq_hi[block],
-                        table,
-                    );
+                    super::ring_switch::compose_block_table(first_table, first.eq_hi[block], table);
                     let mut s = 0usize;
                     while s + 3 < block_len {
                         #[cfg(target_arch = "x86_64")]
                         if !pf_base.is_null() && pf_at < pf_span {
-                            // SAFETY: `pf_at < pf_span` and the slab is
-                            // `pf_span` bytes, so the address is inside
-                            // `packed_witness`. Prefetch has no architectural
-                            // effect, so this arm is bit-identical to the
-                            // kill-switched one.
+                            // SAFETY: `pf_at < pf_span`; the helper bounds every
+                            // LLC-spread address to the same next-block slab.
                             unsafe {
-                                core::arch::x86_64::_mm_prefetch(
-                                    pf_base.add(pf_at).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T1,
-                                );
+                                mdf4_prefetch_llc_spread(pf_base, pf_span, pf_at);
                             }
                             pf_at += 64;
                         }
@@ -4766,28 +4778,28 @@ fn materialize_direct_fold4(
                     }
                 }
                 for (claim, direct_table) in claims_iter {
-                    super::ring_switch::compose_block_table(direct_table, claim.eq_hi[block], table);
+                    super::ring_switch::compose_block_table(
+                        direct_table,
+                        claim.eq_hi[block],
+                        table,
+                    );
                     let mut s = 0usize;
                     while s + 3 < block_len {
                         #[cfg(target_arch = "x86_64")]
                         if !pf_base.is_null() && pf_at < pf_span {
-                            // SAFETY: `pf_at < pf_span` and the slab is
-                            // `pf_span` bytes, so the address is inside
-                            // `packed_witness`. Prefetch has no architectural
-                            // effect, so this arm is bit-identical to the
-                            // kill-switched one.
+                            // SAFETY: as above.
                             unsafe {
-                                core::arch::x86_64::_mm_prefetch(
-                                    pf_base.add(pf_at).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T1,
-                                );
+                                mdf4_prefetch_llc_spread(pf_base, pf_span, pf_at);
                             }
                             pf_at += 64;
                         }
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
-                        b_out[s + 1] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
-                        b_out[s + 2] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
-                        b_out[s + 3] += super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
+                        b_out[s + 1] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
+                        b_out[s + 2] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
+                        b_out[s + 3] +=
+                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
                         s += 4;
                     }
                     while s < block_len {
@@ -4856,11 +4868,7 @@ fn materialize_direct_ab_fold2(
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
-            super::ring_switch::build_direct_fold2_table(
-                &claim.low_eq,
-                &fold_weight,
-                &claim.table,
-            )
+            super::ring_switch::build_direct_fold2_table(&claim.low_eq, &fold_weight, &claim.table)
         })
         .collect();
 
@@ -4946,7 +4954,9 @@ fn materialize_direct_ab_fold2(
                     // 2× pair unroll keeps two slot pairs in flight per iteration.
                     let table = &mut scratch[..table_len];
                     super::ring_switch::compose_block_table(
-                        &direct_tables[0], first.eq_hi[block], table,
+                        &direct_tables[0],
+                        first.eq_hi[block],
+                        table,
                     );
                     let n_pairs = block_len / 2;
                     let mut pair = 0usize;
@@ -4968,7 +4978,9 @@ fn materialize_direct_ab_fold2(
                         b_out[s1] = super::ring_switch::fold_one_slot(first.eq_lo[s1], table);
                     }
                     super::ring_switch::compose_block_table(
-                        &direct_tables[1], second.eq_hi[block], table,
+                        &direct_tables[1],
+                        second.eq_hi[block],
+                        table,
                     );
                     pair = 0;
                     while pair + 1 < n_pairs {
@@ -4976,23 +4988,23 @@ fn materialize_direct_ab_fold2(
                         let s1 = s0 + 1;
                         let s2 = s0 + 2;
                         let s3 = s0 + 3;
-                        b_out[s0] = b_out[s0]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] = b_out[s1]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
-                        b_out[s2] = b_out[s2]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s2], table);
-                        b_out[s3] = b_out[s3]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s3], table);
+                        b_out[s0] =
+                            b_out[s0] + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
+                        b_out[s1] =
+                            b_out[s1] + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
+                        b_out[s2] =
+                            b_out[s2] + super::ring_switch::fold_one_slot(second.eq_lo[s2], table);
+                        b_out[s3] =
+                            b_out[s3] + super::ring_switch::fold_one_slot(second.eq_lo[s3], table);
                         pair += 2;
                     }
                     if pair < n_pairs {
                         let s0 = 2 * pair;
                         let s1 = s0 + 1;
-                        b_out[s0] = b_out[s0]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
-                        b_out[s1] = b_out[s1]
-                            + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
+                        b_out[s0] =
+                            b_out[s0] + super::ring_switch::fold_one_slot(second.eq_lo[s0], table);
+                        b_out[s1] =
+                            b_out[s1] + super::ring_switch::fold_one_slot(second.eq_lo[s1], table);
                     }
                 } else {
                     for pair in 0..(block_len / 2) {
@@ -5011,10 +5023,10 @@ fn materialize_direct_ab_fold2(
                                 })
                                 .fold(F128::ZERO, |sum, value| sum + value)
                         };
-                        let b0 = direct_at(slot0)
-                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
-                        let b1 = direct_at(slot1)
-                            + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
+                        let b0 =
+                            direct_at(slot0) + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot0));
+                        let b1 =
+                            direct_at(slot1) + b_in.map_or(F128::ZERO, |basis| fold4(basis, slot1));
                         b_out[slot0] = b0;
                         b_out[slot1] = b1;
                     }
@@ -5123,21 +5135,45 @@ unsafe fn fold_and_msg_chunk_nt_neon(
             let pf = ghash_mul_vec2_neon(
                 [r, r],
                 [
-                    F128 { lo: fe0.lo ^ fo0.lo, hi: fe0.hi ^ fo0.hi },
-                    F128 { lo: fe1.lo ^ fo1.lo, hi: fe1.hi ^ fo1.hi },
+                    F128 {
+                        lo: fe0.lo ^ fo0.lo,
+                        hi: fe0.hi ^ fo0.hi,
+                    },
+                    F128 {
+                        lo: fe1.lo ^ fo1.lo,
+                        hi: fe1.hi ^ fo1.hi,
+                    },
                 ],
             );
             let pb = ghash_mul_vec2_neon(
                 [r, r],
                 [
-                    F128 { lo: be0.lo ^ bo0.lo, hi: be0.hi ^ bo0.hi },
-                    F128 { lo: be1.lo ^ bo1.lo, hi: be1.hi ^ bo1.hi },
+                    F128 {
+                        lo: be0.lo ^ bo0.lo,
+                        hi: be0.hi ^ bo0.hi,
+                    },
+                    F128 {
+                        lo: be1.lo ^ bo1.lo,
+                        hi: be1.hi ^ bo1.hi,
+                    },
                 ],
             );
-            let f0 = F128 { lo: fe0.lo ^ pf[0].lo, hi: fe0.hi ^ pf[0].hi };
-            let f1 = F128 { lo: fe1.lo ^ pf[1].lo, hi: fe1.hi ^ pf[1].hi };
-            let b0 = F128 { lo: be0.lo ^ pb[0].lo, hi: be0.hi ^ pb[0].hi };
-            let b1 = F128 { lo: be1.lo ^ pb[1].lo, hi: be1.hi ^ pb[1].hi };
+            let f0 = F128 {
+                lo: fe0.lo ^ pf[0].lo,
+                hi: fe0.hi ^ pf[0].hi,
+            };
+            let f1 = F128 {
+                lo: fe1.lo ^ pf[1].lo,
+                hi: fe1.hi ^ pf[1].hi,
+            };
+            let b0 = F128 {
+                lo: be0.lo ^ pb[0].lo,
+                hi: be0.hi ^ pb[0].hi,
+            };
+            let b1 = F128 {
+                lo: be1.lo ^ pb[1].lo,
+                hi: be1.hi ^ pb[1].hi,
+            };
 
             store_nt_pair(dst_f, f0, f1);
             store_nt_pair(dst_b, b0, b1);
@@ -5529,7 +5565,11 @@ impl FoldArena {
         for i in 0..PREFAULT_THREADS {
             let (start, end) = (
                 bound(i),
-                if i + 1 == PREFAULT_THREADS { cap } else { bound(i + 1) },
+                if i + 1 == PREFAULT_THREADS {
+                    cap
+                } else {
+                    bound(i + 1)
+                },
             );
             let done = Arc::new(AtomicUsize::new(start));
             parts.push(PrefaultPart {
@@ -5856,9 +5896,8 @@ fn direct_fold8_final_generators(
 ))]
 #[inline]
 fn direct_fold8_b_gfni_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_FOLD8_B_GFNI").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_B_GFNI").is_none());
     *ON
 }
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
@@ -5898,8 +5937,7 @@ fn materialize_direct_fold8(
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     ))]
-    let b_gfni_candidate =
-        direct_fold8_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
+    let b_gfni_candidate = direct_fold8_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5989,27 +6027,15 @@ fn materialize_direct_fold8(
                     ),
                     crate::scratch::LocalBuf::new(if has_ordinary { 16 * SUB } else { 0 }, pooled),
                     crate::scratch::LocalBuf::new((4 * SUB).max(ALIGN64_MIN_F128), pooled),
-                    // `gfni_tmp` sits under the SAME sub-`RECYCLE_MIN` gate
-                    // `mid4` above does, and the staged GFNI kernel hammers it
-                    // with ZMM `storeu`/`loadu`: at 64 F128 = 1 KiB it goes to
-                    // the system allocator and lands 16 mod 64, so every 64 B
-                    // ZMM access against it straddles two cache lines.
-                    //
-                    // The size arithmetic is NOT `mid4`'s. `mid4` is 16 KiB and
-                    // crosses a 32 KiB threshold, i.e. 2x. This buffer is 1 KiB,
-                    // so asking for the gate's minimum inflates it 32x. That is
-                    // affordable here for one specific reason: the pooled arm is
-                    // `take_local_f128`, which recycles a per-thread allocation
-                    // and does NOT zero it (`scratch.rs`; the unpooled kill-switch
-                    // arm's `vec![F128::ZERO; n]` is not the ranked path). So the
-                    // inflation costs one 32 KiB reservation per thread ONCE,
-                    // 512 KiB across 16 threads, and the kernel still touches only
-                    // the first 1 KiB -- the resident cache footprint is unchanged,
-                    // which is what `killed.md:2170`'s L1D lesson actually cares
-                    // about. CAPACITY ONLY: the kernel still addresses exactly the
-                    // same 64 elements, so no value, element or order changes.
+                    // `gfni_tmp` sits under the same sub-`RECYCLE_MIN` gate as `mid4`.
+                    // The kernel touches only the first 64 elements; the larger capacity
+                    // selects the pool allocator’s 64-byte-aligned class.
                     crate::scratch::LocalBuf::new(
-                        if b_gfni_on { (64usize).max(ALIGN64_MIN_F128) } else { 0 },
+                        if b_gfni_on {
+                            (64usize).max(ALIGN64_MIN_F128)
+                        } else {
+                            0
+                        },
                         pooled,
                     ),
                 )
@@ -6032,19 +6058,25 @@ fn materialize_direct_fold8(
                     let n = SUB.min(block_len - slot);
                     let m4 = &mut mid4[..4 * n];
                     crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)], m4, &fold16_weight,
+                        &f_in[64 * slot..64 * (slot + n)],
+                        m4,
+                        &fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(
-                        m4, &mut f_out[slot..slot + n], r4, r5,
-                    );
+                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
                     if has_ordinary {
                         let m16 = &mut mid16[..16 * n];
                         crate::field::f128_slice::fold4_nested(
-                            &b_in[64 * slot..64 * (slot + n)], m16, r0, r1,
+                            &b_in[64 * slot..64 * (slot + n)],
+                            m16,
+                            r0,
+                            r1,
                         );
                         crate::field::f128_slice::fold4_nested(m16, m4, r2, r3);
                         crate::field::f128_slice::fold4_nested(
-                            m4, &mut b_out[slot..slot + n], r4, r5,
+                            m4,
+                            &mut b_out[slot..slot + n],
+                            r4,
+                            r5,
                         );
                     }
                     slot += n;
@@ -6063,12 +6095,14 @@ fn materialize_direct_fold8(
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0], claim0.eq_hi[block],
+                        &direct_tables[0],
+                        claim0.eq_hi[block],
                     );
                     let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                     let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
                     let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1], claim1.eq_hi[block],
+                        &direct_tables[1],
+                        claim1.eq_hi[block],
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
@@ -6110,11 +6144,7 @@ fn materialize_direct_fold8(
                         };
                     }
                     for (claim, table) in rest_claims.iter().zip(direct_tables.iter().skip(1)) {
-                        super::ring_switch::compose_block_table(
-                            table,
-                            claim.eq_hi[block],
-                            scratch,
-                        );
+                        super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
                         for (slot, out) in b_out.iter_mut().enumerate() {
                             *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                         }
@@ -6306,12 +6336,7 @@ impl SumcheckProver {
             Some(PendingOodEq::Introduced { .. }) => {
                 panic!("fold before factorized OOD glue")
             }
-            None => fold_and_msg_lsb(
-                &self.f,
-                &self.combined_basis,
-                r,
-                self.fold_arena.as_mut(),
-            ),
+            None => fold_and_msg_lsb(&self.f, &self.combined_basis, r, self.fold_arena.as_mut()),
         };
         // On x86_64, recycle the just-consumed OWNED buffers into the scratch
         // pool (same ownership as the Drop impl) so the next round's
@@ -6363,10 +6388,7 @@ impl SumcheckProver {
     /// Introduce `eq(z, ·)` without building its dense 2^19 table. The LSB
     /// coordinate is kept separately and the remaining equality is split into
     /// cache-resident low/high tensor factors.
-    fn introduce_new_ood_factorized(
-        &mut self,
-        z: &[F128],
-    ) -> Option<(SumcheckMessage, F128)> {
+    fn introduce_new_ood_factorized(&mut self, z: &[F128]) -> Option<(SumcheckMessage, F128)> {
         let expected_len = 1usize.checked_shl(z.len().try_into().ok()?);
         if z.is_empty()
             || expected_len != Some(self.f.len())
@@ -6380,8 +6402,7 @@ impl SumcheckProver {
         let eq_lo = build_eq_table(&tail[..split]);
         let eq_hi = build_eq_table(&tail[split..]);
         let z_0 = z[0];
-        let (msg, h_new) =
-            round_msg_and_eval_lsb_factorized_eq(&self.f, &eq_lo, &eq_hi, z_0);
+        let (msg, h_new) = round_msg_and_eval_lsb_factorized_eq(&self.f, &eq_lo, &eq_hi, z_0);
         self.transcript.push(msg);
         self.pending_ood_eq = Some(PendingOodEq::Introduced {
             eq_lo,
@@ -6565,12 +6586,7 @@ fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) ->
 /// [`merkle::merkle_multi_proof_sibling_indices`]); `false` is the incumbent
 /// single-pass walk, kept verbatim as the kill-switch path and the
 /// byte-identity oracle.
-fn multi_proof_gather(
-    tree: &[Hash],
-    block_len: usize,
-    queries: &[usize],
-    par: bool,
-) -> Vec<Hash> {
+fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: bool) -> Vec<Hash> {
     use rayon::prelude::*;
     if par {
         let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
@@ -6886,7 +6902,10 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    assert!(config.initial_k >= 4, "direct-fold4 scaffold requires initial_k >= 4");
+    assert!(
+        config.initial_k >= 4,
+        "direct-fold4 scaffold requires initial_k >= 4"
+    );
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -6928,7 +6947,10 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    assert_eq!(config.initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
+    assert_eq!(
+        config.initial_k, 6,
+        "direct-fold8 scaffold requires initial_k=6"
+    );
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -7130,36 +7152,38 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     r,
                 )
             } else {
-                    let direct = direct_fold8.take().expect("direct-fold8 factors consumed once");
-                    let (f8, b8, msg) = materialize_direct_fold8(
-                        packed_witness.take().unwrap(),
-                        b_initial.take().unwrap(),
-                        &direct,
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            fold4_challenges[3],
-                            fold4_challenges[4],
-                            r,
-                        ],
-                    );
-                    sc_prover = Some(SumcheckProver::new_after_direct_fold8(
-                        f8,
-                        b8,
-                        target,
-                        [
-                            start_msg,
-                            fold4_msgs[0],
-                            fold4_msgs[1],
-                            fold4_msgs[2],
-                            fold4_msgs[3],
-                            fold4_msgs[4],
-                            msg,
-                        ],
-                        fold_arena.take(),
-                    ));
-                    msg
+                let direct = direct_fold8
+                    .take()
+                    .expect("direct-fold8 factors consumed once");
+                let (f8, b8, msg) = materialize_direct_fold8(
+                    packed_witness.take().unwrap(),
+                    b_initial.take().unwrap(),
+                    &direct,
+                    [
+                        fold4_challenges[0],
+                        fold4_challenges[1],
+                        fold4_challenges[2],
+                        fold4_challenges[3],
+                        fold4_challenges[4],
+                        r,
+                    ],
+                );
+                sc_prover = Some(SumcheckProver::new_after_direct_fold8(
+                    f8,
+                    b8,
+                    target,
+                    [
+                        start_msg,
+                        fold4_msgs[0],
+                        fold4_msgs[1],
+                        fold4_msgs[2],
+                        fold4_msgs[3],
+                        fold4_msgs[4],
+                        msg,
+                    ],
+                    fold_arena.take(),
+                ));
+                msg
             };
             fold4_challenges.push(r);
             fold4_msgs.push(msg);
@@ -7188,12 +7212,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     r,
                 ),
                 _ => {
-                    let direct = direct_fold4.take().expect("direct-fold4 factors consumed once");
+                    let direct = direct_fold4
+                        .take()
+                        .expect("direct-fold4 factors consumed once");
                     let (f4, b4, msg) = materialize_direct_fold4(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
                         &direct,
-                        [fold4_challenges[0], fold4_challenges[1], fold4_challenges[2], r],
+                        [
+                            fold4_challenges[0],
+                            fold4_challenges[1],
+                            fold4_challenges[2],
+                            r,
+                        ],
                     );
                     sc_prover = Some(SumcheckProver::new_after_direct_fold4(
                         f4,
@@ -7219,7 +7250,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_msg1 = Some(msg);
             msg
         } else if direct_mode && j == 1 {
-            let direct = direct_fold2.take().expect("direct AB factors consumed once");
+            let direct = direct_fold2
+                .take()
+                .expect("direct AB factors consumed once");
             let (f2, b2, msg) = materialize_direct_ab_fold2(
                 packed_witness.take().unwrap(),
                 b_initial.take().unwrap(),
@@ -7242,9 +7275,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             round_diag.push((
                 grind_ms,
                 _tf.elapsed().as_secs_f64() * 1e3,
-                sc_prover
-                    .as_ref()
-                    .is_some_and(SumcheckProver::f_is_arena),
+                sc_prover.as_ref().is_some_and(SumcheckProver::f_is_arena),
             ));
         }
         challenger.observe_f128(msg.u_0);
@@ -7442,11 +7473,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = gather_opened_rows(
-                &queries_last,
-                |q| wtns_prev.row(q),
-                serial_par_enabled(),
-            );
+            let opened_rows_last: Vec<Vec<F128>> =
+                gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -7460,9 +7488,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     t_init_sumcheck.as_secs_f64() * 1e3
                 );
                 for (j, (g, f, a)) in round_diag.iter().enumerate() {
-                    eprintln!(
-                        "    round {j}: grind {g:.2} ms, fold {f:.2} ms, arena={a}",
-                    );
+                    eprintln!("    round {j}: grind {g:.2} ms, fold {f:.2} ms, arena={a}",);
                 }
                 eprintln!(
                     "  recursive commits (NTT + merkle):              {:.2} ms",
@@ -7585,11 +7611,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(
-            &queries_i,
-            |q| wtns_prev.row(q),
-            serial_par_enabled(),
-        );
+        let opened_rows_i: Vec<Vec<F128>> =
+            gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
@@ -9244,9 +9267,7 @@ mod tests {
         // Ranked-L0-like shape (218 queries, wide rows, deep tree — both
         // gathers above their par floors) plus a tiny shape (below both
         // floors — the par route must fall back and still match).
-        for &(log_leaves, n_queries, row_len) in
-            &[(12usize, 218usize, 64usize), (4, 3, 2)]
-        {
+        for &(log_leaves, n_queries, row_len) in &[(12usize, 218usize, 64usize), (4, 3, 2)] {
             let num_leaves = 1usize << log_leaves;
             let mut tree: Vec<Hash> = Vec::with_capacity(2 * num_leaves - 1);
             for _ in 0..(2 * num_leaves - 1) {
@@ -9288,8 +9309,7 @@ mod tests {
                 rows_seq,
                 "corrupted row went undetected log_leaves={log_leaves}"
             );
-            let sibling_indices =
-                merkle::merkle_multi_proof_sibling_indices(num_leaves, &queries);
+            let sibling_indices = merkle::merkle_multi_proof_sibling_indices(num_leaves, &queries);
             assert!(!sibling_indices.is_empty());
             let mut bad_tree = tree.clone();
             bad_tree[sibling_indices[0]][0] ^= 1;
@@ -9325,10 +9345,8 @@ mod tests {
         .into_iter()
         .map(|value| gamma * value)
         .collect();
-        let direct_full = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix),
-            &scaled_rdp,
-        );
+        let direct_full =
+            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
         let combined_full: Vec<F128> = ordinary_c
             .iter()
             .zip(direct_full)
@@ -9350,8 +9368,7 @@ mod tests {
         partial_eval_lsb_one(&mut want_f, r1);
         partial_eval_lsb_one(&mut want_b, r1);
         let want_msg = round_msg_lsb(&want_f, &want_b);
-        let (got_f, got_b, got_msg) =
-            materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
+        let (got_f, got_b, got_msg) = materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
         assert_eq!(got_f, want_f);
         assert_eq!(got_b, want_b);
         assert_eq!(got_msg, want_msg);
@@ -9366,9 +9383,7 @@ mod tests {
         let k_0 = 2;
         let log_inv_rate = 1;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_AB02);
-        let poly: Vec<F128> = (0..(1usize << log_n))
-            .map(|_| rng.sample_f128())
-            .collect();
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let suffix_ab: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let suffix_c: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp_ab: Vec<F128> = build_eq_table(
@@ -9381,14 +9396,10 @@ mod tests {
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let basis_ab = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix_ab),
-            &scaled_rdp_ab,
-        );
-        let basis_c = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix_c),
-            &scaled_rdp_c,
-        );
+        let basis_ab =
+            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_ab), &scaled_rdp_ab);
+        let basis_c =
+            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix_c), &scaled_rdp_c);
         let combined_basis: Vec<F128> = basis_ab
             .iter()
             .zip(basis_c)
@@ -9399,15 +9410,12 @@ mod tests {
             .zip(combined_basis.iter())
             .map(|(&f, &b)| f * b)
             .fold(F128::ZERO, |acc, value| acc + value);
-        let (round0, lookahead) =
-            super::super::round0_and_round1_lookahead(&poly, &combined_basis);
+        let (round0, lookahead) = super::super::round0_and_round1_lookahead(&poly, &combined_basis);
         let direct = [(&suffix_ab, &scaled_rdp_ab), (&suffix_c, &scaled_rdp_c)]
             .into_iter()
             .map(|(suffix, scaled_rdp)| {
-                let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
-                    &suffix[2..],
-                    (log_n - 2) / 2,
-                );
+                let (eq_lo, eq_hi) =
+                    super::super::ring_switch::build_eq_split(&suffix[2..], (log_n - 2) / 2);
                 super::super::ring_switch::DirectFold2Factors {
                     eq_lo,
                     eq_hi,
@@ -9427,7 +9435,10 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            queries: log_inv_rates
+                .iter()
+                .map(|&rate| udr_queries(rate))
+                .collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -9489,9 +9500,7 @@ mod tests {
             let k_0 = 2;
             let log_inv_rate = 3;
             let mut rng = crate::challenger::RandomChallenger::new(seed);
-            let poly: Vec<F128> = (0..(1usize << log_n))
-                .map(|_| rng.sample_f128())
-                .collect();
+            let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
             let suffix_ab: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
             let suffix_c: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
             let scaled_rdp_ab: Vec<F128> = build_eq_table(
@@ -9537,10 +9546,8 @@ mod tests {
                         }
                     }
                 }
-                let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
-                    &suffix[4..],
-                    (log_n - 4) / 2,
-                );
+                let (eq_lo, eq_hi) =
+                    super::super::ring_switch::build_eq_split(&suffix[4..], (log_n - 4) / 2);
                 super::super::ring_switch::DirectFold4Factors {
                     eq_lo,
                     eq_hi,
@@ -9567,7 +9574,10 @@ mod tests {
                 initial_k,
                 recursive_log_msg_cols: vec![log_n - initial_k - k_0],
                 recursive_ks: vec![k_0],
-                queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+                queries: log_inv_rates
+                    .iter()
+                    .map(|&rate| udr_queries(rate))
+                    .collect(),
                 grinding_bits: vec![0; log_inv_rates.len()],
                 fold_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
@@ -9616,7 +9626,8 @@ mod tests {
 
             assert_eq!(got, ordinary, "direct-fold4 proof differs at log_n={log_n}");
             assert_eq!(
-                bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold4 proof/claim"),
+                bincode::serialize(&(got.clone(), target))
+                    .expect("serialize direct-fold4 proof/claim"),
                 bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
             );
 
@@ -9628,7 +9639,10 @@ mod tests {
                 initial_k,
                 recursive_log_msg_cols: vec![log_n - initial_k - k_0],
                 recursive_ks: vec![k_0],
-                queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+                queries: log_inv_rates
+                    .iter()
+                    .map(|&rate| udr_queries(rate))
+                    .collect(),
                 grinding_bits: vec![0; log_inv_rates.len()],
                 fold_grinding_bits: vec![0; 2],
                 ood_samples: vec![0; 2],
@@ -9663,7 +9677,10 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             state
         };
-        let mut f128 = || F128 { lo: next(), hi: next() };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
         for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16), (2048, 0)] {
             let total = 2 * (base + n_pairs);
             let f: Vec<F128> = (0..total).map(|_| f128()).collect();
@@ -9721,7 +9738,10 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             state
         };
-        let mut f128 = || F128 { lo: next(), hi: next() };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
         for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16)] {
             let total = 2 * (base + n_pairs);
             let f: Vec<F128> = (0..total).map(|_| f128()).collect();
@@ -9769,7 +9789,10 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             state
         };
-        let mut f128 = || F128 { lo: next(), hi: next() };
+        let mut f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
         for (n_pairs, base) in [(2usize, 0usize), (8, 0), (32, 4), (64, 16), (2048, 2048)] {
             let total = 2 * (base + n_pairs);
             let f: Vec<F128> = (0..total).map(|_| f128()).collect();
@@ -10715,8 +10738,7 @@ mod tests {
                     let mut dense = vec![F128::ZERO; 1usize << K];
                     dense[p] = value;
                     let want = transpose_forward_ntt_window_dense(&ntt, log_d, K, w, dense);
-                    let got =
-                        transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
+                    let got = transpose_forward_ntt_window_singleton(&ntt, log_d, K, w, p, value);
                     assert_eq!(got, want, "log_d={log_d} w={w} p={p}");
                 }
             }
@@ -10745,10 +10767,22 @@ mod tests {
         let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_d);
         let want = sparse_dense_oracle(log_d, &positions, &values);
-        let (got, stats) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true), Some(8));
-        let (off, _) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(false), Some(8));
+        let (got, stats) = transpose_forward_ntt_sparse_inner(
+            &ntt,
+            &positions,
+            &values,
+            log_d,
+            Some(true),
+            Some(8),
+        );
+        let (off, _) = transpose_forward_ntt_sparse_inner(
+            &ntt,
+            &positions,
+            &values,
+            log_d,
+            Some(false),
+            Some(8),
+        );
         assert_eq!(got, want);
         assert_eq!(off, want);
         assert_eq!(stats.singleton_hits, 0);
@@ -10772,8 +10806,14 @@ mod tests {
         let values: Vec<F128> = positions.iter().map(|_| ch.sample_f128()).collect();
         let ntt = AdditiveNttF128::standard(log_d);
         let want = sparse_dense_oracle(log_d, &positions, &values);
-        let (got, stats) =
-            transpose_forward_ntt_sparse_inner(&ntt, &positions, &values, log_d, Some(true), Some(8));
+        let (got, stats) = transpose_forward_ntt_sparse_inner(
+            &ntt,
+            &positions,
+            &values,
+            log_d,
+            Some(true),
+            Some(8),
+        );
         assert_eq!(got, want);
         assert_eq!(stats.singleton_hits, 2);
         assert_eq!(stats.multi_hits, 1);
@@ -10818,9 +10858,8 @@ mod tests {
             let wlen = 1usize << k;
             let last_w = (1usize << (log_d - k)) - 1;
             for &w in &[0usize, last_w] {
-                let mut ch = crate::challenger::RandomChallenger::new(
-                    0x0117_15EE ^ ((k * 8191 + w) as u64),
-                );
+                let mut ch =
+                    crate::challenger::RandomChallenger::new(0x0117_15EE ^ ((k * 8191 + w) as u64));
                 for nnz in 1..=(k / 2 + 1) {
                     let mut ps: Vec<usize> = vec![0, wlen - 1];
                     ps.truncate(nnz);
@@ -10835,8 +10874,7 @@ mod tests {
                     for (&p, &v) in ps.iter().zip(&vs) {
                         dense[p] += v;
                     }
-                    let (_, want) =
-                        transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
+                    let (_, want) = transpose_forward_ntt_window_dense(&ntt, log_d, k, w, dense);
                     let mut buf = take_singleton_buf(k);
                     expand_singleton_into(&ntt, log_d, k, w, ps[0], vs[0], &mut buf);
                     let mut scratch = take_singleton_buf(k);
@@ -10938,7 +10976,11 @@ mod tests {
         for d in 0..=20usize {
             let mut ch = crate::challenger::RandomChallenger::new(0x3EE7_u64 ^ d as u64);
             let point: Vec<F128> = (0..d).map(|_| ch.sample_f128()).collect();
-            assert_eq!(build_eq_table_split(&point), build_eq_table(&point), "d={d}");
+            assert_eq!(
+                build_eq_table_split(&point),
+                build_eq_table(&point),
+                "d={d}"
+            );
         }
     }
 
@@ -11017,8 +11059,7 @@ mod tests {
         let (mut lazy, lazy_start) = SumcheckProver::new(f, b, target);
         assert_eq!(lazy_start, dense_start);
 
-        let (dense_intro, dense_y) =
-            dense.introduce_new_with_eval(build_eq_table(&z));
+        let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
         let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
         assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
         dense.glue(beta);
@@ -11120,7 +11161,10 @@ mod tests {
             eq_hi[0] += F128::ONE;
             let (_, bad_b, _) =
                 fold_and_msg_lsb_inner(&f, &b, r, None, Some((&eq_lo, &eq_hi, gamma)));
-            assert_ne!(&*bad_b, &*want_b, "corrupted high factor went undetected d={d}");
+            assert_ne!(
+                &*bad_b, &*want_b,
+                "corrupted high factor went undetected d={d}"
+            );
         }
     }
 
@@ -11148,8 +11192,7 @@ mod tests {
             let (mut lazy, lazy_start) = SumcheckProver::new(f, b, target);
             assert_eq!(lazy_start, dense_start);
 
-            let (dense_intro, dense_y) =
-                dense.introduce_new_with_eval(build_eq_table(&z));
+            let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
             let (lazy_intro, lazy_y) = lazy.introduce_new_ood_factorized(&z).unwrap();
             assert_eq!((lazy_intro, lazy_y), (dense_intro, dense_y));
             dense.glue(beta);
@@ -11207,9 +11250,8 @@ mod tests {
             let ntt = AdditiveNttF128::standard(log_d.max(1));
             for top in 0..=log_d {
                 let n = 1usize << log_d;
-                let mut ch = crate::challenger::RandomChallenger::new(
-                    0x7A5E ^ ((log_d * 37 + top) as u64),
-                );
+                let mut ch =
+                    crate::challenger::RandomChallenger::new(0x7A5E ^ ((log_d * 37 + top) as u64));
                 let base: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
                 let mut a = base.clone();
                 let mut b = base;
@@ -11954,9 +11996,7 @@ mod tests {
                 super::super::ring_switch::build_fold_byte_table(&generators)
             })
             .collect();
-        let values: Vec<Vec<u64>> = (0..4)
-            .map(|_| (0..64).map(|_| next()).collect())
-            .collect();
+        let values: Vec<Vec<u64>> = (0..4).map(|_| (0..64).map(|_| next()).collect()).collect();
         let mats: Vec<[u64; 128]> = tables
             .iter()
             .map(|table| build_row_fold_mats(&table[..8 * 256]))
@@ -11999,19 +12039,15 @@ mod tests {
         let k_0 = 2;
         let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
-        let poly: Vec<F128> = (0..(1usize << log_n))
-            .map(|_| rng.sample_f128())
-            .collect();
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
         let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let combined_basis = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix),
-            &scaled_rdp,
-        );
+        let combined_basis =
+            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
         let target = poly
             .iter()
             .zip(combined_basis.iter())
@@ -12024,8 +12060,9 @@ mod tests {
         let low_eq = build_eq_table(&suffix[..6]);
         let mut a_state = vec![F128::ZERO; 64 * n_packed];
         for e in 0..64 {
-            let strided: Vec<F128> =
-                (0..poly.len() / 64).map(|rest| poly[64 * rest + e]).collect();
+            let strided: Vec<F128> = (0..poly.len() / 64)
+                .map(|rest| poly[64 * rest + e])
+                .collect();
             let bank = super::super::ring_switch::fold_1b_rows_naive(&strided, &tail_eq);
             let transposed = super::super::ring_switch::tensor_algebra_transpose(&bank);
             for (bit, value) in transposed.into_iter().enumerate() {
@@ -12070,7 +12107,10 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            queries: log_inv_rates
+                .iter()
+                .map(|&rate| udr_queries(rate))
+                .collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -12128,7 +12168,10 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            queries: log_inv_rates
+                .iter()
+                .map(|&rate| udr_queries(rate))
+                .collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -12678,8 +12721,7 @@ mod tests {
         );
         let initial_root = wtns_0.root();
 
-        let mut p_ch =
-            crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
+        let mut p_ch = crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
         let proof = recursive_prover_with_basis(
             &p_cfg,
             poly,
@@ -12696,8 +12738,7 @@ mod tests {
         format!("{proof:?}").hash(&mut h);
         eprintln!("PROOF_DIGEST {:016x}", h.finish());
 
-        let mut v_ch =
-            crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
+        let mut v_ch = crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
         assert!(
             recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
             "m29 blake3 proof must verify"
@@ -13203,9 +13244,8 @@ mod tests {
             let data: Vec<F128> = (0..n_leaves * leaf_size / 16)
                 .map(|i| F128::new(i as u64, (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
                 .collect();
-            let bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 16)
-            };
+            let bytes: &[u8] =
+                unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 16) };
             let mut busy_ms = 0.0f64;
             let gpu_tree = gpu_merkle_tree_for_open(bytes, n_leaves, leaf_size, &mut busy_ms)
                 .expect("GPU open-merkle session must complete when Metal is available");
@@ -13255,5 +13295,4 @@ mod tests {
             }
         }
     }
-
 }
