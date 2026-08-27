@@ -1320,10 +1320,7 @@ pub fn s_hat_v_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F12
 /// The two least-significant packed-polynomial index variables are retained
 /// instead of being folded at `x_inner_rest_tail[..2]`. Collapsing the banks
 /// with `eq(x_inner_rest_tail[..2], ·)` recovers [`s_hat_v_from_z_vec`].
-pub fn s_hat_v_quad_from_z_vec(
-    z_vec: &[F128],
-    x_inner_rest_tail: &[F128],
-) -> Vec<F128> {
+pub fn s_hat_v_quad_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -1473,10 +1470,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
 /// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
-pub fn s_hat_v_fold8_from_z_vec(
-    z_vec: &[F128],
-    x_inner_rest_tail: &[F128],
-) -> Vec<F128> {
+pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -1516,8 +1510,7 @@ pub fn s_hat_v_fold8_from_z_vec(
             |mut acc, (k, &weight)| {
                 let base = 64 * k * n_packed;
                 for bank in 0..64 {
-                    let block =
-                        &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
+                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
                     for packed in 0..n_packed {
                         acc[bank * n_packed + packed] += weight * block[packed];
                     }
@@ -1541,10 +1534,7 @@ pub fn s_hat_v_fold8_from_z_vec(
 /// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
 /// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
 /// addition is XOR.
-pub(crate) fn collapse_s_hat_v_fold8(
-    s_hat_v_fold8: &[F128],
-    low_point: &[F128],
-) -> Vec<F128> {
+pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
@@ -1687,9 +1677,8 @@ fn inner_product_unreduced(a: &[F128], b: &[F128]) -> F128 {
     target_feature = "vpclmulqdq"
 ))]
 fn inner_product_wide_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_IP_WIDE").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IP_WIDE").is_none());
     *ON
 }
 
@@ -2053,10 +2042,7 @@ fn build_direct_fold_table<const N: usize>(
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
         table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8]
-            .iter()
-            .enumerate()
-        {
+        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
             let half = 1usize << bit;
             for value in 0..half {
                 table[value + half] = table[value] + generator;
@@ -2119,6 +2105,7 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     r0 + r1
 }
 
+#[allow(dead_code)] // Scalar oracle for the generator-based table builder.
 pub(crate) fn build_direct_fold8_table(
     low_eq: &[F128; 64],
     fold_weight: &[F128; 64],
@@ -2629,9 +2616,8 @@ fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 /// `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full `build_eq_split`.
 #[inline]
 fn rs_elide_dead_basis_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
     *ON
 }
 
@@ -2768,6 +2754,136 @@ fn direct_fold8_states_par(
     (a_state, w_state, round0)
 }
 
+/// Build the two ranked DirectFold8 factor states in one pair of Rayon
+/// regions. This preserves every per-row allocation, transpose and final
+/// bit-major value from two calls to [`direct_fold8_states_par`]; only the
+/// duplicate pool entry/barrier and outer row-vector allocations are removed.
+fn direct_fold8_states_par_2way(
+    fold8: [&[F128]; 2],
+    low_eq: [&[F128; 64]; 2],
+    table: [&[F128]; 2],
+) -> (
+    (Vec<F128>, Vec<F128>, (F128, F128)),
+    (Vec<F128>, Vec<F128>, (F128, F128)),
+) {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    for claim in 0..2 {
+        debug_assert_eq!(fold8[claim].len(), 64 * n_packed);
+        debug_assert_eq!(table[claim].len(), FOLD_TABLE_TOTAL);
+    }
+
+    // Natural task order is claim-major then row-major. Indexed collect
+    // preserves exactly the two 64-row arrays produced by the incumbent calls.
+    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
+        || {
+            (0..128usize)
+                .into_par_iter()
+                .map(|task| {
+                    let claim = task / 64;
+                    let d_low = task % 64;
+                    let mut row = Vec::with_capacity(n_packed);
+                    let mut basis_product = low_eq[claim][d_low];
+                    row.push(fold_one_slot(basis_product, table[claim]));
+                    for _ in 1..n_packed {
+                        basis_product = crate::field::mul_by_x(basis_product);
+                        row.push(fold_one_slot(basis_product, table[claim]));
+                    }
+                    row
+                })
+                .collect()
+        },
+        || {
+            (0..128usize)
+                .into_par_iter()
+                .map(|task| {
+                    let claim = task / 64;
+                    let e = task % 64;
+                    tensor_algebra_transpose(
+                        &fold8[claim][e * n_packed..(e + 1) * n_packed],
+                    )
+                })
+                .collect()
+        },
+    );
+    let (w_rows_0, w_rows_1) = w_rows.split_at(64);
+    let (a_rows_0, a_rows_1) = a_rows.split_at(64);
+
+    // Keep all four destination buffers physically separate. One task owns
+    // one complete 64-element (1024-byte) row in every buffer. The slices are
+    // disjoint; their allocator alignment and possible boundary-line sharing
+    // are exactly the same as the incumbent per-claim gather.
+    let mut w_state_0 = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state_0 = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state_1 = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state_1 = vec![F128::ZERO; 64 * n_packed];
+    w_state_0
+        .par_chunks_mut(64)
+        .zip(a_state_0.par_chunks_mut(64))
+        .zip(w_state_1.par_chunks_mut(64))
+        .zip(a_state_1.par_chunks_mut(64))
+        .enumerate()
+        .for_each(|(bit, (((w_row_0, a_row_0), w_row_1), a_row_1))| {
+            for lane in 0..64 {
+                w_row_0[lane] = w_rows_0[lane][bit];
+                a_row_0[lane] = a_rows_0[lane][bit];
+                w_row_1[lane] = w_rows_1[lane][bit];
+                a_row_1[lane] = a_rows_1[lane][bit];
+            }
+        });
+
+    // Preserve incumbent claim order for the two independent reductions.
+    let round0_0 = direct_fold8_round0_wide(&a_state_0, &w_state_0);
+    let round0_1 = direct_fold8_round0_wide(&a_state_1, &w_state_1);
+    (
+        (a_state_0, w_state_0, round0_0),
+        (a_state_1, w_state_1, round0_1),
+    )
+}
+
+fn build_direct_fold8_factors_2way(
+    fold8: [&[F128]; 2],
+    suffix: [&[F128]; 2],
+    table: [&[F128]; 2],
+) -> (DirectFold8Factors, DirectFold8Factors) {
+    let low_eq_0: [F128; 64] = build_eq(&suffix[0][..6])
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
+    let low_eq_1: [F128; 64] = build_eq(&suffix[1][..6])
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
+    let ((a_state_0, w_state_0, round0_0), (a_state_1, w_state_1, round0_1)) =
+        direct_fold8_states_par_2way(fold8, [&low_eq_0, &low_eq_1], table);
+
+    let tail_0 = &suffix[0][6..];
+    let tail_1 = &suffix[1][6..];
+    let (eq_lo_0, eq_hi_0) = build_eq_split(tail_0, deferred_split_n_lo(tail_0.len()));
+    let (eq_lo_1, eq_hi_1) = build_eq_split(tail_1, deferred_split_n_lo(tail_1.len()));
+    (
+        DirectFold8Factors {
+            eq_lo: eq_lo_0,
+            eq_hi: eq_hi_0,
+            a_state: a_state_0,
+            w_state: w_state_0,
+            round0: round0_0,
+        },
+        DirectFold8Factors {
+            eq_lo: eq_lo_1,
+            eq_hi: eq_hi_1,
+            a_state: a_state_1,
+            w_state: w_state_1,
+            round0: round0_1,
+        },
+    )
+}
+
+#[inline]
+fn rs_states_2way_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_STATES_2WAY").is_none());
+    *ON
+}
+
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
 /// suffix tensor is sparse (e.g. the hash-chain claim). Verifier-side
@@ -2798,13 +2914,14 @@ pub enum RsEqInd {
     /// Deferred dense: the `γ_k·B_k` buffer is **not** materialized. Instead the
     /// fold ingredients (`build_eq_split` factors + the γ-baked byte table) are
     /// carried so pcs's combine can fold each slot on the fly and accumulate it
-    /// straight into `b_combined` — avoiding a 2^(m-7) materialize + readback
-    /// per claim. `value(j) = deferred_dense_value(eq_lo, eq_hi, table, log2(B), j)`,
-    /// `B = eq_lo.len()`; byte-identical to `Dense(fold_b128_elems_split(..))`.
+    /// straight into `b_combined`. When the ranked all-direct route proves the
+    /// factors dead, both vectors may be empty and `logical_len` preserves the
+    /// shape that downstream length checks still require.
     DeferredDense {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
+        logical_len: usize,
     },
     Sparse {
         len: usize,
@@ -2817,7 +2934,7 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDense { logical_len, .. } => *logical_len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2840,6 +2957,7 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
@@ -2862,6 +2980,7 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
@@ -3132,7 +3251,6 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, or 64·2^LOG_PACKING"
         );
     }
-
     // Per-orig-claim "precomputed?" predicate. Empty precomputed slice → all
     // claims need fold (matches the existing behavior bit-for-bit).
     let has_precomputed =
@@ -3417,7 +3535,9 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let retain_direct_c = cfg!(target_arch = "x86_64")
         && l == (1usize << 25)
         && n == 2
-        && work.first().is_some_and(|claim| claim.s_hat_v_quad.is_some())
+        && work
+            .first()
+            .is_some_and(|claim| claim.s_hat_v_quad.is_some())
         && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none();
@@ -3426,10 +3546,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // route and the full-width ranked route (see `rs_tail_par_enabled`). The
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
-    let claim_output = |i: usize,
-                        w: ClaimWork,
-                        g: F128|
-     -> (RingSwitchProof, RingSwitchBatchOutput) {
+    let claim_output =
+        |i: usize, w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -3457,8 +3575,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         products
                     });
                     let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
                     Some(DirectFold2Factors {
                         eq_lo,
                         eq_hi,
@@ -3489,14 +3606,9 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 _ => None,
             };
             let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                    Some(build_direct_fold8_factors(
-                        fold8,
-                        dense_suffixes[d],
-                        &table,
-                        tail_par,
-                    ))
-                }
+                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => Some(
+                    build_direct_fold8_factors(fold8, dense_suffixes[d], &table, tail_par),
+                ),
                 _ => None,
             };
             let rs_eq_ind = match kinds[i] {
@@ -3507,16 +3619,16 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // `b_combined` (no 2^(m-7) materialize + readback). The
                         // table build is the only work done here (16·256 adds).
                         if elide_basis {
-                            // Dead basis: only `RsEqInd::len()` is observed
-                            // downstream, and it is `eq_lo.len() *
-                            // eq_hi.len()`. Hand over factors with exactly the
-                            // shape `build_eq_split` would have produced.
+                            // Dead basis: only `RsEqInd::len()` is observed.
+                            // Preserve the logical tensor shape without
+                            // allocating or zeroing factors no caller reads.
                             let n_lo = split_n_lo(dense_suffixes[d].len());
                             let n_hi = dense_suffixes[d].len() - n_lo;
                             RsEqInd::DeferredDense {
-                                eq_lo: vec![F128::ZERO; 1usize << n_lo],
-                                eq_hi: vec![F128::ZERO; 1usize << n_hi],
+                                eq_lo: Vec::new(),
+                                eq_hi: Vec::new(),
                                 table,
+                                logical_len: (1usize << n_lo) * (1usize << n_hi),
                             }
                         } else {
                             let (eq_lo, eq_hi) = &dense_splits[d];
@@ -3524,6 +3636,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                                 eq_lo: eq_lo.clone(),
                                 eq_hi: eq_hi.clone(),
                                 table,
+                                logical_len: eq_lo.len() * eq_hi.len(),
                             }
                         }
                     } else {
@@ -3545,7 +3658,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     direct_fold8,
                 },
             )
-    };
+        };
     // Indexed parallel collect preserves claim order, so the output vector —
     // and with it every transcript-visible byte downstream — is identical to
     // the sequential route.
@@ -3564,22 +3677,120 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // and that `direct_fold8_factor_tail_par_matches_seq` pins.
     const TAIL_PAR_MIN_CLAIMS: usize = 4;
     let n_claims = work.len();
-    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = if tail_par
-        && n_claims >= TAIL_PAR_MIN_CLAIMS
-    {
-        use rayon::prelude::*;
-        work.into_par_iter()
-            .zip(gammas_rs.par_iter())
-            .enumerate()
-            .map(|(i, (w, &g))| claim_output(i, w, g))
-            .collect()
-    } else {
-        work.into_iter()
-            .zip(gammas_rs.iter())
-            .enumerate()
-            .map(|(i, (w, &g))| claim_output(i, w, g))
-            .collect()
-    };
+    // Exact ranked two-claim seam. Both claims have already observed their
+    // messages and all gammas have already been sampled, so batching these
+    // pure state builders cannot alter the Fiat-Shamir schedule. The gate is
+    // deliberately narrower than the algebraic capability of the helper:
+    // the kill-switch and every non-ranked/fallback shape run the existing
+    // `claim_output` body verbatim.
+    let use_states_2way = cfg!(target_arch = "x86_64")
+        && elide_basis
+        && n_claims == 2
+        && l == (1usize << 25)
+        && all_claims_yield_fold8
+        && tail_par
+        && rs_states_2way_enabled();
+    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> =
+        if use_states_2way {
+            let mut work = work.into_iter();
+            let work_0 = work.next().expect("two-way gate checked claim zero");
+            let work_1 = work.next().expect("two-way gate checked claim one");
+            debug_assert!(work.next().is_none());
+            debug_assert!(work_0.s_hat_v_quad.is_none() && work_1.s_hat_v_quad.is_none());
+            debug_assert!(work_0.s_hat_v_fold4.is_none() && work_1.s_hat_v_fold4.is_none());
+
+            // Match `claim_output` exactly: retain each input equality Vec,
+            // allocate the same scaled Vec with map+collect, then construct
+            // the same two 16×256 tables before borrowing them for the
+            // batched state builder. In particular, do not fold gamma into
+            // `eq_r_dprime` in place: that is a separate allocator experiment.
+            let scaled_eq_0: Vec<F128> = work_0
+                .eq_r_dprime
+                .iter()
+                .map(|value| gammas_rs[0] * *value)
+                .collect();
+            let scaled_eq_1: Vec<F128> = work_1
+                .eq_r_dprime
+                .iter()
+                .map(|value| gammas_rs[1] * *value)
+                .collect();
+            let table_0 = build_fold_byte_table(&scaled_eq_0);
+            let table_1 = build_fold_byte_table(&scaled_eq_1);
+
+            let d_0 = match kinds[0] {
+                Kind::Dense(d) => d,
+                Kind::Sparse(_) => unreachable!("two-way gate requires dense claim zero"),
+            };
+            let d_1 = match kinds[1] {
+                Kind::Dense(d) => d,
+                Kind::Sparse(_) => unreachable!("two-way gate requires dense claim one"),
+            };
+            let fold8_0 = work_0
+                .s_hat_v_fold8
+                .as_deref()
+                .expect("two-way gate checked claim-zero fold8");
+            let fold8_1 = work_1
+                .s_hat_v_fold8
+                .as_deref()
+                .expect("two-way gate checked claim-one fold8");
+            let (direct_0, direct_1) = build_direct_fold8_factors_2way(
+                [fold8_0, fold8_1],
+                [dense_suffixes[d_0], dense_suffixes[d_1]],
+                [&table_0, &table_1],
+            );
+
+            let logical_len_0 = 1usize << dense_suffixes[d_0].len();
+            let logical_len_1 = 1usize << dense_suffixes[d_1].len();
+            vec![
+                (
+                    RingSwitchProof {
+                        s_hat_v: work_0.s_hat_v,
+                    },
+                    RingSwitchBatchOutput {
+                        rs_eq_ind: RsEqInd::DeferredDense {
+                            eq_lo: Vec::new(),
+                            eq_hi: Vec::new(),
+                            table: table_0,
+                            logical_len: logical_len_0,
+                        },
+                        sumcheck_claim: work_0.sumcheck_claim,
+                        direct_fold2: None,
+                        direct_fold4: None,
+                        direct_fold8: Some(direct_0),
+                    },
+                ),
+                (
+                    RingSwitchProof {
+                        s_hat_v: work_1.s_hat_v,
+                    },
+                    RingSwitchBatchOutput {
+                        rs_eq_ind: RsEqInd::DeferredDense {
+                            eq_lo: Vec::new(),
+                            eq_hi: Vec::new(),
+                            table: table_1,
+                            logical_len: logical_len_1,
+                        },
+                        sumcheck_claim: work_1.sumcheck_claim,
+                        direct_fold2: None,
+                        direct_fold4: None,
+                        direct_fold8: Some(direct_1),
+                    },
+                ),
+            ]
+        } else if tail_par && n_claims >= TAIL_PAR_MIN_CLAIMS {
+            use rayon::prelude::*;
+            work.into_par_iter()
+                .zip(gammas_rs.par_iter())
+                .enumerate()
+                .map(|(i, (w, &g))| claim_output(i, w, g))
+                .collect()
+        } else {
+            work.into_iter()
+                .zip(gammas_rs.iter())
+                .enumerate()
+                .map(|(i, (w, &g))| claim_output(i, w, g))
+                .collect()
+        };
 
     if trace {
         eprintln!(
@@ -4580,7 +4791,6 @@ mod tests {
             &padding,
             &mut direct_challenger,
         );
-
         assert_eq!(direct_gammas, baseline_gammas);
         assert_eq!(direct[0].0, baseline[0].0);
         assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
@@ -4627,12 +4837,7 @@ mod tests {
         let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
         let mut ab_point = inner_rest.clone();
         ab_point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(
-            &z_packed_lincheck,
-            M,
-            K_LOG,
-            &build_eq(&outer),
-        );
+        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
         let quad = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
         let padding = PaddingSpec::dense(M);
 
@@ -4665,18 +4870,12 @@ mod tests {
         for high in 0..(packed.len() / 4) {
             for e in 0..4 {
                 for d in 0..4 {
-                    product_oracle[4 * e + d] +=
-                        packed[4 * high + e] * ab_basis[4 * high + d];
+                    product_oracle[4 * e + d] += packed[4 * high + e] * ab_basis[4 * high + d];
                 }
             }
         }
         assert_eq!(
-            direct[0]
-                .1
-                .direct_fold2
-                .as_ref()
-                .unwrap()
-                .products,
+            direct[0].1.direct_fold2.as_ref().unwrap().products,
             Some(product_oracle)
         );
     }
