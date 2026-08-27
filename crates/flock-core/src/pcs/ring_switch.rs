@@ -2805,6 +2805,7 @@ pub enum RsEqInd {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
+        logical_len: usize,
     },
     Sparse {
         len: usize,
@@ -2817,7 +2818,7 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDense { logical_len, .. } => *logical_len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2836,11 +2837,7 @@ impl RsEqInd {
                     *o += gamma * x;
                 }
             }
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
                     *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
@@ -2858,11 +2855,7 @@ impl RsEqInd {
     pub fn to_dense(&self) -> Vec<F128> {
         match self {
             Self::Dense(v) => v.clone(),
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
                 (0..l)
@@ -3513,17 +3506,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             // shape `build_eq_split` would have produced.
                             let n_lo = split_n_lo(dense_suffixes[d].len());
                             let n_hi = dense_suffixes[d].len() - n_lo;
-                            RsEqInd::DeferredDense {
-                                eq_lo: vec![F128::ZERO; 1usize << n_lo],
-                                eq_hi: vec![F128::ZERO; 1usize << n_hi],
-                                table,
+                            RsEqInd::DeferredDense { eq_lo: Vec::new(), eq_hi: Vec::new(), table, logical_len: (1usize << n_lo) * (1usize << n_hi),
                             }
                         } else {
                             let (eq_lo, eq_hi) = &dense_splits[d];
-                            RsEqInd::DeferredDense {
-                                eq_lo: eq_lo.clone(),
-                                eq_hi: eq_hi.clone(),
-                                table,
+                            RsEqInd::DeferredDense { eq_lo: eq_lo.clone(), eq_hi: eq_hi.clone(), table, logical_len: eq_lo.len() * eq_hi.len(),
                             }
                         }
                     } else {
