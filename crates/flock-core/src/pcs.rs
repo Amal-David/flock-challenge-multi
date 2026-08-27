@@ -288,10 +288,6 @@ struct CombinedClaim {
     round2_lookahead: Option<Fold4Lookahead2>,
     /// Direct-fold4 round-3 trivariate lookahead (coefficients in r0, r1, r2).
     round3_lookahead: Option<Fold4Lookahead3>,
-    /// Direct-fold8 round-4 quadrivariate lookahead.
-    round4_lookahead: Option<Fold8Lookahead4>,
-    /// Direct-fold8 round-5 quintivariate lookahead.
-    round5_lookahead: Option<Fold8Lookahead5>,
     /// AB sufficient statistics for direct materialization after rounds 0/1.
     /// `b_combined` contains the ordinary C contribution only.
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
@@ -403,8 +399,6 @@ fn messages_from_direct_products(
 
 pub(crate) type Fold4Lookahead2 = [F128; 18];
 pub(crate) type Fold4Lookahead3 = [F128; 54];
-pub(crate) type Fold8Lookahead4 = [F128; 162];
-pub(crate) type Fold8Lookahead5 = [F128; 486];
 
 #[inline(always)]
 fn quadratic_coefficients([at_zero, at_one, leading]: [F128; 3]) -> [F128; 3] {
@@ -527,127 +521,6 @@ pub(crate) fn messages_from_direct_products_fold4(
     ((round0_u0[0], round0_u2[0]), round1, round2, round3)
 }
 
-/// Build the two message-polynomial coefficient tensors at `round` from a
-/// 64×64 bilinear product matrix. Same algebra as
-/// [`direct_fold4_message_coefficients`] one level wider: prior-coordinate
-/// grid digit 0/1 selects the zero/one endpoint, 2 the quadratic leading
-/// term (both endpoint banks); higher coordinates are summed independently.
-/// Selected banks always form a subcube, so the product sum iterates set
-/// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
-/// F128 adds total — scalar-negligible).
-fn direct_fold8_message_coefficients(
-    h: &[F128; 4096],
-    round: usize,
-) -> (Vec<F128>, Vec<F128>) {
-    debug_assert!(round < 6);
-    let grid_len = 3usize.pow(round as u32);
-    let mut endpoints = vec![F128::ZERO; 2 * grid_len];
-
-    let product = |mask: u64| {
-        let mut sum = F128::ZERO;
-        let mut e_bits = mask;
-        while e_bits != 0 {
-            let e = e_bits.trailing_zeros() as usize;
-            e_bits &= e_bits - 1;
-            let row = &h[64 * e..64 * e + 64];
-            let mut d_bits = mask;
-            while d_bits != 0 {
-                let d = d_bits.trailing_zeros() as usize;
-                d_bits &= d_bits - 1;
-                sum += row[d];
-            }
-        }
-        sum
-    };
-
-    for current_leading in 0..2 {
-        for grid_index in 0..grid_len {
-            let mut total = F128::ZERO;
-            let high_assignments = 1usize << (5 - round);
-            for high in 0..high_assignments {
-                let mut mask = 0u64;
-                'bank: for bank in 0..64usize {
-                    if current_leading == 0 && ((bank >> round) & 1) != 0 {
-                        continue;
-                    }
-                    for bit in 0..round {
-                        let divisor = 3usize.pow((round - bit - 1) as u32);
-                        let mode = (grid_index / divisor) % 3;
-                        if mode < 2 && ((bank >> bit) & 1) != mode {
-                            continue 'bank;
-                        }
-                    }
-                    if bank >> (round + 1) != high {
-                        continue;
-                    }
-                    mask |= 1 << bank;
-                }
-                total += product(mask);
-            }
-            endpoints[current_leading * grid_len + grid_index] = total;
-        }
-    }
-
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
-}
-
-/// Derive the first six transcript messages from sixty-four-bank direct
-/// sufficient statistics, without materializing either N-sized polynomial.
-/// The returned lookaheads are respectively uni-, bi-, tri-, quadri-, and
-/// quintivariate quadratics in the already-sampled challenges.
-#[cfg(any())]
-pub(crate) fn messages_from_direct_products_fold8(
-    factors: &[ring_switch::DirectFold8Factors],
-) -> (
-    (F128, F128),
-    [F128; 6],
-    Fold4Lookahead2,
-    Fold4Lookahead3,
-    Fold8Lookahead4,
-    Fold8Lookahead5,
-) {
-    let mut h = [F128::ZERO; 4096];
-    for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
-            *out += value;
-        }
-    }
-
-    let (round0_u0, round0_u2) = direct_fold8_message_coefficients(&h, 0);
-    let (round1_u0, round1_u2) = direct_fold8_message_coefficients(&h, 1);
-    let (round2_u0, round2_u2) = direct_fold8_message_coefficients(&h, 2);
-    let (round3_u0, round3_u2) = direct_fold8_message_coefficients(&h, 3);
-    let (round4_u0, round4_u2) = direct_fold8_message_coefficients(&h, 4);
-    let (round5_u0, round5_u2) = direct_fold8_message_coefficients(&h, 5);
-
-    let mut round1 = [F128::ZERO; 6];
-    round1[..3].copy_from_slice(&round1_u0);
-    round1[3..].copy_from_slice(&round1_u2);
-    let mut round2 = [F128::ZERO; 18];
-    round2[..9].copy_from_slice(&round2_u0);
-    round2[9..].copy_from_slice(&round2_u2);
-    let mut round3 = [F128::ZERO; 54];
-    round3[..27].copy_from_slice(&round3_u0);
-    round3[27..].copy_from_slice(&round3_u2);
-    let mut round4 = [F128::ZERO; 162];
-    round4[..81].copy_from_slice(&round4_u0);
-    round4[81..].copy_from_slice(&round4_u2);
-    let mut round5 = [F128::ZERO; 486];
-    round5[..243].copy_from_slice(&round5_u0);
-    round5[243..].copy_from_slice(&round5_u2);
-
-    (
-        (round0_u0[0], round0_u2[0]),
-        round1,
-        round2,
-        round3,
-        round4,
-        round5,
-    )
-}
 
 /// Sixteen-bank route: both ranked claims must expose a complete
 /// direct-fold4 bundle, so no ordinary basis sweep or duplicate statistics
@@ -1155,8 +1028,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     let mut round2_lookahead = None;
     let mut round3_lookahead = None;
-    let mut round4_lookahead = None;
-    let mut round5_lookahead = None;
     if let Some(direct) = direct_fold8.as_ref() {
         for claim in direct {
             round0_u0 += claim.round0.0;
@@ -1244,8 +1115,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round1_lookahead,
         round2_lookahead,
         round3_lookahead,
-        round4_lookahead,
-        round5_lookahead,
         direct_fold2,
         direct_fold4,
         direct_fold8,
