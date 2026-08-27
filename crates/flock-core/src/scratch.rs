@@ -141,8 +141,7 @@ const PENDING_CAP: usize = 8;
 /// [`void_pending_tag`] — which runs on every buffer hand-out, including
 /// every [`crate::alloc_uninit_vec`] — costs `PENDING_CAP` relaxed loads and
 /// takes the mutex only on an actual hit.
-static PENDING_PTRS: [AtomicUsize; PENDING_CAP] =
-    [const { AtomicUsize::new(0) }; PENDING_CAP];
+static PENDING_PTRS: [AtomicUsize; PENDING_CAP] = [const { AtomicUsize::new(0) }; PENDING_CAP];
 
 /// Republish the lock-free mirror from the registry. Call while holding the
 /// [`PENDING_TAGS`] lock, after every mutation.
