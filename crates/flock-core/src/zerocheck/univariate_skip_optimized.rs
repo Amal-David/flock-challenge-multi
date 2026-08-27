@@ -2398,10 +2398,9 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
         // here — this level compiles for every arch and the loads were the
         // bulk of the band tail.
         let mut bank_f128 = [F128::ZERO; ELL];
+        let bank_ptr = state.plane_banks.as_ptr() as *const [u8; 16 * ELL];
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
+            let bank: &[u8; 16 * ELL] = unsafe { &*bank_ptr.add(u) };
             kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
             for lane in 0..ELL {
                 state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
@@ -2800,7 +2799,13 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ab_inner.as_ptr().add(byte_base_b),
+                    state.chunk_ab_bytes[b_med].as_mut_ptr(),
+                    64,
+                );
+            }
         }
         #[cfg(target_arch = "x86_64")]
         if pf_spread {
@@ -2817,13 +2822,10 @@ fn process_one_x_hi_ab_only(
         if let Some((_, mats, bank_bits)) = eq_fold {
             let w_idx = x_outer_lo >> bank_bits;
             let u = x_outer_lo & ((1usize << bank_bits) - 1);
-            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
-                .try_into()
-                .expect("one 16x16 qword matrix block per w");
-            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
-                [u * 16 * ELL..(u + 1) * 16 * ELL])
-                .try_into()
-                .expect("one plane bank per low index");
+            let mats_ptr = mats.as_ptr() as *const [u64; 256];
+            let mats_w: &[u64; 256] = unsafe { &*mats_ptr.add(w_idx) };
+            let bank_ptr = state.plane_banks.as_mut_ptr() as *mut [u8; 16 * ELL];
+            let bank: &mut [u8; 16 * ELL] = unsafe { &mut *bank_ptr.add(u) };
             if plane_first_write && w_idx == 0 {
                 kernels::write_convert_ab_nomul_gfni(
                     &state.chunk_ab_bytes,
@@ -2872,10 +2874,9 @@ fn process_one_x_hi_ab_only(
         // shared `add_scaled` leaf, which selects the architecture kernel.
         let mut bank_f128 = [F128::ZERO; ELL];
         let wide = r1_eqfold_x4_enabled();
+        let bank_ptr = state.plane_banks.as_ptr() as *const [u8; 16 * ELL];
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
+            let bank: &[u8; 16 * ELL] = unsafe { &*bank_ptr.add(u) };
             kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
             if wide {
                 crate::field::f128_slice::add_scaled(
