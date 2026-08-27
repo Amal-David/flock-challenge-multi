@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -62,7 +62,9 @@ pub(super) struct BstaticPartials;
     target_feature = "avx512bw"
 )))]
 #[inline]
-pub(super) fn prepare_bstatic(_inv_table: &InvNttTableByteSingleGf8) -> Option<&'static BstaticPartials> {
+pub(super) fn prepare_bstatic(
+    _inv_table: &InvNttTableByteSingleGf8,
+) -> Option<&'static BstaticPartials> {
     None
 }
 
@@ -87,7 +89,9 @@ pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
 #[derive(Clone, Copy)]
 pub(super) struct ShiftReducePlan {
     img2: bool,
+    #[allow(dead_code)] // Reserved by the matching rollback selector.
     pidx: bool,
+    #[allow(dead_code)] // Reserved by the matching rollback selector.
     offw: bool,
 }
 
@@ -101,9 +105,7 @@ impl ShiftReducePlan {
 }
 
 #[inline]
-pub(super) fn prepare_shift_reduce(
-    inv_table: &InvNttTableByteSingleGf8,
-) -> ShiftReducePlan {
+pub(super) fn prepare_shift_reduce(inv_table: &InvNttTableByteSingleGf8) -> ShiftReducePlan {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "gfni",
@@ -376,16 +378,7 @@ pub(super) fn shift_reduce_inner_ab_at(
         let mut a_col = [F8::ZERO; 64];
         let mut b_col = [F8::ZERO; 64];
         shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            byte_base,
-            0,
-            out,
-            &mut a_col,
-            &mut b_col,
-            None,
-            nt,
+            a_packed, b_packed, inv_table, byte_base, 0, out, &mut a_col, &mut b_col, None, nt,
         );
     }
 }
@@ -531,12 +524,7 @@ pub(super) fn write_convert_ab_nomul_gfni(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every 64-byte load/store. The caller proves write-before-read.
     unsafe {
-        x86_64::write_convert_ab_nomul_x86_gfni(
-            chunk_ab_bytes,
-            n_b_med,
-            mats,
-            bank_planes,
-        );
+        x86_64::write_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
     }
 }
 
@@ -571,6 +559,33 @@ pub(super) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super
         }
         *slot = super::F128 { lo, hi };
     }
+}
+
+/// Apply the 64-point F8 inverse-NTT/LDE to every F128 bit plane, then map
+/// the 128 resulting F8 rows back into F128 with prebuilt GFNI matrices.
+/// The scalar twin performs 8,192 reduced GHASH products; this path evaluates
+/// the identical F2-linear maps in byte planes and transposes only once.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn ntt_extend_f128_vec_gfni(
+    in_s: &[super::F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    mats: &[u64],
+) -> Vec<super::F128> {
+    assert_eq!(in_s.len(), 64);
+    assert_eq!(inv_table.ell, 64);
+    assert_eq!(inv_table.n_chunks, 8);
+    assert_eq!(mats.len(), 128 * 16);
+    // SAFETY: cfg supplies every target feature; the assertions establish
+    // the fixed ranked geometry and the matrix/input bounds.
+    unsafe { x86_64::ntt_extend_f128_vec_gfni_x86(in_s, inv_table, mats) }
 }
 
 /// Ascending bulk fetch of one four-window C group into the worker staging
@@ -727,10 +742,14 @@ impl CBankNibbleLut {
         debug_assert_eq!(mask_tables.len(), 512);
         let (t_lo, t_hi) = mask_tables.split_at(256);
         let mut lut = Self {
-            lo_n0_lo: [0; 16], lo_n0_hi: [0; 16],
-            lo_n1_lo: [0; 16], lo_n1_hi: [0; 16],
-            hi_n0_lo: [0; 16], hi_n0_hi: [0; 16],
-            hi_n1_lo: [0; 16], hi_n1_hi: [0; 16],
+            lo_n0_lo: [0; 16],
+            lo_n0_hi: [0; 16],
+            lo_n1_lo: [0; 16],
+            lo_n1_hi: [0; 16],
+            hi_n0_lo: [0; 16],
+            hi_n0_hi: [0; 16],
+            hi_n1_lo: [0; 16],
+            hi_n1_hi: [0; 16],
         };
         for i in 0..16 {
             lut.lo_n0_lo[i] = t_lo[i].lo;
@@ -753,7 +772,10 @@ impl CBankNibbleLut {
 ))]
 pub(super) fn build_c_bank_nibble_luts(mask_tables: &[super::F128]) -> Vec<CBankNibbleLut> {
     debug_assert_eq!(mask_tables.len() % 512, 0);
-    mask_tables.chunks_exact(512).map(CBankNibbleLut::new).collect()
+    mask_tables
+        .chunks_exact(512)
+        .map(CBankNibbleLut::new)
+        .collect()
 }
 
 #[cfg(all(
@@ -772,13 +794,9 @@ pub(super) fn accumulate_c_banks_prebuilt(
     // SAFETY: cfg supplies the features and fixed arrays bound all accesses.
     unsafe {
         if c_nibble_lut_enabled() {
-            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(
-                c_block, n_b_med, lut, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, lut, partial_c);
         } else {
-            x86_64::accumulate_c_banks_x86_avx512(
-                c_block, n_b_med, mask_tables, partial_c,
-            );
+            x86_64::accumulate_c_banks_x86_avx512(c_block, n_b_med, mask_tables, partial_c);
         }
     }
 }
