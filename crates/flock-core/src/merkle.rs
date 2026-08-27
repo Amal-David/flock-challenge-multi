@@ -331,21 +331,23 @@ fn blake3_hash_many<const N: usize>(
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        let msg_ptr = msgs.as_ptr() as *const [u8; N];
+        let mut inputs: [core::mem::MaybeUninit<&[u8; N]>; BLAKE3_BATCH] =
+            [core::mem::MaybeUninit::uninit(); BLAKE3_BATCH];
         for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+            slot.write(unsafe { &*msg_ptr.add(i) });
         }
+        // SAFETY: The first `n` slots are initialized with valid references.
+        let inputs_ref: &[&[u8; N]] = unsafe {
+            core::slice::from_raw_parts(inputs.as_ptr() as *const &[u8; N], n)
+        };
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
-            &inputs[..n],
+            inputs_ref,
             &BLAKE3_IV,
             0,
             blake3::IncrementCounter::No,
@@ -540,7 +542,7 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
     // initialized bytes with no padding.
     let read_bytes: &[u8] =
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
-    const SERIAL_LEVEL_NODES: usize = 1024;
+    const SERIAL_LEVEL_NODES: usize = 512;
     let serial = write.len() <= SERIAL_LEVEL_NODES;
 
     match kind {
@@ -548,9 +550,10 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
+                let group = (write.len() / 32).next_power_of_two().clamp(64, BLAKE3_GROUP);
                 write
-                    .par_chunks_mut(BLAKE3_GROUP)
-                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .par_chunks_mut(group)
+                    .zip(read_bytes.par_chunks(group * 64))
                     .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }

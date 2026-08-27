@@ -367,7 +367,13 @@ fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
             .ok()?;
             let mut ids = Vec::new();
             for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
+                if let Some((a, b)) = part.trim().split_once('-') {
+                    let a: usize = a.trim().parse().ok()?;
+                    let b: usize = b.trim().parse().ok()?;
+                    ids.extend(a..=b);
+                } else {
+                    ids.push(part.trim().parse::<usize>().ok()?);
+                }
             }
             if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
                 return None;
@@ -993,7 +999,13 @@ fn st_fmp_pairs() -> Option<&'static Vec<(usize, usize)>> {
             .ok()?;
             let mut ids = Vec::new();
             for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
+                if let Some((a, b)) = part.trim().split_once('-') {
+                    let a: usize = a.trim().parse().ok()?;
+                    let b: usize = b.trim().parse().ok()?;
+                    ids.extend(a..=b);
+                } else {
+                    ids.push(part.trim().parse::<usize>().ok()?);
+                }
             }
             if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
                 return None;
