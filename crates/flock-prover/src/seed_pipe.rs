@@ -1134,7 +1134,11 @@ mod tests {
     #[test]
     fn seed_pipe_matches_reference_at_ranked_size() {
         for &seed in &[0x1234_5678_9ABC_DEF0u64, WARMUP_SEED, 424242, u64::MAX] {
-            assert_eq!(generate_compressions_par(18, seed), reference(18, seed), "seed={seed}");
+            assert_eq!(
+                generate_compressions_par(18, seed),
+                reference(18, seed),
+                "seed={seed}"
+            );
         }
     }
 
@@ -1144,7 +1148,10 @@ mod tests {
         let mut buf = prefaulted_blocks(1 << 12);
         fill_compressions_par(&mut buf, 12, 0xDEAD_BEEF);
         assert_eq!(buf, reference(12, 0xDEAD_BEEF));
-        assert_eq!(gen_block(generator_init(12, 0xDEAD_BEEF), 77), reference(12, 0xDEAD_BEEF)[77]);
+        assert_eq!(
+            gen_block(generator_init(12, 0xDEAD_BEEF), 77),
+            reference(12, 0xDEAD_BEEF)[77]
+        );
     }
 
     #[test]
@@ -1284,7 +1291,9 @@ mod tests {
             assert_eq!(r, buf);
             eprintln!(
                 "[probe] round {round}: serial reference {:.3} ms, par (alloc+fill) {:.3} ms, par fill into prefaulted {:.3} ms",
-                ms(t_ref), ms(t_par), ms(t_fill)
+                ms(t_ref),
+                ms(t_par),
+                ms(t_fill)
             );
         }
     }
