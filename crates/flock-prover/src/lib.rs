@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! `flock-prover`: the Apple-silicon-optimized end-to-end Flock prover.
 //!
 //! Builds on [`flock_core`] (the protocol library + verifier) with the

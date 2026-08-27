@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! `flock-core`: the protocol library and verifier for Flock's R1CS-over-GF(2)
 //! sumcheck/zerocheck PIOP with a multilinear PCS.
 //!
@@ -188,7 +189,6 @@ pub(crate) mod topology_pool {
         }
     }
 }
-
 
 /// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
 /// THP in `madvise` mode, so without this hint the prover's 32 MB-1 GB
