@@ -189,7 +189,6 @@ pub(crate) mod topology_pool {
     }
 }
 
-
 /// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
 /// THP in `madvise` mode, so without this hint the prover's 32 MB-1 GB
 /// working buffers sit on 4 KiB pages through every strided sweep. Advising
@@ -371,3 +370,5 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// Yukon variance-redraw marker: intentionally no executable behavior.
