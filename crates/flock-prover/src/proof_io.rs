@@ -707,10 +707,17 @@ mod tests {
         let mut reference = Vec::new();
         write_header(&mut reference, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut reference, &bundle).expect("reference serialize");
-        assert_eq!(bytes, reference, "fast to_bytes diverged from single-shot bincode");
+        assert_eq!(
+            bytes, reference,
+            "fast to_bytes diverged from single-shot bincode"
+        );
 
         // The pre-encoded-prefix path must also reproduce the same bytes.
-        stash_pre_encoded_prefix(&bundle.commitment, &bundle.proof.zerocheck, &bundle.proof.lincheck);
+        stash_pre_encoded_prefix(
+            &bundle.commitment,
+            &bundle.proof.zerocheck,
+            &bundle.proof.lincheck,
+        );
         assert_eq!(
             bundle.to_bytes(),
             reference,
