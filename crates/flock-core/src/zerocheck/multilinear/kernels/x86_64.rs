@@ -1138,7 +1138,13 @@ pub(crate) fn zc_tail_pf_enabled() -> bool {
 /// One body consumes sixteen lines from each of `a` and `b`, so the hint for
 /// body `T + ZC_TAIL_PF_TILES` is issued at the head of body `T` and every
 /// line is still requested exactly once — only earlier.
-const ZC_TAIL_PF_TILES: usize = 2;
+/// Four, not two. A look-ahead has to cover the memory latency it is hiding:
+/// two bodies is about four kibibytes of stream ahead of the consumer, which
+/// is short of a DRAM round trip at the rate this loop retires lines, and the
+/// cost of going further is only that the hinted lines sit in L1 a little
+/// longer — at thirty-two lines per body, four bodies is a hundred and
+/// twenty-eight lines against a cache that holds many times that.
+const ZC_TAIL_PF_TILES: usize = 4;
 
 /// `FLOCK_NO_ZC_TAIL_PF_SPREAD=1` restores the incumbent delivery of the
 /// composed tail fold's input prefetch: all thirty-two hints of a body
