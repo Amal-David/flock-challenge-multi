@@ -316,6 +316,12 @@ const BLAKE3_BATCH: usize = 16;
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
 /// `Vec`-per-call formulation this costs nothing per batch.
+///
+/// With the `inline-message-schedule` feature on (forwarded from
+/// flock-prover's `bench` / `pgo` aggregates), the inner SIMD loop is
+/// marked `#[inline(always)]` so the SIGMA load hoists out of the
+/// FFI per-iteration prologue; without it, the default inliner
+/// threshold is enough.
 #[inline]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
@@ -326,6 +332,8 @@ fn blake3_hash_many<const N: usize>(
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
+    #[cfg(feature = "inline-message-schedule")]
+    let _ = (flags, flags_start, flags_end); // keep all three live
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
