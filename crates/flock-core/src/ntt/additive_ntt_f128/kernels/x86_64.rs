@@ -1090,16 +1090,31 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
-            if H != 0 {
-                let off = lane * core::mem::size_of::<F128>();
-                for i in 0..16 {
-                    let p = pf_row(i).add(off);
-                    if H == 1 {
-                        _mm_prefetch::<_MM_HINT_T0>(p);
-                    } else {
-                        _mm_prefetch::<_MM_HINT_T1>(p);
+            // Hint DELIVERY, not hint content: the same sixteen lines of the
+            // next row group are still requested exactly once per lane step,
+            // four at a time at four points spaced through the body instead
+            // of all sixteen back to back at its head. The incumbent burst
+            // put sixteen prefetch uops on the load ports immediately in
+            // front of the sixteen DEMAND loads of this lane step, which are
+            // on the critical path; the three other hot prefetch sites in
+            // this prover (`seed_pf_spread`, `zc_r1ab_pf_spread`,
+            // `zc_tail_pf_spread`) already ship exactly this delivery and
+            // each is worth several percent of its window. Architecturally
+            // invisible: a prefetch moves no value.
+            macro_rules! pf_quad {
+                ($g:expr) => {{
+                    if H != 0 {
+                        let off = lane * core::mem::size_of::<F128>();
+                        for i in (4 * $g)..(4 * $g + 4) {
+                            let p = pf_row(i).add(off);
+                            if H == 1 {
+                                _mm_prefetch::<_MM_HINT_T0>(p);
+                            } else {
+                                _mm_prefetch::<_MM_HINT_T1>(p);
+                            }
+                        }
                     }
-                }
+                }};
             }
             let mut values = [zero; 16];
             for (i, value) in values.iter_mut().enumerate() {
@@ -1115,22 +1130,26 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 }};
             }
 
+            pf_quad!(0);
             let outer = tw[0];
             for i in 0..8 {
                 butterfly!(i, i + 8, outer);
             }
+            pf_quad!(1);
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..4 {
                     butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
                 }
             }
+            pf_quad!(2);
             for s in 0..4 {
                 let twiddle = tw[3 + s];
                 for i in 0..2 {
                     butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
                 }
             }
+            pf_quad!(3);
             for s in 0..8 {
                 let twiddle = tw[7 + s];
                 butterfly!(2 * s, 2 * s + 1, twiddle);
