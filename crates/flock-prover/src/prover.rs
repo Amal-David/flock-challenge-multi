@@ -454,6 +454,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -482,6 +483,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -511,6 +513,36 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        false,
+        challenger,
+    )
+}
+
+/// Ranked fused-witness entry: the supplied codeword already contains exact
+/// additive-NTT layers 1..8 and commitment resumes at the deep pass.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_from_seeded_block_major_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    seeded_codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        Some(ab_inner),
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        Some(seeded_codeword),
+        true,
         challenger,
     )
 }
@@ -526,6 +558,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    seeded_codeword: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -553,6 +586,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        seeded_codeword,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -784,6 +818,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
 }
@@ -799,6 +834,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    seeded_codeword: bool,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -835,8 +871,14 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = match prefaulted_codeword {
+                Some(buf) if seeded_codeword => {
+                    pcs::commit_seeded_into(&z_packed, pcs_params, buf)
+                }
                 Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-                None => pcs::commit(&z_packed, pcs_params),
+                None => {
+                    assert!(!seeded_codeword, "seeded commit requires its codeword");
+                    pcs::commit(&z_packed, pcs_params)
+                }
             };
             flock_core::gaptime::mark("commit: work done");
             r

@@ -220,6 +220,19 @@ pub fn commit_into(
     finalize_commit(codeword, z_packed, params)
 }
 
+/// Commit a ranked codeword whose additive-NTT layers 1..8 were already
+/// published by the fused witness producer.
+pub fn commit_seeded_into(
+    z_packed: &[F128],
+    params: &PcsParams,
+    codeword: Vec<F128>,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    assert_eq!(codeword.len(), params.codeword_len_f128());
+    finalize_commit_mode(codeword, z_packed, params, true)
+}
+
 /// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
 /// logical cores, including efficiency cores that otherwise idle).
 /// Built lazily — the ranked worker's untimed warm-up prove pays the spawn.
@@ -242,9 +255,18 @@ pub(crate) fn wide_hash_pool() -> &'static rayon::ThreadPool {
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
 fn finalize_commit(
+    codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    finalize_commit_mode(codeword, z_packed, params, false)
+}
+
+fn finalize_commit_mode(
     mut codeword: Vec<F128>,
     z_packed: &[F128],
     params: &PcsParams,
+    seeded: bool,
 ) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let ntt = AdditiveNttF128::standard(params.k_code());
@@ -255,7 +277,8 @@ fn finalize_commit(
     // size, GPU Merkle pipeline available (Metal present, not latched off,
     // FLOCK_NO_GPU / FLOCK_NO_GPU_MERKLE unset). Everything else — and any
     // in-flight GPU failure — lands on the existing pure-CPU path below.
-    if params.merkle_hash == HashKind::Blake3
+    if !seeded
+        && params.merkle_hash == HashKind::Blake3
         && params.n_leaves() >= (1 << 18)
         && merkle::blake3_leaf_size_is_batchable(params.leaf_size_bytes())
         && crate::gpu::merkle::available()
@@ -324,11 +347,7 @@ fn finalize_commit(
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
-    ntt.rs_encode_interleaved_on_range_done(
-        z_packed,
-        &mut codeword,
-        num_ntts,
-        &|range, sub_data| {
+    let on_range_done = |range: core::ops::Range<usize>, sub_data: &[F128]| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
             // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
             // the one-shot `merkle_tree` cast in the previous barrier path.
@@ -418,8 +437,21 @@ fn finalize_commit(
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
             }
-        },
-    );
+    };
+    if seeded {
+        ntt.deep_encode_interleaved_on_range_done(
+            &mut codeword,
+            num_ntts,
+            &on_range_done,
+        );
+    } else {
+        ntt.rs_encode_interleaved_on_range_done(
+            z_packed,
+            &mut codeword,
+            num_ntts,
+            &on_range_done,
+        );
+    }
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",

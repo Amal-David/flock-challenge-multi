@@ -1371,6 +1371,18 @@ fn live_witgen_simd_enabled() -> bool {
     }
 }
 
+fn fused_witgen_ntt_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_NTT_FUSE").is_none());
+    cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && *ON
+}
+
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
 /// explicit staged-NT toggle so tests can assert byte equality of the paths.
 /// SIMD dispatch follows [`live_witgen_simd_enabled`].
@@ -1674,6 +1686,191 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
 
+/// Ranked q-major witness producer fused with additive-NTT layers 1..8.
+///
+/// Block `idx = q + 1024*k + 65536*i` supplies message positions
+/// `2*idx` and `2*idx+1`, so one q-task owns exactly NTT tasks `2q` and
+/// `2q+1`. Every witness destination and every published codeword row is
+/// therefore disjoint across q-tasks.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn generate_witness_and_seed_top_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    ctx: &flock_core::ntt::additive_ntt_f128::RankedSeedTopCtx,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+
+    const F128_PER_BLOCK: usize = K / 128;
+    const U32_PER_BLOCK: usize = K / 32;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const Q_TASKS: usize = 1024;
+    const K_PER_Q: usize = 64;
+    const QUADRANTS: usize = 4;
+    const OCTAS_PER_Q: usize = 32;
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+    const Z_LOCAL_LINES: usize = 8 * BYTES_PER_BLOCK / 64;
+
+    assert_eq!(n_blocks_log, 18);
+    let n_total = 1usize << n_blocks_log;
+    assert_eq!(blocks.len(), n_total);
+    assert!(witgen_simd::witgen_ab_nt_enabled());
+    assert!(witgen_simd::witgen_ab_winstream_enabled());
+
+    let skip_bytes = flock_core::zerocheck::univariate_skip_optimized::
+        planned_round1_gpu_prefix_bytes(K_LOG + n_blocks_log);
+    assert_eq!(skip_bytes % BYTES_PER_BLOCK, 0);
+    let skip_blocks = skip_bytes / BYTES_PER_BLOCK;
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let mut ab_inner =
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        );
+    ab_inner.set_invalid_prefix_bytes(skip_bytes);
+
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(
+        K_SKIP,
+        flock_core::field::F8::ZERO,
+    );
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+        K_SKIP,
+        flock_core::field::F8(1u8 << K_SKIP),
+    );
+    let inv_table =
+        flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let ab_bytes = ab_inner.as_bytes_mut();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::
+        prepare_round1_ab_window_plan(&inv_table, ab_bytes, true);
+
+    let elide_on = witgen_simd::const_elide_enabled();
+    let ab_elide = elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+    let elide = [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide];
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let z_addr = z.as_mut_ptr() as usize;
+    let a_addr = a.as_mut_ptr() as usize;
+    let b_addr = b.as_mut_ptr() as usize;
+    let ab_addr = ab_bytes.as_mut_ptr() as usize;
+
+    let uninit_lines = |n: usize| {
+        let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+        v.reserve_exact(n);
+        // SAFETY: MaybeUninit needs no initialization; each consumer writes
+        // its complete logical region before reading it.
+        unsafe { v.set_len(n) };
+        v
+    };
+
+    let next_q = std::sync::atomic::AtomicUsize::new(0);
+    rayon::broadcast(|_| {
+        use std::sync::atomic::Ordering;
+        let mut st_even = ctx.take_staging();
+        let mut st_odd = ctx.take_staging();
+        let mut z_local_lines = uninit_lines(Z_LOCAL_LINES);
+        let mut proj_lines = uninit_lines(STAGE_LINES);
+        let z_local = z_local_lines.as_mut_ptr().cast::<F128>();
+        let proj_stage = proj_lines.as_mut_ptr().cast::<u32>();
+
+        loop {
+            let q = next_q.fetch_add(1, Ordering::Relaxed);
+            if q >= Q_TASKS {
+                break;
+            }
+            unsafe {
+                for octa in 0..OCTAS_PER_Q {
+                    let k0 = 2 * octa;
+                    let indices: [usize; 8] = std::array::from_fn(|j| {
+                        let kk = j / QUADRANTS;
+                        let i = j % QUADRANTS;
+                        q + Q_TASKS * (k0 + kk) + (Q_TASKS * K_PER_Q) * i
+                    });
+                    let offsets_u32 = indices.map(|idx| idx * U32_PER_BLOCK);
+                    let offsets_bytes = indices.map(|idx| idx * BYTES_PER_BLOCK);
+                    let mut live = 0u32;
+                    for (j, &idx) in indices.iter().enumerate() {
+                        if idx >= skip_blocks {
+                            live |= 1 << j;
+                        }
+                    }
+                    let inputs = match blocks {
+                        crate::seed_pipe::BlockSource::Slice(s) => {
+                            blake3_witgen8::OctaInputs::Blocks(
+                                std::array::from_fn(|j| &s[indices[j]]),
+                            )
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len } => {
+                            debug_assert!(indices.iter().all(|&idx| idx < len));
+                            blake3_witgen8::OctaInputs::ClosedIdx { init, indices }
+                        }
+                    };
+                    let proj = blake3_witgen8::StreamProj {
+                        stage: proj_stage,
+                        out: ab_addr as *mut u8,
+                        out_offsets: Some(offsets_bytes),
+                        live,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                    };
+                    blake3_witgen8::build_octa_witness_ab_stream_elide_indexed(
+                        inputs,
+                        z_addr as *mut u32,
+                        a_addr as *mut u32,
+                        b_addr as *mut u32,
+                        offsets_u32,
+                        Some(z_local.cast::<u32>()),
+                        None,
+                        Some(proj),
+                        elide,
+                        z_nt,
+                    );
+                    for kk in 0..2 {
+                        let src = z_local.add(8 * kk * 64);
+                        ctx.seed_group(st_even.as_mut_ptr(), k0 + kk, src, 2, 0);
+                        ctx.seed_group(st_odd.as_mut_ptr(), k0 + kk, src, 2, 1);
+                    }
+                }
+                ctx.finish_task(st_even.as_mut_ptr(), 2 * q);
+                ctx.finish_task(st_odd.as_mut_ptr(), 2 * q + 1);
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            }
+        }
+    });
+
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        b.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    (z, a, b, ab_inner)
+}
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
@@ -1838,6 +2035,7 @@ fn generate_round1_inner_octa(
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                                out_offsets: None,
                                 live,
                                 inv_table,
                                 plan: win_plan,
@@ -3292,6 +3490,75 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    target_feature = "avx2",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if fused_witgen_ntt_enabled()
+                    && self.n_blocks_log() == 18
+                    && blocks.len() == (1usize << 18)
+                    && self.pcs_params.num_ntts() == 64
+                    && self.pcs_params.log_inv_rate == 1
+                    && live_witgen_simd_enabled()
+                    && witgen_simd::witgen_ab_nt_enabled()
+                    && witgen_simd::witgen_ab_winstream_enabled()
+                    && rayon::current_num_threads() >= 2
+                {
+                    let fused = crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                        let (codeword, ()) =
+                            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || ());
+                        let mut codeword = codeword?;
+                        let _zero_lane_skip =
+                            flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
+                                self.pcs_params.num_ntts(),
+                                flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::
+                                    lanes_for_padding(
+                                        self.pcs_params.num_ntts(),
+                                        K_LOG,
+                                        USEFUL_BITS,
+                                    ),
+                            );
+                        let ntt = flock_core::ntt::AdditiveNttF128::standard(
+                            self.pcs_params.k_code(),
+                        );
+                        let Some(ctx) =
+                            ntt.ranked_seed_top_ctx(&mut codeword, self.pcs_params.num_ntts())
+                        else {
+                            flock_core::scratch::give_f128(codeword);
+                            return None;
+                        };
+                        flock_core::gaptime::mark("witness+seed-top: pool entered");
+                        let witness = generate_witness_and_seed_top_fused(
+                            blocks,
+                            self.n_blocks_log(),
+                            &ctx,
+                        );
+                        flock_core::gaptime::mark("witness+seed-top: work done");
+                        Some((codeword, witness))
+                    });
+                    if let Some((
+                        codeword,
+                        (z_packed, a_packed_f128, b_packed_f128, ab_inner),
+                    )) = fused
+                    {
+                        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+                        return crate::prover::
+                            prove_fast_ligerito_from_seeded_block_major_witness(
+                                &self.r1cs,
+                                &self.pcs_params,
+                                z_packed,
+                                a_packed_f128,
+                                b_packed_f128,
+                                ab_inner,
+                                lc_circuit,
+                                codeword,
+                                challenger,
+                            );
+                    }
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -3697,6 +3964,27 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_witgen_q_mapping_partitions_ranked_blocks() {
+        const Q: usize = 1024;
+        const S: usize = 2048;
+        const B: usize = 1 << 17;
+        let mut seen = vec![false; 1 << 18];
+        for q in 0..Q {
+            for k in 0..64 {
+                for i in 0..4 {
+                    let idx = q + Q * k + (Q * 64) * i;
+                    assert!(!seen[idx]);
+                    seen[idx] = true;
+                    for parity in 0..2 {
+                        assert_eq!(2 * idx + parity, 2 * q + k * S + i * B + parity);
+                    }
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|hit| hit));
+    }
 
     /// The 4-wide lockstep quad builder must reproduce the scalar driver
     /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and

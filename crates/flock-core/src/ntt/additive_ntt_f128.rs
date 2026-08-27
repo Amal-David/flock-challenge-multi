@@ -887,6 +887,141 @@ pub struct AdditiveNttF128 {
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
 
+/// Ranked-only seed/top encoder context used by the fused BLAKE3 witness
+/// producer. It applies exactly the same layers 1..8 and direct publication
+/// kernels as [`AdditiveNttF128::seed_top_fused8_pass`], but accepts each
+/// 64-row seed group as soon as its eight source blocks exist.
+#[derive(Clone)]
+pub struct RankedSeedTopCtx {
+    ntt: AdditiveNttF128,
+    codeword_base: usize,
+    tw4: [[F128; 15]; 8],
+    seed_right: F128,
+    seed_dense: [F128; 3],
+    stage_perm: bool,
+    odd_tail: usize,
+    zmm_aligned: bool,
+}
+
+impl RankedSeedTopCtx {
+    /// Allocate one write-before-read 512-row staging block.
+    pub fn take_staging(&self) -> Vec<F128> {
+        staging_block(512, 64)
+    }
+
+    /// Seed one logical `k` group for one ranked task.
+    ///
+    /// # Safety
+    /// `staging` owns 512 rows of 64 F128 values. `src` owns eight source
+    /// rows of 64 values in four-quarter geometry, and `src_r < 2`.
+    pub unsafe fn seed_group(
+        &self,
+        staging: *mut F128,
+        k: usize,
+        src: *const F128,
+        src_quarter: usize,
+        src_r: usize,
+    ) {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            let kp = seed_top_stage_row(k, self.stage_perm);
+            kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                src,
+                src_quarter,
+                src_r,
+                staging.add(kp * 64),
+                staging.add((256 + kp) * 64),
+                64,
+                64,
+                self.seed_right,
+                &self.seed_dense,
+                core::ptr::null(),
+            );
+            return;
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            let _ = (staging, k, src, src_quarter, src_r);
+            unreachable!("ranked seed/top context is unavailable on this target");
+        }
+    }
+
+    /// Finish layers 3..8 for task `r`, publish its 512 disjoint codeword
+    /// rows non-temporally, and make them globally visible.
+    ///
+    /// # Safety
+    /// `staging` was completely seeded for task `r`; the context's codeword
+    /// allocation remains live and exclusively owned by the fused producer.
+    pub unsafe fn finish_task(&self, staging: *mut F128, r: usize) {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            const BLOCK_SIZE: usize = 1 << 17;
+            const SUB_STRIDE: usize = 1 << 11;
+            st_fmp_fold4(
+                staging,
+                64,
+                SUB_STRIDE,
+                r,
+                self.odd_tail,
+                self.stage_perm,
+                &self.tw4,
+            );
+            let lanes = row_lanes(r, 64, self.odd_tail);
+            let base = self.codeword_base as *mut F128;
+            if self.zmm_aligned {
+                self.ntt.seed_top_direct_publish2::<true>(
+                    staging,
+                    base,
+                    64,
+                    BLOCK_SIZE,
+                    SUB_STRIDE,
+                    r,
+                    lanes,
+                    self.stage_perm,
+                );
+            } else {
+                self.ntt.seed_top_direct_publish2::<false>(
+                    staging,
+                    base,
+                    64,
+                    BLOCK_SIZE,
+                    SUB_STRIDE,
+                    r,
+                    lanes,
+                    self.stage_perm,
+                );
+            }
+            core::arch::x86_64::_mm_sfence();
+            return;
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            let _ = (staging, r);
+            unreachable!("ranked seed/top context is unavailable on this target");
+        }
+    }
+}
+
 /// Prefetch schedule for the seed-fused top pass's message gather.
 ///
 /// Returns `(distance, lines_per_row, spread)`; a zero distance emits no
@@ -1514,6 +1649,108 @@ impl AdditiveNttF128 {
             evals,
             precomputed_twiddles,
         }
+    }
+
+    /// Build the exact ranked seed/top context, or return `None` for every
+    /// other target, geometry, alignment, or disabled production switch.
+    pub fn ranked_seed_top_ctx(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) -> Option<RankedSeedTopCtx> {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            const LOG_D: usize = 20;
+            if self.log_domain_size() != LOG_D
+                || num_ntts != 64
+                || codeword.len() != (1usize << LOG_D) * num_ntts
+                || Self::interleaved_n_top(LOG_D, num_ntts) != 9
+                || !Self::top_fusion_available()
+                || ntt_top_fusion_disabled()
+                || ntt_seed_top_fusion_disabled()
+                || ntt_direct_fused2_publish_disabled()
+                || !Self::scatter_nt_enabled()
+            {
+                return None;
+            }
+            let odd_tail = ranked_zero_odd_tail_lanes(LOG_D, num_ntts);
+            if !direct_fused2_publish_shape(LOG_D, num_ntts, odd_tail) {
+                return None;
+            }
+            let base = codeword.as_mut_ptr() as usize;
+            if base % 16 != 0 {
+                return None;
+            }
+
+            let mut seed_tw = [[F128::ZERO; 3]; 2];
+            for (block, tw) in seed_tw.iter_mut().enumerate() {
+                tw[0] = self.twiddle(1, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(2, 2 * block + s);
+                }
+            }
+            let tw4: [[F128; 15]; 8] = std::array::from_fn(|block| {
+                let mut tw = [F128::ZERO; 15];
+                tw[0] = self.twiddle(3, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(4, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(5, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(6, 8 * block + s);
+                }
+                tw
+            });
+            Some(RankedSeedTopCtx {
+                ntt: self.clone(),
+                codeword_base: base,
+                tw4,
+                seed_right: seed_tw[0][2],
+                seed_dense: seed_tw[1],
+                stage_perm: Self::stage_perm_enabled(),
+                odd_tail,
+                zmm_aligned: base % 64 == 0,
+            })
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            let _ = (codeword, num_ntts);
+            None
+        }
+    }
+
+    /// Finish a ranked codeword whose layers 1..8 were already published by
+    /// [`RankedSeedTopCtx`], invoking the established deep-pass callbacks.
+    pub(crate) fn deep_encode_interleaved_on_range_done(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        assert_eq!(self.log_domain_size(), 20);
+        assert_eq!(num_ntts, 64);
+        assert_eq!(codeword.len(), (1usize << 20) * num_ntts);
+        assert_eq!(Self::interleaved_n_top(20, num_ntts), 9);
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            codeword,
+            num_ntts,
+            9,
+            None,
+            Some(on_range_done),
+            None,
+        );
     }
 
     pub fn log_domain_size(&self) -> usize {
