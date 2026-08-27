@@ -545,7 +545,7 @@ pub(super) fn write_convert_ab_nomul_gfni(
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
 /// GFNI drain.
 #[inline]
-pub(super) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super::F128; 64]) {
+pub(crate) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super::F128; 64]) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",

@@ -1313,17 +1313,8 @@ fn fold_block_major_gfni(
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
-        for (col, slot) in o.iter_mut().enumerate() {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
-            }
-            for byte in 8..16 {
-                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            *slot = F128 { lo, hi };
-        }
+        let out64: &mut [F128; 64] = o.try_into().expect("64-element block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(&acc, out64);
     });
     out
 }

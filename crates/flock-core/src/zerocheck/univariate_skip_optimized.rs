@@ -39,6 +39,7 @@ use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
+pub(crate) use kernels::c_plane_bank_to_f128;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
@@ -343,7 +344,7 @@ pub(crate) fn convert_table() -> &'static [F128] {
 
 const C_MASK_TABLE_STRIDE: usize = 512;
 
-fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
+pub(crate) fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
     let mut tables = crate::scratch::take_f128(eq_lo_scaled.len() * C_MASK_TABLE_STRIDE);
