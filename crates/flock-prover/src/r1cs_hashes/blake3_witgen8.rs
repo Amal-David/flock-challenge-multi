@@ -75,12 +75,12 @@ const _ELIDE_GEOMETRY: () = {
     // only while every elided PREFIX is pair-aligned. (Elided tails need no
     // such property: a half-covered trailing pair degrades to the same
     // single-chunk stream in both.)
-    assert!(DUMP_CHUNKS % 2 == 0);
-    assert!(ELIDE_B_PREFIX_CHUNKS % 2 == 0);
+    assert!(DUMP_CHUNKS.is_multiple_of(2));
+    assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
     // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
     // stays strictly inside the same content-independent constant run.
     assert!(ELIDE_B_TAIL_CHUNK_WIN >= ELIDE_B_TAIL_CHUNK);
-    assert!(ELIDE_B_TAIL_CHUNK_WIN % 2 == 0);
+    assert!(ELIDE_B_TAIL_CHUNK_WIN.is_multiple_of(2));
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
 
@@ -168,8 +168,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +204,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +215,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +224,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -298,6 +289,7 @@ fn xor_v8(a: V8, b: V8) -> V8 {
 /// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
 /// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
+#[allow(dead_code)]
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
     #[cfg(target_feature = "avx512vl")]
@@ -403,7 +395,7 @@ const _RING_GEOMETRY: () = {
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
     // Every epoch boundary is a whole number of drain steps.
-    assert!(RING_WORDS % STEP_WORDS == 0);
+    assert!(RING_WORDS.is_multiple_of(STEP_WORDS));
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
@@ -755,6 +747,7 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
 
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
 /// 32-byte block runs. Temporal stores only.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     unsafe {
@@ -807,6 +800,7 @@ fn spread_nt_enabled() -> bool {
 /// Caller contract: destinations are not read again until after an
 /// `_mm_sfence()` on this thread (the witness task issues one per rayon
 /// task; same-thread reads are self-consistent regardless).
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
     unsafe {
@@ -858,7 +852,7 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
 #[inline(always)]
 unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     unsafe {
-        if wide_nt && p as usize % 32 == 0 {
+        if wide_nt && (p as usize).is_multiple_of(32) {
             _mm256_stream_si256(p.cast::<__m256i>(), v);
             return;
         }
@@ -924,17 +918,14 @@ unsafe fn emit_pair(
 /// block transforms by [`StreamProj::project_blocks`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// are already in the projection's own staging (they are its input). The
+/// publisher loads each staged row once and derives z immediately, before the
+/// transform, so no separate z-row scratch has to survive the outlined call.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    z_lo: *const V8,
-    z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -951,30 +942,34 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
             emit_pair(
                 self.z.add(o),
-                *self.z_lo.add(j),
-                *self.z_hi.add(j),
+                and_v8(a_lo, b_lo),
+                and_v8(a_hi, b_hi),
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1079,9 +1074,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1266,16 +1259,9 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
-
                 let g = abs_word / 8;
                 let mut flags = base;
                 if g < z_g1 {
@@ -1300,8 +1286,6 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    z_lo: z_lo.as_ptr(),
-                    z_hi: z_hi.as_ptr(),
                     flags,
                 };
 
@@ -1310,7 +1294,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1422,6 +1410,7 @@ impl Drain8<'_> {
 /// AVX2 required. `dst` owns 8 contiguous `U32_PER_BLOCK`-word blocks and is
 /// 16-byte aligned; `win` owns 8 contiguous `U32_PER_BLOCK`-word blocks and
 /// is disjoint from `dst` and from `stage`.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt_win(
     stage: *const V8,
@@ -1466,6 +1455,7 @@ unsafe fn dump_range_nt_win(
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_elide(
     stage: *const V8,
@@ -1493,6 +1483,7 @@ unsafe fn dump_elide(
 
 /// [`dump_elide`]'s dual-destination form: same elide range selection, always
 /// non-temporal into `dst`, always FULL into `win`. See [`dump_range_nt_win`].
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_elide_win(
     stage: *const V8,
@@ -1676,8 +1667,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes

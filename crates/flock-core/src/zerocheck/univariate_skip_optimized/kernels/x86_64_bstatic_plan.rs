@@ -44,10 +44,20 @@ pub(crate) const BSTATIC_GENERIC_PLAN: usize = 32;
 
 const fn row(mask: u64, expected: u64) -> BstaticRow {
     if mask == 0 {
-        return BstaticRow { mask, expected, kind: ROW_GENERIC, vary: 0 };
+        return BstaticRow {
+            mask,
+            expected,
+            kind: ROW_GENERIC,
+            vary: 0,
+        };
     }
     if mask == u64::MAX && expected == 0 {
-        return BstaticRow { mask, expected, kind: ROW_ZERO, vary: 0 };
+        return BstaticRow {
+            mask,
+            expected,
+            kind: ROW_ZERO,
+            vary: 0,
+        };
     }
     let mut vary = 0u8;
     let mut j = 0;
@@ -58,13 +68,28 @@ const fn row(mask: u64, expected: u64) -> BstaticRow {
         j += 1;
     }
     if vary.count_ones() <= 6 {
-        BstaticRow { mask, expected, kind: ROW_STATIC, vary }
+        BstaticRow {
+            mask,
+            expected,
+            kind: ROW_STATIC,
+            vary,
+        }
     } else {
-        BstaticRow { mask, expected, kind: ROW_GENERIC, vary: 0 }
+        BstaticRow {
+            mask,
+            expected,
+            kind: ROW_GENERIC,
+            vary: 0,
+        }
     }
 }
 
-const G: BstaticRow = BstaticRow { mask: 0, expected: 0, kind: ROW_GENERIC, vary: 0 };
+const G: BstaticRow = BstaticRow {
+    mask: 0,
+    expected: 0,
+    kind: ROW_GENERIC,
+    vary: 0,
+};
 
 #[rustfmt::skip]
 pub(crate) const BSTATIC_PLAN: [[BstaticRow; 8]; 33] = [
