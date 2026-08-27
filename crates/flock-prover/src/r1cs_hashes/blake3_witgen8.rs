@@ -168,8 +168,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +204,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +215,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +224,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -588,21 +579,19 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t> {
+struct W8<'t, const FLUSH: bool> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
-    flush: bool,
 }
 
-impl<'t> W8<'t> {
+impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>) -> Self {
         Self {
             pending,
             stage,
             drain,
-            flush,
         }
     }
 
@@ -610,7 +599,7 @@ impl<'t> W8<'t> {
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
             store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
-            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
@@ -849,6 +838,105 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
     }
 }
 
+/// Transpose sixteen consecutive stage words into the same low/high rows as
+/// two adjacent [`tr8_chunk`] calls.
+///
+/// For every output row `r`, `lo[r]` receives words `w..w+8` and `hi[r]`
+/// receives words `w+8..w+16` from lane `r` of the stage.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_chunk(stage: *const V8, w: usize) -> ([V8; 8], [V8; 8]) {
+    unsafe {
+        // Every load contains two complete stage words. The stage is only
+        // contractually V8-aligned, so these ZMM loads must remain unaligned.
+        let x0 = _mm512_loadu_si512(stage.add(w).cast::<__m512i>());
+        let x1 = _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>());
+        let x2 = _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>());
+        let x3 = _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>());
+        let x4 = _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>());
+        let x5 = _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>());
+        let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
+        let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
+
+        // Four source rows by four destination columns.
+        let cols_03 = _mm512_setr_epi32(
+            0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27,
+        );
+        let cols_47 = _mm512_setr_epi32(
+            4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31,
+        );
+        let a0 = _mm512_permutex2var_epi32(x0, cols_03, x1);
+        let a1 = _mm512_permutex2var_epi32(x0, cols_47, x1);
+        let a2 = _mm512_permutex2var_epi32(x2, cols_03, x3);
+        let a3 = _mm512_permutex2var_epi32(x2, cols_47, x3);
+        let a4 = _mm512_permutex2var_epi32(x4, cols_03, x5);
+        let a5 = _mm512_permutex2var_epi32(x4, cols_47, x5);
+        let a6 = _mm512_permutex2var_epi32(x6, cols_03, x7);
+        let a7 = _mm512_permutex2var_epi32(x6, cols_47, x7);
+
+        // Eight source rows by two destination columns.
+        let cols_01 = _mm512_setr_epi32(
+            0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23,
+        );
+        let cols_23 = _mm512_setr_epi32(
+            8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31,
+        );
+        let b0 = _mm512_permutex2var_epi32(a0, cols_01, a2);
+        let b1 = _mm512_permutex2var_epi32(a0, cols_23, a2);
+        let b2 = _mm512_permutex2var_epi32(a1, cols_01, a3);
+        let b3 = _mm512_permutex2var_epi32(a1, cols_23, a3);
+        let b4 = _mm512_permutex2var_epi32(a4, cols_01, a6);
+        let b5 = _mm512_permutex2var_epi32(a4, cols_23, a6);
+        let b6 = _mm512_permutex2var_epi32(a5, cols_01, a7);
+        let b7 = _mm512_permutex2var_epi32(a5, cols_23, a7);
+
+        // Sixteen source rows, one destination column per ZMM.
+        let low = _mm512_setr_epi32(
+            0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23,
+        );
+        let high = _mm512_setr_epi32(
+            8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31,
+        );
+        let r0 = _mm512_permutex2var_epi32(b0, low, b4);
+        let r1 = _mm512_permutex2var_epi32(b0, high, b4);
+        let r2 = _mm512_permutex2var_epi32(b1, low, b5);
+        let r3 = _mm512_permutex2var_epi32(b1, high, b5);
+        let r4 = _mm512_permutex2var_epi32(b2, low, b6);
+        let r5 = _mm512_permutex2var_epi32(b2, high, b6);
+        let r6 = _mm512_permutex2var_epi32(b3, low, b7);
+        let r7 = _mm512_permutex2var_epi32(b3, high, b7);
+
+        (
+            [
+                _mm512_castsi512_si256(r0),
+                _mm512_castsi512_si256(r1),
+                _mm512_castsi512_si256(r2),
+                _mm512_castsi512_si256(r3),
+                _mm512_castsi512_si256(r4),
+                _mm512_castsi512_si256(r5),
+                _mm512_castsi512_si256(r6),
+                _mm512_castsi512_si256(r7),
+            ],
+            [
+                _mm512_extracti64x4_epi64::<1>(r0),
+                _mm512_extracti64x4_epi64::<1>(r1),
+                _mm512_extracti64x4_epi64::<1>(r2),
+                _mm512_extracti64x4_epi64::<1>(r3),
+                _mm512_extracti64x4_epi64::<1>(r4),
+                _mm512_extracti64x4_epi64::<1>(r5),
+                _mm512_extracti64x4_epi64::<1>(r6),
+                _mm512_extracti64x4_epi64::<1>(r7),
+            ],
+        )
+    }
+}
+
+#[cfg(not(target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn tr8x16_chunk(stage: *const V8, w: usize) -> ([V8; 8], [V8; 8]) {
+    unsafe { (tr8_chunk(stage, w), tr8_chunk(stage, w + 8)) }
+}
+
 /// Publish one 32-byte transposed run non-temporally.
 ///
 /// # Safety
@@ -1079,9 +1167,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1247,8 +1333,7 @@ impl Drain8<'_> {
                 // Every packed row satisfies `z = a & b` and `tr8` is a bit
                 // permutation, so the Z rows are derived from the transposed
                 // A/B rows instead of transposing a third Z ring.
-                let a_lo = tr8_chunk(self.ast, rw);
-                let a_hi = tr8_chunk(self.ast, rw + 8);
+                let (a_lo, a_hi) = tr8x16_chunk(self.ast, rw);
                 for r in 0..8 {
                     let p = sa.add(r * STEP_WORDS);
                     store_v8(p, a_lo[r]);
@@ -1258,19 +1343,14 @@ impl Drain8<'_> {
                         widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
                     }
                 }
-                let b_lo = tr8_chunk(self.bs, rw);
-                let b_hi = tr8_chunk(self.bs, rw + 8);
+                let (b_lo, b_hi) = tr8x16_chunk(self.bs, rw);
                 for r in 0..8 {
                     let p = sb.add(r * STEP_WORDS);
                     store_v8(p, b_lo[r]);
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
@@ -1310,7 +1390,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1676,8 +1760,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
@@ -1703,10 +1787,10 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
+        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -1881,11 +1965,10 @@ mod tests {
 
                 let sentinel = 0xA5A5_5A5A;
                 let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
+                let mut writer = W8::<false>::at(
                     stage.as_mut_ptr(),
                     dup_u32(pending_hi),
                     core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
                 );
                 unsafe {
                     writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
@@ -1989,11 +2072,10 @@ mod tests {
             // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
+            let mut writer = W8::<false>::at(
                 stage.as_mut_ptr(),
                 dup_u32(pending_low << 15),
                 core::ptr::null_mut::<Drain8<'static>>(),
-                false,
             );
             writer.finish();
             assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);

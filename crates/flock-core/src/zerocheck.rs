@@ -542,7 +542,14 @@ fn prove_packed_padded_inner<C: Challenger>(
                             &r,
                             inv_table,
                         );
-                    (c, s_hat_v_c, quad, fold4, fold8, t.elapsed().as_secs_f64() * 1e3)
+                    (
+                        c,
+                        s_hat_v_c,
+                        quad,
+                        fold4,
+                        fold8,
+                        t.elapsed().as_secs_f64() * 1e3,
+                    )
                 },
             );
             if zc_timing {
@@ -804,8 +811,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Kill switches: FLOCK_NO_ZC_CASCADE2 / FLOCK_NO_ZC_CASCADE3.
     let use_cascade2 =
         use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
-    let use_cascade3 =
-        use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
+    let use_cascade3 = use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
     // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain. Their
     // parity weights r[k_skip+7] / r[k_skip+9] are sampled slots (the seven
     // protocol constants end at k_skip+6), so they are non-zero except with
@@ -1292,16 +1298,14 @@ mod tests {
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
             let mut ch_fused = FsChallenger::new(b"flock-test-v0");
-            let (proof_fused, claim_fused) =
-                prove_packed(&a_p, &b_p, &c_p, m, &mut ch_fused);
+            let (proof_fused, claim_fused) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_fused);
 
             // SAFETY: test-only env toggle; the flag selects between
             // value-identical code paths, so even a concurrently running
             // prove observes no behavioral difference.
             unsafe { std::env::set_var("FLOCK_NO_TAIL_FUSION", "1") };
             let mut ch_unfused = FsChallenger::new(b"flock-test-v0");
-            let (proof_unfused, claim_unfused) =
-                prove_packed(&a_p, &b_p, &c_p, m, &mut ch_unfused);
+            let (proof_unfused, claim_unfused) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_unfused);
             // SAFETY: as above.
             unsafe { std::env::remove_var("FLOCK_NO_TAIL_FUSION") };
 
@@ -1362,8 +1366,8 @@ mod tests {
                 (false, false, false, true, true, false),   // capped at level 2 (frontier)
                 (false, false, true, true, true, false),    // nomat + lookahead + cascade2
                 (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true),      // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),       // incumbent
+                (false, true, true, true, true, true), // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true),  // incumbent
             ];
             let n_mlv = m - K_SKIP;
             let all = if n_mlv >= 12 {
@@ -1377,16 +1381,7 @@ mod tests {
             } else {
                 1
             };
-            let expect_levels = [
-                all,
-                all,
-                all.min(4),
-                all.min(3),
-                all.min(2),
-                1,
-                1,
-                0,
-            ];
+            let expect_levels = [all, all, all.min(4), all.min(3), all.min(2), 1, 1, 0];
             let expect_nomat = [true, false, true, true, true, true, false, false];
             let mut results = Vec::new();
             for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
@@ -1418,8 +1413,14 @@ mod tests {
 
             let (proof_full, claim_full) = &results[0];
             for (k, (proof, claim)) in results.iter().enumerate().skip(1) {
-                assert_eq!(proof_full, proof, "proof diverges arm {k} at m={m} padded={padded}");
-                assert_eq!(claim_full, claim, "claim diverges arm {k} at m={m} padded={padded}");
+                assert_eq!(
+                    proof_full, proof,
+                    "proof diverges arm {k} at m={m} padded={padded}"
+                );
+                assert_eq!(
+                    claim_full, claim,
+                    "claim diverges arm {k} at m={m} padded={padded}"
+                );
             }
 
             let mut ch_v = FsChallenger::new(b"flock-test-v0");
