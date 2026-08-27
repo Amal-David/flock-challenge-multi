@@ -952,11 +952,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     let direct_c_stats = if use_direct_c {
         match &rs_results[1].1.rs_eq_ind {
-            ring_switch::RsEqInd::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => Some((eq_lo.as_slice(), eq_hi.as_slice(), table.as_slice())),
+            ring_switch::RsEqInd::DeferredDense { eq_lo, eq_hi, table, .. } => Some((eq_lo.as_slice(), eq_hi.as_slice(), table.as_slice())),
             _ => None,
         }
     } else {
@@ -988,11 +984,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 return None;
             }
             match &output.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some((
+                ring_switch::RsEqInd::DeferredDense { eq_lo, eq_hi, table, .. } => Some((
                     eq_lo.as_slice(),
                     eq_hi.as_slice(),
                     table.as_slice(),
@@ -1126,11 +1118,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let materialized: Vec<Vec<F128>> = rs_results
             .iter()
             .filter_map(|(_, o)| match &o.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                ring_switch::RsEqInd::DeferredDense { eq_lo, eq_hi, table, .. } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
                 _ => None,
             })
             .collect();
@@ -1449,7 +1437,7 @@ fn deferred_stats_lookahead(
         .par_iter()
         .enumerate()
         .map_init(
-            || vec![F128::ZERO; ring_switch::FOLD_TABLE_TOTAL],
+            || crate::alloc_uninit_f128_vec(ring_switch::FOLD_TABLE_TOTAL),
             |composed, (hi, &e_hi)| {
                 let base = hi * b;
                 ring_switch::compose_block_table(table, e_hi, composed);

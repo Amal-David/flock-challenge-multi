@@ -1906,7 +1906,7 @@ pub fn fold_packed_witness_at_z(
     assert_eq!(witness_packed.len(), (1usize << m) / 8);
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
-    let mut out = vec![F128::ZERO; n_out];
+    let mut out = crate::alloc_uninit_f128_vec(n_out);
     out.par_iter_mut().enumerate().for_each(|(x_rest, slot)| {
         *slot = table.fold_one_row(&witness_packed[x_rest * n_chunks..(x_rest + 1) * n_chunks]);
     });

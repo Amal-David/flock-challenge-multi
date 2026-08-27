@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! `flock-core`: the protocol library and verifier for Flock's R1CS-over-GF(2)
 //! sumcheck/zerocheck PIOP with a multilinear PCS.
 //!

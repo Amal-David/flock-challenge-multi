@@ -1854,7 +1854,7 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
-    let mut tables = vec![F128::ZERO; N_BYTES * TABLE_SIZE];
+    let mut tables = crate::alloc_uninit_f128_vec(N_BYTES * TABLE_SIZE);
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
@@ -1943,7 +1943,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2037,7 +2037,7 @@ fn build_direct_fold_table<const N: usize>(
     base: &[F128],
 ) -> Vec<F128> {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
-    let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+    let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_TOTAL);
     // N independent mul_by_x chains (one per low_eq bank), then XOR-sum.
     // Φ = fold_one_slot is only F2-linear on bits — do NOT pull fold_weight
     // through Φ.
@@ -2697,7 +2697,7 @@ fn direct_fold8_states_seq(
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
     for d_low in 0..64 {
         let mut basis_product = low_eq[d_low];
         w_state[d_low] = fold_one_slot(basis_product, table);
@@ -2706,7 +2706,7 @@ fn direct_fold8_states_seq(
             w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
         }
     }
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
     for e in 0..64 {
         let bank = &fold8[e * n_packed..(e + 1) * n_packed];
         for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
@@ -2752,8 +2752,8 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
+    let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
@@ -2805,6 +2805,7 @@ pub enum RsEqInd {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
+        logical_len: usize,
     },
     Sparse {
         len: usize,
@@ -2817,7 +2818,7 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDense { logical_len, .. } => *logical_len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2836,11 +2837,7 @@ impl RsEqInd {
                     *o += gamma * x;
                 }
             }
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
                     *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
@@ -2858,11 +2855,7 @@ impl RsEqInd {
     pub fn to_dense(&self) -> Vec<F128> {
         match self {
             Self::Dense(v) => v.clone(),
-            Self::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => {
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
                 (0..l)
@@ -3513,17 +3506,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             // shape `build_eq_split` would have produced.
                             let n_lo = split_n_lo(dense_suffixes[d].len());
                             let n_hi = dense_suffixes[d].len() - n_lo;
-                            RsEqInd::DeferredDense {
-                                eq_lo: vec![F128::ZERO; 1usize << n_lo],
-                                eq_hi: vec![F128::ZERO; 1usize << n_hi],
-                                table,
+                            RsEqInd::DeferredDense { eq_lo: Vec::new(), eq_hi: Vec::new(), table, logical_len: (1usize << n_lo) * (1usize << n_hi),
                             }
                         } else {
                             let (eq_lo, eq_hi) = &dense_splits[d];
-                            RsEqInd::DeferredDense {
-                                eq_lo: eq_lo.clone(),
-                                eq_hi: eq_hi.clone(),
-                                table,
+                            RsEqInd::DeferredDense { eq_lo: eq_lo.clone(), eq_hi: eq_hi.clone(), table, logical_len: eq_lo.len() * eq_hi.len(),
                             }
                         }
                     } else {
