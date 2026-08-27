@@ -86,6 +86,14 @@ const _ELIDE_GEOMETRY: () = {
 
 type V8 = __m256i;
 
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+type V16 = __m512i;
+
 /// Input form for one eight-compression witness kernel invocation.
 ///
 /// The ranked speculative path carries the generator's closed form all the
@@ -104,6 +112,26 @@ struct PreparedInputs {
     counter_hi: V8,
     block_len: V8,
     flags: V8,
+}
+
+/// Closed-form inputs for the sixteen-lane kernel.  This deliberately stays
+/// as one aligned memory object: `run_w16` borrows it out of line and loads
+/// only the message/CV word needed by the current G, rather than extending 24
+/// more ZMM live ranges across the compression state.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+#[repr(C, align(64))]
+struct PreparedInputs16 {
+    cv: [V16; 8],
+    message: [V16; 16],
+    counter_lo: V16,
+    counter_hi: V16,
+    block_len: V16,
+    flags: V16,
 }
 
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
@@ -168,8 +196,8 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -204,15 +232,9 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(
-            z,
-            _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64),
-        );
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
@@ -221,10 +243,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(
-            *state,
-            _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64),
-        );
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -233,8 +252,8 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride = crate::seed_pipe::GOLDEN
-            .wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride =
+            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -256,6 +275,64 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
             counter_hi: _mm256_setzero_si256(),
             block_len: _mm256_set1_epi32(64),
             flags: _mm256_set1_epi32(11),
+        }
+    }
+}
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+#[inline(always)]
+unsafe fn join_v8(lo: V8, hi: V8) -> V16 {
+    unsafe { _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi) }
+}
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+#[inline(always)]
+unsafe fn low_v8(v: V16) -> V8 {
+    unsafe { _mm512_castsi512_si256(v) }
+}
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+#[inline(always)]
+unsafe fn high_v8(v: V16) -> V8 {
+    unsafe { _mm512_extracti64x4_epi64::<1>(v) }
+}
+
+/// Form lanes 0..7 and 8..15 with the already-established closed generator,
+/// then join each word.  No new generator arithmetic or draw ordering exists
+/// in the W16 path.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+#[inline(never)]
+unsafe fn prepare_closed_inputs16(init: u64, base: usize) -> PreparedInputs16 {
+    unsafe {
+        let lo = prepare_closed_inputs(init, base);
+        let hi = prepare_closed_inputs(init, base + 8);
+        PreparedInputs16 {
+            cv: core::array::from_fn(|i| join_v8(lo.cv[i], hi.cv[i])),
+            message: core::array::from_fn(|i| join_v8(lo.message[i], hi.message[i])),
+            counter_lo: join_v8(lo.counter_lo, hi.counter_lo),
+            counter_hi: join_v8(lo.counter_hi, hi.counter_hi),
+            block_len: join_v8(lo.block_len, hi.block_len),
+            flags: join_v8(lo.flags, hi.flags),
         }
     }
 }
@@ -588,21 +665,19 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t> {
+struct W8<'t, const FLUSH: bool> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
-    flush: bool,
 }
 
-impl<'t> W8<'t> {
+impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>) -> Self {
         Self {
             pending,
             stage,
             drain,
-            flush,
         }
     }
 
@@ -610,7 +685,7 @@ impl<'t> W8<'t> {
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
             store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
-            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
@@ -924,17 +999,14 @@ unsafe fn emit_pair(
 /// block transforms by [`StreamProj::project_blocks`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// are already in the projection's own staging (they are its input). The
+/// publisher loads each staged row once and derives z immediately, before the
+/// transform, so no separate z-row scratch has to survive the outlined call.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    z_lo: *const V8,
-    z_hi: *const V8,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -951,30 +1023,34 @@ impl StepRows {
             let f = self.flags;
             let wide = f & 0x80 != 0;
             let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
             emit_pair(
                 self.z.add(o),
-                *self.z_lo.add(j),
-                *self.z_hi.add(j),
+                and_v8(a_lo, b_lo),
+                and_v8(a_hi, b_hi),
                 f & 1 != 0,
                 f & 2 != 0,
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                a_lo,
+                a_hi,
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                b_lo,
+                b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -1079,9 +1155,7 @@ impl Drain8<'_> {
 
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => {
-                        stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt)
-                    }
+                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
                     (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
                     (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
                     (false, true, true) => {
@@ -1266,16 +1340,9 @@ impl Drain8<'_> {
                     store_v8(p.add(8), b_hi[r]);
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
-                let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
-                let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
-
                 let g = abs_word / 8;
                 let mut flags = base;
                 if g < z_g1 {
@@ -1300,8 +1367,6 @@ impl Drain8<'_> {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    z_lo: z_lo.as_ptr(),
-                    z_hi: z_hi.as_ptr(),
                     flags,
                 };
 
@@ -1310,7 +1375,11 @@ impl Drain8<'_> {
                     plan,
                     imgs,
                     Some(rows),
-                    if use_off { Some(op as *const u16) } else { None },
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
                 );
             }
         }
@@ -1676,8 +1745,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
         let chain: [V8; 20] = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-            m[13], m[14], m[15], tlo, thi, blen, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
         ];
         // Words 16..35 are available before the rounds. Retain them in the
         // rolling epochs; the writer publishes each epoch when it completes
@@ -1703,10 +1772,10 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
+        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -1815,6 +1884,749 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     }
 }
 
+/// Sixteen closed compressions share one AVX-512 arithmetic stream and one
+/// native pair of V16 rolling rings. Every sixteen completed packed words are
+/// transposed directly into sixteen block-major ZMM rows; two disjoint
+/// eight-block projection stages retain the proven round-1 kernels and store
+/// policy without splitting the producer into four V8 rings.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+mod w16_kernel {
+    use super::*;
+
+    #[inline(always)]
+    fn dup(x: u32) -> V16 {
+        unsafe { _mm512_set1_epi32(x as i32) }
+    }
+
+    #[inline(always)]
+    fn xor(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_xor_si512(a, b) }
+    }
+
+    #[inline(always)]
+    fn or(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_or_si512(a, b) }
+    }
+
+    #[inline(always)]
+    fn shl<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_slli_epi32::<N>(v) }
+    }
+
+    #[inline(always)]
+    fn shr<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_srli_epi32::<N>(v) }
+    }
+
+    #[inline(always)]
+    fn add_parts(x: V16, y: V16) -> (V16, V16, V16) {
+        unsafe {
+            let sum = _mm512_add_epi32(x, y);
+            (sum, xor(sum, y), xor(sum, x))
+        }
+    }
+
+    #[inline(always)]
+    fn xor_rotr<const N: i32>(x: V16, y: V16) -> V16 {
+        unsafe { _mm512_ror_epi32::<N>(xor(x, y)) }
+    }
+
+    #[inline(always)]
+    unsafe fn load_v16(p: *const u32) -> V16 {
+        unsafe { _mm512_loadu_si512(p.cast::<V16>()) }
+    }
+
+    #[inline(always)]
+    unsafe fn store_v16(p: *mut u32, v: V16) {
+        unsafe { _mm512_storeu_si512(p.cast::<V16>(), v) }
+    }
+
+    #[inline(always)]
+    fn lo128(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_shuffle_i32x4::<0x88>(a, b) }
+    }
+
+    #[inline(always)]
+    fn hi128(a: V16, b: V16) -> V16 {
+        unsafe { _mm512_shuffle_i32x4::<0xdd>(a, b) }
+    }
+
+    /// Native 16x16 u32 transpose from the official BLAKE3 AVX-512 network.
+    /// Input `i` is packed word `i` over sixteen blocks; output `j` is the
+    /// sixteen consecutive words of block `j`.
+    #[inline(always)]
+    unsafe fn tr16_chunk(src: *const V16, rw: usize) -> [V16; 16] {
+        unsafe {
+            let x: [V16; 16] = [
+                _mm512_loadu_si512(src.add(rw)),
+                _mm512_loadu_si512(src.add(rw + 1)),
+                _mm512_loadu_si512(src.add(rw + 2)),
+                _mm512_loadu_si512(src.add(rw + 3)),
+                _mm512_loadu_si512(src.add(rw + 4)),
+                _mm512_loadu_si512(src.add(rw + 5)),
+                _mm512_loadu_si512(src.add(rw + 6)),
+                _mm512_loadu_si512(src.add(rw + 7)),
+                _mm512_loadu_si512(src.add(rw + 8)),
+                _mm512_loadu_si512(src.add(rw + 9)),
+                _mm512_loadu_si512(src.add(rw + 10)),
+                _mm512_loadu_si512(src.add(rw + 11)),
+                _mm512_loadu_si512(src.add(rw + 12)),
+                _mm512_loadu_si512(src.add(rw + 13)),
+                _mm512_loadu_si512(src.add(rw + 14)),
+                _mm512_loadu_si512(src.add(rw + 15)),
+            ];
+
+            let ab0 = _mm512_unpacklo_epi32(x[0], x[1]);
+            let ab2 = _mm512_unpackhi_epi32(x[0], x[1]);
+            let cd0 = _mm512_unpacklo_epi32(x[2], x[3]);
+            let cd2 = _mm512_unpackhi_epi32(x[2], x[3]);
+            let ef0 = _mm512_unpacklo_epi32(x[4], x[5]);
+            let ef2 = _mm512_unpackhi_epi32(x[4], x[5]);
+            let gh0 = _mm512_unpacklo_epi32(x[6], x[7]);
+            let gh2 = _mm512_unpackhi_epi32(x[6], x[7]);
+            let ij0 = _mm512_unpacklo_epi32(x[8], x[9]);
+            let ij2 = _mm512_unpackhi_epi32(x[8], x[9]);
+            let kl0 = _mm512_unpacklo_epi32(x[10], x[11]);
+            let kl2 = _mm512_unpackhi_epi32(x[10], x[11]);
+            let mn0 = _mm512_unpacklo_epi32(x[12], x[13]);
+            let mn2 = _mm512_unpackhi_epi32(x[12], x[13]);
+            let op0 = _mm512_unpacklo_epi32(x[14], x[15]);
+            let op2 = _mm512_unpackhi_epi32(x[14], x[15]);
+
+            let abcd0 = _mm512_unpacklo_epi64(ab0, cd0);
+            let abcd1 = _mm512_unpackhi_epi64(ab0, cd0);
+            let abcd2 = _mm512_unpacklo_epi64(ab2, cd2);
+            let abcd3 = _mm512_unpackhi_epi64(ab2, cd2);
+            let efgh0 = _mm512_unpacklo_epi64(ef0, gh0);
+            let efgh1 = _mm512_unpackhi_epi64(ef0, gh0);
+            let efgh2 = _mm512_unpacklo_epi64(ef2, gh2);
+            let efgh3 = _mm512_unpackhi_epi64(ef2, gh2);
+            let ijkl0 = _mm512_unpacklo_epi64(ij0, kl0);
+            let ijkl1 = _mm512_unpackhi_epi64(ij0, kl0);
+            let ijkl2 = _mm512_unpacklo_epi64(ij2, kl2);
+            let ijkl3 = _mm512_unpackhi_epi64(ij2, kl2);
+            let mnop0 = _mm512_unpacklo_epi64(mn0, op0);
+            let mnop1 = _mm512_unpackhi_epi64(mn0, op0);
+            let mnop2 = _mm512_unpacklo_epi64(mn2, op2);
+            let mnop3 = _mm512_unpackhi_epi64(mn2, op2);
+
+            let h0 = lo128(abcd0, efgh0);
+            let h1 = lo128(abcd1, efgh1);
+            let h2 = lo128(abcd2, efgh2);
+            let h3 = lo128(abcd3, efgh3);
+            let h4 = hi128(abcd0, efgh0);
+            let h5 = hi128(abcd1, efgh1);
+            let h6 = hi128(abcd2, efgh2);
+            let h7 = hi128(abcd3, efgh3);
+            let i0 = lo128(ijkl0, mnop0);
+            let i1 = lo128(ijkl1, mnop1);
+            let i2 = lo128(ijkl2, mnop2);
+            let i3 = lo128(ijkl3, mnop3);
+            let i4 = hi128(ijkl0, mnop0);
+            let i5 = hi128(ijkl1, mnop1);
+            let i6 = hi128(ijkl2, mnop2);
+            let i7 = hi128(ijkl3, mnop3);
+
+            [
+                lo128(h0, i0),
+                lo128(h1, i1),
+                lo128(h2, i2),
+                lo128(h3, i3),
+                lo128(h4, i4),
+                lo128(h5, i5),
+                lo128(h6, i6),
+                lo128(h7, i7),
+                hi128(h0, i0),
+                hi128(h1, i1),
+                hi128(h2, i2),
+                hi128(h3, i3),
+                hi128(h4, i4),
+                hi128(h5, i5),
+                hi128(h6, i6),
+                hi128(h7, i7),
+            ]
+        }
+    }
+
+    #[cfg(target_feature = "avx512bw")]
+    #[inline(always)]
+    unsafe fn widen_off_v16(v: V16, op: *mut u16) {
+        unsafe {
+            let widen = |x: V8| _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(x));
+            _mm512_store_si512(op.cast::<V16>(), widen(low_v8(v)));
+            _mm512_store_si512(op.add(32).cast::<V16>(), widen(high_v8(v)));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct OffsetSink16 {
+        lo: *mut u16,
+        hi: *mut u16,
+    }
+
+    /// Transpose one side of a sixteen-block step into the two eight-block
+    /// projection stages. When supplied, offset sinks are already adjusted to
+    /// this side's A or B half of each 128-u16 block.
+    #[inline(never)]
+    unsafe fn transpose16_to_stage(
+        ring: *const V16,
+        rw: usize,
+        stage_lo: *mut u32,
+        stage_hi: *mut u32,
+        offsets: Option<OffsetSink16>,
+    ) {
+        unsafe {
+            let rows = tr16_chunk(ring, rw);
+            #[cfg(target_feature = "avx512bw")]
+            if let Some(sink) = offsets {
+                for j in 0..8usize {
+                    store_v16(stage_lo.add(j * STEP_WORDS), rows[j]);
+                    widen_off_v16(rows[j], sink.lo.add(j * ROUND1_AB_OFF_WORDS));
+                }
+                for j in 0..8usize {
+                    store_v16(stage_hi.add(j * STEP_WORDS), rows[8 + j]);
+                    widen_off_v16(rows[8 + j], sink.hi.add(j * ROUND1_AB_OFF_WORDS));
+                }
+                return;
+            }
+            for j in 0..8usize {
+                store_v16(stage_lo.add(j * STEP_WORDS), rows[j]);
+            }
+            for j in 0..8usize {
+                store_v16(stage_hi.add(j * STEP_WORDS), rows[8 + j]);
+            }
+            #[cfg(not(target_feature = "avx512bw"))]
+            debug_assert!(offsets.is_none());
+        }
+    }
+
+    /// Publish one complete 64-byte row without rebuilding a ZMM from two
+    /// YMM values on the aligned ranked path. Partial and diagnostic store
+    /// modes retain the proven V8 publisher.
+    #[inline(always)]
+    unsafe fn emit_v16(
+        p: *mut u32,
+        v: V16,
+        lo_live: bool,
+        hi_live: bool,
+        nt: bool,
+        wide_nt: bool,
+    ) {
+        unsafe {
+            if !lo_live && !hi_live {
+                return;
+            }
+            if lo_live && hi_live {
+                if nt && wide_nt && p as usize % 64 == 0 {
+                    _mm512_stream_si512(p.cast::<V16>(), v);
+                    return;
+                }
+                if !nt {
+                    store_v16(p, v);
+                    return;
+                }
+            }
+            emit_pair(p, low_v8(v), high_v8(v), lo_live, hi_live, nt, wide_nt);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct StepRows16 {
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        /// Same flags as `StepRows`: z/a/b low/high live, z-NT, wide-NT.
+        flags: u8,
+    }
+
+    impl StepRows16 {
+        #[inline(always)]
+        unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
+            unsafe {
+                let f = self.flags;
+                let wide = f & 0x80 != 0;
+                let o = j * U32_PER_BLOCK;
+                let av = load_v16(sa.add(j * STEP_WORDS));
+                let bv = load_v16(sb.add(j * STEP_WORDS));
+                emit_v16(
+                    self.z.add(o),
+                    _mm512_and_si512(av, bv),
+                    f & 1 != 0,
+                    f & 2 != 0,
+                    f & 0x40 != 0,
+                    wide,
+                );
+                emit_v16(self.a.add(o), av, f & 4 != 0, f & 8 != 0, true, wide);
+                emit_v16(
+                    self.b.add(o),
+                    bv,
+                    f & 0x10 != 0,
+                    f & 0x20 != 0,
+                    true,
+                    wide,
+                );
+            }
+        }
+    }
+
+    impl StreamProj<'_> {
+        /// ZMM-row publisher twin of `project_blocks`. The transform entries,
+        /// liveness rule, plan/images, and output addresses are unchanged.
+        #[inline(never)]
+        unsafe fn project_blocks_v16(
+            &self,
+            blk: usize,
+            plan: Round1AbWindowPlan,
+            imgs: Round1AbTableImages,
+            rows: StepRows16,
+            off: Option<*const u16>,
+        ) {
+            unsafe {
+                let (sa, sb) = self.sides();
+                let live = self.live;
+                if let Some(op) = off {
+                    debug_assert!(plan.offsets_eligible(blk));
+                    for j in 0..8usize {
+                        rows.publish(j, sa, sb);
+                        if live & (1 << j) == 0 {
+                            continue;
+                        }
+                        let out = &mut *self
+                            .out
+                            .add(j * BYTES_PER_BLOCK + blk * 64)
+                            .cast::<[u8; 64]>();
+                        round1_ab_inner_window_from_offsets(
+                            &*op.add(j * ROUND1_AB_OFF_WORDS)
+                                .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                            out,
+                            plan,
+                            imgs,
+                        );
+                    }
+                    return;
+                }
+                for j in 0..8usize {
+                    rows.publish(j, sa, sb);
+                    if live & (1 << j) == 0 {
+                        continue;
+                    }
+                    let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                    let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                    let out = &mut *self
+                        .out
+                        .add(j * BYTES_PER_BLOCK + blk * 64)
+                        .cast::<[u8; 64]>();
+                    round1_ab_inner_window_with_images(
+                        a_win,
+                        b_win,
+                        out,
+                        blk,
+                        self.inv_table,
+                        plan,
+                        imgs,
+                    );
+                }
+            }
+        }
+    }
+
+    struct Drain16<'t> {
+        ast: *const V16,
+        bs: *const V16,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        proj_lo: StreamProj<'t>,
+        proj_hi: StreamProj<'t>,
+        elide: [bool; 3],
+        z_nt: bool,
+        wide_nt: bool,
+        spread: bool,
+    }
+
+    impl Drain16<'_> {
+        #[inline(always)]
+        fn ab_ranges(&self) -> (usize, usize, usize) {
+            let a_g1 = if self.elide[1] { ELIDE_ZERO_CHUNK } else { DUMP_CHUNKS };
+            let b_g0 = if self.elide[2] { ELIDE_B_PREFIX_CHUNKS } else { 0 };
+            let b_g1 = if self.elide[2] { ELIDE_B_TAIL_CHUNK_WIN } else { DUMP_CHUNKS };
+            (a_g1, b_g0, b_g1)
+        }
+
+        #[inline(always)]
+        unsafe fn project_half(
+            &self,
+            proj: &StreamProj<'_>,
+            blk: usize,
+            plan: Round1AbWindowPlan,
+            imgs: Round1AbTableImages,
+            rows: StepRows16,
+            off: Option<*const u16>,
+        ) {
+            unsafe {
+                if self.spread {
+                    proj.project_blocks_v16(blk, plan, imgs, rows, off);
+                } else {
+                    let (sa, sb) = proj.sides();
+                    for j in 0..8usize {
+                        rows.publish(j, sa, sb);
+                    }
+                    proj.project_blocks(blk, plan, imgs, None, off);
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn drain_step(&self, abs_word: usize, rw: usize) {
+            unsafe {
+                let blk = abs_word / STEP_WORDS;
+                let (plan, imgs) = self.proj_lo.window_prep(blk);
+                let use_off = plan.offsets_eligible(blk);
+                #[repr(align(64))]
+                struct OffArena([u16; 16 * ROUND1_AB_OFF_WORDS]);
+                let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+                let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
+                let (sa_lo, sb_lo) = self.proj_lo.sides();
+                let (sa_hi, sb_hi) = self.proj_hi.sides();
+                let a_offsets = if use_off {
+                    Some(OffsetSink16 {
+                        lo: op,
+                        hi: op.add(8 * ROUND1_AB_OFF_WORDS),
+                    })
+                } else {
+                    None
+                };
+                let b_offsets = if use_off {
+                    Some(OffsetSink16 {
+                        lo: op.add(64),
+                        hi: op.add(8 * ROUND1_AB_OFF_WORDS + 64),
+                    })
+                } else {
+                    None
+                };
+                transpose16_to_stage(self.ast, rw, sa_lo, sa_hi, a_offsets);
+                transpose16_to_stage(self.bs, rw, sb_lo, sb_hi, b_offsets);
+
+                let z_g1 = if self.elide[0] { ELIDE_ZERO_CHUNK } else { DUMP_CHUNKS };
+                let (a_g1, b_g0, b_g1) = self.ab_ranges();
+                let g = abs_word / 8;
+                let mut flags = 0u8;
+                if self.z_nt {
+                    flags |= 0x40;
+                }
+                if self.wide_nt {
+                    flags |= 0x80;
+                }
+                if g < z_g1 {
+                    flags |= 1;
+                }
+                if g + 1 < z_g1 {
+                    flags |= 2;
+                }
+                if g < a_g1 {
+                    flags |= 4;
+                }
+                if g + 1 < a_g1 {
+                    flags |= 8;
+                }
+                if g >= b_g0 && g < b_g1 {
+                    flags |= 0x10;
+                }
+                if g + 1 >= b_g0 && g + 1 < b_g1 {
+                    flags |= 0x20;
+                }
+
+                let half_words = 8 * U32_PER_BLOCK;
+                let rows_lo = StepRows16 {
+                    z: self.z.add(abs_word),
+                    a: self.a.add(abs_word),
+                    b: self.b.add(abs_word),
+                    flags,
+                };
+                let rows_hi = StepRows16 {
+                    z: self.z.add(half_words + abs_word),
+                    a: self.a.add(half_words + abs_word),
+                    b: self.b.add(half_words + abs_word),
+                    flags,
+                };
+                let off_lo = if use_off { Some(op as *const u16) } else { None };
+                let off_hi = if use_off {
+                    Some(op.add(8 * ROUND1_AB_OFF_WORDS) as *const u16)
+                } else {
+                    None
+                };
+                self.project_half(&self.proj_lo, blk, plan, imgs, rows_lo, off_lo);
+                self.project_half(&self.proj_hi, blk, plan, imgs, rows_hi, off_hi);
+            }
+        }
+
+        #[inline(never)]
+        unsafe fn drain_range(&self, base_word: usize, ring_word: usize, words: usize) {
+            debug_assert!(words == STEP_WORDS || words == RING_WORDS);
+            debug_assert_eq!(base_word % STEP_WORDS, 0);
+            debug_assert_eq!(ring_word % STEP_WORDS, 0);
+            debug_assert!(ring_word + words <= RING_WORDS);
+            unsafe {
+                for off in (0..words).step_by(STEP_WORDS) {
+                    self.drain_step(base_word + off, ring_word + off);
+                }
+            }
+        }
+    }
+
+    struct Writer16<'t, const FLUSH: bool> {
+        pending: V16,
+        stage: *mut V16,
+        drain: *mut Drain16<'t>,
+    }
+
+    impl<'t, const FLUSH: bool> Writer16<'t, FLUSH> {
+        #[inline(always)]
+        fn at(stage: *mut V16, pending: V16, drain: *mut Drain16<'t>) -> Self {
+            Self { pending, stage, drain }
+        }
+
+        #[inline(always)]
+        unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
+            unsafe {
+                let rw = WORD & (RING_WORDS - 1);
+                _mm512_storeu_si512(self.stage.add(rw), v);
+                if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
+                    let (base, ring, words) = if WORD + 1 == RING_WORDS {
+                        (16, 16, RING_WORDS - 16)
+                    } else {
+                        (WORD + 1 - RING_WORDS, 0, RING_WORDS)
+                    };
+                    (*self.drain).drain_range(base, ring, words);
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn push<const USED: i32, const WIDTH: i32, const WORD: usize>(&mut self, v: V16) {
+            const {
+                assert!(USED >= 0 && USED < 32);
+                assert!(WIDTH == 31 || WIDTH == 32);
+                assert!(WORD < U32_PER_BLOCK);
+            }
+            unsafe {
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        self.write_word::<WORD>(v);
+                        self.pending = dup(0);
+                    } else {
+                        self.pending = shl::<1>(v);
+                    }
+                } else {
+                    self.write_word::<WORD>(_mm512_shldi_epi32::<USED>(v, self.pending));
+                    self.pending = if WIDTH == 31 { shl::<1>(v) } else { v };
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish(&mut self) {
+            const { assert!(USEFUL_BITS % 32 == 17) };
+            unsafe { self.write_word::<LAST_WORD>(shr::<15>(self.pending)) }
+        }
+    }
+
+    macro_rules! pushf16 {
+        ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+            $w.push::<{ ($pos % 32) as i32 }, $width, { $pos / 32 }>($v);
+        }};
+    }
+
+    #[inline(always)]
+    unsafe fn chain_word(p: &PreparedInputs16, k: usize) -> V16 {
+        unsafe {
+            if k < 16 {
+                *p.message.get_unchecked(k)
+            } else {
+                match k {
+                    16 => p.counter_lo,
+                    17 => p.counter_hi,
+                    18 => p.block_len,
+                    19 => p.flags,
+                    _ => core::hint::unreachable_unchecked(),
+                }
+            }
+        }
+    }
+
+    /// Kept out of line so `PreparedInputs16` remains a memory operand source
+    /// instead of being cloned into 24 long-lived vector locals beside state.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run<'t>(
+        p: &PreparedInputs16,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        proj_lo: StreamProj<'t>,
+        proj_hi: StreamProj<'t>,
+        elide: [bool; 3],
+        z_nt: bool,
+    ) {
+        unsafe {
+            let mut state: [V16; 16] = [
+                p.cv[0], p.cv[1], p.cv[2], p.cv[3], p.cv[4], p.cv[5], p.cv[6], p.cv[7],
+                dup(BLAKE3_IV[0]), dup(BLAKE3_IV[1]), dup(BLAKE3_IV[2]), dup(BLAKE3_IV[3]),
+                p.counter_lo, p.counter_hi, p.block_len, p.flags,
+            ];
+            let mut ast = core::mem::MaybeUninit::<[V16; RING_WORDS]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V16; RING_WORDS]>::uninit();
+            let ast = ast.as_mut_ptr().cast::<V16>();
+            let bs = bs.as_mut_ptr().cast::<V16>();
+            let mut drain = Drain16 {
+                ast,
+                bs,
+                z,
+                a,
+                b,
+                proj_lo,
+                proj_hi,
+                elide,
+                z_nt,
+                wide_nt: wide_nt_enabled(),
+                spread: spread_nt_enabled(),
+            };
+
+            let maxv = dup(u32::MAX);
+            let one = dup(1);
+            let mut prev = dup(0);
+            for k in 0..20usize {
+                let cur = chain_word(p, k);
+                let v = if k == 0 {
+                    or(one, shl::<1>(cur))
+                } else {
+                    or(shr::<31>(prev), shl::<1>(cur))
+                };
+                let w = 16 + k;
+                _mm512_storeu_si512(ast.add(w & (RING_WORDS - 1)), v);
+                _mm512_storeu_si512(bs.add(w & (RING_WORDS - 1)), maxv);
+                prev = cur;
+            }
+            if RING_WORDS <= PROLOGUE_WORDS + 16 {
+                drain.drain_range(16, 16, RING_WORDS - 16);
+            }
+
+            let drain_ptr = &mut drain as *mut Drain16;
+            let mut wa =
+                Writer16::<false>::at(ast, shl::<31>(shr::<31>(p.flags)), drain_ptr);
+            let mut wb = Writer16::<true>::at(bs, shl::<31>(one), drain_ptr);
+
+            macro_rules! g {
+                ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+                 $mx:literal, $my:literal) => {{
+                    let (t0, l0, r0) = add_parts(state[$la], state[$lb]);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                    let (a1, l1, r1) = add_parts(t0, p.message[$mx]);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                    let d1 = xor_rotr::<16>(state[$ld], a1);
+                    let (c1s, l2, r2) = add_parts(state[$lc], d1);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                    let b1 = xor_rotr::<12>(state[$lb], c1s);
+                    let (t1, l3, r3) = add_parts(a1, b1);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                    let (a2, l4, r4) = add_parts(t1, p.message[$my]);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                    let d2 = xor_rotr::<8>(d1, a2);
+                    let (c2s, l5, r5) = add_parts(c1s, d2);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                    let bn = xor_rotr::<7>(b1, c2s);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
+                    pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                    pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                    state[$la] = a2; state[$lb] = bn; state[$lc] = c2s; state[$ld] = d2;
+                }};
+            }
+            macro_rules! round {
+                ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+                 $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+                 $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+                 $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                    g!($gb, 0, 4, 8, 12, $m0, $m1); g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5); g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9); g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13); g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                }};
+            }
+            round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+            round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+            round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+            round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+            round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+            round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+            macro_rules! oh {
+                ($w:literal) => {{
+                    pushf16!(wa, OUT_HI_BASE + 32 * $w, 32, xor(state[$w + 8], p.cv[$w]));
+                    pushf16!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+                }};
+            }
+            oh!(0); oh!(1); oh!(2); oh!(3); oh!(4); oh!(5); oh!(6); oh!(7);
+            wa.finish();
+            wb.finish();
+
+            const ZF: usize = USEFUL_BITS.div_ceil(32);
+            for w in ZF..U32_PER_BLOCK {
+                let i = w & (RING_WORDS - 1);
+                _mm512_storeu_si512(ast.add(i), dup(0));
+                _mm512_storeu_si512(bs.add(i), dup(0));
+            }
+            drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+
+            for w in 0..8usize {
+                _mm512_storeu_si512(ast.add(w), p.cv[w]);
+                _mm512_storeu_si512(bs.add(w), maxv);
+                _mm512_storeu_si512(ast.add(8 + w), xor(state[w], state[w + 8]));
+                _mm512_storeu_si512(bs.add(8 + w), maxv);
+            }
+            drain.drain_range(0, 0, 16);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_closed_witness_ab_stream_elide(
+        init: u64,
+        base: usize,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        proj_lo: StreamProj<'_>,
+        proj_hi: StreamProj<'_>,
+        elide: [bool; 3],
+        z_nt: bool,
+    ) {
+        unsafe {
+            let prepared = prepare_closed_inputs16(init, base);
+            run(&prepared, z, a, b, proj_lo, proj_hi, elide, z_nt);
+        }
+    }
+}
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi2"
+))]
+pub(crate) use w16_kernel::build_closed_witness_ab_stream_elide;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1881,11 +2693,10 @@ mod tests {
 
                 let sentinel = 0xA5A5_5A5A;
                 let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
+                let mut writer = W8::<false>::at(
                     stage.as_mut_ptr(),
                     dup_u32(pending_hi),
                     core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
                 );
                 unsafe {
                     writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
@@ -1989,11 +2800,10 @@ mod tests {
             // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
+            let mut writer = W8::<false>::at(
                 stage.as_mut_ptr(),
                 dup_u32(pending_low << 15),
                 core::ptr::null_mut::<Drain8<'static>>(),
-                false,
             );
             writer.finish();
             assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);
