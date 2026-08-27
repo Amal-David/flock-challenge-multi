@@ -1033,6 +1033,12 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+fn lincheck_trace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LINCHECK_TRACE").is_some());
+    *ON
+}
+
 /// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
 /// chunk) the eight gathered+transposed stripe rows drain through
 /// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
@@ -1064,12 +1070,15 @@ fn fold_block_major_gfni(
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
-    // Same total footprint as the F128 partials (k*16 bytes per worker).
-    let mut planes = vec![0u8; n_workers * k * 16];
+    let mut planes_vec = crate::scratch::take_f128(n_workers * k);
+    let planes: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(planes_vec.as_mut_ptr() as *mut u8, n_workers * k * 16)
+    };
     planes
         .par_chunks_mut(k * 16)
         .enumerate()
         .for_each(|(worker, wplanes)| {
+            wplanes.fill(0);
             let tile_lo = worker * tiles_per_worker;
             let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
             let (mut claim_lo, mut claim_hi) = if dynamic {
@@ -1313,18 +1322,10 @@ fn fold_block_major_gfni(
                 kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
             }
         }
-        for (col, slot) in o.iter_mut().enumerate() {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
-            }
-            for byte in 8..16 {
-                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            *slot = F128 { lo, hi };
-        }
+        let out64: &mut [F128; 64] = o.try_into().expect("64-element block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(&acc, out64);
     });
+    crate::scratch::give_f128(planes_vec);
     out
 }
 
@@ -1369,7 +1370,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
     // kill switch, which restores the always-on probes). Resolved once here
     // so the worker loop reads a register, not the environment.
-    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    let trace_fold = lincheck_trace_enabled();
     // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
     // so `LINCHECK_TRACE=1` measures the production sweep. Set
     // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the

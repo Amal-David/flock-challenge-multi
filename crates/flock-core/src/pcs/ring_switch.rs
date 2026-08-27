@@ -1499,11 +1499,14 @@ pub fn s_hat_v_fold8_from_z_vec(
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
-        let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        let mut out = crate::scratch::take_f128(half);
+        out.copy_from_slice(z0);
+        const CHUNK: usize = 512;
+        out.par_chunks_mut(CHUNK)
+            .zip(z1.par_chunks(CHUNK))
+            .for_each(|(lo, hi)| {
+                crate::field::f128_slice::bind_split_half(lo, hi, r);
+            });
         return out;
     }
 
