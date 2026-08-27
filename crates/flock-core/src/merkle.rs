@@ -331,13 +331,13 @@ fn blake3_hash_many<const N: usize>(
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
+        // SAFETY: data.len() == out.len() * N and msgs.len() == n * N, so
+        // msg_ptr.add(i) points to a valid [u8; N] for all i < n.
+        let msg_ptr = msgs.as_ptr() as *const [u8; N];
+        let first: &[u8; N] = unsafe { &*msg_ptr };
         let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
         for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+            *slot = unsafe { &*msg_ptr.add(i) };
         }
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`

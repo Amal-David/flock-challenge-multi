@@ -3201,8 +3201,16 @@ impl Blake3Setup {
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
+                let src = if self.n_blocks.is_power_of_two() {
+                    crate::seed_pipe::BlockSource::closed(
+                        self.n_blocks.trailing_zeros(),
+                        0x00C0_FFEE_BEEF_D15C,
+                    )
+                } else {
+                    crate::seed_pipe::BlockSource::Slice(blocks)
+                };
                 let _ = std::hint::black_box(self.prove_fast_inner(
-                    crate::seed_pipe::BlockSource::Slice(blocks),
+                    src,
                     &mut warm_challenger,
                 ));
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {

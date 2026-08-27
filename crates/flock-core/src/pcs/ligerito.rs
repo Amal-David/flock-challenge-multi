@@ -4547,34 +4547,6 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
-#[inline]
-fn eval_fold8_lookahead4(
-    coefficients: &super::Fold8Lookahead4,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..81], &[r0, r1, r2, r3]),
-        u_2: eval_quadratic_tensor(&coefficients[81..], &[r0, r1, r2, r3]),
-    }
-}
-
-#[inline]
-fn eval_fold8_lookahead5(
-    coefficients: &super::Fold8Lookahead5,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-    r4: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..243], &[r0, r1, r2, r3, r4]),
-        u_2: eval_quadratic_tensor(&coefficients[243..], &[r0, r1, r2, r3, r4]),
-    }
-}
 
 /// Sixteen-bank materializer (direct-fold4). Four challenges have been
 /// sampled from the 16×16 product statistics; this binds the witness and the
@@ -5821,10 +5793,8 @@ fn fold_direct_fold8_factors_and_message(
 ) -> SumcheckMessage {
     let (u0, u2) = if claims.len() == 2 {
         let (left, right) = claims.split_at_mut(1);
-        let (a, b) = rayon::join(
-            || fold_one_direct_fold8_claim_and_message(&mut left[0], challenge),
-            || fold_one_direct_fold8_claim_and_message(&mut right[0], challenge),
-        );
+        let a = fold_one_direct_fold8_claim_and_message(&mut left[0], challenge);
+        let b = fold_one_direct_fold8_claim_and_message(&mut right[0], challenge);
         (a.0 + b.0, a.1 + b.1)
     } else {
         claims.iter_mut().fold((F128::ZERO, F128::ZERO), |mut total, claim| {
@@ -6744,8 +6714,6 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
         challenger,
     )
 }
@@ -6778,8 +6746,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
-        None,
-        None,
         None,
         None,
         None,
@@ -6819,8 +6785,6 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         Some(round1_lookahead),
-        None,
-        None,
         None,
         None,
         Some(direct),
@@ -6867,8 +6831,6 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         Some(round2_lookahead),
         Some(round3_lookahead),
         None,
-        None,
-        None,
         Some(direct),
         None,
         fold_arena,
@@ -6910,8 +6872,6 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
         Some(direct),
         fold_arena,
         challenger,
@@ -6930,8 +6890,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
     round3_lookahead: Option<super::Fold4Lookahead3>,
-    round4_lookahead: Option<super::Fold8Lookahead4>,
-    round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,

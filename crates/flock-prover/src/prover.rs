@@ -67,6 +67,12 @@ fn ranked_direct_fold4_precompute_enabled(
 /// relies on ranked BLAKE3's block geometry and honest padding, and every miss
 /// keeps the incumbent producer.
 ///
+#[inline(always)]
+fn cached_c0_is_identity(r1cs: &BlockR1cs) -> bool {
+    static IS_ID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_ID.get_or_init(|| r1cs.c0_is_identity())
+}
+
 /// The fold4 capture is checked by shape rather than by a `CapturedSHatVC`,
 /// because this gate runs *before* round one produces one; the stripe path
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
@@ -80,7 +86,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_skip == zerocheck::K_SKIP
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-        && r1cs.c0_is_identity()
+        && cached_c0_is_identity(r1cs)
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
@@ -320,7 +326,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     // a = A·z, b = B·z; for the C = I convention c aliases z.
     let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
     let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
+    let c_packed_f128: Vec<F128> = if cached_c0_is_identity(r1cs) {
         Vec::new()
     } else {
         r1cs.apply_c_packed(&z_packed)
@@ -366,8 +372,13 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
+    let r_inner_slice = if lc_claim.r_inner_rest.is_empty() {
+        &[]
+    } else {
+        &lc_claim.r_inner_rest[1..]
+    };
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, r_inner_slice);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(

@@ -1090,6 +1090,10 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
+            let mut values = [zero; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
             if H != 0 {
                 let off = lane * core::mem::size_of::<F128>();
                 for i in 0..16 {
@@ -1100,10 +1104,6 @@ unsafe fn butterfly_fused_4layer_row_impl<
                         _mm_prefetch::<_MM_HINT_T1>(p);
                     }
                 }
-            }
-            let mut values = [zero; 16];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
             }
 
             macro_rules! butterfly {
