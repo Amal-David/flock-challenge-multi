@@ -918,7 +918,13 @@ mod blake3_pow_avx512 {
         }
         // Leading zero bits of the digest byte stream = integer leading
         // zeros of the byte-reversed word 0: pass iff `bswap32(w0) < 2^(32-bits)`.
-        let thresh = _mm512_set1_epi32((if bits == 32 { 1u32 } else { 1u32 << (32 - bits) }) as i32);
+        let thresh = _mm512_set1_epi32(
+            (if bits == 32 {
+                1u32
+            } else {
+                1u32 << (32 - bits)
+            }) as i32,
+        );
         // Per-dword byte reverse for `vpshufb` (same pattern in every 128-bit lane).
         let bswap = _mm512_set4_epi32(0x0C0D_0E0F, 0x0809_0A0B, 0x0405_0607, 0x0001_0203);
         let prefix = round0_prefix(&dig, zero);
@@ -941,7 +947,12 @@ mod blake3_pow_avx512 {
                 let carry: __mmask16 = _mm512_cmplt_epu32_mask(lo, lo_base);
                 let hi_base = _mm512_set1_epi32((gb >> 32) as u32 as i32);
                 let hi = _mm512_mask_add_epi32(hi_base, carry, hi_base, _mm512_set1_epi32(1));
-                Msg { dig, n_lo: lo, n_hi: hi, zero }
+                Msg {
+                    dig,
+                    n_lo: lo,
+                    n_hi: hi,
+                    zero,
+                }
             });
             #[cfg(feature = "hash-count")]
             super::fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1587,9 +1598,8 @@ mod tests {
             for &len in &lens {
                 for &start in &starts {
                     for bits in [1u32, 6, 8, 13, 32] {
-                        let want = (start..start + len).find(|&n| {
-                            pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3)
-                        });
+                        let want = (start..start + len)
+                            .find(|&n| pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3));
                         assert_eq!(
                             blake3_pow_neon::scan(state, start, len, bits),
                             want,
@@ -1656,9 +1666,8 @@ mod tests {
             for &len in &lens {
                 for &start in &starts {
                     for bits in [1u32, 6, 8, 13, 32] {
-                        let want = (start..start + len).find(|&n| {
-                            pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3)
-                        });
+                        let want = (start..start + len)
+                            .find(|&n| pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3));
                         assert_eq!(
                             blake3_pow_avx512::scan(state, start, len, bits),
                             want,
@@ -1699,7 +1708,11 @@ mod tests {
                 }
                 let want = (base..base + 32)
                     .find(|&n| pow_has_leading_zero_bits(state, n, lz, HashKind::Blake3));
-                assert_eq!(blake3_pow_avx512::scan(state, base, 32, lz), want, "off={off} lz={lz}");
+                assert_eq!(
+                    blake3_pow_avx512::scan(state, base, 32, lz),
+                    want,
+                    "off={off} lz={lz}"
+                );
             }
         }
     }
@@ -1744,7 +1757,10 @@ mod tests {
             ch.observe_bytes(b"root");
             let t = std::time::Instant::now();
             let n = ch.grind_pow(bits);
-            println!("grind_pow({bits}) = {n} in {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "grind_pow({bits}) = {n} in {:.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 
