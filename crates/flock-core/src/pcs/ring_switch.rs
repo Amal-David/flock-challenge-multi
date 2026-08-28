@@ -1741,10 +1741,42 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 #[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v.len(), 128);
-    let mut out = Vec::<F128>::with_capacity(128);
-    unsafe {
-        transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-        out.set_len(128);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("gfni")
+        {
+            let mut out = Vec::<F128>::with_capacity(128);
+            unsafe {
+                transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
+                out.set_len(128);
+            }
+            return out;
+        }
+    }
+    let mut out = vec![F128::ZERO; 128];
+    for i in 0..128 {
+        let row = s_hat_v[i];
+        for b in 0..64 {
+            if (row.lo >> b) & 1 == 1 {
+                if i < 64 {
+                    out[b].lo |= 1 << i;
+                } else {
+                    out[b].hi |= 1 << (i - 64);
+                }
+            }
+        }
+        for b in 0..64 {
+            if (row.hi >> b) & 1 == 1 {
+                let col = b + 64;
+                if i < 64 {
+                    out[col].lo |= 1 << i;
+                } else {
+                    out[col].hi |= 1 << (i - 64);
+                }
+            }
+        }
     }
     out
 }

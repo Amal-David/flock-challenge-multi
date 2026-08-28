@@ -32,7 +32,35 @@ pub(crate) fn transpose_8x8_bits(mut x: u64) -> u64 {
 #[inline(always)]
 pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     debug_assert_eq!(out.len(), 64);
-    unsafe { transpose_8_u64s_to_64_bytes_gfni(lanes, out) }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("gfni")
+        {
+            unsafe { transpose_8_u64s_to_64_bytes_gfni(lanes, out) };
+            return;
+        }
+    }
+    transpose_8_u64s_to_64_bytes_scalar(lanes, out);
+}
+
+fn transpose_8_u64s_to_64_bytes_scalar(lanes: &[u64; 8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 64);
+    for c in 0..8 {
+        let shift = c * 8;
+        let mut packed: u64 = 0;
+        packed |= ((lanes[0] >> shift) & 0xFF) << 0;
+        packed |= ((lanes[1] >> shift) & 0xFF) << 8;
+        packed |= ((lanes[2] >> shift) & 0xFF) << 16;
+        packed |= ((lanes[3] >> shift) & 0xFF) << 24;
+        packed |= ((lanes[4] >> shift) & 0xFF) << 32;
+        packed |= ((lanes[5] >> shift) & 0xFF) << 40;
+        packed |= ((lanes[6] >> shift) & 0xFF) << 48;
+        packed |= ((lanes[7] >> shift) & 0xFF) << 56;
+        let transposed = transpose_8x8_bits(packed);
+        out[c * 8..c * 8 + 8].copy_from_slice(&transposed.to_le_bytes());
+    }
 }
 
 #[rustfmt::skip]
@@ -49,29 +77,174 @@ unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BLAKE3 8-way interleaved8 transpose (batch = 8, stride = 64 bytes / block)
+//
+// BLAKE3's `hash_many` kernel sees its `DEGREE = 8` input blocks already in
+// "interleaved8" form: lane `i` of every 256-bit SIMD register holds byte `i`
+// of the eight `BLOCK_LEN = 64` message blocks. Building that transposed
+// layout on the fly is the "per-block bit-reversal/byte-copy step" the AVX2
+// batched compress relies on, and the BLAKE3 reference AVX2 implementation
+// builds it from 8 pointers via `_mm256_unpacklo/hi_epi32/64` and
+// `_mm256_permute2x128_si256` (see `transpose_vecs` / `transpose_msg_vecs`).
+//
+// For callers that already own the 8 input blocks as 8 contiguous 64-byte
+// slices and want to skip the per-block SIMD re-load, this module exposes
+// a 64-byte-aligned scratch buffer `Interleaved8Block` of length
+// `64 * batch` and a function `interleaved8_block_into` that emits the
+// transposed layout directly. The output byte at
+//   `out[byte * batch + lane] = block_lane[byte]`
+// is exactly the row-major BLAKE3 hash_many input the reference kernel
+// consumes after its `transpose_vecs` step, so callers can use the buffer
+// either as the source of a `_mm256_loadu_si256` per row or as the
+// pre-transposed storage for a streaming kernel that prefers single loads.
+// ---------------------------------------------------------------------------
+
+/// `64 * 8 = 512` byte cache-line-aligned scratch holding the eight 64-byte
+/// message blocks in BLAKE3's "interleaved8" transposed layout (lane `i`
+/// of every 32-byte half = byte `i` of block `i`). The batch count is
+/// fixed at 8 — the AVX2 kernel's `DEGREE` — to keep the buffer exactly
+/// 512 bytes, two cache lines per side, which is the rank's hot L1
+/// working set per batch. A const generic over `BATCH` would force a
+/// per-instantiation type that the BLAKE3 reference kernel does not need
+/// (its AVX2 SIMD width is a single hard-coded 8), so the helper is
+/// specialised on the ranked shape here.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct Interleaved8Block([u8; INTERLEAVED8_BYTES]);
+
+/// Total bytes in an [`Interleaved8Block`]: `64 * 8 = 512`.
+pub const INTERLEAVED8_BYTES: usize = 64 * 8;
+/// Number of blocks in one batch: BLAKE3's AVX2 `DEGREE`.
+pub const INTERLEAVED8_BATCH: usize = 8;
+
+impl Interleaved8Block {
+    /// Construct an uninitialized scratch. Caller must overwrite every byte
+    /// before reading any.
+    #[inline(always)]
+    pub fn uninit() -> Self {
+        // The default-initialised `[u8; N]` is a zeroed buffer; the
+        // kernel overwrites every byte before any read, so the zero
+        // start is sound and skips a memset on the hot path.
+        Interleaved8Block([0u8; INTERLEAVED8_BYTES])
+    }
+
+    /// Borrow as a `&[u8]` of length `INTERLEAVED8_BYTES`.
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Borrow as a `&mut [u8]` of length `INTERLEAVED8_BYTES`.
+    #[inline(always)]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    /// Raw pointer to the first byte of the transposed buffer.
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    /// Raw mutable pointer to the first byte of the transposed buffer.
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+}
+
+/// Emit the eight `BLOCK_LEN`-byte blocks of `input` into `out` in BLAKE3's
+/// interleaved8 transposed layout: `out[byte * 8 + lane] = input[lane][byte]`.
+///
+/// This is the per-block "bit-reversal/byte-copy step" that precedes the AVX2
+/// 8-way `hash_many` compress — the same shuffle the reference kernel
+/// performs via three layers of 32/64/128-bit unpacks, but lifted to a single
+/// cold pass that can be prefetched and overlapped with the next batch's
+/// transposes. The destination is `64 * 8 = 512` bytes — [`Interleaved8Block`]
+/// — and the layout matches the BLAKE3 reference `hash8` input row-for-row
+/// after its internal `transpose_vecs`.
+///
+/// # Layout
+/// ```text
+/// for byte in 0..64:
+///     for lane in 0..8:
+///         out[byte * 8 + lane] = input[lane][byte]
+/// ```
+/// Equivalently, the 32-byte halves of each 256-bit YMM register hold
+/// `[byte0_l0, byte0_l1, ..., byte0_l7, byte1_l0, byte1_l1, ..., byte1_l7]`
+/// — the exact shape the AVX2 kernel reads as `_mm256_loadu_si256`.
+///
+/// # Non-AVX2 path
+/// Always available. The AVX2 batched compress falls back to a scalar
+/// `compress_in_place` loop when `is_x86_feature_detected!("avx2")` is false;
+/// in that case the transposed buffer is still correct (the scalar fallback
+/// re-reads the source blocks), so this helper is unconditionally compiled.
+#[inline(always)]
+pub fn interleaved8_block_into(
+    out: &mut Interleaved8Block,
+    input: &[&[u8; 64]; 8],
+) {
+    debug_assert_eq!(INTERLEAVED8_BATCH, 8);
+    let dst = out.as_bytes_mut();
+    for byte in 0..64 {
+        let row = byte * 8;
+        for lane in 0..8 {
+            // SAFETY: the source block is `[u8; 64]` and `row + lane < 512`
+            // by construction (byte < 64 and lane < 8).
+            unsafe {
+                let p = dst.as_mut_ptr().add(row + lane);
+                *p = *input[lane].as_ptr().add(byte);
+            }
+        }
+    }
+}
+
+/// `Interleaved8Block` filled in with the BLAKE3 hash_many "block" half of
+/// the inputs (8 message blocks, 8 chaining values, 8 counter pairs, 8
+/// `block_len`s, 8 `flags`s). The `HashManyInputs` is the natural call shape
+/// for the batched compress: one struct carries everything the AVX2 kernel
+/// needs and the bytes live in their final positions in the scratch buffer
+/// before the first G fires.
+#[derive(Clone, Copy)]
+pub struct HashMany8Inputs<'a> {
+    /// 8 input `BLOCK_LEN = 64` message blocks in caller order.
+    pub blocks: [&'a [u8; 64]; 8],
+    /// 8 input chaining values (one per block).
+    pub chaining_values: [&'a [u32; 8]; 8],
+    /// 8 input 64-bit counters (low half interpreted as a `u32`; the high
+    /// half is read separately and passed in `counter_hi` for the same lane).
+    pub counter: [u64; 8],
+    /// 8 input `block_len`s. Ranked shape fixes all 8 to `64`; the array
+    /// stays generic to keep the kernel reusable for variable-length chains.
+    pub block_len: [u32; 8],
+    /// 8 input `flags` u32s. The reference kernel ORs `flags_start` /
+    /// `flags_end` per block, so this array carries the per-block result.
+    pub flags: [u32; 8],
+}
+
+impl<'a> HashMany8Inputs<'a> {
+    /// Build the inputs from 8 sets of (block, cv, counter, block_len, flags).
+    pub fn new(
+        blocks: [&'a [u8; 64]; 8],
+        chaining_values: [&'a [u32; 8]; 8],
+        counter: [u64; 8],
+        block_len: [u32; 8],
+        flags: [u32; 8],
+    ) -> Self {
+        Self {
+            blocks,
+            chaining_values,
+            counter,
+            block_len,
+            flags,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Scalar reference for [`transpose_8_u64s_to_64_bytes`] — test oracle only.
-    #[allow(clippy::erasing_op, clippy::identity_op)]
-    fn transpose_8_u64s_to_64_bytes_scalar(lanes: &[u64; 8], out: &mut [u8]) {
-        debug_assert_eq!(out.len(), 64);
-        for c in 0..8 {
-            let shift = c * 8;
-            let mut packed: u64 = 0;
-            packed |= ((lanes[0] >> shift) & 0xFF) << (0 * 8);
-            packed |= ((lanes[1] >> shift) & 0xFF) << (1 * 8);
-            packed |= ((lanes[2] >> shift) & 0xFF) << (2 * 8);
-            packed |= ((lanes[3] >> shift) & 0xFF) << (3 * 8);
-            packed |= ((lanes[4] >> shift) & 0xFF) << (4 * 8);
-            packed |= ((lanes[5] >> shift) & 0xFF) << (5 * 8);
-            packed |= ((lanes[6] >> shift) & 0xFF) << (6 * 8);
-            packed |= ((lanes[7] >> shift) & 0xFF) << (7 * 8);
-            let transposed = transpose_8x8_bits(packed);
-            out[c * 8..c * 8 + 8].copy_from_slice(&transposed.to_le_bytes());
-        }
-    }
 
     /// The NEON-delegating transpose must match the scalar per-column oracle
     /// bit-for-bit on varied inputs.

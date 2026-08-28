@@ -14,6 +14,7 @@
 
 pub use flock_core::*;
 
+pub mod blake3_hash_many8;
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
