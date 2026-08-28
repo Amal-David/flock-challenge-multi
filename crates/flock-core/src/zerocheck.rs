@@ -523,49 +523,36 @@ fn prove_packed_padded_inner<C: Challenger>(
             // interleaved recovers the fused kernel's stream-level
             // parallelism over the same total bytes.
             let t_r1 = std::time::Instant::now();
-            let ab_closure = || {
-                let t = std::time::Instant::now();
-                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                    ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
-                );
-                (ab, t.elapsed().as_secs_f64() * 1e3)
-            };
-            let c_closure = || {
-                let t = std::time::Instant::now();
-                let (c, s_hat_v_c, quad, fold4, fold8) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
-                        c_identity_z,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
+            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) = rayon::join(
+                || {
+                    let t = std::time::Instant::now();
+                    let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                        ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
                     );
-                (
-                    c,
-                    s_hat_v_c,
-                    quad,
-                    fold4,
-                    fold8,
-                    t.elapsed().as_secs_f64() * 1e3,
-                )
-            };
-            // Per-core SMT arm partition. When the half-pools exist (ranked
-            // shape; built at process start in `crate::smt_split`), AB runs on
-            // sibling 0 of every physical core and C on sibling 1, so each core
-            // pairs one of each kernel instead of whatever the work-stealer
-            // happened to co-schedule. Schedule only: identical closures over
-            // identical inputs, so the proof bytes are unchanged. Falls back to
-            // the incumbent `rayon::join` whenever the pools are absent.
-            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) =
-                match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) => rayon::join(
-                        || ab_pool.install(ab_closure),
-                        || c_pool.install(c_closure),
-                    ),
-                    None => rayon::join(ab_closure, c_closure),
-                };
+                    (ab, t.elapsed().as_secs_f64() * 1e3)
+                },
+                || {
+                    let t = std::time::Instant::now();
+                    let (c, s_hat_v_c, quad, fold4, fold8) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
+                            c_identity_z,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                        );
+                    (
+                        c,
+                        s_hat_v_c,
+                        quad,
+                        fold4,
+                        fold8,
+                        t.elapsed().as_secs_f64() * 1e3,
+                    )
+                },
+            );
             if zc_timing {
                 eprintln!(
                     "[zc-timing] round1 AB {t_ab_ms:.2} ms || identity-C fold {t_c_ms:.2} ms -> {:.2} ms",
