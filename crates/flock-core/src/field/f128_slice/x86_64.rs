@@ -1,9 +1,168 @@
 use crate::field::F128;
 
+/// Four independent GHASH muls via Karatsuba+CLMUL (no VPCLMUL / `ghash_mul_x4`).
+///
+/// Field-identical to [`crate::field::gf2_128::x86_64::ghash_mul_karatsuba_vec`].
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+unsafe fn ghash_mul_xmm(
+    a: core::arch::x86_64::__m128i,
+    b: core::arch::x86_64::__m128i,
+) -> core::arch::x86_64::__m128i {
+    use core::arch::x86_64::*;
+    // SAFETY: function carries pclmulqdq; lane extracts are SSE2.
+    unsafe {
+        let lane0 = |v: __m128i| _mm_cvtsi128_si64(v) as u64;
+        let lane1 = |v: __m128i| _mm_cvtsi128_si64(_mm_srli_si128::<8>(v)) as u64;
+        let pmull = |x: u64, y: u64| {
+            _mm_clmulepi64_si128::<0x00>(_mm_set_epi64x(0, x as i64), _mm_set_epi64x(0, y as i64))
+        };
+        let a_lo = lane0(a);
+        let a_hi = lane1(a);
+        let b_lo = lane0(b);
+        let b_hi = lane1(b);
+        let p0 = pmull(a_lo, b_lo);
+        let p1 = pmull(a_hi, b_hi);
+        let pm = pmull(a_lo ^ a_hi, b_lo ^ b_hi);
+        let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
+        let mut t0 = p0;
+        t1 = _mm_xor_si128(t1, _mm_slli_si128::<8>(p1));
+        t1 = _mm_xor_si128(t1, pmull(lane1(p1), 0x87));
+        t0 = _mm_xor_si128(t0, _mm_slli_si128::<8>(t1));
+        t0 = _mm_xor_si128(t0, pmull(lane1(t1), 0x87));
+        t0
+    }
+}
+
+/// One 4-lane (64 B dst) pair-fold body: even + r·(even+odd) per slot.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+unsafe fn fold4_xmm(src: *const F128, dst: *mut F128, base: usize, t: usize, r: core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller supplies features and in-bounds 8-source / 4-dest slots.
+    unsafe {
+        let s = 2 * (base + t);
+        let e0 = _mm_loadu_si128(src.add(s) as *const __m128i);
+        let o0 = _mm_loadu_si128(src.add(s + 1) as *const __m128i);
+        let e1 = _mm_loadu_si128(src.add(s + 2) as *const __m128i);
+        let o1 = _mm_loadu_si128(src.add(s + 3) as *const __m128i);
+        let e2 = _mm_loadu_si128(src.add(s + 4) as *const __m128i);
+        let o2 = _mm_loadu_si128(src.add(s + 5) as *const __m128i);
+        let e3 = _mm_loadu_si128(src.add(s + 6) as *const __m128i);
+        let o3 = _mm_loadu_si128(src.add(s + 7) as *const __m128i);
+        let p0 = ghash_mul_xmm(_mm_xor_si128(e0, o0), r);
+        let p1 = ghash_mul_xmm(_mm_xor_si128(e1, o1), r);
+        let p2 = ghash_mul_xmm(_mm_xor_si128(e2, o2), r);
+        let p3 = ghash_mul_xmm(_mm_xor_si128(e3, o3), r);
+        _mm_storeu_si128(dst.add(t) as *mut __m128i, _mm_xor_si128(e0, p0));
+        _mm_storeu_si128(dst.add(t + 1) as *mut __m128i, _mm_xor_si128(e1, p1));
+        _mm_storeu_si128(dst.add(t + 2) as *mut __m128i, _mm_xor_si128(e2, p2));
+        _mm_storeu_si128(dst.add(t + 3) as *mut __m128i, _mm_xor_si128(e3, p3));
+    }
+}
+
+/// Four-lane pair fold using PCLMULQDQ (no AVX-512). Unroll=2, tile=32, block=64 B.
+///
+/// # Safety
+/// Requires `pclmulqdq`, `sse2`, and `ssse3`. Caller guarantees source bounds.
+#[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+pub(super) unsafe fn fold_pairs_4x(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let r_xmm = _mm_set_epi64x(r.hi as i64, r.lo as i64);
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
+        let n = dst.len();
+        let mut t = 0usize;
+        while t + 32 <= n {
+            let tile_end = t + 32;
+            while t < tile_end {
+                fold4_xmm(src_ptr, dst_ptr, base, t, r_xmm);
+                fold4_xmm(src_ptr, dst_ptr, base, t + 4, r_xmm);
+                t += 8;
+            }
+        }
+        while t + 8 <= n {
+            fold4_xmm(src_ptr, dst_ptr, base, t, r_xmm);
+            fold4_xmm(src_ptr, dst_ptr, base, t + 4, r_xmm);
+            t += 8;
+        }
+        if t + 4 <= n {
+            fold4_xmm(src_ptr, dst_ptr, base, t, r_xmm);
+            t += 4;
+        }
+        portable_tail(src, base, dst, r, t);
+    }
+}
+
+/// In-place DirectFold8 bind with fused `(u0,u2)` using the 4-lane PCLMUL body.
+/// Unroll=2 (8 dst slots / iter, same `t += 8` as the VPCLMUL kernel).
+///
+/// # Safety
+/// Requires `pclmulqdq`, `sse2`, and `ssse3`. `f.len() == b.len()`, multiple of 4.
+#[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+pub(super) unsafe fn fold_two_and_msg_in_place_4x(
+    f: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len().is_multiple_of(4));
+    let half = f.len() / 2;
+    // SAFETY: caller guarantees features and even pair counts; each 4-lane
+    // body loads `2t..2t+8` before storing `t..t+4`.
+    unsafe {
+        let r_xmm = _mm_set_epi64x(r.hi as i64, r.lo as i64);
+        let f_ptr = f.as_mut_ptr();
+        let b_ptr = b.as_mut_ptr();
+        let lanes = half & !7;
+        let mut t = 0usize;
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        while t < lanes {
+            fold4_xmm(f_ptr, f_ptr, 0, t, r_xmm);
+            fold4_xmm(f_ptr, f_ptr, 0, t + 4, r_xmm);
+            fold4_xmm(b_ptr, b_ptr, 0, t, r_xmm);
+            fold4_xmm(b_ptr, b_ptr, 0, t + 4, r_xmm);
+            let mut i = 0usize;
+            while i < 8 {
+                let f0 = *f_ptr.add(t + i);
+                let f1 = *f_ptr.add(t + i + 1);
+                let b0 = *b_ptr.add(t + i);
+                let b1 = *b_ptr.add(t + i + 1);
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                i += 2;
+            }
+            t += 8;
+        }
+        while t < half {
+            let source = 2 * t;
+            let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
+            let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
+            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
+            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            *f_ptr.add(t) = f0;
+            *f_ptr.add(t + 1) = f1;
+            *b_ptr.add(t) = b0;
+            *b_ptr.add(t + 1) = b1;
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            t += 2;
+        }
+        f.truncate(half);
+        b.truncate(half);
+        (u0, u2)
+    }
+}
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -34,6 +193,7 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -67,6 +227,7 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; the caller guarantees that both input
 /// slices contain every pair selected by `base` and `dst.len()`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs_with_scaled_addend(
     src: &[F128],
@@ -148,6 +309,7 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -209,8 +371,10 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
 /// is folding, in F128 elements. `FLOCK_NO_FOLD16_PF=1` removes the hints
 /// (they move no data of their own and change no value, so the fold is
 /// byte-identical either way); `FLOCK_FOLD16_PF=<n>` overrides the distance.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 const FOLD16_PF_AHEAD: usize = 512;
 
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 fn fold16_pf_ahead() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_FOLD16_PF").is_some() {
@@ -236,6 +400,7 @@ fn fold16_pf_ahead() -> usize {
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
@@ -313,6 +478,7 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `f.len() == b.len()`, multiple of 4.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_two_and_msg_in_place(
     f: &mut Vec<F128>,
@@ -402,6 +568,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; `hi.len() >= lo.len()`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -440,6 +607,7 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all four slices at least `n` long.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn msg_split_half(
     chi: &[F128],
@@ -490,6 +658,7 @@ pub(super) unsafe fn msg_split_half(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all eight slices at least `n` long.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bind_both_and_msg_split(
