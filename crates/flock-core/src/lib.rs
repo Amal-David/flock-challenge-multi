@@ -54,6 +54,15 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    let built = init_global_pool();
+    // Process start, on the (unpinned) main thread, after the global pool
+    // exists. This is the only place the zerocheck round-1 half-pools may be
+    // built: see `smt_split`.
+    smt_split::init();
+    built
+}
+
+fn init_global_pool() -> Option<usize> {
     if let Some(n) = topology_pool::try_build_global() {
         return Some(n);
     }
@@ -185,6 +194,241 @@ pub(crate) mod topology_pool {
                 Ok(()) => Some(n),
                 Err(_) => None,
             }
+        }
+    }
+}
+
+/// Per-core SMT arm partition for zerocheck round 1 (Linux/x86-64).
+///
+/// Round 1 runs two independent halves — the AB shift-reduce and the
+/// identity-C block-major fold — as `rayon::join`. The incumbent spreads
+/// BOTH halves' inner `par_iter`s over the same 16 pinned workers, so each
+/// physical core ends up running whichever chunks the work-stealer handed
+/// it: sometimes AB next to AB, sometimes C next to C.
+///
+/// Measured on this machine (`zc1-notes/FINDINGS.md`, 144 value-valid runs):
+/// the per-task cost of a co-resident SMT sibling, normalised against the
+/// same task with the sibling idle, is **1.66** for AB beside AB and
+/// **1.85** for C beside C (sum 3.50), against **1.69 / 1.64** for the
+/// heterogeneous pairing (sum 3.33). The two kernels stress different parts
+/// of a core, so pairing one of each on a core is ~5% cheaper than pairing
+/// like with like. Giving each half its own 8-thread pool, pinned one thread
+/// per physical core to opposite SMT siblings, makes every core run exactly
+/// one AB thread beside one C thread.
+///
+/// The pools are built **here, at process start, on the unpinned main
+/// thread**, from an explicit CPU list read out of
+/// `/sys/devices/system/cpu/*/topology/thread_siblings_list`. They must
+/// never be built lazily on a rayon worker: those are pinned to one logical
+/// CPU, and `std::thread::available_parallelism()` honours the calling
+/// thread's affinity mask, so asking it there returns 1 and both "8-thread"
+/// pools silently degenerate to a single thread (this happened, and the
+/// resulting 4-8x regression read as a clean refutation of the mechanism).
+/// Nothing on this path calls `available_parallelism`.
+///
+/// Rollback is compile-time, because `run_trial` calls `env_clear()` and no
+/// `FLOCK_*` variable reaches the ranked worker: set
+/// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
+/// restored and no extra thread is spawned. The two env vars are local
+/// diagnostics only and are absent on the ranked runner, so the shipped
+/// default is the split.
+pub(crate) mod smt_split {
+    use rayon::ThreadPool;
+    use std::sync::OnceLock;
+
+    /// Compile-time rollback. `false` restores the incumbent schedule and
+    /// builds no pools at all.
+    pub(crate) const ZC_R1_SMT_SPLIT: bool = true;
+
+    static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
+
+    /// The two half-pools, or `None` when this process is not the ranked
+    /// shape (or the mechanism is off). Never builds anything: if [`init`]
+    /// has not run, callers get the incumbent schedule.
+    #[inline]
+    pub(crate) fn zc_r1_pools() -> Option<&'static (ThreadPool, ThreadPool)> {
+        POOLS.get().and_then(Option::as_ref)
+    }
+
+    /// Build the half-pools. Call ONCE, at process start, from an UNPINNED
+    /// thread, and only after the global rayon pool exists.
+    pub(crate) fn init() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            if !ZC_R1_SMT_SPLIT {
+                return;
+            }
+            let _ = POOLS.set(imp::build());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    mod imp {
+        use rayon::ThreadPool;
+
+        unsafe extern "C" {
+            fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+            fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
+        }
+
+        type Mask = [u64; 16]; // 1024 CPUs
+
+        fn affinity() -> Mask {
+            let mut m: Mask = [0; 16];
+            // SAFETY: `m` is exactly the 1024-bit buffer the kernel is told about.
+            unsafe {
+                sched_getaffinity(0, core::mem::size_of::<Mask>(), m.as_mut_ptr());
+            }
+            m
+        }
+
+        fn pin_to(cpu: usize) {
+            if cpu >= 1024 {
+                return;
+            }
+            let mut mask: Mask = [0; 16];
+            mask[cpu / 64] |= 1u64 << (cpu % 64);
+            // SAFETY: plain syscall on the calling thread with a valid mask
+            // buffer; failure is ignored (pure scheduling hint).
+            unsafe {
+                let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+            }
+        }
+
+        /// Logical CPU count from `/sys/devices/system/cpu/present`.
+        /// Deliberately NOT `available_parallelism()` — see the module doc.
+        fn present_cpus() -> usize {
+            let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/present") else {
+                return 0;
+            };
+            let mut hi = 0usize;
+            for part in s.trim().split(',') {
+                let last = part.split('-').next_back().unwrap_or("");
+                if let Ok(v) = last.parse::<usize>() {
+                    hi = hi.max(v);
+                }
+            }
+            hi + 1
+        }
+
+        /// One ascending group per physical core, from `thread_siblings_list`.
+        fn sibling_groups() -> Vec<Vec<usize>> {
+            let n = present_cpus();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            let mut seen = vec![false; n];
+            for cpu in 0..n {
+                if seen[cpu] {
+                    continue;
+                }
+                let path =
+                    format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+                let Ok(list) = std::fs::read_to_string(path) else {
+                    return Vec::new();
+                };
+                let mut g = Vec::new();
+                for part in list.trim().split(',') {
+                    if let Some((a, b)) = part.split_once('-') {
+                        let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) else {
+                            return Vec::new();
+                        };
+                        g.extend(a..=b);
+                    } else if let Ok(v) = part.parse::<usize>() {
+                        g.push(v);
+                    } else {
+                        return Vec::new();
+                    }
+                }
+                g.retain(|&c| c < n);
+                g.sort_unstable();
+                g.dedup();
+                for &c in &g {
+                    seen[c] = true;
+                }
+                groups.push(g);
+            }
+            groups
+        }
+
+        fn half(sibling: usize, cpus: Vec<usize>, debug: bool) -> ThreadPool {
+            if debug {
+                eprintln!("[smt_split] pool sibling{sibling} cpus {cpus:?}");
+            }
+            let n = cpus.len();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(move |i| format!("zcr1s{sibling}-{i}"))
+                .start_handler(move |i| {
+                    if let Some(&c) = cpus.get(i) {
+                        pin_to(c);
+                    }
+                })
+                .build()
+                .expect("zc_r1 half pool")
+        }
+
+        pub(super) fn build() -> Option<(ThreadPool, ThreadPool)> {
+            let debug = std::env::var_os("FLOCK_SMT_SPLIT_DEBUG").is_some();
+            if std::env::var_os("FLOCK_NO_ZC_R1_SMT_SPLIT").is_some() {
+                if debug {
+                    eprintln!("[smt_split] disabled by FLOCK_NO_ZC_R1_SMT_SPLIT");
+                }
+                return None;
+            }
+            let groups = sibling_groups();
+            let cores = groups.len();
+            // Ranked shape only: every core has exactly two SMT siblings, the
+            // machine is fully described, and the global pool already owns one
+            // worker per logical CPU (so the split reassigns workers rather
+            // than adding oversubscription during the window itself).
+            if cores < 2
+                || groups.iter().any(|g| g.len() != 2)
+                || present_cpus() != 2 * cores
+                || rayon::current_num_threads() != 2 * cores
+            {
+                if debug {
+                    eprintln!(
+                        "[smt_split] declined: cores={cores} present={} rayon={}",
+                        present_cpus(),
+                        rayon::current_num_threads()
+                    );
+                }
+                return None;
+            }
+            // Every CPU we would pin to must be inside this process's own
+            // affinity set, or the pin silently lands the thread somewhere the
+            // cpuset forbids.
+            let m = affinity();
+            for g in &groups {
+                for &c in g {
+                    if c >= 1024 || m[c / 64] & (1u64 << (c % 64)) == 0 {
+                        if debug {
+                            eprintln!("[smt_split] declined: cpu {c} outside affinity mask");
+                        }
+                        return None;
+                    }
+                }
+            }
+            let s0: Vec<usize> = groups.iter().map(|g| g[0]).collect();
+            let s1: Vec<usize> = groups.iter().map(|g| g[1]).collect();
+            let p0 = half(0, s0, debug);
+            let p1 = half(1, s1, debug);
+            if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
+                // Diagnostics: pools are built (and their threads spawned and
+                // pinned) but never installed on, isolating the standing cost
+                // of the extra threads from the value of the partition.
+                if debug {
+                    eprintln!("[smt_split] built but IDLE (FLOCK_ZC_R1_SMT_SPLIT_IDLE)");
+                }
+                // Leak them: `ThreadPool`'s `Drop` terminates its workers, and
+                // this arm exists precisely to keep the extra threads alive.
+                core::mem::forget(p0);
+                core::mem::forget(p1);
+                return None;
+            }
+            Some((p0, p1))
         }
     }
 }
