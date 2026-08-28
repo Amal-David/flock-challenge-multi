@@ -6,25 +6,39 @@ use crate::field::F128;
 /// Requires `avx512f` and `vpclmulqdq`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-        let r_x64 = ghash_shift64_x4(r_bcast);
         let lanes = dst.len() & !3;
         let mut t = 0;
-        while t < lanes {
-            let s = 2 * (base + t);
-            let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            let diff = _mm512_xor_si512(even, odd);
-            let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
-            t += 4;
+        if r.hi == 0 {
+            while t < lanes {
+                let s = 2 * (base + t);
+                let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                let diff = _mm512_xor_si512(even, odd);
+                let new = _mm512_xor_si512(even, ghash_mul_x4_low_rhs(diff, r_bcast));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+                t += 4;
+            }
+        } else {
+            let r_x64 = ghash_shift64_x4(r_bcast);
+            while t < lanes {
+                let s = 2 * (base + t);
+                let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                let diff = _mm512_xor_si512(even, odd);
+                let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+                t += 4;
+            }
         }
         portable_tail(src, base, dst, r, t);
     }

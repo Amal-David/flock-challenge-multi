@@ -1507,6 +1507,11 @@ fn fold_block_major_gfni(
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                 }
+                let mats_bcast: [core::arch::x86_64::__m512i; 128] = unsafe {
+                    core::array::from_fn(|i| {
+                        core::arch::x86_64::_mm512_set1_epi64(mats[i] as i64)
+                    })
+                };
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
                 // The row stride is 2048 bytes, so a tile's 64 live rows
@@ -1580,7 +1585,7 @@ fn fold_block_major_gfni(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
                                     2,
-                                    &mats,
+                                    &mats_bcast,
                                     wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
                                     first_tile,
                                 );
@@ -1638,7 +1643,7 @@ fn fold_block_major_gfni(
                             transposed.as_ptr(),
                             128,
                             chunk_bits.div_ceil(64),
-                            &mats,
+                            &mats_bcast,
                             wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
                             first_tile,
                         );
