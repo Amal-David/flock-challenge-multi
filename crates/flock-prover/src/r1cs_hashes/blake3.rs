@@ -310,6 +310,211 @@ pub fn blake3_compress(
     state
 }
 
+// ---------------------------------------------------------------------------
+// Chunk-stride counter/flags header precomputation.
+//
+// BLAKE3's chaining model processes an outer chunk of `CHUNK_SIZE = 1024`
+// bytes as 16 sub-blocks of 64 bytes each. The chunk's counter, block_len
+// and flags are CONSTANT across all 16 sub-block compresses; only the
+// chaining value (cv) and the message block change per sub-block. Pre-baking
+// the 4 state words 12..15 (counter_lo, counter_hi, block_len, flags) into
+// a stack-resident 64-byte buffer amortizes the per-compress setup and
+// replaces the four `as u32` / `>> 32` shifts in every sub-block call with
+// four byte-aligned u32 reads from a register-pinned buffer.
+//
+// Layout of the 64-byte header (per the optimisation spec):
+//   [0  .. 32)   32 LE counter bytes (the u64 counter at [0..8], upper 24
+//                bytes stay zero — they only exist so a u64 ADD on the lo
+//                lane can carry into the hi lane at [8..16] without
+//                disturbing the rest of the buffer)
+//   [32 .. 36)    4 LE block_len bytes
+//   [36 .. 37)    1 flags byte
+//   [37 .. 64)   27 zero padding bytes
+//
+// Only bytes [0..16) participate in the `bump_chunk_header` carry chain;
+// the remaining 48 bytes (block_len, flags, padding) are immutable across
+// the 16 sub-block compresses and across the per-chunk counter bump.
+// ---------------------------------------------------------------------------
+
+/// Build the 64-byte BLAKE3 counter/flags header (32 LE counter bytes + 4 LE
+/// block_len bytes + flags byte + 27 zero padding bytes) into a
+/// stack-resident `[u8; 64]`. Called once per outer 1024-byte chunk; the same
+/// buffer is then passed to all 16 sub-block `compress_in_place` calls within
+/// that chunk. `#[inline(always)]` so the 8-byte counter write, the 4-byte
+/// block_len write and the 1-byte flags write stay adjacent to the call site
+/// at every chunk boundary.
+#[inline(always)]
+fn build_chunk_header(out: &mut [u8; 64], counter: u64, block_len: u32, flags: u32) {
+    // Zero the whole buffer first; the meaningful 37 bytes overwrite the
+    // first 36 of those zeros and the flags byte lands at offset 36. This
+    // keeps the upper 27 bytes (37..64) deterministically zero, which the
+    // `compress_in_place` consumer treats as padding and ignores.
+    *out = [0u8; 64];
+    // 32 LE counter bytes: the u64 counter occupies bytes 0..8 LE; bytes
+    // 8..32 stay zero so a u64 ADD on the lo lane at bytes 0..8 carries
+    // naturally into the u64 hi lane at bytes 8..16 without touching the
+    // block_len / flags region that begins at byte 32.
+    out[0..8].copy_from_slice(&counter.to_le_bytes());
+    // 4 LE block_len bytes at offset 32.
+    out[32..36].copy_from_slice(&block_len.to_le_bytes());
+    // 1 flags byte at offset 36.
+    out[36] = (flags & 0xff) as u8;
+    // Bytes 37..64 stay zero (padding) — already enforced by the *out = [0; 64].
+}
+
+/// Bump the chunk counter in place by 1: u64 ADD on the counter lo lane
+/// (bytes 0..8) with the carry folded into the counter hi lane (bytes
+/// 8..16). Called exactly once per outer chunk crossing — the next chunk's
+/// `build_chunk_header` is then skipped in favour of the in-place mutation
+/// of the same buffer. `#[inline(always)]` so the load / add-with-carry /
+/// store sequence fuses with the chunk-loop exit branch.
+#[inline(always)]
+fn bump_chunk_header(h: &mut [u8; 64]) {
+    let lo = u64::from_le_bytes(h[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(h[8..16].try_into().unwrap());
+    let (lo, carry) = lo.overflowing_add(1);
+    let hi = if carry { hi.wrapping_add(1) } else { hi };
+    h[0..8].copy_from_slice(&lo.to_le_bytes());
+    h[8..16].copy_from_slice(&hi.to_le_bytes());
+}
+
+/// Decoded counter/block_len/flags words lifted out of a precomputed chunk
+/// header. A direct 4-word copy of the BLAKE3 state lanes 12..15, kept
+/// separate from `compress_in_place` so the loop body stays tight.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ChunkHeaderWords {
+    counter_lo: u32,
+    counter_hi: u32,
+    block_len: u32,
+    flags: u32,
+}
+
+#[inline(always)]
+fn chunk_header_words(h: &[u8; 64]) -> ChunkHeaderWords {
+    ChunkHeaderWords {
+        counter_lo: u32::from_le_bytes(h[0..4].try_into().unwrap()),
+        counter_hi: u32::from_le_bytes(h[4..8].try_into().unwrap()),
+        block_len: u32::from_le_bytes(h[32..36].try_into().unwrap()),
+        flags: h[36] as u32,
+    }
+}
+
+/// Number of sub-blocks in one BLAKE3 outer chunk (16 × 64 B = 1024 B).
+pub const CHUNK_SUB_BLOCKS: usize = 16;
+/// BLAKE3 outer chunk size in bytes (CHUNK_SUB_BLOCKS × 64).
+pub const CHUNK_SIZE: usize = CHUNK_SUB_BLOCKS * 64;
+
+/// BLAKE3 compression with in-place chaining-value mutation (standard
+/// BLAKE3 chained API). Replaces `cv` with the post-finalization output
+/// CV: `state[0..8] ^= state[8..16]; state[8..16] ^= cv; cv := state[0..8]`.
+///
+/// The 7-round G-mix schedule and the 16-word message permutation are
+/// identical to `blake3_compress`; the only difference is the API surface
+/// (mutates CV in place vs returns the full 16-word state) and that the
+/// counter/block_len/flags are sourced from the precomputed `header`
+/// buffer rather than recomputed from individual `u64`/`u32` arguments.
+///
+/// **Public signature is the BLAKE3 chained API**: callers pass the same
+/// `header` buffer to all 16 sub-block compresses within an outer chunk
+/// (the counter is constant across them) and call `bump_chunk_header` on
+/// the buffer once at the chunk boundary.
+pub fn compress_in_place(
+    cv: &mut [u32; 8],
+    block_words: &[u32; 16],
+    header: &[u8; 64],
+) {
+    let w = chunk_header_words(header);
+    let mut state = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        w.counter_lo,
+        w.counter_hi,
+        w.block_len,
+        w.flags,
+    ];
+    let mut block = *block_words;
+    for r in 0..N_ROUNDS {
+        round_fn(&mut state, &block);
+        if r + 1 < N_ROUNDS {
+            permute(&mut block);
+        }
+    }
+    for i in 0..8 {
+        state[i] ^= state[i + 8];
+        state[i + 8] ^= cv[i];
+    }
+    cv.copy_from_slice(&state[0..8]);
+}
+
+/// Compress one full BLAKE3 outer chunk (16 sub-blocks × 64 bytes) starting
+/// from `cv`. Builds the 64-byte counter/block_len/flags header once via
+/// `build_chunk_header`, threads the same buffer through the 16
+/// `compress_in_place` calls, then bumps the header counter by 1 so the
+/// caller can chain straight into the next chunk without rebuilding.
+///
+/// Returns the new chaining value (the post-bump header's `state[0..8]`).
+pub fn compress_chunk(
+    cv: &mut [u32; 8],
+    blocks: &[[u32; 16]; CHUNK_SUB_BLOCKS],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) {
+    // The header lives in a stack-resident `[u8; 64]`. All 16 sub-block
+    // compresses inside this chunk share this exact buffer — the counter is
+    // constant across them in BLAKE3's standard chaining model, so passing
+    // the same buffer is bit-identical to recomputing those four state lanes
+    // from raw u64 / u32 arguments on every iteration.
+    let mut header = [0u8; 64];
+    build_chunk_header(&mut header, counter, block_len, flags);
+    for block in blocks.iter() {
+        compress_in_place(cv, block, &header);
+    }
+    // Cross-chunk bump: the next chunk's counter is this chunk's counter + 1.
+    // Keeping the bump here (rather than at the next chunk's prologue)
+    // amortises the u64 ADD-with-carry over a single stack-resident buffer
+    // that the very next chunk's loop can read without re-zeroing.
+    bump_chunk_header(&mut header);
+}
+
+/// Compress `n_chunks` full outer chunks (each 16 sub-blocks of 64 bytes)
+/// starting from `cv`. The chunk counter starts at `start_counter` and
+/// advances by 1 per chunk. `flags_base` is OR'd into the per-call flags
+/// (e.g. CHUNK_START on the first chunk, CHUNK_END on the last).
+pub fn compress_chunks(
+    cv: &mut [u32; 8],
+    chunks: &[[[u32; 16]; CHUNK_SUB_BLOCKS]],
+    start_counter: u64,
+    block_len: u32,
+    flags_base: u32,
+) {
+    let mut header = [0u8; 64];
+    let first = chunks
+        .first()
+        .map(|_| start_counter)
+        .unwrap_or(start_counter);
+    build_chunk_header(&mut header, first, block_len, flags_base);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            bump_chunk_header(&mut header);
+        }
+        for block in chunk.iter() {
+            compress_in_place(cv, block, &header);
+        }
+    }
+}
+
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
 /// — i.e., `PERM^r [G_MSG_IDX[g]]`.
 fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
