@@ -1095,10 +1095,21 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     r: usize,
     twiddles: &[F128; 15],
 ) {
+    let low_l4 = !low_twiddle_fused3_disabled() && twiddles[7..15].iter().all(|t| t.hi == 0);
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
+                ptr,
+                sixteenth,
+                num_ntts,
+                active_lanes,
+                r,
+                twiddles,
+                0,
+            )
+        } else if low_l4 {
+            butterfly_fused_4layer_row_impl::<true, true, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1108,7 +1119,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 0,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -2161,7 +2172,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -2171,7 +2182,7 @@ mod diet_tests {
                             0,
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
