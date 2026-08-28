@@ -528,6 +528,44 @@ pub(super) fn write_convert_ab_nomul_gfni(
     }
 }
 
+/// Direct-from-stream twin of [`accumulate_convert_ab_nomul_gfni`] /
+/// [`write_convert_ab_nomul_gfni`]: `src` is the window's first row inside the
+/// packed `ab_inner` stream and `next_src` the look-ahead base whose hints the
+/// kernel interleaves with its own row loads. `FIRST_WRITE` is resolved by the
+/// caller's window split, not by a branch in the loop.
+///
+/// # Safety
+/// `src` must be valid for `16 * 64` readable bytes; `next_src` is only ever
+/// a prefetch operand.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
+    src: *const u8,
+    next_src: *const u8,
+    n_next: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: the cfg gate guarantees the SIMD features; the window contract
+    // is forwarded from this function's own caller.
+    unsafe {
+        x86_64::convert_ab_nomul_x86_gfni_direct::<FIRST_WRITE>(
+            src,
+            next_src,
+            n_next,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
