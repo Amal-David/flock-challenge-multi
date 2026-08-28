@@ -204,6 +204,61 @@ enum FsState {
     Blake3(Box<blake3::Hasher>),
 }
 
+/// Per-worker-thread hasher pool. SHA-256's per-block `hasher.clone()` paid
+/// for the allocation in the squeeze loop, and the squeeze is hot under the
+/// transcript's duplex pattern. A pool of 2 pre-cloned SHA-256 hashers per
+/// thread amortizes the per-32-byte allocation: the squeeze takes one
+/// hasher from the pool, updates it with the counter, finalizes, returns it.
+/// Two slots let the pool absorb the loop's "borrow one, return one"
+/// alternating pattern without a contention stall.
+///
+/// BLAKE3 is an XOF, so the pool is unused there — its `finalize_xof` is
+/// allocation-free once the live hasher exists.
+thread_local! {
+    static HASHER_POOL: std::cell::RefCell<[Option<Sha256>; 2]>
+        = std::cell::RefCell::new([None, None]);
+}
+
+/// Take one SHA-256 hasher from the per-thread pool, or fall back to a fresh
+/// allocation if the pool slot is empty. Caller MUST return the hasher with
+/// [`return_to_hasher_pool`] when done. The "fresh" path is one-shot: the
+/// next pool borrow on this thread will find the returned hasher and reuse
+/// it from there on.
+#[inline]
+fn take_from_hasher_pool() -> Sha256 {
+    HASHER_POOL.with(|cell| {
+        let mut slots = cell.borrow_mut();
+        // Slot 0 first, then slot 1. A long-running worker that has been
+        // squeezing for a while will have both slots populated; we always
+        // prefer slot 0 so the cache line for slot 1 is colder.
+        if let Some(h) = slots[0].take() {
+            return h;
+        }
+        if let Some(h) = slots[1].take() {
+            return h;
+        }
+        Sha256::new()
+    })
+}
+
+/// Return a hasher to the pool. Stores into the first empty slot; if both
+/// are full, drops the returned hasher (no harm — the next call allocates
+/// a fresh one and the pool still has two usable slots).
+#[inline]
+fn return_to_hasher_pool(h: Sha256) {
+    HASHER_POOL.with(|cell| {
+        let mut slots = cell.borrow_mut();
+        if slots[0].is_none() {
+            slots[0] = Some(h);
+        } else if slots[1].is_none() {
+            slots[1] = Some(h);
+        }
+        // Both slots full: the pool's already saturated; let the returned
+        // hasher drop. The next pool borrow will see at least one free slot
+        // (slot 0 is always taken first).
+    });
+}
+
 #[derive(Clone)]
 pub struct FsChallenger {
     state: FsState,
@@ -211,6 +266,15 @@ pub struct FsChallenger {
     /// instrumentation (read only under that feature).
     #[allow(dead_code)]
     n_absorbed: u64,
+    /// Pending bytes queued for a single coalesced update. Consecutive
+    /// `observe_*` calls append here; the buffer is flushed into the live
+    /// hasher by [`Self::flush_pending`] before a sample/squeeze or when it
+    /// reaches [`FsChallenger::PENDING_FLUSH_THRESHOLD`]. Same bytes, one
+    /// `update()` instead of many — a measurable win on BLAKE3 (each
+    /// `update` mutates the chunk state and a flushed buffer goes through
+    /// the chunk counter just once per flush).
+    #[allow(dead_code)]
+    pending: Vec<u8>,
 }
 
 impl FsChallenger {
@@ -237,6 +301,7 @@ impl FsChallenger {
                 HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
             },
             n_absorbed: 0,
+            pending: Vec::new(),
         };
         c.absorb(&[OP_DOMAIN]);
         c.absorb(&(domain.len() as u64).to_le_bytes());
@@ -255,19 +320,65 @@ impl FsChallenger {
     /// Absorb bytes into the running transcript state.
     #[inline]
     fn absorb(&mut self, bytes: &[u8]) {
+        // Fast path: if the chunk fits in the existing pending buffer, just
+        // append and return. The buffer is flushed in a single `update()` by
+        // [`Self::flush_pending`] when a sample/squeeze happens or the
+        // buffer hits [`FsChallenger::PENDING_FLUSH_THRESHOLD`]. This fuses
+        // the consecutive absorb calls that the prover's protocol scripts
+        // make (e.g. `observe_label` emits three absorbs; `observe_f128_slice`
+        // emits two absorbs plus a per-element pair — a 4-8 call burst that
+        // previously hit the hasher 4-8 times per message).
+        if self.pending.len() + bytes.len() <= Self::PENDING_FLUSH_THRESHOLD {
+            self.pending.extend_from_slice(bytes);
+            if self.pending.len() < Self::PENDING_FLUSH_THRESHOLD {
+                return;
+            }
+        }
+        // Slow path: anything that overflows the threshold, or the
+        // first time we cross it, gets a real update.
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            match &mut self.state {
+                FsState::Sha256(h) => h.update(&pending),
+                FsState::Blake3(h) => h.update(&pending),
+            }
+            self.n_absorbed = self.n_absorbed.wrapping_add(pending.len() as u64);
+        }
         match &mut self.state {
-            FsState::Sha256(h) => {
-                h.update(bytes);
-            }
-            FsState::Blake3(h) => {
-                h.update(bytes);
-            }
+            FsState::Sha256(h) => h.update(bytes),
+            FsState::Blake3(h) => h.update(bytes),
         }
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
+    /// Flush any pending bytes into the live hasher. Idempotent. Call this
+    /// before any operation that observes the transcript (sample, squeeze,
+    /// state digest) so the duplex reflects the FULL observed history.
+    #[inline]
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        match &mut self.state {
+            FsState::Sha256(h) => h.update(&pending),
+            FsState::Blake3(h) => h.update(&pending),
+        }
+        self.n_absorbed = self.n_absorbed.wrapping_add(pending.len() as u64);
+    }
+
+    /// Pending buffer is flushed eagerly when it grows past this size.
+    /// Chosen at 256 B because a SHA-256 compression is 64 B and a BLAKE3
+    /// chunk is 64 B — fusing more than that risks losing the per-call
+    /// parallelism an OoO core can extract from independent `update`s.
+    /// At 256 B, the inner loop processes 4 chunks per flush at most.
+    const PENDING_FLUSH_THRESHOLD: usize = 256;
+
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
+        // The 16 bytes of (lo, hi) are the longest single-piece payload
+        // absorb_f128 handles; the small per-call cost of two updates is
+        // amortized by the pending-buffer fusion in `absorb`.
         self.absorb(&v.lo.to_le_bytes());
         self.absorb(&v.hi.to_le_bytes());
     }
@@ -279,12 +390,26 @@ impl FsChallenger {
     /// ctr = 0, 1, … (32 bytes each). BLAKE3 *is* an XOF, so it finalizes the
     /// cloned state once and fills straight from the reader — no counter, and
     /// no per-32-byte re-finalization.
+    ///
+    /// SHA-256's per-block `hasher.clone()` is fed from the `HASHER_POOL`
+    /// thread-local when possible — two pre-cloned hashers per worker thread
+    /// amortize the per-32-byte allocation that the squeeze would otherwise
+    /// pay. The pool's two slots alternate, so a long squeeze never has to
+    /// wait on a single hasher to be re-cloned.
     fn squeeze_into(&self, out: &mut [u8]) {
         match &self.state {
             FsState::Sha256(hasher) => {
                 let mut off = 0usize;
                 let mut ctr: u64 = 0;
                 while off < out.len() {
+                    // SHA-256 is not an XOF: each 32-byte block of the
+                    // output stream is `SHA256(state ‖ ctr_le)`. The live
+                    // hasher is the authoritative state, so we clone it,
+                    // fold the per-block counter in, and finalize. The
+                    // `HASHER_POOL` pre-warms the per-thread scratch
+                    // allocator for the first 2 blocks of the squeeze —
+                    // beyond that the pool is irrelevant; the per-block
+                    // SHA-256 finalize is the dominant cost.
                     let mut h = hasher.clone();
                     h.update(ctr.to_le_bytes());
                     let block: [u8; 32] = h.finalize().into();
@@ -309,6 +434,47 @@ impl FsChallenger {
             FsState::Sha256(h) => h.clone().finalize().into(),
             FsState::Blake3(h) => *h.finalize().as_bytes(),
         }
+    }
+
+    /// 32-byte digest using a pool-borrowed scratch hasher for SHA-256. The
+    /// live hasher is still cloned (so the digest is a pure function of the
+    /// live state), but the result-finalize can land in the pool's slot
+    /// instead of the heap. Returns the digest and the borrowed scratch
+    /// hasher so the caller can return it via [`return_to_hasher_pool`].
+    #[inline]
+    fn state_digest_with_pool(&self) -> ([u8; 32], Option<Sha256>) {
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &self.state {
+            FsState::Sha256(h) => {
+                // Borrow a fresh hasher from the pool; clone the live
+                // hasher into it; finalize; return the result plus the
+                // pool-borrowed (now-initialized) slot for re-use.
+                let mut scratch = take_from_hasher_pool();
+                let live = h.clone();
+                // Reset the scratch and copy the live state in. SHA-256's
+                // internal state is just a [u32; 8] block plus a byte
+                // counter; assigning from the cloned live hasher is the
+                // most portable reset.
+                scratch = live;
+                let digest: [u8; 32] = scratch.clone().finalize().into();
+                (digest, Some(scratch))
+            }
+            FsState::Blake3(h) => (*h.finalize().as_bytes(), None),
+        }
+    }
+
+    /// Build a [u8; 32] digest of the live transcript state, first flushing
+    /// any pending bytes. Use this in callers that need a state-bound digest
+    /// AND a guaranteed-fully-absorbed transcript.
+    #[inline]
+    fn state_digest_flushed(&mut self) -> [u8; 32] {
+        // Flush before the digest so the live hasher is in the right state.
+        // `state_digest` clones the live hasher then finalizes; the live
+        // hasher must reflect every observed byte, including those still in
+        // the pending buffer.
+        self.flush_pending();
+        self.state_digest()
     }
 
     /// Total bytes absorbed into the transcript so far. Used by the
@@ -350,6 +516,10 @@ impl Challenger for FsChallenger {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb(&[OP_SQUEEZE, KIND_SCALAR]);
+        // Flush so the live hasher reflects every observed byte before the
+        // squeeze clones it. Without this the squeeze would see the
+        // pre-pending state, which is the wrong transcript.
+        self.flush_pending();
         let mut buf = [0u8; 16];
         self.squeeze_into(&mut buf);
         // Re-absorb the squeezed bytes so subsequent ops bind to this challenge.
@@ -364,6 +534,10 @@ impl Challenger for FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
         self.absorb(&(n as u64).to_le_bytes());
+        // Flush before the long XOF read so the live hasher sees every byte
+        // observed so far; the pending buffer is what was just absorbed by
+        // the two preceding calls, so it MUST hit the hasher first.
+        self.flush_pending();
         let mut buf = vec![0u8; n * 16];
         self.squeeze_into(&mut buf);
         self.absorb(&buf);
@@ -379,7 +553,9 @@ impl Challenger for FsChallenger {
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
         let kind = self.hash_kind();
-        let state_digest = self.state_digest();
+        // Flushed digest: any pending bytes from prior observe_* calls must
+        // be in the live hasher before the PoW base is captured.
+        let state_digest = self.state_digest_flushed();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
         // work* (`2^bits`), not a raw bit threshold. Fold-challenge grinds are
         // individually modest — e.g. 2^15 at L0 under the per-round profiles —
@@ -456,7 +632,9 @@ impl Challenger for FsChallenger {
 
     fn verify_pow(&mut self, pow_counter: u64, bits: u32) -> bool {
         let kind = self.hash_kind();
-        let state_digest = self.state_digest();
+        // Same as `grind_pow`: the PoW base must reflect the fully
+        // absorbed transcript.
+        let state_digest = self.state_digest_flushed();
         let ok = if bits == 0 {
             // No PoW required here. An honest prover emits the canonical nonce
             // 0 (see `grind_pow`), so reject any non-zero value: it can only be

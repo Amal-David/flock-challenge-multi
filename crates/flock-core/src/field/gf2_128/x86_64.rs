@@ -16,6 +16,22 @@ unsafe fn pmull(a: u64, b: u64) -> __m128i {
     _mm_clmulepi64_si128::<0x00>(va, vb)
 }
 
+/// SSE2-only lane extract: shift the 128-bit register right by 8 bytes and
+/// store the low 64 bits. Equivalent to `_mm_extract_epi64::<1>` from SSE4.1
+/// but works under the broader `pclmulqdq,sse2` floor.
+///
+/// # Safety
+/// Requires `sse2`; the function carries the attribute.
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn hi64(v: __m128i) -> u64 {
+    // srli by 8 bytes moves the high qword into the low qword position; we
+    // then read that lane via a `_mm_cvtsi128_si64` (movq), which extracts the
+    // low 64 bits of an __m128i and is an SSE2 baseline intrinsic.
+    let shifted = _mm_srli_si128::<8>(v);
+    _mm_cvtsi128_si64(shifted) as u64
+}
+
 #[inline]
 #[target_feature(enable = "sse4.1")]
 unsafe fn lane0(v: __m128i) -> u64 {
@@ -248,6 +264,368 @@ pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
             r2: lane0(p_hh) ^ cr_hi,
             r3: lane1(p_hh),
         }
+    }
+}
+
+// -----------------------------------------------------------------------
+// PCLMULQDQ (SSE2-floor) 4x batched multiply.
+//
+// `PCLMULQDQ` is a 128-bit instruction: every call processes ONE 64×64
+// carry-less product. To get 4 independent `F128` products out the other side
+// we issue the schoolbook 4-CLMULs for product 0, then product 1, …, product
+// 3 — i.e. a 4-way unroll in source order, but every product's CLMULs sit
+// back-to-back so the OoO core sees 4×4 = 16 independent CLMULs in the
+// instruction window. Westmere/Nehalem through Skylake have one
+// `pclmulqdq`-capable pipe (port 5) and dispatch CLMULs at 1/cycle; the 4x
+// unroll amortizes the per-product reduction (a 0x87 fold is one more CLMUL
+// per stage) by overlapping it with the next product's wide multiply.
+//
+// SSE2 (not SSE4.1) is the floor: lane extracts use `_mm_srli_si128::<8>`
+// instead of `_mm_extract_epi64::<1>`, so the kernel compiles on every
+// `pclmulqdq`-capable core, including the Westmere/Clarkdale era where the
+// field is otherwise forced to the software `portable` path.
+//
+// The 0x87 reduction is the same binius 2-stage fold used by
+// `ghash_mul_binius` above — 4 product CLMULs + 2 reduction CLMULs per
+// product, = 6 CLMUL per F128 · 4 products = 24 CLMULs in flight, field
+// identical to the scalar `ghash_mul_binius` (cross-checked in the
+// ntt module's tests).
+// -----------------------------------------------------------------------
+
+/// Issue one PCLMULQDQ of the low qword of `a` with the low qword of `b`,
+/// returning the 128-bit product {lo, hi}. Identical to [`pmull`] but
+/// callable from a kernel whose target feature is the broader
+/// `pclmulqdq,sse2`.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse2")]
+unsafe fn pmull_lo_sse2(a: u64, b: u64) -> __m128i {
+    let va = _mm_set_epi64x(0, a as i64);
+    let vb = _mm_set_epi64x(0, b as i64);
+    _mm_clmulepi64_si128::<0x00>(va, vb)
+}
+
+/// 4-way unrolled GF(2^128) multiply using only `pclmulqdq` and `sse2`.
+///
+/// Each of the 4 products runs the binius schoolbook + 2-stage `0x87`
+/// reduction sequence (4 product CLMULs + 2 reduction CLMULs, plus the shift
+/// and 0x87 fold CLMULs), so the kernel emits 24 PCLMULQDQ instructions
+/// grouped by per-product dependency chains. The OoO core resolves the
+/// inter-product ILP, and the per-product reduction sits behind the next
+/// product's first CLMUL — net throughput ≈ 1 CLMUL/cycle, 4× the scalar
+/// rate.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse2` (the function carries the attribute).
+#[target_feature(enable = "pclmulqdq,sse2")]
+pub unsafe fn ghash_mul_x4_pclmul_sse2(
+    a: [F128; 4],
+    b: [F128; 4],
+) -> [F128; 4] {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Per-product: 4 product CLMULs (p0=ll, p1=hh, cross=lo·hi + hi·lo).
+        // pclmul imm 0x00 = a.lo · b.lo; 0x11 = a.hi · b.hi.
+        // We unroll all 4 products in this same block so the per-product
+        // reductions and the next product's first CLMUL overlap in the issue
+        // window.
+        let p0a_ll = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(b[0].hi as i64, b[0].lo as i64),
+        );
+        let p0a_hh = _mm_clmulepi64_si128::<0x11>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(b[0].hi as i64, b[0].lo as i64),
+        );
+        let p0a_lh = _mm_clmulepi64_si128::<0x10>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(b[0].hi as i64, b[0].lo as i64),
+        );
+        let p0a_hl = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(b[0].hi as i64, b[0].lo as i64),
+        );
+
+        let p1a_ll = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(b[1].hi as i64, b[1].lo as i64),
+        );
+        let p1a_hh = _mm_clmulepi64_si128::<0x11>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(b[1].hi as i64, b[1].lo as i64),
+        );
+        let p1a_lh = _mm_clmulepi64_si128::<0x10>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(b[1].hi as i64, b[1].lo as i64),
+        );
+        let p1a_hl = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(b[1].hi as i64, b[1].lo as i64),
+        );
+
+        let p2a_ll = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(b[2].hi as i64, b[2].lo as i64),
+        );
+        let p2a_hh = _mm_clmulepi64_si128::<0x11>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(b[2].hi as i64, b[2].lo as i64),
+        );
+        let p2a_lh = _mm_clmulepi64_si128::<0x10>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(b[2].hi as i64, b[2].lo as i64),
+        );
+        let p2a_hl = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(b[2].hi as i64, b[2].lo as i64),
+        );
+
+        let p3a_ll = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(b[3].hi as i64, b[3].lo as i64),
+        );
+        let p3a_hh = _mm_clmulepi64_si128::<0x11>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(b[3].hi as i64, b[3].lo as i64),
+        );
+        let p3a_lh = _mm_clmulepi64_si128::<0x10>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(b[3].hi as i64, b[3].lo as i64),
+        );
+        let p3a_hl = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(b[3].hi as i64, b[3].lo as i64),
+        );
+
+        // Cross terms: t1 = p_lh ^ p_hl, lives at the x^64 coefficient.
+        // _mm_xor_si128 is an SSE2 baseline op.
+        let p0_t1 = _mm_xor_si128(p0a_lh, p0a_hl);
+        let p1_t1 = _mm_xor_si128(p1a_lh, p1a_hl);
+        let p2_t1 = _mm_xor_si128(p2a_lh, p2a_hl);
+        let p3_t1 = _mm_xor_si128(p3a_lh, p3a_hl);
+
+        // First reduce: t1 = t1 + x^64·t2 (mod p), where t2 = p_hh.
+        // Shift t2.lo into t1.hi and fold t2.hi · 0x87 into t1.lo. The
+        // shift is `_mm_slli_si128::<8>(t2) ^ zero_low_lane`; with an
+        // existing zero in the low lane (we manufacture it via
+        // `_mm_slli_si128::<8>(p_hh)` since the high qword of t2 shifts into
+        // the high qword of the result, leaving the low qword zero).
+        let zero_const = _mm_setzero_si128();
+
+        // Product 0
+        let p0_t2_shifted = _mm_slli_si128::<8>(p0a_hh);
+        let p0_t1 = _mm_xor_si128(p0_t1, p0_t2_shifted);
+        let p0_t2_hi = hi64(p0a_hh);
+        let p0_t2_red = pmull_lo_sse2(p0_t2_hi, 0x87);
+        let p0_t1 = _mm_xor_si128(p0_t1, p0_t2_red);
+
+        // Product 1
+        let p1_t2_shifted = _mm_slli_si128::<8>(p1a_hh);
+        let p1_t1 = _mm_xor_si128(p1_t1, p1_t2_shifted);
+        let p1_t2_hi = hi64(p1a_hh);
+        let p1_t2_red = pmull_lo_sse2(p1_t2_hi, 0x87);
+        let p1_t1 = _mm_xor_si128(p1_t1, p1_t2_red);
+
+        // Product 2
+        let p2_t2_shifted = _mm_slli_si128::<8>(p2a_hh);
+        let p2_t1 = _mm_xor_si128(p2_t1, p2_t2_shifted);
+        let p2_t2_hi = hi64(p2a_hh);
+        let p2_t2_red = pmull_lo_sse2(p2_t2_hi, 0x87);
+        let p2_t1 = _mm_xor_si128(p2_t1, p2_t2_red);
+
+        // Product 3
+        let p3_t2_shifted = _mm_slli_si128::<8>(p3a_hh);
+        let p3_t1 = _mm_xor_si128(p3_t1, p3_t2_shifted);
+        let p3_t2_hi = hi64(p3a_hh);
+        let p3_t2_red = pmull_lo_sse2(p3_t2_hi, 0x87);
+        let p3_t1 = _mm_xor_si128(p3_t1, p3_t2_red);
+
+        // Silence "value assigned to p0a_ll is never read" — the LL product
+        // is the lo limb of t0; the 2nd reduce consumes it.
+        let _ = zero_const;
+        let _ = p0a_ll;
+        let _ = p1a_ll;
+        let _ = p2a_ll;
+        let _ = p3a_ll;
+
+        // Second reduce: t0 = t0 + x^64·t1 (mod p).
+        let p0_t1_shifted = _mm_slli_si128::<8>(p0_t1);
+        let p0_t0 = _mm_xor_si128(p0a_ll, p0_t1_shifted);
+        let p0_t1_hi = hi64(p0_t1);
+        let p0_t1_red = pmull_lo_sse2(p0_t1_hi, 0x87);
+        let p0_t0 = _mm_xor_si128(p0_t0, p0_t1_red);
+
+        let p1_t1_shifted = _mm_slli_si128::<8>(p1_t1);
+        let p1_t0 = _mm_xor_si128(p1a_ll, p1_t1_shifted);
+        let p1_t1_hi = hi64(p1_t1);
+        let p1_t1_red = pmull_lo_sse2(p1_t1_hi, 0x87);
+        let p1_t0 = _mm_xor_si128(p1_t0, p1_t1_red);
+
+        let p2_t1_shifted = _mm_slli_si128::<8>(p2_t1);
+        let p2_t0 = _mm_xor_si128(p2a_ll, p2_t1_shifted);
+        let p2_t1_hi = hi64(p2_t1);
+        let p2_t1_red = pmull_lo_sse2(p2_t1_hi, 0x87);
+        let p2_t0 = _mm_xor_si128(p2_t0, p2_t1_red);
+
+        let p3_t1_shifted = _mm_slli_si128::<8>(p3_t1);
+        let p3_t0 = _mm_xor_si128(p3a_ll, p3_t1_shifted);
+        let p3_t1_hi = hi64(p3_t1);
+        let p3_t1_red = pmull_lo_sse2(p3_t1_hi, 0x87);
+        let p3_t0 = _mm_xor_si128(p3_t0, p3_t1_red);
+
+        [
+            F128 {
+                lo: _mm_cvtsi128_si64(p0_t0) as u64,
+                hi: hi64(p0_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p1_t0) as u64,
+                hi: hi64(p1_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p2_t0) as u64,
+                hi: hi64(p2_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p3_t0) as u64,
+                hi: hi64(p3_t0),
+            },
+        ]
+    }
+}
+
+/// 4-way unrolled GF(2^128) multiply, where the *right-hand* operand's
+/// high limb is zero in every lane. This is the structural precondition for
+/// the additive-NTT butterfly's `r · (a + b)` step: the `a + b` term has its
+/// high limb cancelled to zero in the rank-1 update direction.
+///
+/// With `b.hi == 0` in every lane, the cross term `a.hi·b.lo ^ a.lo·b.hi`
+/// collapses to `a.hi·b.lo`, and `a.hi·b.hi = 0` so the 2-stage reduction
+/// shortens to a single `0x87` fold. Net 3 CLMUL per F128, 4 F128 per call
+/// = 12 CLMULs — half the cost of [`ghash_mul_x4_pclmul_sse2`].
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse2`. The caller must ensure every `b[i].hi == 0`.
+#[target_feature(enable = "pclmulqdq,sse2")]
+pub unsafe fn ghash_mul_x4_pclmul_sse2_low_rhs(
+    a: [F128; 4],
+    b: [F128; 4],
+) -> [F128; 4] {
+    debug_assert!(b.iter().all(|v| v.hi == 0), "b.hi must be 0 in every lane");
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Only two product CLMULs per F128: p0 = a.lo · b.lo, p1 = a.hi · b.lo.
+        let p0a_lo = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(0, b[0].lo as i64),
+        );
+        let p0a_hi = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[0].hi as i64, a[0].lo as i64),
+            _mm_set_epi64x(0, b[0].lo as i64),
+        );
+
+        let p1a_lo = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(0, b[1].lo as i64),
+        );
+        let p1a_hi = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[1].hi as i64, a[1].lo as i64),
+            _mm_set_epi64x(0, b[1].lo as i64),
+        );
+
+        let p2a_lo = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(0, b[2].lo as i64),
+        );
+        let p2a_hi = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[2].hi as i64, a[2].lo as i64),
+            _mm_set_epi64x(0, b[2].lo as i64),
+        );
+
+        let p3a_lo = _mm_clmulepi64_si128::<0x00>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(0, b[3].lo as i64),
+        );
+        let p3a_hi = _mm_clmulepi64_si128::<0x01>(
+            _mm_set_epi64x(a[3].hi as i64, a[3].lo as i64),
+            _mm_set_epi64x(0, b[3].lo as i64),
+        );
+
+        // t1 = a.hi · b.lo (single product — b.hi = 0 kills a.lo · b.hi).
+        // Single-stage reduction: t0 = t0 + x^64·t1 mod p.
+        let p0_t1_shifted = _mm_slli_si128::<8>(p0a_hi);
+        let p0_t0 = _mm_xor_si128(p0a_lo, p0_t1_shifted);
+        let p0_t1_hi = hi64(p0a_hi);
+        let p0_t1_red = pmull_lo_sse2(p0_t1_hi, 0x87);
+        let p0_t0 = _mm_xor_si128(p0_t0, p0_t1_red);
+
+        let p1_t1_shifted = _mm_slli_si128::<8>(p1a_hi);
+        let p1_t0 = _mm_xor_si128(p1a_lo, p1_t1_shifted);
+        let p1_t1_hi = hi64(p1a_hi);
+        let p1_t1_red = pmull_lo_sse2(p1_t1_hi, 0x87);
+        let p1_t0 = _mm_xor_si128(p1_t0, p1_t1_red);
+
+        let p2_t1_shifted = _mm_slli_si128::<8>(p2a_hi);
+        let p2_t0 = _mm_xor_si128(p2a_lo, p2_t1_shifted);
+        let p2_t1_hi = hi64(p2a_hi);
+        let p2_t1_red = pmull_lo_sse2(p2_t1_hi, 0x87);
+        let p2_t0 = _mm_xor_si128(p2_t0, p2_t1_red);
+
+        let p3_t1_shifted = _mm_slli_si128::<8>(p3a_hi);
+        let p3_t0 = _mm_xor_si128(p3a_lo, p3_t1_shifted);
+        let p3_t1_hi = hi64(p3a_hi);
+        let p3_t1_red = pmull_lo_sse2(p3_t1_hi, 0x87);
+        let p3_t0 = _mm_xor_si128(p3_t0, p3_t1_red);
+
+        [
+            F128 {
+                lo: _mm_cvtsi128_si64(p0_t0) as u64,
+                hi: hi64(p0_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p1_t0) as u64,
+                hi: hi64(p1_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p2_t0) as u64,
+                hi: hi64(p2_t0),
+            },
+            F128 {
+                lo: _mm_cvtsi128_si64(p3_t0) as u64,
+                hi: hi64(p3_t0),
+            },
+        ]
+    }
+}
+
+/// Software prefetch hint for the F128 data feeding
+/// [`ghash_mul_x4_pclmul_sse2`]. SSE2 baseline (`prefetcht0`).
+///
+/// # Safety
+/// Requires `sse2`; the caller must ensure `p` is a valid readable pointer.
+#[inline]
+#[target_feature(enable = "sse2")]
+pub unsafe fn prefetch_f128(p: *const F128) {
+    // _mm_prefetch is a `prefetcht0` (L1) under SSE2 — keeps the next
+    // 4-element block warm in cache while the current block is multiplied.
+    _mm_prefetch(p as *const i8, _MM_HINT_T0);
+}
+
+/// CPUID gate for the 4x batched PCLMULQDQ kernel. Returns `true` when
+/// the running CPU advertises both `pclmulqdq` and `sse2`. Used by the
+/// runtime-dispatch wrapper that picks between the 4x PCLMULQDQ kernel
+/// and the per-element fallback. The static-feature build (`-C
+/// target-cpu=native`, which is the harness default) folds this to a
+/// constant `true`.
+#[inline]
+pub fn cpu_has_pclmulqdq_sse2() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::is_x86_feature_detected!("pclmulqdq")
+            && std::is_x86_feature_detected!("sse2")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
     }
 }
 
