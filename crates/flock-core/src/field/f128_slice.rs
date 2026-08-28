@@ -1,7 +1,5 @@
 //! Architecture-selected kernels over contiguous [`F128`] slices.
 
-#![allow(clippy::items_after_test_module)] // Keep the nearby kernel-oracle tests in place.
-
 use super::F128;
 
 #[cfg(any(
@@ -15,7 +13,6 @@ use super::F128;
         all(target_arch = "aarch64", target_feature = "aes")
     ))
 ))]
-#[allow(dead_code)] // Portable fallbacks remain available for rollback builds.
 mod portable;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -75,7 +72,6 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
 /// per process; default ON. The selector is outside the bind, so there is no
 /// per-element dispatch — the historical "avoid dispatch" scalar comment no
 /// longer applies on Sapphire Rapids.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 fn fold8_bind_x4_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_none());

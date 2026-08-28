@@ -31,14 +31,11 @@ pub(crate) fn transpose_8x8_bits(mut x: u64) -> u64 {
 /// [`bit_transpose_64bytes`]: crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes
 #[inline(always)]
 pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
-    unsafe {
-        let x=_mm512_loadu_si512(lanes.as_ptr() as *const __m512i);
-        let i=_mm512_loadu_si512(I.as_ptr() as *const __m512i);
-        let id=_mm512_set1_epi64(0x8040201008040201u64 as i64);
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i,_mm512_gf2p8affine_epi64_epi8::<0>(id,_mm512_permutexvar_epi8(i,x)));
-    }
+    debug_assert_eq!(out.len(), 64);
+    // SAFETY: [u64; 8] is 64 bytes with no padding; u8 has weaker alignment.
+    let input: &[u8; 64] = unsafe { &*(lanes.as_ptr() as *const [u8; 64]) };
+    let out64: &mut [u8; 64] = out.try_into().expect("64-byte stripe slice");
+    crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
 }
 
 #[cfg(test)]

@@ -83,7 +83,7 @@ pub trait Challenger: Send {
     /// Default implementation accepts unconditionally (no-op). Real
     /// implementations must check the PoW; an honest verifier rejects the
     /// proof if this returns `false`.
-    fn verify_pow(&mut self, _pow_counter: u64, _bits: u32) -> bool {
+    fn verify_pow(&mut self, _nonce: u64, _bits: u32) -> bool {
         true
     }
 }
@@ -454,7 +454,7 @@ impl Challenger for FsChallenger {
         nonce
     }
 
-    fn verify_pow(&mut self, pow_counter: u64, bits: u32) -> bool {
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         let ok = if bits == 0 {
@@ -466,14 +466,14 @@ impl Challenger for FsChallenger {
             // already carries the full security target, and the FS soundness
             // accounting assumes free re-grinding regardless — it just keeps
             // proofs canonical / non-malleable at zero-bit grinding sites.
-            pow_counter == 0
+            nonce == 0
         } else {
-            pow_has_leading_zero_bits(&state_digest, pow_counter, bits, kind)
+            pow_has_leading_zero_bits(&state_digest, nonce, bits, kind)
         };
         // Absorb regardless of `ok` so the transcript stays byte-identical to
         // the prover's (an honest prover always reaches this with the same
         // nonce); a failed check rejects the proof at the call site anyway.
-        self.observe_bytes(&pow_counter.to_le_bytes());
+        self.observe_bytes(&nonce.to_le_bytes());
         ok
     }
 }
@@ -501,10 +501,10 @@ impl Challenger for FsChallenger {
 /// BLAKE3's PoW pre-image: `state_digest ‖ nonce_le ‖ zero padding`, one whole
 /// 64-byte block. `blake3::hash` of this is what the PoW is defined against.
 #[inline]
-fn blake3_pow_preimage(state_digest: &[u8; 32], pow_counter: u64) -> [u8; 64] {
+fn blake3_pow_preimage(state_digest: &[u8; 32], nonce: u64) -> [u8; 64] {
     let mut pre = [0u8; 64];
     pre[..32].copy_from_slice(state_digest);
-    pre[32..40].copy_from_slice(&pow_counter.to_le_bytes());
+    pre[32..40].copy_from_slice(&nonce.to_le_bytes());
     pre
 }
 
@@ -534,7 +534,7 @@ fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
 #[inline]
 fn pow_has_leading_zero_bits(
     state_digest: &[u8; 32],
-    pow_counter: u64,
+    nonce: u64,
     bits: u32,
     kind: HashKind,
 ) -> bool {
@@ -544,12 +544,12 @@ fn pow_has_leading_zero_bits(
         HashKind::Sha256 => {
             let mut pre = [0u8; 40];
             pre[..32].copy_from_slice(state_digest);
-            pre[32..].copy_from_slice(&pow_counter.to_le_bytes());
+            pre[32..].copy_from_slice(&nonce.to_le_bytes());
             let h: [u8; 32] = Sha256::digest(pre).into();
             has_leading_zero_bits(&h, bits)
         }
         HashKind::Blake3 => {
-            let h = blake3::hash(&blake3_pow_preimage(state_digest, pow_counter));
+            let h = blake3::hash(&blake3_pow_preimage(state_digest, nonce));
             has_leading_zero_bits(h.as_bytes(), bits)
         }
     }

@@ -28,12 +28,11 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
-    fold2_from_packed_and_round_pair_lookahead_into_with_eq,
-    fold2_plain_and_round_pair_lookahead_into, fold2_plain_and_round4_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
-    packed_round2_split_eq, round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
+    fold2_from_packed_and_round_pair_lookahead_into, fold2_plain_and_round_pair_lookahead_into,
+    fold2_plain_and_round4_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
-    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq,
+    uni_skip_round_pair_lookahead_nomat_packed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -565,7 +564,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 Some(CapturedSHatVC {
                     s_hat_v_c,
                     quad,
-                    fold4: (!fold4.is_empty()).then_some(fold4),
+                    fold4: Some(fold4),
                     fold8: (!fold8.is_empty()).then_some(fold8),
                 }),
             )
@@ -703,18 +702,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
-    // Round two and the packed rounds-3+4 pass share the same 13 high eq
-    // coordinates at the ranked split. Keep round two's small tensors until
-    // that pass; its low tensor loses exactly the first two coordinates.
-    let mut packed_eq = use_nomat
-        .then(|| packed_round2_split_eq(&mlv_arg))
-        // The composed packed leaf requires at least one low variable after
-        // the two-coordinate marginalization. Tiny test shapes keep their
-        // independently built split.
-        .filter(|eq| eq.n_lo >= 3);
-
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
-        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded(
             a_packed,
             b_packed,
             m,
@@ -722,7 +711,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             &fold_table,
             &mlv_arg,
             padding,
-            packed_eq.as_ref(),
         );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
@@ -887,13 +875,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // pair is dropped. Also yields the round-five lookahead.
             let mut a4 = crate::scratch::take_f128(quarter);
             let mut b4 = crate::scratch::take_f128(quarter);
-            let round2_eq = packed_eq.take();
-            let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
-            let eq_override = match (&eq_lo, &round2_eq) {
-                (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
-                _ => None,
-            };
-            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
+            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into(
                 a_packed,
                 b_packed,
                 m,
@@ -905,7 +887,6 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[0],
                 mlv_rhos[1],
                 &r_next,
-                eq_override,
             );
             a_mlv = a4;
             b_mlv = b4;

@@ -3054,17 +3054,12 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
-    let r_outer = &r[k_skip + N_INNER..];
-    let n_hi = r_outer.len().min(SplitEqGhash::MAX_N_HI);
-    let n_lo = r_outer.len() - n_hi;
-    let big_lo_size = 1usize << n_lo;
-    let hi_size = 1usize << n_hi;
-    let n_lo_and_inner = n_lo + N_INNER;
-    // The ranked GFNI arm factors the low equality directly from its
-    // challenges below. Build only the shared 128-entry high tensor here;
-    // constructing and then scaling the full 4096-entry low tensor would be
-    // dead work in that arm.
-    let eq_hi = build_eq(&r_outer[n_lo..]);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
@@ -3074,40 +3069,13 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     ))]
-    let eq_fold_enabled = ab_eq_fold_gfni_enabled() && n_lo >= 2;
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    )))]
-    let eq_fold_enabled = false;
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    let eq_fold_state = eq_fold_enabled.then(|| {
-        let bank_bits = if n_lo == 12 {
-            7
-        } else {
-            n_lo.saturating_sub(5).max(1)
-        };
-        let r_lo = &r_outer[..n_lo];
+    let eq_fold_state = (ab_eq_fold_gfni_enabled() && eq.n_lo >= 2).then(|| {
+        let bank_bits = eq.n_lo.saturating_sub(5).max(1);
+        let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
         let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
         (eq_bot, mats, bank_bits)
     });
-    let eq_lo_scaled: Vec<F128> = if eq_fold_enabled {
-        Vec::new()
-    } else {
-        let d_inv_val = d_inv();
-        build_eq(&r_outer[..n_lo])
-            .into_iter()
-            .map(|v| v * d_inv_val)
-            .collect()
-    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -3151,7 +3119,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 &b_med_counts,
                 ab_inner_bytes,
                 &eq_lo_scaled,
-                eq_hi[x_hi],
+                eq.hi[x_hi],
                 convert,
                 eq_fold_arg,
                 plane_first_write,
@@ -3236,27 +3204,21 @@ pub fn round1_c_fold4_from_block_major_z(
     assert_eq!(z_packed.len(), (1usize << m) / 128);
     assert_eq!(inv_table.k, k_skip);
 
+    // One fold at the original r_outer: the length-2^k_log inner table over
+    // witness coordinates [0, k_log).
+    let c_inner = identity_c_inner_fold(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        &r[k_log..],
+        crate::serial_par_enabled(),
+    );
+
     let inner_tail = &r[k_skip + 1..k_log];
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let par = crate::serial_par_enabled();
     let (fold4, fold8) = if crate::pcs::ranked_direct_fold8_enabled() {
-        // Ranked shape has one coordinate above the six Fold8 bank
-        // selectors. On the parallel/GFNI path, bind it while reducing the
-        // worker byte planes so the full length-2^k_log C inner table is
-        // never written and immediately read back by a second Rayon pass.
-        let fold8 = if par && inner_tail.len() == 7 {
-            crate::lincheck::fold_block_major_one_shot_bind_top(
-                z_packed,
-                m,
-                k_log,
-                useful_bits,
-                &r[k_log..],
-                inner_tail[6],
-            )
-        } else {
-            let c_inner = identity_c_inner_fold(z_packed, m, k_log, useful_bits, &r[k_log..], par);
-            crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail)
-        };
+        let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
         let retained_top_eq = build_eq(&inner_tail[4..6]);
         let mut fold4 = vec![F128::ZERO; 16 * n_packed];
@@ -3282,7 +3244,6 @@ pub fn round1_c_fold4_from_block_major_z(
     } else {
         // Kill switch restores the incumbent sixteen-bank producer; do not
         // pay for widening and collapsing a statistic no consumer will use.
-        let c_inner = identity_c_inner_fold(z_packed, m, k_log, useful_bits, &r[k_log..], par);
         (
             crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail),
             Vec::new(),

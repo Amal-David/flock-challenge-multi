@@ -666,7 +666,6 @@ pub(crate) fn fill_merkle_tree(tree: &mut [Hash], data: &[u8], num_leaves: usize
 /// prefix. Do not absorb a range whose last NTT write has not retired.
 /// Parents fold as soon as both children exist, and only on a contiguous
 /// pair-prefix of an already-written child level. Root stays at `tree[2n−2]`.
-#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
 pub(crate) struct StreamMerkle {
     tree: Vec<Hash>,
     n_leaves: usize,
@@ -678,7 +677,6 @@ pub(crate) struct StreamMerkle {
     level_done: Vec<usize>,
 }
 
-#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
 impl StreamMerkle {
     pub(crate) fn new(n_leaves: usize, leaf_size: usize, kind: HashKind) -> Self {
         assert!(
@@ -745,7 +743,6 @@ impl StreamMerkle {
 
 /// Same tree as [`merkle_tree`], built by streaming `ranges` in leaf-index
 /// order and folding parents as soon as both children exist.
-#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
 pub(crate) fn merkle_tree_streaming(
     data: &[u8],
     num_leaves: usize,
@@ -1345,7 +1342,6 @@ mod tests {
     /// Merkle rewrite 1 oracle: streaming layers into the same `2n−1` tree
     /// is node-for-node identical to the one-shot [`merkle_tree`] build.
     /// Reduced geometries, including the ranked 1024 B leaf.
-    #[allow(clippy::single_range_in_vec_init)] // One case intentionally models one full range.
     #[test]
     fn streaming_tree_matches_merkle_tree_node_for_node() {
         let cases: &[(usize, usize, &[core::ops::Range<usize>])] = &[

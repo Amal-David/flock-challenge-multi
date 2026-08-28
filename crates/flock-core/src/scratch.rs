@@ -250,14 +250,11 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
 /// work: a race between fault cost and the hiding window flips sign across
 /// machines; eliminated work doesn't.)
 ///
-/// The ranked BLAKE3 path has one 2^(m-6)-class owner: the retained L0
-/// codeword. Zerocheck's no-materialize path emits at most N/4 outputs and
-/// DirectFold8 rejoins at N/64, while seed-pipe warm-up and timed proofs are
-/// serialized (fallback drains the speculative proof before starting one),
-/// so a second full codeword is never live. Keep one large buffer. The
-/// 2^(m-7)-class fleet remains 11 buffers for witness z/a/b, the round-one
-/// AB projection, zerocheck ping-pong, and open-stage transients. This parks
-/// 6.5 GiB at ranked m = 32 instead of 10.5 GiB; release with [`clear`].
+/// The set (sizes in F128s): 2^(m-6)-class — L0 codeword, zerocheck round-2
+/// a/b, open-stage codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
+/// z/a/b, zerocheck tail ping-pong ×2, open-stage transients, rs_eq_ind ×2,
+/// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
+/// [`clear`].
 pub fn prewarm_prover(m: usize) {
     use rayon::prelude::*;
     if m < 7 {
@@ -266,7 +263,9 @@ pub fn prewarm_prover(m: usize) {
     let small = 1usize << (m - 7);
     let large = 1usize << (m - 6);
     let mut bufs: Vec<Vec<F128>> = Vec::new();
-    bufs.push(take_f128(large));
+    for _ in 0..5 {
+        bufs.push(take_f128(large));
+    }
     for _ in 0..11 {
         bufs.push(take_f128(small));
     }

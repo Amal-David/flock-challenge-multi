@@ -89,9 +89,7 @@ pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
 #[derive(Clone, Copy)]
 pub(super) struct ShiftReducePlan {
     img2: bool,
-    #[allow(dead_code)] // Reserved by the matching rollback selector.
     pidx: bool,
-    #[allow(dead_code)] // Reserved by the matching rollback selector.
     offw: bool,
 }
 
