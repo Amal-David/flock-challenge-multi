@@ -171,6 +171,125 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Add one field slice into another in place: `dst[i] += addend[i]`.
+///
+/// Accelerated with AVX-512 `_mm512_xor_si512` on x86_64 and NEON `veorq_u8` on aarch64.
+#[inline]
+pub(crate) fn add_slice(dst: &mut [F128], addend: &[F128]) {
+    assert_eq!(dst.len(), addend.len(), "add_slice length mismatch");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f"
+    ))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let len = dst.len();
+        let lanes8 = len & !7;
+        let mut i = 0;
+        while i < lanes8 {
+            let dp0 = dst.as_mut_ptr().add(i) as *mut __m512i;
+            let dp1 = dst.as_mut_ptr().add(i + 4) as *mut __m512i;
+            let sp0 = addend.as_ptr().add(i) as *const __m512i;
+            let sp1 = addend.as_ptr().add(i + 4) as *const __m512i;
+            let d0 = _mm512_loadu_si512(dp0);
+            let d1 = _mm512_loadu_si512(dp1);
+            let s0 = _mm512_loadu_si512(sp0);
+            let s1 = _mm512_loadu_si512(sp1);
+            _mm512_storeu_si512(dp0, _mm512_xor_si512(d0, s0));
+            _mm512_storeu_si512(dp1, _mm512_xor_si512(d1, s1));
+            i += 8;
+        }
+        let lanes4 = len & !3;
+        while i < lanes4 {
+            let dp = dst.as_mut_ptr().add(i) as *mut __m512i;
+            let sp = addend.as_ptr().add(i) as *const __m512i;
+            let d = _mm512_loadu_si512(dp);
+            let s = _mm512_loadu_si512(sp);
+            _mm512_storeu_si512(dp, _mm512_xor_si512(d, s));
+            i += 4;
+        }
+        while i < len {
+            dst[i] += addend[i];
+            i += 1;
+        }
+        return;
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        use core::arch::aarch64::*;
+        let len = dst.len();
+        let lanes4 = len & !3;
+        let mut i = 0;
+        while i < lanes4 {
+            let dp = dst.as_mut_ptr().add(i) as *mut uint8x16_t;
+            let sp = addend.as_ptr().add(i) as *const uint8x16_t;
+            for k in 0..4 {
+                let d = *dp.add(k);
+                let s = *sp.add(k);
+                *dp.add(k) = veorq_u8(d, s);
+            }
+            i += 4;
+        }
+        while i < len {
+            dst[i] += addend[i];
+            i += 1;
+        }
+        return;
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx512f"),
+        all(target_arch = "aarch64", target_feature = "neon")
+    )))]
+    for (d, s) in dst.iter_mut().zip(addend.iter()) {
+        *d += *s;
+    }
+}
+
+/// Compute the field inner product `\sum a[i] * b[i]`.
+///
+/// Accelerated with AVX-512 + VPCLMULQDQ via WideGhashX4 on x86_64.
+#[inline]
+pub(crate) fn dot_product(a: &[F128], b: &[F128]) -> F128 {
+    assert_eq!(a.len(), b.len(), "dot_product length mismatch");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        use crate::field::gf2_128::x86_64::WideGhashX4;
+        use core::arch::x86_64::*;
+        let mut acc = WideGhashX4::zero();
+        let lanes4 = a.len() & !3;
+        let mut i = 0;
+        while i < lanes4 {
+            let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            acc.mul_acc(va, vb);
+            i += 4;
+        }
+        let mut sum = acc.fold().reduce();
+        while i < a.len() {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        a.iter().zip(b.iter()).map(|(&x, &y)| x * y).fold(F128::ZERO, |acc, v| acc + v)
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where
@@ -216,6 +335,55 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn add_slice_matches_scalar() {
+        use super::*;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128] {
+            let mut dst: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let src: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let mut expected = dst.clone();
+            for (e, s) in expected.iter_mut().zip(src.iter()) {
+                *e += *s;
+            }
+            add_slice(&mut dst, &src);
+            assert_eq!(dst, expected, "add_slice mismatch at length {}", n);
+        }
+    }
+
+    #[test]
+    fn dot_product_matches_scalar() {
+        use super::*;
+        let mut state = 0xfedc_ba98_7654_3210u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 128] {
+            let a: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let b: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let expected = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).fold(F128::ZERO, |acc, v| acc + v);
+            let got = dot_product(&a, &b);
+            assert_eq!(got, expected, "dot_product mismatch at length {}", n);
+        }
+    }
+
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
     /// elsewhere) equals the straight reduced sum `Σ w[b]·src[16t+b]` at
     /// lengths that hit the four-slot vector body and the scalar tail.

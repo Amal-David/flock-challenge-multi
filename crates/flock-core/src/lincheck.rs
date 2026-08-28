@@ -1431,6 +1431,7 @@ fn fold_block_major_gfni(
             };
             let mut mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
+            let mut mats_bcast = [unsafe { core::arch::x86_64::_mm512_setzero_si512() }; 128];
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
             let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
@@ -1477,6 +1478,11 @@ fn fold_block_major_gfni(
                 for t in 0..DIRECT_FOLD_TILE_STRIPES {
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                }
+                unsafe {
+                    for i in 0..128 {
+                        mats_bcast[i] = core::arch::x86_64::_mm512_set1_epi64(mats[i] as i64);
+                    }
                 }
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
@@ -1551,7 +1557,7 @@ fn fold_block_major_gfni(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
                                     2,
-                                    &mats,
+                                    &mats_bcast,
                                     wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
                                     first_tile,
                                 );
@@ -1609,7 +1615,7 @@ fn fold_block_major_gfni(
                             transposed.as_ptr(),
                             128,
                             chunk_bits.div_ceil(64),
-                            &mats,
+                            &mats_bcast,
                             wplanes.as_mut_ptr().add(2 * q * 1024),
                             first_tile,
                         );

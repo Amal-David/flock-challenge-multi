@@ -526,30 +526,6 @@ impl StreamProj<'_> {
             }
         }
     }
-
-    #[inline(never)]
-    unsafe fn project_blocks_ranked(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: StepRows, off: *const u16, use_off: bool) {
-        unsafe {
-            let (sa,sb)=self.sides();
-            if use_off {
-                let mut j=0usize;
-                while j!=8 {
-                    rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                    round1_ab_inner_window_from_offsets(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
-                    j+=1;
-                }
-            } else {
-                let mut j=0usize;
-                while j!=8 {
-                    rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                    round1_ab_inner_window_with_images(&*sa.add(j*STEP_WORDS).cast::<[u8;64]>(),&*sb.add(j*STEP_WORDS).cast::<[u8;64]>(),out,blk,self.inv_table,plan,imgs);
-                    j+=1;
-                }
-            }
-        }
-    }
 }
 
 /// Rolling drain state shared by the A/B packed writers. The witness uses two
@@ -563,7 +539,7 @@ struct Drain8<'t> {
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
-    proj: StreamProj<'t>,
+    proj: Option<StreamProj<'t>>,
     elide: [bool; 3],
     z_nt: bool,
     wide_nt: bool,
@@ -1139,8 +1115,10 @@ impl Drain8<'_> {
         };
         let b_g1 = if !self.elide[2] {
             DUMP_CHUNKS
-        } else {
+        } else if self.win_ab.is_some() || self.proj.is_some() {
             ELIDE_B_TAIL_CHUNK_WIN
+        } else {
+            ELIDE_B_TAIL_CHUNK
         };
         (a_g1, b_g0, b_g1)
     }
@@ -1148,7 +1126,54 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.elide==[true;3]{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if let Some(proj) = &self.proj {
+                // The live schedule. Everything below it is the bunched
+                // incumbent, kept for `FLOCK_NO_SPREAD_NT=1`.
+                if self.spread {
+                    self.drain_range_spread(proj, base_word, ring_word, words);
+                    return;
+                }
+                let z_g1 = if self.elide[0] {
+                    ELIDE_ZERO_CHUNK
+                } else {
+                    DUMP_CHUNKS
+                };
+                let (a_g1, b_g0, b_g1) = self.ab_ranges();
+                let (sa, sb) = proj.sides();
+                for off in (0..words).step_by(STEP_WORDS) {
+                    let abs_word = base_word + off;
+                    let rw = ring_word + off;
+                    Self::publish_step(
+                        self.ast,
+                        self.a,
+                        Some((sa, STEP_WORDS)),
+                        abs_word,
+                        rw,
+                        0,
+                        a_g1,
+                        true,
+                        self.wide_nt,
+                    );
+                    Self::publish_b_with_derived_z(
+                        self.bs,
+                        self.b,
+                        Some((sb, STEP_WORDS)),
+                        (sa, STEP_WORDS),
+                        self.z,
+                        abs_word,
+                        rw,
+                        z_g1,
+                        b_g0,
+                        b_g1,
+                        true,
+                        self.z_nt,
+                        self.wide_nt,
+                    );
+                    proj.project(abs_word / STEP_WORDS);
+                }
+                return;
+            }
+            self.drain_range_buffered(base_word, ring_word, words);
         }
     }
 
@@ -1169,7 +1194,7 @@ impl Drain8<'_> {
     /// of twenty-four per step — and still exactly one call per step, so the
     /// spread costs no extra call or spill traffic.
     #[inline(never)]
-    unsafe fn drain_range_spread<const E:bool>(
+    unsafe fn drain_range_spread(
         &self,
         proj: &StreamProj<'_>,
         base_word: usize,
@@ -1177,12 +1202,20 @@ impl Drain8<'_> {
         words: usize,
     ) {
         unsafe {
-            let z_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let a_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let b_g0=if E{ELIDE_B_PREFIX_CHUNKS}else if self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
-            let b_g1=if E{ELIDE_B_TAIL_CHUNK_WIN}else if self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
+            let z_g1 = if self.elide[0] {
+                ELIDE_ZERO_CHUNK
+            } else {
+                DUMP_CHUNKS
+            };
+            let (a_g1, b_g0, b_g1) = self.ab_ranges();
             let (sa, sb) = proj.sides();
-            let base=0xC0u8;
+            let mut base = 0u8;
+            if self.z_nt {
+                base |= 0x40;
+            }
+            if self.wide_nt {
+                base |= 0x80;
+            }
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
@@ -1193,7 +1226,7 @@ impl Drain8<'_> {
                 // `u16` offsets. The kernel then consumes the arena and never
                 // reloads the staging, and no consuming load executes in the
                 // shadow of its own offset stores.
-                let use_off=blk>1&&blk<30;
+                let use_off = plan.offsets_eligible(blk);
                 #[repr(align(64))]
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
@@ -1254,7 +1287,17 @@ impl Drain8<'_> {
                     flags,
                 };
 
-                proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
+                proj.project_blocks(
+                    blk,
+                    plan,
+                    imgs,
+                    Some(rows),
+                    if use_off {
+                        Some(op as *const u16)
+                    } else {
+                        None
+                    },
+                );
             }
         }
     }
@@ -1487,7 +1530,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     a: *mut u32,
     b: *mut u32,
     win_ab: Option<(*mut u32, *mut u32)>,
-    proj: StreamProj<'_>,
+    proj: Option<StreamProj<'_>>,
     elide: [bool; 3],
     z_nt: bool,
 ) {
@@ -1616,8 +1659,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             z_nt,
-            wide_nt: true,
-            spread: true,
+            wide_nt: wide_nt_enabled(),
+            spread: spread_nt_enabled(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);

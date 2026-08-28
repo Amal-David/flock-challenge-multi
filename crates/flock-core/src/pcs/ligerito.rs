@@ -2097,11 +2097,7 @@ pub(crate) fn induce_sumcheck_poly(
                 let q = queries[i];
                 let ap = alpha_pows[i];
 
-                let dot: F128 = row
-                    .iter()
-                    .zip(eq.iter())
-                    .map(|(&r, &e)| r * e)
-                    .fold(F128::ZERO, |a, v| a + v);
+                let dot = crate::field::f128_slice::dot_product(row, &eq);
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
@@ -2113,9 +2109,7 @@ pub(crate) fn induce_sumcheck_poly(
                     q_field,
                     ap,
                 );
-                for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
-                    *acc += v;
-                }
+                crate::field::f128_slice::add_slice(&mut accum_basis, &local_basis);
             }
             (accum_basis, local_sum)
         })
@@ -2152,16 +2146,12 @@ pub(crate) fn induce_sumcheck_poly(
                 let base = ci * chunk;
                 let len = out.len();
                 for (lb, _) in partials.iter() {
-                    for (acc, &v) in out.iter_mut().zip(lb[base..base + len].iter()) {
-                        *acc += v;
-                    }
+                    crate::field::f128_slice::add_slice(out, &lb[base..base + len]);
                 }
             });
     } else {
         for (lb, _) in partials.iter() {
-            for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
-                *acc += v;
-            }
+            crate::field::f128_slice::add_slice(&mut basis_poly, lb);
         }
     }
 
@@ -3174,9 +3164,7 @@ fn transpose_forward_ntt_sparse_inner(
                                 values[i],
                                 scratch,
                             );
-                            for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
-                                *d += s;
-                            }
+                            crate::field::f128_slice::add_slice(&mut buf, scratch);
                         }
                     }
                     return (w, buf);

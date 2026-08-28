@@ -565,7 +565,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 Some(CapturedSHatVC {
                     s_hat_v_c,
                     quad,
-                    fold4: (!fold4.is_empty()).then_some(fold4),
+                    fold4: Some(fold4),
                     fold8: (!fold8.is_empty()).then_some(fold8),
                 }),
             )
