@@ -85,6 +85,10 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
         let r_x64 = ghash_shift64_x4(r_x4);
         let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
         let scale_x64 = ghash_shift64_x4(scale_x4);
+        let scale_r = scale * r;
+        let scale_r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale_r.hi as i64, scale_r.lo as i64));
+        let scale_r_x64 = ghash_shift64_x4(scale_r_x4);
+        
         let lanes = dst.len() & !3;
         let mut t = 0usize;
         while t < lanes {
@@ -93,22 +97,22 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
             let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
             let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
             let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
-            let src_folded = _mm512_xor_si512(
-                src_even,
-                ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
-            );
+            let src_diff = _mm512_xor_si512(src_even, src_odd);
+            
             let addend_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
             let addend_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
             let addend_even = _mm512_shuffle_i32x4::<0x88>(addend_lo, addend_hi);
             let addend_odd = _mm512_shuffle_i32x4::<0xDD>(addend_lo, addend_hi);
-            let addend_folded = _mm512_xor_si512(
-                addend_even,
-                ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
-            );
-            let output = _mm512_xor_si512(
-                src_folded,
-                ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
-            );
+            let addend_diff = _mm512_xor_si512(addend_even, addend_odd);
+            
+            let mul1 = ghash_mul_x4_split(src_diff, r_x4, r_x64);
+            let mul2 = ghash_mul_x4_split(addend_even, scale_x4, scale_x64);
+            let mul3 = ghash_mul_x4_split(addend_diff, scale_r_x4, scale_r_x64);
+            
+            let out1 = _mm512_xor_si512(src_even, mul1);
+            let out2 = _mm512_xor_si512(mul2, mul3);
+            let output = _mm512_xor_si512(out1, out2);
+            
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
             t += 4;
         }
