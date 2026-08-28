@@ -28,6 +28,13 @@ mod aarch64;
 ))]
 mod x86_64;
 
+/// Runtime-detected PCLMULQDQ (SSE) pair fold for x86_64 hosts that lack
+/// AVX-512 + VPCLMULQDQ. See the module-level docs in `x86_64_pclmul.rs`
+/// for the design (4-tile SSE, 2-unroll, L1-resident 4096-F128 block,
+/// prefetch_distance = 8 F128, cfg(target_arch="x86_64") portable fallback).
+#[cfg(target_arch = "x86_64")]
+mod x86_64_pclmul;
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -58,13 +65,23 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
         aarch64::fold_pairs(src, base, dst, r);
     }
 
+    // x86_64 hosts that don't have AVX-512 + VPCLMULQDQ fall through to the
+    // runtime-detected PCLMULQDQ (SSE) kernel with a `cfg(target_arch =
+    // "x86_64")` portable fallback when PCLMULQDQ/SSE4.1 are not present.
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        x86_64_pclmul::fold_pairs_portable(src, base, dst, r);
+    }
+
     #[cfg(not(any(
         all(
             target_arch = "x86_64",
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ),
-        all(target_arch = "aarch64", target_feature = "aes")
+        all(target_arch = "aarch64", target_feature = "aes"),
+        target_arch = "x86_64",
     )))]
     portable::fold_pairs(src, base, dst, r);
 }
