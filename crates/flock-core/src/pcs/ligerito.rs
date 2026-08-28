@@ -6783,9 +6783,21 @@ where
 const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
 
 /// One rayon task per this many sibling gathers: each gather is a single
-/// (usually cold) 32-byte tree read, so a task is ~64 line fills — big
+/// (usually cold) 32-byte tree read, so a task is ~128 line fills — big
 /// enough to amortize dispatch, small enough to spread the misses wide.
-const MULTIPROOF_PAR_CHUNK: usize = 64;
+const MULTIPROOF_PAR_CHUNK: usize = 128;
+
+/// Same-binary task-grain override. `64` restores the previous ranked grain.
+fn multiproof_par_chunk() -> usize {
+    static CHUNK: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_MULTIPROOF_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(MULTIPROOF_PAR_CHUNK)
+    });
+    *CHUNK
+}
 
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
@@ -6828,7 +6840,7 @@ fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: b
         if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
             return indices
                 .par_iter()
-                .with_min_len(MULTIPROOF_PAR_CHUNK)
+                .with_min_len(multiproof_par_chunk())
                 .map(|&i| tree[i])
                 .collect();
         }

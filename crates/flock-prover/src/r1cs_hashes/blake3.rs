@@ -1474,13 +1474,31 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    // The table is statement-fixed at k=6. Reuse zerocheck's warm cached copy
+    // on measured proofs; retain the exact rebuild as a same-binary rollback.
+    fn witgen_urm_table_cache_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_URM_CACHE").is_none());
+        *ON
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_table_cache_enabled()
+    {
+        flock_core::zerocheck::urm_inv_table_k_skip()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if use_simd && !use_nt && n_total >= 8 {
+    // The octa implementation below requires its streaming stage. Rollback
+    // configurations without that stage use the exact generic generator
+    // instead of constructing an invalid `StreamProj`.
+    if use_simd && !use_nt && n_total >= 8 && ab_nt && witgen_simd::witgen_ab_winstream_enabled() {
         // BLOCKER REMOVED: a/b's constant lines used to be re-read L1-hot by
         // the round-1 window precompute right after the dump, so eliding their
         // stores turned warm reads into cold misses (measured +1 ms) — the
@@ -1728,6 +1746,10 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    assert!(
+        ab_stream,
+        "octa stream generator requires ab-NT and win-stream staging"
+    );
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -1836,19 +1858,11 @@ fn generate_round1_inner_octa(
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
+                        // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
-                                }
-                            }
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
                                 inv_table,
                                 plan: win_plan,
                             }
@@ -1858,10 +1872,8 @@ fn generate_round1_inner_octa(
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            win_ab,
                             proj,
                             elide,
-                            z_nt,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same
@@ -4191,8 +4203,9 @@ mod tests {
     /// * `skip_blocks` — blocks below it get no projection at all; the fused
     ///   arm must skip exactly the same ones.
     ///
-    /// All four (elide, ab_nt) combinations must reproduce the plain
-    /// full-write temporal reference bit-for-bit.
+    /// Both elision states must reproduce the full-write streaming reference
+    /// bit-for-bit. The separate end-to-end oracle above compares that
+    /// streaming reference with the generic rollback generator.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn round1_inner_octa_ab_nt_matches_across_elide_and_skip() {
@@ -4261,29 +4274,22 @@ mod tests {
                 (z, a, b, ab)
             };
 
-            let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], false, None);
-            let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, None);
+            let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], true, None);
+            let (z_o, a_o, b_o, _) = run(&other, [false; 3], true, None);
             let seed = (z_o, a_o, b_o);
             for &elide_on in &[false, true] {
-                for &ab_nt in &[false, true] {
-                    if !elide_on && !ab_nt {
-                        continue; // that IS the reference
-                    }
-                    let elide = [elide_on; 3];
-                    let (z, a, b, ab) = run(
-                        &blocks,
-                        elide,
-                        ab_nt,
-                        if elide_on { Some(&seed) } else { None },
-                    );
-                    let tag = format!(
-                        "n_total={n_total} skip={skip_blocks} elide={elide_on} ab_nt={ab_nt}"
-                    );
-                    assert_eq!(z, z_r, "z mismatch, {tag}");
-                    assert_eq!(a, a_r, "a mismatch, {tag}");
-                    assert_eq!(b, b_r, "b mismatch, {tag}");
-                    assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
-                }
+                let elide = [elide_on; 3];
+                let (z, a, b, ab) = run(
+                    &blocks,
+                    elide,
+                    true,
+                    if elide_on { Some(&seed) } else { None },
+                );
+                let tag = format!("n_total={n_total} skip={skip_blocks} elide={elide_on}");
+                assert_eq!(z, z_r, "z mismatch, {tag}");
+                assert_eq!(a, a_r, "a mismatch, {tag}");
+                assert_eq!(b, b_r, "b mismatch, {tag}");
+                assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
             }
         }
     }

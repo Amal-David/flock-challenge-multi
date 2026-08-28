@@ -1741,14 +1741,42 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 #[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v.len(), 128);
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        return tensor_algebra_transpose_scalar(s_hat_v);
+    }
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
     let mut out = Vec::<F128>::with_capacity(128);
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
     unsafe {
         transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
         out.set_len(128);
     }
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
     out
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
@@ -1780,6 +1808,7 @@ unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
     }
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> [core::arch::x86_64::__m512i;8] {
@@ -1797,6 +1826,7 @@ unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> 
     }
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn transpose8x64_bytes(mut x: [core::arch::x86_64::__m512i;8]) -> [core::arch::x86_64::__m512i;8] {
@@ -1827,7 +1857,6 @@ unsafe fn transpose8x64_bytes(mut x: [core::arch::x86_64::__m512i;8]) -> [core::
 
 /// Straight-line definition retained only as the independent oracle for the
 /// tiled implementation above.
-#[cfg(test)]
 fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
     let mut s_hat_u = vec![F128::ZERO; 1 << LOG_PACKING];
