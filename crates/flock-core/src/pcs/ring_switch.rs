@@ -1870,7 +1870,7 @@ fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
 pub fn fold_b128_elems_naive(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    suffix_tensor
+    let out = suffix_tensor
         .par_iter()
         .map(|&elem| {
             let mut acc = F128::ZERO;
@@ -1906,7 +1906,7 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
-    let mut tables = vec![F128::ZERO; N_BYTES * TABLE_SIZE];
+    let mut tables = crate::scratch::take_small(N_BYTES * TABLE_SIZE);
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
@@ -1920,7 +1920,7 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
         }
     }
 
-    suffix_tensor
+    let out = suffix_tensor
         .par_iter()
         .map(|&elem| {
             let tables_ptr = tables.as_ptr();
@@ -1966,7 +1966,9 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
             let r1 = q2 + q3;
             r0 + r1
         })
-        .collect()
+        .collect();
+    crate::scratch::give_small(tables);
+    out
 }
 
 /// Tensor-split sibling of [`fold_b128_elems`]. Takes the two factors
@@ -1995,7 +1997,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    let mut tables = crate::scratch::take_small(FOLD_N_BYTES * FOLD_TABLE_SIZE);
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2211,8 +2213,10 @@ pub(crate) fn deferred_dense_value(
 }
 
 pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128]) -> Vec<F128> {
-    let tables = build_fold_byte_table(eq_r_dprime);
-    fold_b128_from_table(eq_lo, eq_hi, &tables)
+    let mut tables = build_fold_byte_table(eq_r_dprime);
+    let out = fold_b128_from_table(eq_lo, eq_hi, &tables);
+    crate::scratch::give_small(tables);
+    out
 }
 
 /// Materialize a split-tensor fold from a prebuilt byte `tables`
@@ -2746,7 +2750,7 @@ fn direct_fold8_states_seq(
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
     for d_low in 0..64 {
         let mut basis_product = low_eq[d_low];
         w_state[d_low] = fold_one_slot(basis_product, table);
@@ -2755,7 +2759,7 @@ fn direct_fold8_states_seq(
             w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
         }
     }
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state = crate::scratch::take_small(64 * n_packed);
     for e in 0..64 {
         let bank = &fold8[e * n_packed..(e + 1) * n_packed];
         for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
@@ -2801,8 +2805,8 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
+    let mut a_state = crate::scratch::take_small(64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
@@ -2933,14 +2937,14 @@ impl RsEqInd {
 
     /// Consume into a dense `Vec<F128>`. Returns the inner vector directly when
     /// already `Dense` (no copy).
-    pub fn into_dense(self) -> Vec<F128> {
-        match self {
-            Self::Dense(v) => v,
+    pub fn into_dense(mut self) -> Vec<F128> {
+        match &mut self {
+            Self::Dense(v) => std::mem::take(v),
             Self::DeferredDense { .. } => self.to_dense(),
             Self::Sparse { len, entries } => {
-                let mut out = vec![F128::ZERO; len];
+                let mut out = vec![F128::ZERO; *len];
                 for (idx, val) in entries {
-                    out[idx] = val;
+                    out[*idx] = *val;
                 }
                 out
             }
@@ -5328,5 +5332,46 @@ mod tests {
             assert_eq!(build_eq_parallel(&r), two_mul(&r), "n={n}");
             assert_eq!(build_eq_parallel(&r), build_eq(&r), "vs sequential n={n}");
         }
+    }
+}
+
+impl Drop for DirectFold8Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.w_state));
+        crate::scratch::give_small(std::mem::take(&mut self.a_state));
+    }
+}
+
+impl Drop for RsEqInd {
+    fn drop(&mut self) {
+        match self {
+            Self::Dense(v) => crate::scratch::give_small(std::mem::take(v)),
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
+                crate::scratch::give_small(std::mem::take(eq_lo));
+                crate::scratch::give_small(std::mem::take(eq_hi));
+                crate::scratch::give_small(std::mem::take(table));
+            }
+            Self::Sparse { entries, .. } => {
+                 let _ = entries;
+            }
+        }
+    }
+}
+
+impl Drop for DirectFold2Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.table));
+    }
+}
+
+impl Drop for DirectFold4Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.table));
     }
 }
