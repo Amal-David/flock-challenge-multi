@@ -199,22 +199,22 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
+unsafe fn mix_u64x8(mut z: __m512i, k1: __m512i, k2: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
+        z = _mm512_mullo_epi64(z, k1);
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
+        z = _mm512_mullo_epi64(z, k2);
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
+unsafe fn next_generator_draw(state: &mut __m512i, golden: __m512i, k1: __m512i, k2: __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
-        _mm512_cvtepi64_epi32(mix_u64x8(*state))
+        *state = _mm512_add_epi64(*state, golden);
+        _mm512_cvtepi64_epi32(mix_u64x8(*state, k1, k2))
     }
 }
 
@@ -235,9 +235,12 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
             first.wrapping_add(stride.wrapping_mul(6)) as i64,
             first.wrapping_add(stride.wrapping_mul(7)) as i64,
         );
-        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let counter_lo = next_generator_draw(&mut state);
+        let golden = _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64);
+        let k1 = _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64);
+        let k2 = _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64);
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut state, golden, k1, k2));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut state, golden, k1, k2));
+        let counter_lo = next_generator_draw(&mut state, golden, k1, k2);
         PreparedInputs {
             cv,
             message,
