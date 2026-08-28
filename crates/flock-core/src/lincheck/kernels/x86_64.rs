@@ -88,6 +88,11 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                             &mut mats[t * 16..(t + 1) * 16],
                         );
                     }
+                    let mats_bcast: [core::arch::x86_64::__m512i; 128] = unsafe {
+                        core::array::from_fn(|i| {
+                            core::arch::x86_64::_mm512_set1_epi64(mats[i] as i64)
+                        })
+                    };
                     // SAFETY: tile_rel < n_tiles_in_chunk keeps the tile in
                     // bounds; the block loop stays within k columns and the
                     // plane buffer is k*16 bytes. tile_rel == 0 seeds from
@@ -97,7 +102,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                             chunk_bytes.as_ptr().add(tile_rel * TILE_T * k),
                             k,
                             n_blocks64,
-                            &mats,
+                            &mats_bcast,
                             out_planes.as_mut_ptr(),
                             tile_rel == 0,
                         );
@@ -387,7 +392,7 @@ pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
     n_blocks64: usize,
-    mats: &[u64; 128],
+    mats: &[core::arch::x86_64::__m512i; 128],
     out_planes_ptr: *mut u8,
     seed_zero: bool,
 ) {
@@ -410,11 +415,11 @@ pub(crate) unsafe fn gfni_fold_tile(
                 for t in (0..8).step_by(2) {
                     let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                         rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                        mats[t * 16 + byte_k],
                     );
                     let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
                         rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                        mats[(t + 1) * 16 + byte_k],
                     );
                     acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
                 }

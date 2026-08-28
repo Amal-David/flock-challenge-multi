@@ -1,5 +1,23 @@
 //! Small bit-manipulation primitives shared across modules.
 
+pub trait BitOps {
+    fn isolate_lowest_one(self) -> Self;
+}
+
+impl BitOps for usize {
+    #[inline(always)]
+    fn isolate_lowest_one(self) -> Self {
+        self & self.wrapping_neg()
+    }
+}
+
+impl BitOps for u64 {
+    #[inline(always)]
+    fn isolate_lowest_one(self) -> Self {
+        self & self.wrapping_neg()
+    }
+}
+
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.
 ///
 /// The input holds 8 bytes representing 8 rows of 8 bits each; the output holds
