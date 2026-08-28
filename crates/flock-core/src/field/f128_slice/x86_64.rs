@@ -85,30 +85,138 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
         let r_x64 = ghash_shift64_x4(r_x4);
         let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
         let scale_x64 = ghash_shift64_x4(scale_x4);
-        let lanes = dst.len() & !3;
+        let poly = crate::field::gf2_128::x86_64::ghash_poly_x4();
+        let lanes = dst.len() & !7;
         let mut t = 0usize;
         while t < lanes {
+            let index = 2 * (base + t);
+            
+            // --- SRC FOLD ---
+            let src0_a = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+            let src1_a = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
+            let src_even_a = _mm512_shuffle_i32x4::<0x88>(src0_a, src1_a);
+            let src_diff_a = _mm512_xor_si512(src_even_a, _mm512_shuffle_i32x4::<0xDD>(src0_a, src1_a));
+
+            let src0_b = _mm512_loadu_si512(src.as_ptr().add(index + 8) as *const __m512i);
+            let src1_b = _mm512_loadu_si512(src.as_ptr().add(index + 12) as *const __m512i);
+            let src_even_b = _mm512_shuffle_i32x4::<0x88>(src0_b, src1_b);
+            let src_diff_b = _mm512_xor_si512(src_even_b, _mm512_shuffle_i32x4::<0xDD>(src0_b, src1_b));
+
+            let src_mlo0_a = _mm512_clmulepi64_epi128::<0x00>(src_diff_a, r_x4);
+            let src_mlo0_b = _mm512_clmulepi64_epi128::<0x00>(src_diff_b, r_x4);
+            let src_mlo1_a = _mm512_clmulepi64_epi128::<0x01>(src_diff_a, r_x64);
+            let src_mlo1_b = _mm512_clmulepi64_epi128::<0x01>(src_diff_b, r_x64);
+
+            let src_mhi0_a = _mm512_clmulepi64_epi128::<0x10>(src_diff_a, r_x4);
+            let src_mhi0_b = _mm512_clmulepi64_epi128::<0x10>(src_diff_b, r_x4);
+            let src_mhi1_a = _mm512_clmulepi64_epi128::<0x11>(src_diff_a, r_x64);
+            let src_mhi1_b = _mm512_clmulepi64_epi128::<0x11>(src_diff_b, r_x64);
+
+            let src_mhi_a = _mm512_xor_si512(src_mhi0_a, src_mhi1_a);
+            let src_mhi_b = _mm512_xor_si512(src_mhi0_b, src_mhi1_b);
+
+            let src_folded1_a = _mm512_ternarylogic_epi64(src_mlo0_a, src_mlo1_a, src_even_a, 0x96);
+            let src_folded1_b = _mm512_ternarylogic_epi64(src_mlo0_b, src_mlo1_b, src_even_b, 0x96);
+
+            let src_folded_a = _mm512_ternarylogic_epi64(src_folded1_a, _mm512_bslli_epi128::<8>(src_mhi_a), _mm512_clmulepi64_epi128::<0x01>(src_mhi_a, poly), 0x96);
+            let src_folded_b = _mm512_ternarylogic_epi64(src_folded1_b, _mm512_bslli_epi128::<8>(src_mhi_b), _mm512_clmulepi64_epi128::<0x01>(src_mhi_b, poly), 0x96);
+
+            // --- ADDEND FOLD ---
+            let addend0_a = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
+            let addend1_a = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
+            let addend_even_a = _mm512_shuffle_i32x4::<0x88>(addend0_a, addend1_a);
+            let addend_diff_a = _mm512_xor_si512(addend_even_a, _mm512_shuffle_i32x4::<0xDD>(addend0_a, addend1_a));
+
+            let addend0_b = _mm512_loadu_si512(addend.as_ptr().add(index + 8) as *const __m512i);
+            let addend1_b = _mm512_loadu_si512(addend.as_ptr().add(index + 12) as *const __m512i);
+            let addend_even_b = _mm512_shuffle_i32x4::<0x88>(addend0_b, addend1_b);
+            let addend_diff_b = _mm512_xor_si512(addend_even_b, _mm512_shuffle_i32x4::<0xDD>(addend0_b, addend1_b));
+
+            let addend_mlo0_a = _mm512_clmulepi64_epi128::<0x00>(addend_diff_a, r_x4);
+            let addend_mlo0_b = _mm512_clmulepi64_epi128::<0x00>(addend_diff_b, r_x4);
+            let addend_mlo1_a = _mm512_clmulepi64_epi128::<0x01>(addend_diff_a, r_x64);
+            let addend_mlo1_b = _mm512_clmulepi64_epi128::<0x01>(addend_diff_b, r_x64);
+
+            let addend_mhi0_a = _mm512_clmulepi64_epi128::<0x10>(addend_diff_a, r_x4);
+            let addend_mhi0_b = _mm512_clmulepi64_epi128::<0x10>(addend_diff_b, r_x4);
+            let addend_mhi1_a = _mm512_clmulepi64_epi128::<0x11>(addend_diff_a, r_x64);
+            let addend_mhi1_b = _mm512_clmulepi64_epi128::<0x11>(addend_diff_b, r_x64);
+
+            let addend_mhi_a = _mm512_xor_si512(addend_mhi0_a, addend_mhi1_a);
+            let addend_mhi_b = _mm512_xor_si512(addend_mhi0_b, addend_mhi1_b);
+
+            let addend_folded1_a = _mm512_ternarylogic_epi64(addend_mlo0_a, addend_mlo1_a, addend_even_a, 0x96);
+            let addend_folded1_b = _mm512_ternarylogic_epi64(addend_mlo0_b, addend_mlo1_b, addend_even_b, 0x96);
+
+            let addend_folded_a = _mm512_ternarylogic_epi64(addend_folded1_a, _mm512_bslli_epi128::<8>(addend_mhi_a), _mm512_clmulepi64_epi128::<0x01>(addend_mhi_a, poly), 0x96);
+            let addend_folded_b = _mm512_ternarylogic_epi64(addend_folded1_b, _mm512_bslli_epi128::<8>(addend_mhi_b), _mm512_clmulepi64_epi128::<0x01>(addend_mhi_b, poly), 0x96);
+
+            // --- SCALE FOLD ---
+            let scale_mlo0_a = _mm512_clmulepi64_epi128::<0x00>(addend_folded_a, scale_x4);
+            let scale_mlo0_b = _mm512_clmulepi64_epi128::<0x00>(addend_folded_b, scale_x4);
+            let scale_mlo1_a = _mm512_clmulepi64_epi128::<0x01>(addend_folded_a, scale_x64);
+            let scale_mlo1_b = _mm512_clmulepi64_epi128::<0x01>(addend_folded_b, scale_x64);
+
+            let scale_mhi0_a = _mm512_clmulepi64_epi128::<0x10>(addend_folded_a, scale_x4);
+            let scale_mhi0_b = _mm512_clmulepi64_epi128::<0x10>(addend_folded_b, scale_x4);
+            let scale_mhi1_a = _mm512_clmulepi64_epi128::<0x11>(addend_folded_a, scale_x64);
+            let scale_mhi1_b = _mm512_clmulepi64_epi128::<0x11>(addend_folded_b, scale_x64);
+
+            let scale_mhi_a = _mm512_xor_si512(scale_mhi0_a, scale_mhi1_a);
+            let scale_mhi_b = _mm512_xor_si512(scale_mhi0_b, scale_mhi1_b);
+
+            let out1_a = _mm512_ternarylogic_epi64(scale_mlo0_a, scale_mlo1_a, src_folded_a, 0x96);
+            let out1_b = _mm512_ternarylogic_epi64(scale_mlo0_b, scale_mlo1_b, src_folded_b, 0x96);
+
+            let out_a = _mm512_ternarylogic_epi64(out1_a, _mm512_bslli_epi128::<8>(scale_mhi_a), _mm512_clmulepi64_epi128::<0x01>(scale_mhi_a, poly), 0x96);
+            let out_b = _mm512_ternarylogic_epi64(out1_b, _mm512_bslli_epi128::<8>(scale_mhi_b), _mm512_clmulepi64_epi128::<0x01>(scale_mhi_b, poly), 0x96);
+
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out_a);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, out_b);
+            t += 8;
+        }
+        
+        while t < dst.len() & !3 {
             let index = 2 * (base + t);
             let src_lo = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
             let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
             let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
             let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
-            let src_folded = _mm512_xor_si512(
-                src_even,
-                ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
-            );
+            let src_diff = _mm512_xor_si512(src_even, src_odd);
+            
+            let src_mlo0 = _mm512_clmulepi64_epi128::<0x00>(src_diff, r_x4);
+            let src_mlo1 = _mm512_clmulepi64_epi128::<0x01>(src_diff, r_x64);
+            let src_mhi0 = _mm512_clmulepi64_epi128::<0x10>(src_diff, r_x4);
+            let src_mhi1 = _mm512_clmulepi64_epi128::<0x11>(src_diff, r_x64);
+            
+            let src_mhi = _mm512_xor_si512(src_mhi0, src_mhi1);
+            let src_folded1 = _mm512_ternarylogic_epi64(src_mlo0, src_mlo1, src_even, 0x96);
+            let src_folded = _mm512_ternarylogic_epi64(src_folded1, _mm512_bslli_epi128::<8>(src_mhi), _mm512_clmulepi64_epi128::<0x01>(src_mhi, poly), 0x96);
+            
             let addend_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
             let addend_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
             let addend_even = _mm512_shuffle_i32x4::<0x88>(addend_lo, addend_hi);
             let addend_odd = _mm512_shuffle_i32x4::<0xDD>(addend_lo, addend_hi);
-            let addend_folded = _mm512_xor_si512(
-                addend_even,
-                ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
-            );
-            let output = _mm512_xor_si512(
-                src_folded,
-                ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
-            );
+            let addend_diff = _mm512_xor_si512(addend_even, addend_odd);
+            
+            let addend_mlo0 = _mm512_clmulepi64_epi128::<0x00>(addend_diff, r_x4);
+            let addend_mlo1 = _mm512_clmulepi64_epi128::<0x01>(addend_diff, r_x64);
+            let addend_mhi0 = _mm512_clmulepi64_epi128::<0x10>(addend_diff, r_x4);
+            let addend_mhi1 = _mm512_clmulepi64_epi128::<0x11>(addend_diff, r_x64);
+            
+            let addend_mhi = _mm512_xor_si512(addend_mhi0, addend_mhi1);
+            let addend_folded1 = _mm512_ternarylogic_epi64(addend_mlo0, addend_mlo1, addend_even, 0x96);
+            let addend_folded = _mm512_ternarylogic_epi64(addend_folded1, _mm512_bslli_epi128::<8>(addend_mhi), _mm512_clmulepi64_epi128::<0x01>(addend_mhi, poly), 0x96);
+            
+            let scale_mlo0 = _mm512_clmulepi64_epi128::<0x00>(addend_folded, scale_x4);
+            let scale_mlo1 = _mm512_clmulepi64_epi128::<0x01>(addend_folded, scale_x64);
+            let scale_mhi0 = _mm512_clmulepi64_epi128::<0x10>(addend_folded, scale_x4);
+            let scale_mhi1 = _mm512_clmulepi64_epi128::<0x11>(addend_folded, scale_x64);
+            
+            let scale_mhi = _mm512_xor_si512(scale_mhi0, scale_mhi1);
+            let out1 = _mm512_ternarylogic_epi64(scale_mlo0, scale_mlo1, src_folded, 0x96);
+            let output = _mm512_ternarylogic_epi64(out1, _mm512_bslli_epi128::<8>(scale_mhi), _mm512_clmulepi64_epi128::<0x01>(scale_mhi, poly), 0x96);
+            
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
             t += 4;
         }
@@ -319,7 +427,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(f.len(), b.len());
@@ -505,7 +613,7 @@ pub(super) unsafe fn bind_both_and_msg_split(
     n: usize,
 ) -> (F128, F128) {
     use crate::field::gf2_128::F256Unreduced;
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees features and that every slice covers `n`.
