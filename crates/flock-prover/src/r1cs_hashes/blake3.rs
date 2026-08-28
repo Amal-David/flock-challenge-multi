@@ -941,6 +941,154 @@ pub fn build_block_witness(
     z
 }
 
+/// Build the witness blocks for TWO adjacent compressions back-to-back inside
+/// a single `#[inline(always)]` body. Two fully-unrolled 7-round straight-line
+/// compress bodies are issued in the same basic block so LLVM's MachineScheduler
+/// can interleave the G-mix chains of compress #1 and compress #2 across the
+/// shared instruction window — independent streams (no shared state, no
+/// cross-compress aliasing, no `t`-tuple). Counter is spelled as separate
+/// `t_lo` / `t_hi` scalars (a `(u32, u32)` tuple triggered a 480s codegen
+/// timeout in the rejected `implement-failed` family). Inputs are passed as
+/// distinct scalars for the same reason.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn compress_in_place2(
+    cv1: &[u32; 8],
+    m1: &[u32; 16],
+    t1_lo: u32,
+    t1_hi: u32,
+    blen1: u32,
+    fl1: u32,
+    cv2: &[u32; 8],
+    m2: &[u32; 16],
+    t2_lo: u32,
+    t2_hi: u32,
+    blen2: u32,
+    fl2: u32,
+    out1: &mut [bool],
+    out2: &mut [bool],
+) {
+    // ---- stream #1 (CV, m, counter, blen, flags) ----
+    out1[Z_CONST_POS] = true;
+    for w in 0..8 {
+        write_word(out1, cv_bit(w, 0), cv1[w]);
+    }
+    for i in 0..16 {
+        write_word(out1, m_bit(i, 0), m1[i]);
+    }
+    write_word(out1, T_LO_BASE, t1_lo);
+    write_word(out1, T_HI_BASE, t1_hi);
+    write_word(out1, BLEN_BASE, blen1);
+    write_word(out1, FLAGS_BASE, fl1);
+    let mut s1: [u32; 16] = [
+        cv1[0], cv1[1], cv1[2], cv1[3], cv1[4], cv1[5], cv1[6], cv1[7], BLAKE3_IV[0], BLAKE3_IV[1],
+        BLAKE3_IV[2], BLAKE3_IV[3], t1_lo, t1_hi, blen1, fl1,
+    ];
+    // ---- stream #2 (CV, m, counter, blen, flags) ----
+    out2[Z_CONST_POS] = true;
+    for w in 0..8 {
+        write_word(out2, cv_bit(w, 0), cv2[w]);
+    }
+    for i in 0..16 {
+        write_word(out2, m_bit(i, 0), m2[i]);
+    }
+    write_word(out2, T_LO_BASE, t2_lo);
+    write_word(out2, T_HI_BASE, t2_hi);
+    write_word(out2, BLEN_BASE, blen2);
+    write_word(out2, FLAGS_BASE, fl2);
+    let mut s2: [u32; 16] = [
+        cv2[0], cv2[1], cv2[2], cv2[3], cv2[4], cv2[5], cv2[6], cv2[7], BLAKE3_IV[0], BLAKE3_IV[1],
+        BLAKE3_IV[2], BLAKE3_IV[3], t2_lo, t2_hi, blen2, fl2,
+    ];
+    // ---- 7-round unrolled bodies, side-by-side, hardcoded message indices ----
+    macro_rules! g2 {
+        ($g:expr, $la1:literal, $lb1:literal, $lc1:literal, $ld1:literal,
+         $mx1:literal, $my1:literal, $la2:literal, $lb2:literal, $lc2:literal, $ld2:literal,
+         $mx2:literal, $my2:literal) => {{
+            let mx1 = m1[$mx1];
+            let my1 = m1[$my1];
+            let mx2 = m2[$mx2];
+            let my2 = m2[$my2];
+            let a1 = s1[$la1];
+            let b1 = s1[$lb1];
+            let c1 = s1[$lc1];
+            let d1 = s1[$ld1];
+            let t0_1 = add_with_witness_carry_only(a1, b1, out1, g_add_carry_bit($g, ADD_TMP0, 0));
+            let a1_1 = add_with_witness_carry_only(t0_1, mx1, out1, g_add_carry_bit($g, ADD_A1, 0));
+            let d1_1 = (d1 ^ a1_1).rotate_right(16);
+            let c1_1 = add_with_witness_carry_only(c1, d1_1, out1, g_add_carry_bit($g, ADD_C1, 0));
+            let b1_1 = (b1 ^ c1_1).rotate_right(12);
+            let t1_1 =
+                add_with_witness_carry_only(a1_1, b1_1, out1, g_add_carry_bit($g, ADD_TMP1, 0));
+            let a2_1 = add_with_witness_carry_only(t1_1, my1, out1, g_add_carry_bit($g, ADD_A2, 0));
+            let d2_1 = (d1_1 ^ a2_1).rotate_right(8);
+            let c2_1 = add_with_witness_carry_only(c1_1, d2_1, out1, g_add_carry_bit($g, ADD_C2, 0));
+            let bn1 = (b1_1 ^ c2_1).rotate_right(7);
+            let dn1 = d2_1;
+            write_word(out1, g_lin_bit($g, LIN_B_NEW, 0), bn1);
+            write_word(out1, g_lin_bit($g, LIN_D_NEW, 0), dn1);
+            s1[$la1] = a2_1;
+            s1[$lb1] = bn1;
+            s1[$lc1] = c2_1;
+            s1[$ld1] = dn1;
+            let a2 = s2[$la2];
+            let b2 = s2[$lb2];
+            let c2 = s2[$lc2];
+            let d2 = s2[$ld2];
+            let t0_2 = add_with_witness_carry_only(a2, b2, out2, g_add_carry_bit($g, ADD_TMP0, 0));
+            let a1_2 = add_with_witness_carry_only(t0_2, mx2, out2, g_add_carry_bit($g, ADD_A1, 0));
+            let d1_2 = (d2 ^ a1_2).rotate_right(16);
+            let c1_2 = add_with_witness_carry_only(c2, d1_2, out2, g_add_carry_bit($g, ADD_C1, 0));
+            let b1_2 = (b2 ^ c1_2).rotate_right(12);
+            let t1_2 =
+                add_with_witness_carry_only(a1_2, b1_2, out2, g_add_carry_bit($g, ADD_TMP1, 0));
+            let a2_2 = add_with_witness_carry_only(t1_2, my2, out2, g_add_carry_bit($g, ADD_A2, 0));
+            let d2_2 = (d1_2 ^ a2_2).rotate_right(8);
+            let c2_2 = add_with_witness_carry_only(c1_2, d2_2, out2, g_add_carry_bit($g, ADD_C2, 0));
+            let bn2 = (b1_2 ^ c2_2).rotate_right(7);
+            let dn2 = d2_2;
+            write_word(out2, g_lin_bit($g, LIN_B_NEW, 0), bn2);
+            write_word(out2, g_lin_bit($g, LIN_D_NEW, 0), dn2);
+            s2[$la2] = a2_2;
+            s2[$lb2] = bn2;
+            s2[$lc2] = c2_2;
+            s2[$ld2] = dn2;
+        }};
+    }
+    macro_rules! round2 {
+        ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal, $m4:literal, $m5:literal,
+         $m6:literal, $m7:literal, $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {
+            g2!($gb,     0,  4,  8, 12, $m0, $m1, 0,  4,  8, 12, $m0, $m1);
+            g2!($gb + 1, 1,  5,  9, 13, $m2, $m3, 1,  5,  9, 13, $m2, $m3);
+            g2!($gb + 2, 2,  6, 10, 14, $m4, $m5, 2,  6, 10, 14, $m4, $m5);
+            g2!($gb + 3, 3,  7, 11, 15, $m6, $m7, 3,  7, 11, 15, $m6, $m7);
+            g2!($gb + 4, 0,  5, 10, 15, $m8, $m9, 0,  5, 10, 15, $m8, $m9);
+            g2!($gb + 5, 1,  6, 11, 12, $m10, $m11, 1,  6, 11, 12, $m10, $m11);
+            g2!($gb + 6, 2,  7,  8, 13, $m12, $m13, 2,  7,  8, 13, $m12, $m13);
+            g2!($gb + 7, 3,  4,  9, 14, $m14, $m15, 3,  4,  9, 14, $m14, $m15);
+        };
+    }
+    round2!(0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15);
+    round2!(8,  2,  6,  3, 10,  7,  0,  4, 13,  1, 11, 12,  5,  9, 14, 15,  8);
+    round2!(16, 3,  4, 10, 12, 13,  2,  7, 14,  6,  5,  9,  0, 11, 15,  8,  1);
+    round2!(24, 10, 7, 12,  9, 14,  3, 13, 15,  4,  0, 11,  2,  5,  8,  1,  6);
+    round2!(32, 12, 13, 9, 11, 15, 10, 14,  8,  7,  2,  5,  3,  0,  1,  6,  4);
+    round2!(40, 9,  14, 11,  5,  8, 12, 15,  1, 13,  3,  0, 10,  2,  6,  4,  7);
+    round2!(48, 11, 15,  5,  0,  1,  9,  8,  6, 14, 10,  2, 12,  3,  4,  7, 13);
+    // ---- finalization XORs (out_lo, out_hi) for both streams ----
+    for w in 0..8 {
+        let lo1 = s1[w] ^ s1[w + 8];
+        let hi1 = s1[w + 8] ^ cv1[w];
+        write_word(out1, out_lo_bit(w, 0), lo1);
+        write_word(out1, out_hi_bit(w, 0), hi1);
+        let lo2 = s2[w] ^ s2[w + 8];
+        let hi2 = s2[w + 8] ^ cv2[w];
+        write_word(out2, out_lo_bit(w, 0), lo2);
+        write_word(out2, out_hi_bit(w, 0), hi2);
+    }
+}
+
 /// Minimum `n_blocks_log` needed to prove `n_blocks` BLAKE3 compressions,
 /// subject to the lincheck floor of `n_blocks_log ≥ 3` (`n_outer ≥ 8`).
 pub fn min_n_blocks_log(n_blocks: usize) -> usize {
@@ -955,6 +1103,11 @@ pub type Compression = ([u32; 8], [u32; 16], u64, u32, u32);
 /// Generate the boolean witness vector for `blocks.len()` independent BLAKE3
 /// compressions, padded to `2^n_blocks_log` slots. Padding blocks are
 /// all-zero (trivially satisfy the R1CS). Parallel across instances via rayon.
+///
+/// Adjacent block pairs run through the 2-way straight-line
+/// [`compress_in_place2`] helper so LLVM's MachineScheduler can interleave the
+/// G-mix chains of both compressions in one shared basic block. A trailing
+/// odd block (if any) falls back to the single-stream [`build_block_witness`].
 pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool> {
     use rayon::prelude::*;
     let n_total = 1usize << n_blocks_log;
@@ -964,13 +1117,28 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
         "{n_blocks} compressions > 2^{n_blocks_log} = {n_total} slots"
     );
     let mut z = vec![false; n_total * K];
-    z.par_chunks_mut(K)
-        .take(n_blocks)
-        .zip(blocks.par_iter())
-        .for_each(|(chunk, (cv, m, t, b, d))| {
-            let block = build_block_witness(cv, m, *t, *b, *d);
-            chunk.copy_from_slice(&block);
+    let (pairs, tail) = blocks.split_at(n_blocks & !1usize);
+    let n_pairs = pairs.len() / 2;
+    z.par_chunks_mut(2 * K)
+        .take(n_pairs)
+        .zip(pairs.par_chunks(2))
+        .for_each(|(chunk, pair)| {
+            let (cv1, m1, t1, b1, d1) = pair[0];
+            let (cv2, m2, t2, b2, d2) = pair[1];
+            let t1_lo = t1 as u32;
+            let t1_hi = (t1 >> 32) as u32;
+            let t2_lo = t2 as u32;
+            let t2_hi = (t2 >> 32) as u32;
+            let (out1, out2) = chunk.split_at_mut(K);
+            compress_in_place2(
+                cv1, m1, t1_lo, t1_hi, b1, d1, cv2, m2, t2_lo, t2_hi, b2, d2, out1, out2,
+            );
         });
+    if let Some((last, _)) = tail.split_first() {
+        let (cv, m, t, b, d) = *last;
+        let block = build_block_witness(cv, m, t, b, d);
+        z[n_pairs * 2 * K..(n_pairs * 2 + 1) * K].copy_from_slice(&block);
+    }
     z
 }
 
