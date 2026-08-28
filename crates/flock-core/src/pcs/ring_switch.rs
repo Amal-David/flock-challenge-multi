@@ -3881,16 +3881,18 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
         z_vals_suffix.len() <= 32,
         "y_bits is u32; suffix > 32 not supported"
     );
-    let mut eval = prefix.clone();
+    let mut total_scalar = F128::ONE;
     for (j, &z_i) in z_vals_suffix.iter().enumerate() {
         let scalar = if (y_bits >> j) & 1 == 1 {
             z_i
         } else {
             F128::ONE + z_i
         };
-        for e in eval.elems.iter_mut() {
-            *e *= scalar;
-        }
+        total_scalar *= scalar;
+    }
+    let mut eval = prefix.clone();
+    for e in eval.elems.iter_mut() {
+        *e *= total_scalar;
     }
     eval.fold_vertical(eq_r_dprime)
 }
