@@ -200,7 +200,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_kara_fold_x4, ghash_mul_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -215,6 +215,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Resolved once per worker chunk, never inside the sweep loop.
+        let kara = zc_kara_acc_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
@@ -263,11 +265,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let g0 = row_base + 2 * x_lo;
                 // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
                 // start, so its block position decides the dead lines.
-                let dead = super::super::prefold_dead_line_mask_gated(
-                    g0,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                );
+                // `prefold_dead_line_mask_gated` is opt-in behind
+                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                // worker with a cleared environment, so the gate is off and
+                // the mask is a constant 0 on every one of the ~2.1 M leaf
+                // tiles. Feeding the constant in directly drops the per-tile
+                // `OnceLock` acquire load and the eight-bit mask build, and
+                // lets the fold kernels take their unpredicated line path.
+                let dead = 0u8;
+                let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -464,18 +470,66 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            if kara {
+                // Karatsuba middle limb: the unreduced product's middle is
+                // `k ^ lo ^ hi` with `k = (x.lo^x.hi)*(y.lo^y.hi)`, and the two
+                // correction terms are the limbs this accumulator already keeps.
+                // XOR-accumulation is F2-linear, so the correction is applied
+                // ONCE per accumulator after the sweep (`finish_kara`) instead
+                // of per product: three CLMUL per accumulate instead of four,
+                // eight of this iteration's fifty-two `vpclmulqdq` deleted.
+                // `ghash_kara_fold_x4` is F2-linear too, so the eight base folds
+                // cover all sixteen operands -- every sum operand reuses an XOR
+                // of folds rather than another shuffle.
+                let ka0 = ghash_kara_fold_x4(a0w);
+                let ka1 = ghash_kara_fold_x4(a1w);
+                let ka2 = ghash_kara_fold_x4(a2w);
+                let ka3 = ghash_kara_fold_x4(a3w);
+                let kb0 = ghash_kara_fold_x4(b0);
+                let kb1 = ghash_kara_fold_x4(b1);
+                let kb2 = ghash_kara_fold_x4(b2);
+                let kb3 = ghash_kara_fold_x4(b3);
+                let ke_a = _mm512_xor_si512(ka0, ka2);
+                let ke_b = _mm512_xor_si512(kb0, kb2);
+                let ko_a = _mm512_xor_si512(ka1, ka3);
+                let ko_b = _mm512_xor_si512(kb1, kb3);
+                acc[0].mul_acc_kara(a1w, ka1, b1, kb1);
+                acc[1].mul_acc_kara(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(ka0, ka1),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(kb0, kb1),
+                );
+                acc[2].mul_acc_kara(a3w, ka3, b3, kb3);
+                acc[3].mul_acc_kara(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(ka2, ka3),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(kb2, kb3),
+                );
+                acc[4].mul_acc_kara(a2w, ka2, b2, kb2);
+                acc[5].mul_acc_kara(e_aw, ke_a, e_b, ke_b);
+                acc[6].mul_acc_kara(o_aw, ko_a, o_b, ko_b);
+                acc[7].mul_acc_kara(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(ke_a, ko_a),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(ke_b, ko_b),
+                );
+            } else {
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }
             x_lo += 8;
         }
 
@@ -535,6 +589,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
 
         let mut out = [F128::ZERO; 8];
         for i in 0..8 {
+            // Karatsuba correction, once per accumulator (see `mul_acc_kara`).
+            if kara {
+                acc[i].finish_kara();
+            }
             tail[i] ^= acc[i].fold();
             out[i] = tail[i].reduce();
         }
@@ -725,7 +783,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     wtab: Option<&[F128]>,
     nt_out: bool,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_kara_fold_x4, ghash_mul_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -802,11 +860,19 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let rb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_b.hi as i64, rho_b.lo as i64));
         let rho_ab = rho_a * rho_b;
         let rarb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_ab.hi as i64, rho_ab.lo as i64));
+        // Pass constants: the composed fold's three multipliers never change,
+        // so their Karatsuba operand folds are hoisted out of the sweep.
+        let kara_fold = zc_kara_fold_enabled();
+        let kra = ghash_kara_fold_x4(ra);
+        let krb = ghash_kara_fold_x4(rb);
+        let krarb = ghash_kara_fold_x4(rarb);
         let defer = zc_fold_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Resolved once per worker chunk, never inside the sweep loop.
+        let kara = zc_kara_acc_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         // Input look-ahead, resolved once per worker chunk (never inside the
@@ -829,7 +895,18 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
                 }
             }
-            let (oa0, oa1, oa2, oa3, ob0, ob1, ob2, ob3) = if defer {
+            let (oa0, oa1, oa2, oa3, ob0, ob1, ob2, ob3) = if defer && kara_fold {
+                (
+                    fold16_to_4_deferred_kara(a_src, ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(a_src.add(16), ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(a_src.add(32), ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(a_src.add(48), ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(b_src, ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(b_src.add(16), ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(b_src.add(32), ra, rb, rarb, kra, krb, krarb),
+                    fold16_to_4_deferred_kara(b_src.add(48), ra, rb, rarb, kra, krb, krarb),
+                )
+            } else if defer {
                 (
                     fold16_to_4_deferred(a_src, ra, rb, rarb),
                     fold16_to_4_deferred(a_src.add(16), ra, rb, rarb),
@@ -936,18 +1013,66 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            if kara {
+                // Karatsuba middle limb: the unreduced product's middle is
+                // `k ^ lo ^ hi` with `k = (x.lo^x.hi)*(y.lo^y.hi)`, and the two
+                // correction terms are the limbs this accumulator already keeps.
+                // XOR-accumulation is F2-linear, so the correction is applied
+                // ONCE per accumulator after the sweep (`finish_kara`) instead
+                // of per product: three CLMUL per accumulate instead of four,
+                // eight of this iteration's fifty-two `vpclmulqdq` deleted.
+                // `ghash_kara_fold_x4` is F2-linear too, so the eight base folds
+                // cover all sixteen operands -- every sum operand reuses an XOR
+                // of folds rather than another shuffle.
+                let ka0 = ghash_kara_fold_x4(a0w);
+                let ka1 = ghash_kara_fold_x4(a1w);
+                let ka2 = ghash_kara_fold_x4(a2w);
+                let ka3 = ghash_kara_fold_x4(a3w);
+                let kb0 = ghash_kara_fold_x4(b0);
+                let kb1 = ghash_kara_fold_x4(b1);
+                let kb2 = ghash_kara_fold_x4(b2);
+                let kb3 = ghash_kara_fold_x4(b3);
+                let ke_a = _mm512_xor_si512(ka0, ka2);
+                let ke_b = _mm512_xor_si512(kb0, kb2);
+                let ko_a = _mm512_xor_si512(ka1, ka3);
+                let ko_b = _mm512_xor_si512(kb1, kb3);
+                acc[0].mul_acc_kara(a1w, ka1, b1, kb1);
+                acc[1].mul_acc_kara(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(ka0, ka1),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(kb0, kb1),
+                );
+                acc[2].mul_acc_kara(a3w, ka3, b3, kb3);
+                acc[3].mul_acc_kara(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(ka2, ka3),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(kb2, kb3),
+                );
+                acc[4].mul_acc_kara(a2w, ka2, b2, kb2);
+                acc[5].mul_acc_kara(e_aw, ke_a, e_b, ke_b);
+                acc[6].mul_acc_kara(o_aw, ko_a, o_b, ko_b);
+                acc[7].mul_acc_kara(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(ke_a, ko_a),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(ke_b, ko_b),
+                );
+            } else {
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }
             x_lo += 8;
         }
 
@@ -992,6 +1117,10 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         }
         let mut out = [F128::ZERO; 8];
         for i in 0..8 {
+            // Karatsuba correction, once per accumulator (see `mul_acc_kara`).
+            if kara {
+                acc[i].finish_kara();
+            }
             tail[i] ^= acc[i].fold();
             out[i] = tail[i].reduce();
         }
@@ -1182,6 +1311,28 @@ pub(crate) fn zc_wtab_enabled() -> bool {
     *ON
 }
 
+/// Karatsuba middle limb in the eight deferred round-message accumulators of
+/// the round-2 sweep, the composed rounds-3+4 pass and the cascade levels.
+///
+/// `FLOCK_NO_ZC_KARA_ACC=1` restores the incumbent four-CLMUL `mul_acc`.
+/// Read ONCE per worker chunk (never inside the sweep loops).
+pub(crate) fn zc_kara_acc_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_KARA_ACC").is_none());
+    *ON
+}
+
+/// Karatsuba middle limb in the cascade levels' sixteen-to-four composed pair
+/// fold (`fold16_to_4_deferred`).
+///
+/// `FLOCK_NO_ZC_KARA_FOLD=1` restores the incumbent fourteen-CLMUL form.
+/// Read ONCE per worker chunk (never inside the sweep loops).
+pub(crate) fn zc_kara_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_KARA_FOLD").is_none());
+    *ON
+}
+
 pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
@@ -1229,6 +1380,62 @@ unsafe fn fold16_to_4_deferred(
         acc.mul_acc(ra, x01);
         acc.mul_acc(rb, x02);
         acc.mul_acc(rarb, x0123);
+        _mm512_xor_si512(x0, acc.reduce_lanes())
+    }
+}
+
+/// [`fold16_to_4_deferred`] with the Karatsuba middle limb: **11 CLMUL instead
+/// of 14**, the same fold shuffles plus four `vpshufd`-class operand folds.
+///
+/// The three multiplier folds `kra`/`krb`/`krarb` are [`ghash_kara_fold_x4`]
+/// of `ra`/`rb`/`rarb` and are pass constants, so they are hoisted to the
+/// caller. The variable side needs only the four input-lane folds: the fold is
+/// F2-linear, so the three XOR combinations the incumbent already forms
+/// (`x0^x1`, `x0^x2`, `x0^x1^x2^x3`) reuse XORs of those four.
+/// Bit-identical to [`fold16_to_4_deferred`] by the `mul_acc_kara` argument.
+///
+/// # Safety
+/// As [`fold16_to_4_deferred`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold16_to_4_deferred_kara(
+    src: *const F128,
+    ra: core::arch::x86_64::__m512i,
+    rb: core::arch::x86_64::__m512i,
+    rarb: core::arch::x86_64::__m512i,
+    kra: core::arch::x86_64::__m512i,
+    krb: core::arch::x86_64::__m512i,
+    krarb: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_kara_fold_x4};
+    use core::arch::x86_64::*;
+    // SAFETY: bounds per the contract; features per the cfg above.
+    unsafe {
+        let i0 = _mm512_loadu_si512(src.cast::<__m512i>());
+        let i1 = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
+        let i2 = _mm512_loadu_si512(src.add(8).cast::<__m512i>());
+        let i3 = _mm512_loadu_si512(src.add(12).cast::<__m512i>());
+        let [x0, x1, x2, x3] = transpose4_lanes(i0, i1, i2, i3);
+        let x01 = _mm512_xor_si512(x0, x1);
+        let x02 = _mm512_xor_si512(x0, x2);
+        let x0123 = _mm512_xor_si512(x01, _mm512_xor_si512(x2, x3));
+        let k0 = ghash_kara_fold_x4(x0);
+        let k1 = ghash_kara_fold_x4(x1);
+        let k2 = ghash_kara_fold_x4(x2);
+        let k3 = ghash_kara_fold_x4(x3);
+        let k01 = _mm512_xor_si512(k0, k1);
+        let k02 = _mm512_xor_si512(k0, k2);
+        let k0123 = _mm512_xor_si512(k01, _mm512_xor_si512(k2, k3));
+        let mut acc = WideGhashX4::zero();
+        acc.mul_acc_kara(ra, kra, x01, k01);
+        acc.mul_acc_kara(rb, krb, x02, k02);
+        acc.mul_acc_kara(rarb, krarb, x0123, k0123);
+        acc.finish_kara();
         _mm512_xor_si512(x0, acc.reduce_lanes())
     }
 }
@@ -1328,7 +1535,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     cfold: Option<&CFoldMats>,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_kara_fold_x4, ghash_mul_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -1554,6 +1761,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Resolved once per worker chunk, never inside the sweep loop.
+        let kara = zc_kara_acc_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
@@ -1593,11 +1802,15 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                    let dead = super::super::prefold_dead_line_mask_gated(
-                        4 * xg,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    );
+                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                    // worker with a cleared environment, so the gate is off and
+                    // the mask is a constant 0 on every one of the ~2.1 M leaf
+                    // tiles. Feeding the constant in directly drops the per-tile
+                    // `OnceLock` acquire load and the eight-bit mask build, and
+                    // lets the fold kernels take their unpredicated line path.
+                    let dead = 0u8;
+                    let _ = (pair_in_block_mask, useful_pairs_inclusive);
                     if use_c4 {
                         let c = cfold.unwrap();
                         if c4_bcast {
@@ -1832,18 +2045,66 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            if kara {
+                // Karatsuba middle limb: the unreduced product's middle is
+                // `k ^ lo ^ hi` with `k = (x.lo^x.hi)*(y.lo^y.hi)`, and the two
+                // correction terms are the limbs this accumulator already keeps.
+                // XOR-accumulation is F2-linear, so the correction is applied
+                // ONCE per accumulator after the sweep (`finish_kara`) instead
+                // of per product: three CLMUL per accumulate instead of four,
+                // eight of this iteration's fifty-two `vpclmulqdq` deleted.
+                // `ghash_kara_fold_x4` is F2-linear too, so the eight base folds
+                // cover all sixteen operands -- every sum operand reuses an XOR
+                // of folds rather than another shuffle.
+                let ka0 = ghash_kara_fold_x4(a0w);
+                let ka1 = ghash_kara_fold_x4(a1w);
+                let ka2 = ghash_kara_fold_x4(a2w);
+                let ka3 = ghash_kara_fold_x4(a3w);
+                let kb0 = ghash_kara_fold_x4(b0);
+                let kb1 = ghash_kara_fold_x4(b1);
+                let kb2 = ghash_kara_fold_x4(b2);
+                let kb3 = ghash_kara_fold_x4(b3);
+                let ke_a = _mm512_xor_si512(ka0, ka2);
+                let ke_b = _mm512_xor_si512(kb0, kb2);
+                let ko_a = _mm512_xor_si512(ka1, ka3);
+                let ko_b = _mm512_xor_si512(kb1, kb3);
+                acc[0].mul_acc_kara(a1w, ka1, b1, kb1);
+                acc[1].mul_acc_kara(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(ka0, ka1),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(kb0, kb1),
+                );
+                acc[2].mul_acc_kara(a3w, ka3, b3, kb3);
+                acc[3].mul_acc_kara(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(ka2, ka3),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(kb2, kb3),
+                );
+                acc[4].mul_acc_kara(a2w, ka2, b2, kb2);
+                acc[5].mul_acc_kara(e_aw, ke_a, e_b, ke_b);
+                acc[6].mul_acc_kara(o_aw, ko_a, o_b, ko_b);
+                acc[7].mul_acc_kara(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(ke_a, ko_a),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(ke_b, ko_b),
+                );
+            } else {
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }
             x_lo += 8;
         }
 
@@ -1889,6 +2150,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         }
         let mut out = [F128::ZERO; 8];
         for i in 0..8 {
+            // Karatsuba correction, once per accumulator (see `mul_acc_kara`).
+            if kara {
+                acc[i].finish_kara();
+            }
             tail[i] ^= acc[i].fold();
             out[i] = tail[i].reduce();
         }
@@ -2303,9 +2568,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
     // every line `i` not marked dead, and 64 writable F128s at `out`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs(z, mats, out);
@@ -2336,9 +2609,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs_sigma(z, mats, out);
@@ -2363,9 +2644,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     // SAFETY: as for `gfni_fold64_rows_masked_tr`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
@@ -2534,9 +2823,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     // shuffle index is in range and the cfg gate supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
 
@@ -2731,9 +3028,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     // supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
 
@@ -2822,24 +3127,39 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 // pair `(v2, v3)`, and the running pair absorbs it in one more
                 // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
                 // 32-input tree, with the four-residue reduction inside it.
+                //
+                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
+                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
+                // the eight affine results of `(a, hh)` are born and consumed
+                // inside one four-op window while the eight broadcasts of residue
+                // `a` and both accumulator pairs are still live, and the register
+                // allocator spills: the emitted body pays four stack stores and
+                // seven reloads per call that the map never asks for. Materialising
+                // all sixteen results of the residue first widens the window the
+                // scheduler has to place the reduction in without widening the peak
+                // live set. The uop map and the port split are untouched: 128
+                // affines, 32 port-5 shuffles, 64 XOR-class, 64 broadcasts.
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
                     let b: [__m512i; 8] = core::array::from_fn(|j| {
                         _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
                     });
-                    for hh in 0..2usize {
-                        let aff = |j: usize| {
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
                             _mm512_gf2p8affine_epi64_epi8::<0>(
                                 b[j],
                                 _mm512_loadu_si512(
                                     mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
                                 ),
                             )
-                        };
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
                         if a == 0 {
                             accp[hh] = v2;
                             accq[hh] = v3;

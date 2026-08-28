@@ -491,6 +491,23 @@ unsafe fn xor4_lanes(v: __m512i) -> __m128i {
     _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
 }
 
+/// Karatsuba middle-operand fold: `x ^ (x with its two qwords swapped in every
+/// 128-bit lane)`, so lane `i`'s LOW qword is `x[i].lo ^ x[i].hi` — the operand
+/// `_mm512_clmulepi64_epi128::<0x00>` needs for the Karatsuba middle product.
+///
+/// F2-linear in `x`, so folds of XOR combinations are the XOR of the folds; a
+/// caller that already forms `x0 ^ x1` can XOR the two folds instead of running
+/// another shuffle. One `vpshufd`-class shuffle + one XOR.
+///
+/// # Safety
+/// `avx512f` available (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn ghash_kara_fold_x4(x: __m512i) -> __m512i {
+    _mm512_xor_si512(x, _mm512_shuffle_epi32::<0b01_00_11_10>(x))
+}
+
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[derive(Clone, Copy)]
@@ -532,6 +549,44 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
+    }
+
+    /// Karatsuba `mul_acc`: **3** CLMUL instead of 4.
+    ///
+    /// The unreduced product's middle limb is
+    /// `x.hi*y.lo ^ x.lo*y.hi = (x.lo^x.hi)*(y.lo^y.hi) ^ x.lo*y.lo ^ x.hi*y.hi`.
+    /// Two of those three terms are the `lo` and `hi` limbs this accumulator
+    /// already keeps, and XOR-accumulation is F2-linear, so the identity can be
+    /// applied ONCE at the end over the accumulated sums instead of per product:
+    /// accumulate `k = (x.lo^x.hi)*(y.lo^y.hi)` here and call [`Self::finish_kara`]
+    /// before any reduce. One `vpclmulqdq` per accumulated product disappears.
+    ///
+    /// `xk`/`yk` must be [`ghash_kara_fold_x4`] of `x`/`y` (only their low qword
+    /// is read). The fold is F2-linear too, so a caller that accumulates sums of
+    /// operands (`x0 ^ x1`) can XOR the folds instead of re-folding.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_kara(&mut self, x: __m512i, xk: __m512i, y: __m512i, yk: __m512i) {
+        // Register-only widen (3 CLMULs) + XOR-accumulate; cfg-gated.
+        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+        self.mid = _mm512_xor_si512(self.mid, _mm512_clmulepi64_epi128::<0x00>(xk, yk));
+    }
+
+    /// Turn a [`Self::mul_acc_kara`] accumulator into the `(lo, mid, hi)` form
+    /// [`Self::fold`] / [`Self::reduce_lanes`] expect: `mid = k ^ lo ^ hi`.
+    ///
+    /// Exactly once per accumulator, after the last `mul_acc_kara`.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn finish_kara(&mut self) {
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, self.lo, self.hi);
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

@@ -589,4 +589,105 @@ mod tests {
             assert_eq!(folded.reduce(), scalar.reduce(), "reduced values differ");
         }
     }
+
+    /// `mul_acc_kara` + `finish_kara` must be BIT-IDENTICAL to `mul_acc` on the
+    /// same operand stream: the Karatsuba middle limb `k ^ lo ^ hi` is applied
+    /// once over the accumulated sums, which is exact because XOR-accumulation
+    /// is F2-linear. Also pins `ghash_kara_fold_x4`'s low qword.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn wide_ghash_x4_karatsuba_matches_mul_acc() {
+        let mut rng = Rng::new(0x4A5A_1234);
+        for _ in 0..128 {
+            // SAFETY: vpclmulqdq+avx512f+sse4.1 enabled at compile time.
+            unsafe {
+                let mut plain = x86_64::WideGhashX4::zero();
+                let mut kara = x86_64::WideGhashX4::zero();
+                let mut scalar = F256Unreduced::ZERO;
+                for _ in 0..7 {
+                    let xs = [
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                    ];
+                    let ys = [
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                    ];
+                    let xv = x86_64::f128x4_loadu(xs.as_ptr());
+                    let yv = x86_64::f128x4_loadu(ys.as_ptr());
+                    plain.mul_acc(xv, yv);
+                    kara.mul_acc_kara(
+                        xv,
+                        x86_64::ghash_kara_fold_x4(xv),
+                        yv,
+                        x86_64::ghash_kara_fold_x4(yv),
+                    );
+                    for i in 0..4 {
+                        scalar ^= xs[i].mul_unreduced(ys[i]);
+                    }
+                }
+                kara.finish_kara();
+                assert_eq!(kara.fold(), plain.fold(), "karatsuba fold != mul_acc fold");
+                assert_eq!(kara.fold(), scalar, "karatsuba fold != scalar deferred");
+                let pl = plain.reduce_lanes();
+                let kl = kara.reduce_lanes();
+                let mut pb = [0u8; 64];
+                let mut kb = [0u8; 64];
+                core::arch::x86_64::_mm512_storeu_si512(pb.as_mut_ptr().cast(), pl);
+                core::arch::x86_64::_mm512_storeu_si512(kb.as_mut_ptr().cast(), kl);
+                assert_eq!(pb, kb, "karatsuba reduce_lanes != mul_acc reduce_lanes");
+            }
+        }
+    }
+
+    /// The operand fold is F2-linear, so folding a XOR equals XOR of folds --
+    /// the identity the sweeps rely on to share eight folds across sixteen
+    /// operands.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ghash_kara_fold_x4_is_linear() {
+        let mut rng = Rng::new(0x4A5A_9876);
+        for _ in 0..64 {
+            // SAFETY: avx512f enabled at compile time.
+            unsafe {
+                let xs = [
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                ];
+                let ys = [
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                ];
+                let xv = x86_64::f128x4_loadu(xs.as_ptr());
+                let yv = x86_64::f128x4_loadu(ys.as_ptr());
+                let sum = core::arch::x86_64::_mm512_xor_si512(xv, yv);
+                let a = x86_64::ghash_kara_fold_x4(sum);
+                let b = core::arch::x86_64::_mm512_xor_si512(
+                    x86_64::ghash_kara_fold_x4(xv),
+                    x86_64::ghash_kara_fold_x4(yv),
+                );
+                let mut ab = [0u8; 64];
+                let mut bb = [0u8; 64];
+                core::arch::x86_64::_mm512_storeu_si512(ab.as_mut_ptr().cast(), a);
+                core::arch::x86_64::_mm512_storeu_si512(bb.as_mut_ptr().cast(), b);
+                assert_eq!(ab, bb, "kara fold is not F2-linear");
+            }
+        }
+    }
 }
