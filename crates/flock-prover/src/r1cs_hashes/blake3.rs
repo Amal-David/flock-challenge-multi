@@ -135,6 +135,28 @@ pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// BLAKE3 IV (module-level alias used by the inline `compress_in_place`
+/// body so the constants monomorphize into the call site and LLVM can
+/// fold them as immediates into the G-mix additions).
+const IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// BLAKE3 message schedule sigma. `SIGMA[r][k]` is the message-word index
+/// consumed at position `k` in round `r`. Hoisted to module scope so it
+/// monomorphizes as immediates into the inlined `compress_in_place` body,
+/// letting LLVM keep the message-word loads in registers across the
+/// 7-iteration counted loop.
+const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
@@ -269,6 +291,342 @@ fn permute(m: &mut [u32; 16]) {
 
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+///
+/// The compression body is inlined from [`compress_in_place`] (a single
+/// `#[inline(always)]` function) so the module-level `SIGMA` and `IV`
+/// constants monomorphize into this call site and LLVM can pipeline the
+/// 7-iteration counted loop with the message-word indices held in
+/// registers across the back-edge.
+#[inline(always)]
+pub fn compress_in_place(
+    cv: &[u32; 8],
+    block_words: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    // ---- Straight-line prologue: let-bind h0..h15, m0..m15, iv0..iv7.
+    // Mix IV into h0..h7 and counter_lo/counter_hi/block_len/flags into
+    // h8..h11 as inline adjacent scalars so the initialization is one
+    // straight-line block with no temporaries.
+    let counter_low = counter as u32;
+    let counter_high = (counter >> 32) as u32;
+    let h0 = cv[0];
+    let h1 = cv[1];
+    let h2 = cv[2];
+    let h3 = cv[3];
+    let h4 = cv[4];
+    let h5 = cv[5];
+    let h6 = cv[6];
+    let h7 = cv[7];
+    let h8 = IV[0];
+    let h9 = IV[1];
+    let h10 = IV[2];
+    let h11 = IV[3];
+    let h12 = counter_low;
+    let h13 = counter_high;
+    let h14 = block_len;
+    let h15 = flags;
+    let m0 = block_words[0];
+    let m1 = block_words[1];
+    let m2 = block_words[2];
+    let m3 = block_words[3];
+    let m4 = block_words[4];
+    let m5 = block_words[5];
+    let m6 = block_words[6];
+    let m7 = block_words[7];
+    let m8 = block_words[8];
+    let m9 = block_words[9];
+    let m10 = block_words[10];
+    let m11 = block_words[11];
+    let m12 = block_words[12];
+    let m13 = block_words[13];
+    let m14 = block_words[14];
+    let m15 = block_words[15];
+    let iv0 = IV[0];
+    let iv1 = IV[1];
+    let iv2 = IV[2];
+    let iv3 = IV[3];
+    let iv4 = IV[4];
+    let iv5 = IV[5];
+    let iv6 = IV[6];
+    let iv7 = IV[7];
+
+    // ---- 7-iteration counted loop. Each iteration issues two G-mix
+    // chains back-to-back for the column step (4 column G's, on the
+    // (h0,h4,h8,h12), (h1,h5,h9,h13), (h2,h6,h10,h14), (h3,h7,h11,h15)
+    // tuples) using m[SIGMA[r][0..8]], then two G-mix chains
+    // back-to-back for the diagonal step (4 diagonal G's, on the
+    // rotated tuples) using m[SIGMA[r][8..16]]. No `let _t = (...)`
+    // alias between the column and diagonal chains; no per-round
+    // straight-line unroll — the 7 rounds are in a counted loop so
+    // LLVM can pipeline the back-edge.
+    let (mut h0, mut h1, mut h2, mut h3, mut h4, mut h5, mut h6, mut h7) = (
+        h0.wrapping_add(iv0),
+        h1.wrapping_add(iv1),
+        h2.wrapping_add(iv2),
+        h3.wrapping_add(iv3),
+        h4.wrapping_add(iv4),
+        h5.wrapping_add(iv5),
+        h6.wrapping_add(iv6),
+        h7.wrapping_add(iv7),
+    );
+    let mut h8 = h8;
+    let mut h9 = h9;
+    let mut h10 = h10;
+    let mut h11 = h11;
+    let mut h12 = h12;
+    let mut h13 = h13;
+    let mut h14 = h14;
+    let mut h15 = h15;
+
+    // Optional module-level message precompute: hoist m[SIGMA[r][k]] into
+    // a 7×16 table once so each iteration's 8 loads become table lookups
+    // with the row index in a register across the back-edge.
+    let msg: [[u32; 16]; 7] = {
+        let m_arr = *block_words;
+        [
+            [
+                m_arr[SIGMA[0][0] as usize],
+                m_arr[SIGMA[0][1] as usize],
+                m_arr[SIGMA[0][2] as usize],
+                m_arr[SIGMA[0][3] as usize],
+                m_arr[SIGMA[0][4] as usize],
+                m_arr[SIGMA[0][5] as usize],
+                m_arr[SIGMA[0][6] as usize],
+                m_arr[SIGMA[0][7] as usize],
+                m_arr[SIGMA[0][8] as usize],
+                m_arr[SIGMA[0][9] as usize],
+                m_arr[SIGMA[0][10] as usize],
+                m_arr[SIGMA[0][11] as usize],
+                m_arr[SIGMA[0][12] as usize],
+                m_arr[SIGMA[0][13] as usize],
+                m_arr[SIGMA[0][14] as usize],
+                m_arr[SIGMA[0][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[1][0] as usize],
+                m_arr[SIGMA[1][1] as usize],
+                m_arr[SIGMA[1][2] as usize],
+                m_arr[SIGMA[1][3] as usize],
+                m_arr[SIGMA[1][4] as usize],
+                m_arr[SIGMA[1][5] as usize],
+                m_arr[SIGMA[1][6] as usize],
+                m_arr[SIGMA[1][7] as usize],
+                m_arr[SIGMA[1][8] as usize],
+                m_arr[SIGMA[1][9] as usize],
+                m_arr[SIGMA[1][10] as usize],
+                m_arr[SIGMA[1][11] as usize],
+                m_arr[SIGMA[1][12] as usize],
+                m_arr[SIGMA[1][13] as usize],
+                m_arr[SIGMA[1][14] as usize],
+                m_arr[SIGMA[1][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[2][0] as usize],
+                m_arr[SIGMA[2][1] as usize],
+                m_arr[SIGMA[2][2] as usize],
+                m_arr[SIGMA[2][3] as usize],
+                m_arr[SIGMA[2][4] as usize],
+                m_arr[SIGMA[2][5] as usize],
+                m_arr[SIGMA[2][6] as usize],
+                m_arr[SIGMA[2][7] as usize],
+                m_arr[SIGMA[2][8] as usize],
+                m_arr[SIGMA[2][9] as usize],
+                m_arr[SIGMA[2][10] as usize],
+                m_arr[SIGMA[2][11] as usize],
+                m_arr[SIGMA[2][12] as usize],
+                m_arr[SIGMA[2][13] as usize],
+                m_arr[SIGMA[2][14] as usize],
+                m_arr[SIGMA[2][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[3][0] as usize],
+                m_arr[SIGMA[3][1] as usize],
+                m_arr[SIGMA[3][2] as usize],
+                m_arr[SIGMA[3][3] as usize],
+                m_arr[SIGMA[3][4] as usize],
+                m_arr[SIGMA[3][5] as usize],
+                m_arr[SIGMA[3][6] as usize],
+                m_arr[SIGMA[3][7] as usize],
+                m_arr[SIGMA[3][8] as usize],
+                m_arr[SIGMA[3][9] as usize],
+                m_arr[SIGMA[3][10] as usize],
+                m_arr[SIGMA[3][11] as usize],
+                m_arr[SIGMA[3][12] as usize],
+                m_arr[SIGMA[3][13] as usize],
+                m_arr[SIGMA[3][14] as usize],
+                m_arr[SIGMA[3][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[4][0] as usize],
+                m_arr[SIGMA[4][1] as usize],
+                m_arr[SIGMA[4][2] as usize],
+                m_arr[SIGMA[4][3] as usize],
+                m_arr[SIGMA[4][4] as usize],
+                m_arr[SIGMA[4][5] as usize],
+                m_arr[SIGMA[4][6] as usize],
+                m_arr[SIGMA[4][7] as usize],
+                m_arr[SIGMA[4][8] as usize],
+                m_arr[SIGMA[4][9] as usize],
+                m_arr[SIGMA[4][10] as usize],
+                m_arr[SIGMA[4][11] as usize],
+                m_arr[SIGMA[4][12] as usize],
+                m_arr[SIGMA[4][13] as usize],
+                m_arr[SIGMA[4][14] as usize],
+                m_arr[SIGMA[4][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[5][0] as usize],
+                m_arr[SIGMA[5][1] as usize],
+                m_arr[SIGMA[5][2] as usize],
+                m_arr[SIGMA[5][3] as usize],
+                m_arr[SIGMA[5][4] as usize],
+                m_arr[SIGMA[5][5] as usize],
+                m_arr[SIGMA[5][6] as usize],
+                m_arr[SIGMA[5][7] as usize],
+                m_arr[SIGMA[5][8] as usize],
+                m_arr[SIGMA[5][9] as usize],
+                m_arr[SIGMA[5][10] as usize],
+                m_arr[SIGMA[5][11] as usize],
+                m_arr[SIGMA[5][12] as usize],
+                m_arr[SIGMA[5][13] as usize],
+                m_arr[SIGMA[5][14] as usize],
+                m_arr[SIGMA[5][15] as usize],
+            ],
+            [
+                m_arr[SIGMA[6][0] as usize],
+                m_arr[SIGMA[6][1] as usize],
+                m_arr[SIGMA[6][2] as usize],
+                m_arr[SIGMA[6][3] as usize],
+                m_arr[SIGMA[6][4] as usize],
+                m_arr[SIGMA[6][5] as usize],
+                m_arr[SIGMA[6][6] as usize],
+                m_arr[SIGMA[6][7] as usize],
+                m_arr[SIGMA[6][8] as usize],
+                m_arr[SIGMA[6][9] as usize],
+                m_arr[SIGMA[6][10] as usize],
+                m_arr[SIGMA[6][11] as usize],
+                m_arr[SIGMA[6][12] as usize],
+                m_arr[SIGMA[6][13] as usize],
+                m_arr[SIGMA[6][14] as usize],
+                m_arr[SIGMA[6][15] as usize],
+            ],
+        ]
+    };
+    // Silence unused-binding warnings for the m0..m15 let-binds in the
+    // prologue: the precompute table above is the canonical source of
+    // message words, and the let-binds document the schedule for readers.
+    let _ = (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15);
+
+    for r in 0..7 {
+        // --- Column step: two G-mix chains back-to-back ---
+        // Chain A: G(h0, h4, h8, h12, msg[r][0], msg[r][1])
+        //   a = a + b + mx; d = (d ^ a) >>> 16; c = c + d; b = (b ^ c) >>> 12
+        //   a = a + b + my; d = (d ^ a) >>> 8;  c = c + d; b = (b ^ c) >>> 7
+        h0 = h0.wrapping_add(h4).wrapping_add(msg[r][0]);
+        h12 = (h12 ^ h0).rotate_right(16);
+        h8 = h8.wrapping_add(h12);
+        h4 = (h4 ^ h8).rotate_right(12);
+        h0 = h0.wrapping_add(h4).wrapping_add(msg[r][1]);
+        h12 = (h12 ^ h0).rotate_right(8);
+        h8 = h8.wrapping_add(h12);
+        h4 = (h4 ^ h8).rotate_right(7);
+        // Chain B: G(h1, h5, h9, h13, msg[r][2], msg[r][3])
+        h1 = h1.wrapping_add(h5).wrapping_add(msg[r][2]);
+        h13 = (h13 ^ h1).rotate_right(16);
+        h9 = h9.wrapping_add(h13);
+        h5 = (h5 ^ h9).rotate_right(12);
+        h1 = h1.wrapping_add(h5).wrapping_add(msg[r][3]);
+        h13 = (h13 ^ h1).rotate_right(8);
+        h9 = h9.wrapping_add(h13);
+        h5 = (h5 ^ h9).rotate_right(7);
+        // Chain C: G(h2, h6, h10, h14, msg[r][4], msg[r][5])
+        h2 = h2.wrapping_add(h6).wrapping_add(msg[r][4]);
+        h14 = (h14 ^ h2).rotate_right(16);
+        h10 = h10.wrapping_add(h14);
+        h6 = (h6 ^ h10).rotate_right(12);
+        h2 = h2.wrapping_add(h6).wrapping_add(msg[r][5]);
+        h14 = (h14 ^ h2).rotate_right(8);
+        h10 = h10.wrapping_add(h14);
+        h6 = (h6 ^ h10).rotate_right(7);
+        // Chain D: G(h3, h7, h11, h15, msg[r][6], msg[r][7])
+        h3 = h3.wrapping_add(h7).wrapping_add(msg[r][6]);
+        h15 = (h15 ^ h3).rotate_right(16);
+        h11 = h11.wrapping_add(h15);
+        h7 = (h7 ^ h11).rotate_right(12);
+        h3 = h3.wrapping_add(h7).wrapping_add(msg[r][7]);
+        h15 = (h15 ^ h3).rotate_right(8);
+        h11 = h11.wrapping_add(h15);
+        h7 = (h7 ^ h11).rotate_right(7);
+
+        // --- Diagonal step: two G-mix chains back-to-back on rotated
+        // h-word tuples. The rotations are applied to the lane indices
+        // (h0,h5,h10,h15), (h1,h6,h11,h12), (h2,h7,h8,h13),
+        // (h3,h4,h9,h14). No `let _t = (...)` alias between the column
+        // and diagonal chains — the column G's have fully written back
+        // to h0..h15 before the diagonal step begins.
+        // Chain A: G(h0, h5, h10, h15, msg[r][8], msg[r][9])
+        h0 = h0.wrapping_add(h5).wrapping_add(msg[r][8]);
+        h15 = (h15 ^ h0).rotate_right(16);
+        h10 = h10.wrapping_add(h15);
+        h5 = (h5 ^ h10).rotate_right(12);
+        h0 = h0.wrapping_add(h5).wrapping_add(msg[r][9]);
+        h15 = (h15 ^ h0).rotate_right(8);
+        h10 = h10.wrapping_add(h15);
+        h5 = (h5 ^ h10).rotate_right(7);
+        // Chain B: G(h1, h6, h11, h12, msg[r][10], msg[r][11])
+        h1 = h1.wrapping_add(h6).wrapping_add(msg[r][10]);
+        h12 = (h12 ^ h1).rotate_right(16);
+        h11 = h11.wrapping_add(h12);
+        h6 = (h6 ^ h11).rotate_right(12);
+        h1 = h1.wrapping_add(h6).wrapping_add(msg[r][11]);
+        h12 = (h12 ^ h1).rotate_right(8);
+        h11 = h11.wrapping_add(h12);
+        h6 = (h6 ^ h11).rotate_right(7);
+        // Chain C: G(h2, h7, h8, h13, msg[r][12], msg[r][13])
+        h2 = h2.wrapping_add(h7).wrapping_add(msg[r][12]);
+        h13 = (h13 ^ h2).rotate_right(16);
+        h8 = h8.wrapping_add(h13);
+        h7 = (h7 ^ h8).rotate_right(12);
+        h2 = h2.wrapping_add(h7).wrapping_add(msg[r][13]);
+        h13 = (h13 ^ h2).rotate_right(8);
+        h8 = h8.wrapping_add(h13);
+        h7 = (h7 ^ h8).rotate_right(7);
+        // Chain D: G(h3, h4, h9, h14, msg[r][14], msg[r][15])
+        h3 = h3.wrapping_add(h4).wrapping_add(msg[r][14]);
+        h14 = (h14 ^ h3).rotate_right(16);
+        h9 = h9.wrapping_add(h14);
+        h4 = (h4 ^ h9).rotate_right(12);
+        h3 = h3.wrapping_add(h4).wrapping_add(msg[r][15]);
+        h14 = (h14 ^ h3).rotate_right(8);
+        h9 = h9.wrapping_add(h14);
+        h4 = (h4 ^ h9).rotate_right(7);
+    }
+
+    // ---- Finalization XORs (BLAKE3: out_lo = state[0..8] ^ state[8..16],
+    //                            out_hi = state[8..16] ^ cv[0..8]) ----
+    let s0 = h0 ^ h8;
+    let s1 = h1 ^ h9;
+    let s2 = h2 ^ h10;
+    let s3 = h3 ^ h11;
+    let s4 = h4 ^ h12;
+    let s5 = h5 ^ h13;
+    let s6 = h6 ^ h14;
+    let s7 = h7 ^ h15;
+    let s8 = h8 ^ cv[0];
+    let s9 = h9 ^ cv[1];
+    let s10 = h10 ^ cv[2];
+    let s11 = h11 ^ cv[3];
+    let s12 = h12 ^ cv[4];
+    let s13 = h13 ^ cv[5];
+    let s14 = h14 ^ cv[6];
+    let s15 = h15 ^ cv[7];
+    [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15]
+}
+
+/// BLAKE3 compression function. Returns the full 16-word output state
+/// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -276,38 +634,7 @@ pub fn blake3_compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
-    let counter_low = counter as u32;
-    let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
-        block_len,
-        flags,
-    ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
-    for i in 0..8 {
-        state[i] ^= state[i + 8];
-        state[i + 8] ^= cv[i];
-    }
-    state
+    compress_in_place(cv, block_words, counter, block_len, flags)
 }
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
