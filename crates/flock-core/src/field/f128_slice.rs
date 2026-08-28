@@ -171,6 +171,59 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Fold adjacent pairs from `src` and `addend` at `r`, add the scaled folded
+/// addend, and write the result without materializing either intermediate:
+/// `dst[t] = fold_r(src)[j] + scale * fold_r(addend)[j]`, where
+/// `j = base + t`.
+///
+/// The ranked Ligerito open uses this to defer an ordinary basis glue into
+/// the already-fused next fold. The AVX-512 leaf keeps all three products in
+/// one register pipeline and writes `dst` once; other builds use the identical
+/// scalar expression.
+#[inline]
+pub(crate) fn fold_pairs_with_scaled_addend(
+    src: &[F128],
+    addend: &[F128],
+    base: usize,
+    dst: &mut [F128],
+    r: F128,
+    scale: F128,
+) {
+    assert!(
+        base <= src.len() / 2 && dst.len() <= src.len() / 2 - base,
+        "fold source must contain both elements for every destination slot"
+    );
+    assert!(
+        base <= addend.len() / 2 && dst.len() <= addend.len() / 2 - base,
+        "scaled addend must contain both elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds checks above cover both inputs for every output.
+    unsafe {
+        x86_64::fold_pairs_with_scaled_addend(src, addend, base, dst, r, scale);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (t, value) in dst.iter_mut().enumerate() {
+        let index = 2 * (base + t);
+        let src_even = src[index];
+        let addend_even = addend[index];
+        let src_folded = src_even + r * (src_even + src[index + 1]);
+        let addend_folded = addend_even + r * (addend_even + addend[index + 1]);
+        *value = src_folded + scale * addend_folded;
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where
@@ -555,6 +608,54 @@ mod tests {
                 let expect = src[s] * one_plus_r + src[s + 1] * r;
                 assert_eq!(got[t], expect, "base={base} t={t}");
             }
+        }
+    }
+
+    /// The fused deferred-glue leaf is exactly a pair fold followed by one
+    /// scaled add, including offset inputs and every AVX-512 tail residue.
+    #[test]
+    fn fold_pairs_with_scaled_addend_matches_materialized_glue_then_fold() {
+        let mut state = 0xDEF3_22ED_61A0_0D5Eu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let src: Vec<F128> = (0..96)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let scale = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for &(base, n) in &[(0usize, 1usize), (3, 3), (5, 4), (7, 5), (2, 11), (0, 32)] {
+            let initial: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let addend: Vec<F128> = (0..src.len())
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut glued = src.clone();
+            add_scaled(&mut glued, &addend, scale);
+            let mut want = initial.clone();
+            fold_pairs(&glued, base, &mut want, r);
+            let mut got = initial;
+            fold_pairs_with_scaled_addend(&src, &addend, base, &mut got, r, scale);
+            assert_eq!(got, want, "base={base} n={n}");
         }
     }
 

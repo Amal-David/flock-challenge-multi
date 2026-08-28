@@ -336,6 +336,37 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     }
 }
 
+/// Fixed-`nt=2` twin of [`shift_reduce_inner_ab_x86_avx512_from_off`] for the
+/// measured ranked offset consumer. The destination class is part of that
+/// producer's contract, so the terminal store is one unconditional ZMM
+/// non-temporal stream instead of entering [`store_out64`]'s selector.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_from_off`], with `out` additionally
+/// 64-byte aligned. The caller must publish an `_mm_sfence()` before another
+/// thread observes the output.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract. Unlike the generic
+    // twin, ranked nt=2 makes alignment/store class invariant by construction.
+    unsafe {
+        let acc = horner_2img_offw(imgs, op);
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
 /// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
 /// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
 /// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
