@@ -1741,14 +1741,66 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 #[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v.len(), 128);
-    let mut out = Vec::<F128>::with_capacity(128);
-    unsafe {
-        transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-        out.set_len(128);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        let mut out = Vec::<F128>::with_capacity(128);
+        // SAFETY: the `cfg` supplies exactly the features the callee enables,
+        // and the callee initializes all 128 elements before `set_len`.
+        unsafe {
+            transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
+            out.set_len(128);
+        }
+        out
     }
-    out
+    // Portable tiling: sixteen 8-row stripes through the shared
+    // architecture-dispatching 8x64 bit transpose. Value-identical to the
+    // GFNI form; this is the body that shipped before the GFNI rewrite.
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
+        let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
+        for row_group in 0..16 {
+            let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
+            let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
+            let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
+            let mut lo_columns = [0u8; 64];
+            let mut hi_columns = [0u8; 64];
+            crate::bits::transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
+            crate::bits::transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
+            for bit in 0..64 {
+                out_bytes[bit][row_group] = lo_columns[bit];
+                out_bytes[bit + 64][row_group] = hi_columns[bit];
+            }
+        }
+        out_bytes
+            .iter()
+            .map(|b| F128 {
+                lo: u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
+                hi: u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
+            })
+            .collect()
+    }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1781,6 +1833,13 @@ unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1799,6 +1858,13 @@ unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> 
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
@@ -2684,6 +2750,16 @@ fn rs_elide_dead_basis_enabled() -> bool {
     *ON
 }
 
+/// Let the spent sixty-four-bank statistic become the direct-fold8 A state.
+/// Default **ON**; the ranked runner calls `env_clear()`, so the reuse is what
+/// ships. `FLOCK_NO_RS_REUSE_FOLD8_A=1` restores the separate zeroed
+/// allocation, for exact same-binary A/B.
+fn rs_reuse_fold8_a_state_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_REUSE_FOLD8_A").is_none());
+    *ON
+}
+
 fn rs_tail_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_TAIL_PAR").is_none());
@@ -2712,8 +2788,33 @@ fn direct_fold8_round0_wide(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 /// statistic and γ-baked byte table. `par` selects the full-width tail (see
 /// [`rs_tail_par_enabled`]); `false` is the incumbent sequential scalar
 /// form, kept verbatim as the kill-switch path and the byte-identity oracle.
+#[cfg(test)]
 fn build_direct_fold8_factors(
     fold8: &[F128],
+    suffix: &[F128],
+    table: &[F128],
+    par: bool,
+) -> DirectFold8Factors {
+    build_direct_fold8_factors_reusing_a_state(fold8.to_vec(), suffix, table, par)
+}
+
+/// Owning form of [`build_direct_fold8_factors`].
+///
+/// The sixty-four-bank statistic is **dead the moment the bank transposes are
+/// collected** - nothing downstream of `a_rows` reads it - while the bit-major
+/// `a_state` the scatter fills has exactly the same `64 * 2^LOG_PACKING`
+/// shape. Taking ownership lets the spent statistic *become* the A state: one
+/// equally-sized allocation and its zero-fill disappear, and the scatter
+/// writes into pages that are already resident and cache-warm from the
+/// transposes instead of into a fresh mapping every worker must fault in.
+/// All `64 * 2^LOG_PACKING` slots are written by the scatter, so no byte of
+/// the old contents survives and the state is value-identical.
+///
+/// The sequential kill-switch route still borrows: it interleaves reads of
+/// the statistic with writes of `a_state`, so there those two must stay
+/// distinct allocations.
+fn build_direct_fold8_factors_reusing_a_state(
+    fold8: Vec<F128>,
     suffix: &[F128],
     table: &[F128],
     par: bool,
@@ -2727,7 +2828,7 @@ fn build_direct_fold8_factors(
     let (a_state, w_state, round0) = if par {
         direct_fold8_states_par(fold8, &low_eq, table)
     } else {
-        direct_fold8_states_seq(fold8, &low_eq, table)
+        direct_fold8_states_seq(&fold8, &low_eq, table)
     };
     let tail = &suffix[6..];
     let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -2772,7 +2873,7 @@ fn direct_fold8_states_seq(
 /// stripe), the bit-major gather writes disjoint 64-lane rows, and the
 /// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
 fn direct_fold8_states_par(
-    fold8: &[F128],
+    fold8: Vec<F128>,
     low_eq: &[F128; 64],
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
@@ -2802,7 +2903,15 @@ fn direct_fold8_states_par(
         },
     );
     let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    // The statistic is spent - `a_rows` holds everything derived from it - so
+    // its allocation becomes the A state instead of being freed while an
+    // identically-sized fresh one is zeroed and then wholly overwritten.
+    let mut a_state = if rs_reuse_fold8_a_state_enabled() && fold8.len() == 64 * n_packed {
+        fold8
+    } else {
+        vec![F128::ZERO; 64 * n_packed]
+    };
+    debug_assert_eq!(a_state.len(), 64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
@@ -3480,7 +3589,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
     let claim_output =
-        |i: usize, w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
+        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -3538,10 +3647,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 }
                 _ => None,
             };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => Some(
-                    build_direct_fold8_factors(fold8, dense_suffixes[d], &table, tail_par),
-                ),
+            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
+                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
+                    Some(build_direct_fold8_factors_reusing_a_state(
+                        fold8,
+                        dense_suffixes[d],
+                        &table,
+                        tail_par,
+                    ))
+                }
                 _ => None,
             };
             let rs_eq_ind = match kinds[i] {
