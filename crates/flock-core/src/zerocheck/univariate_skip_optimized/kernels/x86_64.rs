@@ -1568,6 +1568,187 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
     }
 }
 
+/// Direct-from-stream ranked body: the window's rows are read straight out of
+/// the packed `ab_inner` stream (`src`) instead of a staged 1 KiB copy, and
+/// the look-ahead hint for row `bm` of the window `ZC_R1AB_PF_WINDOWS` on
+/// (`next_src`) is issued immediately before that row's
+/// own demand load.
+///
+/// The staging copy the caller used to run was the *carrier* for those hints:
+/// its loop alternated one hint with one demand line. Deleting the copy and
+/// leaving the hints at the head of the window collapses them into one
+/// back-to-back block — the arm the delivery A/B already measured as worse.
+/// Passing the look-ahead base into the kernel restores the alternation with
+/// the copy gone, so the sixteen `vmovdqu64` that now pull from `ab_inner`
+/// are covered the way the copy's loads were.
+///
+/// Bit-identical to [`accumulate_convert_ab_nomul_x86_gfni_fixed`] and to
+/// `accumulate_convert_ab_nomul_x86_gfni_impl`: the rows are the same bytes
+/// and a prefetch has no architectural effect.
+///
+/// # Safety
+/// `src` must be valid for `(1 << N_MEDIUM) * ELL` readable bytes.
+/// `next_src` is only ever the operand of `_mm_prefetch`, which faults on
+/// nothing.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_direct<const N: usize, const FIRST_WRITE: bool>(
+    src: *const u8,
+    next_src: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    // SAFETY: the caller guarantees `src` covers the whole 1 KiB window, so
+    // each `bm < N <= 1 << N_MEDIUM` row load is in bounds. `mats` is exactly
+    // the 16x16 qword matrix block for this table slice and `bank_planes` is
+    // the fixed 16-plane bank. `_mm_prefetch` reads no memory.
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        // Hint `bm`, then demand-load row `bm`. `N` is a constant so this
+        // unrolls into an alternating, BRANCH-FREE sequence: exactly the
+        // delivery the deleted copy loop provided. Hinting all `N` rows of the
+        // look-ahead window rather than only its live ones costs at most one
+        // line per window (the padding skip drops the last chunk of every
+        // second window) and buys the branch ladder's removal — a predicated
+        // hint cannot be scheduled next to its load.
+        for bm in 0..N {
+            _mm_prefetch(next_src.add(bm * ELL) as *const i8, _MM_HINT_T0);
+            // Compile-time only, zero instructions emitted: without it LLVM
+            // hoists all sixteen demand loads above all sixteen hints and the
+            // delivery collapses back into the block arm. The fence pins each
+            // hint next to the load it shadows — the alternation the deleted
+            // copy loop used to provide. The loads stay independent, so the
+            // out-of-order engine still has all sixteen misses in flight.
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            rows[bm] = _mm512_loadu_si512(src.add(bm * ELL) as *const __m512i);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = 0;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+/// Cold twin of [`accumulate_convert_ab_nomul_x86_gfni_direct`] for row counts
+/// outside the ranked pair: stage the window locally and run the incumbent
+/// body, so the direct sweep never needs a second dynamic kernel.
+///
+/// # Safety
+/// As [`accumulate_convert_ab_nomul_x86_gfni_direct`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_direct_cold<const FIRST_WRITE: bool>(
+    src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    debug_assert!(n_b_med <= 1 << N_MEDIUM);
+    // SAFETY: `src` covers the whole 1 KiB window by the caller's contract,
+    // and the staged array has exactly that layout.
+    unsafe {
+        let mut staged = [[0u8; ELL]; 1 << N_MEDIUM];
+        core::ptr::copy_nonoverlapping(
+            src,
+            staged.as_mut_ptr() as *mut u8,
+            (1 << N_MEDIUM) * ELL,
+        );
+        accumulate_convert_ab_nomul_x86_gfni_impl::<FIRST_WRITE>(
+            &staged,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// Ranked-count dispatch for the direct sweep. `FIRST_WRITE` is a band-level
+/// property the caller has already split its window range on, so it is a
+/// constant here and no kill-switch branch survives inside the loop.
+///
+/// # Safety
+/// As [`accumulate_convert_ab_nomul_x86_gfni_direct`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn convert_ab_nomul_x86_gfni_direct<const FIRST_WRITE: bool>(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    // SAFETY: every arm has this entry point's window contract.
+    unsafe {
+        match n_b_med {
+            16 => accumulate_convert_ab_nomul_x86_gfni_direct::<16, FIRST_WRITE>(
+                src,
+                next_src,
+                mats,
+                bank_planes,
+            ),
+            15 => accumulate_convert_ab_nomul_x86_gfni_direct::<15, FIRST_WRITE>(
+                src,
+                next_src,
+                mats,
+                bank_planes,
+            ),
+            _ => accumulate_convert_ab_nomul_x86_gfni_direct_cold::<FIRST_WRITE>(
+                src,
+                n_b_med,
+                mats,
+                bank_planes,
+            ),
+        }
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

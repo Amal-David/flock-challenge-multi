@@ -180,6 +180,17 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
+/// Borrow the protocol-fixed inverse-NTT table for `k_skip == K_SKIP`.
+///
+/// The table depends only on `k_skip`, never on the transcript, so every caller
+/// in a worker process wants the same bytes. Round one has borrowed the cached
+/// copy since the static was introduced; this accessor lets witness generation
+/// borrow it too instead of rebuilding an identical table on every proof.
+#[inline]
+pub fn shared_urm_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
+
 /// Witness padding descriptor for URM work-skipping.
 ///
 /// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
