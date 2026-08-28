@@ -1749,6 +1749,7 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     out
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
@@ -1780,6 +1781,7 @@ unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
     }
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> [core::arch::x86_64::__m512i;8] {
@@ -1797,6 +1799,7 @@ unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> 
     }
 }
 
+#[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn transpose8x64_bytes(mut x: [core::arch::x86_64::__m512i;8]) -> [core::arch::x86_64::__m512i;8] {
