@@ -307,7 +307,7 @@ impl FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match &self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
-            FsState::Blake3(h) => *h.finalize().as_bytes(),
+            FsState::Blake3(h) => unsafe { let ptr = h.as_ref() as *const _ as *const u8; let cv = *(ptr as *const [u32; 8]); let buf = *(ptr.add(40) as *const [u8; 64]); let buf_len = *(ptr.add(104) as *const u8); let flags = *(ptr.add(106) as *const u8); crate::hash::finalize_root_bytes(cv, &buf, buf_len, flags | 0x08) },
         }
     }
 
