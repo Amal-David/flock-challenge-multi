@@ -18,11 +18,10 @@
 //! outright; rows whose b word is fully static additionally take a
 //! `x^K`-prescaled image so the `x^K` GFNI multiply disappears too.
 //!
-//! Every planned row still checks `(b_word & mask) == expected` and falls
-//! back to the generic row on a miss, so the output is bit-identical to
-//! [`super::x86_64::shift_reduce_inner_ab_x86_avx512`] for ANY witness — the
-//! plan is a performance hint, never a correctness assumption. The generic
-//! rows are the incumbent computation verbatim.
+//! General callers check every planned row and fall back on a miss. The ranked
+//! witness seam has a separate trusted entry for the three B windows it builds
+//! from literal constants; that entry skips the redundant reads. Generic rows
+//! remain the incumbent computation verbatim.
 //!
 //! Kill switch: `FLOCK_NO_FAST_SHIFT_REDUCE=1` keeps the incumbent kernel.
 
@@ -294,15 +293,10 @@ unsafe fn all_static_acc<const IMG2: bool>(
     }
 }
 
-/// One `(BLK)`-specialised static-B kernel call. Same contract as
-/// [`super::x86_64::shift_reduce_inner_ab_x86_avx512`]; `byte_base_b` is
-/// `chunk_byte_base + b_med * N_CHUNKS * 8`.
-///
-/// Returns `false` (having written nothing) when any planned K-row's b word
-/// disagrees with the plan; the caller then runs the incumbent kernel for the
-/// whole window. Checking all eight rows up front keeps the specialised body
-/// a single straight-line block (no per-row fallback paths for LLVM to hoist
-/// loads across and spill), at the cost of the rare all-or-nothing miss.
+/// The shared `(BLK)`-specialised static-B body. Checked callers sniff B before
+/// entering it; the ranked witness seam may enter it directly after proving
+/// the exact static window by construction. Keeping this outlined gives both
+/// entry paths one heavy body in the instruction cache.
 ///
 /// # Safety
 /// `gfni`, `avx512f`, `avx512bw` must be available; `a_packed`/`b_packed` must
@@ -310,19 +304,19 @@ unsafe fn all_static_acc<const IMG2: bool>(
 /// protocol shape (`ell = 64`, `n_chunks = 8`) and `partials` must have been
 /// built from it.
 /// (No `#[target_feature]`: this module only compiles when gfni/avx512f/bw are
-/// baseline features of the build, and `#[inline(always)]` cannot be combined
-/// with `#[target_feature]` — rust#145574. Inlining the live bodies into the
-/// hot dispatcher keeps them out of cold call targets.)
-#[inline(always)]
-unsafe fn kernel<const BLK: usize>(
+/// baseline features of the build. The body is outlined so checked and trusted
+/// entries cannot clone it.)
+#[inline(never)]
+unsafe fn kernel_body<const BLK: usize>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
     partials: &BstaticPartials,
+    b_words: &[u64; 8],
     out: &mut [u8; 64],
     nt: u8,
-) -> bool {
+) {
     let table = inv_table.data_ptr();
     // Paired two-image apply, resolved once per buffer into `partials`
     // (never a per-window `OnceLock` entry). `table8` is only formed when the
@@ -340,33 +334,7 @@ unsafe fn kernel<const BLK: usize>(
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
-        // 1. Sniff: every planned row must match its (mask, expected).
-        let mut b_words = [0u64; 8];
-        let mut hit = true;
-        macro_rules! sniff {
-            ($k:literal) => {{
-                let p: BstaticRow = BSTATIC_PLAN[BLK][$k];
-                if p.kind != ROW_GENERIC {
-                    let w = u64::from_le(core::ptr::read_unaligned(
-                        b_base.add($k * N_CHUNKS) as *const u64
-                    ));
-                    b_words[$k] = w;
-                    hit &= (w & p.mask) == p.expected;
-                }
-            }};
-        }
-        sniff!(0);
-        sniff!(1);
-        sniff!(2);
-        sniff!(3);
-        sniff!(4);
-        sniff!(5);
-        sniff!(6);
-        sniff!(7);
-        if !hit {
-            return false;
-        }
-        // 2a. All eight rows fully static (blocks 0 and 1): a compact loop —
+        // All eight rows fully static (blocks 0 and 1): a compact loop —
         //     LLVM keeps it rolled like the incumbent's, which avoids the
         //     unrolled body's register spills.
         const ALL_FULLY_STATIC: [bool; 33] = {
@@ -397,9 +365,9 @@ unsafe fn kernel<const BLK: usize>(
                 all_static_acc::<false>(table, table8, a_base, parts)
             };
             super::x86_64::store_out64(out, acc, nt);
-            return true;
+            return;
         }
-        // 2b. Straight-line specialised body.
+        // Straight-line specialised body.
         let mut acc = _mm512_setzero_si512();
         macro_rules! row {
             ($k:literal) => {{
@@ -458,7 +426,88 @@ unsafe fn kernel<const BLK: usize>(
         row!(6);
         row!(7);
         super::x86_64::store_out64(out, acc, nt);
+    }
+}
+
+/// Checked entry: sniff every planned B row, then tail into the shared body.
+/// Returns `false` without writing when the hint does not match.
+#[inline(always)]
+unsafe fn kernel<const BLK: usize>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) -> bool {
+    unsafe {
+        let b_base = b_packed.as_ptr().add(byte_base_b);
+        let mut b_words = [0u64; 8];
+        let mut hit = true;
+        macro_rules! sniff {
+            ($k:literal) => {{
+                let p: BstaticRow = BSTATIC_PLAN[BLK][$k];
+                if p.kind != ROW_GENERIC {
+                    let w = u64::from_le(core::ptr::read_unaligned(
+                        b_base.add($k * N_CHUNKS) as *const u64
+                    ));
+                    b_words[$k] = w;
+                    hit &= (w & p.mask) == p.expected;
+                }
+            }};
+        }
+        sniff!(0);
+        sniff!(1);
+        sniff!(2);
+        sniff!(3);
+        sniff!(4);
+        sniff!(5);
+        sniff!(6);
+        sniff!(7);
+        if !hit {
+            return false;
+        }
+        kernel_body::<BLK>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            partials,
+            &b_words,
+            out,
+            nt,
+        );
         true
+    }
+}
+
+/// Trusted ranked-static entry. `BLK` is the static plan identity, not a
+/// runtime dispatcher key; callers use `0` for both all-one windows and `30`
+/// for the 49-one-bit tail window. The caller guarantees B matches that plan.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_trusted<const BLK: usize>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) {
+    debug_assert!(BLK == 0 || BLK == 30);
+    unsafe {
+        kernel_body::<BLK>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            partials,
+            &[0; 8],
+            out,
+            nt,
+        );
     }
 }
 

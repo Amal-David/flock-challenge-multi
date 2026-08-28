@@ -1040,6 +1040,45 @@ pub unsafe fn round1_ab_inner_window_with_images(
     );
 }
 
+/// Ranked-only static-B seam. `PLAN_BLK` is `0` for either all-one B window
+/// (`blk` 0 or 1) and `30` for the 49-one-bit tail window. When static-B is
+/// disabled in `plan`, this deliberately falls back to the generic kernel.
+///
+/// # Safety
+/// The caller must prove `b_window` is exactly the ranked static window named
+/// by `PLAN_BLK`; `imgs` has the same contract as
+/// [`round1_ab_inner_window_with_images`].
+#[inline]
+pub unsafe fn round1_ab_inner_window_static_trusted<const PLAN_BLK: usize>(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    blk: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    kernels::shift_reduce_inner_ab_static_trusted_at::<PLAN_BLK>(
+        a_window,
+        b_window,
+        inv_table,
+        0,
+        blk,
+        out,
+        plan.bstatic,
+        plan.kernel,
+        plan.nt,
+        (imgs.0, imgs.1),
+    );
+}
+
+/// Publish a mathematically known-zero round-1 window under `plan`'s terminal
+/// store policy, without resolving table images or entering a transform.
+#[inline(always)]
+pub fn round1_ab_inner_window_zero(out: &mut [u8; 64], plan: Round1AbWindowPlan) {
+    kernels::store_zero_window(out, plan.nt);
+}
+
 /// `u16` count of one window-block's pre-scaled offset block for
 /// [`round1_ab_inner_window_from_offsets`].
 pub const ROUND1_AB_OFF_WORDS: usize = 128;

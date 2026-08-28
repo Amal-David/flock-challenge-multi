@@ -25,8 +25,8 @@ use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
-    round1_ab_inner_window_from_offsets, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_inner_window_from_offsets, round1_ab_inner_window_static_trusted,
+    round1_ab_inner_window_with_images, round1_ab_inner_window_zero, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -52,7 +52,6 @@ pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
 // proof). Chunk 61 is entirely inside the zero tail (LAST_WORD = 481), so
 // storing it is redundant-but-correct and the ragged tail branch vanishes.
 const ELIDE_ZERO_CHUNK: usize = 62;
-const ELIDE_B_TAIL_CHUNK: usize = 59;
 // 60, not 59, for the FUSED (`dump_range_nt_win`) drain, for exactly the reason
 // `ELIDE_ZERO_CHUNK` is 62: an odd first-elided chunk leaves chunk 58 as a lone
 // 32-byte NT store inside the 64-byte line (58, 59) — a partially-filled
@@ -79,7 +78,6 @@ const _ELIDE_GEOMETRY: () = {
     assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
     // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
     // stays strictly inside the same content-independent constant run.
-    assert!(ELIDE_B_TAIL_CHUNK_WIN >= ELIDE_B_TAIL_CHUNK);
     assert!(ELIDE_B_TAIL_CHUNK_WIN.is_multiple_of(2));
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
@@ -390,12 +388,20 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
+/// Ranked static windows whose B side is supplied without reading the ring.
+const RANKED_STATIC_B_PREFIX_END: usize = 2 * STEP_WORDS;
+const RANKED_STATIC_B_TAIL_START: usize = 30 * STEP_WORDS;
+/// The final ranked static window supplies both sides without reading rings.
+const RANKED_STATIC_A_TAIL_START: usize = 31 * STEP_WORDS;
 const _RING_GEOMETRY: () = {
     assert!(RING_WORDS >= 32);
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
     // Every epoch boundary is a whole number of drain steps.
     assert!(RING_WORDS.is_multiple_of(STEP_WORDS));
+    assert!(RANKED_STATIC_B_PREFIX_END == 32);
+    assert!(RANKED_STATIC_B_TAIL_START == 480);
+    assert!(RANKED_STATIC_A_TAIL_START == 496);
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
@@ -405,32 +411,36 @@ const _RING_GEOMETRY: () = {
 ///
 /// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
 /// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks. Bit `j` of `live` selects block `j`.
+/// `BYTES_PER_BLOCK` ab_inner blocks.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
-    pub(crate) live: u32,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
 }
+
+#[repr(C, align(64))]
+struct RankedStaticWindow([u8; 64]);
+
+const fn ranked_b30() -> [u8; 64] {
+    let mut x = [0u8; 64];
+    let w = 0x0001_ffff_ffff_ffffu64.to_le_bytes();
+    let mut i = 0;
+    while i != 8 {
+        x[i] = w[i];
+        i += 1;
+    }
+    x
+}
+
+static RANKED_B_MAX: RankedStaticWindow = RankedStaticWindow([u8::MAX; 64]);
+static RANKED_B30: RankedStaticWindow = RankedStaticWindow(ranked_b30());
 
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
         // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
-    }
-
-    /// Transform the staged window `blk` (`0..2 · 16`) for every live block.
-    ///
-    /// # Safety
-    /// Both staging sides hold the eight blocks' bytes for window `blk`.
-    #[inline(never)]
-    unsafe fn project(&self, blk: usize) {
-        unsafe {
-            let (plan, imgs) = self.window_prep(blk);
-            self.project_blocks(blk, plan, imgs, None, None);
-        }
     }
 
     /// The window's per-block invariants: its static-B eligibility and the
@@ -443,90 +453,7 @@ impl StreamProj<'_> {
         (p, round1_ab_table_images(self.inv_table, p))
     }
 
-    /// [`Self::project`] with the window invariants already resolved, and with
-    /// an optional set of drain rows to publish AS the eight blocks are
-    /// transformed. `rows` is what makes the streaming stores spread: they are
-    /// emitted three per block instead of twenty-four per step, and because
-    /// the publisher lives inside the transform loop it costs no extra call
-    /// and no second copy of the kernel body.
-    ///
-    /// # Safety
-    /// As for [`Self::project`], and `plan`/`imgs` must be this window's
-    /// [`Self::window_prep`]; `rows`, when present, must describe the drain
-    /// step that produced this window's staging. `off`, when present, must
-    /// point to the eight blocks' prebuilt offset arena
-    /// (`8 * ROUND1_AB_OFF_WORDS` u16s, 64-byte aligned, block-major) for
-    /// this window's staging bytes, and `plan.offsets_eligible(blk)` must
-    /// hold.
-    #[inline(never)]
-    unsafe fn project_blocks(
-        &self,
-        blk: usize,
-        plan: Round1AbWindowPlan,
-        imgs: Round1AbTableImages,
-        rows: Option<StepRows>,
-        off: Option<*const u16>,
-    ) {
-        unsafe {
-            let (sa, sb) = self.sides();
-            let live = self.live;
-            // Producer-fused offsets: the drain built the arena straight from
-            // its transpose registers, so the staging is never reloaded here.
-            // Publish scheduling identical to the loops below.
-            if let Some(op) = off {
-                debug_assert!(plan.offsets_eligible(blk));
-                for j in 0..8usize {
-                    if let Some(rows) = rows {
-                        rows.publish(j, sa, sb);
-                    }
-                    if live & (1 << j) == 0 {
-                        continue;
-                    }
-                    let out = &mut *self
-                        .out
-                        .add(j * BYTES_PER_BLOCK + blk * 64)
-                        .cast::<[u8; 64]>();
-                    round1_ab_inner_window_from_offsets(
-                        &*op.add(j * ROUND1_AB_OFF_WORDS)
-                            .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                        out,
-                        plan,
-                        imgs,
-                    );
-                }
-                return;
-            }
-            for j in 0..8usize {
-                // ONE block transformed per THREE lines published: the drain's
-                // streaming stores land ~1/8 of a window apart instead of all
-                // together. Publishing block `j`'s rows before transforming it
-                // is deliberate — the two touch disjoint memory, and this way
-                // the eight-block loop below is untouched.
-                if let Some(rows) = rows {
-                    rows.publish(j, sa, sb);
-                }
-                if live & (1 << j) == 0 {
-                    continue;
-                }
-                let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let out = &mut *self
-                    .out
-                    .add(j * BYTES_PER_BLOCK + blk * 64)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_with_images(
-                    a_win,
-                    b_win,
-                    out,
-                    blk,
-                    self.inv_table,
-                    plan,
-                    imgs,
-                );
-            }
-        }
-    }
-
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: StepRows, off: *const u16, use_off: bool) {
         unsafe {
@@ -550,6 +477,74 @@ impl StreamProj<'_> {
             }
         }
     }
+
+    /// Ranked all-elide windows 2..29 always consume producer-built offsets,
+    /// and every half-row is live with wide non-temporal publication. Keeping
+    /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
+    /// policy branch and the generic row publisher from the measured path.
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: StepRows, off: *const u16) {
+        unsafe {
+            debug_assert!(blk > 1 && blk < 30);
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_all_ranked(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_static<const BLK: usize>(
+        &self,
+        plan: Round1AbWindowPlan,
+        imgs: Round1AbTableImages,
+        rows: StepRows,
+    ) {
+        unsafe {
+            debug_assert!(BLK <= 1 || BLK == 30);
+            let b = if BLK <= 1 {
+                &RANKED_B_MAX.0
+            } else {
+                &RANKED_B30.0
+            };
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_ranked_static::<BLK>(j, self.stage);
+                let a = &*self.stage.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + BLK * 64)
+                    .cast::<[u8; 64]>();
+                if BLK <= 1 {
+                    round1_ab_inner_window_static_trusted::<0>(
+                        a,
+                        b,
+                        out,
+                        BLK,
+                        self.inv_table,
+                        plan,
+                        imgs,
+                    );
+                } else {
+                    round1_ab_inner_window_static_trusted::<30>(
+                        a,
+                        b,
+                        out,
+                        BLK,
+                        self.inv_table,
+                        plan,
+                        imgs,
+                    );
+                }
+                j += 1;
+            }
+        }
+    }
 }
 
 /// Rolling drain state shared by the A/B packed writers. The witness uses two
@@ -562,12 +557,9 @@ struct Drain8<'t> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    win_ab: Option<(*mut u32, *mut u32)>,
     proj: StreamProj<'t>,
     elide: [bool; 3],
-    z_nt: bool,
-    wide_nt: bool,
-    spread: bool,
+    ranked_static: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -623,7 +615,16 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
-            store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            // In the ranked all-elide path, static windows provide B words
+            // 0..31 and 480..511 without touching this ring. Keep the flush
+            // check independent of the store: a skipped epoch-ending B word
+            // must still publish the completed A/B epoch.
+            let static_b = FLUSH
+                && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
+                && (*self.drain).ranked_static;
+            if !static_b {
+                store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
@@ -796,21 +797,6 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
-/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
-fn wide_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
-    *ON
-}
-
-/// `FLOCK_NO_SPREAD_NT=1` restores the bunched drain step (three eight-row
-/// runs of streaming stores, then the whole window's projection).
-fn spread_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
-    *ON
-}
-
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -906,7 +892,7 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
 
 /// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
 /// (its high run), under the same `nt`/liveness policy — and therefore with
-/// the same bytes at the same addresses — as [`Drain8::publish_step`]'s body.
+/// the same bytes at the same addresses as the ranked drain publisher.
 ///
 /// # Safety
 /// As for [`stream_pair_v8`] and [`store_v8`].
@@ -937,7 +923,7 @@ unsafe fn emit_pair(
 }
 
 /// One drain step's three destination rows, staged for publication BETWEEN
-/// block transforms by [`StreamProj::project_blocks`].
+/// block transforms by [`StreamProj::project_blocks_ranked`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
 /// are already in the projection's own staging (they are its input). The
@@ -999,156 +985,47 @@ impl StepRows {
             );
         }
     }
+
+    /// Fixed ranked policy for non-static windows 2..29: both halves of all
+    /// three destinations are live, and every publication is wide NT.
+    #[inline(always)]
+    unsafe fn publish_all_ranked(&self, j: usize, sa: *const u32, sb: *const u32) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            let bp = sb.add(j * STEP_WORDS);
+            let b_lo = load_v8(bp);
+            let b_hi = load_v8(bp.add(8));
+            stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
+            stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+            stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn publish_ranked_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
+        unsafe {
+            debug_assert!(BLK <= 1 || BLK == 30);
+            let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let a_lo = load_v8(ap);
+            let a_hi = load_v8(ap.add(8));
+            // BLK 0/1 have B=1. BLK 30 has ones for the 49 useful A bits
+            // and A is already zero beyond USEFUL_BITS, so Z=A there too.
+            stream_pair_v8(self.z.add(o), a_lo, a_hi, true);
+            stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+        }
+    }
 }
 
 impl Drain8<'_> {
-    /// Transpose one 16-word drain step of the current ring epoch and publish
-    /// it. `carry`, when present, additionally receives all sixteen words of
-    /// every block at `(base, row_stride)` — even where the recyclable main
-    /// destination elides a constant range.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_step(
-        stage: *const V8,
-        dst: *mut u32,
-        carry: Option<(*mut u32, usize)>,
-        abs_word: usize,
-        ring_word: usize,
-        g0: usize,
-        g1: usize,
-        nt: bool,
-        wide_nt: bool,
-    ) {
-        unsafe {
-            let lo_rows = tr8_chunk(stage, ring_word);
-            let hi_rows = tr8_chunk(stage, ring_word + 8);
-            let g = abs_word / 8;
-            let lo_live = g >= g0 && g < g1;
-            let hi_live = g + 1 >= g0 && g + 1 < g1;
-            for r in 0..8 {
-                if let Some((base, row_stride)) = carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, lo_rows[r]);
-                    store_v8(p.add(8), hi_rows[r]);
-                }
-                let p = dst.add(r * U32_PER_BLOCK + abs_word);
-                match (nt, lo_live, hi_live) {
-                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], wide_nt),
-                    (true, true, false) => stream_v8(p, lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(p.add(8), hi_rows[r], wide_nt),
-                    (false, true, true) => {
-                        store_v8(p, lo_rows[r]);
-                        store_v8(p.add(8), hi_rows[r]);
-                    }
-                    (false, true, false) => store_v8(p, lo_rows[r]),
-                    (false, false, true) => store_v8(p.add(8), hi_rows[r]),
-                    (_, false, false) => {}
-                }
-            }
-        }
-    }
-
-    /// Publish one B step and derive the matching Z rows from the already
-    /// transposed A rows. Every R1CS row satisfies `z = a & b`; `tr8` is a
-    /// bit permutation, so the identity is unchanged after transposition.
-    ///
-    /// `a_rows` is the row-major carry written by the immediately preceding
-    /// A `publish_step`. Keeping only B's sixteen results live preserves the
-    /// paired 64-byte NT stores without holding all A and B rows in registers.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_b_with_derived_z(
-        b_stage: *const V8,
-        b_dst: *mut u32,
-        b_carry: Option<(*mut u32, usize)>,
-        a_rows: (*const u32, usize),
-        z_dst: *mut u32,
-        abs_word: usize,
-        ring_word: usize,
-        z_g1: usize,
-        b_g0: usize,
-        b_g1: usize,
-        b_nt: bool,
-        z_nt: bool,
-        wide_nt: bool,
-    ) {
-        unsafe {
-            let b_lo_rows = tr8_chunk(b_stage, ring_word);
-            let b_hi_rows = tr8_chunk(b_stage, ring_word + 8);
-            let g = abs_word / 8;
-            let z_lo_live = g < z_g1;
-            let z_hi_live = g + 1 < z_g1;
-            let b_lo_live = g >= b_g0 && g < b_g1;
-            let b_hi_live = g + 1 >= b_g0 && g + 1 < b_g1;
-
-            for r in 0..8 {
-                let ap = a_rows.0.add(r * a_rows.1);
-                let a_lo = load_v8(ap);
-                let a_hi = load_v8(ap.add(8));
-                let z_lo = and_v8(a_lo, b_lo_rows[r]);
-                let z_hi = and_v8(a_hi, b_hi_rows[r]);
-
-                if let Some((base, row_stride)) = b_carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, b_lo_rows[r]);
-                    store_v8(p.add(8), b_hi_rows[r]);
-                }
-
-                let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
-                match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
-                    (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
-                    (false, true, true) => {
-                        store_v8(bp, b_lo_rows[r]);
-                        store_v8(bp.add(8), b_hi_rows[r]);
-                    }
-                    (false, true, false) => store_v8(bp, b_lo_rows[r]),
-                    (false, false, true) => store_v8(bp.add(8), b_hi_rows[r]),
-                    (_, false, false) => {}
-                }
-
-                let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
-                match (z_nt, z_lo_live, z_hi_live) {
-                    (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
-                    (true, true, false) => stream_v8(zp, z_lo, wide_nt),
-                    (true, false, true) => stream_v8(zp.add(8), z_hi, wide_nt),
-                    (false, true, true) => {
-                        store_v8(zp, z_lo);
-                        store_v8(zp.add(8), z_hi);
-                    }
-                    (false, true, false) => store_v8(zp, z_lo),
-                    (false, false, true) => store_v8(zp.add(8), z_hi),
-                    (_, false, false) => {}
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn ab_ranges(&self) -> (usize, usize, usize) {
-        let a_g1 = if self.elide[1] {
-            ELIDE_ZERO_CHUNK
-        } else {
-            DUMP_CHUNKS
-        };
-        let b_g0 = if self.elide[2] {
-            ELIDE_B_PREFIX_CHUNKS
-        } else {
-            0
-        };
-        let b_g1 = if !self.elide[2] {
-            DUMP_CHUNKS
-        } else {
-            ELIDE_B_TAIL_CHUNK_WIN
-        };
-        (a_g1, b_g0, b_g1)
-    }
-
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.elide==[true;3]{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
         }
     }
 
@@ -1168,6 +1045,7 @@ impl Drain8<'_> {
     /// go. Identical addresses, identical bytes, three lines per block instead
     /// of twenty-four per step — and still exactly one call per step, so the
     /// spread costs no extra call or spill traffic.
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range_spread<const E:bool>(
         &self,
@@ -1177,23 +1055,58 @@ impl Drain8<'_> {
         words: usize,
     ) {
         unsafe {
-            let z_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let a_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let b_g0=if E{ELIDE_B_PREFIX_CHUNKS}else if self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
-            let b_g1=if E{ELIDE_B_TAIL_CHUNK_WIN}else if self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
+            let z_g1=if E||self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
+            let a_g1=if E||self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
+            let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
+            let b_g1=if E||self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
             let (sa, sb) = proj.sides();
             let base=0xC0u8;
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
+                if E && blk == 31 {
+                    let mut j=0usize;
+                    while j!=8 {
+                        let out=&mut *proj.out.add(j*BYTES_PER_BLOCK+31*64).cast::<[u8;64]>();
+                        round1_ab_inner_window_zero(out,proj.plan);
+                        j+=1;
+                    }
+                    continue;
+                }
                 let (plan, imgs) = proj.window_prep(blk);
+                if E && (blk <= 1 || blk == 30) {
+                    let rows = StepRows {
+                        z: self.z.add(abs_word),
+                        a: self.a.add(abs_word),
+                        b: self.b.add(abs_word),
+                        flags: base,
+                    };
+                    let a_lo = tr8_chunk(self.ast, rw);
+                    let a_hi = tr8_chunk(self.ast, rw + 8);
+                    for r in 0..8 {
+                        let p = sa.add(r * STEP_WORDS);
+                        store_v8(p, a_lo[r]);
+                        store_v8(p.add(8), a_hi[r]);
+                    }
+                    if blk == 0 {
+                        proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                    } else if blk == 1 {
+                        proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                    } else {
+                        proj.project_blocks_ranked_static::<30>(plan, imgs, rows);
+                    }
+                    continue;
+                }
                 // Fused offset arena: while the transposed rows are still in
                 // registers, also widen them to the split kernel's pre-scaled
                 // `u16` offsets. The kernel then consumes the arena and never
                 // reloads the staging, and no consuming load executes in the
                 // shadow of its own offset stores.
-                let use_off=blk>1&&blk<30;
+                // The E=true static cases continued above, so its remaining
+                // windows are exactly 2..29 and offsets are unconditional.
+                // E=false retains the original per-window eligibility test.
+                let use_off=E||plan.offsets_eligible(blk);
                 #[repr(align(64))]
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
@@ -1227,116 +1140,36 @@ impl Drain8<'_> {
                         widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
-                let g = abs_word / 8;
-                let mut flags = base;
-                if g < z_g1 {
-                    flags |= 1;
-                }
-                if g + 1 < z_g1 {
-                    flags |= 2;
-                }
-                if g < a_g1 {
-                    flags |= 4;
-                }
-                if g + 1 < a_g1 {
-                    flags |= 8;
-                }
-                if g >= b_g0 && g < b_g1 {
-                    flags |= 0x10;
-                }
-                if g + 1 >= b_g0 && g + 1 < b_g1 {
-                    flags |= 0x20;
-                }
                 let rows = StepRows {
                     z: self.z.add(abs_word),
                     a: self.a.add(abs_word),
                     b: self.b.add(abs_word),
-                    flags,
+                    flags: base,
                 };
-
-                proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
-            }
-        }
-    }
-
-    /// The two non-streaming drains — the `win_ab` window fusion and the plain
-    /// temporal publish. Out of line so the streaming drain above keeps a
-    /// register allocation of its own.
-    #[inline(never)]
-    unsafe fn drain_range_buffered(&mut self, base_word: usize, ring_word: usize, words: usize) {
-        unsafe {
-            let z_g1 = if self.elide[0] {
-                ELIDE_ZERO_CHUNK
-            } else {
-                DUMP_CHUNKS
-            };
-            let (a_g1, b_g0, b_g1) = self.ab_ranges();
-            match self.win_ab {
-                Some((win_a, win_b)) => {
-                    for off in (0..words).step_by(STEP_WORDS) {
-                        let abs_word = base_word + off;
-                        let rw = ring_word + off;
-                        Self::publish_step(
-                            self.ast,
-                            self.a,
-                            Some((win_a.add(abs_word), U32_PER_BLOCK)),
-                            abs_word,
-                            rw,
-                            0,
-                            a_g1,
-                            true,
-                            self.wide_nt,
-                        );
-                        Self::publish_b_with_derived_z(
-                            self.bs,
-                            self.b,
-                            Some((win_b.add(abs_word), U32_PER_BLOCK)),
-                            (win_a.add(abs_word), U32_PER_BLOCK),
-                            self.z,
-                            abs_word,
-                            rw,
-                            z_g1,
-                            b_g0,
-                            b_g1,
-                            true,
-                            self.z_nt,
-                            self.wide_nt,
-                        );
+                if E {
+                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
+                } else {
+                    let g = abs_word / 8;
+                    let mut flags = base;
+                    if g < z_g1 {
+                        flags |= 1;
                     }
-                }
-                None => {
-                    let mut a_rows = core::mem::MaybeUninit::<[V8; STEP_WORDS]>::uninit();
-                    let a_rows = a_rows.as_mut_ptr().cast::<u32>();
-                    for off in (0..words).step_by(STEP_WORDS) {
-                        let abs_word = base_word + off;
-                        let rw = ring_word + off;
-                        Self::publish_step(
-                            self.ast,
-                            self.a,
-                            Some((a_rows, STEP_WORDS)),
-                            abs_word,
-                            rw,
-                            0,
-                            a_g1,
-                            false,
-                            self.wide_nt,
-                        );
-                        Self::publish_b_with_derived_z(
-                            self.bs,
-                            self.b,
-                            None,
-                            (a_rows, STEP_WORDS),
-                            self.z,
-                            abs_word,
-                            rw,
-                            z_g1,
-                            b_g0,
-                            b_g1,
-                            false,
-                            self.z_nt,
-                            self.wide_nt,
-                        );
+                    if g + 1 < z_g1 {
+                        flags |= 2;
                     }
+                    if g < a_g1 {
+                        flags |= 4;
+                    }
+                    if g + 1 < a_g1 {
+                        flags |= 8;
+                    }
+                    if g >= b_g0 && g < b_g1 {
+                        flags |= 0x10;
+                    }
+                    if g + 1 >= b_g0 && g + 1 < b_g1 {
+                        flags |= 0x20;
+                    }
+                    proj.project_blocks_ranked(blk,plan,imgs,StepRows { flags, ..rows },op as *const u16,use_off);
                 }
             }
         }
@@ -1461,22 +1294,15 @@ unsafe fn dump_elide_win(
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
-/// `win_ab = Some((win_a, win_b))` selects the FUSED a/b drain: the main a/b
-/// buffers are published non-temporally and a full copy of this octa's 8
-/// blocks lands in the two window buffers, which the caller projects from
-/// instead of re-reading a/b. `None` is the incumbent temporal drain.
-///
-/// `proj = Some(..)` selects the STREAMING form of the same fusion: a/b are
-/// published non-temporally exactly as under `win_ab`, and each drain step's
+/// `proj` selects the STREAMING form of the a/b fusion: a/b are
+/// published non-temporally, and each drain step's
 /// eight 64-byte round-1 medium windows are transformed straight into the
 /// caller's ab_inner blocks out of a small staging pair, so no full-block
-/// window buffer exists. `win_ab` and `proj` are mutually exclusive.
+/// window buffer exists.
 ///
 /// # Safety
 /// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
-/// When `win_ab` is `Some`, both window pointers own 8 contiguous 512-word
-/// blocks too, disjoint from each other and from `z`/`a`/`b`. When `proj` is
-/// `Some`, its staging and `out` satisfy [`StreamProj`]'s contract. In every
+/// `proj`'s staging and `out` satisfy [`StreamProj`]'s contract. In every
 /// non-temporal arm the caller must `_mm_sfence()` on this thread after its
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
@@ -1486,12 +1312,13 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    win_ab: Option<(*mut u32, *mut u32)>,
     proj: StreamProj<'_>,
     elide: [bool; 3],
-    z_nt: bool,
 ) {
     unsafe {
+        // Only the all-elide provenance state selects the ranked static
+        // windows. Partial/cold states still read both rings in every window.
+        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -1612,12 +1439,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z,
             a,
             b,
-            win_ab,
             proj,
             elide,
-            z_nt,
-            wide_nt: true,
-            spread: true,
+            ranked_static,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -1636,6 +1460,15 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             };
             let w = 16 + k;
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
+        }
+        // Unswitch the static-prefix decision once per octa. Ranked blocks
+        // 0/1 source B from RANKED_B_MAX; block 2 still needs words 32..35.
+        if !ranked_static {
+            for w in 16..RANKED_STATIC_B_PREFIX_END {
+                store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
+            }
+        }
+        for w in RANKED_STATIC_B_PREFIX_END..16 + PROLOGUE_WORDS {
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
 
@@ -1739,10 +1572,17 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         }
         // finish() completed word 481. Complete the final rolling epoch with
         // the all-zero tail, then publish words 384..511 in one long sweep.
-        for w in ZF..U32_PER_BLOCK {
-            let i = w & (RING_WORDS - 1);
-            store_v8(ast.add(i) as *mut u32, zero);
-            store_v8(bs.add(i) as *mut u32, zero);
+        if ranked_static {
+            for w in ZF..RANKED_STATIC_A_TAIL_START {
+                let i = w & (RING_WORDS - 1);
+                store_v8(ast.add(i) as *mut u32, zero);
+            }
+        } else {
+            for w in ZF..U32_PER_BLOCK {
+                let i = w & (RING_WORDS - 1);
+                store_v8(ast.add(i) as *mut u32, zero);
+                store_v8(bs.add(i) as *mut u32, zero);
+            }
         }
         drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
@@ -1753,9 +1593,13 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         for w in 0..8usize {
             let lo = xor_v8(state[w], state[w + 8]);
             store_v8(ast.add(w) as *mut u32, cv_v[w]);
-            store_v8(bs.add(w) as *mut u32, maxv);
             store_v8(ast.add(8 + w) as *mut u32, lo);
-            store_v8(bs.add(8 + w) as *mut u32, maxv);
+        }
+        if !ranked_static {
+            for w in 0..8usize {
+                store_v8(bs.add(w) as *mut u32, maxv);
+                store_v8(bs.add(8 + w) as *mut u32, maxv);
+            }
         }
         drain.drain_range(0, 0, 16);
     }

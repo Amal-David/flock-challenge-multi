@@ -383,6 +383,75 @@ pub(super) fn shift_reduce_inner_ab_at(
     }
 }
 
+/// Ranked witness seam for a B window whose exact static contents are proven
+/// by construction. `PLAN_BLK` is `0` for both all-one windows or `30` for the
+/// 49-one-bit tail window. A disabled/unavailable static plan still takes the
+/// generic kernel, preserving every rollback switch.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_static_trusted_at<const PLAN_BLK: usize>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base: usize,
+    blk: usize,
+    out: &mut [u8; 64],
+    bstatic: Option<&'static BstaticPartials>,
+    prepared: ShiftReducePlan,
+    nt: u8,
+    imgs: (*const u8, *const u8),
+) {
+    debug_assert!(PLAN_BLK == 0 || PLAN_BLK == 30);
+    debug_assert!((PLAN_BLK == 0 && blk <= 1) || (PLAN_BLK == 30 && blk == 30));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    if let Some(partials) = bstatic {
+        // SAFETY: the caller guarantees this B window matches `PLAN_BLK`;
+        // target features are enabled statically and the slices cover 64 B.
+        unsafe {
+            x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_trusted::<PLAN_BLK>(
+                a_packed, b_packed, inv_table, byte_base, partials, out, nt,
+            );
+        }
+        return;
+    }
+    let _ = bstatic;
+    shift_reduce_inner_ab_at(
+        a_packed, b_packed, inv_table, byte_base, blk, out, None, prepared, nt, imgs,
+    );
+}
+
+/// Publish a known-zero round-1 window with the output store policy resolved
+/// in the surrounding plan. AVX-512 reuses the exact terminal store helper;
+/// every other target uses a temporal fill (their prepared `nt` is ignored).
+#[inline(always)]
+pub(super) fn store_zero_window(out: &mut [u8; 64], nt: u8) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: the statically enabled features satisfy `store_out64`; `out`
+    // supplies exactly 64 writable bytes and `nt` came from its allocation.
+    unsafe {
+        x86_64::store_out64(out, core::arch::x86_64::_mm512_setzero_si512(), nt);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = nt;
+        out.fill(0);
+    }
+}
+
 /// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
 /// call. On aarch64 this takes the interleaved two-window NEON wavefront
 /// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
