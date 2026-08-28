@@ -542,19 +542,70 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     let d = point.len();
     let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
     out.push(F128::ONE);
-    for j in 0..d {
-        let r_j = point[j];
-        let len = 1usize << j;
-        out.resize(2 * len, F128::ZERO);
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
-        //   out[i]       = v + v*r_j      ← new bit_j = 0
-        //   out[i + len] = v * r_j        ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            let hi = v * r_j;
-            out[i + len] = hi;
-            out[i] = v + hi;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4};
+        use core::arch::x86_64::*;
+        for j in 0..d {
+            let r_j = point[j];
+            let len = 1usize << j;
+            out.resize(2 * len, F128::ZERO);
+            if len >= 4 {
+                // SAFETY: avx512f + vpclmulqdq cfg-gated; slices sized to 2*len.
+                unsafe {
+                    let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r_j.hi as i64, r_j.lo as i64));
+                    let lanes = len & !3;
+                    let mut i = 0usize;
+                    if r_j.hi == 0 {
+                        while i < lanes {
+                            let v = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+                            let hi = ghash_mul_x4_low_rhs(v, r_bcast);
+                            let lo = _mm512_xor_si512(v, hi);
+                            _mm512_storeu_si512(out.as_mut_ptr().add(i + len) as *mut __m512i, hi);
+                            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, lo);
+                            i += 4;
+                        }
+                    } else {
+                        let r_x64 = ghash_shift64_x4(r_bcast);
+                        while i < lanes {
+                            let v = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+                            let hi = ghash_mul_x4_split(v, r_bcast, r_x64);
+                            let lo = _mm512_xor_si512(v, hi);
+                            _mm512_storeu_si512(out.as_mut_ptr().add(i + len) as *mut __m512i, hi);
+                            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, lo);
+                            i += 4;
+                        }
+                    }
+                    while i < len {
+                        let v = out[i];
+                        let hi = v * r_j;
+                        out[i + len] = hi;
+                        out[i] = v + hi;
+                        i += 1;
+                    }
+                }
+            } else {
+                for i in 0..len {
+                    let v = out[i];
+                    let hi = v * r_j;
+                    out[i + len] = hi;
+                    out[i] = v + hi;
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        for j in 0..d {
+            let r_j = point[j];
+            let len = 1usize << j;
+            out.resize(2 * len, F128::ZERO);
+            for i in 0..len {
+                let v = out[i];
+                let hi = v * r_j;
+                out[i + len] = hi;
+                out[i] = v + hi;
+            }
         }
     }
     out
