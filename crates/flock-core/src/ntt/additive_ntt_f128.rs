@@ -251,6 +251,24 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
 }
 
+/// `FLOCK_NO_NTT_RATE4_PARTIAL_FUSION=1` restores the incumbent separate
+/// rate-1/4 seed and deep transform for the exact ranked L1 recursive commit.
+///
+/// Unlike the rejected six-layer rate-1/4 fusion, this candidate retains only
+/// one rate block (four layer-4 blocks) at a time. Its per-worker staging is
+/// therefore 32 KiB rather than 128 KiB, and it rejoins the incumbent at
+/// layer 8 instead of carrying layers 8 and 9 in the seed task.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "pclmulqdq",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_rate4_partial_fusion_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_RATE4_PARTIAL_FUSION").is_some())
+}
+
 /// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
 /// fused-two scratch stores followed by the separate non-temporal scatter.
 /// Read once per process, outside every row/quad loop.
@@ -1771,6 +1789,40 @@ impl AdditiveNttF128 {
             return;
         }
 
+        // Exact ranked L1 recursive commit. Seed layers 2..3 and immediately
+        // apply layers 4..7 while each rate block is resident in a 32 KiB
+        // worker-local stage. Publish the post-layer-7 codeword once, then
+        // resume the incumbent deep transform at layer 8. The narrower stage
+        // is the material distinction from the measured-negative 128 KiB
+        // layers-4..9 fusion.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        if log_inv_rate == 2
+            && log_d == 18
+            && num_ntts == 8
+            && rayon::current_num_threads() == 16
+            && Self::interleaved_n_top(log_d, num_ntts) == 4
+            && msg.len() == (1usize << 19)
+            && codeword.len() == (1usize << 21)
+            && !rate_seed_disabled()
+            && !ntt_rate4_partial_fusion_disabled()
+        {
+            self.seed_rate_quarter_partial_top_fused4_pass(msg, codeword, num_ntts, log_d);
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                8,
+                None,
+                Some(on_range_done),
+                None,
+            );
+            return;
+        }
+
         // Rate ≤ 1/4 (every recursive Ligerito commit): same seed idea as the
         // rate-1/2 path above. The incumbent materialized the replicated
         // codeword with `replicate_message_fill` and then had the transform's
@@ -2568,6 +2620,180 @@ impl AdditiveNttF128 {
                 );
             }
         }
+    }
+
+    /// Fuse the exact ranked rate-1/4 seed with layers 4..7 one rate block at
+    /// a time. A rate block produces four independent 64-row layer-4 blocks,
+    /// so the complete live stage is `4 * 64 * 8 * 16 = 32 KiB`.
+    ///
+    /// Every stage row is seed-written before use. Each fused-four block keeps
+    /// the incumbent butterfly and twiddle order, and publication maps the
+    /// resulting row back to the same post-layer-7 codeword slot. Distinct
+    /// `r` tasks write disjoint rows.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "pclmulqdq",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    fn seed_rate_quarter_partial_top_fused4_pass(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+    ) {
+        use rayon::prelude::*;
+
+        const SEED_LAYER: usize = 2;
+        const TOP_LAYER: usize = 4;
+        const RATE_BLOCKS: usize = 4;
+        const BLOCKS_PER_RATE: usize = 4;
+        const ROWS_PER_BLOCK: usize = 64;
+        const STAGE_ROWS: usize = BLOCKS_PER_RATE * ROWS_PER_BLOCK;
+
+        debug_assert_eq!(log_d, 18);
+        debug_assert_eq!(num_ntts, 8);
+        debug_assert_eq!(rayon::current_num_threads(), 16);
+        debug_assert_eq!(Self::interleaved_n_top(log_d, num_ntts), 4);
+        debug_assert_eq!(msg.len(), 1usize << 19);
+        debug_assert_eq!(data.len(), 1usize << 21);
+        debug_assert_eq!(data.len(), RATE_BLOCKS * msg.len());
+        debug_assert_eq!(ranked_zero_odd_tail_lanes(log_d, num_ntts), 0);
+
+        let block_size = 1usize << (log_d - TOP_LAYER);
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert_eq!(msg_positions, RATE_BLOCKS * block_size);
+        debug_assert!(block_size.is_multiple_of(ROWS_PER_BLOCK));
+        let sub_stride = block_size / ROWS_PER_BLOCK;
+        let row_len = num_ntts;
+        let block_elems = block_size * row_len;
+
+        let mut seed_tw = [[F128::ZERO; 3]; RATE_BLOCKS];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(SEED_LAYER, block);
+            tw[1] = self.twiddle(SEED_LAYER + 1, 2 * block);
+            tw[2] = self.twiddle(SEED_LAYER + 1, 2 * block + 1);
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+
+        let top_blocks = RATE_BLOCKS * BLOCKS_PER_RATE;
+        let tw4: Vec<[F128; 15]> = (0..top_blocks)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(TOP_LAYER, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(TOP_LAYER + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(TOP_LAYER + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(TOP_LAYER + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+
+        let src_addr = msg.as_ptr() as usize;
+        let base_addr = data.as_mut_ptr() as usize;
+        let publish_nt = Self::scatter_nt_enabled() && base_addr.is_multiple_of(16);
+        let stage_perm = Self::stage_perm_enabled();
+        let perm = |k: usize| seed_top_stage_row(k, stage_perm);
+        let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
+
+        struct Rate4PartialNtFence(bool);
+        impl Drop for Rate4PartialNtFence {
+            fn drop(&mut self) {
+                if self.0 {
+                    // All NT publications performed by this worker must be
+                    // visible before the following deep pass can steal them.
+                    unsafe { core::arch::x86_64::_mm_sfence() };
+                }
+            }
+        }
+
+        let task = |buf: &mut Vec<F128>, r: usize| {
+            debug_assert_eq!(buf.len(), STAGE_ROWS * row_len);
+            let bufp = buf.as_mut_ptr();
+            unsafe {
+                let src = src_addr as *const F128;
+                let base = base_addr as *mut F128;
+
+                for rate_block in 0..RATE_BLOCKS {
+                    // The seed fills all four local layer-4 blocks before any
+                    // staged butterfly reads them.
+                    for k in 0..ROWS_PER_BLOCK {
+                        let src_r = r + k * sub_stride;
+                        let kp = perm(k);
+                        if rate_block == 0 {
+                            kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                                src,
+                                block_size,
+                                src_r,
+                                bufp.add(kp * row_len),
+                                ROWS_PER_BLOCK,
+                                0,
+                                row_len,
+                                seed_tw[0][2],
+                            );
+                        } else {
+                            kernels::butterfly_fused_2layer_row_from_geo(
+                                src,
+                                block_size,
+                                src_r,
+                                bufp.add(kp * row_len),
+                                ROWS_PER_BLOCK,
+                                0,
+                                row_len,
+                                &seed_tw[rate_block],
+                            );
+                        }
+                    }
+
+                    for local_block in 0..BLOCKS_PER_RATE {
+                        let global_block = rate_block * BLOCKS_PER_RATE + local_block;
+                        let region = bufp.add(local_block * ROWS_PER_BLOCK * row_len);
+                        for j in 0..4 {
+                            kernels::butterfly_fused_4layer_row(
+                                region.add(j * g4_base * row_len),
+                                g4_stride,
+                                row_len,
+                                row_len,
+                                0,
+                                &tw4[global_block],
+                            );
+                        }
+
+                        for k in 0..ROWS_PER_BLOCK {
+                            let src_row = region.add(perm(k) * row_len);
+                            let dst_row = base.add(
+                                seed_top_codeword_row(global_block, r, k, block_size, sub_stride)
+                                    * row_len,
+                            );
+                            if publish_nt {
+                                Self::publish_row_nt(src_row, dst_row, row_len);
+                            } else {
+                                core::ptr::copy_nonoverlapping(src_row, dst_row, row_len);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        (0..sub_stride).into_par_iter().for_each_init(
+            || {
+                (
+                    staging_block(STAGE_ROWS, row_len),
+                    Rate4PartialNtFence(publish_nt),
+                )
+            },
+            |state, r| task(&mut state.0, r),
+        );
+
+        debug_assert_eq!(block_elems * top_blocks, data.len());
     }
 
     #[allow(clippy::manual_is_multiple_of)]
