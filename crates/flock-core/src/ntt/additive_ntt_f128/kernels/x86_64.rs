@@ -1426,6 +1426,56 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     }
 }
 
+/// Ranked `log_d=20` final-tail batch.  The caller has already established
+/// the exact production geometry, so the standard-domain facts that the
+/// generic leaf rediscovers on every group are compile-time choices here:
+/// the split 5-CLMUL multiply is enabled and layers 18/19 use the low-limb
+/// 3-CLMUL form.  Both products are field-identical to their diagnostic
+/// alternatives.
+///
+/// # Safety
+/// Contract forwarded from
+/// [`super::butterfly_fused_3layer_rows_ranked_batch16`].
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_3layer_rows_ranked_batch16(
+    ptr: *mut F128,
+    twiddle_tree: *const F128,
+    first_block: usize,
+) {
+    const NN: usize = 64;
+    const DENSE: usize = 60;
+    const GROUP_WORDS: usize = 8 * NN;
+    const L17: usize = (1usize << 17) - 1;
+    const L18: usize = (1usize << 18) - 1;
+    const L19: usize = (1usize << 19) - 1;
+
+    // SAFETY: the caller supplies the complete ranked twiddle tree and sixteen
+    // disjoint consecutive groups.  Layers 18 and 19 of the standard basis
+    // have zero high limbs (pinned by the parent module's invariant test).
+    unsafe {
+        for j in 0..16usize {
+            let g = first_block + j;
+            let twiddles = [
+                *twiddle_tree.add(L17 + g),
+                *twiddle_tree.add(L18 + 2 * g),
+                *twiddle_tree.add(L18 + 2 * g + 1),
+                *twiddle_tree.add(L19 + 4 * g),
+                *twiddle_tree.add(L19 + 4 * g + 1),
+                *twiddle_tree.add(L19 + 4 * g + 2),
+                *twiddle_tree.add(L19 + 4 * g + 3),
+            ];
+            debug_assert!(twiddles[1..].iter().all(|t| t.hi == 0));
+            butterfly_fused_3layer_rows_impl::<true, true, NN>(
+                ptr.add(j * GROUP_WORDS),
+                NN,
+                DENSE,
+                &twiddles,
+            );
+        }
+    }
+}
+
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores the general twiddle product
 /// for the fused-three sweep's two inner layers inside the same binary, so a
 /// candidate/control pair differs only in the product form. Read once,

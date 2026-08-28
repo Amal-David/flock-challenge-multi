@@ -807,6 +807,52 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
 }
 
+/// Exact ranked-tail batch: sixteen adjacent eight-row groups, with the
+/// layer-17/18/19 twiddles read directly from the standard breadth-first
+/// twiddle tree.
+///
+/// The ordinary wrapper deliberately rechecks three process switches and the
+/// six low-limb predicates for every eight-row group.  At the ranked
+/// `log_d=20, num_ntts=64, dense_lanes=60` tail those facts are invariant
+/// across all sixteen groups retired before one leaf callback.  Keeping the
+/// whole batch inside one target-feature leaf removes those repeated
+/// dispatches and lets LLVM scalar-replace the temporary seven-twiddle view.
+///
+/// Returns `false` on builds without the ranked AVX-512 backend so the caller
+/// can execute the portable per-group loop.
+///
+/// # Safety
+/// `ptr` covers sixteen consecutive groups of `8 * 64` F128 elements;
+/// `twiddle_tree` covers the complete `2^20 - 1` standard-domain tree;
+/// `first_block + 16 <= 2^17`; odd rows' lanes 60..64 are zero.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_rows_ranked_batch16(
+    ptr: *mut F128,
+    twiddle_tree: *const F128,
+    first_block: usize,
+) -> bool {
+    debug_assert!(first_block + 16 <= 1usize << 17);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::butterfly_fused_3layer_rows_ranked_batch16(ptr, twiddle_tree, first_block);
+        true
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = (ptr, twiddle_tree, first_block);
+        false
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

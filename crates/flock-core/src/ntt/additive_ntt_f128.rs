@@ -3489,28 +3489,50 @@ impl AdditiveNttF128 {
                         },
                         hint,
                     );
-                    for j in 0..16usize {
-                        let g8 = g4 * 16 + j;
-                        let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
-                        tw3[0] = self.twiddle(layer3, g8);
-                        for s in 0..2 {
-                            tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
-                        }
-                        for s in 0..4 {
-                            tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
-                        }
-                        let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
-                        // SAFETY: eight consecutive rows of `num_ntts` lanes,
-                        // owned exclusively by this sub-group task; the zero
-                        // tail lives on odd rows exactly as in the sweep
-                        // schedule (blocks start at even global rows).
-                        unsafe {
-                            kernels::butterfly_fused_3layer_rows(
-                                eight.as_mut_ptr(),
-                                num_ntts,
-                                dense_lanes,
-                                &tw3,
-                            );
+                    // Exact ranked geometry: retire all sixteen final-tail
+                    // groups in one target-feature leaf.  This removes the
+                    // per-group shaped/low-limb/mul-diet dispatches and reads
+                    // the three twiddle spans directly from the cached tree.
+                    // Other architectures and every non-ranked shape retain
+                    // the byte-identical loop below.
+                    let ranked_batch =
+                        if log_d == 20 && layer3 == 17 && num_ntts == 64 && dense_lanes == 60 {
+                            self.precomputed_twiddles
+                                .as_ref()
+                                .is_some_and(|tree| unsafe {
+                                    kernels::butterfly_fused_3layer_rows_ranked_batch16(
+                                        blk.as_mut_ptr(),
+                                        tree.as_ptr(),
+                                        g4 * 16,
+                                    )
+                                })
+                        } else {
+                            false
+                        };
+                    if !ranked_batch {
+                        for j in 0..16usize {
+                            let g8 = g4 * 16 + j;
+                            let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+                            tw3[0] = self.twiddle(layer3, g8);
+                            for s in 0..2 {
+                                tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+                            }
+                            for s in 0..4 {
+                                tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+                            }
+                            let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+                            // SAFETY: eight consecutive rows of `num_ntts`
+                            // lanes, owned exclusively by this sub-group task;
+                            // the zero tail lives on odd rows exactly as in the
+                            // sweep schedule (blocks start at even global rows).
+                            unsafe {
+                                kernels::butterfly_fused_3layer_rows(
+                                    eight.as_mut_ptr(),
+                                    num_ntts,
+                                    dense_lanes,
+                                    &tw3,
+                                );
+                            }
                         }
                     }
                     let lo = sub_idx * sub_size_positions + b * block_size4;
@@ -5735,6 +5757,41 @@ mod tests {
         assert!(!direct_fused2_publish_shape(19, 64, 4));
         assert!(!direct_fused2_publish_shape(20, 32, 4));
         assert!(!direct_fused2_publish_shape(20, 64, 8));
+    }
+
+    #[test]
+    fn ranked_fused3_batch_twiddle_indices_match_public_lookup() {
+        const L17: usize = (1usize << 17) - 1;
+        const L18: usize = (1usize << 18) - 1;
+        const L19: usize = (1usize << 19) - 1;
+        let ntt = AdditiveNttF128::standard(20);
+        let tree = ntt
+            .precomputed_twiddles
+            .as_ref()
+            .expect("ranked standard domain has a cached twiddle tree");
+
+        for g in 0..(1usize << 17) {
+            let direct = [
+                tree[L17 + g],
+                tree[L18 + 2 * g],
+                tree[L18 + 2 * g + 1],
+                tree[L19 + 4 * g],
+                tree[L19 + 4 * g + 1],
+                tree[L19 + 4 * g + 2],
+                tree[L19 + 4 * g + 3],
+            ];
+            let public = [
+                ntt.twiddle(17, g),
+                ntt.twiddle(18, 2 * g),
+                ntt.twiddle(18, 2 * g + 1),
+                ntt.twiddle(19, 4 * g),
+                ntt.twiddle(19, 4 * g + 1),
+                ntt.twiddle(19, 4 * g + 2),
+                ntt.twiddle(19, 4 * g + 3),
+            ];
+            assert_eq!(direct, public, "final-tail group {g}");
+            assert!(direct[1..].iter().all(|t| t.hi == 0));
+        }
     }
 
     /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs
