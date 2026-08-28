@@ -1138,10 +1138,21 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
+    let low_l4 = !low_twiddle_fused3_disabled() && twiddles[7..15].iter().all(|t| t.hi == 0);
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, H, 0, 0>(
+                ptr,
+                sixteenth,
+                num_ntts,
+                active_lanes,
+                r,
+                twiddles,
+                pf_r,
+            )
+        } else if low_l4 {
+            butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1151,7 +1162,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 pf_r,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1189,11 +1200,22 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
+    let low_l4 = !low_twiddle_fused3_disabled() && twiddles[7..15].iter().all(|t| t.hi == 0);
     // SAFETY: forwarded caller contract; S16/NN substitute equal runtime
     // values in the same impl body (a distinct monomorphization).
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<false, false, H, S16, NN>(
+                ptr,
+                S16,
+                NN,
+                active_lanes,
+                r,
+                twiddles,
+                pf_r,
+            )
+        } else if low_l4 {
+            butterfly_fused_4layer_row_impl::<true, true, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1203,7 +1225,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 pf_r,
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<true, false, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1226,6 +1248,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
     const DIET: bool,
+    const LOW_L4: bool,
     const H: u8,
     const S16: usize,
     const NN: usize,
@@ -1253,8 +1276,11 @@ unsafe fn butterfly_fused_4layer_row_impl<
         // steps of savings.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+        for (slot, value) in tw[0..7].iter_mut().zip(twiddles[0..7].iter()) {
             *slot = tw_x4::<false, DIET>(*value);
+        }
+        for (slot, value) in tw[7..15].iter_mut().zip(twiddles[7..15].iter()) {
+            *slot = tw_x4::<LOW_L4, DIET>(*value);
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
@@ -1287,6 +1313,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     }
                 }};
             }
+
             let mut values = [zero; 16];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
@@ -1296,6 +1323,12 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 ($u:expr, $v:expr, $twiddle:expr) => {{
                     let new_u =
                         _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    values[$u] = new_u;
+                }};
+                ($u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
+                    let new_u =
+                        _mm512_xor_si512(values[$u], mul_x4::<$low, DIET>($twiddle, values[$v]));
                     values[$v] = _mm512_xor_si512(values[$v], new_u);
                     values[$u] = new_u;
                 }};
@@ -1323,7 +1356,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
             pf_quad!(3);
             for s in 0..8 {
                 let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                butterfly!(2 * s, 2 * s + 1, twiddle, LOW_L4);
             }
 
             for (i, value) in values.iter().enumerate() {
