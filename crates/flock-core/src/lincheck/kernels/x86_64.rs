@@ -405,25 +405,60 @@ pub(crate) unsafe fn gfni_fold_tile(
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
             let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
+            for byte_k in (0..16).step_by(4) {
+                let plane_ptr0 = planes.add(byte_k * 64) as *mut __m512i;
+                let plane_ptr1 = planes.add((byte_k + 1) * 64) as *mut __m512i;
+                let plane_ptr2 = planes.add((byte_k + 2) * 64) as *mut __m512i;
+                let plane_ptr3 = planes.add((byte_k + 3) * 64) as *mut __m512i;
+
+                let mut acc0 = if seed_zero {
                     _mm512_setzero_si512()
                 } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    _mm512_loadu_si512(plane_ptr0 as *const __m512i)
                 };
+                let mut acc1 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr1 as *const __m512i)
+                };
+                let mut acc2 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr2 as *const __m512i)
+                };
+                let mut acc3 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr3 as *const __m512i)
+                };
+
                 for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        mats[t * 16 + byte_k],
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        mats[(t + 1) * 16 + byte_k],
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                    let r0 = rows[t];
+                    let r1 = rows[t + 1];
+                    let m_base0 = t * 16 + byte_k;
+                    let m_base1 = (t + 1) * 16 + byte_k;
+
+                    let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, mats[m_base0]);
+                    let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, mats[m_base1]);
+                    acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+
+                    let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, mats[m_base0 + 1]);
+                    let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, mats[m_base1 + 1]);
+                    acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
+
+                    let g0_2 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, mats[m_base0 + 2]);
+                    let g1_2 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, mats[m_base1 + 2]);
+                    acc2 = _mm512_ternarylogic_epi64::<0x96>(acc2, g0_2, g1_2);
+
+                    let g0_3 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, mats[m_base0 + 3]);
+                    let g1_3 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, mats[m_base1 + 3]);
+                    acc3 = _mm512_ternarylogic_epi64::<0x96>(acc3, g0_3, g1_3);
                 }
-                _mm512_storeu_si512(plane_ptr, acc);
+
+                _mm512_storeu_si512(plane_ptr0, acc0);
+                _mm512_storeu_si512(plane_ptr1, acc1);
+                _mm512_storeu_si512(plane_ptr2, acc2);
+                _mm512_storeu_si512(plane_ptr3, acc3);
             }
         }
     }
