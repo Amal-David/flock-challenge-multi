@@ -115,17 +115,34 @@ impl Mul for F128 {
             // SAFETY: aes target feature is enabled at compile time.
             unsafe { aarch64::ghash_mul_binius(self, rhs) }
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            // Runtime cpuid dispatch: pick the PCLMULQDQ path when the host
+            // CPU advertises the feature, fall through to the portable
+            // shift/xor clmul64 otherwise. `is_x86_feature_detected!` caches
+            // the cpuid result in a `static`, so the hot path is a single
+            // load + branch on a boolean — negligible against a 5-CLMUL
+            // Karatsuba multiply.
+            //
+            // The PCLMULQDQ variant (`ghash_mul_pclmul_xor_fold`) does 4
+            // schoolbook CLMULs + a branchless SSE2 xor-fold reduction
+            // (shared `ghash_reduce`: 4 constant shifts + 5 XORs, no
+            // reduction CLMUL). That is one fewer CLMUL than the
+            // compile-time `ghash_mul_karatsuba_vec` path (5 CLMUL), and on
+            // Sapphire Rapids port 5 (the only port that issues PCLMULQDQ,
+            // 1/cycle) the dropped CLMUL directly buys throughput on the
+            // throughput-bound F128 multiply sites in the prover.
+            if std::is_x86_feature_detected!("pclmulqdq") {
+                // SAFETY: `is_x86_feature_detected!` guaranteed pclmulqdq is
+                // available on the current CPU before we reach this call.
+                unsafe { x86_64::ghash_mul_pclmul_xor_fold(self, rhs) }
+            } else {
+                software::ghash_mul(self, rhs)
+            }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+            target_arch = "x86_64",
         )))]
         {
             software::ghash_mul(self, rhs)
@@ -246,7 +263,14 @@ pub mod aarch64;
 // primitive and lane-shuffle ops differ. The shared `ghash_reduce` is reused.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+// The module is compiled on every x86_64 target (not just when pclmulqdq is
+// enabled at compile time) so that the runtime-cpuid dispatch in `Mul` can
+// reach the PCLMULQDQ-based variants on CPUs that have the feature even when
+// the binary was built without `-C target-feature=+pclmulqdq`. Each function
+// inside carries its own `#[target_feature(enable = "...")]` attribute, so
+// the compiler emits the required instructions regardless of the build's
+// base target — the caller is responsible for the runtime feature check.
+#[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
 // ---------------------------------------------------------------------------

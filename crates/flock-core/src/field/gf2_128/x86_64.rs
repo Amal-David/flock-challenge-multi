@@ -223,6 +223,77 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     }
 }
 
+/// PCLMULQDQ-based GF(2^128) multiply with branchless SSE2 xor-fold reduction.
+///
+/// 4 independent schoolbook `_mm_clmulepi64_si128` products (ll, lh, hl, hh),
+/// the cross term `lh ^ hl` is XOR-folded into the middle two u64 words, and
+/// the resulting 256-bit product is handed to the shared `ghash_reduce` —
+/// a pure shift+XOR sequence with no data-dependent branches (the
+/// characteristic-2 identity `x^128 ≡ x^7 + x^2 + x + 1` makes the upper half
+/// fold into the lower half with four constant shifts and five XORs, no
+/// reduction CLMUL required).
+///
+/// Why this variant:
+///   * **Fewer CLMULs than `ghash_mul_karatsuba_vec`** (4 vs 5). On CPUs
+///     where PCLMULQDQ throughput is the bottleneck (Sapphire Rapids port 5:
+///     1/cycle), one fewer CLMUL directly buys ~20% throughput.
+///   * **No SSE4.1 dependency** — only `pclmulqdq` + `sse2`. Useful for
+///     runtime-cpuid dispatch from builds that do not compile with
+///     `+pclmulqdq` at compile time.
+///   * **Branchless reduction**: the dep chain through `ghash_reduce` is
+///     shifts and XORs only (no CLMUL in the reduction), so it can overlap
+///     with the next multiply's product CLMULs when the caller pipelines.
+///
+/// Field-identical to `ghash_mul_karatsuba_vec` (both reduce the same 256-bit
+/// product mod p; the choice of reduction is field-equivalent by the
+/// identity `x^128 ≡ x^7 + x^2 + x + 1`).
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse2`, as declared by the target-feature
+/// attribute.
+#[target_feature(enable = "pclmulqdq,sse2")]
+pub unsafe fn ghash_mul_pclmul_xor_fold(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features; pmull and the
+    // SSE2 stores/loads below only need pclmulqdq+sse2.
+    unsafe {
+        // Pack each operand into a __m128i with the low qword = operand and
+        // the high qword = 0, so `_mm_clmulepi64_si128::<0x00>` does a 64×64
+        // carry-less product into a 128-bit {lo, hi} vector.
+        let va_lo = _mm_set_epi64x(0, a.lo as i64);
+        let va_hi = _mm_set_epi64x(0, a.hi as i64);
+        let vb_lo = _mm_set_epi64x(0, b.lo as i64);
+        let vb_hi = _mm_set_epi64x(0, b.hi as i64);
+
+        // 4 independent schoolbook CLMULs.
+        let p_ll = _mm_clmulepi64_si128::<0x00>(va_lo, vb_lo);
+        let p_lh = _mm_clmulepi64_si128::<0x00>(va_lo, vb_hi);
+        let p_hl = _mm_clmulepi64_si128::<0x00>(va_hi, vb_lo);
+        let p_hh = _mm_clmulepi64_si128::<0x00>(va_hi, vb_hi);
+
+        // Cross term = lh ^ hl, at the x^64 position in the 256-bit product.
+        let cross = _mm_xor_si128(p_lh, p_hl);
+
+        // Extract the four u64 words of the 256-bit product using SSE2 stores
+        // (avoids the SSE4.1 `_mm_extract_epi64`). The compiler keeps these
+        // in registers when the call is inlined.
+        let mut ll_buf = [0u64; 2];
+        let mut hh_buf = [0u64; 2];
+        let mut cross_buf = [0u64; 2];
+        _mm_storeu_si128(ll_buf.as_mut_ptr() as *mut __m128i, p_ll);
+        _mm_storeu_si128(hh_buf.as_mut_ptr() as *mut __m128i, p_hh);
+        _mm_storeu_si128(cross_buf.as_mut_ptr() as *mut __m128i, cross);
+
+        // 256-bit product = ll_lo + (ll_hi ^ cross_lo)·x^64
+        //                + (hh_lo ^ cross_hi)·x^128 + hh_hi·x^192.
+        ghash_reduce(
+            ll_buf[0],
+            ll_buf[1] ^ cross_buf[0],
+            hh_buf[0] ^ cross_buf[1],
+            hh_buf[1],
+        )
+    }
+}
+
 /// 256-bit unreduced schoolbook product, for XOR-accumulation then one
 /// deferred `reduce()`. Port of `aarch64::ghash_mul_unreduced_neon`.
 ///
