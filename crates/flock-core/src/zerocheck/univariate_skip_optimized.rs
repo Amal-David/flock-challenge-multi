@@ -1132,6 +1132,48 @@ pub unsafe fn round1_ab_inner_window_from_offsets(
     unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
 }
 
+/// Fixed-ZMM-stream-store twin of [`round1_ab_inner_window_from_offsets`] for
+/// the measured ranked path. It computes identical bytes but specializes the
+/// already-resolved `nt=2` destination class, so the terminal store has no
+/// runtime selector. Generic/cold/static callers retain the general wrapper.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets`], with `plan.nt == 2` and
+/// `out` 64-byte aligned. The producing thread must execute
+/// [`abinner_publish_fence`] before publishing the output across threads.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
@@ -2796,10 +2838,55 @@ fn zc_r1ab_first_write_enabled() -> bool {
     *ON
 }
 
+/// Keep one ranked 128 KiB plane arena resident on each Rayon worker.  The
+/// official all-live first-write sweep overwrites every byte before any read,
+/// so warmup can park the allocation (and its faulted pages) for the measured
+/// proofs instead of repeating malloc/mmap + soft faults + free/munmap.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1ab_plane_cache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PLANE_CACHE").is_none());
+    *ON
+}
+
+const RANKED_AB_PLANE_BYTES: usize = 128 * 16 * ELL;
+
+std::thread_local! {
+    static RANKED_AB_PLANE_CACHE: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn take_ranked_ab_plane() -> Vec<u8> {
+    RANKED_AB_PLANE_CACHE
+        .with(|slot| slot.borrow_mut().take())
+        .filter(|v| v.len() == RANKED_AB_PLANE_BYTES)
+        .unwrap_or_else(|| crate::alloc_uninit_vec(RANKED_AB_PLANE_BYTES))
+}
+
+#[inline]
+fn give_ranked_ab_plane(v: Vec<u8>) {
+    if v.len() != RANKED_AB_PLANE_BYTES {
+        return;
+    }
+    RANKED_AB_PLANE_CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(v);
+        }
+    });
+}
+
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
+    cached_plane_banks: bool,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
@@ -2809,8 +2896,19 @@ impl WorkerStateAbOnly {
         Self {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
+            cached_plane_banks: false,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
+        }
+    }
+}
+
+impl Drop for WorkerStateAbOnly {
+    #[inline]
+    fn drop(&mut self) {
+        if self.cached_plane_banks {
+            self.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut self.plane_banks));
         }
     }
 }
@@ -2830,6 +2928,7 @@ fn process_one_x_hi_ab_only(
     convert: &[F128],
     eq_fold: Option<(&[F128], &[u64], usize)>,
     plane_first_write: bool,
+    plane_cache: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
@@ -2837,7 +2936,14 @@ fn process_one_x_hi_ab_only(
     if let Some((eq_bot, _, _)) = eq_fold {
         let plane_len = eq_bot.len() * 16 * ELL;
         if state.plane_banks.len() != plane_len {
-            state.plane_banks = if plane_first_write {
+            if state.cached_plane_banks {
+                state.cached_plane_banks = false;
+                give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+            }
+            state.plane_banks = if plane_cache {
+                state.cached_plane_banks = true;
+                take_ranked_ab_plane()
+            } else if plane_first_write {
                 // Every byte is overwritten by the `w_idx == 0` visits below
                 // before the vector is read; see the function-level guard.
                 crate::alloc_uninit_vec(plane_len)
@@ -3124,6 +3230,29 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     )))]
     let plane_first_write = false;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let plane_cache = plane_first_write
+        && zc_r1ab_plane_cache_enabled()
+        && m == 32
+        && n_lo == 12
+        && hi_size == 128
+        && eq_fold_state
+            .as_ref()
+            .is_some_and(|(eq_bot, mats, bank_bits)| {
+                eq_bot.len() == 128 && mats.len() == 32 * 256 && *bank_bits == 7
+            });
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let plane_cache = false;
     let res_ab = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
@@ -3155,6 +3284,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 convert,
                 eq_fold_arg,
                 plane_first_write,
+                plane_cache,
                 &mut state,
             );
             state
