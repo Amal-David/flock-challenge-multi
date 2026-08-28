@@ -676,8 +676,8 @@ mod tests {
             let block_len = 64u32;
             let flags = 0u32;
             blocks.push((cv, m, counter, block_len, flags));
-            let st = blake3_compress(&cv, &m, counter, block_len, flags);
-            cv = st[0..8].try_into().unwrap();
+            let (cv_out, _root) = blake3_compress(&cv, &m, counter, block_len, flags);
+            cv = cv_out;
         }
         (blocks, cv0, cv)
     }

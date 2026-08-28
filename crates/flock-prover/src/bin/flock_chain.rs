@@ -255,8 +255,8 @@ fn prove_blake3(
     for _ in 0..steps {
         let m = rng.next_block();
         blocks.push((cv, m, 0u64, 64u32, 0u32));
-        let st = blake3_compress(&cv, &m, 0, 64, 0);
-        cv = st[0..8].try_into().unwrap();
+        let (cv_out, _root) = blake3_compress(&cv, &m, 0, 64, 0);
+        cv = cv_out;
     }
     let cv_last = cv;
     eprintln!("  cv_last:    {}", u32_words_to_hex_be(&cv_last));

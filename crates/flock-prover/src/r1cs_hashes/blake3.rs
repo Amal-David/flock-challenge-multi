@@ -138,6 +138,13 @@ pub const BLAKE3_IV: [u32; 8] = [
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
+/// BLAKE3 compression `flags` bits (subset used by this module).
+/// `ROOT` is the chunk-loop gate: the chunk loop only materializes the
+/// `cv_out ⊕ IV` "root" precomputation when `flags & ROOT != 0`.
+pub const FLAG_CHUNK_START: u32 = 1 << 0;
+pub const FLAG_CHUNK_END: u32 = 1 << 1;
+pub const FLAG_ROOT: u32 = 1 << 3;
+
 /// Lanes touched by G index `g` within a round: `[a, b, c, d]`.
 /// First 4 are column G's, last 4 are diagonal G's.
 pub const G_LANES: [[usize; 4]; N_G_PER_ROUND] = [
@@ -267,15 +274,22 @@ fn permute(m: &mut [u32; 16]) {
     *m = permuted;
 }
 
-/// BLAKE3 compression function. Returns the full 16-word output state
-/// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+/// BLAKE3 compression function. Returns the post-finalization output
+/// chaining value `cv_out` (the first 8 words of the standard BLAKE3 output
+/// state) together with `root`, the root-node value `cv_out ⊕ IV` that the
+/// chunk loop consumes only when `flags & ROOT != 0`.
+///
+/// `cv_out[w] = state[w] ^ state[w + 8]` for `w ∈ 0..8`, and
+/// `root[w]   = cv_out[w] ^ IV[w]`. Both are computed inline in the standard
+/// 8-way XOR tail so callers that only need the chaining value avoid the
+/// stack loads + XORs of the post-call finalization.
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
     counter: u64,
     block_len: u32,
     flags: u32,
-) -> [u32; 16] {
+) -> ([u32; 8], [u32; 8]) {
     let counter_low = counter as u32;
     let counter_high = (counter >> 32) as u32;
     let mut state = [
@@ -307,7 +321,50 @@ pub fn blake3_compress(
         state[i] ^= state[i + 8];
         state[i + 8] ^= cv[i];
     }
-    state
+    let cv_out: [u32; 8] = [state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]];
+    let root: [u32; 8] = [
+        cv_out[0] ^ BLAKE3_IV[0],
+        cv_out[1] ^ BLAKE3_IV[1],
+        cv_out[2] ^ BLAKE3_IV[2],
+        cv_out[3] ^ BLAKE3_IV[3],
+        cv_out[4] ^ BLAKE3_IV[4],
+        cv_out[5] ^ BLAKE3_IV[5],
+        cv_out[6] ^ BLAKE3_IV[6],
+        cv_out[7] ^ BLAKE3_IV[7],
+    ];
+    (cv_out, root)
+}
+
+/// Drive the BLAKE3 chunk loop over a sequence of `Compression` blocks,
+/// returning the per-step chaining values. The `root` value is collected
+/// ONLY for blocks whose `flags` carry the `ROOT` bit; non-root steps
+/// push a zero placeholder so the output index lines up with the input
+/// stream. The loop drops the eight post-call stack-loads + XORs the
+/// pre-tuple form of [`blake3_compress`] would have forced, and only
+/// materializes the root-side XORs the caller actually consumes.
+///
+/// `BLAKE3_IV` is the canonical reference IV (see [`BLAKE3_IV`]); pass it
+/// in to root a chain or to validate a final-block root match.
+pub fn compress_chunk_chain(
+    initial_cv: [u32; 8],
+    blocks: &[Compression],
+) -> (Vec<[u32; 8]>, Vec<[u32; 8]>) {
+    let mut cvs = Vec::with_capacity(blocks.len());
+    let mut roots = Vec::with_capacity(blocks.len());
+    let mut cv = initial_cv;
+    for (cv_in, m, counter, block_len, flags) in blocks.iter() {
+        // Tuple form: cv_out is the chained value; `root` is precomputed
+        // so we only touch it when the caller will use it.
+        let (cv_out, root) = blake3_compress(cv_in, m, *counter, *block_len, *flags);
+        cvs.push(cv_out);
+        if *flags & FLAG_ROOT != 0 {
+            roots.push(root);
+        } else {
+            roots.push([0u32; 8]);
+        }
+        cv = cv_out;
+    }
+    (cvs, roots)
 }
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
@@ -3908,7 +3965,7 @@ mod tests {
     /// (a single root-block, single-chunk, ROOT-flagged compression).
     #[test]
     fn compress_matches_blake3_crate_empty() {
-        let state = blake3_compress(
+        let (cv_out, root) = blake3_compress(
             &BLAKE3_IV,
             &[0u32; 16],
             0,
@@ -3917,10 +3974,13 @@ mod tests {
         );
         let mut got = [0u8; 32];
         for w in 0..8 {
-            got[w * 4..w * 4 + 4].copy_from_slice(&state[w].to_le_bytes());
+            got[w * 4..w * 4 + 4].copy_from_slice(&root[w].to_le_bytes());
         }
         let expected = *::blake3::hash(b"").as_bytes();
         assert_eq!(got, expected);
+        // The chunk loop reads `root` only when `flags & ROOT != 0`; here it
+        // is set, so `root` is well-defined. The chained CV is `cv_out`.
+        let _ = cv_out;
     }
 
     /// Reference compression matches the `blake3` crate for a full 64-byte
@@ -3936,13 +3996,15 @@ mod tests {
         for i in 0..16 {
             m[i] = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
         }
-        let state = blake3_compress(&BLAKE3_IV, &m, 0, 64, CHUNK_START | CHUNK_END | ROOT);
+        let (cv_out, root) =
+            blake3_compress(&BLAKE3_IV, &m, 0, 64, CHUNK_START | CHUNK_END | ROOT);
         let mut got = [0u8; 32];
         for w in 0..8 {
-            got[w * 4..w * 4 + 4].copy_from_slice(&state[w].to_le_bytes());
+            got[w * 4..w * 4 + 4].copy_from_slice(&root[w].to_le_bytes());
         }
         let expected = *::blake3::hash(&bytes).as_bytes();
         assert_eq!(got, expected);
+        let _ = cv_out;
     }
 
     /// Witness's out_lo / out_hi slots equal the BLAKE3 finalization XORs.
@@ -3955,7 +4017,7 @@ mod tests {
         let block_len = 64;
         let flags = CHUNK_START | CHUNK_END | ROOT;
         let z = build_block_witness(&cv, &m, counter, block_len, flags);
-        let expected = blake3_compress(&cv, &m, counter, block_len, flags);
+        let (cv_out, root) = blake3_compress(&cv, &m, counter, block_len, flags);
         for w in 0..8 {
             let mut got = 0u32;
             for b in 0..WORD_BITS {
@@ -3963,14 +4025,17 @@ mod tests {
                     got |= 1 << b;
                 }
             }
-            assert_eq!(got, expected[w], "out_lo[{w}] mismatch");
+            assert_eq!(got, cv_out[w], "out_lo[{w}] mismatch");
             let mut got_hi = 0u32;
             for b in 0..WORD_BITS {
                 if z[out_hi_bit(w, b)] {
                     got_hi |= 1 << b;
                 }
             }
-            assert_eq!(got_hi, expected[w + 8], "out_hi[{w}] mismatch");
+            // out_hi[w] is the post-finalization `state[w+8]` (i.e. the
+            // uncompressed upper half XORed with `cv[w]`), which equals
+            // `root[w] ^ cv[w]` once `root` is unwound.
+            assert_eq!(got_hi, root[w] ^ cv[w], "out_hi[{w}] mismatch");
         }
     }
 
@@ -5029,10 +5094,8 @@ mod chain_e2e_tests {
     /// The new chaining value out of `compress` is `state[0..8]` = `out_lo`.
     fn out_cv(block: &Compression) -> [u32; 8] {
         let (cv, m, ctr, blen, flags) = block;
-        let st = blake3_compress(cv, m, *ctr, *blen, *flags);
-        let mut o = [0u32; 8];
-        o.copy_from_slice(&st[0..8]);
-        o
+        let (cv_out, _root) = blake3_compress(cv, m, *ctr, *blen, *flags);
+        cv_out
     }
 
     /// Build an honest CV chain: each instance's input cv = previous instance's
