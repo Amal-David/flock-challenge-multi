@@ -164,6 +164,22 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
     [14, 15],
 ];
 
+/// BLAKE3 IV (alias for [`BLAKE3_IV`] used by the unrolled compress body).
+pub const IV: [u32; 8] = BLAKE3_IV;
+
+/// BLAKE3 per-round message schedule: `SIGMA[r][i]` is the index into the
+/// input block used as the i-th message word in round `r`. Derived by
+/// applying [`MSG_PERMUTATION`] `r` times to the identity schedule.
+pub const SIGMA: [[u32; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
 // ---------------------------------------------------------------------------
 // Layout positions (bit indices into the per-block z slice of length K)
 // ---------------------------------------------------------------------------
@@ -234,41 +250,530 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 // ---------------------------------------------------------------------------
 // Reference BLAKE3 compression — the witness oracle. Cross-checked against
 // the `blake3` crate in tests.
+//
+// 7-round fully-unrolled straight-line compress body. The 5-word chunk
+// header `(counter_lo, counter_hi, block_len, flags)` plus the CV is
+// precomputed by the caller and passed in as inline adjacent scalars; the
+// body holds the 16 state lanes (h0..h15) and 16 message words (m0..m15)
+// as `let`-bound locals across all 7 rounds so LLVM can reschedule G-mix
+// across the 7 round boundaries without materializing 7 separate 8-tuple
+// live-ranges.
+//
+// Each round is factored into a const-generic `g<const PHASE: bool>` helper
+// (`PHASE` tags the column-vs-diagonal G-mix ordering for rescheduling). The
+// intra-round ordering is column-before-diagonal: 4 column G's then 4
+// diagonal G's, with each G's 4 lanes (a, b, c, d) destructured back into
+// the 16 state scalars. After the 7 unrolled rounds complete, a
+// tail-fusion output-XOR loop over `chunks_exact_mut(8)` folds the chaining
+// value into the post-compress state in a single pass (out_lo = state_lo
+// ^ state_hi, out_hi = state_hi ^ cv).
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn g_fn(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
-    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
-    state[d] = (state[d] ^ state[a]).rotate_right(16);
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_right(12);
-    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
-    state[d] = (state[d] ^ state[a]).rotate_right(8);
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_right(7);
+/// BLAKE3 G function. `PHASE` is a compile-time tag for the column-vs-
+/// diagonal G-mix ordering so LLVM can specialize and reschedule each
+/// call site independently. Returns `(a, b, c, d)` for the caller to
+/// destructure into the 16 state scalars.
+#[inline(always)]
+fn g<const PHASE: bool>(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> (u32, u32, u32, u32) {
+    let mut a = a.wrapping_add(b).wrapping_add(mx);
+    let mut d = (d ^ a).rotate_right(16);
+    let mut c = c.wrapping_add(d);
+    let mut b = (b ^ c).rotate_right(12);
+    a = a.wrapping_add(b).wrapping_add(my);
+    d = (d ^ a).rotate_right(8);
+    c = c.wrapping_add(d);
+    b = (b ^ c).rotate_right(7);
+    let _ = PHASE;
+    (a, b, c, d)
 }
 
-fn round_fn(state: &mut [u32; 16], block: &[u32; 16]) {
-    g_fn(state, 0, 4, 8, 12, block[0], block[1]);
-    g_fn(state, 1, 5, 9, 13, block[2], block[3]);
-    g_fn(state, 2, 6, 10, 14, block[4], block[5]);
-    g_fn(state, 3, 7, 11, 15, block[6], block[7]);
-    g_fn(state, 0, 5, 10, 15, block[8], block[9]);
-    g_fn(state, 1, 6, 11, 12, block[10], block[11]);
-    g_fn(state, 2, 7, 8, 13, block[12], block[13]);
-    g_fn(state, 3, 4, 9, 14, block[14], block[15]);
-}
+/// 7-round fully-unrolled BLAKE3 compress body. The 5-word chunk header is
+/// already precomputed by [`blake3_compress`] and passed in as inline
+/// adjacent scalars so the body does not re-derive `counter_lo/hi`. Writes
+/// the post-finalization 16-word state to `state_out`.
+#[allow(clippy::too_many_arguments)]
+fn compress_in_place(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter_lo: u32,
+    counter_hi: u32,
+    block_len: u32,
+    flags: u32,
+    state_out: &mut [u32; 16],
+) {
+    // Inline adjacent scalars for IV, CV, and message block. LLVM sees every
+    // load as a register-resident value across all 7 rounds.
+    let iv0 = IV[0];
+    let iv1 = IV[1];
+    let iv2 = IV[2];
+    let iv3 = IV[3];
+    let cv0 = cv[0];
+    let cv1 = cv[1];
+    let cv2 = cv[2];
+    let cv3 = cv[3];
+    let cv4 = cv[4];
+    let cv5 = cv[5];
+    let cv6 = cv[6];
+    let cv7 = cv[7];
+    let m0 = block[0];
+    let m1 = block[1];
+    let m2 = block[2];
+    let m3 = block[3];
+    let m4 = block[4];
+    let m5 = block[5];
+    let m6 = block[6];
+    let m7 = block[7];
+    let m8 = block[8];
+    let m9 = block[9];
+    let m10 = block[10];
+    let m11 = block[11];
+    let m12 = block[12];
+    let m13 = block[13];
+    let m14 = block[14];
+    let m15 = block[15];
 
-fn permute(m: &mut [u32; 16]) {
-    let mut permuted = [0u32; 16];
-    for i in 0..16 {
-        permuted[i] = m[MSG_PERMUTATION[i]];
+    // Initial state: lanes 0..7 = cv, 8..11 = IV[0..4], 12..15 = chunk header.
+    let mut h0 = cv0;
+    let mut h1 = cv1;
+    let mut h2 = cv2;
+    let mut h3 = cv3;
+    let mut h4 = cv4;
+    let mut h5 = cv5;
+    let mut h6 = cv6;
+    let mut h7 = cv7;
+    let mut h8 = iv0;
+    let mut h9 = iv1;
+    let mut h10 = iv2;
+    let mut h11 = iv3;
+    let mut h12 = counter_lo;
+    let mut h13 = counter_hi;
+    let mut h14 = block_len;
+    let mut h15 = flags;
+
+    // Round 0: SIGMA[0] = identity.
+    // 4 column G's (PHASE=true) then 4 diagonal G's (PHASE=false).
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, m0, m1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, m2, m3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, m4, m5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, m6, m7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, m8, m9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, m10, m11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, m12, m13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, m14, m15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 1: SIGMA[1] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8].
+    let s0 = m2;
+    let s1 = m6;
+    let s2 = m3;
+    let s3 = m10;
+    let s4 = m7;
+    let s5 = m0;
+    let s6 = m4;
+    let s7 = m13;
+    let s8 = m1;
+    let s9 = m11;
+    let s10 = m12;
+    let s11 = m5;
+    let s12 = m9;
+    let s13 = m14;
+    let s14 = m15;
+    let s15 = m8;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 2: SIGMA[2] = [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1].
+    let s0 = m3;
+    let s1 = m4;
+    let s2 = m10;
+    let s3 = m12;
+    let s4 = m13;
+    let s5 = m2;
+    let s6 = m7;
+    let s7 = m14;
+    let s8 = m6;
+    let s9 = m5;
+    let s10 = m9;
+    let s11 = m0;
+    let s12 = m11;
+    let s13 = m15;
+    let s14 = m8;
+    let s15 = m1;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 3: SIGMA[3] = [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6].
+    let s0 = m10;
+    let s1 = m7;
+    let s2 = m12;
+    let s3 = m9;
+    let s4 = m14;
+    let s5 = m3;
+    let s6 = m13;
+    let s7 = m15;
+    let s8 = m4;
+    let s9 = m0;
+    let s10 = m11;
+    let s11 = m2;
+    let s12 = m5;
+    let s13 = m8;
+    let s14 = m1;
+    let s15 = m6;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 4: SIGMA[4] = [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4].
+    let s0 = m12;
+    let s1 = m13;
+    let s2 = m9;
+    let s3 = m11;
+    let s4 = m15;
+    let s5 = m10;
+    let s6 = m14;
+    let s7 = m8;
+    let s8 = m7;
+    let s9 = m2;
+    let s10 = m5;
+    let s11 = m3;
+    let s12 = m0;
+    let s13 = m1;
+    let s14 = m6;
+    let s15 = m4;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 5: SIGMA[5] = [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7].
+    let s0 = m9;
+    let s1 = m14;
+    let s2 = m11;
+    let s3 = m5;
+    let s4 = m8;
+    let s5 = m12;
+    let s6 = m15;
+    let s7 = m1;
+    let s8 = m13;
+    let s9 = m3;
+    let s10 = m0;
+    let s11 = m10;
+    let s12 = m2;
+    let s13 = m6;
+    let s14 = m4;
+    let s15 = m7;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Round 6: SIGMA[6] = [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13].
+    let s0 = m11;
+    let s1 = m15;
+    let s2 = m5;
+    let s3 = m0;
+    let s4 = m1;
+    let s5 = m9;
+    let s6 = m8;
+    let s7 = m6;
+    let s8 = m14;
+    let s9 = m10;
+    let s10 = m2;
+    let s11 = m12;
+    let s12 = m3;
+    let s13 = m4;
+    let s14 = m7;
+    let s15 = m13;
+    let (na0, nb0, nc0, nd0) = g::<true>(h0, h4, h8, h12, s0, s1);
+    h0 = na0;
+    h4 = nb0;
+    h8 = nc0;
+    h12 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<true>(h1, h5, h9, h13, s2, s3);
+    h1 = na1;
+    h5 = nb1;
+    h9 = nc1;
+    h13 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<true>(h2, h6, h10, h14, s4, s5);
+    h2 = na2;
+    h6 = nb2;
+    h10 = nc2;
+    h14 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<true>(h3, h7, h11, h15, s6, s7);
+    h3 = na3;
+    h7 = nb3;
+    h11 = nc3;
+    h15 = nd3;
+    let (na0, nb0, nc0, nd0) = g::<false>(h0, h5, h10, h15, s8, s9);
+    h0 = na0;
+    h5 = nb0;
+    h10 = nc0;
+    h15 = nd0;
+    let (na1, nb1, nc1, nd1) = g::<false>(h1, h6, h11, h12, s10, s11);
+    h1 = na1;
+    h6 = nb1;
+    h11 = nc1;
+    h12 = nd1;
+    let (na2, nb2, nc2, nd2) = g::<false>(h2, h7, h8, h13, s12, s13);
+    h2 = na2;
+    h7 = nb2;
+    h8 = nc2;
+    h13 = nd2;
+    let (na3, nb3, nc3, nd3) = g::<false>(h3, h4, h9, h14, s14, s15);
+    h3 = na3;
+    h4 = nb3;
+    h9 = nc3;
+    h14 = nd3;
+
+    // Tail-fusion output-XOR: fold cv into the 16-word post-compress state
+    // in a single pass over 8-word chunks (lo = state[0..8] ^ state[8..16],
+    // hi = state[8..16] ^ cv). One iteration of `chunks_exact_mut(8)` per
+    // half; the loop body is the unrolled G-mix's final XOR pair.
+    state_out[0] = h0;
+    state_out[1] = h1;
+    state_out[2] = h2;
+    state_out[3] = h3;
+    state_out[4] = h4;
+    state_out[5] = h5;
+    state_out[6] = h6;
+    state_out[7] = h7;
+    state_out[8] = h8;
+    state_out[9] = h9;
+    state_out[10] = h10;
+    state_out[11] = h11;
+    state_out[12] = h12;
+    state_out[13] = h13;
+    state_out[14] = h14;
+    state_out[15] = h15;
+    let mut chunks = state_out.chunks_exact_mut(8);
+    let (lo, hi) = (chunks.next().unwrap(), chunks.next().unwrap());
+    for w in 0..8 {
+        lo[w] ^= hi[w];
+        hi[w] ^= cv[w];
     }
-    *m = permuted;
 }
 
-/// BLAKE3 compression function. Returns the full 16-word output state
-/// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+/// BLAKE3 compression function. Hoists the 5-word chunk header precompute
+/// `(counter_lo, counter_hi, block_len, flags)` out of the body, then calls
+/// [`compress_in_place`] which receives the header as inline adjacent
+/// scalars. Returns the full 16-word output state (post-finalization XOR).
+/// For chaining, the new CV is `out[0..8]`.
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -276,37 +781,18 @@ pub fn blake3_compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
-    let counter_low = counter as u32;
-    let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+    let mut state = [0u32; 16];
+    compress_in_place(
+        cv,
+        block_words,
+        counter_lo,
+        counter_hi,
         block_len,
         flags,
-    ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
-    for i in 0..8 {
-        state[i] ^= state[i + 8];
-        state[i + 8] ^= cv[i];
-    }
+        &mut state,
+    );
     state
 }
 
