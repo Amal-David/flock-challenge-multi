@@ -1741,14 +1741,66 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 #[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v.len(), 128);
-    let mut out = Vec::<F128>::with_capacity(128);
-    unsafe {
-        transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-        out.set_len(128);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        let mut out = Vec::<F128>::with_capacity(128);
+        // SAFETY: the `cfg` supplies exactly the features the callee enables,
+        // and the callee initializes all 128 elements before `set_len`.
+        unsafe {
+            transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
+            out.set_len(128);
+        }
+        out
     }
-    out
+    // Portable tiling: sixteen 8-row stripes through the shared
+    // architecture-dispatching 8x64 bit transpose. Value-identical to the
+    // GFNI form; this is the body that shipped before the GFNI rewrite.
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
+        let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
+        for row_group in 0..16 {
+            let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
+            let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
+            let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
+            let mut lo_columns = [0u8; 64];
+            let mut hi_columns = [0u8; 64];
+            crate::bits::transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
+            crate::bits::transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
+            for bit in 0..64 {
+                out_bytes[bit][row_group] = lo_columns[bit];
+                out_bytes[bit + 64][row_group] = hi_columns[bit];
+            }
+        }
+        out_bytes
+            .iter()
+            .map(|b| F128 {
+                lo: u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
+                hi: u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
+            })
+            .collect()
+    }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1781,6 +1833,13 @@ unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1799,6 +1858,13 @@ unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> 
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
