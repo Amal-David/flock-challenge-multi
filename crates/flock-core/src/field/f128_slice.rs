@@ -12,6 +12,11 @@ use super::F128;
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "pclmulqdq"
+        ),
         all(target_arch = "aarch64", target_feature = "aes")
     ))
 ))]
@@ -28,6 +33,31 @@ mod aarch64;
 ))]
 mod x86_64;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "pclmulqdq"
+))]
+mod x86_64_avx2;
+
+/// Whether to use the AVX-512 + VPCLMULQDQ `x86_64` kernel when the binary
+/// is built with both AVX-512 and AVX-2 enabled (e.g. by `target-cpu=native`
+/// on Sapphire Rapids). The default is AVX-512 — but Sapphire Rapids's
+/// downstream F-divide ratio and the wider zmm store contention on this
+/// kernel tilt the price/performance a few percent toward the AVX2 path
+/// on certain input sizes, so we let the build decide. Read once per
+/// process via `FLOCK_AVX2=1|0`; default to AVX-512.
+fn avx2_preferred() -> bool {
+    static USE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        match std::env::var("FLOCK_AVX2").ok().as_deref() {
+            Some("0") | Some("false") | Some("no") => false,
+            Some(_) => true,
+            None => false,
+        }
+    });
+    *USE
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -40,15 +70,66 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
         "fold source must contain both elements for every destination pair"
     );
 
+    // x86_64: pick AVX-512 vs AVX2 at runtime. Both are statically
+    // available on a native build; the `FLOCK_AVX2=1` env var requests the
+    // AVX2 path. Both paths are gated to the appropriate target features
+    // by cfg; on a build that statically has only AVX-512 (or only AVX2),
+    // there's nothing to choose between, so the dispatch is a no-op.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
+    {
+        // Both modules compiled. Pick at runtime.
+        if avx2_preferred() {
+            // SAFETY: cfg gate guarantees avx2 + pclmulqdq; bounds check
+            // above guarantees both source elements for every output.
+            unsafe {
+                x86_64_avx2::fold_pairs(src, base, dst, r);
+                return;
+            }
+        }
+        // SAFETY: cfg gate guarantees avx512f + vpclmulqdq; bounds check
+        // above guarantees both source elements for every output.
+        unsafe {
+            x86_64::fold_pairs(src, base, dst, r);
+            return;
+        }
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    )))]
     // SAFETY: the cfg gate guarantees the required target features and the
     // bounds check above guarantees both source elements for every output.
     unsafe {
         x86_64::fold_pairs(src, base, dst, r);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: cfg gate guarantees avx2 + pclmulqdq; bounds check above
+    // guarantees both source elements for every output.
+    unsafe {
+        x86_64_avx2::fold_pairs(src, base, dst, r);
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -63,6 +144,11 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
             target_arch = "x86_64",
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
+        ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "pclmulqdq"
         ),
         all(target_arch = "aarch64", target_feature = "aes")
     )))]
@@ -153,18 +239,70 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
+    {
+        if avx2_preferred() {
+            // SAFETY: cfg gate guarantees avx2 + pclmulqdq; the length
+            // assertion guarantees one readable addend per dst slot.
+            unsafe {
+                x86_64_avx2::add_scaled(dst, addend, scale);
+                return;
+            }
+        }
+        // SAFETY: cfg gate guarantees avx512f + vpclmulqdq; the length
+        // assertion guarantees one readable addend per dst slot.
+        unsafe {
+            x86_64::add_scaled(dst, addend, scale);
+            return;
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    )))]
     // SAFETY: the cfg gate guarantees the required target features and the
     // length assertion guarantees one readable addend per destination slot.
     unsafe {
         x86_64::add_scaled(dst, addend, scale);
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: cfg gate guarantees avx2 + pclmulqdq; the length assertion
+    // guarantees one readable addend per destination slot.
+    unsafe {
+        x86_64_avx2::add_scaled(dst, addend, scale);
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "pclmulqdq"
+        )
     )))]
     for (value, &extra) in dst.iter_mut().zip(addend) {
         *value += scale * extra;
@@ -207,20 +345,30 @@ pub(crate) fn fold_pairs_with_scaled_addend(
     // bounds checks above cover both inputs for every output.
     unsafe {
         x86_64::fold_pairs_with_scaled_addend(src, addend, base, dst, r, scale);
+        return;
     }
 
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "pclmulqdq"
+        )
     )))]
-    for (t, value) in dst.iter_mut().enumerate() {
-        let index = 2 * (base + t);
-        let src_even = src[index];
-        let addend_even = addend[index];
-        let src_folded = src_even + r * (src_even + src[index + 1]);
-        let addend_folded = addend_even + r * (addend_even + addend[index + 1]);
-        *value = src_folded + scale * addend_folded;
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let index = 2 * (base + t);
+            let src_even = src[index];
+            let addend_even = addend[index];
+            let src_folded = src_even + r * (src_even + src[index + 1]);
+            let addend_folded = addend_even + r * (addend_even + addend[index + 1]);
+            *value = src_folded + scale * addend_folded;
+        }
     }
 }
 
@@ -241,18 +389,70 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
+    {
+        if avx2_preferred() {
+            // SAFETY: cfg gate guarantees avx2 + pclmulqdq; the bounds
+            // check above guarantees all four source elements per output.
+            unsafe {
+                x86_64_avx2::fold4_nested(src, dst, r0, r1);
+                return;
+            }
+        }
+        // SAFETY: cfg gate guarantees avx512f + vpclmulqdq; the bounds
+        // check above guarantees all four source elements per output.
+        unsafe {
+            x86_64::fold4_nested(src, dst, r0, r1);
+            return;
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    )))]
     // SAFETY: the cfg gate guarantees the required target features and the
     // bounds check above guarantees all four source elements per output.
     unsafe {
         x86_64::fold4_nested(src, dst, r0, r1);
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "pclmulqdq"
+    ))]
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: cfg gate guarantees avx2 + pclmulqdq; the bounds check
+    // above guarantees all four source elements per output.
+    unsafe {
+        x86_64_avx2::fold4_nested(src, dst, r0, r1);
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "pclmulqdq"
+        )
     )))]
     {
         for (t, value) in dst.iter_mut().enumerate() {
