@@ -1903,7 +1903,7 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
-    let mut tables = vec![F128::ZERO; N_BYTES * TABLE_SIZE];
+    let mut tables = crate::scratch::take_small(N_BYTES * TABLE_SIZE);
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
@@ -1992,7 +1992,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    let mut tables = crate::scratch::take_small(FOLD_N_BYTES * FOLD_TABLE_SIZE);
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2259,7 +2259,8 @@ const SPARSE_ZERO_THRESHOLD: usize = 3;
 /// position. Avoids materializing the scattered `(full_idx, val)` pairs —
 /// consumers compute the scattered idx on-the-fly via [`Self::scatter_idx`]
 /// (a bit-deposit / pdep operation) at the point of use.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+#[derive(Clone)]
 pub struct SparseEqTensor {
     /// `build_eq(live_coords)` — length `2^live_positions.len()`.
     pub live_tensor: Vec<F128>,
@@ -2594,7 +2595,7 @@ pub struct RingSwitchProof {
 
 /// What both prover and verifier compute as a result of the reduction:
 /// the transparent multilinear and the BaseFold sumcheck target.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RingSwitchOutput {
     pub rs_eq_ind: Vec<F128>,
     pub sumcheck_claim: F128,
@@ -2602,7 +2603,7 @@ pub struct RingSwitchOutput {
 
 /// Dense ingredients retained for the x86 direct-fold2 path. The table and
 /// optional products already include this claim's ring-switch γ.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct DirectFold2Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
@@ -2619,7 +2620,7 @@ pub(crate) struct DirectFold2Factors {
 /// `e_small + 4 * q`, matching the retained-coordinate producers
 /// (`s_hat_v_fold4_from_z_vec`, the zerocheck 32-bank C capture) and the
 /// little-endian order of `build_eq(suffix[..4])`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct DirectFold4Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
@@ -2632,7 +2633,7 @@ pub(crate) struct DirectFold4Factors {
 /// Factor-state sufficient statistic for the direct-fold8 opening. Rather
 /// than materializing H[64][64], retain its A/W factors bit-major and bind
 /// one bank coordinate per initial PCS challenge.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct DirectFold8Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
@@ -2743,7 +2744,7 @@ fn direct_fold8_states_seq(
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
     for d_low in 0..64 {
         let mut basis_product = low_eq[d_low];
         w_state[d_low] = fold_one_slot(basis_product, table);
@@ -2752,7 +2753,7 @@ fn direct_fold8_states_seq(
             w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
         }
     }
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state = crate::scratch::take_small(64 * n_packed); a_state.fill(F128::ZERO);
     for e in 0..64 {
         let bank = &fold8[e * n_packed..(e + 1) * n_packed];
         for (bit, value) in tensor_algebra_transpose(bank).into_iter().enumerate() {
@@ -2775,41 +2776,46 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
+    let mut w_rows_flat = crate::scratch::take_small(64 * n_packed);
+    let mut a_rows_flat = crate::scratch::take_small(64 * n_packed);
+    
+    rayon::join(
         || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
-                        row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
+            w_rows_flat.par_chunks_mut(n_packed).enumerate().for_each(|(d_low, row)| {
+                let mut basis_product = low_eq[d_low];
+                row[0] = fold_one_slot(basis_product, table);
+                for i in 1..n_packed {
+                    basis_product = crate::field::mul_by_x(basis_product);
+                    row[i] = fold_one_slot(basis_product, table);
+                }
+            })
         },
         || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                .collect()
+            a_rows_flat.par_chunks_mut(n_packed).enumerate().for_each(|(e, row)| {
+                let transposed = tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]);
+                for (i, val) in transposed.into_iter().enumerate() {
+                    row[i] = val;
+                }
+            })
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
+    let mut a_state = crate::scratch::take_small(64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
         .enumerate()
         .for_each(|(bit, (w_row, a_row))| {
             for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
-                a_row[lane] = a_rows[lane][bit];
+                w_row[lane] = w_rows_flat[lane * n_packed + bit];
+                a_row[lane] = a_rows_flat[lane * n_packed + bit];
             }
         });
+        
+    crate::scratch::give_small(w_rows_flat);
+    crate::scratch::give_small(a_rows_flat);
+    
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }
@@ -2819,7 +2825,7 @@ fn direct_fold8_states_par(
 /// suffix tensor is sparse (e.g. the hash-chain claim). Verifier-side
 /// (`ring_switch::verify` + `pcs::verify_opening_batch`) still consumes the
 /// dense [`RingSwitchOutput`].
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RingSwitchBatchOutput {
     /// For dense claims this is `γ_k · B_k` — γ is baked into the byte
     /// table during the fold inside `prove_batched_padded_with_precomputed`,
@@ -2838,7 +2844,7 @@ pub struct RingSwitchBatchOutput {
 
 /// Sparse-or-dense representation of `rs_eq_ind`. All variants here have γ_k
 /// pre-multiplied in (see `RingSwitchBatchOutput`).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum RsEqInd {
     Dense(Vec<F128>),
     /// Deferred dense: the `γ_k·B_k` buffer is **not** materialized. Instead the
@@ -2930,14 +2936,14 @@ impl RsEqInd {
 
     /// Consume into a dense `Vec<F128>`. Returns the inner vector directly when
     /// already `Dense` (no copy).
-    pub fn into_dense(self) -> Vec<F128> {
-        match self {
-            Self::Dense(v) => v,
+    pub fn into_dense(mut self) -> Vec<F128> {
+        match &mut self {
+            Self::Dense(v) => std::mem::take(v),
             Self::DeferredDense { .. } => self.to_dense(),
             Self::Sparse { len, entries } => {
-                let mut out = vec![F128::ZERO; len];
+                let mut out = vec![F128::ZERO; *len];
                 for (idx, val) in entries {
-                    out[idx] = val;
+                    out[*idx] = *val;
                 }
                 out
             }
@@ -3691,7 +3697,7 @@ pub fn verify<Ch: Challenger>(
 /// Verifier-side output of [`verify_succinct`]: contains everything the caller
 /// needs to drive the BaseFold consistency check, *without* materializing the
 /// dense `rs_eq_ind` vector of length `2^(m-7)`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RingSwitchVerifierOutput {
     pub sumcheck_claim: F128,
     /// `eq` tensor of length `2^LOG_PACKING = 128` derived from the verifier's
@@ -5325,5 +5331,46 @@ mod tests {
             assert_eq!(build_eq_parallel(&r), two_mul(&r), "n={n}");
             assert_eq!(build_eq_parallel(&r), build_eq(&r), "vs sequential n={n}");
         }
+    }
+}
+
+impl Drop for DirectFold8Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.w_state));
+        crate::scratch::give_small(std::mem::take(&mut self.a_state));
+    }
+}
+
+impl Drop for RsEqInd {
+    fn drop(&mut self) {
+        match self {
+            Self::Dense(v) => crate::scratch::give_small(std::mem::take(v)),
+            Self::DeferredDense { eq_lo, eq_hi, table, .. } => {
+                crate::scratch::give_small(std::mem::take(eq_lo));
+                crate::scratch::give_small(std::mem::take(eq_hi));
+                crate::scratch::give_small(std::mem::take(table));
+            }
+            Self::Sparse { entries, .. } => {
+                 let _ = entries;
+            }
+        }
+    }
+}
+
+impl Drop for DirectFold2Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.table));
+    }
+}
+
+impl Drop for DirectFold4Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_small(std::mem::take(&mut self.eq_lo));
+        crate::scratch::give_small(std::mem::take(&mut self.eq_hi));
+        crate::scratch::give_small(std::mem::take(&mut self.table));
     }
 }
