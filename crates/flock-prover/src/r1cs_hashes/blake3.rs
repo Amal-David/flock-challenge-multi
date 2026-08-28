@@ -135,8 +135,30 @@ pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// BLAKE3 initial hash values (alias of [`BLAKE3_IV`] used by the new
+/// unrolled `compress_in_place` driver). Identical bytes; the separate name
+/// documents the scalar compress path's own table.
+pub const IV: [u32; 8] = BLAKE3_IV;
+
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+/// BLAKE3 message-schedule table: `SIGMA[r][i]` is the index into the 16-word
+/// message block consumed by G-call `i` of round `r`. Round 0 is the identity
+/// (the block has not yet been permuted); each subsequent round is
+/// `PERM^r(SIGMA[0])` where `PERM = MSG_PERMUTATION`. The table is the seven
+/// pre-computed `PERM^r` expansions used by the unrolled `compress_in_place`
+/// driver, kept as `[[u8; 16]; 7]` so the 7-round unroll indexes it directly
+/// without recomputing permutations at runtime.
+pub const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
 
 /// Lanes touched by G index `g` within a round: `[a, b, c, d]`.
 /// First 4 are column G's, last 4 are diagonal G's.
@@ -267,8 +289,341 @@ fn permute(m: &mut [u32; 16]) {
     *m = permuted;
 }
 
+// ---------------------------------------------------------------------------
+// Scalar compress path — `compress_in_place` and the `g<const PHASE>` helper.
+//
+// The pre-existing `g_fn` / `round_fn` / `blake3_compress` loop is a generic
+// 7-round driver over a mutable state slice; it runs 56 `g_fn` calls through
+// two layers of `#[inline]` and gives the optimizer the full 7-round
+// dependency graph but no explicit 4-tuple shape. The new path makes the G-mix
+// boundary a real `#[inline(never)]` call returning `(a, b, c, d)`, and the
+// 7-round driver a single `#[inline(always)]` unroll that names the 4-tuple
+// outputs explicitly. With `g` as a real call (8 per round, 56 total) the
+// compiler emits a single body for the G-mix and the unrolled driver hands it
+// the dependency graph as 56 (input, output) pairs. The 4-tuple let-bindings
+// expose the inter-round diagonal->column edge to instruction scheduling
+// without bundling the two phases into a cross-round 8-tuple that would hide
+// the per-G producer/consumer relation.
+//
+// `PHASE` is a const-generic marker:
+//   - `PHASE = false` — column G (first 4 of a round, lanes (0,4,8,12) etc.)
+//   - `PHASE = true`  — diagonal G (last 4 of a round, lanes (0,5,10,15) etc.)
+// The G-mix body is identical for both phases; only the lane assignment
+// changes, which is fixed at the call site in the unrolled driver.
+// ---------------------------------------------------------------------------
+
+/// Pure BLAKE3 G-mix. Returns the updated `(a, b, c, d)` as a 4-tuple.
+/// `#[inline(never)]` keeps the G-mix body as a single out-of-line copy that
+/// the 7-round unrolled driver in [`compress_in_place`] calls 56 times; the
+/// unroll exposes the per-G 4-tuple inputs and outputs so the compiler can
+/// interleave the 12 arithmetic ops of one G with the 12 ops of the next.
+#[inline(never)]
+fn g<const PHASE: bool>(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> (u32, u32, u32, u32) {
+    let a = a.wrapping_add(b).wrapping_add(mx);
+    let d = (d ^ a).rotate_right(16);
+    let c = c.wrapping_add(d);
+    let b = (b ^ c).rotate_right(12);
+    let a = a.wrapping_add(b).wrapping_add(my);
+    let d = (d ^ a).rotate_right(8);
+    let c = c.wrapping_add(d);
+    let b = (b ^ c).rotate_right(7);
+    (a, b, c, d)
+}
+
+/// 7-round unrolled BLAKE3 compression on the 16-word `state` in place using
+/// the `block` as the message schedule. The driver is a single
+/// `#[inline(always)]` function so the 56 `g<const PHASE>` call sites and
+/// their 4-tuple let-bindings land at the caller; the `#[inline(never)]` on
+/// `g` makes each G-mix a real out-of-line call, so the function body is
+/// emitted once and shared by all 56 sites.
+///
+/// Per round (4 column G's then 4 diagonal G's) the 4-tuple results feed
+/// directly into the next round's column G's as the named `(a, b, c, d)`
+/// inputs. The inter-round diagonal->column handoff is left as plain
+/// sequential 4-tuple let-bindings — no cross-round 8-tuple alias — so the
+/// scheduler can interleave the latter half of round `r`'s diagonal with the
+/// first half of round `r+1`'s column (the rotations of `D3` of round `r`
+/// are independent of the `a + b + mx` of `C0` of round `r+1` until the
+/// latter reads the rotated `D3.1`).
+///
+/// `block` is the un-permuted 16-word message; the driver indexes
+/// `block[SIGMA[r][i] as usize]` for round `r`, G index `i`. The compiler
+/// folds the constant `SIGMA` table to literal indices at every call site.
+#[inline(always)]
+pub fn compress_in_place(state: &mut [u32; 16], block: &[u32; 16]) {
+    // --- Round 0: column phase, then diagonal phase -----------------------
+    // Column G's touch (0,4,8,12), (1,5,9,13), (2,6,10,14), (3,7,11,15).
+    let (a0c, b0c, c0c, d0c) = g::<false>(
+        state[0], state[4], state[8], state[12],
+        block[SIGMA[0][0] as usize], block[SIGMA[0][1] as usize],
+    );
+    let (a1c, b1c, c1c, d1c) = g::<false>(
+        state[1], state[5], state[9], state[13],
+        block[SIGMA[0][2] as usize], block[SIGMA[0][3] as usize],
+    );
+    let (a2c, b2c, c2c, d2c) = g::<false>(
+        state[2], state[6], state[10], state[14],
+        block[SIGMA[0][4] as usize], block[SIGMA[0][5] as usize],
+    );
+    let (a3c, b3c, c3c, d3c) = g::<false>(
+        state[3], state[7], state[11], state[15],
+        block[SIGMA[0][6] as usize], block[SIGMA[0][7] as usize],
+    );
+    // Diagonal G's touch (0,5,10,15), (1,6,11,12), (2,7,8,13), (3,4,9,14).
+    let (a0d, b0d, c0d, d0d) = g::<true>(
+        a0c, b1c, c2c, d3c,
+        block[SIGMA[0][8] as usize], block[SIGMA[0][9] as usize],
+    );
+    let (a1d, b1d, c1d, d1d) = g::<true>(
+        a1c, b2c, c3c, d0c,
+        block[SIGMA[0][10] as usize], block[SIGMA[0][11] as usize],
+    );
+    let (a2d, b2d, c2d, d2d) = g::<true>(
+        a2c, b3c, c0c, d1c,
+        block[SIGMA[0][12] as usize], block[SIGMA[0][13] as usize],
+    );
+    let (a3d, b3d, c3d, d3d) = g::<true>(
+        a3c, b0c, c1c, d2c,
+        block[SIGMA[0][14] as usize], block[SIGMA[0][15] as usize],
+    );
+
+    // --- Round 1 ----------------------------------------------------------
+    // After round 0's diagonal: lane 0=a0d, 1=a1d, 2=a2d, 3=a3d, 4=b3d,
+    // 5=b0d, 6=b1d, 7=b2d, 8=c2d, 9=c3d, 10=c0d, 11=c1d, 12=d1d, 13=d2d,
+    // 14=d3d, 15=d0d. Column G 0 reads (a0d, b3d, c2d, d1d); etc.
+    let (a0c1, b0c1, c0c1, d0c1) = g::<false>(
+        a0d, b3d, c2d, d1d,
+        block[SIGMA[1][0] as usize], block[SIGMA[1][1] as usize],
+    );
+    let (a1c1, b1c1, c1c1, d1c1) = g::<false>(
+        a1d, b0d, c3d, d2d,
+        block[SIGMA[1][2] as usize], block[SIGMA[1][3] as usize],
+    );
+    let (a2c1, b2c1, c2c1, d2c1) = g::<false>(
+        a2d, b1d, c0d, d3d,
+        block[SIGMA[1][4] as usize], block[SIGMA[1][5] as usize],
+    );
+    let (a3c1, b3c1, c3c1, d3c1) = g::<false>(
+        a3d, b2d, c1d, d0d,
+        block[SIGMA[1][6] as usize], block[SIGMA[1][7] as usize],
+    );
+    let (a0d1, b0d1, c0d1, d0d1) = g::<true>(
+        a0c1, b1c1, c2c1, d3c1,
+        block[SIGMA[1][8] as usize], block[SIGMA[1][9] as usize],
+    );
+    let (a1d1, b1d1, c1d1, d1d1) = g::<true>(
+        a1c1, b2c1, c3c1, d0c1,
+        block[SIGMA[1][10] as usize], block[SIGMA[1][11] as usize],
+    );
+    let (a2d1, b2d1, c2d1, d2d1) = g::<true>(
+        a2c1, b3c1, c0c1, d1c1,
+        block[SIGMA[1][12] as usize], block[SIGMA[1][13] as usize],
+    );
+    let (a3d1, b3d1, c3d1, d3d1) = g::<true>(
+        a3c1, b0c1, c1c1, d2c1,
+        block[SIGMA[1][14] as usize], block[SIGMA[1][15] as usize],
+    );
+
+    // --- Round 2 ----------------------------------------------------------
+    let (a0c2, b0c2, c0c2, d0c2) = g::<false>(
+        a0d1, b3d1, c2d1, d1d1,
+        block[SIGMA[2][0] as usize], block[SIGMA[2][1] as usize],
+    );
+    let (a1c2, b1c2, c1c2, d1c2) = g::<false>(
+        a1d1, b0d1, c3d1, d2d1,
+        block[SIGMA[2][2] as usize], block[SIGMA[2][3] as usize],
+    );
+    let (a2c2, b2c2, c2c2, d2c2) = g::<false>(
+        a2d1, b1d1, c0d1, d3d1,
+        block[SIGMA[2][4] as usize], block[SIGMA[2][5] as usize],
+    );
+    let (a3c2, b3c2, c3c2, d3c2) = g::<false>(
+        a3d1, b2d1, c1d1, d0d1,
+        block[SIGMA[2][6] as usize], block[SIGMA[2][7] as usize],
+    );
+    let (a0d2, b0d2, c0d2, d0d2) = g::<true>(
+        a0c2, b1c2, c2c2, d3c2,
+        block[SIGMA[2][8] as usize], block[SIGMA[2][9] as usize],
+    );
+    let (a1d2, b1d2, c1d2, d1d2) = g::<true>(
+        a1c2, b2c2, c3c2, d0c2,
+        block[SIGMA[2][10] as usize], block[SIGMA[2][11] as usize],
+    );
+    let (a2d2, b2d2, c2d2, d2d2) = g::<true>(
+        a2c2, b3c2, c0c2, d1c2,
+        block[SIGMA[2][12] as usize], block[SIGMA[2][13] as usize],
+    );
+    let (a3d2, b3d2, c3d2, d3d2) = g::<true>(
+        a3c2, b0c2, c1c2, d2c2,
+        block[SIGMA[2][14] as usize], block[SIGMA[2][15] as usize],
+    );
+
+    // --- Round 3 ----------------------------------------------------------
+    let (a0c3, b0c3, c0c3, d0c3) = g::<false>(
+        a0d2, b3d2, c2d2, d1d2,
+        block[SIGMA[3][0] as usize], block[SIGMA[3][1] as usize],
+    );
+    let (a1c3, b1c3, c1c3, d1c3) = g::<false>(
+        a1d2, b0d2, c3d2, d2d2,
+        block[SIGMA[3][2] as usize], block[SIGMA[3][3] as usize],
+    );
+    let (a2c3, b2c3, c2c3, d2c3) = g::<false>(
+        a2d2, b1d2, c0d2, d3d2,
+        block[SIGMA[3][4] as usize], block[SIGMA[3][5] as usize],
+    );
+    let (a3c3, b3c3, c3c3, d3c3) = g::<false>(
+        a3d2, b2d2, c1d2, d0d2,
+        block[SIGMA[3][6] as usize], block[SIGMA[3][7] as usize],
+    );
+    let (a0d3, b0d3, c0d3, d0d3) = g::<true>(
+        a0c3, b1c3, c2c3, d3c3,
+        block[SIGMA[3][8] as usize], block[SIGMA[3][9] as usize],
+    );
+    let (a1d3, b1d3, c1d3, d1d3) = g::<true>(
+        a1c3, b2c3, c3c3, d0c3,
+        block[SIGMA[3][10] as usize], block[SIGMA[3][11] as usize],
+    );
+    let (a2d3, b2d3, c2d3, d2d3) = g::<true>(
+        a2c3, b3c3, c0c3, d1c3,
+        block[SIGMA[3][12] as usize], block[SIGMA[3][13] as usize],
+    );
+    let (a3d3, b3d3, c3d3, d3d3) = g::<true>(
+        a3c3, b0c3, c1c3, d2c3,
+        block[SIGMA[3][14] as usize], block[SIGMA[3][15] as usize],
+    );
+
+    // --- Round 4 ----------------------------------------------------------
+    let (a0c4, b0c4, c0c4, d0c4) = g::<false>(
+        a0d3, b3d3, c2d3, d1d3,
+        block[SIGMA[4][0] as usize], block[SIGMA[4][1] as usize],
+    );
+    let (a1c4, b1c4, c1c4, d1c4) = g::<false>(
+        a1d3, b0d3, c3d3, d2d3,
+        block[SIGMA[4][2] as usize], block[SIGMA[4][3] as usize],
+    );
+    let (a2c4, b2c4, c2c4, d2c4) = g::<false>(
+        a2d3, b1d3, c0d3, d3d3,
+        block[SIGMA[4][4] as usize], block[SIGMA[4][5] as usize],
+    );
+    let (a3c4, b3c4, c3c4, d3c4) = g::<false>(
+        a3d3, b2d3, c1d3, d0d3,
+        block[SIGMA[4][6] as usize], block[SIGMA[4][7] as usize],
+    );
+    let (a0d4, b0d4, c0d4, d0d4) = g::<true>(
+        a0c4, b1c4, c2c4, d3c4,
+        block[SIGMA[4][8] as usize], block[SIGMA[4][9] as usize],
+    );
+    let (a1d4, b1d4, c1d4, d1d4) = g::<true>(
+        a1c4, b2c4, c3c4, d0c4,
+        block[SIGMA[4][10] as usize], block[SIGMA[4][11] as usize],
+    );
+    let (a2d4, b2d4, c2d4, d2d4) = g::<true>(
+        a2c4, b3c4, c0c4, d1c4,
+        block[SIGMA[4][12] as usize], block[SIGMA[4][13] as usize],
+    );
+    let (a3d4, b3d4, c3d4, d3d4) = g::<true>(
+        a3c4, b0c4, c1c4, d2c4,
+        block[SIGMA[4][14] as usize], block[SIGMA[4][15] as usize],
+    );
+
+    // --- Round 5 ----------------------------------------------------------
+    let (a0c5, b0c5, c0c5, d0c5) = g::<false>(
+        a0d4, b3d4, c2d4, d1d4,
+        block[SIGMA[5][0] as usize], block[SIGMA[5][1] as usize],
+    );
+    let (a1c5, b1c5, c1c5, d1c5) = g::<false>(
+        a1d4, b0d4, c3d4, d2d4,
+        block[SIGMA[5][2] as usize], block[SIGMA[5][3] as usize],
+    );
+    let (a2c5, b2c5, c2c5, d2c5) = g::<false>(
+        a2d4, b1d4, c0d4, d3d4,
+        block[SIGMA[5][4] as usize], block[SIGMA[5][5] as usize],
+    );
+    let (a3c5, b3c5, c3c5, d3c5) = g::<false>(
+        a3d4, b2d4, c1d4, d0d4,
+        block[SIGMA[5][6] as usize], block[SIGMA[5][7] as usize],
+    );
+    let (a0d5, b0d5, c0d5, d0d5) = g::<true>(
+        a0c5, b1c5, c2c5, d3c5,
+        block[SIGMA[5][8] as usize], block[SIGMA[5][9] as usize],
+    );
+    let (a1d5, b1d5, c1d5, d1d5) = g::<true>(
+        a1c5, b2c5, c3c5, d0c5,
+        block[SIGMA[5][10] as usize], block[SIGMA[5][11] as usize],
+    );
+    let (a2d5, b2d5, c2d5, d2d5) = g::<true>(
+        a2c5, b3c5, c0c5, d1c5,
+        block[SIGMA[5][12] as usize], block[SIGMA[5][13] as usize],
+    );
+    let (a3d5, b3d5, c3d5, d3d5) = g::<true>(
+        a3c5, b0c5, c1c5, d2c5,
+        block[SIGMA[5][14] as usize], block[SIGMA[5][15] as usize],
+    );
+
+    // --- Round 6 ----------------------------------------------------------
+    let (a0c6, b0c6, c0c6, d0c6) = g::<false>(
+        a0d5, b3d5, c2d5, d1d5,
+        block[SIGMA[6][0] as usize], block[SIGMA[6][1] as usize],
+    );
+    let (a1c6, b1c6, c1c6, d1c6) = g::<false>(
+        a1d5, b0d5, c3d5, d2d5,
+        block[SIGMA[6][2] as usize], block[SIGMA[6][3] as usize],
+    );
+    let (a2c6, b2c6, c2c6, d2c6) = g::<false>(
+        a2d5, b1d5, c0d5, d3d5,
+        block[SIGMA[6][4] as usize], block[SIGMA[6][5] as usize],
+    );
+    let (a3c6, b3c6, c3c6, d3c6) = g::<false>(
+        a3d5, b2d5, c1d5, d0d5,
+        block[SIGMA[6][6] as usize], block[SIGMA[6][7] as usize],
+    );
+    let (a0d6, b0d6, c0d6, d0d6) = g::<true>(
+        a0c6, b1c6, c2c6, d3c6,
+        block[SIGMA[6][8] as usize], block[SIGMA[6][9] as usize],
+    );
+    let (a1d6, b1d6, c1d6, d1d6) = g::<true>(
+        a1c6, b2c6, c3c6, d0c6,
+        block[SIGMA[6][10] as usize], block[SIGMA[6][11] as usize],
+    );
+    let (a2d6, b2d6, c2d6, d2d6) = g::<true>(
+        a2c6, b3c6, c0c6, d1c6,
+        block[SIGMA[6][12] as usize], block[SIGMA[6][13] as usize],
+    );
+    let (a3d6, b3d6, c3d6, d3d6) = g::<true>(
+        a3c6, b0c6, c1c6, d2c6,
+        block[SIGMA[6][14] as usize], block[SIGMA[6][15] as usize],
+    );
+
+    // --- Commit the 16 lane values back to the state slice. ---------------
+    // Lane mapping after the final diagonal: 0=a0d6, 1=a1d6, 2=a2d6,
+    // 3=a3d6, 4=b3d6, 5=b0d6, 6=b1d6, 7=b2d6, 8=c2d6, 9=c3d6, 10=c0d6,
+    // 11=c1d6, 12=d1d6, 13=d2d6, 14=d3d6, 15=d0d6.
+    state[0] = a0d6;
+    state[1] = a1d6;
+    state[2] = a2d6;
+    state[3] = a3d6;
+    state[4] = b3d6;
+    state[5] = b0d6;
+    state[6] = b1d6;
+    state[7] = b2d6;
+    state[8] = c2d6;
+    state[9] = c3d6;
+    state[10] = c0d6;
+    state[11] = c1d6;
+    state[12] = d1d6;
+    state[13] = d2d6;
+    state[14] = d3d6;
+    state[15] = d0d6;
+}
+
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+///
+/// The state evolution is delegated to [`compress_in_place`], the new
+/// `#[inline(always)]` 7-round unrolled driver. The G-mix runs through
+/// 56 `g<const PHASE>` calls (the `#[inline(never)]` helper) with 4-tuple
+/// let-bindings between rounds, replacing the old `g_fn`/`round_fn` loop
+/// that called `g_fn` 56 times through two layers of `#[inline]`.
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -296,13 +651,7 @@ pub fn blake3_compress(
         block_len,
         flags,
     ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
+    compress_in_place(&mut state, block_words);
     for i in 0..8 {
         state[i] ^= state[i + 8];
         state[i + 8] ^= cv[i];
