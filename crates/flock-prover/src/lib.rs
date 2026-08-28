@@ -36,7 +36,7 @@ pub mod seed_pipe;
 ))]
 #[global_allocator]
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
-// resample gtr r1 20260819-1220
+// claude-x86 r11 sub128 draw2
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];

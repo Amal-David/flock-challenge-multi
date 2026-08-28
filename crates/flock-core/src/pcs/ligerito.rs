@@ -4621,7 +4621,13 @@ fn materialize_direct_fold4(
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     // Ranked path has no ordinary basis and uses fold16_banked, so the mid
     // buffer is dead there — allocate it only when the nested b-side needs it.
-    const SUB: usize = 256;
+    // 128 output slots, not 256. The comment above sizes this sub-block's
+    // inputs at 4096 elements -- 64 KiB -- and calls it an L1 stage, but this
+    // part's L1 data cache is 48 KiB. At 256 slots the inputs alone overflow
+    // it before the mid buffer and the fold tables are counted, so every pass
+    // over the sub-block refetches from L2. Halving the slot count puts the
+    // inputs at 32 KiB and leaves room for the rest of the working set.
+    const SUB: usize = 128;
     let deferred_reduce = super::fold_deferred_reduce_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
@@ -5929,7 +5935,13 @@ fn materialize_direct_fold8_f_for_precommit(
 ) {
     use rayon::prelude::*;
 
-    const SUB: usize = 256;
+    // 128 output slots, not 256. The comment above sizes this sub-block's
+    // inputs at 4096 elements -- 64 KiB -- and calls it an L1 stage, but this
+    // part's L1 data cache is 48 KiB. At 256 slots the inputs alone overflow
+    // it before the mid buffer and the fold tables are counted, so every pass
+    // over the sub-block refetches from L2. Halving the slot count puts the
+    // inputs at 32 KiB and leaves room for the rest of the working set.
+    const SUB: usize = 128;
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     folded_f
         .par_chunks_mut(block_len)
@@ -6222,7 +6234,13 @@ fn materialize_direct_fold8(
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    const SUB: usize = 256;
+    // 128 output slots, not 256. The comment above sizes this sub-block's
+    // inputs at 4096 elements -- 64 KiB -- and calls it an L1 stage, but this
+    // part's L1 data cache is 48 KiB. At 256 slots the inputs alone overflow
+    // it before the mid buffer and the fold tables are counted, so every pass
+    // over the sub-block refetches from L2. Halving the slot count puts the
+    // inputs at 32 KiB and leaves room for the rest of the working set.
+    const SUB: usize = 128;
     /// `RecycleAlloc` (`flock-prover/src/recycle_alloc.rs`) only hands back
     /// 64-byte-aligned pointers for allocations of at least `RECYCLE_MIN`
     /// = 32 KiB; anything smaller goes straight to the system allocator and
