@@ -16,7 +16,6 @@
 //!
 //! Ranked live path: `generate_witness_with_ab_packed_and_round1_inner_impl`
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
-
 use super::{
     ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE,
     USEFUL_BITS, WORD_BITS,
@@ -28,7 +27,6 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
-
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
@@ -83,9 +81,7 @@ const _ELIDE_GEOMETRY: () = {
     assert!(ELIDE_B_TAIL_CHUNK_WIN % 2 == 0);
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
-
 type V8 = __m256i;
-
 /// Input form for one eight-compression witness kernel invocation.
 ///
 /// The ranked speculative path carries the generator's closed form all the
@@ -96,7 +92,6 @@ pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
     Closed { init: u64, base: usize },
 }
-
 struct PreparedInputs {
     cv: [V8; 8],
     message: [V8; 16],
@@ -105,7 +100,6 @@ struct PreparedInputs {
     block_len: V8,
     flags: V8,
 }
-
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
 /// handles the low limbs; the two cross-products supply bits 32..63. The
 /// high×high term is above bit 63 and is discarded, exactly like
@@ -124,7 +118,6 @@ unsafe fn mullo_u64x4(a: __m256i, b: u64) -> __m256i {
         _mm256_add_epi64(lo, _mm256_slli_epi64::<32>(cross))
     }
 }
-
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn mix_u64x4(mut z: __m256i) -> __m256i {
@@ -136,7 +129,6 @@ unsafe fn mix_u64x4(mut z: __m256i) -> __m256i {
         _mm256_xor_si256(z, _mm256_srli_epi64::<31>(z))
     }
 }
-
 /// Pack the low u32 of eight u64 lanes into one `V8`, preserving block order.
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
@@ -148,7 +140,6 @@ unsafe fn pack_low_u32x8(lo: __m256i, hi: __m256i) -> V8 {
         _mm256_permute2x128_si256::<0x20>(lo, hi)
     }
 }
-
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
@@ -159,7 +150,6 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
         pack_low_u32x8(mix_u64x4(states[0]), mix_u64x4(states[1]))
     }
 }
-
 /// Generate the exact protected-wrapper inputs for blocks `base..base+8`
 /// directly in the word-major form consumed by the witness kernel. AVX2
 /// targets use two four-lane SplitMix states and the low-limb multiplication
@@ -198,7 +188,6 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
         }
     }
 }
-
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
@@ -216,7 +205,6 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
-
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
@@ -228,7 +216,6 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
-
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
@@ -259,17 +246,14 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
         }
     }
 }
-
 #[inline(always)]
 unsafe fn load_v8(p: *const u32) -> V8 {
     unsafe { _mm256_loadu_si256(p.cast::<__m256i>()) }
 }
-
 #[inline(always)]
 unsafe fn store_v8(p: *mut u32, v: V8) {
     unsafe { _mm256_storeu_si256(p.cast::<__m256i>(), v) }
 }
-
 /// Widen one staged 64-byte window side (its two transposed V8 rows, still in
 /// registers) to the pre-scaled `u16` offset half the split shift-reduce
 /// kernel consumes: `byte * 64` per lane, two ZMM stores. Identical values to
@@ -284,17 +268,14 @@ unsafe fn widen_off_half(lo: V8, hi: V8, op: *mut u16) {
         _mm512_store_si512(op.add(32).cast::<__m512i>(), w(hi));
     }
 }
-
 #[inline(always)]
 fn dup_u32(x: u32) -> V8 {
     unsafe { _mm256_set1_epi32(x as i32) }
 }
-
 #[inline(always)]
 fn xor_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_xor_si256(a, b) }
 }
-
 /// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
 /// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
 /// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
@@ -310,32 +291,26 @@ fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
         _mm256_xor_si256(_mm256_xor_si256(a, b), c)
     }
 }
-
 #[inline(always)]
 fn or_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_or_si256(a, b) }
 }
-
 #[inline(always)]
 fn and_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_and_si256(a, b) }
 }
-
 #[inline(always)]
 fn add_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_add_epi32(a, b) }
 }
-
 #[inline(always)]
 fn shr_v8<const N: i32>(v: V8) -> V8 {
     unsafe { _mm256_srli_epi32::<N>(v) }
 }
-
 #[inline(always)]
 fn shl_v8<const N: i32>(v: V8) -> V8 {
     unsafe { _mm256_slli_epi32::<N>(v) }
 }
-
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
@@ -359,7 +334,6 @@ fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
         _mm256_or_si256(_mm256_slli_epi32::<N>(b), _mm256_and_si256(a, mask))
     }
 }
-
 /// 8×8 u32 transpose. `r[i]` lane `j` becomes `out[j]` lane `i`.
 #[inline(always)]
 fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8] {
@@ -372,7 +346,6 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
         let t5 = _mm256_unpackhi_epi32(v4, v5);
         let t6 = _mm256_unpacklo_epi32(v6, v7);
         let t7 = _mm256_unpackhi_epi32(v6, v7);
-
         let u0 = _mm256_unpacklo_epi64(t0, t2);
         let u1 = _mm256_unpackhi_epi64(t0, t2);
         let u2 = _mm256_unpacklo_epi64(t1, t3);
@@ -381,7 +354,6 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
         let u5 = _mm256_unpackhi_epi64(t4, t6);
         let u6 = _mm256_unpacklo_epi64(t5, t7);
         let u7 = _mm256_unpackhi_epi64(t5, t7);
-
         [
             _mm256_permute2x128_si256::<0x20>(u0, u4),
             _mm256_permute2x128_si256::<0x20>(u1, u5),
@@ -394,7 +366,6 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
         ]
     }
 }
-
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
@@ -405,7 +376,6 @@ const _RING_GEOMETRY: () = {
     // Every epoch boundary is a whole number of drain steps.
     assert!(RING_WORDS % STEP_WORDS == 0);
 };
-
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
 /// step is one 64-byte round-1 medium window per block, so the transform runs
 /// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
@@ -421,14 +391,12 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
 }
-
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
         // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
     }
-
     /// Transform the staged window `blk` (`0..2 · 16`) for every live block.
     ///
     /// # Safety
@@ -440,7 +408,6 @@ impl StreamProj<'_> {
             self.project_blocks(blk, plan, imgs, None, None);
         }
     }
-
     /// The window's per-block invariants: its static-B eligibility and the
     /// table images the kernel addresses. Both are the same for all eight
     /// blocks, so a producer that walks the eight blocks in several pieces
@@ -450,7 +417,6 @@ impl StreamProj<'_> {
         let p = self.plan.for_window(blk);
         (p, round1_ab_table_images(self.inv_table, p))
     }
-
     /// [`Self::project`] with the window invariants already resolved, and with
     /// an optional set of drain rows to publish AS the eight blocks are
     /// transformed. `rows` is what makes the streaming stores spread: they are
@@ -535,7 +501,6 @@ impl StreamProj<'_> {
         }
     }
 }
-
 /// Rolling drain state shared by the A/B packed writers. The witness uses two
 /// reusable `RING_WORDS`-word epochs instead of full 512-word stages; B's
 /// writer flushes after A has written the epoch, and Z is derived from the
@@ -553,7 +518,6 @@ struct Drain8<'t> {
     wide_nt: bool,
     spread: bool,
 }
-
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
 /// Sapphire Rapids keeps pending bits at the high end of each lane so VBMI2
 /// can join them to the next field with one `vpshldd`; the portable AVX2
@@ -569,7 +533,6 @@ fn packer_initial_bit(bit: V8) -> V8 {
         bit
     }
 }
-
 /// Recover low-aligned pending bits from the VBMI2 representation. `BACK` is
 /// `32 - used`; the ranked stream finishes with `used = 17`, hence `BACK=15`.
 #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
@@ -580,7 +543,6 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
     }
     shr_v8::<BACK>(pending)
 }
-
 /// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
 ///
 /// On AVX-512VBMI2+VL targets `pending` is high-aligned: if `USED = u > 0`,
@@ -588,32 +550,28 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t> {
+struct W8<'t, const FLUSH: bool> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
-    flush: bool,
 }
-
-impl<'t> W8<'t> {
+impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
-    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, flush: bool) -> Self {
+    fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>) -> Self {
         Self {
             pending,
             stage,
             drain,
-            flush,
         }
     }
-
     #[inline(always)]
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
             store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
-            if self.flush && WORD % RING_WORDS == RING_WORDS - 1 {
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
-                // at word 16; later epochs cover their complete 128 words.
+                // at word 16; later epochs cover their complete RING_WORDS.
                 if WORD + 1 == RING_WORDS {
                     (*self.drain).drain_range(16, 16, RING_WORDS - 16);
                 } else {
@@ -622,7 +580,6 @@ impl<'t> W8<'t> {
             }
         }
     }
-
     #[inline(always)]
     unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
         &mut self,
@@ -681,7 +638,6 @@ impl<'t> W8<'t> {
             }
         }
     }
-
     #[inline(always)]
     unsafe fn finish(&mut self) {
         const {
@@ -699,7 +655,6 @@ impl<'t> W8<'t> {
         }
     }
 }
-
 macro_rules! pushf8 {
     ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
         $w.push::<{ ($pos % 32) as i32 }, $width, {
@@ -708,27 +663,25 @@ macro_rules! pushf8 {
         }, { $pos / 32 }>($v);
     }};
 }
-
 #[inline(always)]
-fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
+fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8) {
     // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
     // `left = x ^ cin` and `right = y ^ cin`, and both collapse algebraically
     // (`left = sum ^ y`, `right = sum ^ x`). Computing them off `sum` removes
     // the carry-in XOR chain entirely — bit-identical outputs, one op less.
+    // The carry (`left & right`) is never read by any caller, so it is not
+    // computed here, saving one `vpand` per call (112 per octa witness build).
     let sum = add_v8(x, y);
     let left = xor_v8(sum, y);
     let right = xor_v8(sum, x);
-    let carry = and_v8(left, right);
-    (sum, left, right, carry)
+    (sum, left, right)
 }
-
 #[inline(always)]
 fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     debug_assert_eq!(N + M, 32);
     let v = xor_v8(x, y);
     ror_v8::<N>(v)
 }
-
 /// Rotate-right by N on AVX-512 (single `vprold`, EVEX.256) -- three ops on
 /// AVX2. Bit-identical either way; the witness phase is ALU-bound so the
 /// uop cut matters on the ranked runner. The EVEX form needs `avx512f`.
@@ -752,7 +705,6 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
         }
     }
 }
-
 /// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
 /// 32-byte block runs. Temporal stores only.
 #[inline(always)]
@@ -780,22 +732,30 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
         }
     }
 }
-
-/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
+#[inline(always)]
 fn wide_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
-    *ON
+    // Ranked Sapphire Rapids always benefits from 64-byte ZMM streams;
+    // keep env gate for local debugging without LazyLock overhead on hot path.
+    #[cfg(target_feature = "avx512f")]
+    { true }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
+        *ON
+    }
 }
-
-/// `FLOCK_NO_SPREAD_NT=1` restores the bunched drain step (three eight-row
-/// runs of streaming stores, then the whole window's projection).
+#[inline(always)]
 fn spread_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
-    *ON
+    #[cfg(target_feature = "avx512f")]
+    { true }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
+        *ON
+    }
 }
-
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -830,7 +790,6 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, w
         }
     }
 }
-
 /// Transpose the eight stage words at `w` (one `dump` chunk) into eight
 /// row-major 32-byte runs.
 #[inline(always)]
@@ -848,7 +807,6 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
         )
     }
 }
-
 /// Publish one 32-byte transposed run non-temporally.
 ///
 /// # Safety
@@ -866,7 +824,6 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
         _mm_stream_si128(p.add(4).cast::<__m128i>(), _mm256_extracti128_si256::<1>(v));
     }
 }
-
 /// Publish a chunk PAIR — two consecutive 32-byte runs, i.e. one 64-byte
 /// cache line when `p` is line-aligned — non-temporally, closing the line's
 /// write-combining buffer in one shot where the ISA allows it.
@@ -887,7 +844,6 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
         stream_v8(p.add(8), vb, wide_nt);
     }
 }
-
 /// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
 /// (its high run), under the same `nt`/liveness policy — and therefore with
 /// the same bytes at the same addresses — as [`Drain8::publish_step`]'s body.
@@ -919,15 +875,13 @@ unsafe fn emit_pair(
         }
     }
 }
-
 /// One drain step's three destination rows, staged for publication BETWEEN
 /// block transforms by [`StreamProj::project_blocks`].
 ///
-/// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input), and z's
-/// sixteen transposed rows are in the drain's frame, which is where the
-/// bunched arm spills them anyway. The publisher therefore re-reads each row
-/// from L1 and the spread costs no extra spill traffic.
+/// A/B rows are cached from the drain's tr8 registers so spread publish
+/// emits them without reloading staging. Staging still holds identical bytes
+/// for the byte-window fallback; on offset-eligible windows staging stores
+/// are elided entirely.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
@@ -935,18 +889,21 @@ struct StepRows {
     b: *mut u32,
     z_lo: *const V8,
     z_hi: *const V8,
+    a_lo: [V8; 8],
+    a_hi: [V8; 8],
+    b_lo: [V8; 8],
+    b_hi: [V8; 8],
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
 }
-
 impl StepRows {
     /// Publish block `j`'s three rows.
     ///
     /// # Safety
     /// `self` describes one live drain step and `j < 8`.
     #[inline(always)]
-    unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
+    unsafe fn publish(&self, j: usize, _sa: *const u32, _sb: *const u32) {
         unsafe {
             let f = self.flags;
             let wide = f & 0x80 != 0;
@@ -960,21 +917,19 @@ impl StepRows {
                 f & 0x40 != 0,
                 wide,
             );
-            let p = sa.add(j * STEP_WORDS);
             emit_pair(
                 self.a.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                self.a_lo[j],
+                self.a_hi[j],
                 f & 4 != 0,
                 f & 8 != 0,
                 true,
                 wide,
             );
-            let p = sb.add(j * STEP_WORDS);
             emit_pair(
                 self.b.add(o),
-                load_v8(p),
-                load_v8(p.add(8)),
+                self.b_lo[j],
+                self.b_hi[j],
                 f & 0x10 != 0,
                 f & 0x20 != 0,
                 true,
@@ -983,7 +938,6 @@ impl StepRows {
         }
     }
 }
-
 impl Drain8<'_> {
     /// Transpose one 16-word drain step of the current ring epoch and publish
     /// it. `carry`, when present, additionally receives all sixteen words of
@@ -1030,7 +984,6 @@ impl Drain8<'_> {
             }
         }
     }
-
     /// Publish one B step and derive the matching Z rows from the already
     /// transposed A rows. Every R1CS row satisfies `z = a & b`; `tr8` is a
     /// bit permutation, so the identity is unchanged after transposition.
@@ -1063,20 +1016,17 @@ impl Drain8<'_> {
             let z_hi_live = g + 1 < z_g1;
             let b_lo_live = g >= b_g0 && g < b_g1;
             let b_hi_live = g + 1 >= b_g0 && g + 1 < b_g1;
-
             for r in 0..8 {
                 let ap = a_rows.0.add(r * a_rows.1);
                 let a_lo = load_v8(ap);
                 let a_hi = load_v8(ap.add(8));
                 let z_lo = and_v8(a_lo, b_lo_rows[r]);
                 let z_hi = and_v8(a_hi, b_hi_rows[r]);
-
                 if let Some((base, row_stride)) = b_carry {
                     let p = base.add(r * row_stride);
                     store_v8(p, b_lo_rows[r]);
                     store_v8(p.add(8), b_hi_rows[r]);
                 }
-
                 let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (b_nt, b_lo_live, b_hi_live) {
                     (true, true, true) => {
@@ -1092,7 +1042,6 @@ impl Drain8<'_> {
                     (false, false, true) => store_v8(bp.add(8), b_hi_rows[r]),
                     (_, false, false) => {}
                 }
-
                 let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
                 match (z_nt, z_lo_live, z_hi_live) {
                     (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
@@ -1109,7 +1058,6 @@ impl Drain8<'_> {
             }
         }
     }
-
     #[inline(always)]
     fn ab_ranges(&self) -> (usize, usize, usize) {
         let a_g1 = if self.elide[1] {
@@ -1131,7 +1079,6 @@ impl Drain8<'_> {
         };
         (a_g1, b_g0, b_g1)
     }
-
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
@@ -1185,7 +1132,6 @@ impl Drain8<'_> {
             self.drain_range_buffered(base_word, ring_word, words);
         }
     }
-
     /// Same bytes as the bunched arm of [`Self::drain_range`], published on a
     /// different SCHEDULE.
     ///
@@ -1240,7 +1186,6 @@ impl Drain8<'_> {
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                 let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
-
                 // Transpose the two ring sides first. a and b go straight
                 // into the projection's staging — which is both its input AND
                 // the bytes the main buffers get, so nothing is published yet.
@@ -1249,33 +1194,29 @@ impl Drain8<'_> {
                 // A/B rows instead of transposing a third Z ring.
                 let a_lo = tr8_chunk(self.ast, rw);
                 let a_hi = tr8_chunk(self.ast, rw + 8);
-                for r in 0..8 {
-                    let p = sa.add(r * STEP_WORDS);
-                    store_v8(p, a_lo[r]);
-                    store_v8(p.add(8), a_hi[r]);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    if use_off {
-                        widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
-                    }
-                }
                 let b_lo = tr8_chunk(self.bs, rw);
                 let b_hi = tr8_chunk(self.bs, rw + 8);
-                for r in 0..8 {
-                    let p = sb.add(r * STEP_WORDS);
-                    store_v8(p, b_lo[r]);
-                    store_v8(p.add(8), b_hi[r]);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    if use_off {
-                        widen_off_half(
-                            b_lo[r],
-                            b_hi[r],
-                            op.add(r * ROUND1_AB_OFF_WORDS + 64),
-                        );
+                if !use_off {
+                    for r in 0..8 {
+                        let p = sa.add(r * STEP_WORDS);
+                        store_v8(p, a_lo[r]);
+                        store_v8(p.add(8), a_hi[r]);
+                    }
+                    for r in 0..8 {
+                        let p = sb.add(r * STEP_WORDS);
+                        store_v8(p, b_lo[r]);
+                        store_v8(p.add(8), b_hi[r]);
+                    }
+                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                if use_off {
+                    for r in 0..8 {
+                        widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
+                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
                     }
                 }
                 let z_lo: [V8; 8] = core::array::from_fn(|r| and_v8(a_lo[r], b_lo[r]));
                 let z_hi: [V8; 8] = core::array::from_fn(|r| and_v8(a_hi[r], b_hi[r]));
-
                 let g = abs_word / 8;
                 let mut flags = base;
                 if g < z_g1 {
@@ -1302,9 +1243,12 @@ impl Drain8<'_> {
                     b: self.b.add(abs_word),
                     z_lo: z_lo.as_ptr(),
                     z_hi: z_hi.as_ptr(),
+                    a_lo,
+                    a_hi,
+                    b_lo,
+                    b_hi,
                     flags,
                 };
-
                 proj.project_blocks(
                     blk,
                     plan,
@@ -1315,7 +1259,6 @@ impl Drain8<'_> {
             }
         }
     }
-
     /// The two non-streaming drains — the `win_ab` window fusion and the plain
     /// temporal publish. Out of line so the streaming drain above keeps a
     /// register allocation of its own.
@@ -1399,7 +1342,6 @@ impl Drain8<'_> {
         }
     }
 }
-
 /// Dual-destination twin of [`dump_range_nt`] for the a/b sides: one
 /// transpose feeds BOTH
 ///  * `dst` — the main witness buffer, published NON-TEMPORALLY over the
@@ -1465,7 +1407,6 @@ unsafe fn dump_range_nt_win(
         }
     }
 }
-
 #[inline(always)]
 unsafe fn dump_elide(
     stage: *const V8,
@@ -1490,7 +1431,6 @@ unsafe fn dump_elide(
         }
     }
 }
-
 /// [`dump_elide`]'s dual-destination form: same elide range selection, always
 /// non-temporal into `dst`, always FULL into `win`. See [`dump_range_nt_win`].
 #[inline(always)]
@@ -1511,7 +1451,6 @@ unsafe fn dump_elide_win(
     let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
     unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
 }
-
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
@@ -1572,7 +1511,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                     cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
                     cv_rows[6], cv_rows[7],
                 );
-
                 let mptrs = [
                     inputs[0].1.as_ptr(),
                     inputs[1].1.as_ptr(),
@@ -1606,7 +1544,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 let mut message = [dup_u32(0); 16];
                 message[..8].copy_from_slice(&m_lo);
                 message[8..].copy_from_slice(&m_hi);
-
                 let mut tlo_a = [0u32; 8];
                 let mut thi_a = [0u32; 8];
                 let mut bl_a = [0u32; 8];
@@ -1634,7 +1571,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let thi = prepared.counter_hi;
         let blen = prepared.block_len;
         let flags = prepared.flags;
-
         let mut state: [V8; 16] = [
             cv_v[0],
             cv_v[1],
@@ -1653,13 +1589,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             blen,
             flags,
         ];
-
         let zero = dup_u32(0);
         let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
         let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
-
         let mut drain = Drain8 {
             ast,
             bs,
@@ -1692,7 +1626,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
-
         // The round stream starts at word `PROLOGUE_WORDS + 16`, so a first
         // epoch that ends inside the prologue never reaches the writers'
         // epoch boundary — publish it here instead. Constant-folded away for
@@ -1700,36 +1633,34 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         if RING_WORDS <= PROLOGUE_WORDS + 16 {
             drain.drain_range(16, 16, RING_WORDS - 16);
         }
-
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::at(bs, packer_initial_bit(one), drain_ptr, true);
-
+        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr);
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
-                let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
+                let (t0, l0, r0) = add_carry_parts_v8(state[$la], state[$lb]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
+                let (a1, l1, r1) = add_carry_parts_v8(t0, m[$mx]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
-                let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
+                let (c1s, l2, r2) = add_carry_parts_v8(state[$lc], d1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
-                let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
+                let (t1, l3, r3) = add_carry_parts_v8(a1, b1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
+                let (a2, l4, r4) = add_carry_parts_v8(t1, m[$my]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
-                let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
+                let (c2s, l5, r5) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
@@ -1765,7 +1696,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
         round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
         round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
-
         const {
             assert!(OUT_HI_BASE % 32 == 17);
         }
@@ -1786,7 +1716,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         oh!(7);
         wa.finish();
         wb.finish();
-
         const ZF: usize = USEFUL_BITS.div_ceil(32);
         const {
             assert!(U32_PER_BLOCK - ZF == 30);
@@ -1799,7 +1728,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             store_v8(bs.add(i) as *mut u32, zero);
         }
         drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
-
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
         // the complete cache line now, then publish it through the exact same
@@ -1814,17 +1742,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         drain.drain_range(0, 0, 16);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     unsafe fn lanes(v: V8) -> [u32; 8] {
         let mut out = [0u32; 8];
         unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), v) };
         out
     }
-
     /// Compile every W8 offset/width specialization used by the witness and
     /// compare its high-aligned VBMI2 state transition with an independent
     /// scalar bitstream append.  Bit-basis inputs include the deliberately
@@ -1860,7 +1785,6 @@ mod tests {
         }
         field_cases.sort_unstable();
         field_cases.dedup();
-
         for &pending_low in &pending_cases {
             for &raw_v in &field_cases {
                 let v = raw_v & field_mask;
@@ -1878,19 +1802,16 @@ mod tests {
                 } else {
                     pending_low << (32 - USED)
                 };
-
                 let sentinel = 0xA5A5_5A5A;
                 let mut stage = [dup_u32(sentinel); 1];
-                let mut writer = W8::at(
+                let mut writer = W8::<false>::at(
                     stage.as_mut_ptr(),
                     dup_u32(pending_hi),
                     core::ptr::null_mut::<Drain8<'static>>(),
-                    false,
                 );
                 unsafe {
                     writer.push::<USED, WIDTH, BACK, 0>(dup_u32(raw_v));
                 }
-
                 let got_out = lanes(stage[0])[0];
                 assert_eq!(
                     got_out,
@@ -1908,7 +1829,6 @@ mod tests {
             }
         }
     }
-
     #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn check_vbmi2_finish<const USED: i32, const BACK: i32>() {
@@ -1927,7 +1847,6 @@ mod tests {
             assert_eq!(got, [pending_low; 8], "finish: used={USED}");
         }
     }
-
     #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
     #[test]
     fn vbmi2_high_aligned_w8_matches_scalar_all_offsets() {
@@ -1972,7 +1891,6 @@ mod tests {
             check_offset!(29, 3);
             check_offset!(30, 2);
             check_offset!(31, 1);
-
             let flags = [0, 1, 0x7FFF_FFFF, 0x8000_0000, u32::MAX, 11, 64, 9];
             let flags_v = load_v8(flags.as_ptr());
             assert_eq!(
@@ -1985,21 +1903,18 @@ mod tests {
                 [0x8000_0000; 8],
                 "B prior flag must occupy bit 31"
             );
-
             // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
-            let mut writer = W8::at(
+            let mut writer = W8::<false>::at(
                 stage.as_mut_ptr(),
                 dup_u32(pending_low << 15),
                 core::ptr::null_mut::<Drain8<'static>>(),
-                false,
             );
             writer.finish();
             assert_eq!(lanes(stage[LAST_WORD & (RING_WORDS - 1)]), [pending_low; 8]);
         }
     }
-
     #[test]
     fn closed_octa_inputs_match_scalar_generator() {
         if !std::is_x86_feature_detected!("avx2") {
@@ -2034,7 +1949,6 @@ mod tests {
             }
         }
     }
-
     /// Independent algebra/codegen oracle for the production Z derivation.
     /// The direct path packs `a & b` and then transposes; the new path
     /// transposes A/B separately and ANDs corresponding row vectors.
@@ -2077,7 +1991,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn witgen8_tr8_is_8x8_u32_transpose() {
         if !std::is_x86_feature_detected!("avx2") {
@@ -2085,7 +1998,6 @@ mod tests {
         }
         unsafe { tr8_check() }
     }
-
     unsafe fn tr8_check() {
         unsafe {
             let rows: [V8; 8] = core::array::from_fn(|i| {
@@ -2124,7 +2036,6 @@ mod tests {
 // witfire-7 draw marker 10514
 // witfire-16 draw marker 2194
 // fire51: fresh draw on new bar 3852475 (rival NTT promotion)
-
 // vbmi2draw-1: independent official timing sample of promoted fbc3001 VBMI2 W8 packer; no executable change.
 // rivaldraw-28 marker 76708 on 2758bc1
 // rivaldraw-37 marker 33507 on ca47b5d
