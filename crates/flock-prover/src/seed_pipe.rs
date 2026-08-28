@@ -345,6 +345,9 @@ fn bytes_of(v: &[Compression]) -> &[u8] {
 /// publishes — the shape plus the two blocks the O(1) gate actually reads —
 /// and is produced *only* when `GENERATOR_VERIFIED` already holds, i.e. only
 /// when the gate is the O(1) one. See [`try_adopt`].
+// Keep endpoint metadata inline: boxing either block would add allocator
+// traffic to the ranked speculative/adoption path just to shrink one state.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum SpecBlocks {
     Full(Arc<Vec<Compression>>),
@@ -574,6 +577,7 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&temporary)?;
     file.write_all(&bytes)?;
     file.set_len(bytes.len() as u64)?;
@@ -1051,16 +1055,16 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     };
 
     // The head start is exactly what this mechanism buys; make it printable.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
-        if let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at) {
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-            eprintln!(
-                "[seed-pipe] par-gen {:.3} ms, head start {:.3} ms, blocks matched={matched}, gate={}",
-                ms(blocks_at - seed_at),
-                ms(seed_at.elapsed()),
-                if fast_gate { "fast" } else { "full" },
-            );
-        }
+    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+        && let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at)
+    {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "[seed-pipe] par-gen {:.3} ms, head start {:.3} ms, blocks matched={matched}, gate={}",
+            ms(blocks_at - seed_at),
+            ms(seed_at.elapsed()),
+            if fast_gate { "fast" } else { "full" },
+        );
     }
 
     // Phase 2: collect the result. Even on a mismatch we must drain the
@@ -1071,14 +1075,14 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     let result = state.result.take();
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
-        if let Some(seed_at) = seed_at {
-            eprintln!(
-                "[seed-pipe] result ready {:.3} ms after seed (dead={}, matched={matched})",
-                seed_at.elapsed().as_secs_f64() * 1e3,
-                state.dead
-            );
-        }
+    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+        && let Some(seed_at) = seed_at
+    {
+        eprintln!(
+            "[seed-pipe] result ready {:.3} ms after seed (dead={}, matched={matched})",
+            seed_at.elapsed().as_secs_f64() * 1e3,
+            state.dead
+        );
     }
     if state.dead || !matched {
         return None;
@@ -1134,7 +1138,11 @@ mod tests {
     #[test]
     fn seed_pipe_matches_reference_at_ranked_size() {
         for &seed in &[0x1234_5678_9ABC_DEF0u64, WARMUP_SEED, 424242, u64::MAX] {
-            assert_eq!(generate_compressions_par(18, seed), reference(18, seed), "seed={seed}");
+            assert_eq!(
+                generate_compressions_par(18, seed),
+                reference(18, seed),
+                "seed={seed}"
+            );
         }
     }
 
@@ -1144,7 +1152,10 @@ mod tests {
         let mut buf = prefaulted_blocks(1 << 12);
         fill_compressions_par(&mut buf, 12, 0xDEAD_BEEF);
         assert_eq!(buf, reference(12, 0xDEAD_BEEF));
-        assert_eq!(gen_block(generator_init(12, 0xDEAD_BEEF), 77), reference(12, 0xDEAD_BEEF)[77]);
+        assert_eq!(
+            gen_block(generator_init(12, 0xDEAD_BEEF), 77),
+            reference(12, 0xDEAD_BEEF)[77]
+        );
     }
 
     #[test]
@@ -1284,7 +1295,9 @@ mod tests {
             assert_eq!(r, buf);
             eprintln!(
                 "[probe] round {round}: serial reference {:.3} ms, par (alloc+fill) {:.3} ms, par fill into prefaulted {:.3} ms",
-                ms(t_ref), ms(t_par), ms(t_fill)
+                ms(t_ref),
+                ms(t_par),
+                ms(t_fill)
             );
         }
     }
