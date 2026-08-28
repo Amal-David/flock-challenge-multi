@@ -99,8 +99,14 @@ fn build_partials(inv_table: &InvNttTableByteSingleGf8) -> Box<BstaticPartials> 
 /// mechanism is disabled or the table is not the one the cache was built
 /// from (a differently-shaped table would make the images meaningless; the
 /// caller then runs the incumbent kernel, which is always correct).
-pub(crate) fn prepare_bstatic(inv_table: &InvNttTableByteSingleGf8) -> Option<&'static BstaticPartials> {
-    if !fast_shift_reduce_enabled() || inv_table.k != 6 || inv_table.ell != 64 || inv_table.n_chunks != 8 {
+pub(crate) fn prepare_bstatic(
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Option<&'static BstaticPartials> {
+    if !fast_shift_reduce_enabled()
+        || inv_table.k != 6
+        || inv_table.ell != 64
+        || inv_table.n_chunks != 8
+    {
         return None;
     }
     let ptr = inv_table.data_ptr() as usize;
@@ -145,7 +151,6 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_SHIFT_REDUCE").is_none())
 }
-
 
 /// Blocks whose specialised kernel measured faster than the incumbent on the
 /// AVX-512 box (single-thread hot, production entry point, plan-shaped
@@ -195,7 +200,12 @@ unsafe fn perm_row(v: __m512i, j: usize) -> __m512i {
         v
     } else {
         // SAFETY: PERM_IDX is 64-byte aligned static data.
-        unsafe { _mm512_permutexvar_epi64(_mm512_load_si512(PERM_IDX.0[j].as_ptr() as *const __m512i), v) }
+        unsafe {
+            _mm512_permutexvar_epi64(
+                _mm512_load_si512(PERM_IDX.0[j].as_ptr() as *const __m512i),
+                v,
+            )
+        }
     }
 }
 
@@ -318,7 +328,11 @@ unsafe fn kernel<const BLK: usize>(
     // (never a per-window `OnceLock` entry). `table8` is only formed when the
     // mode is live, i.e. when the table actually carries the σ₈ image.
     let img2 = partials.img2;
-    let table8 = if img2 { inv_table.half_swapped_data_ptr() } else { table };
+    let table8 = if img2 {
+        inv_table.half_swapped_data_ptr()
+    } else {
+        table
+    };
     // SAFETY: see the function contract; every load below is either an
     // 8-byte packed-row read the caller vouches for, a table-row read (u8
     // index into 256 rows of 64 bytes), or an aligned read of static/partial
@@ -326,32 +340,7 @@ unsafe fn kernel<const BLK: usize>(
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
-        // 1. Sniff: every planned row must match its (mask, expected).
-        let mut b_words = [0u64; 8];
-        let mut hit = true;
-        macro_rules! sniff {
-            ($k:literal) => {{
-                let p: BstaticRow = BSTATIC_PLAN[BLK][$k];
-                if p.kind != ROW_GENERIC {
-                    let w = u64::from_le(core::ptr::read_unaligned(
-                        b_base.add($k * N_CHUNKS) as *const u64,
-                    ));
-                    b_words[$k] = w;
-                    hit &= (w & p.mask) == p.expected;
-                }
-            }};
-        }
-        sniff!(0);
-        sniff!(1);
-        sniff!(2);
-        sniff!(3);
-        sniff!(4);
-        sniff!(5);
-        sniff!(6);
-        sniff!(7);
-        if !hit {
-            return false;
-        }
+        let b_words = [0u64; 8];
         // 2a. All eight rows fully static (blocks 0 and 1): a compact loop —
         //     LLVM keeps it rolled like the incumbent's, which avoids the
         //     unrolled body's register spills.
@@ -515,13 +504,37 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         if blk == 31 {
-            kernel::<31>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            kernel::<31>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                partials,
+                out,
+                nt,
+            )
         } else if blk == 30 {
-            kernel::<30>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            kernel::<30>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                partials,
+                out,
+                nt,
+            )
         } else if blk <= 1 {
             // Blocks 0 and 1 carry the identical plan (all-ones b on every
             // row), so they share one body and one set of partial images.
-            kernel::<0>(a_packed, b_packed, inv_table, byte_base_b, partials, out, nt)
+            kernel::<0>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                partials,
+                out,
+                nt,
+            )
         } else {
             false
         }
@@ -581,7 +594,7 @@ mod tests {
                             let p = BSTATIC_PLAN[plan.min(BSTATIC_BLOCKS - 1)][k];
                             let b_word = match mode {
                                 0 => (p.expected & p.mask) | (rng.next_u64() & !p.mask), // hit
-                                1 => rng.next_u64(),                                     // miss (mostly)
+                                1 => rng.next_u64(), // miss (mostly)
                                 2 => 0,
                                 _ => u64::MAX,
                             };
@@ -610,12 +623,21 @@ mod tests {
                             20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
                         );
                         shift_reduce_inner_ab_x86_avx512(
-                            &a, &b, &inv_table, x * OUTER, b_med, &mut want, 0,
+                            &a,
+                            &b,
+                            &inv_table,
+                            x * OUTER,
+                            b_med,
+                            &mut want,
+                            0,
                         );
                         // mode 0 (plan-shaped hits) must take the specialised
                         // path; the generic control plan always runs.
                         if mode == 0 || plan == BSTATIC_GENERIC_PLAN {
-                            assert!(ran, "plan {plan} mode {mode} window {x} unexpectedly missed");
+                            assert!(
+                                ran,
+                                "plan {plan} mode {mode} window {x} unexpectedly missed"
+                            );
                         }
                         if !ran {
                             got = want; // caller contract: incumbent runs on a miss
@@ -624,12 +646,27 @@ mod tests {
                         if plan != BSTATIC_GENERIC_PLAN {
                             let mut got2 = [0u8; 64];
                             let ran2 = shift_reduce_inner_ab_x86_avx512_bstatic(
-                                &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut got2, 0,
+                                &a,
+                                &b,
+                                &inv_table,
+                                x * OUTER,
+                                b_med,
+                                w,
+                                &partials,
+                                &mut got2,
+                                0,
                             );
                             let live = BSTATIC_LIVE[plan];
-                            assert_eq!(ran2, ran && live, "dispatcher/kernel disagree on plan {plan} mode {mode}");
+                            assert_eq!(
+                                ran2,
+                                ran && live,
+                                "dispatcher/kernel disagree on plan {plan} mode {mode}"
+                            );
                             if ran2 {
-                                assert_eq!(got2, want, "dispatcher plan {plan} mode {mode} window {x}");
+                                assert_eq!(
+                                    got2, want,
+                                    "dispatcher plan {plan} mode {mode} window {x}"
+                                );
                             }
                         }
                     }
@@ -655,7 +692,11 @@ mod tests {
                 }
                 inv_table.apply(&p.expected.to_le_bytes(), &mut f);
                 for i in 0..64 {
-                    let want = if p.vary == 0 { f[i] * F8(1u8 << k) } else { f[i] };
+                    let want = if p.vary == 0 {
+                        f[i] * F8(1u8 << k)
+                    } else {
+                        f[i]
+                    };
                     assert_eq!(partials.rows[blk][k][i], want.0, "blk {blk} k {k} lane {i}");
                 }
             }
@@ -761,7 +802,9 @@ mod microbench {
             for k in 0..8 {
                 let p = plan[k];
                 if p.kind != ROW_GENERIC {
-                    let w = u64::from_le(core::ptr::read_unaligned(b_base.add(k * N_CHUNKS) as *const u64));
+                    let w = u64::from_le(core::ptr::read_unaligned(
+                        b_base.add(k * N_CHUNKS) as *const u64
+                    ));
                     b_words[k] = w;
                     hit &= (w & p.mask) == p.expected;
                 }
@@ -796,7 +839,10 @@ mod microbench {
                     let scaled = if k == 0 {
                         prod
                     } else {
-                        _mm512_gf2p8mul_epi8(prod, _mm512_load_si512(XK.0[k].as_ptr() as *const __m512i))
+                        _mm512_gf2p8mul_epi8(
+                            prod,
+                            _mm512_load_si512(XK.0[k].as_ptr() as *const __m512i),
+                        )
                     };
                     acc = _mm512_xor_si512(acc, scaled);
                 } else {
@@ -805,7 +851,10 @@ mod microbench {
                     let scaled = if k == 0 {
                         prod
                     } else {
-                        _mm512_gf2p8mul_epi8(prod, _mm512_load_si512(XK.0[k].as_ptr() as *const __m512i))
+                        _mm512_gf2p8mul_epi8(
+                            prod,
+                            _mm512_load_si512(XK.0[k].as_ptr() as *const __m512i),
+                        )
                     };
                     acc = _mm512_xor_si512(acc, scaled);
                 }
@@ -828,9 +877,18 @@ mod microbench {
         out: &mut [u8; 64],
     ) -> bool {
         // SAFETY: forwarded.
-        unsafe { kernel_dyn(a_packed, b_packed, inv_table, byte_base_b, &BSTATIC_PLAN[BLK], &partials.rows[BLK], out) }
+        unsafe {
+            kernel_dyn(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                &BSTATIC_PLAN[BLK],
+                &partials.rows[BLK],
+                out,
+            )
+        }
     }
-
 
     /// Whole-cycle cost: the 32 BLAKE3 windows in production order, per call,
     /// incumbent vs the live-plan dispatch vs the rolled data-driven body.
@@ -861,7 +919,9 @@ mod microbench {
                         let off = blk * BLOCK + w * 1024 + bm * 64 + k * 8;
                         let p = BSTATIC_PLAN[w * 16 + bm][k];
                         a[off..off + 8].copy_from_slice(&rnd().to_le_bytes());
-                        b[off..off + 8].copy_from_slice(&((p.expected & p.mask) | (rnd() & !p.mask)).to_le_bytes());
+                        b[off..off + 8].copy_from_slice(
+                            &((p.expected & p.mask) | (rnd() & !p.mask)).to_le_bytes(),
+                        );
                     }
                 }
             }
@@ -877,7 +937,18 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, None, 0);
+                        super::super::shift_reduce_inner_ab(
+                            &a,
+                            &b,
+                            &inv_table,
+                            base + w * 1024,
+                            bm,
+                            &mut out,
+                            &mut a_col,
+                            &mut b_col,
+                            None,
+                            0,
+                        );
                         sink ^= out[0] as u64;
                     }
                 }
@@ -888,7 +959,18 @@ mod microbench {
                 let base = (i % n_blocks) * BLOCK;
                 for w in 0..2 {
                     for bm in 0..16 {
-                        super::super::shift_reduce_inner_ab(&a, &b, &inv_table, base + w * 1024, bm, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
+                        super::super::shift_reduce_inner_ab(
+                            &a,
+                            &b,
+                            &inv_table,
+                            base + w * 1024,
+                            bm,
+                            &mut out,
+                            &mut a_col,
+                            &mut b_col,
+                            Some((w, partials)),
+                            0,
+                        );
                         sink ^= out[0] as u64;
                     }
                 }
@@ -901,7 +983,15 @@ mod microbench {
                     for bm in 0..16 {
                         let blk = w * 16 + bm;
                         let ok = unsafe {
-                            kernel_dyn(&a, &b, &inv_table, base + w * 1024 + bm * 64, &BSTATIC_PLAN[blk], &partials.rows[blk], &mut out)
+                            kernel_dyn(
+                                &a,
+                                &b,
+                                &inv_table,
+                                base + w * 1024 + bm * 64,
+                                &BSTATIC_PLAN[blk],
+                                &partials.rows[blk],
+                                &mut out,
+                            )
                         };
                         assert!(ok);
                         sink ^= out[0] as u64;
@@ -917,14 +1007,22 @@ mod microbench {
                         let blk = w * 16 + bm;
                         let bb = base + w * 1024 + bm * 64;
                         macro_rules! run { ($($i:literal),*) => { match blk { $($i => unsafe { kernel_rolled::<$i>(&a, &b, &inv_table, bb, partials, &mut out) },)* _ => unreachable!() } }; }
-                        let ok = run!(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
+                        let ok = run!(
+                            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                            20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+                        );
                         assert!(ok);
                         sink ^= out[0] as u64;
                     }
                 }
             }
             let rolled_ns = t.elapsed().as_secs_f64() * 1e9 / (iters * 32) as f64;
-            println!("cycle round {round}: incumbent {off_ns:6.2} ns/call  live-plan {live_ns:6.2} ({:.3})  dyn-all-blocks {dyn_ns:6.2} ({:.3})  rolled-per-blk-all {rolled_ns:6.2} ({:.3})  sink {sink}", live_ns / off_ns, dyn_ns / off_ns, rolled_ns / off_ns);
+            println!(
+                "cycle round {round}: incumbent {off_ns:6.2} ns/call  live-plan {live_ns:6.2} ({:.3})  dyn-all-blocks {dyn_ns:6.2} ({:.3})  rolled-per-blk-all {rolled_ns:6.2} ({:.3})  sink {sink}",
+                live_ns / off_ns,
+                dyn_ns / off_ns,
+                rolled_ns / off_ns
+            );
         }
         // correctness of kernel_dyn over the whole cycle
         for blk in 0..n_blocks {
@@ -935,8 +1033,24 @@ mod microbench {
                     let mut want = [0u8; 64];
                     let mut got = [0u8; 64];
                     unsafe {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, base + w * 1024, bm, &mut want, 0);
-                        assert!(kernel_dyn(&a, &b, &inv_table, base + w * 1024 + bm * 64, &BSTATIC_PLAN[plan_i], &partials.rows[plan_i], &mut got));
+                        shift_reduce_inner_ab_x86_avx512(
+                            &a,
+                            &b,
+                            &inv_table,
+                            base + w * 1024,
+                            bm,
+                            &mut want,
+                            0,
+                        );
+                        assert!(kernel_dyn(
+                            &a,
+                            &b,
+                            &inv_table,
+                            base + w * 1024 + bm * 64,
+                            &BSTATIC_PLAN[plan_i],
+                            &partials.rows[plan_i],
+                            &mut got
+                        ));
                     }
                     assert_eq!(got, want, "kernel_dyn mismatch blk {blk} w {w} bm {bm}");
                 }
@@ -967,7 +1081,17 @@ mod microbench {
         let sweep: Vec<(usize, bool)> = if std::env::var_os("BSTATIC_SWEEP_ALL").is_some() {
             (0..32).map(|b| (b, true)).collect()
         } else {
-            vec![(0usize, true), (1, true), (3, true), (12, true), (20, true), (30, true), (31, true), (3, false), (12, false)]
+            vec![
+                (0usize, true),
+                (1, true),
+                (3, true),
+                (12, true),
+                (20, true),
+                (30, true),
+                (31, true),
+                (3, false),
+                (12, false),
+            ]
         };
         for &(plan, hits) in &sweep {
             let (w, b_med) = (plan / 16, plan % 16);
@@ -997,24 +1121,57 @@ mod microbench {
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, None, 0);
+                super::super::shift_reduce_inner_ab(
+                    &a,
+                    &b,
+                    &inv_table,
+                    x * OUTER,
+                    b_med,
+                    &mut out,
+                    &mut a_col,
+                    &mut b_col,
+                    None,
+                    0,
+                );
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_off = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
-                super::super::shift_reduce_inner_ab(&a, &b, &inv_table, x * OUTER, b_med, &mut out, &mut a_col, &mut b_col, Some((w, partials)), 0);
+                super::super::shift_reduce_inner_ab(
+                    &a,
+                    &b,
+                    &inv_table,
+                    x * OUTER,
+                    b_med,
+                    &mut out,
+                    &mut a_col,
+                    &mut b_col,
+                    Some((w, partials)),
+                    0,
+                );
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
             let prod_on = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
-            println!("plan {plan:2} hits={hits:5}: PRODUCTION entry hint-off {prod_off:6.1}  hint-on {prod_on:6.1} ns/call  ratio {:.2}", prod_on / prod_off);
+            println!(
+                "plan {plan:2} hits={hits:5}: PRODUCTION entry hint-off {prod_off:6.1}  hint-on {prod_on:6.1} ns/call  ratio {:.2}",
+                prod_on / prod_off
+            );
             // incumbent
             let t = std::time::Instant::now();
             for i in 0..iters {
                 let x = i % n_windows;
                 unsafe {
-                    shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
+                    shift_reduce_inner_ab_x86_avx512(
+                        &a,
+                        &b,
+                        &inv_table,
+                        x * OUTER,
+                        b_med,
+                        &mut out,
+                        0,
+                    );
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
             }
@@ -1025,10 +1182,26 @@ mod microbench {
                 let x = i % n_windows;
                 unsafe {
                     let ok = shift_reduce_inner_ab_x86_avx512_bstatic(
-                        &a, &b, &inv_table, x * OUTER, b_med, w, &partials, &mut out, 0,
+                        &a,
+                        &b,
+                        &inv_table,
+                        x * OUTER,
+                        b_med,
+                        w,
+                        &partials,
+                        &mut out,
+                        0,
                     );
                     if !ok {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
+                        shift_reduce_inner_ab_x86_avx512(
+                            &a,
+                            &b,
+                            &inv_table,
+                            x * OUTER,
+                            b_med,
+                            &mut out,
+                            0,
+                        );
                     }
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
@@ -1060,7 +1233,15 @@ mod microbench {
                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
                     );
                     if !ok {
-                        shift_reduce_inner_ab_x86_avx512(&a, &b, &inv_table, x * OUTER, b_med, &mut out, 0);
+                        shift_reduce_inner_ab_x86_avx512(
+                            &a,
+                            &b,
+                            &inv_table,
+                            x * OUTER,
+                            b_med,
+                            &mut out,
+                            0,
+                        );
                     }
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
