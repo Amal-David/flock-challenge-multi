@@ -1,5 +1,5 @@
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
-use crate::field::{F128, F256Unreduced};
+use crate::field::gf2_128::x86_64::{f128x4_loadu, WideGhashX4};
+use crate::field::{F256Unreduced, F128};
 
 /// Fold the four rows for one round-2 pair in parallel x86 SIMD registers.
 /// Returns `[a0, a1, b0, b1]`.
@@ -263,20 +263,23 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let g0 = row_base + 2 * x_lo;
                 // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
                 // start, so its block position decides the dead lines.
-                let dead = super::super::prefold_dead_line_mask_gated(
-                    g0,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                );
+                // `prefold_dead_line_mask_gated` is opt-in behind
+                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                // worker with a cleared environment, so the gate is off and
+                // the mask is a constant 0 on every one of the ~2.1 M leaf
+                // tiles. Feeding the constant in directly drops the per-tile
+                // `OnceLock` acquire load and the eight-bit mask build, and
+                // lets the fold kernels take their unpredicated line path.
+                let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
-                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
                 } else if tr_emit {
-                    gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                    gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
                 } else {
-                    gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                    gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
                 }
                 // The packed bursts `pf_tiles` refills ahead — a gap the
                 // hardware prefetcher does not bridge across the strided
@@ -1593,11 +1596,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                    let dead = super::super::prefold_dead_line_mask_gated(
-                        4 * xg,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    );
+                    // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                    // worker with a cleared environment, so the gate is off and
+                    // the mask is a constant 0 on every one of the ~2.1 M leaf
+                    // tiles. Feeding the constant in directly drops the per-tile
+                    // `OnceLock` acquire load and the eight-bit mask build, and
+                    // lets the fold kernels take their unpredicated line path.
+                    let _ = (pair_in_block_mask, useful_pairs_inclusive);
                     if use_c4 {
                         let c = cfold.unwrap();
                         if c4_bcast {
@@ -1605,32 +1611,20 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.add(4 * xg * 8),
                                 c,
                                 fa.as_mut_ptr(),
-                                dead,
                             );
                             gfni_fold64_rows_masked_c4_bcast(
                                 b_pkt.add(4 * xg * 8),
                                 c,
                                 fb.as_mut_ptr(),
-                                dead,
                             );
                         } else {
-                            gfni_fold64_rows_masked_c4(
-                                a_pkt.add(4 * xg * 8),
-                                c,
-                                fa.as_mut_ptr(),
-                                dead,
-                            );
-                            gfni_fold64_rows_masked_c4(
-                                b_pkt.add(4 * xg * 8),
-                                c,
-                                fb.as_mut_ptr(),
-                                dead,
-                            );
+                            gfni_fold64_rows_masked_c4(a_pkt.add(4 * xg * 8), c, fa.as_mut_ptr());
+                            gfni_fold64_rows_masked_c4(b_pkt.add(4 * xg * 8), c, fb.as_mut_ptr());
                         }
                     } else {
                         let m = mats.unwrap();
-                        gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
-                        gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr());
                     }
                     // The 512-byte bursts `pf_tiles` refills ahead of the
                     // consumer — see the round-2 twin for the rationale.
@@ -2292,21 +2286,14 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked(
-    rows: *const u8,
-    mats: &[u64; 128],
-    out: *mut F128,
-    dead_lines: u8,
-) {
+pub(crate) unsafe fn gfni_fold64_rows_masked(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY: caller guarantees 64 readable bytes at `rows.add(64 * i)` for
     // every line `i` not marked dead, and 64 writable F128s at `out`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
         gfni_fold64_regs(z, mats, out);
     }
@@ -2330,16 +2317,13 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
-    dead_lines: u8,
 ) {
     use core::arch::x86_64::*;
     // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
         gfni_fold64_regs_sigma(z, mats, out);
     }
@@ -2357,16 +2341,13 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
-    dead_lines: u8,
 ) {
     use core::arch::x86_64::*;
     // SAFETY: as for `gfni_fold64_rows_masked_tr`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
     }
@@ -2523,21 +2504,14 @@ const SIGMA_C4: [i8; 64] = [
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
-    rows: *const u8,
-    m: &CFoldMats,
-    out: *mut F128,
-    dead_lines: u8,
-) {
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4(rows: *const u8, m: &CFoldMats, out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees the row and output bounds; every
     // shuffle index is in range and the cfg gate supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
 
         #[rustfmt::skip]
@@ -2721,7 +2695,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     rows: *const u8,
     m: &CFoldMats,
     out: *mut F128,
-    dead_lines: u8,
 ) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 readable bytes at
@@ -2732,9 +2705,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
 
         // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
@@ -2822,24 +2793,39 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 // pair `(v2, v3)`, and the running pair absorbs it in one more
                 // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
                 // 32-input tree, with the four-residue reduction inside it.
+                //
+                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
+                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
+                // the eight affine results of `(a, hh)` are born and consumed
+                // inside one four-op window while the eight broadcasts of residue
+                // `a` and both accumulator pairs are still live, and the register
+                // allocator spills: the emitted body pays four stack stores and
+                // seven reloads per call that the map never asks for. Materialising
+                // all sixteen results of the residue first widens the window the
+                // scheduler has to place the reduction in without widening the peak
+                // live set. The uop map and the port split are untouched: 128
+                // affines, 32 port-5 shuffles, 64 XOR-class, 64 broadcasts.
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
                     let b: [__m512i; 8] = core::array::from_fn(|j| {
                         _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
                     });
-                    for hh in 0..2usize {
-                        let aff = |j: usize| {
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
                             _mm512_gf2p8affine_epi64_epi8::<0>(
                                 b[j],
                                 _mm512_loadu_si512(
                                     mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
                                 ),
                             )
-                        };
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
                         if a == 0 {
                             accp[hh] = v2;
                             accq[hh] = v3;
