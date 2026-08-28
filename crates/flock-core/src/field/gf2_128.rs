@@ -117,11 +117,23 @@ impl Mul for F128 {
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
-            // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            // Runtime CPUID gate: only use the new PCLMULQDQ + canonical
+            // GCM Barrett path when the host CPU advertises PCLMULQDQ
+            // (CPUID leaf 1, ECX bit 1). Otherwise fall back to the
+            // incumbent `ghash_mul_karatsuba_vec`, which itself needs
+            // PCLMULQDQ at compile time but is the previous-best path.
+            if x86_64::runtime_pclmulqdq() {
+                // SAFETY: pclmulqdq target feature is enabled at compile
+                // time and the runtime CPUID check above just confirmed
+                // the host supports it. `ghash_mul_pclmulqdq` is the
+                // PCLMULQDQ + canonical GCM Barrett path, unrolled 4x.
+                unsafe { x86_64::ghash_mul_pclmulqdq(self, rhs) }
+            } else {
+                // SAFETY: pclmulqdq target feature is enabled at compile
+                // time; the same intrinsic set as the new path, just a
+                // different inner organisation.
+                unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -495,11 +507,14 @@ mod tests {
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
+            // The PCLMULQDQ + canonical GCM Barrett path, unrolled 4x.
+            let pc = unsafe { x86_64::ghash_mul_pclmulqdq(a, b) };
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
             assert_eq!(sw, un, "unreduced");
+            assert_eq!(sw, pc, "pclmulqdq_barrett");
         }
     }
 

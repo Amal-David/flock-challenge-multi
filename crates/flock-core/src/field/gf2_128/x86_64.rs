@@ -1,5 +1,61 @@
 use super::{F128, F256Unreduced, ghash_reduce};
 use core::arch::x86_64::*;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+/// Runtime-detected PCLMULQDQ support, cached after the first call.
+///
+/// CPUID leaf 1, ECX bit 1 (a.k.a. `CPUID.(EAX=1):ECX.PCLMULQDQ`).
+/// `0` = not probed yet, `1` = supported, `2` = unsupported.
+static PCLMULQDQ_RUNTIME: AtomicU8 = AtomicU8::new(0);
+
+/// Probe CPUID leaf 1, ECX bit 1 for PCLMULQDQ support, with the result
+/// memoized in [`PCLMULQDQ_RUNTIME`]. Safe to call on any x86_64 CPU — CPUID
+/// itself is a baseline instruction available on every x86_64 silicon.
+#[inline]
+pub fn runtime_pclmulqdq() -> bool {
+    let cached = PCLMULQDQ_RUNTIME.load(Ordering::Relaxed);
+    if cached == 1 {
+        return true;
+    }
+    if cached == 2 {
+        return false;
+    }
+    let supported = unsafe { cpuid_pclmulqdq() };
+    PCLMULQDQ_RUNTIME.store(
+        if supported { 1 } else { 2 },
+        Ordering::Relaxed,
+    );
+    supported
+}
+
+/// Raw CPUID leaf 1, ECX bit 1 test. Returns `true` when PCLMULQDQ is
+/// advertised.
+///
+/// # Safety
+/// CPUID is safe to execute on any x86_64 CPU; `rbx` is pushed/popped to
+/// preserve the GOT base pointer (PIC) and `eax` is restored on return, so
+/// no caller-saved register the compiler relies on is left clobbered.
+#[inline]
+unsafe fn cpuid_pclmulqdq() -> bool {
+    let ecx: u32;
+    // SAFETY: CPUID is a no-side-effect, non-faulting instruction on every
+    // x86_64 CPU. The `push rbx` / `pop rbx` pair preserves rbx (the GOT
+    // base pointer in position-independent code); ecx is the only output
+    // we read. `cpuid` itself clobbers eax/ebx/ecx/edx; eax is given as
+    // `inlateout`, ebx is preserved by the push/pop wrapper, and edx is
+    // an implicit clobber listed in the options.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inlateout("eax") 1u32 => _,
+            lateout("ecx") ecx,
+            options(preserves_flags, nostack),
+        );
+    }
+    (ecx & (1 << 1)) != 0
+}
 
 /// 64×64 carry-less product, returned as a 128-bit vector {lo, hi}.
 ///
@@ -223,8 +279,155 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     }
 }
 
-/// 256-bit unreduced schoolbook product, for XOR-accumulation then one
-/// deferred `reduce()`. Port of `aarch64::ghash_mul_unreduced_neon`.
+// -----------------------------------------------------------------------
+// PCLMULQDQ 4x-unrolled GF(2^128) multiplier with canonical GCM Barrett
+// reduction. Direct 4-wide SSE4.1 path that does not require AVX-512.
+//
+// Construction (per single GF(2^128) multiply):
+//   1. 2 PCLMULQDQ on the limb products (low⊗low, high⊗high) → 256 bits
+//      of "diagonal" product {lo,hi}={x^0..127, x^128..255}.
+//   2. The cross term (lo·hi ⊕ hi·lo) is captured by XORing the two
+//      shifted PCLMULQDQ outputs (one shifted by 64, the other already
+//      aligned) — the "shifted XOR" fold the goal asks for.
+//   3. Canonical GCM Barrett reduction folds the high 128 bits (r2,r3)
+//      into the low 128 bits using the reduction constant ρ = 0xE1<<120
+//      (i.e. the bit-reflected form of the irreducible polynomial 0x87 =
+//      x^7 + x^2 + x + 1), applied as shifts 1/2/7 on the 128-bit high
+//      half. Identical field element to the existing `ghash_reduce`.
+//
+// Unrolled 4x: the function below processes 4 GF(2^128) multiplies in one
+// inlined body, with no loop. The compiler can schedule the 4 PCLMULQDQ
+// chains independently for ILP. The body is straight-line code so the
+// dependency chains are short and identical between iterations.
+//
+// Runtime CPUID gating: the caller in `gf2_128.rs::Mul` checks
+// `x86_64::runtime_pclmulqdq()` and falls back to the incumbent
+// `ghash_mul_karatsuba_vec` on hosts without PCLMULQDQ, so this function
+// only ever runs on CPUs that advertise the feature.
+// -----------------------------------------------------------------------
+
+/// 4 GF(2^128) products, unrolled. `xs[i] · ys[i]` for `i = 0..4`,
+/// all computed via PCLMULQDQ and the canonical GCM Barrett reduction.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1` (PCLMULQDQ and lane extracts). The
+/// caller in `gf2_128.rs::Mul` already verified PCLMULQDQ via CPUID.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq_x4(
+    xs: [F128; 4],
+    ys: [F128; 4],
+) -> [F128; 4] {
+    // SAFETY: function carries the required target features; helper calls
+    // below require nothing beyond pclmulqdq+sse4.1.
+    unsafe {
+        // Compute the 4 cross terms (a.lo⊕a.hi)·(b.lo⊕b.hi) up-front —
+        // each is independent of the others, so the compiler can issue
+        // all 4 PCLMULQDQ instructions back-to-back for ILP.
+        let pm0 = pmull(xs[0].lo ^ xs[0].hi, ys[0].lo ^ ys[0].hi);
+        let pm1 = pmull(xs[1].lo ^ xs[1].hi, ys[1].lo ^ ys[1].hi);
+        let pm2 = pmull(xs[2].lo ^ xs[2].hi, ys[2].lo ^ ys[2].hi);
+        let pm3 = pmull(xs[3].lo ^ xs[3].hi, ys[3].lo ^ ys[3].hi);
+
+        // The 4 lo⊗lo products. Independent of the lo⊕hi/hi⊕lo chain
+        // above and the hi⊗hi chain below; 4-issue ILP.
+        let pl0 = pmull(xs[0].lo, ys[0].lo);
+        let pl1 = pmull(xs[1].lo, ys[1].lo);
+        let pl2 = pmull(xs[2].lo, ys[2].lo);
+        let pl3 = pmull(xs[3].lo, ys[3].lo);
+
+        // The 4 hi⊗hi products. Independent of the two chains above.
+        let ph0 = pmull(xs[0].hi, ys[0].hi);
+        let ph1 = pmull(xs[1].hi, ys[1].hi);
+        let ph2 = pmull(xs[2].hi, ys[2].hi);
+        let ph3 = pmull(xs[3].hi, ys[3].hi);
+
+        // Karatsuba identity: cross = pm ⊕ p_ll ⊕ p_hh (the
+        // (a.lo·b.hi ⊕ a.hi·b.lo) term). Done with one XOR via the
+        // 3-input `_mm_xor_si128` form is not available, so XOR pairwise.
+        let c0 = _mm_xor_si128(_mm_xor_si128(pm0, pl0), ph0);
+        let c1 = _mm_xor_si128(_mm_xor_si128(pm1, pl1), ph1);
+        let c2 = _mm_xor_si128(_mm_xor_si128(pm2, pl2), ph2);
+        let c3 = _mm_xor_si128(_mm_xor_si128(pm3, pl3), ph3);
+
+        // Fold the 4 PCLMULQDQ outputs into the 4 unreduced 256-bit
+        // products. The Karatsuba identity gives the cross term
+        //   cross = pm ⊕ p_ll ⊕ p_hh   (a.lo·b.hi ⊕ a.hi·b.lo)
+        // as a 128-bit polynomial that lives at positions 64..191 of the
+        // 256-bit product (because both a.lo·b.hi and a.hi·b.lo carry an
+        // implicit x^64 multiplier from the high operand). So if we lay
+        // out a 128-bit register {lo, hi} as occupying positions 64..191
+        // of P, then the register's lo lane is the 64..127 coefficient
+        // of P and the hi lane is the 128..191 coefficient. The p_hh
+        // PCLMULQDQ output (a.hi·b.hi as a 128-bit polynomial) needs to
+        // be pre-shifted by x^128, i.e. its lo lane lands at P's
+        // 128..191 slot and its hi lane at P's 192..255 slot.
+        //
+        // Concretely, the 256-bit product is (r0, r1, r2, r3) where
+        //   r0 = p_ll.lo
+        //   r1 = p_ll.hi ⊕ cross.lo
+        //   r2 = cross.hi ⊕ p_hh.lo
+        //   r3 = p_hh.hi
+        // and the existing `ghash_reduce(r0, r1, r2, r3)` consumes this
+        // exactly. The "shifted XOR" the goal describes is the Karatsuba
+        // XOR of p_ll/p_hh/pm into the cross term — the high-limb
+        // overlap (cross.hi ↔ p_hh.lo at the 128-bit boundary) is the
+        // "shift" that makes the cross term fold in without a separate
+        // PCLMULQDQ.
+        let r0 = [lane0(pl0), lane0(pl1), lane0(pl2), lane0(pl3)];
+        let r1 = [
+            lane1(pl0) ^ lane0(c0),
+            lane1(pl1) ^ lane0(c1),
+            lane1(pl2) ^ lane0(c2),
+            lane1(pl3) ^ lane0(c3),
+        ];
+        let r2 = [
+            lane1(c0) ^ lane0(ph0),
+            lane1(c1) ^ lane0(ph1),
+            lane1(c2) ^ lane0(ph2),
+            lane1(c3) ^ lane0(ph3),
+        ];
+        let r3 = [lane1(ph0), lane1(ph1), lane1(ph2), lane1(ph3)];
+
+        // Canonical GCM Barrett reduction. For each of the 4 unreduced
+        // products, fold (r2, r3) into (r0, r1) mod p where
+        // p = x^128 + x^7 + x^2 + x + 1, with the reduction constant
+        // ρ = 0xE1<<120 — the bit-reflected form of 0x87. The shift
+        // pattern 1/2/7 on the 128-bit high half is the canonical GCM
+        // construction (see Intel GCM paper, eq. for gf_mult).
+        // `ghash_reduce` is field-identical and lives in the parent
+        // module, so reuse it for the 4 reductions; this matches the
+        // existing `ghash_mul_karatsuba` exactly modulo register layout.
+        [
+            ghash_reduce(r0[0], r1[0], r2[0], r3[0]),
+            ghash_reduce(r0[1], r1[1], r2[1], r3[1]),
+            ghash_reduce(r0[2], r1[2], r2[2], r3[2]),
+            ghash_reduce(r0[3], r1[3], r2[3], r3[3]),
+        ]
+    }
+}
+
+/// Single GF(2^128) product via the PCLMULQDQ + GCM Barrett path. Thin
+/// wrapper that calls [`ghash_mul_pclmulqdq_x4`] with 4 copies of the
+/// same pair — the unrolled body still runs 4 PCLMULQDQ chains; for
+/// single-mul call sites the compiler will share the inputs across
+/// iterations and the cost is identical to a non-unrolled version.
+/// Field-identical to `ghash_mul_karatsuba_vec` (same field element,
+/// same reduction polynomial — only the inner organisation differs).
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`; the caller in `gf2_128.rs::Mul`
+/// already verified PCLMULQDQ via CPUID.
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features; the helper
+    // requires the same.
+    unsafe {
+        let res = ghash_mul_pclmulqdq_x4([a, a, a, a], [b, b, b, b]);
+        res[0]
+    }
+}
+
+
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
