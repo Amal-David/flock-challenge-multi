@@ -1,5 +1,7 @@
 use crate::field::F128;
 
+use super::portable;
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
 /// # Safety

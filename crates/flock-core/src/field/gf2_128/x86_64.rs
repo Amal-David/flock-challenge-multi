@@ -575,3 +575,161 @@ impl WideGhashX4 {
         }
     }
 }
+
+// -----------------------------------------------------------------------
+// Runtime CPUID detection.
+//
+// The build always targets `target-cpu=native` (see setup.sh), so the
+// compiled feature set normally includes both `avx2` and `pclmulqdq`.
+// The runtime probe re-checks the actual CPU bits so the kernel tier
+// matches the host, not just the build options — important when the
+// binary is shipped to a different machine than the build host.
+// -----------------------------------------------------------------------
+
+/// Tier of F128 fold kernel to use. Higher tiers are faster but require
+/// more ISA support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldTier {
+    /// Scalar portable fallback (always works).
+    Scalar,
+    /// AVX2 + PCLMULQDQ on ymm (2 independent 128-bit lanes).
+    Avx2Pclmul,
+    /// AVX-512 + VPCLMULQDQ on zmm (4 independent 128-bit lanes).
+    Avx512Vpclmul,
+}
+
+/// Runtime-detected fold tier. `cpuid` is consulted once per process
+/// behind a `OnceLock`; subsequent calls are a single relaxed load.
+///
+/// Selection rule:
+///   - AVX-512F + VPCLMULQDQ → `Avx512Vpclmul`
+///   - AVX2 + PCLMULQDQ      → `Avx2Pclmul`
+///   - otherwise             → `Scalar`
+#[inline]
+pub fn detect_fold_tier() -> FoldTier {
+    use std::sync::OnceLock;
+    static TIER: OnceLock<FoldTier> = OnceLock::new();
+    *TIER.get_or_init(cpuid_detect_fold_tier)
+}
+
+#[inline]
+fn cpuid_detect_fold_tier() -> FoldTier {
+    // CPUID leaf 1, ECX bit 28 = AVX; leaf 1, ECX bit 1 = PCLMULQDQ.
+    // CPUID leaf 7, sub-leaf 0, EBX bit 16 = AVX512F; bit 10 = VPCLMULQDQ.
+    //
+    // We use raw `__cpuid` / `__cpuid_count` because they are stable core::arch
+    // intrinsics that don't require any compile-time feature to call. The
+    // `cpuid` instruction itself is legal on any x86_64 CPU.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // Leaf 1: feature bits in ECX.
+        let leaf1 = core::arch::x86_64::__cpuid(1);
+        let ecx = leaf1.ecx;
+        let has_avx = (ecx >> 28) & 1 != 0;
+        let has_pclmulqdq = (ecx >> 1) & 1 != 0;
+
+        // Leaf 7 sub 0: feature bits in EBX.
+        let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+        let ebx = leaf7.ebx;
+        let has_avx512f = (ebx >> 16) & 1 != 0;
+        let has_vpclmulqdq = (ebx >> 10) & 1 != 0;
+
+        if has_avx512f && has_vpclmulqdq {
+            return FoldTier::Avx512Vpclmul;
+        }
+        if has_avx && has_pclmulqdq {
+            return FoldTier::Avx2Pclmul;
+        }
+    }
+    FoldTier::Scalar
+}
+
+// -----------------------------------------------------------------------
+// AVX2 + PCLMULQDQ: 2 independent GF(2^128) multiplies per instruction.
+//
+// Lane-parallel port of `ghash_mul_binius` (one stage shorter) on a
+// `__m256i` (2 lanes of 128 bits each). Same 4 product CLMULs + one
+// `0x87` reduction as the AVX-512 `ghash_mul_x4_split`, but 2 lanes per
+// instruction instead of 4 — used by the AVX2+PCLMULQDQ fold kernels
+// (tile=8, unroll=4) when the runtime cpuid gate picks the AVX2 path.
+// Requires `pclmulqdq` only (no `vpclmulqdq`), so it works on hardware
+// that exposes PCLMULQDQ on ymm but not VPCLMULQDQ on zmm.
+// -----------------------------------------------------------------------
+
+/// Per-128-bit-lane reduce: returns `t0 + x^64 · t1` (mod p) in each lane.
+/// Same field element as the AVX-512 `gf2_128_reduce_x4`, applied on two
+/// 128-bit lanes of a `__m256i` instead of four 128-bit lanes of a zmm.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "pclmulqdq",
+    target_feature = "avx2"
+))]
+#[inline]
+#[target_feature(enable = "pclmulqdq,avx2")]
+unsafe fn gf2_128_reduce_y2(mut t0: __m256i, t1: __m256i) -> __m256i {
+    // SAFETY: caller carries pclmulqdq+avx2.
+    unsafe {
+        // {0x87, 0} per lane.
+        let poly = _mm256_set_epi64x(0, 0x87, 0, 0x87);
+        t0 = _mm256_xor_si256(t0, _mm256_bslli_epi128::<8>(t1));
+        t0 = _mm256_xor_si256(
+            t0,
+            _mm256_clmulepi64_epi128::<0x01>(t1, poly),
+        );
+        t0
+    }
+}
+
+/// `t · x^64 mod p`, independently in each 128-bit lane of a `__m256i` —
+/// the companion constant consumed by [`ghash_mul_split_y2`].
+///
+/// # Safety
+/// Caller must ensure `pclmulqdq` and `avx2` are available.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "pclmulqdq",
+    target_feature = "avx2"
+))]
+#[inline]
+#[target_feature(enable = "pclmulqdq,avx2")]
+pub unsafe fn ghash_shift64_y2(t: __m256i) -> __m256i {
+    // SAFETY: caller carries pclmulqdq+avx2.
+    unsafe { gf2_128_reduce_y2(_mm256_setzero_si256(), t) }
+}
+
+/// 2 independent GF(2^128) products `v[i]·t` for a twiddle supplied in
+/// split form: `t` and `t_x64 = t·x^64 mod p` (see [`ghash_shift64_y2`]).
+///
+/// Field-identical to applying `ghash_mul_binius` to each lane, but
+/// reaches the result with 5 PCLMULQDQ on 2 lanes (2.5 per output) against
+/// 6 PCLMUL for the per-lane binius. Both twiddle operands are normally
+/// lane-broadcast loop constants.
+///
+/// # Safety
+/// Caller must ensure `pclmulqdq` + `avx2` are available and that
+/// `t_x64` really is `t·x^64 mod p` in every lane.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "pclmulqdq",
+    target_feature = "avx2"
+))]
+#[inline]
+#[target_feature(enable = "pclmulqdq,avx2")]
+pub unsafe fn ghash_mul_split_y2(v: __m256i, t: __m256i, t_x64: __m256i) -> __m256i {
+    // SAFETY: caller carries pclmulqdq+avx2 and the companion contract.
+    unsafe {
+        // Limb 0..1 of the 192-bit product: v.lo·t.lo ⊕ v.hi·t_x64.lo.
+        let lo = _mm256_xor_si256(
+            _mm256_clmulepi64_epi128::<0x00>(v, t),
+            _mm256_clmulepi64_epi128::<0x01>(v, t_x64),
+        );
+        // Limb 1..2, weighted x^64: v.lo·t.hi ⊕ v.hi·t_x64.hi.
+        let hi = _mm256_xor_si256(
+            _mm256_clmulepi64_epi128::<0x10>(v, t),
+            _mm256_clmulepi64_epi128::<0x11>(v, t_x64),
+        );
+        // One fold: lo + x^64·hi (mod p). The top limb is 64 bits wide, so
+        // the single `0x87` PCLMULQDQ finishes it (degree ≤ 70 < 128).
+        gf2_128_reduce_y2(lo, hi)
+    }
+}
