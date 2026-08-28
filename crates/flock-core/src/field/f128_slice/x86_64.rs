@@ -1,5 +1,423 @@
 use crate::field::F128;
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(super) fn vpclmulqdq_runtime() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
+    // Cache the result of the runtime detection: hot F128 paths call this on
+    // every fold, so the one-shot check has to be cheap. `u8::MAX` is the
+    // "not yet computed" sentinel; `0/1` are the cached verdicts.
+    match CACHE.load(Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    let res = unsafe { detect_vpclmulqdq() };
+    CACHE.store(res as u8, Ordering::Relaxed);
+    res
+}
+
+/// Probe CPUID for AVX-512F + VPCLMULQDQ. Returns true iff both are usable on
+/// this core. VPCLMULQDQ lives in leaf 7 sub-leaf 0 EBX bit 10; AVX-512F
+/// lives in the same word at bit 16. We do not require OS support (XCR0
+/// checks): on a kernel that hasn't enabled AVX-512 we'll fault on the first
+/// `_mm512_*` use, but that is consistent with the rest of the x86_64
+/// kernel set which assumes the runtime has already enabled AVX-512 state.
+///
+/// # Safety
+/// Pure CPUID — no side effects, no memory access.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn detect_vpclmulqdq() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__cpuid_count, CpuidResult};
+    // SAFETY: SSE4.1 is universally available on x86_64; CPUID is side-effect
+    // free and uses no memory.
+    unsafe {
+        let leaf7: CpuidResult = __cpuid_count(7, 0);
+        const AVX512F_BIT: u32 = 1 << 16;
+        const VPCLMULQDQ_BIT: u32 = 1 << 10;
+        (leaf7.ebx & AVX512F_BIT != 0) && (leaf7.ebx & VPCLMULQDQ_BIT != 0)
+    }
+}
+
+// `_mm_prefetch` and `_mm512_*` are SSE/AVX-512 intrinsics; keep this whole
+// module compilable when only the lower x86 baseline is enabled.
+#[allow(dead_code)]
+const _: () = (); // anchor for cfg-gated attributes below
+
+/// L1-cache-blocked iteration window for the pair-fold kernels, in output
+/// F128 (2 source F128 per output F128). 256 dst F128 per block = 4 KiB of
+/// destination + 8 KiB of source, with the next block's 8 KiB of source
+/// prefetched ahead: 20 KiB total working set, comfortably fitting a 32 KiB
+/// L1d on Sapphire Rapids / Ice Lake / Zen 4. `FLOCK_NO_FOLD_PAIRS_PF=1`
+/// removes the prefetch (the kernel is byte-identical either way — the
+/// hints move no data of their own), `FLOCK_FOLD_PAIRS_PF=<n>` overrides the
+/// distance.
+const FOLD_PAIRS_BLOCK: usize = 256;
+const FOLD_PAIRS_PF_AHEAD: usize = 256;
+
+#[inline]
+fn fold_pairs_block_size() -> usize {
+    FOLD_PAIRS_BLOCK
+}
+
+#[inline]
+fn fold_pairs_pf_ahead() -> usize {
+    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_FOLD_PAIRS_PF").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_FOLD_PAIRS_PF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(FOLD_PAIRS_PF_AHEAD)
+    });
+    *D
+}
+
+/// Issue a sequence of L1-prefetch hints 64 bytes apart starting at `p`.
+/// `count * 64` bytes total; the hints move no data of their own.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+unsafe fn prefetch_l1_lines(p: *const i8, count: usize) {
+    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    // SAFETY: caller guarantees the address range is mapped readable; hints
+    // never fault.
+    unsafe {
+        let mut l = 0usize;
+        while l < count {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+            l = l.wrapping_add(64);
+        }
+    }
+}
+
+/// Four-lane pair fold with L1-cache-blocked iteration and an inner loop
+/// unrolled by 8 (32 output F128 per iteration). Runtime-detected
+/// VPCLMULQDQ + AVX-512F are required — see [`vpclmulqdq_runtime`].
+///
+/// Block size is [`FOLD_PAIRS_BLOCK`] source F128 (= 256 output F128). Each
+/// iteration prefetches one block of source ahead of the current read
+/// window. The inner body is a straight unroll-by-8 of the four-lane body
+/// of [`fold_pairs`]; folding correctness is identical (the iteration
+/// order over the source slice is the same, just with 8 quads per step).
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX-512F + VPCLMULQDQ and that
+/// `base + dst.len() * 2 <= src.len()`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_pairs_cached(
+    src: &[F128],
+    base: usize,
+    dst: &mut [F128],
+    r: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_bcast);
+        let total = dst.len();
+        let block = fold_pairs_block_size().min(total);
+        let pf_ahead = fold_pairs_pf_ahead();
+        let src_base_ptr = src.as_ptr();
+        let src_len = src.len();
+        let mut done = 0usize;
+        while done < total {
+            // Prefetch the block of source that the *next* chunk will read;
+            // the current chunk's loads overlap the previous chunk's
+            // prefetch so the L1d demand stream stays fed. `pf_ahead` is
+            // measured in dst F128 (= 2 src F128).
+            if pf_ahead != 0 {
+                let pf_src_idx = 2 * (base + done) + 2 * pf_ahead;
+                if pf_src_idx + 64 <= src_len {
+                    prefetch_l1_lines(
+                        src_base_ptr.add(pf_src_idx).cast::<i8>(),
+                        ((2 * pf_ahead) / 64).max(1),
+                    );
+                }
+            }
+            let chunk = block.min(total - done);
+            let lanes = chunk & !3;
+            let chunk_end = done + lanes;
+            // Unroll-by-8: 8 quad-iterations per inner pass (32 dst slots,
+            // 64 src F128). Each step is independent — the compiler is free
+            // to pipeline CLMULs across them.
+            let mut t = done;
+            let unroll_end = done + (lanes & !31);
+            while t < unroll_end {
+                let s0 = 2 * (base + t);
+                let s1 = s0 + 8;
+                let s2 = s0 + 16;
+                let s3 = s0 + 24;
+                let s4 = s0 + 32;
+                let s5 = s0 + 40;
+                let s6 = s0 + 48;
+                let s7 = s0 + 56;
+                let lo0 = _mm512_loadu_si512(src.as_ptr().add(s0) as *const __m512i);
+                let hi0 = _mm512_loadu_si512(src.as_ptr().add(s0 + 4) as *const __m512i);
+                let even0 = _mm512_shuffle_i32x4::<0x88>(lo0, hi0);
+                let odd0 = _mm512_shuffle_i32x4::<0xDD>(lo0, hi0);
+                let v0 = _mm512_xor_si512(
+                    even0,
+                    ghash_mul_x4_split(_mm512_xor_si512(even0, odd0), r_bcast, r_x64),
+                );
+                let lo1 = _mm512_loadu_si512(src.as_ptr().add(s1) as *const __m512i);
+                let hi1 = _mm512_loadu_si512(src.as_ptr().add(s1 + 4) as *const __m512i);
+                let even1 = _mm512_shuffle_i32x4::<0x88>(lo1, hi1);
+                let odd1 = _mm512_shuffle_i32x4::<0xDD>(lo1, hi1);
+                let v1 = _mm512_xor_si512(
+                    even1,
+                    ghash_mul_x4_split(_mm512_xor_si512(even1, odd1), r_bcast, r_x64),
+                );
+                let lo2 = _mm512_loadu_si512(src.as_ptr().add(s2) as *const __m512i);
+                let hi2 = _mm512_loadu_si512(src.as_ptr().add(s2 + 4) as *const __m512i);
+                let even2 = _mm512_shuffle_i32x4::<0x88>(lo2, hi2);
+                let odd2 = _mm512_shuffle_i32x4::<0xDD>(lo2, hi2);
+                let v2 = _mm512_xor_si512(
+                    even2,
+                    ghash_mul_x4_split(_mm512_xor_si512(even2, odd2), r_bcast, r_x64),
+                );
+                let lo3 = _mm512_loadu_si512(src.as_ptr().add(s3) as *const __m512i);
+                let hi3 = _mm512_loadu_si512(src.as_ptr().add(s3 + 4) as *const __m512i);
+                let even3 = _mm512_shuffle_i32x4::<0x88>(lo3, hi3);
+                let odd3 = _mm512_shuffle_i32x4::<0xDD>(lo3, hi3);
+                let v3 = _mm512_xor_si512(
+                    even3,
+                    ghash_mul_x4_split(_mm512_xor_si512(even3, odd3), r_bcast, r_x64),
+                );
+                let lo4 = _mm512_loadu_si512(src.as_ptr().add(s4) as *const __m512i);
+                let hi4 = _mm512_loadu_si512(src.as_ptr().add(s4 + 4) as *const __m512i);
+                let even4 = _mm512_shuffle_i32x4::<0x88>(lo4, hi4);
+                let odd4 = _mm512_shuffle_i32x4::<0xDD>(lo4, hi4);
+                let v4 = _mm512_xor_si512(
+                    even4,
+                    ghash_mul_x4_split(_mm512_xor_si512(even4, odd4), r_bcast, r_x64),
+                );
+                let lo5 = _mm512_loadu_si512(src.as_ptr().add(s5) as *const __m512i);
+                let hi5 = _mm512_loadu_si512(src.as_ptr().add(s5 + 4) as *const __m512i);
+                let even5 = _mm512_shuffle_i32x4::<0x88>(lo5, hi5);
+                let odd5 = _mm512_shuffle_i32x4::<0xDD>(lo5, hi5);
+                let v5 = _mm512_xor_si512(
+                    even5,
+                    ghash_mul_x4_split(_mm512_xor_si512(even5, odd5), r_bcast, r_x64),
+                );
+                let lo6 = _mm512_loadu_si512(src.as_ptr().add(s6) as *const __m512i);
+                let hi6 = _mm512_loadu_si512(src.as_ptr().add(s6 + 4) as *const __m512i);
+                let even6 = _mm512_shuffle_i32x4::<0x88>(lo6, hi6);
+                let odd6 = _mm512_shuffle_i32x4::<0xDD>(lo6, hi6);
+                let v6 = _mm512_xor_si512(
+                    even6,
+                    ghash_mul_x4_split(_mm512_xor_si512(even6, odd6), r_bcast, r_x64),
+                );
+                let lo7 = _mm512_loadu_si512(src.as_ptr().add(s7) as *const __m512i);
+                let hi7 = _mm512_loadu_si512(src.as_ptr().add(s7 + 4) as *const __m512i);
+                let even7 = _mm512_shuffle_i32x4::<0x88>(lo7, hi7);
+                let odd7 = _mm512_shuffle_i32x4::<0xDD>(lo7, hi7);
+                let v7 = _mm512_xor_si512(
+                    even7,
+                    ghash_mul_x4_split(_mm512_xor_si512(even7, odd7), r_bcast, r_x64),
+                );
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, v0);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, v1);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 8) as *mut __m512i, v2);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 12) as *mut __m512i, v3);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 16) as *mut __m512i, v4);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 20) as *mut __m512i, v5);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 24) as *mut __m512i, v6);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 28) as *mut __m512i, v7);
+                t += 32;
+            }
+            // Tail of the chunk (0..3 quads not fitting the unroll).
+            while t < chunk_end {
+                let s = 2 * (base + t);
+                let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                let diff = _mm512_xor_si512(even, odd);
+                let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+                t += 4;
+            }
+            // Scalar tail of the chunk (0..3 dst slots).
+            let mut tail = chunk_end;
+            while tail < chunk {
+                let s = 2 * (base + tail);
+                let even = src[s];
+                dst[tail] = even + r * (even + src[s + 1]);
+                tail += 1;
+            }
+            done = done + chunk;
+        }
+    }
+}
+
+/// L1-cache-blocked, unrolled-by-8 version of [`fold_pairs_with_scaled_addend`].
+/// Runtime-detected VPCLMULQDQ + AVX-512F required.
+///
+/// Same body shape as [`fold_pairs_cached`] but every quad additionally
+/// applies a scaled addend fold: the per-slot work becomes
+/// `src_fold + scale * addend_fold`. Folding correctness is preserved
+/// (the in-chunk quad order is identical to the original).
+///
+/// # Safety
+/// Caller must ensure AVX-512F + VPCLMULQDQ are available, the source
+/// slice has `2 * (base + dst.len())` elements, and the addend slice
+/// covers the same pair range.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn fold_pairs_with_scaled_addend_cached(
+    src: &[F128],
+    addend: &[F128],
+    base: usize,
+    dst: &mut [F128],
+    r: F128,
+    scale: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller guarantees target features and source bounds.
+    unsafe {
+        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_x4);
+        let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let scale_x64 = ghash_shift64_x4(scale_x4);
+        let total = dst.len();
+        let block = fold_pairs_block_size().min(total);
+        let pf_ahead = fold_pairs_pf_ahead();
+        let src_base_ptr = src.as_ptr();
+        let addend_base_ptr = addend.as_ptr();
+        let src_len = src.len();
+        let addend_len = addend.len();
+        let mut done = 0usize;
+        while done < total {
+            if pf_ahead != 0 {
+                let pf_src_idx = 2 * (base + done) + 2 * pf_ahead;
+                if pf_src_idx + 64 <= src_len {
+                    prefetch_l1_lines(
+                        src_base_ptr.add(pf_src_idx).cast::<i8>(),
+                        ((2 * pf_ahead) / 64).max(1),
+                    );
+                }
+                let pf_add_idx = 2 * (base + done) + 2 * pf_ahead;
+                if pf_add_idx + 64 <= addend_len {
+                    prefetch_l1_lines(
+                        addend_base_ptr.add(pf_add_idx).cast::<i8>(),
+                        ((2 * pf_ahead) / 64).max(1),
+                    );
+                }
+            }
+            let chunk = block.min(total - done);
+            let lanes = chunk & !3;
+            let chunk_end = done + lanes;
+            let unroll_end = done + (lanes & !31);
+            let mut t = done;
+            while t < unroll_end {
+                macro_rules! fold_pair_quad {
+                    ($tt:expr) => {{
+                        let s_local = 2 * (base + $tt);
+                        let s_lo = _mm512_loadu_si512(
+                            src.as_ptr().add(s_local) as *const __m512i
+                        );
+                        let s_hi = _mm512_loadu_si512(
+                            src.as_ptr().add(s_local + 4) as *const __m512i
+                        );
+                        let s_even = _mm512_shuffle_i32x4::<0x88>(s_lo, s_hi);
+                        let s_odd = _mm512_shuffle_i32x4::<0xDD>(s_lo, s_hi);
+                        let s_folded = _mm512_xor_si512(
+                            s_even,
+                            ghash_mul_x4_split(
+                                _mm512_xor_si512(s_even, s_odd),
+                                r_x4,
+                                r_x64,
+                            ),
+                        );
+                        let a_lo = _mm512_loadu_si512(
+                            addend.as_ptr().add(s_local) as *const __m512i
+                        );
+                        let a_hi = _mm512_loadu_si512(
+                            addend.as_ptr().add(s_local + 4) as *const __m512i
+                        );
+                        let a_even = _mm512_shuffle_i32x4::<0x88>(a_lo, a_hi);
+                        let a_odd = _mm512_shuffle_i32x4::<0xDD>(a_lo, a_hi);
+                        let a_folded = _mm512_xor_si512(
+                            a_even,
+                            ghash_mul_x4_split(
+                                _mm512_xor_si512(a_even, a_odd),
+                                r_x4,
+                                r_x64,
+                            ),
+                        );
+                        _mm512_xor_si512(
+                            s_folded,
+                            ghash_mul_x4_split(a_folded, scale_x4, scale_x64),
+                        )
+                    }};
+                }
+                let v0 = fold_pair_quad!(t);
+                let v1 = fold_pair_quad!(t + 4);
+                let v2 = fold_pair_quad!(t + 8);
+                let v3 = fold_pair_quad!(t + 12);
+                let v4 = fold_pair_quad!(t + 16);
+                let v5 = fold_pair_quad!(t + 20);
+                let v6 = fold_pair_quad!(t + 24);
+                let v7 = fold_pair_quad!(t + 28);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, v0);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, v1);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 8) as *mut __m512i, v2);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 12) as *mut __m512i, v3);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 16) as *mut __m512i, v4);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 20) as *mut __m512i, v5);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 24) as *mut __m512i, v6);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t + 28) as *mut __m512i, v7);
+                t += 32;
+            }
+            while t < chunk_end {
+                let s = 2 * (base + t);
+                let s_lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let s_hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let s_even = _mm512_shuffle_i32x4::<0x88>(s_lo, s_hi);
+                let s_odd = _mm512_shuffle_i32x4::<0xDD>(s_lo, s_hi);
+                let s_folded = _mm512_xor_si512(
+                    s_even,
+                    ghash_mul_x4_split(_mm512_xor_si512(s_even, s_odd), r_x4, r_x64),
+                );
+                let a_lo = _mm512_loadu_si512(addend.as_ptr().add(s) as *const __m512i);
+                let a_hi = _mm512_loadu_si512(addend.as_ptr().add(s + 4) as *const __m512i);
+                let a_even = _mm512_shuffle_i32x4::<0x88>(a_lo, a_hi);
+                let a_odd = _mm512_shuffle_i32x4::<0xDD>(a_lo, a_hi);
+                let a_folded = _mm512_xor_si512(
+                    a_even,
+                    ghash_mul_x4_split(_mm512_xor_si512(a_even, a_odd), r_x4, r_x64),
+                );
+                let out = _mm512_xor_si512(
+                    s_folded,
+                    ghash_mul_x4_split(a_folded, scale_x4, scale_x64),
+                );
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+                t += 4;
+            }
+            let mut tail = chunk_end;
+            while tail < chunk {
+                let index = 2 * (base + tail);
+                let src_even = src[index];
+                let addend_even = addend[index];
+                let src_folded = src_even + r * (src_even + src[index + 1]);
+                let addend_folded = addend_even + r * (addend_even + addend[index + 1]);
+                dst[tail] = src_folded + scale * addend_folded;
+                tail += 1;
+            }
+            done = done + chunk;
+        }
+    }
+}
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
 /// # Safety

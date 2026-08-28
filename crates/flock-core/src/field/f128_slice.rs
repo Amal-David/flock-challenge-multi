@@ -48,7 +48,16 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     // SAFETY: the cfg gate guarantees the required target features and the
     // bounds check above guarantees both source elements for every output.
     unsafe {
-        x86_64::fold_pairs(src, base, dst, r);
+        // Runtime-dispatch to the L1-cache-blocked, unrolled-by-8 kernel
+        // when the hardware actually exposes AVX-512F + VPCLMULQDQ. On
+        // `-C target-cpu=native` builds the detector always succeeds; the
+        // check still guards against sandboxed/kiosk kernels that strip
+        // AVX-512 state at process launch.
+        if x86_64::vpclmulqdq_runtime() {
+            x86_64::fold_pairs_cached(src, base, dst, r);
+        } else {
+            x86_64::fold_pairs(src, base, dst, r);
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -206,7 +215,16 @@ pub(crate) fn fold_pairs_with_scaled_addend(
     // SAFETY: the cfg gate guarantees the required target features and the
     // bounds checks above cover both inputs for every output.
     unsafe {
-        x86_64::fold_pairs_with_scaled_addend(src, addend, base, dst, r, scale);
+        // Runtime dispatch: see `fold_pairs` for the rationale. We keep the
+        // non-cached kernel as a same-binary fallback for sandboxed kernels
+        // that strip AVX-512 state at process launch.
+        if x86_64::vpclmulqdq_runtime() {
+            x86_64::fold_pairs_with_scaled_addend_cached(
+                src, addend, base, dst, r, scale,
+            );
+        } else {
+            x86_64::fold_pairs_with_scaled_addend(src, addend, base, dst, r, scale);
+        }
     }
 
     #[cfg(not(all(
