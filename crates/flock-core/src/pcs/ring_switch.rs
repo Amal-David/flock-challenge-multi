@@ -1070,35 +1070,24 @@ pub fn fold_1b_rows_split(
                     let m_chunk = &w_block[c * 16..c * 16 + 16];
                     let [tbl0, tbl1, tbl2, tbl3] = &tables[c];
 
-                    let mut m_bytes = [[0u8; 16]; 16];
-                    for (e, slot) in m_bytes.iter_mut().enumerate() {
-                        slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                        slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                    }
+                    let mut tlo_all = [0u8; 128];
+                    let mut thi_all = [0u8; 128];
+
+                    let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                    let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                    let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                    let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                     for r_byte in 0..16 {
-                        let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                            | ((m_bytes[1][r_byte] as u64) << 8)
-                            | ((m_bytes[2][r_byte] as u64) << 16)
-                            | ((m_bytes[3][r_byte] as u64) << 24)
-                            | ((m_bytes[4][r_byte] as u64) << 32)
-                            | ((m_bytes[5][r_byte] as u64) << 40)
-                            | ((m_bytes[6][r_byte] as u64) << 48)
-                            | ((m_bytes[7][r_byte] as u64) << 56);
-                        let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                            | ((m_bytes[9][r_byte] as u64) << 8)
-                            | ((m_bytes[10][r_byte] as u64) << 16)
-                            | ((m_bytes[11][r_byte] as u64) << 24)
-                            | ((m_bytes[12][r_byte] as u64) << 32)
-                            | ((m_bytes[13][r_byte] as u64) << 40)
-                            | ((m_bytes[14][r_byte] as u64) << 48)
-                            | ((m_bytes[15][r_byte] as u64) << 56);
-                        let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                        let thi = transpose_8x8_bits(hi8).to_le_bytes();
                         let base = r_byte * 8;
                         for p in 0..8 {
-                            let m_lo = tlo[p];
-                            let m_hi = thi[p];
+                            let m_lo = tlo_all[base + p];
+                            let m_hi = thi_all[base + p];
                             inner[base + p] += tbl0[(m_lo & 0x0F) as usize]
                                 + tbl1[(m_lo >> 4) as usize]
                                 + tbl2[(m_hi & 0x0F) as usize]
@@ -1231,35 +1220,24 @@ pub fn fold_1b_rows_split_2way(
                 let [t0a, t0b, t0c, t0d] = &tables_0[c];
                 let [t1a, t1b, t1c, t1d] = &tables_1[c];
 
-                let mut m_bytes = [[0u8; 16]; 16];
-                for (e, slot) in m_bytes.iter_mut().enumerate() {
-                    slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                    slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                }
+                let mut tlo_all = [0u8; 128];
+                let mut thi_all = [0u8; 128];
+
+                let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                 for r_byte in 0..16 {
-                    let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                        | ((m_bytes[1][r_byte] as u64) << 8)
-                        | ((m_bytes[2][r_byte] as u64) << 16)
-                        | ((m_bytes[3][r_byte] as u64) << 24)
-                        | ((m_bytes[4][r_byte] as u64) << 32)
-                        | ((m_bytes[5][r_byte] as u64) << 40)
-                        | ((m_bytes[6][r_byte] as u64) << 48)
-                        | ((m_bytes[7][r_byte] as u64) << 56);
-                    let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                        | ((m_bytes[9][r_byte] as u64) << 8)
-                        | ((m_bytes[10][r_byte] as u64) << 16)
-                        | ((m_bytes[11][r_byte] as u64) << 24)
-                        | ((m_bytes[12][r_byte] as u64) << 32)
-                        | ((m_bytes[13][r_byte] as u64) << 40)
-                        | ((m_bytes[14][r_byte] as u64) << 48)
-                        | ((m_bytes[15][r_byte] as u64) << 56);
-                    let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                    let thi = transpose_8x8_bits(hi8).to_le_bytes();
                     let base = r_byte * 8;
                     for p in 0..8 {
-                        let m_lo = tlo[p];
-                        let m_hi = thi[p];
+                        let m_lo = tlo_all[base + p];
+                        let m_hi = thi_all[base + p];
                         let i_lo4 = (m_lo & 0x0F) as usize;
                         let i_hi4 = (m_lo >> 4) as usize;
                         let i_lo4h = (m_hi & 0x0F) as usize;
