@@ -55,7 +55,11 @@ pub fn gpu_dbg_trace(msg: &str) {
         return;
     }
     let path = std::env::temp_dir().join("gpu-trace.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "[{:?}] {}", std::thread::current().id(), msg);
     }
 }
@@ -654,7 +658,11 @@ mod real {
                     data.len(),
                     0,
                 );
-                if buf.is_null() { None } else { Some((buf, false)) }
+                if buf.is_null() {
+                    None
+                } else {
+                    Some((buf, false))
+                }
             } else {
                 None
             }
@@ -1864,17 +1872,17 @@ kernel void blake3_parent(
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
     use super::{merkle, urm};
+    use crate::field::F8;
     use crate::field::F128;
     use crate::hash::HashKind;
     use crate::merkle::{Hash, hash_leaf, hash_pair};
     use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+    use crate::zerocheck::PaddingSpec;
     use crate::zerocheck::univariate_skip::{SplitEqGhash, pack_bits};
     use crate::zerocheck::univariate_skip_optimized::{
         K_SKIP, N_INNER, WorkerStateWithSHatV, build_b_med_counts, convert_table, d_inv,
         medium_challenges_ghash, process_one_x_hi_with_s_hat_v, small_challenges_ghash,
     };
-    use crate::zerocheck::PaddingSpec;
-    use crate::field::F8;
 
     // -- shared helpers -------------------------------------------------------
 
@@ -2001,19 +2009,30 @@ mod tests {
                 let tree = PageBuf::zeroed(tree_len * 32);
 
                 let mut s = unsafe {
-                    merkle::begin(&data, leaf_size, tree.hash_ptr(), tree.hash_len(), usize::MAX)
+                    merkle::begin(
+                        &data,
+                        leaf_size,
+                        tree.hash_ptr(),
+                        tree.hash_len(),
+                        usize::MAX,
+                    )
                 }
                 .expect("begin must succeed when Metal is available");
                 // Split into two commits to exercise multi-cb streaming.
                 let mid = n / 2;
                 if mid > 0 {
-                    assert!(s.commit_leaves(0, mid), "commit_leaves lo n={n} ls={leaf_size}");
-                    assert!(s.commit_leaves(mid, n), "commit_leaves hi n={n} ls={leaf_size}");
+                    assert!(
+                        s.commit_leaves(0, mid),
+                        "commit_leaves lo n={n} ls={leaf_size}"
+                    );
+                    assert!(
+                        s.commit_leaves(mid, n),
+                        "commit_leaves hi n={n} ls={leaf_size}"
+                    );
                 } else {
                     assert!(s.commit_leaves(0, n), "commit_leaves n={n} ls={leaf_size}");
                 }
-                s.finish()
-                    .expect("GPU leaf session must complete");
+                s.finish().expect("GPU leaf session must complete");
 
                 for i in 0..n {
                     let want =
@@ -2048,10 +2067,9 @@ mod tests {
             let tree_len = (2 * n).next_multiple_of(512).max(512);
             let tree = PageBuf::zeroed(tree_len * 32);
 
-            let mut s = unsafe {
-                merkle::begin(&data, leaf_size, tree.hash_ptr(), tree.hash_len(), 1)
-            }
-            .expect("begin must succeed when Metal is available");
+            let mut s =
+                unsafe { merkle::begin(&data, leaf_size, tree.hash_ptr(), tree.hash_len(), 1) }
+                    .expect("begin must succeed when Metal is available");
             assert!(s.commit_leaves(0, n));
             assert!(s.commit_parent_levels());
             s.finish().expect("GPU tree session must complete");
@@ -2165,8 +2183,7 @@ mod tests {
         // Bad leaf sizes.
         for &ls in &[0usize, 32, 96 + 1, 2048] {
             assert!(
-                unsafe { merkle::begin(&data, ls, tree.hash_ptr(), tree.hash_len(), 1) }
-                    .is_none()
+                unsafe { merkle::begin(&data, ls, tree.hash_ptr(), tree.hash_len(), 1) }.is_none()
             );
         }
         // Non-multiple data length.
@@ -2183,9 +2200,7 @@ mod tests {
         // Tree region too small for the requested levels (64 leaves need
         // 127 nodes to the root; wrapped region of 0 pages covers none).
         let tiny = PageBuf::zeroed(PAGE);
-        assert!(
-            unsafe { merkle::begin(&data, 64, tiny.hash_ptr(), 100, 1) }.is_none()
-        );
+        assert!(unsafe { merkle::begin(&data, 64, tiny.hash_ptr(), 100, 1) }.is_none());
         // Non-power-of-two leaves with parent levels requested.
         let data3 = vec![0u8; 3 * 64];
         assert!(
@@ -2243,6 +2258,7 @@ mod tests {
         let d_inv_val = d_inv();
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
+        let mask_tables = crate::zerocheck::univariate_skip_optimized::build_c_mask_tables(&eq_lo_scaled);
         let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
 
         // CPU: one x_hi (= 0) into a fresh state ⇒ `local_res_*` hold exactly
@@ -2261,6 +2277,7 @@ mod tests {
             &eq_lo_scaled,
             eq.hi[0],
             convert,
+            &mask_tables,
             &mut state,
         );
 
@@ -2283,8 +2300,8 @@ mod tests {
         let got = job.finish().expect("GPU share must complete");
 
         assert_eq!(got.res_ab, state.local_res_ab, "AB bank mismatch");
-        assert_eq!(got.res_c0, state.local_res_c_s_0, "C bank 0 mismatch");
-        assert_eq!(got.res_c1, state.local_res_c_s_1, "C bank 1 mismatch");
+        assert_eq!(got.res_c0, state.local_res_c_s[0], "C bank 0 mismatch");
+        assert_eq!(got.res_c1, state.local_res_c_s[1], "C bank 1 mismatch");
     }
 
     /// CPU reference for a whole-range GPU share: serial accumulation of
@@ -2302,6 +2319,7 @@ mod tests {
         let d_inv_val = d_inv();
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
+        let mask_tables = crate::zerocheck::univariate_skip_optimized::build_c_mask_tables(&eq_lo_scaled);
         let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
         let mut state = WorkerStateWithSHatV::new();
         for x_hi in 0..(1usize << eq.n_hi) {
@@ -2318,6 +2336,7 @@ mod tests {
                 &eq_lo_scaled,
                 eq.hi[x_hi],
                 convert,
+                &mask_tables,
                 &mut state,
             );
         }
@@ -2364,11 +2383,11 @@ mod tests {
             "AB mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
         assert_eq!(
-            got.res_c0, state.local_res_c_s_0,
+            got.res_c0, state.local_res_c_s[0],
             "C bank 0 mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
         assert_eq!(
-            got.res_c1, state.local_res_c_s_1,
+            got.res_c1, state.local_res_c_s[1],
             "C bank 1 mismatch at m={m}, tile={tile_x_outer_lo:?}"
         );
     }

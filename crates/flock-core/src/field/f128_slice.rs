@@ -1,5 +1,7 @@
 //! Architecture-selected kernels over contiguous [`F128`] slices.
 
+#![allow(clippy::items_after_test_module)] // Keep the nearby kernel-oracle tests in place.
+
 use super::F128;
 
 #[cfg(any(
@@ -13,6 +15,7 @@ use super::F128;
         all(target_arch = "aarch64", target_feature = "aes")
     ))
 ))]
+#[allow(dead_code)] // Portable fallbacks remain available for rollback builds.
 mod portable;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -72,6 +75,7 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
 /// per process; default ON. The selector is outside the bind, so there is no
 /// per-element dispatch — the historical "avoid dispatch" scalar comment no
 /// longer applies on Sapphire Rapids.
+#[allow(dead_code)] // Retained same-binary rollback selector.
 fn fold8_bind_x4_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_none());
@@ -167,6 +171,107 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Add one field slice into another in place: `dst[i] += addend[i]`.
+///
+/// Accelerated with AVX-512 `_mm512_xor_si512` on x86_64 and NEON `veorq_u8` on aarch64.
+#[inline]
+pub(crate) fn add_slice(dst: &mut [F128], addend: &[F128]) {
+    assert_eq!(dst.len(), addend.len(), "add_slice length mismatch");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f"
+    ))]
+    unsafe {
+        let len_bytes = dst.len() * core::mem::size_of::<F128>();
+        let chunks_64 = (len_bytes / 64) * 64;
+        if chunks_64 > 0 {
+            crate::lincheck::kernels::xor_bytes_avx512(
+                dst.as_mut_ptr() as *mut u8,
+                addend.as_ptr() as *const u8,
+                chunks_64,
+            );
+        }
+        for i in (chunks_64 / 16)..dst.len() {
+            dst[i] += addend[i];
+        }
+        return;
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        use core::arch::aarch64::*;
+        let len = dst.len();
+        let lanes4 = len & !3;
+        let mut i = 0;
+        while i < lanes4 {
+            let dp = dst.as_mut_ptr().add(i) as *mut uint8x16_t;
+            let sp = addend.as_ptr().add(i) as *const uint8x16_t;
+            for k in 0..4 {
+                let d = *dp.add(k);
+                let s = *sp.add(k);
+                *dp.add(k) = veorq_u8(d, s);
+            }
+            i += 4;
+        }
+        while i < len {
+            dst[i] += addend[i];
+            i += 1;
+        }
+        return;
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx512f"),
+        all(target_arch = "aarch64", target_feature = "neon")
+    )))]
+    for (d, s) in dst.iter_mut().zip(addend.iter()) {
+        *d += *s;
+    }
+}
+
+/// Compute the field inner product `\sum a[i] * b[i]`.
+///
+/// Accelerated with AVX-512 + VPCLMULQDQ via WideGhashX4 on x86_64.
+#[inline]
+pub(crate) fn dot_product(a: &[F128], b: &[F128]) -> F128 {
+    assert_eq!(a.len(), b.len(), "dot_product length mismatch");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        use crate::field::gf2_128::x86_64::WideGhashX4;
+        use core::arch::x86_64::*;
+        let mut acc = WideGhashX4::zero();
+        let lanes4 = a.len() & !3;
+        let mut i = 0;
+        while i < lanes4 {
+            let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            acc.mul_acc(va, vb);
+            i += 4;
+        }
+        let mut sum = acc.fold().reduce();
+        while i < a.len() {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        a.iter().zip(b.iter()).map(|(&x, &y)| x * y).fold(F128::ZERO, |acc, v| acc + v)
+    }
+}
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where
@@ -212,6 +317,55 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn add_slice_matches_scalar() {
+        use super::*;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [0usize, 1, 3, 4, 7, 8, 15, 16, 63, 64, 127, 128, 255] {
+            let mut dst: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let src: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let mut expected = dst.clone();
+            for (e, s) in expected.iter_mut().zip(src.iter()) {
+                *e += *s;
+            }
+            add_slice(&mut dst, &src);
+            assert_eq!(dst, expected, "add_slice mismatch at length {}", n);
+        }
+    }
+
+    #[test]
+    fn dot_product_matches_scalar() {
+        use super::*;
+        let mut state = 0xfedc_ba98_7654_3210u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 128] {
+            let a: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let b: Vec<F128> = (0..n)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let expected = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).fold(F128::ZERO, |acc, v| acc + v);
+            let got = dot_product(&a, &b);
+            assert_eq!(got, expected, "dot_product mismatch at length {}", n);
+        }
+    }
+
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
     /// elsewhere) equals the straight reduced sum `Σ w[b]·src[16t+b]` at
     /// lengths that hit the four-slot vector body and the scalar tail.
@@ -226,8 +380,16 @@ mod tests {
             state
         };
         for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
-            let src: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
-            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
+            let src: Vec<F128> = (0..16 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
             let mut got = vec![F128::ZERO; n];
             fold16_banked(&src, &mut got, &w);
             for t in 0..n {
@@ -239,7 +401,12 @@ mod tests {
             }
         }
         // Degenerate weights: one-hot, all-zero, all-one.
-        let src: Vec<F128> = (0..16 * 8).map(|i| F128 { lo: i as u64 * 7 + 1, hi: (i as u64) << 40 }).collect();
+        let src: Vec<F128> = (0..16 * 8)
+            .map(|i| F128 {
+                lo: i as u64 * 7 + 1,
+                hi: (i as u64) << 40,
+            })
+            .collect();
         for b0 in 0..16 {
             let mut w = [F128::ZERO; 16];
             w[b0] = F128::ONE;
@@ -253,7 +420,9 @@ mod tests {
         let mut got = vec![F128::ZERO; 8];
         fold16_banked(&src, &mut got, &w);
         for t in 0..8 {
-            let want = src[16 * t..16 * t + 16].iter().fold(F128::ZERO, |a, &b| a + b);
+            let want = src[16 * t..16 * t + 16]
+                .iter()
+                .fold(F128::ZERO, |a, &b| a + b);
             assert_eq!(got[t], want);
         }
     }
@@ -275,18 +444,50 @@ mod tests {
             state
         };
         for n in [1usize, 4, 5, 64, 257] {
-            let w: [F128; 16] = core::array::from_fn(|_| F128 { lo: next(), hi: next() });
-            let src16: Vec<F128> = (0..16 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let src16: Vec<F128> = (0..16 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             let mut zeroed = vec![F128::ZERO; n];
-            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut dirty: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             fold16_banked(&src16, &mut zeroed, &w);
             fold16_banked(&src16, &mut dirty, &w);
             assert_eq!(dirty, zeroed, "fold16_banked n={n}");
 
-            let (r0, r1) = (F128 { lo: next(), hi: next() }, F128 { lo: next(), hi: next() });
-            let src4: Vec<F128> = (0..4 * n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let (r0, r1) = (
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+                F128 {
+                    lo: next(),
+                    hi: next(),
+                },
+            );
+            let src4: Vec<F128> = (0..4 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             let mut zeroed = vec![F128::ZERO; n];
-            let mut dirty: Vec<F128> = (0..n).map(|_| F128 { lo: next(), hi: next() }).collect();
+            let mut dirty: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
             fold4_nested(&src4, &mut zeroed, r0, r1);
             fold4_nested(&src4, &mut dirty, r0, r1);
             assert_eq!(dirty, zeroed, "fold4_nested n={n}");
@@ -334,7 +535,6 @@ mod tests {
             assert_eq!(b_got, b_want, "folded b n={n}");
         }
     }
-
 
     /// The three split-half leaves match the straightforward scalar formulas
     /// at lengths that hit the four-slot body, every tail residue, and the
@@ -402,7 +602,11 @@ mod tests {
                 weinf += (hi + lo) * (zh + zl);
             }
             assert_eq!(got, (we1, weinf), "fused message n={n}");
-            assert_eq!((gc0, gc1, gz0, gz1), (wc0, wc1, wz0, wz1), "fused tables n={n}");
+            assert_eq!(
+                (gc0, gc1, gz0, gz1),
+                (wc0, wc1, wz0, wz1),
+                "fused tables n={n}"
+            );
         }
     }
 
@@ -601,7 +805,10 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
 /// Same char-2 one-mul identity either way.
 #[inline]
 pub(crate) fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
-    assert!(hi.len() >= lo.len(), "split bind needs one high slot per low");
+    assert!(
+        hi.len() >= lo.len(),
+        "split bind needs one high slot per low"
+    );
 
     #[cfg(all(
         target_arch = "x86_64",
