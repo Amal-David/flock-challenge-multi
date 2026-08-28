@@ -615,6 +615,26 @@ unsafe fn shift_reduce_inner_ab_x86_avx512_rows(
 
 /// Scalar 256-entry GPR convert. Kill-switch / oracle for the nibble kernel.
 /// The C side is table-free (see `kernels::accumulate_c_banks`).
+/// Split-twiddle form of the round-1 AB eq scaling.
+///
+/// The per-chunk eq weight is a call constant, so its `x^64` companion can be
+/// built ONCE per call and the reduced product taken with
+/// `ghash_mul_x4_split` (5 CLMUL) instead of `ghash_mul_x4` (6). Strictly
+/// fewer instructions: nothing is added to the loop body.
+///
+/// `FLOCK_NO_ZC_R1_EQSPLIT=1` restores the six-CLMUL form. Read once per
+/// process, never inside a loop.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) fn r1_eq_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_EQSPLIT").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -628,7 +648,9 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -638,6 +660,10 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // Call constant: the eq weight's `x^64` companion, built once so the
+        // scaling below is a 5-CLMUL split product instead of a 6-CLMUL one.
+        let eq_split = r1_eq_split_enabled();
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -648,7 +674,12 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let cf = f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]);
+            let scaled_ab = if eq_split {
+                ghash_mul_x4_split(cf, eq, eq_x64)
+            } else {
+                ghash_mul_x4(cf, eq)
+            };
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -728,7 +759,9 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
@@ -770,6 +803,10 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // Call constant: see `r1_eq_split_enabled`. Four scalings per lane
+        // block go from 6 CLMUL to 5 with nothing added to the body.
+        let eq_split = r1_eq_split_enabled();
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -808,8 +845,14 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let (scaled0, scaled1) = if eq_split {
+                    (
+                        ghash_mul_x4_split(aos0, eq, eq_x64),
+                        ghash_mul_x4_split(aos1, eq, eq_x64),
+                    )
+                } else {
+                    (ghash_mul_x4(aos0, eq), ghash_mul_x4(aos1, eq))
+                };
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
