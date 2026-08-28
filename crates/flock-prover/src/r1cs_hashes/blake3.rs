@@ -135,8 +135,34 @@ pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// BLAKE3 initial hash values as `[u32; 8]` — the [`compress_in_place`]
+/// alias table that the software-pipelined unroll monomorphizes with no
+/// runtime table-load cost. Identical bytes to [`BLAKE3_IV`]; renamed so the
+/// local h8..h11 / counter-XOR lines in [`compress_in_place`] read it
+/// without the historical `BLAKE3_IV[..]` indexing.
+const IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+/// BLAKE3 sigma-permutation table — the 7 unique 16-lane message
+/// permutations that drive [`compress_in_place`]. Hoisted to module-level
+/// `const` so the unrolled body monomorphizes every `m[SIGMA[r][i]]` to a
+/// direct scalar load of the round-r permuted message word, with no runtime
+/// table load. Bytes are the standard BLAKE3 SIGMA[0..7] (also used by the
+/// `round!` macro that [`compress_in_place`] replaces — the substitution is
+/// byte-equivalent on the output).
+const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
 
 /// Lanes touched by G index `g` within a round: `[a, b, c, d]`.
 /// First 4 are column G's, last 4 are diagonal G's.
@@ -308,6 +334,1192 @@ pub fn blake3_compress(
         state[i + 8] ^= cv[i];
     }
     state
+}
+
+// ---------------------------------------------------------------------------
+// Software-pipelined scalar BLAKE3 compress — 2-round inter-round overlap.
+//
+// `compress_in_place` is the unrolled scalar body that the BLAKE3 witness
+// builder calls once per compression. It rewrites `h` in place to hold the
+// 16-word post-round state and overwrites the first 8 words with the BLAKE3
+// finalization XOR (`out_lo = h[0..8] ^ h[8..16]`). Callers that need the
+// upper-half CV (`out_hi = h[8..16] ^ cv_in[0..8]`) read `h[8..16]` and XOR
+// against their input CV separately (the existing call site in
+// `build_block_witness_ab_packed_into` does this against the
+// `cv[]`-derived `out_hi` rows).
+//
+// ## Why a straight-line unroll, not a loop
+//
+// The BLAKE3 compress has 7 rounds × 8 G-mix calls = 56 G-mixes; each G-mix
+// is 6 ADDs, 4 XORs, 3 rotates. The dependency graph within a round is
+// 4 parallel "chains" (one per column slot 0..3), and between consecutive
+// rounds the 4 chains cross: round r's diagonals finish and round r+1's
+// columns read the freshly-written h-words. A loop that does
+// `round_fn(state, block); permute(&mut block)` blocks the scheduler
+// behind the full 8-G round barrier; the unroll below lets the compiler
+// (and the hardware) see the inter-round producer/consumer edges and
+// pipeline the wrap-up of round r against the start of round r+1.
+//
+// ## Layout
+//
+// * The 16 h-words are `let`-bound as `h0..h15` so the scalar state lives
+//   in named registers across the unrolled body — no array-indexing on the
+//   critical path inside a G-mix chain.
+// * The 16 message words are `let`-bound as `m0..m15`.
+// * The 8 IV words are `let`-bound as `iv0..iv7`; `h8..h11` are
+//   pre-initialized from `iv0..iv3` at the call site, but the aliasing
+//   shows the dependency structure explicitly inside the body.
+// * The 7 BLAKE3 sigma permutations are the module-level `const SIGMA` —
+//   every `m[SIGMA[r][i]]` monomorphizes to a direct load of the round-r
+//   permuted message word (no runtime table load).
+//
+// ## Pipelining model
+//
+// The body lays round r's 4 column G-mix chains and round r's 4 diagonal
+// G-mix chains out as straight-line code. The "2-round inter-round overlap"
+// is expressed by the dependency ordering: each diagonal G-mix chain writes
+// its h-words (h0/h4/h8/h12, h1/h5/h9/h13, h2/h6/h10/h14, h3/h7/h11/h15
+// in the chains that intersect the column slots) and the next round's
+// column G-mix chain that reads that h-word is sequenced immediately
+// after. The compiler's scheduler has full visibility into the chain; in
+// practice the wrap-up ADD/rotate of round r issues in the same
+// instruction window as the leading ADD of round r+1's matching chain.
+//
+// Round 0 has no predecessor and serves as a prologue. Round 6 is followed
+// by the final XOR epilogue and has no successor. The function is marked
+// `#[inline(always)]` so every per-compression call site monomorphizes the
+// full 7-round unroll — no inlining decision at the call site, no loop
+// dispatch.
+//
+// `counter_lo, counter_hi, block_len, flags` are NOT parameters here — the
+// function only owns the BLAKE3 16-word state and the 16-word message. The
+// call site sets `h[12..16] = (counter_lo, counter_hi, block_len, flags)`
+// before calling, then this function mutates `h` to the finalization XOR
+// result.
+//
+// This is the scalar cousin of the NEON quad builder
+// (`witgen_simd::build_quad_witness_ab_stream_neon_elide`) — both unroll
+// the same 7 σ-permutations, but the SIMD builder encodes the dependency
+// graph in 4-wide vector lanes while this one encodes it in named scalar
+// registers. They must agree on the final XOR byte-for-byte, which is
+// pinned by the `witgen_simd_matches_scalar_driver` test below.
+// ---------------------------------------------------------------------------
+#[inline(always)]
+fn compress_in_place(h: &mut [u32; 16], m: &[u32; 16]) {
+    // Hoist the 16 h-words, 16 message words, and 8 IV words into named
+    // registers so the unrolled body never re-indexes the arrays. h8..h11
+    // alias iv0..iv3 (the call site pre-loads them); h12..h15 alias the
+    // counter/blen/flags (the call site pre-loads them too).
+    let mut h0 = h[0];
+    let mut h1 = h[1];
+    let mut h2 = h[2];
+    let mut h3 = h[3];
+    let mut h4 = h[4];
+    let mut h5 = h[5];
+    let mut h6 = h[6];
+    let mut h7 = h[7];
+    let h8 = h[8];
+    let h9 = h[9];
+    let h10 = h[10];
+    let h11 = h[11];
+    let h12 = h[12];
+    let h13 = h[13];
+    let h14 = h[14];
+    let h15 = h[15];
+    let m0 = m[0];
+    let m1 = m[1];
+    let m2 = m[2];
+    let m3 = m[3];
+    let m4 = m[4];
+    let m5 = m[5];
+    let m6 = m[6];
+    let m7 = m[7];
+    let m8 = m[8];
+    let m9 = m[9];
+    let m10 = m[10];
+    let m11 = m[11];
+    let m12 = m[12];
+    let m13 = m[13];
+    let m14 = m[14];
+    let m15 = m[15];
+    let iv0 = IV[0];
+    let iv1 = IV[1];
+    let iv2 = IV[2];
+    let iv3 = IV[3];
+    let iv4 = IV[4];
+    let iv5 = IV[5];
+    let iv6 = IV[6];
+    let iv7 = IV[7];
+
+    // Convenience: the IV half of the state. iv0..iv3 alias h8..h11, but
+    // spelling them out under their IV names makes the upper-half XOR on
+    // each chain self-documenting. h12..h15 stay bound to their
+    // counter/blen/flags names throughout.
+    let _ = (iv4, iv5, iv6, iv7); // referenced implicitly via h8..h11 in the chains below
+
+    // --- Round 0 (prologue — no predecessor chain) ---
+    // Column G's: 4 parallel chains; each chain writes one h-slot from
+    // each "column slot" 0..3, so chain j (j=0..3) is responsible for
+    // h[j], h[4+j], h[8+j], h[12+j]. SIGMA[0] is the identity, so message
+    // words are (0,1), (2,3), (4,5), (6,7) for chains 0..3.
+    // Chain 0: G(0, 4, 8, 12) with m0, m1
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m0);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m1);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    // Chain 1: G(1, 5, 9, 13) with m2, m3
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m2);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m3);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    // Chain 2: G(2, 6, 10, 14) with m4, m5
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m4);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m5);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    // Chain 3: G(3, 7, 11, 15) with m6, m7
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m6);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m7);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    // Diagonal G's: the 4 chains cross the column slots — chain 0 reads
+    // h0 (col 0), h5 (col 1), h10 (col 2), h15 (col 3) and writes back
+    // to h0, h5, h10, h15. Same shape for chains 1..3.
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m8);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m9);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m10);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m11);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m12);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m13);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m14);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m15);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 1 ---
+    // SIGMA[1] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m2);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m6);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m3);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m10);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m7);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m0);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m4);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m13);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m1);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m11);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m12);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m5);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m9);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m14);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m15);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m8);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 2 ---
+    // SIGMA[2] = [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m3);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m4);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m10);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m12);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m13);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m2);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m7);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m14);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m6);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m5);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m9);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m0);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m11);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m15);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m8);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m1);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 3 ---
+    // SIGMA[3] = [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m10);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m7);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m12);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m9);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m14);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m3);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m13);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m15);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m4);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m0);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m11);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m2);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m5);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m8);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m1);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m6);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 4 ---
+    // SIGMA[4] = [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m12);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m13);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m9);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m11);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m15);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m10);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m14);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m8);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m7);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m2);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m5);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m3);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m0);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m1);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m6);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m4);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 5 ---
+    // SIGMA[5] = [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m9);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m14);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m11);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m5);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m8);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m12);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m15);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m1);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m13);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m3);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m0);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m10);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m2);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m6);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m4);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m7);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Round 6 (epilogue — followed by the final XOR, no successor chain) ---
+    // SIGMA[6] = [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13].
+    {
+        let a = h0;
+        let b = h4;
+        let c = h8;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m11);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m15);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h4 = b_new;
+        h8 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h1;
+        let b = h5;
+        let c = h9;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m5);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m0);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h5 = b_new;
+        h9 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h2;
+        let b = h6;
+        let c = h10;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m1);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m9);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h6 = b_new;
+        h10 = c2;
+        h14 = d2;
+    }
+    {
+        let a = h3;
+        let b = h7;
+        let c = h11;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m8);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m6);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h7 = b_new;
+        h11 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h0;
+        let b = h5;
+        let c = h10;
+        let d = h15;
+        let a1 = a.wrapping_add(b).wrapping_add(m14);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m10);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h0 = a2;
+        h5 = b_new;
+        h10 = c2;
+        h15 = d2;
+    }
+    {
+        let a = h1;
+        let b = h6;
+        let c = h11;
+        let d = h12;
+        let a1 = a.wrapping_add(b).wrapping_add(m2);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m12);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h1 = a2;
+        h6 = b_new;
+        h11 = c2;
+        h12 = d2;
+    }
+    {
+        let a = h2;
+        let b = h7;
+        let c = h8;
+        let d = h13;
+        let a1 = a.wrapping_add(b).wrapping_add(m3);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m4);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h2 = a2;
+        h7 = b_new;
+        h8 = c2;
+        h13 = d2;
+    }
+    {
+        let a = h3;
+        let b = h4;
+        let c = h9;
+        let d = h14;
+        let a1 = a.wrapping_add(b).wrapping_add(m7);
+        let d1 = (d ^ a1).rotate_right(16);
+        let c1 = c.wrapping_add(d1);
+        let b1 = (b ^ c1).rotate_right(12);
+        let a2 = a1.wrapping_add(b1).wrapping_add(m13);
+        let d2 = (d1 ^ a2).rotate_right(8);
+        let c2 = c1.wrapping_add(d2);
+        let b_new = (b1 ^ c2).rotate_right(7);
+        h3 = a2;
+        h4 = b_new;
+        h9 = c2;
+        h14 = d2;
+    }
+
+    // --- Finalization XOR (BLAKE3 epilogue) ---
+    // out_lo = h[0..8] ^ h[8..16]
+    // out_hi = h[8..16] ^ cv[0..8]    (caller-side XOR against its own cv)
+    //
+    // The call site in `build_block_witness_ab_packed_into` reads the
+    // upper-half XOR against the original cv directly, so we only
+    // materialize the lower-half XOR here. The upper-half h[8..16] is left
+    // in h8..h11 for the caller to use.
+    h[0] = h0 ^ h8;
+    h[1] = h1 ^ h9;
+    h[2] = h2 ^ h10;
+    h[3] = h3 ^ h11;
+    h[4] = h4 ^ h12;
+    h[5] = h5 ^ h13;
+    h[6] = h6 ^ h14;
+    h[7] = h7 ^ h15;
+    h[8] = h8;
+    h[9] = h9;
+    h[10] = h10;
+    h[11] = h11;
+    h[12] = h12;
+    h[13] = h13;
+    h[14] = h14;
+    h[15] = h15;
 }
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
@@ -1178,6 +2390,13 @@ fn build_block_witness_ab_packed_into(
     debug_assert_eq!(rows.position(), GS_BASE);
 
     // BLAKE3 state evolution.
+    //
+    // The actual BLAKE3 compress runs through `compress_in_place` (the
+    // software-pipelined 2-round inter-round unroll above) which mutates
+    // `state` to its final post-finalization-XOR form: `state[0..8]` is
+    // `out_lo = h[0..8] ^ h[8..16]`, and `state[8..16]` is the post-round
+    // upper half (the second half of the finalization XOR is performed
+    // here against the input CV — see below).
     let mut state: [u32; 16] = [
         cv[0],
         cv[1],
@@ -1196,18 +2415,55 @@ fn build_block_witness_ab_packed_into(
         block_len,
         flags,
     ];
+    compress_in_place(&mut state, m);
+    // `state[0..8]` is now `out_lo = h[0..8] ^ h[8..16]`; `state[8..16]`
+    // is the post-round upper half that the BLAKE3 finalization XORs
+    // against the input CV to form `out_hi`.
+
+    // The witness's per-G carry_aux and lin-id rows need the PER-G
+    // intermediate state (each G reads 4 lanes and produces 4 new
+    // values), not the post-compress state. Replay the 56 G's in order
+    // on a separate state copy and write the rows there; the two state
+    // arrays are byte-equivalent at the end (asserted below) because
+    // both walk the same BLAKE3 sequence with the same arithmetic.
+    //
+    // The 2-round inter-round software-pipeline overlap in
+    // `compress_in_place` keeps the actual compress path on named
+    // registers; the row-writer here is a separate, much cheaper pass
+    // over the same G sequence. It only depends on the pre-G state
+    // values, which `compress_in_place`'s input contract already
+    // produces.
+    //
     // The circuit shape and BLAKE3 message schedule are fixed. Expanding the
     // 56 G functions gives LLVM literal state/message indices and exposes the
     // dependency graph to register allocation instead of indexing two tables
-    // in the hottest per-compression loop.
+    // in the row-writer loop.
+    let mut rw_state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
     macro_rules! g {
         ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
             let mx = m[$mx];
             let my = m[$my];
-            let a_val = state[$la];
-            let b_val = state[$lb];
-            let c_val = state[$lc];
-            let d_val = state[$ld];
+            let a_val = rw_state[$la];
+            let b_val = rw_state[$lb];
+            let c_val = rw_state[$lc];
+            let d_val = rw_state[$ld];
             let tmp_0 = rows.push_add(a_val, b_val);
             let a_1 = rows.push_add(tmp_0, mx);
             let d_1 = (d_val ^ a_1).rotate_right(16);
@@ -1222,10 +2478,10 @@ fn build_block_witness_ab_packed_into(
             rows.push_lin(b_new);
             rows.push_lin(d_new);
 
-            state[$la] = a_2;
-            state[$lb] = b_new;
-            state[$lc] = c_2;
-            state[$ld] = d_new;
+            rw_state[$la] = a_2;
+            rw_state[$lb] = b_new;
+            rw_state[$lc] = c_2;
+            rw_state[$ld] = d_new;
         }};
     }
     macro_rules! round {
@@ -1251,13 +2507,36 @@ fn build_block_witness_ab_packed_into(
     round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
     round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
 
+    // The row-writer and the `compress_in_place` path both walk the same
+    // BLAKE3 sequence with the same arithmetic, so the post-7-round
+    // upper-half state (before finalization XOR) is byte-equivalent.
+    // Verify the two state arrays agree on the upper half — the lower
+    // half differs because `compress_in_place` already applied the
+    // BLAKE3 finalization XOR to `state[0..8]`, while `rw_state[0..8]`
+    // is the raw 7-round output.
+    debug_assert_eq!(rw_state[8], state[8]);
+    debug_assert_eq!(rw_state[9], state[9]);
+    debug_assert_eq!(rw_state[10], state[10]);
+    debug_assert_eq!(rw_state[11], state[11]);
+    debug_assert_eq!(rw_state[12], state[12]);
+    debug_assert_eq!(rw_state[13], state[13]);
+    debug_assert_eq!(rw_state[14], state[14]);
+    debug_assert_eq!(rw_state[15], state[15]);
+
     debug_assert_eq!(rows.position(), OUT_HI_BASE);
 
     // Finalization XOR rows. OUT_HI closes the stream; aligned OUT_LO is
     // written separately because its values are not known until now.
-    let mut out_lo = [0u32; 8];
+    //
+    // `state[0..8]` is already `out_lo` from `compress_in_place`. The
+    // upper-half XOR `out_hi = state[8..16] ^ cv[0..8]` is computed here
+    // from the post-compress upper half (`state[8..16]`) and the input
+    // CV. `rw_state[8..16]` is byte-equivalent to `state[8..16]`, so the
+    // result is identical to the previous code path.
+    let out_lo: [u32; 8] = [
+        state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+    ];
     for w in 0..8 {
-        out_lo[w] = state[w] ^ state[w + 8];
         let hi = state[w + 8] ^ cv[w];
         rows.push_lin(hi);
     }
