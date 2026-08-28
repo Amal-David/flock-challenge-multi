@@ -277,49 +277,104 @@ pub fn fold_1b_rows_multi_padded(
 /// [`crate::zerocheck::univariate_skip::build_eq`] (byte-identical), but
 /// parallelizes the inner doubling loop across rayon threads.
 ///
-/// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
-/// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
-/// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
-/// independent and trivially parallelize. Earlier levels are tiny so
-/// rayon's per-task overhead dominates; we keep them sequential and only
-/// switch to parallel above a threshold.
-fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-    let n = r.len();
-    // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
-    // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
-    // (purely written, never read first). So every slot is written before any
-    // read; uninit is safe.
-    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
-    // Threshold below which rayon dispatch overhead beats the parallel work.
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
-        let half = 1usize << i;
-        let (lo, hi_rest) = t.split_at_mut(half);
-        let hi = &mut hi_rest[..half];
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
-        if half < PAR_THRESHOLD {
-            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                let old = *lo_x;
-                let prod = old * r_i;
-                *hi_x = prod;
-                *lo_x = old + prod;
+    /// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
+    /// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
+    /// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
+    /// independent and trivially parallelize. Earlier levels are tiny so
+    /// rayon's per-task overhead dominates; we keep them sequential and only
+    /// switch to parallel above a threshold.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    unsafe fn double_eq_chunk_simd(lo: &mut [F128], hi: &mut [F128], r_i: F128) {
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4};
+        use core::arch::x86_64::*;
+        let len = lo.len();
+        let lanes = len & !3;
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r_i.hi as i64, r_i.lo as i64));
+        let mut i = 0usize;
+        if r_i.hi == 0 {
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                let prod = ghash_mul_x4_low_rhs(v, r_bcast);
+                let new_lo = _mm512_xor_si512(v, prod);
+                _mm512_storeu_si512(hi.as_mut_ptr().add(i) as *mut __m512i, prod);
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new_lo);
+                i += 4;
             }
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| {
+            let r_x64 = ghash_shift64_x4(r_bcast);
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                let prod = ghash_mul_x4_split(v, r_bcast, r_x64);
+                let new_lo = _mm512_xor_si512(v, prod);
+                _mm512_storeu_si512(hi.as_mut_ptr().add(i) as *mut __m512i, prod);
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new_lo);
+                i += 4;
+            }
+        }
+        while i < len {
+            let old = lo[i];
+            let prod = old * r_i;
+            hi[i] = prod;
+            lo[i] = old + prod;
+            i += 1;
+        }
+    }
+
+    /// Parallel `build_eq` for ring-switching's suffix tensors. Same output as
+    /// [`crate::zerocheck::univariate_skip::build_eq`] (byte-identical), but
+    /// parallelizes the inner doubling loop across rayon threads.
+    ///
+    /// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
+    /// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
+    /// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
+    /// independent and trivially parallelize. Earlier levels are tiny so
+    /// rayon's per-task overhead dominates; we keep them sequential and only
+    /// switch to parallel above a threshold.
+    fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+        let n = r.len();
+        // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
+        // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
+        // (purely written, never read first). So every slot is written before any
+        // read; uninit is safe.
+        let mut t = crate::alloc_uninit_f128_vec(1usize << n);
+        t[0] = F128::ONE;
+        // Threshold below which rayon dispatch overhead beats the parallel work.
+        const PAR_THRESHOLD: usize = 1 << 12;
+        for i in 0..n {
+            let r_i = r[i];
+            let half = 1usize << i;
+            let (lo, hi_rest) = t.split_at_mut(half);
+            let hi = &mut hi_rest[..half];
+            // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+            if half < PAR_THRESHOLD {
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                unsafe { double_eq_chunk_simd(lo, hi, r_i); }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                     let old = *lo_x;
                     let prod = old * r_i;
                     *hi_x = prod;
                     *lo_x = old + prod;
-                });
+                }
+            } else {
+                lo.par_chunks_mut(1024)
+                    .zip(hi.par_chunks_mut(1024))
+                    .for_each(|(lo_chunk, hi_chunk)| {
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                        unsafe { double_eq_chunk_simd(lo_chunk, hi_chunk, r_i); }
+                        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                        for (lo_x, hi_x) in lo_chunk.iter_mut().zip(hi_chunk.iter_mut()) {
+                            let old = *lo_x;
+                            let prod = old * r_i;
+                            *hi_x = prod;
+                            *lo_x = old + prod;
+                        }
+                    });
+            }
         }
+        t
     }
-    t
-}
 
 /// Tensor-factored `build_eq`: split the point `r` (length `n`) into a low
 /// part `r[..n_lo]` and a high part `r[n_lo..]`, returning the two smaller
@@ -1015,35 +1070,24 @@ pub fn fold_1b_rows_split(
                     let m_chunk = &w_block[c * 16..c * 16 + 16];
                     let [tbl0, tbl1, tbl2, tbl3] = &tables[c];
 
-                    let mut m_bytes = [[0u8; 16]; 16];
-                    for (e, slot) in m_bytes.iter_mut().enumerate() {
-                        slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                        slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                    }
+                    let mut tlo_all = [0u8; 128];
+                    let mut thi_all = [0u8; 128];
+
+                    let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                    let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                    let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                    let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                     for r_byte in 0..16 {
-                        let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                            | ((m_bytes[1][r_byte] as u64) << 8)
-                            | ((m_bytes[2][r_byte] as u64) << 16)
-                            | ((m_bytes[3][r_byte] as u64) << 24)
-                            | ((m_bytes[4][r_byte] as u64) << 32)
-                            | ((m_bytes[5][r_byte] as u64) << 40)
-                            | ((m_bytes[6][r_byte] as u64) << 48)
-                            | ((m_bytes[7][r_byte] as u64) << 56);
-                        let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                            | ((m_bytes[9][r_byte] as u64) << 8)
-                            | ((m_bytes[10][r_byte] as u64) << 16)
-                            | ((m_bytes[11][r_byte] as u64) << 24)
-                            | ((m_bytes[12][r_byte] as u64) << 32)
-                            | ((m_bytes[13][r_byte] as u64) << 40)
-                            | ((m_bytes[14][r_byte] as u64) << 48)
-                            | ((m_bytes[15][r_byte] as u64) << 56);
-                        let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                        let thi = transpose_8x8_bits(hi8).to_le_bytes();
                         let base = r_byte * 8;
                         for p in 0..8 {
-                            let m_lo = tlo[p];
-                            let m_hi = thi[p];
+                            let m_lo = tlo_all[base + p];
+                            let m_hi = thi_all[base + p];
                             inner[base + p] += tbl0[(m_lo & 0x0F) as usize]
                                 + tbl1[(m_lo >> 4) as usize]
                                 + tbl2[(m_hi & 0x0F) as usize]
@@ -1055,9 +1099,7 @@ pub fn fold_1b_rows_split(
                 // `e · (Σ eq_lo·bit) = Σ (e·eq_lo)·bit` distributes exactly, so
                 // each term equals the materialized `t[i] = eq_lo·eq_hi` term.
                 let e = eq_hi[i_hi];
-                for r in 0..n {
-                    acc[r] += e * inner[r];
-                }
+                crate::field::f128_slice::add_scaled(&mut acc, &inner, e);
                 acc
             },
         )
@@ -1178,35 +1220,24 @@ pub fn fold_1b_rows_split_2way(
                 let [t0a, t0b, t0c, t0d] = &tables_0[c];
                 let [t1a, t1b, t1c, t1d] = &tables_1[c];
 
-                let mut m_bytes = [[0u8; 16]; 16];
-                for (e, slot) in m_bytes.iter_mut().enumerate() {
-                    slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                    slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                }
+                let mut tlo_all = [0u8; 128];
+                let mut thi_all = [0u8; 128];
+
+                let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                 for r_byte in 0..16 {
-                    let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                        | ((m_bytes[1][r_byte] as u64) << 8)
-                        | ((m_bytes[2][r_byte] as u64) << 16)
-                        | ((m_bytes[3][r_byte] as u64) << 24)
-                        | ((m_bytes[4][r_byte] as u64) << 32)
-                        | ((m_bytes[5][r_byte] as u64) << 40)
-                        | ((m_bytes[6][r_byte] as u64) << 48)
-                        | ((m_bytes[7][r_byte] as u64) << 56);
-                    let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                        | ((m_bytes[9][r_byte] as u64) << 8)
-                        | ((m_bytes[10][r_byte] as u64) << 16)
-                        | ((m_bytes[11][r_byte] as u64) << 24)
-                        | ((m_bytes[12][r_byte] as u64) << 32)
-                        | ((m_bytes[13][r_byte] as u64) << 40)
-                        | ((m_bytes[14][r_byte] as u64) << 48)
-                        | ((m_bytes[15][r_byte] as u64) << 56);
-                    let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                    let thi = transpose_8x8_bits(hi8).to_le_bytes();
                     let base = r_byte * 8;
                     for p in 0..8 {
-                        let m_lo = tlo[p];
-                        let m_hi = thi[p];
+                        let m_lo = tlo_all[base + p];
+                        let m_hi = thi_all[base + p];
                         let i_lo4 = (m_lo & 0x0F) as usize;
                         let i_hi4 = (m_lo >> 4) as usize;
                         let i_lo4h = (m_hi & 0x0F) as usize;
@@ -1218,10 +1249,8 @@ pub fn fold_1b_rows_split_2way(
             }
             let e0 = eq_hi_0[i_hi];
             let e1 = eq_hi_1[i_hi];
-            for r in 0..n {
-                acc0[r] += e0 * inner0[r];
-                acc1[r] += e1 * inner1[r];
-            }
+            crate::field::f128_slice::add_scaled(&mut acc0, &inner0, e0);
+            crate::field::f128_slice::add_scaled(&mut acc1, &inner1, e1);
             (acc0, acc1)
         })
         .reduce(zero_acc, |(mut a0, mut a1), (b0, b1)| {

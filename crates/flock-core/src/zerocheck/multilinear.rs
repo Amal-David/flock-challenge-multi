@@ -39,6 +39,7 @@
     target_feature = "vpclmulqdq"
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+use crate::bits::BitOps;
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
