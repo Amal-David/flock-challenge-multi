@@ -344,26 +344,43 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline]
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
 
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
-    let mut lo_bytes = [0u8; 64];
-    let mut hi_bytes = [0u8; 64];
-    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+    use core::arch::x86_64::*;
+    const I: [u8; 64] = [
+        56, 48, 40, 32, 24, 16, 8, 0, 57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10,
+        2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36, 28, 20, 12, 4, 61, 53, 45, 37, 29, 21,
+        13, 5, 62, 54, 46, 38, 30, 22, 14, 6, 63, 55, 47, 39, 31, 23, 15, 7,
+    ];
+    const SWAP_BYTES_MASK: [u8; 64] = [
+        7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 23, 22, 21, 20, 19, 18, 17, 16,
+        31, 30, 29, 28, 27, 26, 25, 24, 39, 38, 37, 36, 35, 34, 33, 32, 47, 46, 45, 44, 43, 42,
+        41, 40, 55, 54, 53, 52, 51, 50, 49, 48, 63, 62, 61, 60, 59, 58, 57, 56,
+    ];
 
-    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
-    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
-    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    unsafe {
+        let z0 = _mm512_loadu_si512(eq8.as_ptr().cast::<__m512i>());
+        let z1 = _mm512_loadu_si512(eq8.as_ptr().add(4).cast::<__m512i>());
+        let lo_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        let hi_idx = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        let x_lo = _mm512_permutex2var_epi64(z0, lo_idx, z1);
+        let x_hi = _mm512_permutex2var_epi64(z0, hi_idx, z1);
+
+        let idx = _mm512_loadu_si512(I.as_ptr().cast::<__m512i>());
+        let id = _mm512_set1_epi64(0x8040_2010_0804_0201u64 as i64);
+        let swap = _mm512_loadu_si512(SWAP_BYTES_MASK.as_ptr().cast::<__m512i>());
+
+        let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(idx, x_lo));
+        let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(idx, x_hi));
+
+        let res_lo = _mm512_shuffle_epi8(t_lo, swap);
+        let res_hi = _mm512_shuffle_epi8(t_hi, swap);
+
+        _mm512_storeu_si512(mats.as_mut_ptr().cast::<__m512i>(), res_lo);
+        _mm512_storeu_si512(mats.as_mut_ptr().add(8).cast::<__m512i>(), res_hi);
     }
 }
 
