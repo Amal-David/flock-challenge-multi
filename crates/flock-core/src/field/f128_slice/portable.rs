@@ -1,6 +1,15 @@
 use crate::field::F128;
 
 #[inline]
+pub(super) fn add_into(dst: &mut [F128], addend: &[F128]) {
+    debug_assert_eq!(dst.len(), addend.len());
+    for (value, &extra) in dst.iter_mut().zip(addend) {
+        value.lo ^= extra.lo;
+        value.hi ^= extra.hi;
+    }
+}
+
+#[inline]
 pub(super) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     // Char-2: even*(1+r) + odd*r = even + r*(even+odd). One mul per pair.
     for (t, value) in dst.iter_mut().enumerate() {

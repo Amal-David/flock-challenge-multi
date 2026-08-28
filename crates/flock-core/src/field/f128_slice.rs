@@ -28,6 +28,37 @@ mod aarch64;
 ))]
 mod x86_64;
 
+/// Batched F128 addition: `dst[i] += addend[i]` (char-2 = XOR) over equal
+/// length slices. x86_64 dispatches to an AVX2 4-way unrolled leaf at
+/// runtime; the fallback is the straightforward scalar loop. Replaces the
+/// `for (value, &extra) in dst.iter_mut().zip(addend) { *value += extra; }`
+/// pattern with one 32-byte XOR per pair instead of two 8-byte XORs plus
+/// the iter plumbing — measurable when the loop dominates a hot setup or
+/// round-end fold.
+#[inline]
+pub(crate) fn add_into(dst: &mut [F128], addend: &[F128]) {
+    assert_eq!(dst.len(), addend.len(), "add_into length mismatch");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the runtime feature check above guarantees `avx2` is
+            // available; equal slice lengths were asserted above. The
+            // function lives in the same module as the AVX-512 leaves and
+            // is target_feature-gated on `avx2` so it is safe to call
+            // whenever the runtime check passes.
+            unsafe { x86_64::add_into_avx2(dst, addend) };
+            return;
+        }
+    }
+
+    portable::add_into(dst, addend);
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -166,8 +197,24 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
-    for (value, &extra) in dst.iter_mut().zip(addend) {
-        *value += scale * extra;
+    {
+        // Pre-scale the addend in a local stack of 8 (covers the typical
+        // 4- to 64-element tail that misses the ranked x86 AVX-512 body),
+        // then hand the batched char-2 add off to the shared leaf. For
+        // longer inputs we fall back to the per-element loop, which the
+        // dispatcher in `add_into` does not accelerate on this target.
+        let n = dst.len();
+        if n <= 8 {
+            let mut tmp = [F128::ZERO; 8];
+            for (t, &a) in tmp[..n].iter_mut().zip(addend) {
+                *t = scale * a;
+            }
+            add_into(dst, &tmp[..n]);
+        } else {
+            for (value, &extra) in dst.iter_mut().zip(addend) {
+                *value += scale * extra;
+            }
+        }
     }
 }
 

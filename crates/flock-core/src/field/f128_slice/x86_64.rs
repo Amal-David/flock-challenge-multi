@@ -1,5 +1,83 @@
 use crate::field::F128;
 
+/// Batched F128 addition (XOR) over slices, AVX2 4-way unrolled leaf.
+///
+/// `F128` is 16 bytes (`lo: u64, hi: u64`, `repr(C, align(16))`), so two
+/// contiguous F128 fill one 32-byte `__m256i` and the char-2 add `dst[i] +=
+/// addend[i]` is exactly a 256-bit XOR per pair. Four unrolled iterations per
+/// loop body give 16 F128 / 64 bytes per main step; the pointer advancement
+/// for the four loads/stores is interleaved before the XORs so the load
+/// pipeline can issue all four 32-byte loads while the previous iteration's
+/// XORs and stores are still draining.
+///
+/// Dispatcher: [`super::add_into`] selects this on x86_64 when the CPU
+/// reports AVX2 (runtime, not compile-time — ranked builds enable AVX-512
+/// at compile time, so the wider gates above don't catch this path).
+///
+/// # Safety
+/// Requires the `avx2` target feature and equal slice lengths.
+#[target_feature(enable = "avx2")]
+pub unsafe fn add_into_avx2(dst: &mut [F128], addend: &[F128]) {
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(dst.len(), addend.len());
+    // SAFETY: caller guarantees the `avx2` target feature; equal slice
+    // lengths mean every destination slot has a matching addend slot.
+    unsafe {
+        let mut dp = dst.as_mut_ptr();
+        let mut ap = addend.as_ptr();
+        let n = dst.len();
+        // 4-way unroll, interleaved pointer advancement. Eight F128 per
+        // body = four 32-byte loads per array. The main loop is bounded by
+        // memory bandwidth; the ILP here lets the load ports overlap the
+        // XOR ports across iterations.
+        let chunks = n / 16;
+        for _ in 0..chunks {
+            // Four loads from each array, pointers advanced *between* the
+            // loads so the CPU can dispatch them in parallel. The four
+            // XORs follow — independent of the next iteration's loads.
+            let d0 = _mm256_loadu_si256(dp as *const __m256i);
+            let a0 = _mm256_loadu_si256(ap as *const __m256i);
+            let s0 = _mm256_xor_si256(d0, a0);
+            let d1 = _mm256_loadu_si256(dp.add(2) as *const __m256i);
+            let a1 = _mm256_loadu_si256(ap.add(2) as *const __m256i);
+            let s1 = _mm256_xor_si256(d1, a1);
+            let d2 = _mm256_loadu_si256(dp.add(4) as *const __m256i);
+            let a2 = _mm256_loadu_si256(ap.add(4) as *const __m256i);
+            let s2 = _mm256_xor_si256(d2, a2);
+            let d3 = _mm256_loadu_si256(dp.add(6) as *const __m256i);
+            let a3 = _mm256_loadu_si256(ap.add(6) as *const __m256i);
+            let s3 = _mm256_xor_si256(d3, a3);
+            // Stores, again with interleaved pointer advancement. All four
+            // XORs are independent and all four stores are independent, so
+            // the out-of-order core can drain them in any order.
+            _mm256_storeu_si256(dp as *mut __m256i, s0);
+            _mm256_storeu_si256(dp.add(2) as *mut __m256i, s1);
+            _mm256_storeu_si256(dp.add(4) as *mut __m256i, s2);
+            _mm256_storeu_si256(dp.add(6) as *mut __m256i, s3);
+            dp = dp.add(16);
+            ap = ap.add(16);
+        }
+        let mut done = chunks * 16;
+        // 2-lane tail (one __m256i = two F128) for the mid residue.
+        while done + 2 <= n {
+            let d = _mm256_loadu_si256(dst.as_ptr().add(done) as *const __m256i);
+            let a = _mm256_loadu_si256(addend.as_ptr().add(done) as *const __m256i);
+            _mm256_storeu_si256(
+                dst.as_mut_ptr().add(done) as *mut __m256i,
+                _mm256_xor_si256(d, a),
+            );
+            done += 2;
+        }
+        // Scalar tail for a single trailing F128.
+        while done < n {
+            dst[done].lo ^= addend[done].lo;
+            dst[done].hi ^= addend[done].hi;
+            done += 1;
+        }
+    }
+}
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
 /// # Safety
