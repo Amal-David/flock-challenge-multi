@@ -534,6 +534,10 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) out: *mut u8,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
+    /// When false, every project_* publishes its z/a/b rows but skips the
+    /// round-1 window transform and its `out` stores entirely — the
+    /// regeneration mode: same drained bytes, no ab_inner.
+    pub(crate) horner: bool,
 }
 
 #[repr(C, align(64))]
@@ -576,6 +580,11 @@ impl StreamProj<'_> {
     unsafe fn project_blocks_ranked(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: StepRows, off: *const u16, use_off: bool) {
         unsafe {
             let (sa,sb)=self.sides();
+            if !self.horner {
+                let mut j=0usize;
+                while j!=8 { rows.publish(j,sa,sb); j+=1; }
+                return;
+            }
             if use_off {
                 let mut j=0usize;
                 while j!=8 {
@@ -606,6 +615,11 @@ impl StreamProj<'_> {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
             let (sa,sb)=self.sides();
+            if !self.horner {
+                let mut j=0usize;
+                while j!=8 { rows.publish_dense(j,sa,sb); j+=1; }
+                return;
+            }
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
@@ -625,6 +639,14 @@ impl StreamProj<'_> {
     ) {
         unsafe {
             const { assert!(BLK <= 1) };
+            if !self.horner {
+                let mut j = 0usize;
+                while j != 8 {
+                    rows.publish_static::<BLK>(j, self.stage);
+                    j += 1;
+                }
+                return;
+            }
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_static::<BLK>(j, self.stage);
@@ -653,6 +675,9 @@ impl StreamProj<'_> {
         plan: Round1AbWindowPlan,
         imgs: Round1AbTableImages,
     ) {
+        if !self.horner {
+            return;
+        }
         unsafe {
             let mut j = 0usize;
             while j != 8 {
@@ -685,6 +710,11 @@ impl StreamProj<'_> {
             // but B30 rows 1..7 are exactly zero, so both the trusted kernel
             // and its generic kill-switch fallback produce the same product.
             let q=self.stage.cast::<u64>();
+            if !self.horner {
+                let mut j=0usize;
+                while j!=8 { rows.publish_sparse_30(j,q.add(j)); j+=1; }
+                return;
+            }
             let mut j=0usize;
             while j!=8 {
                 rows.publish_sparse_30(j,q.add(j));

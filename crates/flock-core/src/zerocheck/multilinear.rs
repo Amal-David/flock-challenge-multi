@@ -1393,8 +1393,17 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         mlv_challenges,
         padding,
         None,
+        None,
     )
 }
+
+/// Regenerates eight consecutive blocks' packed a/b rows for the block group
+/// starting at block `8·(arg/8)` — `f(first_block, a_dst, b_dst)` fills the
+/// two 64-byte-aligned destinations with exactly the `8 · 2048`-byte spans of
+/// the drained a/b buffers covering blocks `first_block .. first_block + 8`.
+/// The provider installs it only for shapes where one block is 2048 packed
+/// bytes per side (`k_log = 14`) and the block source is closed-form.
+pub type AbOctaRegen<'a> = &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
@@ -1406,6 +1415,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
+    ab_regen: Option<AbOctaRegen<'_>>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1479,13 +1489,50 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
+    // Regeneration arm: consume per-chunk a/b from a task-local tile filled
+    // by the closed-form octa rebuild instead of streaming the two packed
+    // buffers from DRAM. Requires whole octas per chunk; every `row_base`
+    // use inside the chunk kernel is pure `a_pkt`/`b_pkt` addressing, so the
+    // tile plus `row_base = 0` computes identical values.
+    let regen_arm = ab_regen.is_some() && chunk_size.is_multiple_of(2048);
+    let chunk_bytes = chunk_size * 8;
+
     let (sum1, sum_inf, agg) = (0..hi_size)
         .into_par_iter()
-        .map(|x_hi| {
+        .map_init(
+            || {
+                if regen_arm {
+                    vec![0u8; 2 * chunk_bytes + 64]
+                } else {
+                    Vec::new()
+                }
+            },
+            |tile, x_hi| {
             let row_base = x_hi * chunk_size;
             let pair_idx_base = x_hi * lo_size;
             let mut none_a: [F128; 0] = [];
             let mut none_b: [F128; 0] = [];
+
+            #[allow(unused_variables)]
+            let (a_ptr, b_ptr, kernel_row_base) = if regen_arm {
+                let f = ab_regen.unwrap();
+                let off = (64 - (tile.as_ptr() as usize & 63)) & 63;
+                // SAFETY: the tile owns `2 * chunk_bytes + 64` bytes, so both
+                // 64-aligned halves hold `chunk_bytes` writable bytes; the
+                // chunk's blocks are whole octas by the `regen_arm` gate.
+                unsafe {
+                    let ta = tile.as_mut_ptr().add(off);
+                    let tb = ta.add(chunk_bytes);
+                    let first_block = row_base / 256;
+                    let n_octas = chunk_size / 2048;
+                    for oi in 0..n_octas {
+                        f(first_block + oi * 8, ta.add(oi * 8 * 2048), tb.add(oi * 8 * 2048));
+                    }
+                    (ta as *const u8, tb as *const u8, 0usize)
+                }
+            } else {
+                (a_packed.as_ptr(), b_packed.as_ptr(), row_base)
+            };
 
             #[cfg(all(
                 target_arch = "x86_64",
@@ -1500,9 +1547,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
                     table.data.as_ptr(),
                     r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
+                    a_ptr,
+                    b_ptr,
+                    kernel_row_base,
                     &mut none_a,
                     &mut none_b,
                     eq_lo,
@@ -1545,7 +1592,8 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     eq_h * out[7],
                 ],
             )
-        })
+            },
+        )
         .reduce(
             || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
             |(s1, sinf, sa), (c1, cinf, ca)| {
