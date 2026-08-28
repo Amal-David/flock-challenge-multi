@@ -1275,3 +1275,5 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-170: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-draw-20260826T211753Z: independent official timing sample; no executable change.
+
+// ey-x86-fk-draw-001: independent official timing sample of the a7ba003 source; no executable change.
