@@ -255,6 +255,14 @@ fn in_zerocheck_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + Send) -> 
     }
 }
 
+/// Ranked x86 zerocheck uses the cached one-worker-per-physical-core pool;
+/// witness and commit remain on the pinned 16-worker global pool.
+/// `FLOCK_NO_ZC_PHYS_POOL=1` is the exact same-binary rollback.
+fn in_ranked_zerocheck_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + Send) -> R {
+    // Candidate isolation: do not include the phase-scoped physical-core arm.
+    in_zerocheck_phase_pool(m, op)
+}
+
 /// Run the BLAKE3 row-major witness/projection phase in the existing cached
 /// all-available pool. The pool's platform and large-instance guards remain
 /// centralized in `zerocheck_phase_pool`; this adds only a phase-local opt-out.
@@ -881,7 +889,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
     let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || {
+        in_ranked_zerocheck_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("zerocheck: pool entered");
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
@@ -1135,7 +1143,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
     let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || {
+        in_ranked_zerocheck_phase_pool(r1cs.m, || {
             let a_packed: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     a_packed_f128.as_ptr() as *const u8,

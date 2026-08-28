@@ -187,6 +187,53 @@ pub(crate) mod topology_pool {
             }
         }
     }
+
+    /// Cached one-worker-per-physical-core pool for phase-scoped work on the
+    /// ranked Linux SMT2 topology. The global pool remains the pinned logical
+    /// pool; callers opt individual CLMUL-heavy phases into this pool.
+    pub(crate) fn physical_pool() -> Option<&'static rayon::ThreadPool> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::{Arc, OnceLock};
+            static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+            POOL.get_or_init(|| {
+                let want: usize = std::env::var("RAYON_NUM_THREADS").ok()?.parse().ok()?;
+                let logical = std::thread::available_parallelism().ok()?.get();
+                if want != logical {
+                    return None;
+                }
+                let groups = sibling_groups()?;
+                let cores = groups.len();
+                if cores == 0 || logical != 2 * cores || groups.iter().any(|g| g.len() != 2) {
+                    return None;
+                }
+                let order = Arc::new(groups.into_iter().map(|g| g[0]).collect::<Vec<_>>());
+                let o2 = order.clone();
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(cores)
+                    .thread_name(|i| format!("flock-phys-{i}"))
+                    .start_handler(move |i| {
+                        if let Some(&cpu) = o2.get(i) {
+                            pin_to(cpu);
+                        }
+                    })
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+        }
+    }
+}
+
+/// Ranked Linux SMT2 physical-core pool for phase-scoped prover work.
+/// Hidden from normal API consumers; off-shape callers receive `None`.
+#[doc(hidden)]
+pub fn ranked_physical_pool() -> Option<&'static rayon::ThreadPool> {
+    topology_pool::physical_pool()
 }
 
 /// Best-effort `madvise(MADV_HUGEPAGE)` for multi-MB buffers. Ubuntu ships
