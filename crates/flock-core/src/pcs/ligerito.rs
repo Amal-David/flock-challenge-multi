@@ -5909,6 +5909,240 @@ fn ranked_deferred_induced_glue_enabled(
     )
 }
 
+/// Same-binary rollback for the exact-ranked three-fold factorized induced
+/// basis.  Setting this retains the complete #1669 dense induce + deferred
+/// glue route.
+const ENV_NO_LIG_FACTORIZED_INDUCED3: &str = "FLOCK_NO_LIG_FACTORIZED_INDUCED3";
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_factorized_induced3_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    n_level: usize,
+    current_len: usize,
+    n_queries: usize,
+    log_inv_rate: usize,
+    lazy_ood: bool,
+    direct_fold8_mode: bool,
+    platform_supported: bool,
+    deferred_disabled: bool,
+    factorized_disabled: bool,
+) -> bool {
+    n_level >= 3
+        && n_level == 19
+        && !factorized_disabled
+        && ranked_deferred_induced_glue_selected(
+            config,
+            log_n,
+            n_level,
+            current_len,
+            n_queries,
+            log_inv_rate,
+            lazy_ood,
+            direct_fold8_mode,
+            platform_supported,
+            deferred_disabled,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_factorized_induced3_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    n_level: usize,
+    current_len: usize,
+    n_queries: usize,
+    log_inv_rate: usize,
+    lazy_ood: bool,
+    direct_fold8_mode: bool,
+) -> bool {
+    ranked_factorized_induced3_selected(
+        config,
+        log_n,
+        n_level,
+        current_len,
+        n_queries,
+        log_inv_rate,
+        lazy_ood,
+        direct_fold8_mode,
+        cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )),
+        std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some(),
+        std::env::var_os(ENV_NO_LIG_FACTORIZED_INDUCED3).is_some(),
+    )
+}
+
+#[inline]
+fn factorized_induced_w_hat(
+    level: usize,
+    q: usize,
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128; 4],
+) -> F128 {
+    assert!(level < inv_sks_vks.len());
+    assert!(level < sks_vks.len());
+    let mut s = F128::new(q as u64, 0);
+    for &sk in &sks_vks[..level] {
+        s = next_s(s, sk);
+    }
+    s * inv_sks_vks[level]
+}
+
+/// One exact-ranked induced LCH descriptor.  Eight private codeword-coset
+/// evaluations recover q0/q1/q2 without materializing D0.  After the third
+/// challenge, [`Self::materialize_d3`] builds the eight-times-smaller D3 in
+/// the exact quotient basis required by W_hat_3.
+struct FactorizedInduced3 {
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    queries: Vec<usize>,
+    weights: Vec<F128>,
+    coset_evals: Vec<[F128; 8]>,
+    sks_vks: Vec<F128>,
+    inv_sks_vks: [F128; 4],
+    depth: usize,
+}
+
+impl FactorizedInduced3 {
+    fn message(&self) -> SumcheckMessage {
+        assert!(
+            self.depth < 3,
+            "eight coset rows do not cover the depth-three message"
+        );
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        for i in 0..self.queries.len() {
+            let c_0 = self.coset_evals[i][0];
+            let c_1 = self.coset_evals[i][1];
+            let w = factorized_induced_w_hat(
+                self.depth,
+                self.queries[i],
+                &self.sks_vks,
+                &self.inv_sks_vks,
+            );
+            let odd = c_0 + c_1;
+            let even = c_0 + w * odd;
+            u_0 += self.weights[i] * even;
+            u_2 += self.weights[i] * (F128::ONE + w) * (even + odd);
+        }
+        SumcheckMessage { u_0, u_2 }
+    }
+
+    fn advance(&mut self, r: F128) {
+        assert!(self.depth < 3);
+        let depth = self.depth;
+        let next_len = 1usize << (2 - depth);
+        for i in 0..self.queries.len() {
+            let q = self.queries[i];
+            let w_q = factorized_induced_w_hat(depth, q, &self.sks_vks, &self.inv_sks_vks);
+            self.weights[i] *= F128::ONE + r * (F128::ONE + w_q);
+            for j in 0..next_len {
+                let x = q ^ (j << (depth + 1));
+                let w_x = factorized_induced_w_hat(depth, x, &self.sks_vks, &self.inv_sks_vks);
+                let c_0 = self.coset_evals[i][2 * j];
+                let c_1 = self.coset_evals[i][2 * j + 1];
+                let odd = c_0 + c_1;
+                let even = c_0 + w_x * odd;
+                self.coset_evals[i][j] = even + r * (even + odd);
+            }
+        }
+        self.depth += 1;
+    }
+
+    fn materialize_d3(&self) -> Vec<F128> {
+        assert_eq!(self.depth, 3);
+        assert!(self.log_msg_cols >= 3);
+        let log_quotient_domain = self.log_msg_cols + self.log_inv_rate - 3;
+        let gamma: Vec<F128> = (0..log_quotient_domain)
+            .map(|j| {
+                factorized_induced_w_hat(3, 1usize << (j + 3), &self.sks_vks, &self.inv_sks_vks)
+            })
+            .collect();
+        let quotient_ntt = AdditiveNttF128::new(&gamma);
+        let quotient_positions: Vec<usize> = self.queries.iter().map(|&q| q >> 3).collect();
+        let mut d3 = transpose_forward_ntt_sparse(
+            &quotient_ntt,
+            &quotient_positions,
+            &self.weights,
+            log_quotient_domain,
+        );
+        d3.truncate(1usize << (self.log_msg_cols - 3));
+        d3
+    }
+}
+
+fn build_factorized_induced3(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    codeword: &[F128],
+    block_len: usize,
+    num_interleaved: usize,
+    opened_rows: &[Vec<F128>],
+    lane_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+) -> (FactorizedInduced3, F128) {
+    assert!(log_msg_cols >= 3);
+    assert_eq!(opened_rows.len(), queries.len());
+    assert_eq!(codeword.len(), block_len * num_interleaved);
+    assert_eq!(num_interleaved, 1usize << lane_challenges.len());
+    assert!(block_len >= 8 && block_len.is_power_of_two());
+
+    let lane_weights = build_eq_table(lane_challenges);
+    let weights: Vec<F128> = build_eq_table(alpha)
+        .into_iter()
+        .take(queries.len())
+        .collect();
+    let fold_row = |row: &[F128]| -> F128 {
+        assert_eq!(row.len(), lane_weights.len());
+        row.iter()
+            .zip(lane_weights.iter())
+            .map(|(&entry, &weight)| entry * weight)
+            .fold(F128::ZERO, |acc, term| acc + term)
+    };
+    let coset_evals: Vec<[F128; 8]> = queries
+        .iter()
+        .enumerate()
+        .map(|(i, &q)| {
+            assert!(q < block_len);
+            let mut values = [F128::ZERO; 8];
+            values[0] = fold_row(&opened_rows[i]);
+            for (t, value) in values.iter_mut().enumerate().skip(1) {
+                let coset_q = q ^ t;
+                let start = coset_q * num_interleaved;
+                *value = fold_row(&codeword[start..start + num_interleaved]);
+            }
+            values
+        })
+        .collect();
+    let enforced_sum = weights
+        .iter()
+        .zip(coset_evals.iter())
+        .map(|(&weight, values)| weight * values[0])
+        .fold(F128::ZERO, |acc, term| acc + term);
+    let sks_vks = eval_sk_at_vks(log_msg_cols + log_inv_rate);
+    assert!(sks_vks.len() >= 4);
+    let inv_sks_vks = core::array::from_fn(|i| sks_vks[i].inv());
+    (
+        FactorizedInduced3 {
+            log_msg_cols,
+            log_inv_rate,
+            queries: queries.to_vec(),
+            weights,
+            coset_evals,
+            sks_vks,
+            inv_sks_vks,
+            depth: 0,
+        },
+        enforced_sum,
+    )
+}
+
 enum PendingOodEq {
     Introduced {
         eq_lo: Vec<F128>,
@@ -6715,6 +6949,43 @@ impl SumcheckProver {
         msg
     }
 
+    /// Additive sibling for the exact-ranked L0 factorized induced basis.
+    /// The incumbent [`Self::fold`] remains the sole owner of the dense/OOD
+    /// fold path; this method only applies the descriptor's transcript
+    /// correction and materializes the eight-times-smaller D3 after the
+    /// third challenge.
+    fn fold_factorized_induced3(
+        &mut self,
+        r: F128,
+        descriptor: &mut FactorizedInduced3,
+        beta: F128,
+    ) -> SumcheckMessage {
+        assert!(
+            descriptor.depth < 3,
+            "factorized induced basis folded past D3"
+        );
+        let mut msg = self.fold(r);
+        descriptor.advance(r);
+        if descriptor.depth < 3 {
+            let correction = descriptor.message();
+            msg.u_0 += beta * correction.u_0;
+            msg.u_2 += beta * correction.u_2;
+        } else {
+            let d3 = descriptor.materialize_d3();
+            assert_eq!(d3.len(), self.f.len());
+            assert_eq!(d3.len(), self.combined_basis.len());
+            let correction = round_msg_lsb(&self.f, &d3);
+            msg.u_0 += beta * correction.u_0;
+            msg.u_2 += beta * correction.u_2;
+            crate::field::f128_slice::add_scaled(&mut self.combined_basis, &d3, beta);
+        }
+        *self
+            .transcript
+            .last_mut()
+            .expect("factorized fold must append a transcript message") = msg;
+        msg
+    }
+
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
@@ -6727,6 +6998,22 @@ impl SumcheckProver {
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
         msg
+    }
+
+    fn introduce_new_factorized_induced3(
+        &mut self,
+        descriptor: &FactorizedInduced3,
+    ) -> SumcheckMessage {
+        assert!(self.pending_glue.is_none());
+        assert!(self.pending_fold_basis.is_none());
+        assert_eq!(self.f.len(), 1usize << descriptor.log_msg_cols);
+        let msg = descriptor.message();
+        self.transcript.push(msg);
+        msg
+    }
+
+    fn glue_factorized_induced3(&mut self, h_new: F128, beta: F128) {
+        self.t_r += beta * h_new;
     }
 
     /// Like [`Self::introduce_new`] but also returns the claimed sum
@@ -7841,16 +8128,42 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     } else {
         Some(eval_sk_at_vks(n1))
     };
-    let _t = std::time::Instant::now();
-    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
+    let factorized_induced3_mode = ranked_factorized_induced3_enabled(
+        config,
+        log_n,
         n1,
+        sc_prover.f().len(),
+        num_queries_0,
         log_inv_rate_0,
-        sks_vks_n1.as_deref(),
-        &opened_rows_0,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
+        lazy_l1_ood,
+        direct_fold8_mode,
     );
+    let _t = std::time::Instant::now();
+    let (basis_0_induced, factorized_0_induced, enforced_sum_0) = if factorized_induced3_mode {
+        let (descriptor, enforced_sum) = build_factorized_induced3(
+            n1,
+            log_inv_rate_0,
+            l0_codeword,
+            l0_block_len,
+            l0_num_interleaved,
+            &opened_rows_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+        );
+        (None, Some(descriptor), enforced_sum)
+    } else {
+        let (basis, enforced_sum) = induce_sumcheck_poly_auto(
+            n1,
+            log_inv_rate_0,
+            sks_vks_n1.as_deref(),
+            &opened_rows_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+        );
+        (Some(basis), None, enforced_sum)
+    };
     if trace {
         let d = _t.elapsed();
         t_induce += d;
@@ -7871,11 +8184,20 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
-    let intro_msg_0 = sc_prover.introduce_new(basis_0_induced, enforced_sum_0);
+    let intro_msg_0 = if let Some(descriptor) = factorized_0_induced.as_ref() {
+        sc_prover.introduce_new_factorized_induced3(descriptor)
+    } else {
+        sc_prover.introduce_new(
+            basis_0_induced.expect("dense L0 induce returns a basis"),
+            enforced_sum_0,
+        )
+    };
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    if ranked_deferred_induced_glue_enabled(
+    if factorized_induced3_mode {
+        sc_prover.glue_factorized_induced3(enforced_sum_0, beta_0);
+    } else if ranked_deferred_induced_glue_enabled(
         config,
         log_n,
         n1,
@@ -7897,6 +8219,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
+    let mut factorized_0_fold = factorized_0_induced.map(|descriptor| (descriptor, beta_0));
 
     for i in 0..r {
         let k_i = config.recursive_ks[i];
@@ -7911,10 +8234,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 fold_grinding_nonces.push(challenger.grind_pow(bits));
             }
             let ri = challenger.sample_f128();
-            let msg = sc_prover.fold(ri);
+            let (msg, factorized_complete) =
+                if let Some((descriptor, beta)) = factorized_0_fold.as_mut() {
+                    let msg = sc_prover.fold_factorized_induced3(ri, descriptor, *beta);
+                    (msg, descriptor.depth == 3)
+                } else {
+                    (sc_prover.fold(ri), false)
+                };
+            if factorized_complete {
+                factorized_0_fold = None;
+            }
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
             level_rs.push(ri);
+        }
+        if i == 0 {
+            assert!(
+                factorized_0_fold.is_none(),
+                "ranked L0 factorized induced basis requires exactly three first-level folds"
+            );
         }
         if trace {
             t_sumcheck_folds += _t.elapsed();
@@ -9722,6 +10060,518 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Correctness-only Phase0 model for retaining one induced LCH basis for
+    /// exactly three LSB sumcheck folds.  This deliberately lives under
+    /// `cfg(test)`: the production state machine is unchanged until the
+    /// algebra, quotient transform, and off-by-one message cadence have an
+    /// exact oracle.
+    struct FactorizedInducedPhase0 {
+        log_msg_cols: usize,
+        log_inv_rate: usize,
+        queries: Vec<usize>,
+        weights: Vec<F128>,
+        /// At depth d, the live prefix stores evaluations at
+        /// `q ^ (t << d)`, for `t < 2^(3-d)`, after the first d coefficient
+        /// variables of the encoded polynomial have been folded.
+        coset_evals: Vec<[F128; 8]>,
+        sks_vks: Vec<F128>,
+        depth: usize,
+    }
+
+    /// Normalized standard-basis subspace polynomial `W_hat_level(q)`.
+    fn phase0_w_hat(level: usize, q: usize, sks_vks: &[F128]) -> F128 {
+        assert!(level < sks_vks.len());
+        let mut s = F128::new(q as u64, 0);
+        for k in 0..level {
+            s = next_s(s, sks_vks[k]);
+        }
+        s * sks_vks[level].inv()
+    }
+
+    fn phase0_f128_bytes(values: &[F128]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 16);
+        for value in values {
+            out.extend_from_slice(&value.lo.to_le_bytes());
+            out.extend_from_slice(&value.hi.to_le_bytes());
+        }
+        out
+    }
+
+    fn phase0_message_bytes(message: SumcheckMessage) -> Vec<u8> {
+        phase0_f128_bytes(&[message.u_0, message.u_2])
+    }
+
+    impl FactorizedInducedPhase0 {
+        fn message(&self) -> SumcheckMessage {
+            assert!(
+                self.depth < 3,
+                "eight coset rows do not cover the depth-3 message"
+            );
+            let mut u_0 = F128::ZERO;
+            let mut u_2 = F128::ZERO;
+            for i in 0..self.queries.len() {
+                let c_0 = self.coset_evals[i][0];
+                let c_1 = self.coset_evals[i][1];
+                let w = phase0_w_hat(self.depth, self.queries[i], &self.sks_vks);
+                let odd = c_0 + c_1;
+                let even = c_0 + w * odd;
+                let even_plus_odd = even + odd;
+                u_0 += self.weights[i] * even;
+                u_2 += self.weights[i] * (F128::ONE + w) * even_plus_odd;
+            }
+            SumcheckMessage { u_0, u_2 }
+        }
+
+        /// Consume one sumcheck challenge.  Besides updating the induced
+        /// descriptor weights, fold every still-needed private codeword
+        /// coset so the next message can be recovered without a dense basis.
+        fn advance(&mut self, r: F128) {
+            assert!(self.depth < 3);
+            let d = self.depth;
+            let next_len = 1usize << (2 - d);
+            for i in 0..self.queries.len() {
+                let q = self.queries[i];
+                let w_q = phase0_w_hat(d, q, &self.sks_vks);
+                self.weights[i] *= F128::ONE + r * (F128::ONE + w_q);
+
+                for j in 0..next_len {
+                    let x = q ^ (j << (d + 1));
+                    let w_x = phase0_w_hat(d, x, &self.sks_vks);
+                    let c_0 = self.coset_evals[i][2 * j];
+                    let c_1 = self.coset_evals[i][2 * j + 1];
+                    let odd = c_0 + c_1;
+                    let even = c_0 + w_x * odd;
+                    self.coset_evals[i][j] = even + r * (even + odd);
+                }
+            }
+            self.depth += 1;
+        }
+
+        /// Materialize D^(3), not D: the quotient domain is eight times
+        /// smaller.  Its basis is NOT the standard basis.  Under
+        /// `z = W_hat_3(x)`, the exact quotient basis is
+        /// `gamma_j = W_hat_3(v_{j+3})`, while an original query has quotient
+        /// coordinates `q >> 3`.
+        fn materialize_d3(&self) -> Vec<F128> {
+            assert_eq!(self.depth, 3);
+            let log_quotient_domain = self.log_msg_cols + self.log_inv_rate - 3;
+            let gamma: Vec<F128> = (0..log_quotient_domain)
+                .map(|j| phase0_w_hat(3, 1usize << (j + 3), &self.sks_vks))
+                .collect();
+            let quotient_ntt = AdditiveNttF128::new(&gamma);
+            let quotient_positions: Vec<usize> = self.queries.iter().map(|&q| q >> 3).collect();
+            let mut d3 = transpose_forward_ntt_sparse(
+                &quotient_ntt,
+                &quotient_positions,
+                &self.weights,
+                log_quotient_domain,
+            );
+            d3.truncate(1usize << (self.log_msg_cols - 3));
+            d3
+        }
+    }
+
+    fn phase0_from_codeword(
+        witness: &LigeroWitness,
+        log_msg_cols: usize,
+        log_inv_rate: usize,
+        lane_challenges: &[F128],
+        queries: &[usize],
+        alpha: &[F128],
+    ) -> (FactorizedInducedPhase0, F128) {
+        let lane_weights = build_eq_table(lane_challenges);
+        assert_eq!(lane_weights.len(), witness.num_interleaved);
+        let weights: Vec<F128> = build_eq_table(alpha)
+            .into_iter()
+            .take(queries.len())
+            .collect();
+        let coset_evals: Vec<[F128; 8]> = queries
+            .iter()
+            .map(|&q| {
+                let mut values = [F128::ZERO; 8];
+                for (t, value) in values.iter_mut().enumerate() {
+                    *value = witness
+                        .row(q ^ t)
+                        .iter()
+                        .zip(lane_weights.iter())
+                        .map(|(&entry, &weight)| entry * weight)
+                        .fold(F128::ZERO, |acc, term| acc + term);
+                }
+                values
+            })
+            .collect();
+        let enforced_sum = weights
+            .iter()
+            .zip(coset_evals.iter())
+            .map(|(&weight, values)| weight * values[0])
+            .fold(F128::ZERO, |acc, term| acc + term);
+        (
+            FactorizedInducedPhase0 {
+                log_msg_cols,
+                log_inv_rate,
+                queries: queries.to_vec(),
+                weights,
+                coset_evals,
+                sks_vks: eval_sk_at_vks(log_msg_cols + log_inv_rate),
+                depth: 0,
+            },
+            enforced_sum,
+        )
+    }
+
+    /// Exact oracle for the corrected three-fold design.  Eight private
+    /// coset rows cover only messages q0/q1/q2.  The q3 message is checked
+    /// only after the custom-basis quotient transpose materializes D^(3).
+    /// The query set intentionally contains several `q >> 3` collisions.
+    #[test]
+    fn factorized_induced_phase0_three_fold_oracle() {
+        use crate::challenger::Challenger;
+
+        for &(log_msg_cols, log_interleaved, log_inv_rate, seed) in &[
+            (4usize, 0usize, 1usize, 0xFA17_0001u64),
+            (6, 2, 1, 0xFA17_0002),
+            (7, 3, 2, 0xFA17_0003),
+            // Exercise the ranked-size sparse transpose path: the quotient
+            // domain has log size 14 + 1 - 3 = 12, while the fixed query set
+            // still contains repeated q >> 3 positions.
+            (14, 0, 1, 0xFA17_0004),
+        ] {
+            let msg_cols = 1usize << log_msg_cols;
+            let num_interleaved = 1usize << log_interleaved;
+            let block_len = 1usize << (log_msg_cols + log_inv_rate);
+            let mut ch = crate::challenger::RandomChallenger::new(seed);
+            let poly: Vec<F128> = (0..msg_cols * num_interleaved)
+                .map(|_| ch.sample_f128())
+                .collect();
+            let lane_challenges = ch.sample_f128_vec(log_interleaved);
+            let folded_f = partial_eval_lsb(&poly, &lane_challenges);
+            let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+            let witness = ligero_commit(
+                &poly,
+                log_msg_cols,
+                log_interleaved,
+                log_inv_rate,
+                &ntt,
+                HashKind::Sha256,
+            );
+
+            // All positions are distinct, but 1/6, 9/14, and 17/22 collide
+            // after q -> q >> 3.  Clamp for the smallest domain.
+            let queries: Vec<usize> = [1usize, 6, 9, 14, 17, 22, 25, 30]
+                .into_iter()
+                .filter(|&q| q < block_len)
+                .collect();
+            assert!(queries.windows(2).all(|pair| pair[0] != pair[1]));
+            assert!(
+                queries
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &q)| queries[..i].iter().any(|&p| p >> 3 == q >> 3))
+            );
+            let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
+            let opened_rows: Vec<Vec<F128>> =
+                queries.iter().map(|&q| witness.row(q).to_vec()).collect();
+            let (mut dense_d, dense_h) = induce_sumcheck_poly(
+                log_msg_cols,
+                &eval_sk_at_vks(log_msg_cols),
+                &opened_rows,
+                &lane_challenges,
+                &queries,
+                &alpha,
+            );
+            let (mut factorized, factor_h) = phase0_from_codeword(
+                &witness,
+                log_msg_cols,
+                log_inv_rate,
+                &lane_challenges,
+                &queries,
+                &alpha,
+            );
+            assert_eq!(
+                phase0_f128_bytes(&[factor_h]),
+                phase0_f128_bytes(&[dense_h])
+            );
+
+            let mut dense_f = folded_f;
+            let intro_dense = round_msg_lsb(&dense_f, &dense_d);
+            let intro_factorized = factorized.message();
+            assert_eq!(
+                phase0_message_bytes(intro_factorized),
+                phase0_message_bytes(intro_dense),
+                "intro/q0 log_msg_cols={log_msg_cols}"
+            );
+
+            let fold_challenges = ch.sample_f128_vec(3);
+            for (round, &r) in fold_challenges.iter().enumerate() {
+                partial_eval_lsb_one(&mut dense_f, r);
+                partial_eval_lsb_one(&mut dense_d, r);
+                factorized.advance(r);
+                if round < 2 {
+                    let dense_msg = round_msg_lsb(&dense_f, &dense_d);
+                    let factorized_msg = factorized.message();
+                    assert_eq!(
+                        phase0_message_bytes(factorized_msg),
+                        phase0_message_bytes(dense_msg),
+                        "q{} log_msg_cols={log_msg_cols}",
+                        round + 1,
+                    );
+                }
+            }
+
+            let d3 = factorized.materialize_d3();
+            assert_eq!(
+                phase0_f128_bytes(&d3),
+                phase0_f128_bytes(&dense_d),
+                "D3 quotient collision/custom-basis mismatch log_msg_cols={log_msg_cols}"
+            );
+            assert_eq!(
+                phase0_message_bytes(round_msg_lsb(&dense_f, &d3)),
+                phase0_message_bytes(round_msg_lsb(&dense_f, &dense_d)),
+                "q3 log_msg_cols={log_msg_cols}"
+            );
+        }
+    }
+
+    /// Model the exact introduction cadence that the production route must
+    /// preserve: q0 is observed before beta, beta updates the running target
+    /// once, and q1/q2/q3 include beta times the induced-basis correction.
+    /// After the third challenge the quotient D3 is glued into the resident
+    /// combined basis, so all later folds can remain on the incumbent path.
+    #[test]
+    fn factorized_induced_phase0_beta_glue_state_machine_oracle() {
+        use crate::challenger::Challenger;
+
+        let log_msg_cols = 14usize;
+        let log_interleaved = 0usize;
+        let log_inv_rate = 1usize;
+        let msg_cols = 1usize << log_msg_cols;
+        let mut ch = crate::challenger::RandomChallenger::new(0xFA17_B37A_0001);
+        let poly: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
+        let lane_challenges: Vec<F128> = Vec::new();
+        let folded_f = partial_eval_lsb(&poly, &lane_challenges);
+        let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+        let witness = ligero_commit(
+            &poly,
+            log_msg_cols,
+            log_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
+        let queries = vec![1usize, 6, 9, 14, 17, 22, 25, 30];
+        let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
+        let opened_rows: Vec<Vec<F128>> =
+            queries.iter().map(|&q| witness.row(q).to_vec()).collect();
+        let (dense_d0, dense_h) = induce_sumcheck_poly(
+            log_msg_cols,
+            &eval_sk_at_vks(log_msg_cols),
+            &opened_rows,
+            &lane_challenges,
+            &queries,
+            &alpha,
+        );
+        let (mut factorized, factor_h) = phase0_from_codeword(
+            &witness,
+            log_msg_cols,
+            log_inv_rate,
+            &lane_challenges,
+            &queries,
+            &alpha,
+        );
+        assert_eq!(dense_h, factor_h);
+
+        let mut dense_f = folded_f.clone();
+        let mut candidate_f = folded_f;
+        let mut dense_combined: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
+        let mut candidate_combined = dense_combined.clone();
+        let beta = ch.sample_f128();
+        let initial_target = ch.sample_f128();
+        let dense_target = initial_target + beta * dense_h;
+        let candidate_target = initial_target + beta * factor_h;
+        assert_eq!(dense_target, candidate_target, "beta target update");
+
+        let intro_dense = round_msg_lsb(&dense_f, &dense_d0);
+        let intro_candidate = factorized.message();
+        assert_eq!(
+            phase0_message_bytes(intro_dense),
+            phase0_message_bytes(intro_candidate),
+            "q0 before beta glue"
+        );
+        let mut dense_transcript = vec![intro_dense];
+        let mut candidate_transcript = vec![intro_candidate];
+
+        for (dst, &value) in dense_combined.iter_mut().zip(dense_d0.iter()) {
+            *dst += beta * value;
+        }
+        let fold_challenges = ch.sample_f128_vec(3);
+        for (round, &r) in fold_challenges.iter().enumerate() {
+            partial_eval_lsb_one(&mut dense_f, r);
+            partial_eval_lsb_one(&mut dense_combined, r);
+            let dense_msg = round_msg_lsb(&dense_f, &dense_combined);
+            dense_transcript.push(dense_msg);
+
+            partial_eval_lsb_one(&mut candidate_f, r);
+            partial_eval_lsb_one(&mut candidate_combined, r);
+            factorized.advance(r);
+            let candidate_msg = if round < 2 {
+                let base = round_msg_lsb(&candidate_f, &candidate_combined);
+                let correction = factorized.message();
+                SumcheckMessage {
+                    u_0: base.u_0 + beta * correction.u_0,
+                    u_2: base.u_2 + beta * correction.u_2,
+                }
+            } else {
+                let d3 = factorized.materialize_d3();
+                assert_eq!(candidate_combined.len(), d3.len());
+                for (dst, &value) in candidate_combined.iter_mut().zip(d3.iter()) {
+                    *dst += beta * value;
+                }
+                round_msg_lsb(&candidate_f, &candidate_combined)
+            };
+            candidate_transcript.push(candidate_msg);
+            assert_eq!(
+                phase0_message_bytes(candidate_msg),
+                phase0_message_bytes(dense_msg),
+                "post-fold q{} with beta correction",
+                round + 1,
+            );
+        }
+
+        assert_eq!(phase0_f128_bytes(&candidate_f), phase0_f128_bytes(&dense_f));
+        assert_eq!(
+            phase0_f128_bytes(&candidate_combined),
+            phase0_f128_bytes(&dense_combined),
+            "D3 must be glued exactly once after the third fold"
+        );
+        let dense_transcript_bytes: Vec<u8> = dense_transcript
+            .into_iter()
+            .flat_map(phase0_message_bytes)
+            .collect();
+        let candidate_transcript_bytes: Vec<u8> = candidate_transcript
+            .into_iter()
+            .flat_map(phase0_message_bytes)
+            .collect();
+        assert_eq!(
+            candidate_transcript_bytes, dense_transcript_bytes,
+            "introduction and three-fold transcript cadence"
+        );
+    }
+
+    /// Exercise the live SumcheckProver seams, including the factorized L1
+    /// OOD term consumed by the first fold.  The dense arm is the exact #1669
+    /// deferred-basis route; the treatment uses the production descriptor and
+    /// must converge to identical state after its third fold.
+    #[test]
+    fn factorized_induced3_live_sumcheck_state_matches_dense() {
+        use crate::challenger::Challenger;
+
+        let log_msg_cols = 14usize;
+        let log_inv_rate = 1usize;
+        let msg_cols = 1usize << log_msg_cols;
+        let block_len = 1usize << (log_msg_cols + log_inv_rate);
+        let mut ch = crate::challenger::RandomChallenger::new(0xFA17_11C3_0001);
+        let f: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
+        let base: Vec<F128> = (0..msg_cols).map(|_| ch.sample_f128()).collect();
+        let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+        let witness = ligero_commit(&f, log_msg_cols, 0, log_inv_rate, &ntt, HashKind::Sha256);
+        let queries = vec![1usize, 6, 9, 14, 17, 22, 25, 30];
+        let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
+        let opened_rows: Vec<Vec<F128>> =
+            queries.iter().map(|&q| witness.row(q).to_vec()).collect();
+        let (dense_d, dense_h) = induce_sumcheck_poly(
+            log_msg_cols,
+            &eval_sk_at_vks(log_msg_cols),
+            &opened_rows,
+            &[],
+            &queries,
+            &alpha,
+        );
+        let (mut descriptor, factor_h) = build_factorized_induced3(
+            log_msg_cols,
+            log_inv_rate,
+            &witness.mat,
+            block_len,
+            1,
+            &opened_rows,
+            &[],
+            &queries,
+            &alpha,
+        );
+        assert_eq!(dense_h, factor_h);
+
+        let target = ch.sample_f128();
+        let (mut dense, dense_start) = SumcheckProver::new(f.clone(), base.clone(), target);
+        let (mut treatment, treatment_start) = SumcheckProver::new(f, base, target);
+        assert_eq!(
+            phase0_message_bytes(dense_start),
+            phase0_message_bytes(treatment_start)
+        );
+
+        let z = ch.sample_f128_vec(log_msg_cols);
+        let (dense_ood_msg, dense_y) = dense
+            .introduce_new_ood_factorized(&z)
+            .expect("test shape admits factorized OOD");
+        let (treatment_ood_msg, treatment_y) = treatment
+            .introduce_new_ood_factorized(&z)
+            .expect("test shape admits factorized OOD");
+        assert_eq!(dense_y, treatment_y);
+        assert_eq!(
+            phase0_message_bytes(dense_ood_msg),
+            phase0_message_bytes(treatment_ood_msg)
+        );
+        let beta_ood = ch.sample_f128();
+        dense.glue_factorized_ood(beta_ood);
+        treatment.glue_factorized_ood(beta_ood);
+
+        let dense_intro = dense.introduce_new(dense_d, dense_h);
+        let treatment_intro = treatment.introduce_new_factorized_induced3(&descriptor);
+        assert_eq!(
+            phase0_message_bytes(dense_intro),
+            phase0_message_bytes(treatment_intro)
+        );
+        let beta_induced = ch.sample_f128();
+        dense.glue_deferred_into_factorized_ood_fold(beta_induced);
+        treatment.glue_factorized_induced3(factor_h, beta_induced);
+
+        for (round, r) in ch.sample_f128_vec(3).into_iter().enumerate() {
+            let dense_msg = dense.fold(r);
+            let treatment_msg =
+                treatment.fold_factorized_induced3(r, &mut descriptor, beta_induced);
+            assert_eq!(
+                phase0_message_bytes(dense_msg),
+                phase0_message_bytes(treatment_msg),
+                "live q{}",
+                round + 1,
+            );
+        }
+
+        assert_eq!(phase0_f128_bytes(&dense.f), phase0_f128_bytes(&treatment.f));
+        assert_eq!(
+            phase0_f128_bytes(&dense.combined_basis),
+            phase0_f128_bytes(&treatment.combined_basis)
+        );
+        assert_eq!(dense.t_r, treatment.t_r);
+        let dense_transcript: Vec<u8> = dense
+            .transcript
+            .iter()
+            .copied()
+            .flat_map(phase0_message_bytes)
+            .collect();
+        let treatment_transcript: Vec<u8> = treatment
+            .transcript
+            .iter()
+            .copied()
+            .flat_map(phase0_message_bytes)
+            .collect();
+        assert_eq!(dense_transcript, treatment_transcript);
+        assert!(dense.pending_glue.is_none());
+        assert!(dense.pending_fold_basis.is_none());
+        assert!(dense.pending_ood_eq.is_none());
+        assert!(treatment.pending_glue.is_none());
+        assert!(treatment.pending_fold_basis.is_none());
+        assert!(treatment.pending_ood_eq.is_none());
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
@@ -11703,6 +12553,128 @@ mod tests {
             true,
             true,
             true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ranked_factorized_induced3_selector_is_l0_exact_and_fail_closed() {
+        let security = LigeritoSecurityConfig::from_toml_str(include_str!(
+            "../../configs/ligerito/m32_fast.toml"
+        ))
+        .unwrap();
+        let (mut config, _) = security.to_prover_verifier_configs().unwrap();
+        config.merkle_hash = HashKind::Blake3;
+        let selected = |config: &ProverConfig,
+                        log_n,
+                        n_level,
+                        len,
+                        queries,
+                        rate,
+                        lazy,
+                        direct8,
+                        platform,
+                        deferred_disabled,
+                        factorized_disabled| {
+            ranked_factorized_induced3_selected(
+                config,
+                log_n,
+                n_level,
+                len,
+                queries,
+                rate,
+                lazy,
+                direct8,
+                platform,
+                deferred_disabled,
+                factorized_disabled,
+            )
+        };
+        assert!(selected(
+            &config,
+            25,
+            19,
+            1 << 19,
+            218,
+            1,
+            true,
+            true,
+            true,
+            false,
+            false,
+        ));
+        for &(n_level, queries, rate) in &[
+            (16usize, 106usize, 2usize),
+            (13, 71, 3),
+            (10, 53, 4),
+            (7, 43, 5),
+        ] {
+            assert!(!selected(
+                &config,
+                25,
+                n_level,
+                1 << n_level,
+                queries,
+                rate,
+                true,
+                true,
+                true,
+                false,
+                false,
+            ));
+        }
+        assert!(!selected(
+            &config,
+            25,
+            19,
+            1 << 19,
+            218,
+            1,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            19,
+            1 << 19,
+            218,
+            1,
+            true,
+            true,
+            true,
+            true,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            19,
+            1 << 19,
+            218,
+            1,
+            true,
+            true,
+            true,
+            false,
+            true,
+        ));
+        let mut wrong_ladder = config.clone();
+        wrong_ladder.queries[1] += 1;
+        assert!(!selected(
+            &wrong_ladder,
+            25,
+            19,
+            1 << 19,
+            218,
+            1,
+            true,
+            true,
+            true,
+            false,
             false,
         ));
     }
