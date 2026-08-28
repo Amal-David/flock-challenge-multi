@@ -57,7 +57,6 @@
 //! `eq(τ',0ⁿ)`. Soundness rests on the PCS binding `g(τ',s₀*)` to the committed
 //! `ẑ`; the sumcheck (random `τ`, `α`) proves the glue + both endpoints at once.
 
-use flock_core::bits::BitOps;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
@@ -393,13 +392,19 @@ pub fn fold_contiguous_regions(
     let n_inst = total_bits >> k_log;
 
     // Subset-sum byte tables: tab[bo][v] = Σ weights at set bits of v.
+    // Constructed via 8-stage prefix doubling (Kronecker addition over F128).
     let mut tab = vec![[F128::ZERO; 256]; n_bytes];
     for bo in 0..n_bytes {
         let t = &mut tab[bo];
-        for v in 1usize..256 {
-            let lsb = v.isolate_lowest_one();
-            let bit = lsb.trailing_zeros() as usize;
-            t[v] = t[v ^ lsb] + region_weights[8 * bo + bit];
+        let w = &region_weights[8 * bo..8 * bo + 8];
+        t[0] = F128::ZERO;
+        t[1] = w[0];
+        for bit in 1..8 {
+            let w_bit = w[bit];
+            let half = 1usize << bit;
+            for i in 0..half {
+                t[half + i] = t[i] + w_bit;
+            }
         }
     }
 
