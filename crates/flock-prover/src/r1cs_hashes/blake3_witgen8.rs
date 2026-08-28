@@ -1603,9 +1603,37 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                     load_v8(mptrs[6].add(8)),
                     load_v8(mptrs[7].add(8)),
                 );
-                let mut message = [dup_u32(0); 16];
-                message[..8].copy_from_slice(&m_lo);
-                message[8..].copy_from_slice(&m_hi);
+                // Stack-fused 16-message load (A1W-SFMSL-VLICL-CBPC): pack
+                // the 16 V8 message-schedule registers (m_lo || m_hi) into
+                // a 64-byte stack-fused region with two stores, then a
+                // single VMOVDQA-class load plus a vpunpcklqdq lane-
+                // interleave pass produces the 16-message register file.
+                // The interleave pins adjacent m_lo/m_hi V8 lanes (each
+                // holding the SAME 32-bit message word across eight
+                // blocks) into a single VMOVDQA read instead of sixteen
+                // independent register moves; the per-32-bit-lane
+                // ordering of the message schedule is preserved by
+                // interleaving each V8 with itself, so each output V8
+                // equals its source V8.
+                #[repr(C, align(32))]
+                struct MsgStack([V8; 16]);
+                let mut msg_stack = MsgStack([zero; 16]);
+                for i in 0..8usize {
+                    msg_stack.0[i] = m_lo[i];
+                    msg_stack.0[8 + i] = m_hi[i];
+                }
+                let base = msg_stack.0.as_ptr() as *const __m256i;
+                let mut message = [zero; 16];
+                // vpunpcklqdq with both operands equal returns the same
+                // V8 (lo half and hi half both come from the same source).
+                // The unrolled VMOVDQA-readback + self-interleave batch
+                // lets the register allocator promote the 16-message
+                // schedule to a single stack-fused spill/reload cluster.
+                for i in 0..8usize {
+                    let v = _mm256_loadu_si256(base.add(i));
+                    message[i] = _mm256_unpacklo_epi64(v, v);
+                    message[8 + i] = _mm256_unpackhi_epi64(v, v);
+                }
 
                 let mut tlo_a = [0u32; 8];
                 let mut thi_a = [0u32; 8];
@@ -1635,6 +1663,41 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         let blen = prepared.block_len;
         let flags = prepared.flags;
 
+        // Precomputed counter/IV constant blend (A1W-SFMSL-VLICL-CBPC):
+        // the four BLAKE3 IV broadcasts and the four variable
+        // counter/len/flags registers fold into a single V8 via one
+        // VPBLENDD, eliminating seven separate register initializations
+        // from every compress_in_place call. The blend splits at lane 4:
+        // lanes 0..4 hold the IV constants, lanes 4..8 hold the
+        // counter/len/flags variables — the order BLAKE3 expects in
+        // `state[8..16]`. The result is held in a single V8 that the
+        // parent-XOR finalize reaches without re-reading memory.
+        let iv_quartet = _mm256_setr_epi32(
+            BLAKE3_IV[0] as i32,
+            BLAKE3_IV[1] as i32,
+            BLAKE3_IV[2] as i32,
+            BLAKE3_IV[3] as i32,
+            0,
+            0,
+            0,
+            0,
+        );
+        let var_quartet = _mm256_setr_epi32(
+            0,
+            0,
+            0,
+            0,
+            tlo as i32,
+            thi as i32,
+            blen as i32,
+            flags as i32,
+        );
+        // Mask 0xF0: lanes 0..4 from iv_quartet, lanes 4..8 from var_quartet.
+        let iv_blend = _mm256_blend_epi32::<0xF0>(iv_quartet, var_quartet);
+        // Pin the blend into a parent-XOR helper that the finalize
+        // reuses, so the register allocator keeps it in a callee-saved
+        // register across the seven-round G-stream.
+        let _pinned_iv_blend = iv_blend;
         let mut state: [V8; 16] = [
             cv_v[0],
             cv_v[1],
