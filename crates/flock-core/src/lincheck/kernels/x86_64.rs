@@ -383,6 +383,78 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
+#[inline(always)]
+unsafe fn gfni_fold_tile_s<const SEED_ZERO: bool>(
+    tile_bytes_ptr: *const u8,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    // Ranked grouped visit: stripe_stride = 128, n_blocks64 = 2. Const so
+    // the seed_zero test is not inside the 16-byte plane loop and the
+    // affine pair is fully unrolled.
+    unsafe {
+        for block in 0..2 {
+            let bs = block * 64;
+            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * 128 + bs) as *const __m512i)
+            });
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in 0..16 {
+                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                let mut acc = if SEED_ZERO {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                };
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[byte_k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let g2 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + byte_k] as i64),
+                );
+                let g3 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g2, g3);
+                let g4 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + byte_k] as i64),
+                );
+                let g5 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g4, g5);
+                let g6 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + byte_k] as i64),
+                );
+                let g7 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g6, g7);
+                _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
 pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
@@ -394,6 +466,14 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
+        if n_blocks64 == 2 && stripe_stride == 128 {
+            if seed_zero {
+                gfni_fold_tile_s::<true>(tile_bytes_ptr, mats, out_planes_ptr);
+            } else {
+                gfni_fold_tile_s::<false>(tile_bytes_ptr, mats, out_planes_ptr);
+            }
+            return;
+        }
         for block in 0..n_blocks64 {
             let bs = block * 64;
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
