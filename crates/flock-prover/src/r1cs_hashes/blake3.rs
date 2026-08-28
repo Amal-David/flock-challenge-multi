@@ -1152,8 +1152,19 @@ fn build_block_witness_ab_packed_into(
     let counter_hi = (counter >> 32) as u32;
 
     // CV occupies the first four aligned words. OUT_LO reserves words 4..8
-    // and is filled after the state evolution below.
-    write_aligned_lin_words(CV_BASE, cv, z, a, b);
+    // and is filled after the state evolution below. Inlined the helper so
+    // every prologue + finalize word is written through the same
+    // direct-store path (no function call, no temporary, no `if`-dispatch
+    // between two near-identical loops).
+    {
+        let base = CV_BASE >> 6;
+        for i in 0..4usize {
+            let packed = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
+            z[base + i] = packed;
+            a[base + i] = packed;
+            b[base + i] = u64::MAX;
+        }
+    }
 
     // Initialize the fixed 641-bit constant/input interval directly. It ends
     // at word 18 with one pending bit, so the generated G sequence starts from
@@ -1253,18 +1264,35 @@ fn build_block_witness_ab_packed_into(
 
     debug_assert_eq!(rows.position(), OUT_HI_BASE);
 
-    // Finalization XOR rows. OUT_HI closes the stream; aligned OUT_LO is
-    // written separately because its values are not known until now.
-    let mut out_lo = [0u32; 8];
+    // Root-finalize: out_hi goes through the stream (one push_lin each),
+    // then a flat out_lo write collapses the helper call into this loop and
+    // the pack of two lo halves. Every word of every destination is the
+    // same `(z, a, b) = (lo, lo, MAX)` shape the helper produced, and the
+    // out_lo XOR is independent of the out_hi push, so the compiler can
+    // issue them in parallel from the same `state[w] ^ state[w + 8]` /
+    // `state[w + 8] ^ cv[w]` values that the loop already has in
+    // registers.
     for w in 0..8 {
-        out_lo[w] = state[w] ^ state[w + 8];
         let hi = state[w + 8] ^ cv[w];
         rows.push_lin(hi);
     }
     debug_assert_eq!(rows.position(), USEFUL_BITS);
     rows.finish();
 
-    write_aligned_lin_words(OUT_LO_BASE, &out_lo, z, a, b);
+    // Flattened out_lo: directly pack two u32 lanes into one u64 and write
+    // z, a, b at the aligned OUT_LO_BASE. Same bytes as the removed
+    // `write_aligned_lin_words(OUT_LO_BASE, &out_lo, …)` call, with the
+    // out_lo array eliminated (no 32-byte stack object) and the XOR
+    // computation fused into the loop.
+    let base = OUT_LO_BASE >> 6;
+    for i in 0..4usize {
+        let lo0 = state[2 * i] ^ state[2 * i + 8];
+        let lo1 = state[2 * i + 1] ^ state[2 * i + 9];
+        let packed = (lo0 as u64) | ((lo1 as u64) << 32);
+        z[base + i] = packed;
+        a[base + i] = packed;
+        b[base + i] = u64::MAX;
+    }
 }
 
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
