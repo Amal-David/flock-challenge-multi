@@ -89,6 +89,8 @@ pub(super) type BstaticHint = Option<(usize, &'static BstaticPartials)>;
 #[derive(Clone, Copy)]
 pub(super) struct ShiftReducePlan {
     img2: bool,
+    #[allow(dead_code)] // Read only by the AVX-512+GFNI offset-arena gate.
+    img4: bool,
     #[allow(dead_code)] // Reserved by the matching rollback selector.
     pidx: bool,
     #[allow(dead_code)] // Reserved by the matching rollback selector.
@@ -114,9 +116,15 @@ pub(super) fn prepare_shift_reduce(inv_table: &InvNttTableByteSingleGf8) -> Shif
     ))]
     {
         let img2 = x86_64::urm_apply_2img_enabled() && inv_table.has_second_image();
+        let img4 = img2 && inv_table.has_four_images();
         let pidx = img2 && x86_64::urm_pidx_enabled();
         let offw = pidx && x86_64::urm_offw_enabled();
-        ShiftReducePlan { img2, pidx, offw }
+        ShiftReducePlan {
+            img2,
+            img4,
+            pidx,
+            offw,
+        }
     }
 
     #[cfg(not(all(
@@ -129,6 +137,7 @@ pub(super) fn prepare_shift_reduce(inv_table: &InvNttTableByteSingleGf8) -> Shif
         let _ = inv_table;
         ShiftReducePlan {
             img2: false,
+            img4: false,
             pidx: false,
             offw: false,
         }
@@ -273,9 +282,10 @@ pub(super) fn shift_reduce_inner_ab(
 }
 
 /// True when [`shift_reduce_inner_ab_at`] with this `prepared` plan and
-/// `bstatic` presence would take the pre-scaled-offset (pidx + offw) x86
-/// body for window `blk` — i.e. when the caller may replace that call with
-/// the split offsets-build / offsets-consume pair and get identical bytes.
+/// `bstatic` presence would take the four-image pre-scaled-offset
+/// (pidx + offw) x86 body for window `blk` — i.e. when the caller may replace
+/// that call with the split offsets-build / offsets-consume pair and get
+/// identical bytes.
 #[inline]
 #[allow(unused_variables)]
 pub(super) fn shift_reduce_offsets_eligible(
@@ -290,7 +300,7 @@ pub(super) fn shift_reduce_offsets_eligible(
         target_feature = "avx512bw"
     ))]
     {
-        prepared.img2
+        prepared.img4
             && prepared.pidx
             && prepared.offw
             && x86_64::urm_off_arena_enabled()

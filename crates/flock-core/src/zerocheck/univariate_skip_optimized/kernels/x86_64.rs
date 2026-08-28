@@ -307,14 +307,15 @@ pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8,
     }
 }
 
-/// The CONSUME half of [`shift_reduce_inner_ab_x86_avx512_pidx`] (two-image
+/// The CONSUME half of [`shift_reduce_inner_ab_x86_avx512_pidx`] (four-image
 /// wide-read Horner + terminal store), fed from offsets prebuilt by
 /// [`shift_reduce_ab_offsets_build`]. Bit-identical output: identical table
-/// addresses, identical arithmetic, identical store class.
+/// rows and arithmetic, with σ₈/σ₁₆/σ₂₄ supplied by table images
+/// instead of two of the three apply shuffles.
 ///
 /// # Safety
-/// `op` holds this window-block's 128 pre-scaled offsets; `imgs` are the
-/// table's base and σ₈ image pointers; `out`/`nt` as for [`store_out64`].
+/// `op` holds this window-block's 128 pre-scaled offsets; `imgs.0` points to
+/// four consecutive [σ₀|σ₈|σ₁₆|σ₂₄] images; `out`/`nt` as for [`store_out64`].
 #[inline]
 #[cfg(all(
     target_arch = "x86_64",
@@ -331,8 +332,40 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
 ) {
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        let acc = horner_2img_offw(imgs, op);
+        let acc = horner_4img_offw(imgs.0, op);
         store_out64(out, acc, nt);
+    }
+}
+
+/// Four-image twin of [`horner_2img_offw`] used only by the prebuilt-offset
+/// ranked generic consumer. Static-B and the incumbent in-kernel pidx path do
+/// not call this body.
+///
+/// # Safety
+/// `base` and `op` satisfy
+/// [`crate::ntt::inv_table::apply_x86_avx512_register_4img_offw_at`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_4img_offw(base: *const u8, op: *const u16) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let apply =
+            |o: *const u16| crate::ntt::inv_table::apply_x86_avx512_register_4img_offw_at(base, o);
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
+        for k in (0..7usize).rev() {
+            let av = apply(op.add(k * 8));
+            let bv = apply(op.add(64 + k * 8));
+            let product = _mm512_gf2p8mul_epi8(av, bv);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        }
+        acc
     }
 }
 

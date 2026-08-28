@@ -1047,8 +1047,8 @@ pub const ROUND1_AB_OFF_WORDS: usize = 128;
 impl Round1AbWindowPlan {
     /// True when [`round1_ab_inner_window_from_offsets`] may replace
     /// [`round1_ab_inner_window_with_images`] for window `blk` under this
-    /// plan (the x86 pidx+offw body on a non-static-B window). The split
-    /// form is bit-identical there.
+    /// plan (the x86 four-image pidx+offw body on a non-static-B window).
+    /// The split form is bit-identical there.
     #[inline]
     pub fn offsets_eligible(&self, blk: usize) -> bool {
         kernels::shift_reduce_offsets_eligible(self.kernel, self.bstatic.is_some(), blk)
@@ -1094,8 +1094,8 @@ pub unsafe fn round1_ab_window_offsets(
 
 /// [`round1_ab_inner_window_with_images`] fed from offsets prebuilt by
 /// [`round1_ab_window_offsets`]. Bit-identical bytes whenever
-/// `plan.offsets_eligible(blk)` — identical table addresses, arithmetic and
-/// store class; the only difference is WHEN the offset stores happen.
+/// `plan.offsets_eligible(blk)` — equivalent permuted table rows, identical
+/// arithmetic and store class. Offset stores are also hoisted before consume.
 ///
 /// # Safety
 /// As for [`round1_ab_inner_window_with_images`], with `off` built from this

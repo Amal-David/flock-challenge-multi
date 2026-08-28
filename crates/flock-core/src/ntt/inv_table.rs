@@ -14,7 +14,8 @@
 //! Per-byte-chunk b contributes `π_b(T_0[byte_b])` to the output, where
 //! `π_b(i') = i' ⊕ 8b`.
 //!
-//! Storage: 256 × ell bytes (16 KB at k=6, 32 KB at k=7) — fits in L1.
+//! Base storage: 256 × ell bytes (16 KB at k=6, 32 KB at k=7). Optimized
+//! targets may append coordinate-permuted images; x86 k=6 uses 64 KB total.
 //! Lookups per row: n_chunks (= ell/8), each load is `ell` contiguous bytes.
 //!
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
@@ -61,9 +62,13 @@ impl InvNttTableByteSingleGf8 {
         // `i ↦ i ^ 8`). Keep that permutation as a second image so the hot
         // paths can load it directly: the AArch64 leaf saves one EXT per
         // vector, and the x86 AVX-512 apply folds its entire first butterfly
-        // level into the loads (10 port-5 shuffles → 3 per apply). Other
-        // architectures keep the original footprint.
-        let table_images = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        // level into the loads (10 port-5 shuffles → 3 per apply). The x86
+        // production ell=64 table additionally materializes σ₁₆ and σ₂₄:
+        // ranked offset-arena applies then need only the final σ₃₂ shuffle.
+        // Other table sizes and architectures retain their old footprint.
+        let table_images = if cfg!(target_arch = "x86_64") && ell == 64 {
+            4
+        } else if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             2
         } else {
             1
@@ -118,6 +123,26 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
+        // Images are contiguous and image-major: [σ₀ | σ₈ | σ₁₆ | σ₂₄].
+        // Keep the extra 32 KiB x86-only and ell=64-only; all incumbent
+        // two-image/static-B entry points continue to address the first two.
+        #[cfg(target_arch = "x86_64")]
+        if ell == 64 {
+            for image in 2..4usize {
+                let image_start = data_offset + image * table_len;
+                let (original_storage, image_storage) = data.split_at_mut(image_start);
+                let original = &original_storage[data_offset..data_offset + table_len];
+                let target = &mut image_storage[..table_len];
+                let shift = image * 8;
+                for (source, target) in original.chunks_exact(ell).zip(target.chunks_exact_mut(ell))
+                {
+                    for i in 0..ell {
+                        target[i] = source[i ^ shift];
+                    }
+                }
+            }
+        }
+
         Self {
             k,
             ell,
@@ -155,6 +180,15 @@ impl InvNttTableByteSingleGf8 {
     #[inline]
     pub(crate) fn has_second_image(&self) -> bool {
         self.data.len() >= self.data_offset + 2 * 256 * self.ell
+    }
+
+    /// True only for the x86 production ell=64 allocation carrying the
+    /// contiguous σ₀/σ₈/σ₁₆/σ₂₄ images.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[allow(dead_code)] // Read only by AVX-512+GFNI builds and x86 tests.
+    pub(crate) fn has_four_images(&self) -> bool {
+        self.ell == 64 && self.data.len() >= self.data_offset + 4 * 256 * self.ell
     }
 
     #[inline]
@@ -562,6 +596,58 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
     }
 }
 
+/// Four-image wide-offset apply for the ranked x86 offset-arena consumer.
+/// Image `r` stores `σ₈ᵣ(T)`, `r=0..4`; therefore chunks 0..3 fold
+/// directly into `lo`, chunks 4..7 fold into `hi` with the same images, and
+/// one final `σ₃₂(hi)` supplies their high coordinate bit. This is the
+/// same eight loads and seven XORs as the two-image apply, but one shuffle
+/// instead of three.
+///
+/// # Safety
+/// `base` points to four consecutive complete 256x64-byte images in
+/// [σ₀|σ₈|σ₁₆|σ₂₄] order. `off` points to eight readable `u16`s,
+/// each equal to `input_byte * 64`; AVX-512F is available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+#[allow(dead_code)] // Read only by AVX-512+GFNI builds and x86 tests.
+pub(crate) unsafe fn apply_x86_avx512_register_4img_offw_at(
+    base: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    const IMAGE_BYTES: usize = 256 * 64;
+    // SAFETY: forwarded from the function contract. The two wide reads cover
+    // exactly the eight offsets; every derived address remains in its image.
+    unsafe {
+        let w0 = (off as *const u64).read_unaligned();
+        let w1 = (off.add(4) as *const u64).read_unaligned();
+        let b8 = base.add(IMAGE_BYTES);
+        let b16 = b8.add(IMAGE_BYTES);
+        let b24 = b16.add(IMAGE_BYTES);
+        let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        let lo01 = _mm512_xor_si512(
+            row(base, w0 as u16 as usize),
+            row(b8, (w0 >> 16) as u16 as usize),
+        );
+        let lo23 = _mm512_xor_si512(
+            row(b16, (w0 >> 32) as u16 as usize),
+            row(b24, (w0 >> 48) as u16 as usize),
+        );
+        let hi01 = _mm512_xor_si512(
+            row(base, w1 as u16 as usize),
+            row(b8, (w1 >> 16) as u16 as usize),
+        );
+        let hi23 = _mm512_xor_si512(
+            row(b16, (w1 >> 32) as u16 as usize),
+            row(b24, (w1 >> 48) as u16 as usize),
+        );
+        let lo = _mm512_xor_si512(lo01, lo23);
+        let hi = _mm512_xor_si512(hi01, hi23);
+        _mm512_xor_si512(lo, _mm512_shuffle_i64x2::<0x4E>(hi, hi))
+    }
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
@@ -649,6 +735,45 @@ mod tests {
                 assert_eq!(&target[..8], &source[8..], "k={k}, chunk={chunk_index}");
                 assert_eq!(&target[8..], &source[..8], "k={k}, chunk={chunk_index}");
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn four_image_storage_is_exhaustively_exact_at_ell64() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(1 << 6));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        assert!(table.has_four_images());
+
+        let image_len = 256 * 64;
+        // SAFETY: `has_four_images` proves four complete contiguous images;
+        // `table` owns them throughout this test.
+        let original = unsafe { core::slice::from_raw_parts(table.data_ptr(), image_len) };
+        for image in 0..4usize {
+            // SAFETY: image is in 0..4 and each image is `image_len` bytes.
+            let got = unsafe {
+                core::slice::from_raw_parts(table.data_ptr().add(image * image_len), image_len)
+            };
+            assert_eq!(got.as_ptr() as usize % 64, 0, "image={image}");
+            let shift = image * 8;
+            for row in 0..256usize {
+                for i in 0..64usize {
+                    assert_eq!(
+                        got[row * 64 + i],
+                        original[row * 64 + (i ^ shift)],
+                        "image={image}, row={row}, i={i}"
+                    );
+                }
+            }
+        }
+
+        // The footprint expansion is deliberately isolated to ell=64.
+        for k in [5usize, 7] {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            assert!(!table.has_four_images(), "k={k}");
         }
     }
 
@@ -824,6 +949,29 @@ mod tests {
                             bytes
                         );
                     }
+
+                    // Four-image ranked-offset form: σ₈/σ₁₆/σ₂₄ come
+                    // from the adjacent images, leaving only the final σ₃₂.
+                    assert!(table.has_four_images());
+                    // SAFETY: avx512f; ell == 64; four images just asserted;
+                    // eight pre-scaled offsets in `off`.
+                    let reg = unsafe {
+                        apply_x86_avx512_register_4img_offw_at(table.data_ptr(), off.as_ptr())
+                    };
+                    let mut got = [0u8; 64];
+                    // SAFETY: 64-byte destination for one ZMM store.
+                    unsafe {
+                        core::arch::x86_64::_mm512_storeu_si512(
+                            got.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                            reg,
+                        )
+                    };
+                    let got: Vec<F8> = got.iter().map(|&b| F8(b)).collect();
+                    assert_eq!(
+                        out_scalar, got,
+                        "scalar/avx512-4img-offw apply disagree at k={k}, bytes={:02x?}",
+                        bytes
+                    );
                 }
             }
         }
