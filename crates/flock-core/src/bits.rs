@@ -29,12 +29,50 @@ pub(crate) fn transpose_8x8_bits(mut x: u64) -> u64 {
 /// core R1CS matrix-apply ([`crate::r1cs`]).
 ///
 /// [`bit_transpose_64bytes`]: crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes
+///
+/// The AVX-512 body needs `VPERMB` (avx512vbmi) and `VGF2P8AFFINEQB` (gfni,
+/// in its 512-bit `epi8` form also avx512bw), and it names
+/// `core::arch::x86_64`, so it must be behind BOTH an architecture `cfg` and
+/// a feature `cfg` — otherwise this file does not compile on aarch64 and
+/// faults on an x86-64 CPU without GFNI. Compile-time gating is what the rest
+/// of this tree does for GFNI, because the workspace builds with
+/// `-C target-cpu=native`.
 #[inline(always)]
 pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     debug_assert_eq!(out.len(), 64);
-    unsafe { transpose_8_u64s_to_64_bytes_gfni(lanes, out) }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    // SAFETY: the `cfg` supplies exactly the features the callee enables.
+    unsafe {
+        transpose_8_u64s_to_64_bytes_gfni(lanes, out)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        // SAFETY: [u64; 8] is 64 bytes with no padding; u8 has weaker alignment.
+        let input: &[u8; 64] = unsafe { &*(lanes.as_ptr() as *const [u8; 64]) };
+        let out64: &mut [u8; 64] = out.try_into().expect("64-byte stripe slice");
+        crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
+    }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
