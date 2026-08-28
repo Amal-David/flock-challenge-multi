@@ -1097,51 +1097,6 @@ fn lc_zfold_pf_spread_enabled() -> bool {
     *ON
 }
 
-/// Block-major row stride, in `F128`, at the ranked shape: `k = 2^14`, so
-/// `chunks_per_block = k / 128 = 128`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-const LC_RANKED_CHUNKS_PER_BLOCK: usize = 128;
-
-/// Sixteen T0 hints on the consecutive block-major rows `base .. base + 16`
-/// (row stride `chunks_per_block` F128). The `ranked` arm exists only so the
-/// stride is an immediate: identical addresses, identical order.
-///
-/// The sweep's row stride is `chunks_per_block = k / 128`, a value the
-/// compiler only sees at run time, so each of the sixteen hints a spread
-/// block issues rebuilds its own address with `lea` + `imul` + `shl`. At the
-/// ranked shape that value is the constant 128 and the sixteen rows are
-/// consecutive: handing the constant to the addressing collapses the whole
-/// block to one base register plus fifteen `disp32`. Same sixteen lines, same
-/// order, same look-ahead — a prefetch has no architectural effect and none
-/// of the folded values are touched, so `ẑ` is bit-identical either way.
-///
-/// # Safety
-/// `base .. base + 15 * chunks_per_block` must lie inside the witness
-/// allocation. A prefetch never dereferences, but the pointer arithmetic
-/// itself must stay in bounds.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-#[inline(always)]
-unsafe fn lc_prefetch_rows16(base: *const F128, chunks_per_block: usize, ranked: bool) {
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-    // SAFETY: bounds per the contract.
-    unsafe {
-        if ranked {
-            for i in 0..16 {
-                _mm_prefetch(
-                    base.add(i * LC_RANKED_CHUNKS_PER_BLOCK).cast::<i8>(),
-                    _MM_HINT_T0,
-                );
-            }
-        } else {
-            let mut p = base;
-            for _ in 0..16 {
-                _mm_prefetch(p.cast::<i8>(), _MM_HINT_T0);
-                p = p.add(chunks_per_block);
-            }
-        }
-    }
-}
-
 #[allow(dead_code)] // Retained same-binary rollback selector.
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -1532,10 +1487,6 @@ fn fold_block_major_gfni(
             };
             #[cfg(target_feature = "avx512vbmi")]
             let pf_spread = lc_zfold_pf_spread_enabled();
-            // Ranked-stride addressing, resolved once per worker (never
-            // inside the tile / chunk / stripe loops).
-            #[cfg(target_feature = "avx512vbmi")]
-            let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1600,25 +1551,25 @@ fn fold_block_major_gfni(
                             if pf_far && pf_spread {
                                 let qn = q + pf_chunks;
                                 if qn <= full_chunks && qn < chunks_per_block {
-                                    // Stripes 2c and 2c+1 are the SIXTEEN
-                                    // consecutive rows 8*stripe_base + 16c ..
-                                    // + 16, so one base pointer and a fixed
-                                    // row stride reach every hint the two
-                                    // eight-row blocks used to address one at
-                                    // a time. Same sixteen lines, same order.
-                                    // SAFETY: those rows are inside this
-                                    // tile's 64 and `qn < chunks_per_block`
-                                    // keeps the column inside the block, so
-                                    // every address the helper forms is in
-                                    // bounds; a prefetch never dereferences.
-                                    unsafe {
-                                        lc_prefetch_rows16(
-                                            z_packed.as_ptr().add(
-                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
-                                            ),
-                                            chunks_per_block,
-                                            cpb_ranked,
-                                        );
+                                    for t in 2 * c..2 * c + 2 {
+                                        let outer_base = 8 * (stripe_base + t);
+                                        // SAFETY: the same indices the gather
+                                        // reads on a later grouped visit; a
+                                        // prefetch never dereferences.
+                                        unsafe {
+                                            for r in 0..8 {
+                                                core::arch::x86_64::_mm_prefetch(
+                                                    z_packed
+                                                        .as_ptr()
+                                                        .add(
+                                                            (outer_base + r) * chunks_per_block
+                                                                + qn,
+                                                        )
+                                                        .cast::<i8>(),
+                                                    core::arch::x86_64::_MM_HINT_T0,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
