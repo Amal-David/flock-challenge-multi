@@ -116,6 +116,32 @@ fn in_wide_combine_pool<R: Send>(_l: usize, op: impl FnOnce() -> R + Send) -> R 
     op()
 }
 
+/// Run only the CLMUL-heavy ranked Ligerito recursion on one pinned worker per
+/// physical core. Keeping the global pin16 pool preserves witness/NTT scaling;
+/// `FLOCK_NO_LIG_PHYS_POOL=1` is the exact same-binary rollback.
+fn in_ligerito_physical_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if l >= (1 << 22) && std::env::var_os("FLOCK_NO_LIG_PHYS_POOL").is_none() {
+        if let Some(pool) = crate::topology_pool::physical_pool() {
+            return pool.install(op);
+        }
+    }
+    op()
+}
+
+/// Run only the ranked ring-switch frontend on one pinned worker per physical
+/// core. Witness and NTT remain on the pinned 16-worker global pool;
+/// `FLOCK_NO_RS_PHYS_POOL=1` is the exact same-binary rollback.
+fn in_ring_switch_physical_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if l >= (1 << 22) && std::env::var_os("FLOCK_NO_RS_PHYS_POOL").is_none() {
+        if let Some(pool) = crate::topology_pool::physical_pool() {
+            return pool.install(op);
+        }
+    }
+    op()
+}
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -192,70 +218,73 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
-        ligerito::recursive_prover_with_basis_direct_fold8(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
-            combined.round0_prime,
-            fold_arena,
-            challenger,
-        )
-    } else if let Some(direct) = combined.direct_fold4 {
-        ligerito::recursive_prover_with_basis_direct_fold4(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct-fold4 requires round-1 lookahead"),
-            combined
-                .round2_lookahead
-                .expect("direct-fold4 requires round-2 lookahead"),
-            combined
-                .round3_lookahead
-                .expect("direct-fold4 requires round-3 lookahead"),
-            fold_arena,
-            challenger,
-        )
-    } else if let Some(direct) = combined.direct_fold2 {
-        ligerito::recursive_prover_with_basis_direct_ab_fold2(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct AB fold2 requires round-1 lookahead"),
-            fold_arena,
-            challenger,
-        )
-    } else {
-        ligerito::recursive_prover_with_basis_precomputed_round0(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            fold_arena,
-            challenger,
-        )
-    };
+    let ligerito_input_len = packed_witness.len();
+    let ligerito_proof = in_ligerito_physical_pool(ligerito_input_len, || {
+        if let Some(direct) = combined.direct_fold8 {
+            ligerito::recursive_prover_with_basis_direct_fold8(
+                lig_config,
+                packed_witness,
+                combined.b_combined,
+                direct,
+                combined.target_combined,
+                &prover_data.codeword,
+                &*prover_data.merkle_tree,
+                combined.round0_prime,
+                fold_arena,
+                challenger,
+            )
+        } else if let Some(direct) = combined.direct_fold4 {
+            ligerito::recursive_prover_with_basis_direct_fold4(
+                lig_config,
+                packed_witness,
+                combined.b_combined,
+                direct,
+                combined.target_combined,
+                &prover_data.codeword,
+                &prover_data.merkle_tree,
+                combined.round0_prime,
+                combined
+                    .round1_lookahead
+                    .expect("direct-fold4 requires round-1 lookahead"),
+                combined
+                    .round2_lookahead
+                    .expect("direct-fold4 requires round-2 lookahead"),
+                combined
+                    .round3_lookahead
+                    .expect("direct-fold4 requires round-3 lookahead"),
+                fold_arena,
+                challenger,
+            )
+        } else if let Some(direct) = combined.direct_fold2 {
+            ligerito::recursive_prover_with_basis_direct_ab_fold2(
+                lig_config,
+                packed_witness,
+                combined.b_combined,
+                direct,
+                combined.target_combined,
+                &prover_data.codeword,
+                &prover_data.merkle_tree,
+                combined.round0_prime,
+                combined
+                    .round1_lookahead
+                    .expect("direct AB fold2 requires round-1 lookahead"),
+                fold_arena,
+                challenger,
+            )
+        } else {
+            ligerito::recursive_prover_with_basis_precomputed_round0(
+                lig_config,
+                packed_witness,
+                combined.b_combined,
+                combined.target_combined,
+                &prover_data.codeword,
+                &prover_data.merkle_tree,
+                combined.round0_prime,
+                fold_arena,
+                challenger,
+            )
+        }
+    });
     crate::gaptime::mark("open: ligerito recursive prover done");
     if trace {
         eprintln!(
@@ -800,14 +829,16 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed_elidable(
-            packed_witness,
-            x_outers,
-            precomputed_s_hat_v,
-            padding,
-            challenger,
-            basis_elidable,
-        )
+        in_ring_switch_physical_pool(packed_witness.len(), || {
+            ring_switch::prove_batched_padded_with_precomputed_elidable(
+                packed_witness,
+                x_outers,
+                precomputed_s_hat_v,
+                padding,
+                challenger,
+                basis_elidable,
+            )
+        })
     } else {
         (Vec::new(), Vec::new())
     };
