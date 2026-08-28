@@ -283,6 +283,35 @@ pub fn prewarm_prover(m: usize) {
     }
 }
 
+static SMALL_POOL: std::sync::LazyLock<std::sync::Mutex<Vec<Vec<F128>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::with_capacity(1024)));
+
+pub fn take_small(n: usize) -> Vec<F128> {
+    if n == 0 { return Vec::new(); }
+    let mut hit = None;
+    if let Ok(mut pool) = SMALL_POOL.lock() {
+        if let Some(i) = pool.iter().position(|v| v.capacity() >= n) {
+            hit = Some(pool.swap_remove(i));
+        }
+    }
+    match hit {
+        Some(mut v) => {
+            unsafe { v.set_len(n); }
+            v
+        }
+        None => crate::alloc_uninit_vec::<F128>(n),
+    }
+}
+
+pub fn give_small(v: Vec<F128>) {
+    if v.capacity() == 0 { return; }
+    if let Ok(mut pool) = SMALL_POOL.lock() {
+        if pool.len() < 2048 {
+            pool.push(v);
+        }
+    }
+}
+
 /// Release every pooled buffer back to the OS. The per-thread free lists
 /// behind [`LocalBuf`] are unreachable from here and are unaffected; they
 /// retain at most a few tens of KiB per worker thread.

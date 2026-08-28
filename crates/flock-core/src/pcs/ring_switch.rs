@@ -1992,7 +1992,7 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    let mut tables = crate::scratch::take_small(FOLD_N_BYTES * FOLD_TABLE_SIZE); tables.fill(F128::ZERO);
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2743,7 +2743,7 @@ fn direct_fold8_states_seq(
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     let n_packed = 1usize << LOG_PACKING;
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
     for d_low in 0..64 {
         let mut basis_product = low_eq[d_low];
         w_state[d_low] = fold_one_slot(basis_product, table);
@@ -2798,7 +2798,7 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    let mut w_state = crate::scratch::take_small(64 * n_packed);
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
     w_state
         .par_chunks_mut(64)
