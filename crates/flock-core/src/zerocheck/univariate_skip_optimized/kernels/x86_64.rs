@@ -336,6 +336,73 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     }
 }
 
+/// Fixed-`nt=2` twin of [`shift_reduce_inner_ab_x86_avx512_from_off`] for the
+/// measured ranked offset consumer. The destination class is part of that
+/// producer's contract, so the terminal store is one unconditional ZMM
+/// non-temporal stream instead of entering [`store_out64`]'s selector.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_from_off`], with `out` additionally
+/// 64-byte aligned. The caller must publish an `_mm_sfence()` before another
+/// thread observes the output.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract. Unlike the generic
+    // twin, ranked nt=2 makes alignment/store class invariant by construction.
+    unsafe {
+        let acc = horner_2img_offw(imgs, op);
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
+/// Two-output fixed-`nt=2` consumer for the measured ranked path. Both
+/// independent Horner chains are kept live together so their table gathers
+/// and GFNI dependencies can overlap, then each result receives the same
+/// unconditional ZMM non-temporal store as the scalar twin.
+///
+/// # Safety
+/// `op0` and `op1` each hold 128 pre-scaled offsets; the rows at
+/// `out_base + out_index * out_stride` and the following stride are disjoint,
+/// writable and 64-byte aligned. `imgs` and the publishing fence contract are as for
+/// [`shift_reduce_inner_ab_x86_avx512_from_off_nt2`].
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_pair(
+    op0: *const u16,
+    op1: *const u16,
+    out_base: *mut u8,
+    out_index: usize,
+    out_stride: usize,
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        let (acc0, acc1) = horner_2img_offw_pair(imgs, op0, op1);
+        let out0 = out_base.add(out_index * out_stride);
+        _mm512_stream_si512(out0 as *mut __m512i, acc0);
+        _mm512_stream_si512(out0.add(out_stride) as *mut __m512i, acc1);
+    }
+}
+
 /// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
 /// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
 /// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
@@ -376,6 +443,54 @@ unsafe fn horner_2img_offw(
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
         }
         acc
+    }
+}
+
+/// Two independent [`horner_2img_offw`] evaluations interleaved at each K
+/// step. The explicit accumulators avoid indexed state that would force
+/// either chain through memory and expose the second dependency chain to the
+/// scheduler while the first chain's GFNI multiply is in flight.
+///
+/// # Safety
+/// As for [`horner_2img_offw`], independently for `op0` and `op1`.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw_pair(
+    imgs: (*const u8, *const u8),
+    op0: *const u16,
+    op1: *const u16,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let xb = _mm512_set1_epi8(2);
+        let a0 = apply(op0.add(7 * 8));
+        let a1 = apply(op1.add(7 * 8));
+        let b0 = apply(op0.add(64 + 7 * 8));
+        let b1 = apply(op1.add(64 + 7 * 8));
+        let mut acc0 = _mm512_gf2p8mul_epi8(a0, b0);
+        let mut acc1 = _mm512_gf2p8mul_epi8(a1, b1);
+        for k in (0..7usize).rev() {
+            let scaled0 = _mm512_gf2p8mul_epi8(acc0, xb);
+            let scaled1 = _mm512_gf2p8mul_epi8(acc1, xb);
+            let a0 = apply(op0.add(k * 8));
+            let a1 = apply(op1.add(k * 8));
+            let b0 = apply(op0.add(64 + k * 8));
+            let b1 = apply(op1.add(64 + k * 8));
+            let product0 = _mm512_gf2p8mul_epi8(a0, b0);
+            let product1 = _mm512_gf2p8mul_epi8(a1, b1);
+            acc0 = _mm512_xor_si512(scaled0, product0);
+            acc1 = _mm512_xor_si512(scaled1, product1);
+        }
+        (acc0, acc1)
     }
 }
 

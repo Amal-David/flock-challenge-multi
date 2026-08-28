@@ -1132,6 +1132,99 @@ pub unsafe fn round1_ab_inner_window_from_offsets(
     unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
 }
 
+/// Fixed-ZMM-stream-store twin of [`round1_ab_inner_window_from_offsets`] for
+/// the measured ranked path. It computes identical bytes but specializes the
+/// already-resolved `nt=2` destination class, so the terminal store has no
+/// runtime selector. Generic/cold/static callers retain the general wrapper.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets`], with `plan.nt == 2` and
+/// `out` 64-byte aligned. The producing thread must execute
+/// [`abinner_publish_fence`] before publishing the output across threads.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
+/// Two-output fixed-ZMM-stream-store consumer for the measured ranked path.
+/// This is byte-for-byte two calls to
+/// [`round1_ab_inner_window_from_offsets_nt2`], with their independent Horner
+/// chains interleaved and the same two terminal non-temporal stores.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`] independently for each
+/// offset block. The rows at `out_base + out_index * out_stride` and the
+/// following stride must be disjoint and writable; one task-level
+/// [`abinner_publish_fence`] still publishes both.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_pair(
+    off0: &[u16; ROUND1_AB_OFF_WORDS],
+    off1: &[u16; ROUND1_AB_OFF_WORDS],
+    out_base: *mut u8,
+    out_index: usize,
+    out_stride: usize,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out_base as usize & 63, 0);
+    debug_assert!(out_stride >= 64);
+    debug_assert_eq!(out_stride & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_pair(
+            off0.as_ptr(),
+            off1.as_ptr(),
+            out_base,
+            out_index,
+            out_stride,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("nt2 pair offsets form is x86 AVX-512+GFNI only");
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
