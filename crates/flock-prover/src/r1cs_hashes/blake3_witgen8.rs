@@ -25,8 +25,8 @@ use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
-    round1_ab_inner_window_from_offsets, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
+    round1_ab_inner_window_with_images, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -52,7 +52,6 @@ pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
 // proof). Chunk 61 is entirely inside the zero tail (LAST_WORD = 481), so
 // storing it is redundant-but-correct and the ragged tail branch vanishes.
 const ELIDE_ZERO_CHUNK: usize = 62;
-const ELIDE_B_TAIL_CHUNK: usize = 59;
 // 60, not 59, for the FUSED (`dump_range_nt_win`) drain, for exactly the reason
 // `ELIDE_ZERO_CHUNK` is 62: an odd first-elided chunk leaves chunk 58 as a lone
 // 32-byte NT store inside the 64-byte line (58, 59) — a partially-filled
@@ -79,7 +78,6 @@ const _ELIDE_GEOMETRY: () = {
     assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
     // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
     // stays strictly inside the same content-independent constant run.
-    assert!(ELIDE_B_TAIL_CHUNK_WIN >= ELIDE_B_TAIL_CHUNK);
     assert!(ELIDE_B_TAIL_CHUNK_WIN.is_multiple_of(2));
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
@@ -261,6 +259,14 @@ unsafe fn store_v8(p: *mut u32, v: V8) {
     unsafe { _mm256_storeu_si256(p.cast::<__m256i>(), v) }
 }
 
+/// Store one complete ranked projection row. `StreamProj::stage` is backed by
+/// `AbWinLine`, and both its side stride and row stride are whole cache lines.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn store_ranked_stage_line(p: *mut u32, v: __m512i) {
+    unsafe { _mm512_store_si512(p.cast::<__m512i>(), v) }
+}
+
 /// Widen one staged 64-byte window side (its two transposed V8 rows, still in
 /// registers) to the pre-scaled `u16` offset half the split shift-reduce
 /// kernel consumes: `byte * 64` per lane, two ZMM stores. Identical values to
@@ -273,6 +279,21 @@ unsafe fn widen_off_half(lo: V8, hi: V8, op: *mut u16) {
         let w = |v: V8| _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(v));
         _mm512_store_si512(op.cast::<__m512i>(), w(lo));
         _mm512_store_si512(op.add(32).cast::<__m512i>(), w(hi));
+    }
+}
+
+/// ZMM-row twin of [`widen_off_half`]. The low cast is free; the one high-half
+/// extract lets the fused transpose keep its row whole for the aligned stage
+/// store while still feeding the two byte-to-word widening instructions.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn widen_off_line(v: __m512i, op: *mut u16) {
+    unsafe {
+        widen_off_half(
+            _mm512_castsi512_si256(v),
+            _mm512_extracti64x4_epi64::<1>(v),
+            op,
+        )
     }
 }
 
@@ -387,15 +408,120 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
+/// 16×8 u32 transpose specialized for one complete ranked projection side.
+/// `stage[w + i]` is word-major (lane `j` belongs to block `j`); the result
+/// is block-major: `out[j]` lane `i == stage[w + i]` lane `j`.
+///
+/// The eight ZMM loads each join two adjacent input words. Three binary
+/// `permutex2var` layers then grow each contiguous output group:
+///
+/// 1. four input rows × four columns,
+/// 2. eight input rows × two columns,
+/// 3. sixteen input rows × one column.
+///
+/// Formally, let `M[i][j]` denote lane `j` of input word `i`. After layer 1,
+/// `p[2g+h][4c+r] = M[4g+r][4h+c]`; after layer 2,
+/// `q[4g+h][8c+r] = M[8g+r][2h+c]`; the final two selectors therefore give
+/// `out[2h+c][r] = M[r][2h+c]`. The index vectors below are those equations
+/// written in `permutex2var_epi32`'s concatenated `[a|b]` lane numbering.
+///
+/// # Safety
+/// `stage[w..w+16]` contains sixteen initialized `V8`s. AVX-512F is enabled.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe {
+        debug_assert!(w + STEP_WORDS <= RING_WORDS);
+        debug_assert!(w.is_multiple_of(STEP_WORDS));
+
+        // Each unaligned ZMM is [word 2k lanes 0..7 | word 2k+1 lanes 0..7].
+        let x0 = _mm512_loadu_si512(stage.add(w).cast::<__m512i>());
+        let x1 = _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>());
+        let x2 = _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>());
+        let x3 = _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>());
+        let x4 = _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>());
+        let x5 = _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>());
+        let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
+        let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
+
+        let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
+        let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
+        let p00 = _mm512_permutex2var_epi32(x0, i10, x1);
+        let p01 = _mm512_permutex2var_epi32(x0, i11, x1);
+        let p10 = _mm512_permutex2var_epi32(x2, i10, x3);
+        let p11 = _mm512_permutex2var_epi32(x2, i11, x3);
+        let p20 = _mm512_permutex2var_epi32(x4, i10, x5);
+        let p21 = _mm512_permutex2var_epi32(x4, i11, x5);
+        let p30 = _mm512_permutex2var_epi32(x6, i10, x7);
+        let p31 = _mm512_permutex2var_epi32(x6, i11, x7);
+
+        let i20 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+        let i21 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
+        let q00 = _mm512_permutex2var_epi32(p00, i20, p10);
+        let q01 = _mm512_permutex2var_epi32(p00, i21, p10);
+        let q02 = _mm512_permutex2var_epi32(p01, i20, p11);
+        let q03 = _mm512_permutex2var_epi32(p01, i21, p11);
+        let q10 = _mm512_permutex2var_epi32(p20, i20, p30);
+        let q11 = _mm512_permutex2var_epi32(p20, i21, p30);
+        let q12 = _mm512_permutex2var_epi32(p21, i20, p31);
+        let q13 = _mm512_permutex2var_epi32(p21, i21, p31);
+
+        let i30 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
+        let i31 = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
+        [
+            _mm512_permutex2var_epi32(q00, i30, q10),
+            _mm512_permutex2var_epi32(q00, i31, q10),
+            _mm512_permutex2var_epi32(q01, i30, q11),
+            _mm512_permutex2var_epi32(q01, i31, q11),
+            _mm512_permutex2var_epi32(q02, i30, q12),
+            _mm512_permutex2var_epi32(q02, i31, q12),
+            _mm512_permutex2var_epi32(q03, i30, q13),
+            _mm512_permutex2var_epi32(q03, i31, q13),
+        ]
+    }
+}
+
+/// Transpose and stage one fully-live ranked side, preserving each complete
+/// ZMM row long enough to build its two offset halves without a stage reload.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op: *mut u16) {
+    unsafe {
+        let rows = tr8x16_zmm(ring, w);
+        for (r, row) in rows.into_iter().enumerate() {
+            store_ranked_stage_line(stage.add(r * STEP_WORDS), row);
+            widen_off_line(row, op.add(r * ROUND1_AB_OFF_WORDS));
+        }
+    }
+}
+
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
+/// Ranked static windows whose B side is supplied without reading the ring.
+const RANKED_STATIC_B_PREFIX_END: usize = 2 * STEP_WORDS;
+const RANKED_STATIC_B_TAIL_START: usize = 30 * STEP_WORDS;
 const _RING_GEOMETRY: () = {
     assert!(RING_WORDS >= 32);
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
     // Every epoch boundary is a whole number of drain steps.
     assert!(RING_WORDS.is_multiple_of(STEP_WORDS));
+    assert!(STEP_WORDS == 16);
+    // One step row is exactly one cache line, and every witness-block stride
+    // preserves that alignment. The ranked publisher relies on both facts to
+    // issue aligned ZMM non-temporal stores without a per-line alignment test.
+    assert!(STEP_WORDS * core::mem::size_of::<u32>() == 64);
+    assert!((U32_PER_BLOCK * core::mem::size_of::<u32>()).is_multiple_of(64));
+    // blk30's packed qwords plus the sliding-reference guard occupy exactly
+    // the first 128 bytes of the A staging side.
+    assert!(8 * STEP_WORDS >= 32);
+    assert!(RANKED_STATIC_B_PREFIX_END == 32);
+    assert!(RANKED_STATIC_B_TAIL_START == 480);
+    assert!(LAST_WORD == RANKED_STATIC_B_TAIL_START + 1);
+    assert!(BYTES_PER_BLOCK == 32 * 64);
+    assert!(30 * STEP_WORDS * 32 < USEFUL_BITS);
+    assert!(USEFUL_BITS <= 31 * STEP_WORDS * 32);
 };
 
 /// Streaming round-1 projection wired into the a/b drain: every 16-word drain
@@ -405,32 +531,37 @@ const _RING_GEOMETRY: () = {
 ///
 /// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
 /// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks. Bit `j` of `live` selects block `j`.
+/// `BYTES_PER_BLOCK` ab_inner blocks.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
-    pub(crate) live: u32,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
+    pub(crate) dead_ranked_blk31: bool,
 }
+
+#[repr(C, align(64))]
+struct RankedStaticWindow([u8; 64]);
+
+const fn ranked_b30() -> [u8; 64] {
+    let mut x = [0u8; 64];
+    let w = 0x0001_ffff_ffff_ffffu64.to_le_bytes();
+    let mut i = 0;
+    while i != 8 {
+        x[i] = w[i];
+        i += 1;
+    }
+    x
+}
+
+static RANKED_B_MAX: RankedStaticWindow = RankedStaticWindow([u8::MAX; 64]);
+static RANKED_B30: RankedStaticWindow = RankedStaticWindow(ranked_b30());
 
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
         // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
-    }
-
-    /// Transform the staged window `blk` (`0..2 · 16`) for every live block.
-    ///
-    /// # Safety
-    /// Both staging sides hold the eight blocks' bytes for window `blk`.
-    #[inline(never)]
-    unsafe fn project(&self, blk: usize) {
-        unsafe {
-            let (plan, imgs) = self.window_prep(blk);
-            self.project_blocks(blk, plan, imgs, None, None);
-        }
     }
 
     /// The window's per-block invariants: its static-B eligibility and the
@@ -443,90 +574,7 @@ impl StreamProj<'_> {
         (p, round1_ab_table_images(self.inv_table, p))
     }
 
-    /// [`Self::project`] with the window invariants already resolved, and with
-    /// an optional set of drain rows to publish AS the eight blocks are
-    /// transformed. `rows` is what makes the streaming stores spread: they are
-    /// emitted three per block instead of twenty-four per step, and because
-    /// the publisher lives inside the transform loop it costs no extra call
-    /// and no second copy of the kernel body.
-    ///
-    /// # Safety
-    /// As for [`Self::project`], and `plan`/`imgs` must be this window's
-    /// [`Self::window_prep`]; `rows`, when present, must describe the drain
-    /// step that produced this window's staging. `off`, when present, must
-    /// point to the eight blocks' prebuilt offset arena
-    /// (`8 * ROUND1_AB_OFF_WORDS` u16s, 64-byte aligned, block-major) for
-    /// this window's staging bytes, and `plan.offsets_eligible(blk)` must
-    /// hold.
-    #[inline(never)]
-    unsafe fn project_blocks(
-        &self,
-        blk: usize,
-        plan: Round1AbWindowPlan,
-        imgs: Round1AbTableImages,
-        rows: Option<StepRows>,
-        off: Option<*const u16>,
-    ) {
-        unsafe {
-            let (sa, sb) = self.sides();
-            let live = self.live;
-            // Producer-fused offsets: the drain built the arena straight from
-            // its transpose registers, so the staging is never reloaded here.
-            // Publish scheduling identical to the loops below.
-            if let Some(op) = off {
-                debug_assert!(plan.offsets_eligible(blk));
-                for j in 0..8usize {
-                    if let Some(rows) = rows {
-                        rows.publish(j, sa, sb);
-                    }
-                    if live & (1 << j) == 0 {
-                        continue;
-                    }
-                    let out = &mut *self
-                        .out
-                        .add(j * BYTES_PER_BLOCK + blk * 64)
-                        .cast::<[u8; 64]>();
-                    round1_ab_inner_window_from_offsets(
-                        &*op.add(j * ROUND1_AB_OFF_WORDS)
-                            .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                        out,
-                        plan,
-                        imgs,
-                    );
-                }
-                return;
-            }
-            for j in 0..8usize {
-                // ONE block transformed per THREE lines published: the drain's
-                // streaming stores land ~1/8 of a window apart instead of all
-                // together. Publishing block `j`'s rows before transforming it
-                // is deliberate — the two touch disjoint memory, and this way
-                // the eight-block loop below is untouched.
-                if let Some(rows) = rows {
-                    rows.publish(j, sa, sb);
-                }
-                if live & (1 << j) == 0 {
-                    continue;
-                }
-                let a_win = &*sa.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let b_win = &*sb.add(j * STEP_WORDS).cast::<[u8; 64]>();
-                let out = &mut *self
-                    .out
-                    .add(j * BYTES_PER_BLOCK + blk * 64)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_with_images(
-                    a_win,
-                    b_win,
-                    out,
-                    blk,
-                    self.inv_table,
-                    plan,
-                    imgs,
-                );
-            }
-        }
-    }
-
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: StepRows, off: *const u16, use_off: bool) {
         unsafe {
@@ -550,6 +598,79 @@ impl StreamProj<'_> {
             }
         }
     }
+
+    /// Ranked all-elide windows 2..29 always consume producer-built offsets,
+    /// and every half-row is live with wide non-temporal publication. Keeping
+    /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
+    /// policy branch and the generic row publisher from the measured path.
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            debug_assert!(blk > 1 && blk < 30);
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_static<const BLK: usize>(
+        &self,
+        plan: Round1AbWindowPlan,
+        imgs: Round1AbTableImages,
+        rows: RankedRows,
+    ) {
+        unsafe {
+            const { assert!(BLK <= 1) };
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_static::<BLK>(j, self.stage);
+                let a = &*self.stage.add(j * STEP_WORDS).cast::<[u8; 64]>();
+                let out = &mut *self
+                    .out
+                    .add(j * BYTES_PER_BLOCK + BLK * 64)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_with_images(
+                    a,
+                    &RANKED_B_MAX.0,
+                    out,
+                    BLK,
+                    self.inv_table,
+                    plan,
+                    imgs,
+                );
+                j += 1;
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_30(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows) {
+        unsafe {
+            // The first eight qwords are the eight blocks' real row-0 A
+            // values. The following eight are initialized guard bytes. A
+            // sliding 64-byte reference starting at qword j is therefore
+            // valid even for j=7. Its later rows may belong to another block,
+            // but B30 rows 1..7 are exactly zero, so both the trusted kernel
+            // and its generic kill-switch fallback produce the same product.
+            let q=self.stage.cast::<u64>();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_sparse_30(j,q.add(j));
+                let a=&*q.add(j).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+30*64).cast::<[u8;64]>();
+                round1_ab_inner_window_with_images(a,&RANKED_B30.0,out,30,self.inv_table,plan,imgs);
+                j+=1;
+            }
+        }
+    }
 }
 
 /// Rolling drain state shared by the A/B packed writers. The witness uses two
@@ -562,12 +683,9 @@ struct Drain8<'t> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    win_ab: Option<(*mut u32, *mut u32)>,
     proj: StreamProj<'t>,
     elide: [bool; 3],
-    z_nt: bool,
-    wide_nt: bool,
-    spread: bool,
+    ranked_static: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -623,7 +741,16 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
     #[inline(always)]
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
-            store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            // In the ranked all-elide path, static windows provide B words
+            // 0..31 and 480..511 without touching this ring. Keep the flush
+            // check independent of the store: a skipped epoch-ending B word
+            // must still publish the completed A/B epoch.
+            let static_b = FLUSH
+                && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
+                && (*self.drain).ranked_static;
+            if !static_b {
+                store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+            }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
@@ -796,21 +923,6 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
-/// `FLOCK_NO_WIDE_NT=1` restores XMM-only streaming stores in [`dump_range_nt`].
-fn wide_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDE_NT").is_none());
-    *ON
-}
-
-/// `FLOCK_NO_SPREAD_NT=1` restores the bunched drain step (three eight-row
-/// runs of streaming stores, then the whole window's projection).
-fn spread_nt_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SPREAD_NT").is_none());
-    *ON
-}
-
 /// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
 /// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
 /// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
@@ -904,9 +1016,24 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     }
 }
 
+/// Fixed ranked publisher for one complete cache line.
+///
+/// Unlike [`stream_pair_v8`], this has no width policy, alignment branch, or
+/// YMM-to-ZMM assembly. The ranked caller supplies an already-complete ZMM and
+/// a line-aligned destination, so publication is exactly one `vmovntdq`.
+///
+/// # Safety
+/// `p` is 64-byte aligned and owns 64 writable bytes that are not observed
+/// before the task-level `_mm_sfence()`.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn stream_ranked_line(p: *mut u32, v: __m512i) {
+    unsafe { _mm512_stream_si512(p.cast::<__m512i>(), v) }
+}
+
 /// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
 /// (its high run), under the same `nt`/liveness policy — and therefore with
-/// the same bytes at the same addresses — as [`Drain8::publish_step`]'s body.
+/// the same bytes at the same addresses as the ranked drain publisher.
 ///
 /// # Safety
 /// As for [`stream_pair_v8`] and [`store_v8`].
@@ -937,7 +1064,7 @@ unsafe fn emit_pair(
 }
 
 /// One drain step's three destination rows, staged for publication BETWEEN
-/// block transforms by [`StreamProj::project_blocks`].
+/// block transforms by [`StreamProj::project_blocks_ranked`].
 ///
 /// Nothing here is kept in registers across the transform: a's and b's bytes
 /// are already in the projection's own staging (they are its input). The
@@ -1001,154 +1128,115 @@ impl StepRows {
     }
 }
 
-impl Drain8<'_> {
-    /// Transpose one 16-word drain step of the current ring epoch and publish
-    /// it. `carry`, when present, additionally receives all sixteen words of
-    /// every block at `(base, row_stride)` — even where the recyclable main
-    /// destination elides a constant range.
+/// Fixed-policy row publisher for the measured all-elide path.
+///
+/// The ranked AVX-512 binary installs `RecycleAlloc` globally. Its cleared
+/// environment selects the allocator's 64-byte-aligned recyclable class for
+/// the large z/a/b vectors. Rayon group starts (32 KiB), octa-half starts
+/// (16 KiB), block rows (2 KiB), and step offsets (64 B) all preserve that
+/// base alignment. `StreamProj::stage` is backed by `AbWinLine`, also aligned
+/// to 64 bytes, and its side/row strides preserve it. Consequently no ranked
+/// store needs to carry the generic publisher's flags, width policy, or
+/// runtime alignment recovery.
+#[derive(Clone, Copy)]
+struct RankedRows {
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+}
+
+impl RankedRows {
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_step(
-        stage: *const V8,
-        dst: *mut u32,
-        carry: Option<(*mut u32, usize)>,
-        abs_word: usize,
-        ring_word: usize,
-        g0: usize,
-        g1: usize,
-        nt: bool,
-        wide_nt: bool,
-    ) {
-        unsafe {
-            let lo_rows = tr8_chunk(stage, ring_word);
-            let hi_rows = tr8_chunk(stage, ring_word + 8);
-            let g = abs_word / 8;
-            let lo_live = g >= g0 && g < g1;
-            let hi_live = g + 1 >= g0 && g + 1 < g1;
-            for r in 0..8 {
-                if let Some((base, row_stride)) = carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, lo_rows[r]);
-                    store_v8(p.add(8), hi_rows[r]);
-                }
-                let p = dst.add(r * U32_PER_BLOCK + abs_word);
-                match (nt, lo_live, hi_live) {
-                    (true, true, true) => stream_pair_v8(p, lo_rows[r], hi_rows[r], wide_nt),
-                    (true, true, false) => stream_v8(p, lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(p.add(8), hi_rows[r], wide_nt),
-                    (false, true, true) => {
-                        store_v8(p, lo_rows[r]);
-                        store_v8(p.add(8), hi_rows[r]);
-                    }
-                    (false, true, false) => store_v8(p, lo_rows[r]),
-                    (false, false, true) => store_v8(p.add(8), hi_rows[r]),
-                    (_, false, false) => {}
-                }
-            }
+    fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
+        #[cfg(target_feature = "avx512f")]
+        {
+            debug_assert!((z as usize).is_multiple_of(64));
+            debug_assert!((a as usize).is_multiple_of(64));
+            debug_assert!((b as usize).is_multiple_of(64));
         }
+        Self { z, a, b }
     }
 
-    /// Publish one B step and derive the matching Z rows from the already
-    /// transposed A rows. Every R1CS row satisfies `z = a & b`; `tr8` is a
-    /// bit permutation, so the identity is unchanged after transposition.
-    ///
-    /// `a_rows` is the row-major carry written by the immediately preceding
-    /// A `publish_step`. Keeping only B's sixteen results live preserves the
-    /// paired 64-byte NT stores without holding all A and B rows in registers.
+    /// Dense ranked windows 2..29: z, a, and b are all fully live.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_b_with_derived_z(
-        b_stage: *const V8,
-        b_dst: *mut u32,
-        b_carry: Option<(*mut u32, usize)>,
-        a_rows: (*const u32, usize),
-        z_dst: *mut u32,
-        abs_word: usize,
-        ring_word: usize,
-        z_g1: usize,
-        b_g0: usize,
-        b_g1: usize,
-        b_nt: bool,
-        z_nt: bool,
-        wide_nt: bool,
-    ) {
+    unsafe fn publish_dense(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
-            let b_lo_rows = tr8_chunk(b_stage, ring_word);
-            let b_hi_rows = tr8_chunk(b_stage, ring_word + 8);
-            let g = abs_word / 8;
-            let z_lo_live = g < z_g1;
-            let z_hi_live = g + 1 < z_g1;
-            let b_lo_live = g >= b_g0 && g < b_g1;
-            let b_hi_live = g + 1 >= b_g0 && g + 1 < b_g1;
-
-            for r in 0..8 {
-                let ap = a_rows.0.add(r * a_rows.1);
+            let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let bp = sb.add(j * STEP_WORDS);
+            #[cfg(target_feature = "avx512f")]
+            {
+                let av = _mm512_load_si512(ap.cast::<__m512i>());
+                let bv = _mm512_load_si512(bp.cast::<__m512i>());
+                stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+                stream_ranked_line(self.a.add(o), av);
+                stream_ranked_line(self.b.add(o), bv);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            {
                 let a_lo = load_v8(ap);
                 let a_hi = load_v8(ap.add(8));
-                let z_lo = and_v8(a_lo, b_lo_rows[r]);
-                let z_hi = and_v8(a_hi, b_hi_rows[r]);
-
-                if let Some((base, row_stride)) = b_carry {
-                    let p = base.add(r * row_stride);
-                    store_v8(p, b_lo_rows[r]);
-                    store_v8(p.add(8), b_hi_rows[r]);
-                }
-
-                let bp = b_dst.add(r * U32_PER_BLOCK + abs_word);
-                match (b_nt, b_lo_live, b_hi_live) {
-                    (true, true, true) => stream_pair_v8(bp, b_lo_rows[r], b_hi_rows[r], wide_nt),
-                    (true, true, false) => stream_v8(bp, b_lo_rows[r], wide_nt),
-                    (true, false, true) => stream_v8(bp.add(8), b_hi_rows[r], wide_nt),
-                    (false, true, true) => {
-                        store_v8(bp, b_lo_rows[r]);
-                        store_v8(bp.add(8), b_hi_rows[r]);
-                    }
-                    (false, true, false) => store_v8(bp, b_lo_rows[r]),
-                    (false, false, true) => store_v8(bp.add(8), b_hi_rows[r]),
-                    (_, false, false) => {}
-                }
-
-                let zp = z_dst.add(r * U32_PER_BLOCK + abs_word);
-                match (z_nt, z_lo_live, z_hi_live) {
-                    (true, true, true) => stream_pair_v8(zp, z_lo, z_hi, wide_nt),
-                    (true, true, false) => stream_v8(zp, z_lo, wide_nt),
-                    (true, false, true) => stream_v8(zp.add(8), z_hi, wide_nt),
-                    (false, true, true) => {
-                        store_v8(zp, z_lo);
-                        store_v8(zp.add(8), z_hi);
-                    }
-                    (false, true, false) => store_v8(zp, z_lo),
-                    (false, false, true) => store_v8(zp.add(8), z_hi),
-                    (_, false, false) => {}
-                }
+                let b_lo = load_v8(bp);
+                let b_hi = load_v8(bp.add(8));
+                stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
+                stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+                stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
             }
         }
     }
 
+    /// Static-B ranked windows 0/1: B=1, so the complete z and a lines match.
     #[inline(always)]
-    fn ab_ranges(&self) -> (usize, usize, usize) {
-        let a_g1 = if self.elide[1] {
-            ELIDE_ZERO_CHUNK
-        } else {
-            DUMP_CHUNKS
-        };
-        let b_g0 = if self.elide[2] {
-            ELIDE_B_PREFIX_CHUNKS
-        } else {
-            0
-        };
-        let b_g1 = if !self.elide[2] {
-            DUMP_CHUNKS
-        } else {
-            ELIDE_B_TAIL_CHUNK_WIN
-        };
-        (a_g1, b_g0, b_g1)
+    unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
+        unsafe {
+            const { assert!(BLK <= 1) };
+            let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            #[cfg(target_feature = "avx512f")]
+            {
+                let av = _mm512_load_si512(ap.cast::<__m512i>());
+                stream_ranked_line(self.z.add(o), av);
+                stream_ranked_line(self.a.add(o), av);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            {
+                let a_lo = load_v8(ap);
+                let a_hi = load_v8(ap.add(8));
+                stream_pair_v8(self.z.add(o), a_lo, a_hi, true);
+                stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+            }
+        }
     }
 
+    /// Sparse ranked window 30: only its first qword is live; publish the
+    /// complete line with the other seven qwords zeroed in the load itself.
+    #[inline(always)]
+    unsafe fn publish_sparse_30(&self, j: usize, p: *const u64) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            #[cfg(target_feature = "avx512f")]
+            {
+                let av = _mm512_maskz_loadu_epi64(1, p.cast::<i64>());
+                stream_ranked_line(self.z.add(o), av);
+                stream_ranked_line(self.a.add(o), av);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            {
+                let lo = _mm256_set_epi64x(0, 0, 0, core::ptr::read_unaligned(p) as i64);
+                let hi = _mm256_setzero_si256();
+                stream_pair_v8(self.z.add(o), lo, hi, true);
+                stream_pair_v8(self.a.add(o), lo, hi, true);
+            }
+        }
+    }
+}
+
+impl Drain8<'_> {
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.elide==[true;3]{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
         }
     }
 
@@ -1168,6 +1256,7 @@ impl Drain8<'_> {
     /// go. Identical addresses, identical bytes, three lines per block instead
     /// of twenty-four per step — and still exactly one call per step, so the
     /// spread costs no extra call or spill traffic.
+    #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range_spread<const E:bool>(
         &self,
@@ -1177,166 +1266,145 @@ impl Drain8<'_> {
         words: usize,
     ) {
         unsafe {
-            let z_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let a_g1=if E{ELIDE_ZERO_CHUNK}else if self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
-            let b_g0=if E{ELIDE_B_PREFIX_CHUNKS}else if self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
-            let b_g1=if E{ELIDE_B_TAIL_CHUNK_WIN}else if self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
+            let z_g1=if E||self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
+            let a_g1=if E||self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
+            let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
+            let b_g1=if E||self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
             let (sa, sb) = proj.sides();
-            let base=0xC0u8;
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
+                if E && blk == 31 {
+                    continue;
+                }
                 let (plan, imgs) = proj.window_prep(blk);
+                if E && (blk <= 1 || blk == 30) {
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    if blk == 30 {
+                        // Only A words 480 and 481 are live. Pair those two
+                        // word-major ring vectors into eight block-major
+                        // qwords, followed by a fully initialized 64-byte
+                        // guard for the sliding synthetic A windows.
+                        let x0=load_v8(self.ast.add(rw).cast::<u32>());
+                        let x1=load_v8(self.ast.add(rw+1).cast::<u32>());
+                        let l=_mm256_unpacklo_epi32(x0,x1);
+                        let h=_mm256_unpackhi_epi32(x0,x1);
+                        store_v8(sa,_mm256_permute2x128_si256::<0x20>(l,h));
+                        store_v8(sa.add(8),_mm256_permute2x128_si256::<0x31>(l,h));
+                        let z=_mm256_setzero_si256();
+                        store_v8(sa.add(16),z);
+                        store_v8(sa.add(24),z);
+                        proj.project_blocks_ranked_30(plan,imgs,rows);
+                        continue;
+                    }
+                    let a_lo = tr8_chunk(self.ast, rw);
+                    let a_hi = tr8_chunk(self.ast, rw + 8);
+                    for r in 0..8 {
+                        let p = sa.add(r * STEP_WORDS);
+                        store_v8(p, a_lo[r]);
+                        store_v8(p.add(8), a_hi[r]);
+                    }
+                    if blk == 0 {
+                        proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                    } else {
+                        proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                    }
+                    continue;
+                }
                 // Fused offset arena: while the transposed rows are still in
                 // registers, also widen them to the split kernel's pre-scaled
                 // `u16` offsets. The kernel then consumes the arena and never
                 // reloads the staging, and no consuming load executes in the
                 // shadow of its own offset stores.
-                let use_off=blk>1&&blk<30;
+                // The E=true static cases continued above, so its remaining
+                // windows are exactly 2..29 and offsets are unconditional.
+                // E=false retains the original per-window eligibility test.
                 #[repr(align(64))]
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                 let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
 
-                // Transpose the two ring sides first. a and b go straight
-                // into the projection's staging — which is both its input AND
-                // the bytes the main buffers get, so nothing is published yet.
-                // Every packed row satisfies `z = a & b` and `tr8` is a bit
-                // permutation, so the Z rows are derived from the transposed
-                // A/B rows instead of transposing a third Z ring.
-                let a_lo = tr8_chunk(self.ast, rw);
-                let a_hi = tr8_chunk(self.ast, rw + 8);
-                for r in 0..8 {
-                    let p = sa.add(r * STEP_WORDS);
-                    store_v8(p, a_lo[r]);
-                    store_v8(p.add(8), a_hi[r]);
+                if E {
+                    // Ranked dense path: each side's two AVX2 half-transposes
+                    // become one 16-word ZMM transpose, one aligned store per
+                    // block row, and the same live ZMM feeds offset widening.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    if use_off {
-                        widen_off_half(a_lo[r], a_hi[r], op.add(r * ROUND1_AB_OFF_WORDS));
+                    {
+                        stage_ranked_dense_side(self.ast,rw,sa,op);
+                        stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
                     }
-                }
-                let b_lo = tr8_chunk(self.bs, rw);
-                let b_hi = tr8_chunk(self.bs, rw + 8);
-                for r in 0..8 {
-                    let p = sb.add(r * STEP_WORDS);
-                    store_v8(p, b_lo[r]);
-                    store_v8(p.add(8), b_hi[r]);
-                    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    if use_off {
-                        widen_off_half(b_lo[r], b_hi[r], op.add(r * ROUND1_AB_OFF_WORDS + 64));
+                    // Portable builds cannot select E=true: the ranked gate
+                    // requires the AVX-512 offset plan. Retain the old staging
+                    // shape so this monomorphization remains well-formed.
+                    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+                    {
+                        let a_lo=tr8_chunk(self.ast,rw);
+                        let a_hi=tr8_chunk(self.ast,rw+8);
+                        for r in 0..8 {
+                            let p=sa.add(r*STEP_WORDS);
+                            store_v8(p,a_lo[r]);
+                            store_v8(p.add(8),a_hi[r]);
+                        }
+                        let b_lo=tr8_chunk(self.bs,rw);
+                        let b_hi=tr8_chunk(self.bs,rw+8);
+                        for r in 0..8 {
+                            let p=sb.add(r*STEP_WORDS);
+                            store_v8(p,b_lo[r]);
+                            store_v8(p.add(8),b_hi[r]);
+                        }
                     }
-                }
-                let g = abs_word / 8;
-                let mut flags = base;
-                if g < z_g1 {
-                    flags |= 1;
-                }
-                if g + 1 < z_g1 {
-                    flags |= 2;
-                }
-                if g < a_g1 {
-                    flags |= 4;
-                }
-                if g + 1 < a_g1 {
-                    flags |= 8;
-                }
-                if g >= b_g0 && g < b_g1 {
-                    flags |= 0x10;
-                }
-                if g + 1 >= b_g0 && g + 1 < b_g1 {
-                    flags |= 0x20;
-                }
-                let rows = StepRows {
-                    z: self.z.add(abs_word),
-                    a: self.a.add(abs_word),
-                    b: self.b.add(abs_word),
-                    flags,
-                };
-
-                proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
-            }
-        }
-    }
-
-    /// The two non-streaming drains — the `win_ab` window fusion and the plain
-    /// temporal publish. Out of line so the streaming drain above keeps a
-    /// register allocation of its own.
-    #[inline(never)]
-    unsafe fn drain_range_buffered(&mut self, base_word: usize, ring_word: usize, words: usize) {
-        unsafe {
-            let z_g1 = if self.elide[0] {
-                ELIDE_ZERO_CHUNK
-            } else {
-                DUMP_CHUNKS
-            };
-            let (a_g1, b_g0, b_g1) = self.ab_ranges();
-            match self.win_ab {
-                Some((win_a, win_b)) => {
-                    for off in (0..words).step_by(STEP_WORDS) {
-                        let abs_word = base_word + off;
-                        let rw = ring_word + off;
-                        Self::publish_step(
-                            self.ast,
-                            self.a,
-                            Some((win_a.add(abs_word), U32_PER_BLOCK)),
-                            abs_word,
-                            rw,
-                            0,
-                            a_g1,
-                            true,
-                            self.wide_nt,
-                        );
-                        Self::publish_b_with_derived_z(
-                            self.bs,
-                            self.b,
-                            Some((win_b.add(abs_word), U32_PER_BLOCK)),
-                            (win_a.add(abs_word), U32_PER_BLOCK),
-                            self.z,
-                            abs_word,
-                            rw,
-                            z_g1,
-                            b_g0,
-                            b_g1,
-                            true,
-                            self.z_nt,
-                            self.wide_nt,
-                        );
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
+                } else {
+                    // Cold/generic path stays on the two incumbent AVX2
+                    // transposes and its per-window offset eligibility gate.
+                    let use_off=plan.offsets_eligible(blk);
+                    let a_lo=tr8_chunk(self.ast,rw);
+                    let a_hi=tr8_chunk(self.ast,rw+8);
+                    for r in 0..8 {
+                        let p=sa.add(r*STEP_WORDS);
+                        store_v8(p,a_lo[r]);
+                        store_v8(p.add(8),a_hi[r]);
+                        #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                        if use_off {
+                            widen_off_half(a_lo[r],a_hi[r],op.add(r*ROUND1_AB_OFF_WORDS));
+                        }
                     }
-                }
-                None => {
-                    let mut a_rows = core::mem::MaybeUninit::<[V8; STEP_WORDS]>::uninit();
-                    let a_rows = a_rows.as_mut_ptr().cast::<u32>();
-                    for off in (0..words).step_by(STEP_WORDS) {
-                        let abs_word = base_word + off;
-                        let rw = ring_word + off;
-                        Self::publish_step(
-                            self.ast,
-                            self.a,
-                            Some((a_rows, STEP_WORDS)),
-                            abs_word,
-                            rw,
-                            0,
-                            a_g1,
-                            false,
-                            self.wide_nt,
-                        );
-                        Self::publish_b_with_derived_z(
-                            self.bs,
-                            self.b,
-                            None,
-                            (a_rows, STEP_WORDS),
-                            self.z,
-                            abs_word,
-                            rw,
-                            z_g1,
-                            b_g0,
-                            b_g1,
-                            false,
-                            self.z_nt,
-                            self.wide_nt,
-                        );
+                    let b_lo=tr8_chunk(self.bs,rw);
+                    let b_hi=tr8_chunk(self.bs,rw+8);
+                    for r in 0..8 {
+                        let p=sb.add(r*STEP_WORDS);
+                        store_v8(p,b_lo[r]);
+                        store_v8(p.add(8),b_hi[r]);
+                        #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                        if use_off {
+                            widen_off_half(b_lo[r],b_hi[r],op.add(r*ROUND1_AB_OFF_WORDS+64));
+                        }
                     }
+                    let base=0xC0u8;
+                    let g = abs_word / 8;
+                    let mut flags = base;
+                    if g < z_g1 {
+                        flags |= 1;
+                    }
+                    if g + 1 < z_g1 {
+                        flags |= 2;
+                    }
+                    if g < a_g1 {
+                        flags |= 4;
+                    }
+                    if g + 1 < a_g1 {
+                        flags |= 8;
+                    }
+                    if g >= b_g0 && g < b_g1 {
+                        flags |= 0x10;
+                    }
+                    if g + 1 >= b_g0 && g + 1 < b_g1 {
+                        flags |= 0x20;
+                    }
+                    let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), flags };
+                    proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
                 }
             }
         }
@@ -1461,22 +1529,15 @@ unsafe fn dump_elide_win(
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
-/// `win_ab = Some((win_a, win_b))` selects the FUSED a/b drain: the main a/b
-/// buffers are published non-temporally and a full copy of this octa's 8
-/// blocks lands in the two window buffers, which the caller projects from
-/// instead of re-reading a/b. `None` is the incumbent temporal drain.
-///
-/// `proj = Some(..)` selects the STREAMING form of the same fusion: a/b are
-/// published non-temporally exactly as under `win_ab`, and each drain step's
+/// `proj` selects the STREAMING form of the a/b fusion: a/b are
+/// published non-temporally, and each drain step's
 /// eight 64-byte round-1 medium windows are transformed straight into the
 /// caller's ab_inner blocks out of a small staging pair, so no full-block
-/// window buffer exists. `win_ab` and `proj` are mutually exclusive.
+/// window buffer exists.
 ///
 /// # Safety
 /// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
-/// When `win_ab` is `Some`, both window pointers own 8 contiguous 512-word
-/// blocks too, disjoint from each other and from `z`/`a`/`b`. When `proj` is
-/// `Some`, its staging and `out` satisfy [`StreamProj`]'s contract. In every
+/// `proj`'s staging and `out` satisfy [`StreamProj`]'s contract. In every
 /// non-temporal arm the caller must `_mm_sfence()` on this thread after its
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
@@ -1486,12 +1547,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    win_ab: Option<(*mut u32, *mut u32)>,
     proj: StreamProj<'_>,
     elide: [bool; 3],
-    z_nt: bool,
 ) {
     unsafe {
+        // Only the all-elide provenance state selects the ranked static
+        // windows. Partial/cold states still read both rings in every window.
+        let ranked_static =
+            elide == [true; 3] && proj.dead_ranked_blk31 && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -1612,12 +1675,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z,
             a,
             b,
-            win_ab,
             proj,
             elide,
-            z_nt,
-            wide_nt: true,
-            spread: true,
+            ranked_static,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -1636,6 +1696,15 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             };
             let w = 16 + k;
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
+        }
+        // Unswitch the static-prefix decision once per octa. Ranked blocks
+        // 0/1 source B from RANKED_B_MAX; block 2 still needs words 32..35.
+        if !ranked_static {
+            for w in 16..RANKED_STATIC_B_PREFIX_END {
+                store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
+            }
+        }
+        for w in RANKED_STATIC_B_PREFIX_END..16 + PROLOGUE_WORDS {
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
 
@@ -1737,12 +1806,15 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         const {
             assert!(U32_PER_BLOCK - ZF == 30);
         }
-        // finish() completed word 481. Complete the final rolling epoch with
-        // the all-zero tail, then publish words 384..511 in one long sweep.
-        for w in ZF..U32_PER_BLOCK {
-            let i = w & (RING_WORDS - 1);
-            store_v8(ast.add(i) as *mut u32, zero);
-            store_v8(bs.add(i) as *mut u32, zero);
+        // finish() completed word 481. The ranked blk30 path reads only ring
+        // words 480/481 and constructs its zero tail directly; blk31 is a
+        // direct zero output. Cold/rollback paths retain the complete tail.
+        if !ranked_static {
+            for w in ZF..U32_PER_BLOCK {
+                let i = w & (RING_WORDS - 1);
+                store_v8(ast.add(i) as *mut u32, zero);
+                store_v8(bs.add(i) as *mut u32, zero);
+            }
         }
         drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
@@ -1753,9 +1825,13 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         for w in 0..8usize {
             let lo = xor_v8(state[w], state[w + 8]);
             store_v8(ast.add(w) as *mut u32, cv_v[w]);
-            store_v8(bs.add(w) as *mut u32, maxv);
             store_v8(ast.add(8 + w) as *mut u32, lo);
-            store_v8(bs.add(8 + w) as *mut u32, maxv);
+        }
+        if !ranked_static {
+            for w in 0..8usize {
+                store_v8(bs.add(w) as *mut u32, maxv);
+                store_v8(bs.add(8 + w) as *mut u32, maxv);
+            }
         }
         drain.drain_range(0, 0, 16);
     }
@@ -2028,6 +2104,27 @@ mod tests {
             return;
         }
         unsafe { tr8_check() }
+    }
+
+    /// Independent scalar-layout oracle for the ranked 16×8 ZMM network.
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn witgen8_tr8x16_zmm_is_word_to_block_transpose() {
+        #[repr(C, align(64))]
+        struct Input([[u32; 8]; STEP_WORDS]);
+
+        let input = Input(core::array::from_fn(|word| {
+            core::array::from_fn(|block| (1000 * word + block) as u32)
+        }));
+        unsafe {
+            let out = tr8x16_zmm(input.0.as_ptr().cast::<V8>(), 0);
+            for (block, row) in out.into_iter().enumerate() {
+                let mut got = [0u32; STEP_WORDS];
+                _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
+                let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
+                assert_eq!(got, expected, "block {block}");
+            }
+        }
     }
 
     unsafe fn tr8_check() {

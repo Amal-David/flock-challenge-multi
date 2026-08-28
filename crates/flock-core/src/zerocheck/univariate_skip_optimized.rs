@@ -432,6 +432,9 @@ pub struct Round1AbInner {
     /// [`planned_round1_gpu_prefix_bytes`]). Always a multiple of the
     /// per-x_hi window byte count; 0 means fully valid.
     invalid_prefix_bytes: usize,
+    /// The ranked x86 producer intentionally left medium row 31 unwritten.
+    /// Only the exact m=32 BLAKE3 padding contract may consume such storage.
+    dead_ranked_blk31: bool,
 }
 
 impl Round1AbInner {
@@ -451,7 +454,28 @@ impl Round1AbInner {
         Self {
             storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
             invalid_prefix_bytes: 0,
+            dead_ranked_blk31: false,
         }
+    }
+
+    /// Mark the exact ranked m=32 layout whose final medium row is dead.
+    #[doc(hidden)]
+    pub fn mark_dead_ranked_blk31(&mut self) {
+        assert_eq!(self.invalid_prefix_bytes, 0);
+        self.dead_ranked_blk31 = true;
+    }
+
+    #[inline]
+    fn assert_ranked_read_contract(&self, m: usize, padding: &PaddingSpec) {
+        if !self.dead_ranked_blk31 {
+            return;
+        }
+        assert_eq!(self.invalid_prefix_bytes, 0);
+        assert_eq!(m, 32);
+        assert!(blake3_static_layout(padding));
+        let (mask, counts) = build_b_med_counts(padding);
+        assert_eq!(mask, 1);
+        assert_eq!(counts.as_slice(), &[16, 15]);
     }
 
     /// Declare the leading `bytes` of the storage unwritten (the producer
@@ -635,6 +659,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
     Round1AbInner {
         storage,
         invalid_prefix_bytes: 0,
+        dead_ranked_blk31: false,
     }
 }
 
@@ -1130,6 +1155,48 @@ pub unsafe fn round1_ab_inner_window_from_offsets(
         target_feature = "avx512bw"
     )))]
     unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
+}
+
+/// Fixed-ZMM-stream-store twin of [`round1_ab_inner_window_from_offsets`] for
+/// the measured ranked path. It computes identical bytes but specializes the
+/// already-resolved `nt=2` destination class, so the terminal store has no
+/// runtime selector. Generic/cold/static callers retain the general wrapper.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets`], with `plan.nt == 2` and
+/// `out` 64-byte aligned. The producing thread must execute
+/// [`abinner_publish_fence`] before publishing the output across threads.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
@@ -1901,6 +1968,7 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
+    ab_inner.assert_ranked_read_contract(m, padding);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
@@ -2570,6 +2638,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
+    ab_inner.assert_ranked_read_contract(m, padding);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
@@ -3053,6 +3122,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(b_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
+    ab_inner.assert_ranked_read_contract(m, padding);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     let r_outer = &r[k_skip + N_INNER..];
     let n_hi = r_outer.len().min(SplitEqGhash::MAX_N_HI);

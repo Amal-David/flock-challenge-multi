@@ -1739,12 +1739,20 @@ fn generate_round1_inner_octa(
     // Contract: one sfence per rayon task, below, before the task's release.
     let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
-    let ab_inner_bytes = ab_inner.as_bytes_mut();
     let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
         inv_table,
-        ab_inner_bytes,
+        ab_inner.as_bytes_mut(),
         abinner_nt,
     );
+    let dead_ranked_blk31 = ab_stream
+        && elide == [true; 3]
+        && skip_blocks == 0
+        && z.len() == (1usize << (32 - K_LOG)) * F128_PER_BLOCK
+        && win_plan.offsets_eligible(2);
+    if dead_ranked_blk31 {
+        ab_inner.mark_dead_ranked_blk31();
+    }
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -1836,21 +1844,14 @@ fn generate_round1_inner_octa(
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
+                        // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
-                                }
-                            }
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
                                 inv_table,
                                 plan: win_plan,
+                                dead_ranked_blk31,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
@@ -1858,10 +1859,8 @@ fn generate_round1_inner_octa(
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            win_ab,
                             proj,
                             elide,
-                            z_nt,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same
