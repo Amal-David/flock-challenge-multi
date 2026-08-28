@@ -57,7 +57,7 @@
 //! The packed witness has `2^(m−7)` F_{2^128} elements indexed by the suffix.
 //! `s_hat_v` has 128 entries indexed by the 7-bit prefix.
 
-use crate::bits::transpose_8x8_bits;
+use crate::bits::{transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
 use crate::challenger::Challenger;
 use crate::field::{F128, F256Unreduced};
 use crate::zerocheck::PaddingSpec;
@@ -1738,91 +1738,31 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 /// bytes are scattered into one byte column of the 128 output elements. This
 /// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
 /// transposes while preserving the exact polynomial-basis layout.
-#[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v.len(), 128);
-    let mut out = Vec::<F128>::with_capacity(128);
-    unsafe {
-        transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-        out.set_len(128);
-    }
-    out
-}
-
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
-    use core::arch::x86_64::*;
-    const L: [u8; 64] = [112,96,80,64,48,32,16,0,113,97,81,65,49,33,17,1,114,98,82,66,50,34,18,2,115,99,83,67,51,35,19,3,116,100,84,68,52,36,20,4,117,101,85,69,53,37,21,5,118,102,86,70,54,38,22,6,119,103,87,71,55,39,23,7];
-    const H: [u8; 64] = [120,104,88,72,56,40,24,8,121,105,89,73,57,41,25,9,122,106,90,74,58,42,26,10,123,107,91,75,59,43,27,11,124,108,92,76,60,44,28,12,125,109,93,77,61,45,29,13,126,110,94,78,62,46,30,14,127,111,95,79,63,47,31,15];
-    unsafe {
-        let l = _mm512_loadu_si512(L.as_ptr() as *const __m512i);
-        let h = _mm512_loadu_si512(H.as_ptr() as *const __m512i);
-        let i0 = _mm512_set_epi64(11,3,10,2,9,1,8,0);
-        let i1 = _mm512_set_epi64(15,7,14,6,13,5,12,4);
-        let d = out as *mut __m512i;
-        let a = transpose64_gfni(p, l);
-        let b = transpose64_gfni(p.add(64), l);
-        let mut k = 0usize;
-        while k != 8 {
-            _mm512_storeu_si512(d.add(k*2), _mm512_permutex2var_epi64(a[k], i0, b[k]));
-            _mm512_storeu_si512(d.add(k*2+1), _mm512_permutex2var_epi64(a[k], i1, b[k]));
-            k += 1;
-        }
-        let a = transpose64_gfni(p, h);
-        let b = transpose64_gfni(p.add(64), h);
-        k = 0;
-        while k != 8 {
-            _mm512_storeu_si512(d.add(16+k*2), _mm512_permutex2var_epi64(a[k], i0, b[k]));
-            _mm512_storeu_si512(d.add(17+k*2), _mm512_permutex2var_epi64(a[k], i1, b[k]));
-            k += 1;
+    assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
+    let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
+    for row_group in 0..16 {
+        let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
+        let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
+        let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
+        let mut lo_columns = [0u8; 64];
+        let mut hi_columns = [0u8; 64];
+        transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
+        transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
+        for bit in 0..64 {
+            out_bytes[bit][row_group] = lo_columns[bit];
+            out_bytes[64 + bit][row_group] = hi_columns[bit];
         }
     }
-}
-
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> [core::arch::x86_64::__m512i;8] {
-    use core::arch::x86_64::*;
-    unsafe {
-        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
-        let mut r = [_mm512_setzero_si512();8];
-        let mut g = 0usize;
-        while g != 8 {
-            let q = p.add(g*8);
-            r[g] = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutex2var_epi8(_mm512_loadu_si512(q as *const __m512i), idx, _mm512_loadu_si512(q.add(4) as *const __m512i)));
-            g += 1;
-        }
-        transpose8x64_bytes(r)
-    }
-}
-
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
-unsafe fn transpose8x64_bytes(mut x: [core::arch::x86_64::__m512i;8]) -> [core::arch::x86_64::__m512i;8] {
-    use core::arch::x86_64::*;
-    const A:[[i64;8];3]=[[0,1,2,3,8,9,10,11],[0,1,8,9,4,5,12,13],[0,8,2,10,4,12,6,14]];
-    const B:[[i64;8];3]=[[4,5,6,7,12,13,14,15],[2,3,10,11,6,7,14,15],[1,9,3,11,5,13,7,15]];
-    const I:[u8;64]=[0,8,16,24,32,40,48,56,1,9,17,25,33,41,49,57,2,10,18,26,34,42,50,58,3,11,19,27,35,43,51,59,4,12,20,28,36,44,52,60,5,13,21,29,37,45,53,61,6,14,22,30,38,46,54,62,7,15,23,31,39,47,55,63];
-    unsafe {
-        let mut s=0usize;
-        while s!=3 {
-            let a=_mm512_loadu_si512(A[s].as_ptr() as *const __m512i);
-            let b=_mm512_loadu_si512(B[s].as_ptr() as *const __m512i);
-            let d=4>>s;
-            let mut y=[_mm512_setzero_si512();8];
-            let mut r=0usize;
-            while r!=8 {
-                if r&d==0 { y[r]=_mm512_permutex2var_epi64(x[r],a,x[r|d]); y[r|d]=_mm512_permutex2var_epi64(x[r],b,x[r|d]); }
-                r+=1;
-            }
-            x=y;s+=1;
-        }
-        let i=_mm512_loadu_si512(I.as_ptr() as *const __m512i);
-        let mut r=0usize;
-        while r!=8 { x[r]=_mm512_permutexvar_epi8(i,x[r]);r+=1; }
-        x
-    }
+    out_bytes
+        .into_iter()
+        .map(|bytes| {
+            F128::new(
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            )
+        })
+        .collect()
 }
 
 /// Straight-line definition retained only as the independent oracle for the
@@ -3181,6 +3121,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, or 64·2^LOG_PACKING"
         );
     }
+
     // Per-orig-claim "precomputed?" predicate. Empty precomputed slice → all
     // claims need fold (matches the existing behavior bit-for-bit).
     let has_precomputed =
@@ -4622,6 +4563,7 @@ mod tests {
             &padding,
             &mut direct_challenger,
         );
+
         assert_eq!(direct_gammas, baseline_gammas);
         assert_eq!(direct[0].0, baseline[0].0);
         assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);

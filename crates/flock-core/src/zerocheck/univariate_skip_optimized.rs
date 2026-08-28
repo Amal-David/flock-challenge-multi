@@ -384,7 +384,7 @@ pub(crate) fn convert_table() -> &'static [F128] {
 
 const C_MASK_TABLE_STRIDE: usize = 512;
 
-fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
+pub(crate) fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
     let mut tables = crate::scratch::take_f128(eq_lo_scaled.len() * C_MASK_TABLE_STRIDE);
@@ -3089,11 +3089,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     ))]
     let eq_fold_state = eq_fold_enabled.then(|| {
-        let bank_bits = if n_lo == 12 {
-            7
-        } else {
-            n_lo.saturating_sub(5).max(1)
-        };
+        let bank_bits = n_lo.saturating_sub(5).max(1);
         let r_lo = &r_outer[..n_lo];
         let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
         let mats = build_ab_eq_fold_mats(&eq_top_scaled, convert);
