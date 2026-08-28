@@ -61,69 +61,6 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
     }
 }
 
-/// Four-lane `dst = fold_r(src) + scale * fold_r(addend)` with all
-/// intermediates kept in zmm and one final store.
-///
-/// # Safety
-/// Requires `avx512f` and `vpclmulqdq`; the caller guarantees that both input
-/// slices contain every pair selected by `base` and `dst.len()`.
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(super) unsafe fn fold_pairs_with_scaled_addend(
-    src: &[F128],
-    addend: &[F128],
-    base: usize,
-    dst: &mut [F128],
-    r: F128,
-    scale: F128,
-) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-
-    // SAFETY: caller supplies target features and source bounds.
-    unsafe {
-        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
-        let r_x64 = ghash_shift64_x4(r_x4);
-        let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
-        let scale_x64 = ghash_shift64_x4(scale_x4);
-        let lanes = dst.len() & !3;
-        let mut t = 0usize;
-        while t < lanes {
-            let index = 2 * (base + t);
-            let src_lo = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
-            let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
-            let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
-            let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
-            let src_folded = _mm512_xor_si512(
-                src_even,
-                ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
-            );
-            let addend_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
-            let addend_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
-            let addend_even = _mm512_shuffle_i32x4::<0x88>(addend_lo, addend_hi);
-            let addend_odd = _mm512_shuffle_i32x4::<0xDD>(addend_lo, addend_hi);
-            let addend_folded = _mm512_xor_si512(
-                addend_even,
-                ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
-            );
-            let output = _mm512_xor_si512(
-                src_folded,
-                ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
-            );
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
-            t += 4;
-        }
-        while t < dst.len() {
-            let index = 2 * (base + t);
-            let src_even = src[index];
-            let addend_even = addend[index];
-            let src_folded = src_even + r * (src_even + src[index + 1]);
-            let addend_folded = addend_even + r * (addend_even + addend[index + 1]);
-            dst[t] = src_folded + scale * addend_folded;
-            t += 1;
-        }
-    }
-}
-
 #[inline]
 fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: usize) {
     // Char-2 one-mul tail (SIMD body already uses even + r*(even+odd)).

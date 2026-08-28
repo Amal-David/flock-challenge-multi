@@ -373,10 +373,6 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
 /// - `out_planes_ptr` must point to at least `n_blocks64 * 1024` bytes.
-/// - With `seed_zero = true`, that output range may be uninitialized: the
-///   kernel seeds registers from zero and stores every byte of every block.
-///   With `seed_zero = false`, the full output range must already be
-///   initialized because every 64-byte plane is loaded before being updated.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

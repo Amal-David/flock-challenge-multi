@@ -1346,46 +1346,25 @@ fn transpose_8x8_bytes(mut rows: [u64; 8]) -> [u64; 8] {
 
 /// Reduce one 64-column GFNI plane block across workers and transpose it
 /// back to the canonical F128 column layout.
-///
-/// # Safety
-/// For every entry in `active_workers`, all 1024 bytes of plane block `blk`
-/// must have been initialized, and every worker index/block range must lie in
-/// `planes`. The producer join must happen-before this call.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
 #[inline(always)]
-unsafe fn reduce_worker_plane_block(
-    planes: &[core::mem::MaybeUninit<u8>],
+fn reduce_worker_plane_block(
+    planes: &[u8],
     worker_stride: usize,
-    active_workers: &[usize],
+    n_workers: usize,
     blk: usize,
     out: &mut [F128],
 ) {
     debug_assert_eq!(out.len(), 64);
-    let Some((&first_worker, rest_workers)) = active_workers.split_first() else {
-        out.fill(F128::ZERO);
-        return;
-    };
     let base = blk * 1024;
     let mut acc = [0u8; 1024];
-    let first = first_worker * worker_stride + base;
-    let first_block = &planes[first..first + 1024];
-    // SAFETY: callers reduce only `blk < live_blocks`, and `first_worker` is
-    // active. Its first claimed tile called `gfni_fold_tile(seed_zero=true)`,
-    // which stores all 16 x 64 bytes of every live block. The Rayon producer
-    // join completed before reduction starts, so this exact block is fully
-    // initialized and may now be viewed as bytes.
-    let first_block = unsafe {
-        core::slice::from_raw_parts(first_block.as_ptr().cast::<u8>(), first_block.len())
-    };
-    acc.copy_from_slice(first_block);
-    for &w in rest_workers {
+    acc.copy_from_slice(&planes[base..base + 1024]);
+    for w in 1..n_workers {
         let src = &planes[w * worker_stride + base..w * worker_stride + base + 1024];
-        // SAFETY: the same active-worker/live-block proof as `first_block`.
-        let src = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len()) };
         // SAFETY: both slices are 1024 bytes (16 x 64); XOR is bitwise so
         // VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
         unsafe {
@@ -1437,19 +1416,12 @@ fn fold_block_major_gfni(
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
-    // Same total footprint as the F128 partials (k*16 bytes per worker). The
-    // first claimed tile seeds every live plane block from register zero, so
-    // eager zeroing is dead work. Dynamic claiming can leave a Rayon chunk
-    // with no tile, however; `active` keeps those stale chunks out of reduce.
-    // MaybeUninit keeps the whole Rayon slice valid while only active/live
-    // subranges are initialized; it is never reinterpreted wholesale as u8.
-    let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * k * 16);
-    let mut active = vec![0u8; n_workers];
+    // Same total footprint as the F128 partials (k*16 bytes per worker).
+    let mut planes = vec![0u8; n_workers * k * 16];
     planes
         .par_chunks_mut(k * 16)
-        .zip(active.par_iter_mut())
         .enumerate()
-        .for_each(|(worker, (wplanes, worker_active))| {
+        .for_each(|(worker, wplanes)| {
             let tile_lo = worker * tiles_per_worker;
             let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
             let (mut claim_lo, mut claim_hi) = if dynamic {
@@ -1462,9 +1434,8 @@ fn fold_block_major_gfni(
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
             let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
-            // First tile this worker writes into an uninitialized plane
-            // buffer: seed the GFNI acc from a register zero idiom. Later
-            // tiles load only blocks that this first tile initialized.
+            // First tile this worker writes into a freshly zeroed plane
+            // buffer: seed the GFNI acc from a register zero idiom.
             let mut first_tile = true;
             // Fused register gather+transpose (no staging arrays); the
             // scalar path stays as the kill-switch arm.
@@ -1581,7 +1552,7 @@ fn fold_block_major_gfni(
                                     128,
                                     2,
                                     &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                    wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
                                     first_tile,
                                 );
                             }
@@ -1639,7 +1610,7 @@ fn fold_block_major_gfni(
                             128,
                             chunk_bits.div_ceil(64),
                             &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                            wplanes.as_mut_ptr().add(2 * q * 1024),
                             first_tile,
                         );
                     }
@@ -1647,10 +1618,6 @@ fn fold_block_major_gfni(
                 }
                 first_tile = false;
             }
-            // This byte is exclusively owned by the zipped Rayon chunk. A
-            // true `first_tile` means dynamic claiming assigned it no work,
-            // so none of its uninitialized plane bytes may enter reduction.
-            *worker_active = u8::from(!first_tile);
         });
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
@@ -1661,49 +1628,13 @@ fn fold_block_major_gfni(
     // incumbent reduction and transpose leaves while avoiding a length-k
     // intermediate allocation plus its complete readback.
     let worker_stride = k * 16;
-    // Iteration over the marker vector preserves the incumbent ascending
-    // worker reduction order while deleting inactive zero contributions.
-    let active_workers: Vec<usize> = active
-        .into_iter()
-        .enumerate()
-        .filter_map(|(worker, active)| (active != 0).then_some(worker))
-        .collect();
-    let live_blocks = useful_bits.div_ceil(64);
     let out_len = if top_bind.is_some() { k / 2 } else { k };
-    // Keep output initialized as F128 throughout. The much larger plane
-    // buffer carries the dead zero-fill; avoiding this comparatively small
-    // clear would require a separate MaybeUninit ownership conversion.
     let mut out = vec![F128::ZERO; out_len];
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
-        if blk < live_blocks {
-            // SAFETY: `active_workers` contains exactly producer chunks that
-            // claimed a tile. Their first tile used `seed_zero=true` and
-            // stored every byte of each `blk < live_blocks`; the producer
-            // parallel iterator joined before this reduction starts.
-            unsafe {
-                reduce_worker_plane_block(&planes, worker_stride, &active_workers, blk, o);
-            }
-        } else {
-            // Padding has no backing worker-plane writes in the uninitialized
-            // allocation, but its canonical folded value is algebraic zero.
-            o.fill(F128::ZERO);
-        }
+        reduce_worker_plane_block(&planes, worker_stride, n_workers, blk, o);
         if let Some(r) = top_bind {
             let mut hi = [F128::ZERO; 64];
-            let hi_blk = blk + k / 128;
-            if hi_blk < live_blocks {
-                // SAFETY: identical to the low-block call above; `hi_blk` is
-                // explicitly constrained to the fully stored live range.
-                unsafe {
-                    reduce_worker_plane_block(
-                        &planes,
-                        worker_stride,
-                        &active_workers,
-                        hi_blk,
-                        &mut hi,
-                    );
-                }
-            }
+            reduce_worker_plane_block(&planes, worker_stride, n_workers, blk + k / 128, &mut hi);
             crate::field::f128_slice::bind_split_half(o, &hi, r);
         }
     });

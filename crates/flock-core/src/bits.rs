@@ -31,14 +31,6 @@ pub(crate) fn transpose_8x8_bits(mut x: u64) -> u64 {
 /// [`bit_transpose_64bytes`]: crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes
 #[inline(always)]
 pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), 64);
-    unsafe { transpose_8_u64s_to_64_bytes_gfni(lanes, out) }
-}
-
-#[rustfmt::skip]
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     use core::arch::x86_64::*;
     const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
     unsafe {

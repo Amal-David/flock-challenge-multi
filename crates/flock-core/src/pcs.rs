@@ -1237,11 +1237,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     CombinedClaim {
         ring_switches: rs_results
             .into_iter()
-            .map(|(p, o)| {
+            .map(|(p, _o)| {
                 // The per-claim rs_eq_ind (L F128s) dies here — recycle it.
-                if let ring_switch::RsEqInd::Dense(v) = o.rs_eq_ind {
-                    crate::scratch::give_f128(v);
-                }
                 p
             })
             .collect(),
