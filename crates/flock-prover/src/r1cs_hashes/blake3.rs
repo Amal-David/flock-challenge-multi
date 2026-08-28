@@ -1474,9 +1474,24 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    // The table is statement-fixed at k=6. Reuse zerocheck's warm cached copy
+    // on measured proofs; retain the exact rebuild as a same-binary rollback.
+    fn witgen_urm_table_cache_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_URM_CACHE").is_none());
+        *ON
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_table_cache_enabled()
+    {
+        flock_core::zerocheck::urm_inv_table_k_skip()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -1836,19 +1851,11 @@ fn generate_round1_inner_octa(
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
+                        // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
-                                }
-                            }
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
                                 inv_table,
                                 plan: win_plan,
                             }
@@ -1858,10 +1865,8 @@ fn generate_round1_inner_octa(
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            win_ab,
                             proj,
                             elide,
-                            z_nt,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same

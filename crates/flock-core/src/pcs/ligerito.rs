@@ -5931,6 +5931,43 @@ fn materialize_direct_fold8_f_for_precommit(
 
     const SUB: usize = 256;
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+    // The ranked state has eight outer blocks. Splitting each block into two
+    // ranges exposes sixteen jobs to the worker pool while retaining the same
+    // 64->4->1 arithmetic order per output.
+    // `FLOCK_NO_LIG_FOLD8_F_SPLIT=1` restores the one-task-per-block schedule.
+    let ranked_split = folded_f.len() == 1usize << 19
+        && block_len == 1usize << 16
+        && std::env::var_os("FLOCK_NO_LIG_FOLD8_F_SPLIT").is_none();
+    if ranked_split {
+        let grain = block_len / 2;
+        folded_f.par_chunks_mut(grain).enumerate().for_each_init(
+            || {
+                crate::scratch::LocalBuf::new(
+                    (4 * SUB).max(ALIGN64_MIN_F128),
+                    crate::scratch::fold_buf_pool_enabled(),
+                )
+            },
+            |mid4, (piece, f_out)| {
+                let block = piece / 2;
+                let slot0 = (piece & 1) * grain;
+                let start = 64 * (block * block_len + slot0);
+                let f_in = &packed_witness[start..start + 64 * f_out.len()];
+                let mut slot = 0usize;
+                while slot < f_out.len() {
+                    let n = SUB.min(f_out.len() - slot);
+                    let m4 = &mut mid4[..4 * n];
+                    crate::field::f128_slice::fold16_banked(
+                        &f_in[64 * slot..64 * (slot + n)],
+                        m4,
+                        fold16_weight,
+                    );
+                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
+                    slot += n;
+                }
+            },
+        );
+        return;
+    }
     folded_f
         .par_chunks_mut(block_len)
         .enumerate()
