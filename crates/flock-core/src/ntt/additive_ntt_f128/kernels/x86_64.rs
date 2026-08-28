@@ -482,8 +482,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
+        let outer_low = twiddles[0].hi == 0;
+        let inner_low = twiddles[1].hi == 0 && twiddles[2].hi == 0;
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, false>(
+            butterfly_fused_2layer_row_from_geo_impl::<false, false, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -494,16 +496,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
                 twiddles,
             )
         } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, false>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
+            match (outer_low, inner_low) {
+                (true, true) => butterfly_fused_2layer_row_from_geo_impl::<true, true, true, false>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (true, false) => butterfly_fused_2layer_row_from_geo_impl::<true, false, true, false>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (false, true) => butterfly_fused_2layer_row_from_geo_impl::<false, true, true, false>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (false, false) => butterfly_fused_2layer_row_from_geo_impl::<false, false, true, false>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+            }
         }
     }
 }
@@ -531,8 +537,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
     debug_assert_eq!(dst as usize % 16, 0);
     // SAFETY: forwarded caller contract.
     unsafe {
+        let outer_low = twiddles[0].hi == 0;
+        let inner_low = twiddles[1].hi == 0 && twiddles[2].hi == 0;
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, true>(
+            butterfly_fused_2layer_row_from_geo_impl::<false, false, false, true>(
                 src,
                 src_quarter,
                 src_r,
@@ -543,16 +551,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
                 twiddles,
             )
         } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
+            match (outer_low, inner_low) {
+                (true, true) => butterfly_fused_2layer_row_from_geo_impl::<true, true, true, true>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (true, false) => butterfly_fused_2layer_row_from_geo_impl::<true, false, true, true>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (false, true) => butterfly_fused_2layer_row_from_geo_impl::<false, true, true, true>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+                (false, false) => butterfly_fused_2layer_row_from_geo_impl::<false, false, true, true>(
+                    src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+                ),
+            }
         }
     }
 }
@@ -563,7 +575,12 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: bool>(
+unsafe fn butterfly_fused_2layer_row_from_geo_impl<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const DIET: bool,
+    const NT: bool,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -579,9 +596,9 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
     // SAFETY: caller guarantees target features, pointer geometry, and
     // non-aliasing src/dst.
     unsafe {
-        let outer = tw_x4::<false, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
@@ -592,17 +609,17 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
             let mut vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
             let mut vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
+            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
             vc = _mm512_xor_si512(vc, new_a);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
+            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
             vd = _mm512_xor_si512(vd, new_b);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
+            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
             vb = _mm512_xor_si512(vb, new_a);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
+            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
