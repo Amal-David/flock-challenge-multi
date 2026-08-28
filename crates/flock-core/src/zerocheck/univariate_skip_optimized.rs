@@ -2913,10 +2913,13 @@ impl Drop for WorkerStateAbOnly {
     }
 }
 
-/// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
-/// instruction: same window order, same kernels, same band-end plane fold.
-/// Every C statement (and every `c_packed` byte) is gone.
-fn process_one_x_hi_ab_only(
+/// The incumbent staged AB sweep, verbatim: one 1 KiB `chunk_ab_bytes`
+/// window copied out of `ab_inner`, then the architecture kernel over the
+/// staged copy. Retained for portable geometry, for the non-GFNI build, and
+/// as the rollback / A-B arm of the direct sweep below.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_one_x_hi_ab_only_staged(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -2924,36 +2927,11 @@ fn process_one_x_hi_ab_only(
     b_med_counts: &[u8],
     ab_inner: &[u8],
     eq_lo_scaled: &[F128],
-    eq_hi_val: F128,
     convert: &[F128],
     eq_fold: Option<(&[F128], &[u64], usize)>,
     plane_first_write: bool,
-    plane_cache: bool,
     state: &mut WorkerStateAbOnly,
 ) {
-    state.partial_ab.fill(F128::ZERO);
-    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
-    if let Some((eq_bot, _, _)) = eq_fold {
-        let plane_len = eq_bot.len() * 16 * ELL;
-        if state.plane_banks.len() != plane_len {
-            if state.cached_plane_banks {
-                state.cached_plane_banks = false;
-                give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
-            }
-            state.plane_banks = if plane_cache {
-                state.cached_plane_banks = true;
-                take_ranked_ab_plane()
-            } else if plane_first_write {
-                // Every byte is overwritten by the `w_idx == 0` visits below
-                // before the vector is read; see the function-level guard.
-                crate::alloc_uninit_vec(plane_len)
-            } else {
-                vec![0u8; plane_len]
-            };
-        } else if !plane_first_write {
-            state.plane_banks.fill(0);
-        }
-    }
     let n_lo = n_lo_and_inner - N_INNER;
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
     // inside the window loop).
@@ -3081,6 +3059,277 @@ fn process_one_x_hi_ab_only(
             );
         }
     }
+}
+
+/// Compile-time rollback for the direct (unstaged) round-1 AB sweep. Setting
+/// this to `false` restores [`process_one_x_hi_ab_only_staged`] on every path,
+/// which is byte-for-byte the incumbent program. There is no `FLOCK_*`
+/// variable on the ranked runner, so the switch has to be a constant.
+const ZC_R1AB_DIRECT: bool = true;
+
+/// Direct AB sweep: the sixteen 64-byte rows one window feeds the GFNI
+/// battery are already exactly one contiguous, 1 KiB-aligned range of
+/// `ab_inner` (`chunk_byte_base` is a multiple of `2^N_INNER * N_CHUNKS` and
+/// the rows are `N_CHUNKS * 8 = ELL` apart), so the staging copy reproduced
+/// 1 KiB per window that the kernel could have read in place.
+///
+/// Deleting that copy on its own measured DEAD, and the reason is recorded:
+/// the copy loop was also the carrier for the two-window look-ahead hints —
+/// it alternated one hint with one demand line. Removing it left the hints
+/// issued as one back-to-back block, the arm the delivery A/B had already
+/// measured as the worse one. Here the look-ahead base goes *into* the
+/// kernel, which issues hint `bm` immediately before loading row `bm`, so the
+/// alternation survives the copy's deletion.
+///
+/// Everything else in this loop is monomorphised: `FIRST_WRITE` is split out
+/// as a window range rather than tested per window, the row count reaches the
+/// kernel as a const generic, and no kill-switch read survives inside the
+/// loop.
+///
+/// Bit-identical to the staged sweep: same rows, same matrices, same bank,
+/// and a prefetch has no architectural effect.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_one_x_hi_ab_only_direct(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    let n_lo = n_lo_and_inner - N_INNER;
+    let pf_windows = if zc_r1ab_pf_enabled() {
+        ZC_R1AB_PF_WINDOWS
+    } else {
+        0
+    };
+    let base_ptr = ab_inner.as_ptr();
+    let bank_mask = (1usize << bank_bits) - 1;
+
+    // One window range per `FIRST_WRITE` value: `w_idx == 0` is exactly
+    // `x_outer_lo < 1 << bank_bits`, so the first-visit specialization is a
+    // prefix of the band, not a per-window test.
+    let split = if plane_first_write {
+        core::cmp::min(1usize << bank_bits, big_lo_size)
+    } else {
+        0
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn run<const FIRST_WRITE: bool>(
+        lo: usize,
+        hi: usize,
+        x_hi: usize,
+        n_lo: usize,
+        n_lo_and_inner: usize,
+        within_outer_mask: usize,
+        bank_mask: usize,
+        bank_bits: usize,
+        pf_windows: usize,
+        b_med_counts: &[u8],
+        base_ptr: *const u8,
+        mats: &[u64],
+        plane_banks: &mut [u8],
+    ) {
+        for x_outer_lo in lo..hi {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            // Same look-ahead base the staged sweep computed. With the hint
+            // count now a compile-time `N`, the live-row count of the
+            // look-ahead window is no longer read: a hint for a dead padding
+            // line is free, a branch on the critical path is not.
+            let next_base = if pf_windows != 0 {
+                (((x_outer_lo + pf_windows) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS
+            } else {
+                chunk_byte_base
+            };
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & bank_mask;
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut plane_banks
+                [u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            debug_assert!(!FIRST_WRITE || w_idx == 0);
+            // At the ranked geometry BLAKE3's two padding classes make this 15
+            // or 16 and the kernel monomorphises on it; any other count is
+            // still correct, it just takes the kernel's cold arm.
+            // SAFETY: the caller proved `chunk_byte_base + WINDOW <=
+            // ab_inner.len()` for every window of this band before selecting
+            // the direct sweep, so `src` covers the whole 1 KiB window.
+            // `next_src` is formed by `wrapping_add` and only ever reaches
+            // `_mm_prefetch`, which faults on nothing.
+            unsafe {
+                kernels::convert_ab_nomul_gfni_direct::<FIRST_WRITE>(
+                    base_ptr.add(chunk_byte_base),
+                    base_ptr.wrapping_add(next_base),
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            }
+        }
+    }
+
+    run::<true>(
+        0,
+        split,
+        x_hi,
+        n_lo,
+        n_lo_and_inner,
+        within_outer_mask,
+        bank_mask,
+        bank_bits,
+        pf_windows,
+        b_med_counts,
+        base_ptr,
+        mats,
+        &mut state.plane_banks,
+    );
+    run::<false>(
+        split,
+        big_lo_size,
+        x_hi,
+        n_lo,
+        n_lo_and_inner,
+        within_outer_mask,
+        bank_mask,
+        bank_bits,
+        pf_windows,
+        b_med_counts,
+        base_ptr,
+        mats,
+        &mut state.plane_banks,
+    );
+}
+
+
+/// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
+/// instruction: same window order, same kernels, same band-end plane fold.
+/// Every C statement (and every `c_packed` byte) is gone.
+fn process_one_x_hi_ab_only(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    eq_fold: Option<(&[F128], &[u64], usize)>,
+    plane_first_write: bool,
+    plane_cache: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+    if let Some((eq_bot, _, _)) = eq_fold {
+        let plane_len = eq_bot.len() * 16 * ELL;
+        if state.plane_banks.len() != plane_len {
+            if state.cached_plane_banks {
+                state.cached_plane_banks = false;
+                give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+            }
+            state.plane_banks = if plane_cache {
+                state.cached_plane_banks = true;
+                take_ranked_ab_plane()
+            } else if plane_first_write {
+                // Every byte is overwritten by the `w_idx == 0` visits below
+                // before the vector is read; see the function-level guard.
+                crate::alloc_uninit_vec(plane_len)
+            } else {
+                vec![0u8; plane_len]
+            };
+        } else if !plane_first_write {
+            state.plane_banks.fill(0);
+        }
+    }
+    // Fail closed: the direct sweep may only run where every window this band
+    // visits is a whole in-bounds 1 KiB range of `ab_inner` and the GFNI
+    // eq-folded drain is the kernel in use. Any other geometry — portable
+    // build, unfolded drain, short stream — takes the staged sweep, which is
+    // the incumbent program.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        let direct = ZC_R1AB_DIRECT
+            && big_lo_size != 0
+            && n_lo_and_inner >= N_INNER
+            && ((big_lo_size - 1) << N_INNER)
+                .checked_add(x_hi << n_lo_and_inner)
+                .and_then(|top| top.checked_mul(N_CHUNKS))
+                .and_then(|top| top.checked_add((1 << N_MEDIUM) * ELL))
+                .is_some_and(|end| end <= ab_inner.len());
+        match eq_fold {
+            Some((_, mats, bank_bits)) if direct => process_one_x_hi_ab_only_direct(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                mats,
+                bank_bits,
+                plane_first_write,
+                state,
+            ),
+            _ => process_one_x_hi_ab_only_staged(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                eq_lo_scaled,
+                convert,
+                eq_fold,
+                plane_first_write,
+                state,
+            ),
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    process_one_x_hi_ab_only_staged(
+        x_hi,
+        big_lo_size,
+        n_lo_and_inner,
+        within_outer_mask,
+        b_med_counts,
+        ab_inner,
+        eq_lo_scaled,
+        convert,
+        eq_fold,
+        plane_first_write,
+        state,
+    );
     if let Some((eq_bot, _, _)) = eq_fold {
         // Plane-major → F128 through the same vectorized kernel the C drain
         // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
