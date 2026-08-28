@@ -528,6 +528,47 @@ pub(super) fn write_convert_ab_nomul_gfni(
     }
 }
 
+/// Exact ranked [16,15] zero-copy pair. `src` covers two consecutive 1 KiB
+/// windows, `mats` covers one 256-qword matrix row, and `banks` covers two
+/// consecutive 1 KiB plane banks. The leaf derives the two-window-ahead
+/// prefetch addresses from `src`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn accumulate_convert_ab_nomul_gfni_ranked_pair(
+    src: *const u8,
+    mats: *const u64,
+    banks: *mut u8,
+) {
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni_ranked_pair(src, mats, banks);
+    }
+}
+
+/// First matrix-row twin of
+/// [`accumulate_convert_ab_nomul_gfni_ranked_pair`]: both 1 KiB banks are
+/// assigned completely without observing their previous bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn write_convert_ab_nomul_gfni_ranked_pair(
+    src: *const u8,
+    mats: *const u64,
+    banks: *mut u8,
+) {
+    unsafe {
+        x86_64::write_convert_ab_nomul_x86_gfni_ranked_pair(src, mats, banks);
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused

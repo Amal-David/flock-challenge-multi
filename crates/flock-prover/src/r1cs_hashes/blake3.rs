@@ -1836,19 +1836,11 @@ fn generate_round1_inner_octa(
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks. `live` carries the same
-                        // `skip_blocks` prefix rule as the loops below.
+                        // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            let mut live = 0u32;
-                            for j in 0..SIMD {
-                                if base + j >= skip_blocks {
-                                    live |= 1 << j;
-                                }
-                            }
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                live,
                                 inv_table,
                                 plan: win_plan,
                             }
@@ -1858,10 +1850,8 @@ fn generate_round1_inner_octa(
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            win_ab,
                             proj,
                             elide,
-                            z_nt,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same

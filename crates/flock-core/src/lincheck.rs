@@ -1346,25 +1346,46 @@ fn transpose_8x8_bytes(mut rows: [u64; 8]) -> [u64; 8] {
 
 /// Reduce one 64-column GFNI plane block across workers and transpose it
 /// back to the canonical F128 column layout.
+///
+/// # Safety
+/// For every entry in `active_workers`, all 1024 bytes of plane block `blk`
+/// must have been initialized, and every worker index/block range must lie in
+/// `planes`. The producer join must happen-before this call.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
 #[inline(always)]
-fn reduce_worker_plane_block(
-    planes: &[u8],
+unsafe fn reduce_worker_plane_block(
+    planes: &[core::mem::MaybeUninit<u8>],
     worker_stride: usize,
-    n_workers: usize,
+    active_workers: &[usize],
     blk: usize,
     out: &mut [F128],
 ) {
     debug_assert_eq!(out.len(), 64);
+    let Some((&first_worker, rest_workers)) = active_workers.split_first() else {
+        out.fill(F128::ZERO);
+        return;
+    };
     let base = blk * 1024;
     let mut acc = [0u8; 1024];
-    acc.copy_from_slice(&planes[base..base + 1024]);
-    for w in 1..n_workers {
+    let first = first_worker * worker_stride + base;
+    let first_block = &planes[first..first + 1024];
+    // SAFETY: callers reduce only `blk < live_blocks`, and `first_worker` is
+    // active. Its first claimed tile called `gfni_fold_tile(seed_zero=true)`,
+    // which stores all 16 x 64 bytes of every live block. The Rayon producer
+    // join completed before reduction starts, so this exact block is fully
+    // initialized and may now be viewed as bytes.
+    let first_block = unsafe {
+        core::slice::from_raw_parts(first_block.as_ptr().cast::<u8>(), first_block.len())
+    };
+    acc.copy_from_slice(first_block);
+    for &w in rest_workers {
         let src = &planes[w * worker_stride + base..w * worker_stride + base + 1024];
+        // SAFETY: the same active-worker/live-block proof as `first_block`.
+        let src = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len()) };
         // SAFETY: both slices are 1024 bytes (16 x 64); XOR is bitwise so
         // VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
         unsafe {
@@ -1416,12 +1437,19 @@ fn fold_block_major_gfni(
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
-    // Same total footprint as the F128 partials (k*16 bytes per worker).
-    let mut planes = vec![0u8; n_workers * k * 16];
+    // Same total footprint as the F128 partials (k*16 bytes per worker). The
+    // first claimed tile seeds every live plane block from register zero, so
+    // eager zeroing is dead work. Dynamic claiming can leave a Rayon chunk
+    // with no tile, however; `active` keeps those stale chunks out of reduce.
+    // MaybeUninit keeps the whole Rayon slice valid while only active/live
+    // subranges are initialized; it is never reinterpreted wholesale as u8.
+    let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * k * 16);
+    let mut active = vec![0u8; n_workers];
     planes
         .par_chunks_mut(k * 16)
+        .zip(active.par_iter_mut())
         .enumerate()
-        .for_each(|(worker, wplanes)| {
+        .for_each(|(worker, (wplanes, worker_active))| {
             let tile_lo = worker * tiles_per_worker;
             let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
             let (mut claim_lo, mut claim_hi) = if dynamic {
@@ -1434,8 +1462,9 @@ fn fold_block_major_gfni(
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
             let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
-            // First tile this worker writes into a freshly zeroed plane
-            // buffer: seed the GFNI acc from a register zero idiom.
+            // First tile this worker writes into an uninitialized plane
+            // buffer: seed the GFNI acc from a register zero idiom. Later
+            // tiles load only blocks that this first tile initialized.
             let mut first_tile = true;
             // Fused register gather+transpose (no staging arrays); the
             // scalar path stays as the kill-switch arm.
@@ -1552,7 +1581,7 @@ fn fold_block_major_gfni(
                                     128,
                                     2,
                                     &mats,
-                                    wplanes.as_mut_ptr().add(2 * (q + c) * 1024),
+                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
                                     first_tile,
                                 );
                             }
@@ -1610,7 +1639,7 @@ fn fold_block_major_gfni(
                             128,
                             chunk_bits.div_ceil(64),
                             &mats,
-                            wplanes.as_mut_ptr().add(2 * q * 1024),
+                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
                             first_tile,
                         );
                     }
@@ -1618,6 +1647,10 @@ fn fold_block_major_gfni(
                 }
                 first_tile = false;
             }
+            // This byte is exclusively owned by the zipped Rayon chunk. A
+            // true `first_tile` means dynamic claiming assigned it no work,
+            // so none of its uninitialized plane bytes may enter reduction.
+            *worker_active = u8::from(!first_tile);
         });
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
@@ -1628,13 +1661,49 @@ fn fold_block_major_gfni(
     // incumbent reduction and transpose leaves while avoiding a length-k
     // intermediate allocation plus its complete readback.
     let worker_stride = k * 16;
+    // Iteration over the marker vector preserves the incumbent ascending
+    // worker reduction order while deleting inactive zero contributions.
+    let active_workers: Vec<usize> = active
+        .into_iter()
+        .enumerate()
+        .filter_map(|(worker, active)| (active != 0).then_some(worker))
+        .collect();
+    let live_blocks = useful_bits.div_ceil(64);
     let out_len = if top_bind.is_some() { k / 2 } else { k };
+    // Keep output initialized as F128 throughout. The much larger plane
+    // buffer carries the dead zero-fill; avoiding this comparatively small
+    // clear would require a separate MaybeUninit ownership conversion.
     let mut out = vec![F128::ZERO; out_len];
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
-        reduce_worker_plane_block(&planes, worker_stride, n_workers, blk, o);
+        if blk < live_blocks {
+            // SAFETY: `active_workers` contains exactly producer chunks that
+            // claimed a tile. Their first tile used `seed_zero=true` and
+            // stored every byte of each `blk < live_blocks`; the producer
+            // parallel iterator joined before this reduction starts.
+            unsafe {
+                reduce_worker_plane_block(&planes, worker_stride, &active_workers, blk, o);
+            }
+        } else {
+            // Padding has no backing worker-plane writes in the uninitialized
+            // allocation, but its canonical folded value is algebraic zero.
+            o.fill(F128::ZERO);
+        }
         if let Some(r) = top_bind {
             let mut hi = [F128::ZERO; 64];
-            reduce_worker_plane_block(&planes, worker_stride, n_workers, blk + k / 128, &mut hi);
+            let hi_blk = blk + k / 128;
+            if hi_blk < live_blocks {
+                // SAFETY: identical to the low-block call above; `hi_blk` is
+                // explicitly constrained to the fully stored live range.
+                unsafe {
+                    reduce_worker_plane_block(
+                        &planes,
+                        worker_stride,
+                        &active_workers,
+                        hi_blk,
+                        &mut hi,
+                    );
+                }
+            }
             crate::field::f128_slice::bind_split_half(o, &hi, r);
         }
     });
@@ -2566,6 +2635,71 @@ enum PackedZ<'a> {
     BlockMajor(&'a [F128]),
 }
 
+/// Owner plus live subrange for a lincheck intermediate retained by the PCS.
+/// The ranked Fold8 path parks its already-bound half in the dead upper half
+/// of the original `z_vec` allocation, so the exposed slice need not begin at
+/// the allocation base.
+pub struct CapturedZVec {
+    storage: Vec<F128>,
+    start: usize,
+    len: usize,
+    ranked_fold8_bound: Option<F128>,
+}
+
+impl CapturedZVec {
+    pub fn from_vec(storage: Vec<F128>) -> Self {
+        let len = storage.len();
+        Self {
+            storage,
+            start: 0,
+            len,
+            ranked_fold8_bound: None,
+        }
+    }
+
+    fn from_owner_tail(storage: Vec<F128>, start: usize, len: usize, bound: F128) -> Self {
+        assert!(start <= storage.len());
+        assert!(len <= storage.len() - start);
+        Self {
+            storage,
+            start,
+            len,
+            ranked_fold8_bound: Some(bound),
+        }
+    }
+
+    fn into_full_vec(self) -> Vec<F128> {
+        assert_eq!(self.start, 0);
+        assert_eq!(self.len, self.storage.len());
+        self.storage
+    }
+
+    /// True only for the ranked post-first-bind owner-tail capture.
+    pub fn is_ranked_fold8_tail(&self) -> bool {
+        self.ranked_fold8_bound.is_some()
+    }
+
+    /// Challenge used by the retained ranked top bind.
+    pub fn ranked_fold8_bound(&self) -> Option<F128> {
+        self.ranked_fold8_bound
+    }
+}
+
+impl core::ops::Deref for CapturedZVec {
+    type Target = [F128];
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage[self.start..self.start + self.len]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZCaptureMode {
+    None,
+    Full,
+    RankedFold8Tail,
+}
+
 // ---------------------------------------------------------------------------
 // Last-ρ leftover z-fold (wait-not-join)
 // ---------------------------------------------------------------------------
@@ -2777,7 +2911,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
@@ -2810,13 +2944,15 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::Full,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured
+            .expect("full capture must produce z_vec")
+            .into_full_vec(),
     )
 }
 
@@ -2842,13 +2978,53 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::Full,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured
+            .expect("full capture must produce z_vec")
+            .into_full_vec(),
+    )
+}
+
+/// Ranked x86 DirectFold8 capture: instead of cloning the full pre-sumcheck
+/// table, retain the first top-bind result in the dead upper half of its own
+/// allocation. That half is already the exact 64-bank AB statistic consumed
+/// by the PCS.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_ranked_fold8_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, CapturedZVec) {
+    assert_eq!(m, 32);
+    assert_eq!(k_log, 14);
+    assert_eq!(k_skip, 6);
+    assert_eq!(useful_bits, 15_409);
+    assert_eq!(k_log - k_skip, 8);
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        ZCaptureMode::RankedFold8Tail,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("ranked Fold8 capture must produce owner tail"),
     )
 }
 
@@ -2861,9 +3037,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_mode: ZCaptureMode,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Option<CapturedZVec>) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -2997,14 +3173,14 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
-    } else {
-        None
+    // 3b. Generic callers retain the full pre-sumcheck table. The strict
+    //     ranked Fold8 caller waits one bind: that result is already its PCS
+    //     statistic, and is parked in the allocation's dead upper half below.
+    let mut captured_z_vec = match capture_mode {
+        ZCaptureMode::Full => Some(CapturedZVec::from_vec(z_vec.clone())),
+        ZCaptureMode::None | ZCaptureMode::RankedFold8Tail => None,
     };
+    let mut ranked_fold8_bound = None;
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -3032,6 +3208,29 @@ fn prove_padded_inner<Ch: Challenger>(
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                if t == 0 && capture_mode == ZCaptureMode::RankedFold8Tail {
+                    // For k_log=14/k_skip=6 the first top bind leaves exactly
+                    // 2^13 = 64*128 values: Fold8's 64 retained banks. The
+                    // original upper half is now outside Vec::len but remains
+                    // allocated and initialized, so preserve the result there
+                    // while all later rounds keep mutating/truncating low.
+                    let half = z_vec.len();
+                    assert_eq!(half, k / 2);
+                    assert!(z_vec.capacity() >= k);
+                    // SAFETY: source [0, half) and destination [half, 2*half)
+                    // are disjoint, both lie within capacity k, and F128 is
+                    // Copy/no-Drop. The destination held initialized elements
+                    // before the just-completed truncate and is not exposed as
+                    // a reference until length is restored after sumcheck.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            z_vec.as_ptr(),
+                            z_vec.as_mut_ptr().add(half),
+                            half,
+                        );
+                    }
+                    ranked_fold8_bound = Some(r);
+                }
                 e1 = ne1;
                 einf = neinf;
             } else {
@@ -3077,6 +3276,19 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
+    if capture_mode == ZCaptureMode::RankedFold8Tail {
+        let bound = ranked_fold8_bound.expect("ranked first top bind must be retained");
+        assert!(z_vec.capacity() >= k);
+        // SAFETY: the one-shot fold initially initialized all k entries.
+        // Sumcheck only overwrote/truncated prefixes (F128 has no Drop), and
+        // the first-bind snapshot explicitly initialized [k/2, k). Restoring
+        // len therefore exposes only initialized F128 values. Consumers see
+        // solely the preserved upper-half range.
+        unsafe {
+            z_vec.set_len(k);
+        }
+        captured_z_vec = Some(CapturedZVec::from_owner_tail(z_vec, k / 2, k / 2, bound));
+    }
     (proof, claim, captured_z_vec)
 }
 

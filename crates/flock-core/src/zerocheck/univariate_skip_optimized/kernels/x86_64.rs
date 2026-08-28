@@ -336,6 +336,37 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     }
 }
 
+/// Fixed-`nt=2` twin of [`shift_reduce_inner_ab_x86_avx512_from_off`] for the
+/// measured ranked offset consumer. The destination class is part of that
+/// producer's contract, so the terminal store is one unconditional ZMM
+/// non-temporal stream instead of entering [`store_out64`]'s selector.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_from_off`], with `out` additionally
+/// 64-byte aligned. The caller must publish an `_mm_sfence()` before another
+/// thread observes the output.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract. Unlike the generic
+    // twin, ranked nt=2 makes alignment/store class invariant by construction.
+    unsafe {
+        let acc = horner_2img_offw(imgs, op);
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
 /// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
 /// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
 /// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
@@ -1534,6 +1565,144 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
             }
             _mm512_storeu_si512(plane_ptr, acc);
         }
+    }
+}
+
+/// Register body for one exact ranked row count. It is inlined twice into the
+/// pair leaf so only the pair boundary pays call/return and VZEROUPPER. The
+/// current rows remain in ZMM0..15 while sixteen independent output-plane
+/// chains walk the shared matrix row.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_ranked_body<
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    src: *const u8,
+    next_src: *const u8,
+    mats: *const u64,
+    bank_planes: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        let mut bm = 0usize;
+        while bm != N {
+            _mm_prefetch(next_src.wrapping_add(bm * ELL).cast::<i8>(), _MM_HINT_T0);
+            // These zero-byte compiler barriers preserve the measured spread
+            // schedule: hint future row, then demand-load current row.
+            core::arch::asm!("", options(nostack, preserves_flags));
+            rows[bm] = _mm512_loadu_si512(src.add(bm * ELL).cast::<__m512i>());
+            core::arch::asm!("", options(nostack, preserves_flags));
+            bm += 1;
+        }
+        let mut k = 0usize;
+        while k != 16 {
+            let plane = bank_planes.add(k * ELL).cast::<__m512i>();
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane)
+            };
+            let mut row = 0usize;
+            while row + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[row],
+                    _mm512_set1_epi64(*mats.add(row * 16 + k) as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[row + 1],
+                    _mm512_set1_epi64(*mats.add((row + 1) * 16 + k) as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                row += 2;
+            }
+            if row != N {
+                acc = _mm512_xor_si512(
+                    acc,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[row],
+                        _mm512_set1_epi64(*mats.add(row * 16 + k) as i64),
+                    ),
+                );
+            }
+            _mm512_storeu_si512(plane, acc);
+            k += 1;
+        }
+    }
+}
+
+/// Exact [16,15] ranked window pair. Both windows use one matrix row and
+/// adjacent plane banks. Pairing halves the hot call/return/VZEROUPPER count;
+/// deriving `next_src` here also removes every dynamic look-ahead address.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_ranked_pair_impl<const FIRST_WRITE: bool>(
+    src: *const u8,
+    mats: *const u64,
+    banks: *mut u8,
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ranked_body::<16, FIRST_WRITE>(
+            src,
+            src.wrapping_add(2 * (1 << N_MEDIUM) * ELL),
+            mats,
+            banks,
+        );
+        accumulate_convert_ab_nomul_x86_gfni_ranked_body::<15, FIRST_WRITE>(
+            src.add((1 << N_MEDIUM) * ELL),
+            src.wrapping_add(3 * (1 << N_MEDIUM) * ELL),
+            mats,
+            banks.add(16 * ELL),
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_ranked_pair(
+    src: *const u8,
+    mats: *const u64,
+    banks: *mut u8,
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ranked_pair_impl::<false>(src, mats, banks);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni_ranked_pair(
+    src: *const u8,
+    mats: *const u64,
+    banks: *mut u8,
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ranked_pair_impl::<true>(src, mats, banks);
     }
 }
 
