@@ -14,6 +14,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Re-exported BLAKE3 platform type. Root-finalize call sites
+/// `use crate::hash::Blake3Platform;` and invoke
+/// `<Blake3Platform>::compress_in_place(...)` directly, bypassing the
+/// `blake3` crate's `OutputReader` / `Hasher` / `finalize` surface (which
+/// forces a per-byte CV reload and trait dispatch). `pub(crate)` so only
+/// in-crate root-finalize hot paths opt in.
+pub(crate) use blake3::platform::Platform as Blake3Platform;
+
 /// Which hash function backs a component.
 ///
 /// `Sha256` is the default, so existing serialized params and configs that
@@ -55,6 +63,21 @@ impl std::fmt::Display for HashKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// BLAKE3 root-finalize that bypasses `OutputReader`.
+///
+/// `OutputReader` goes through trait dispatch + a per-byte CV reload before the
+/// single root compress, which prevents LLVM from keeping the chaining value in
+/// registers across the 7-round compress body. Hoisting the CV to a stack-local
+/// `[u32; 8]`, performing the single `compress_in_place` with the standard
+/// all-zero 64-byte root-padding block, then LE-storing it back yields one
+/// single 32-byte root output and keeps the CV in registers across all 7 rounds.
+pub(crate) fn finalize_root_bytes(cv: [u32; 8], block_len: u8, starting_flags: u8) -> [u8; 32] {
+    let mut cv = cv;
+    let platform = Blake3Platform::detect();
+    Blake3Platform::compress_in_place(&platform, &mut cv, &[0u8; 64], block_len, 0, starting_flags);
+    blake3::platform::le_bytes_from_words_32(&cv)
 }
 
 #[cfg(test)]
