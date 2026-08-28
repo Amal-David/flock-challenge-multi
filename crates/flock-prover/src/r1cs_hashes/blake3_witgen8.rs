@@ -1391,10 +1391,33 @@ impl Drain8<'_> {
                     // Ranked dense path: each side's two AVX2 half-transposes
                     // become one 16-word ZMM transpose, one aligned store per
                     // block row, and the same live ZMM feeds offset widening.
+                    // Directly streams z, a, b without intermediate staging stores/loads.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        stage_ranked_dense_side(self.ast,rw,sa,op);
-                        stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
+                        let rows_a = tr8x16_zmm(self.ast, rw);
+                        for (r, &row) in rows_a.iter().enumerate() {
+                            widen_off_line(row, op.add(r * ROUND1_AB_OFF_WORDS));
+                        }
+                        let rows_b = tr8x16_zmm(self.bs, rw);
+                        for (r, &row) in rows_b.iter().enumerate() {
+                            widen_off_line(row, op.add(r * ROUND1_AB_OFF_WORDS + 64));
+                        }
+                        let rows = RankedRows::new(self.z.add(abs_word), self.a.add(abs_word), self.b.add(abs_word));
+                        for j in 0..8 {
+                            let av = rows_a[j];
+                            let bv = rows_b[j];
+                            let o = j * U32_PER_BLOCK;
+                            stream_ranked_line(rows.z.add(o), _mm512_and_si512(av, bv));
+                            stream_ranked_line(rows.a.add(o), av);
+                            stream_ranked_line(rows.b.add(o), bv);
+                            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
+                            round1_ab_inner_window_from_offsets_nt2(
+                                &*op.add(j * ROUND1_AB_OFF_WORDS).cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                                out,
+                                plan,
+                                imgs,
+                            );
+                        }
                     }
                     // Portable builds cannot select E=true: the ranked gate
                     // requires the AVX-512 offset plan. Retain the old staging
@@ -1415,9 +1438,9 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
                     // transposes and its per-window offset eligibility gate.
