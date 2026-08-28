@@ -80,11 +80,15 @@ unsafe fn store_row4<const NT: bool>(p: *mut F128, v: core::arch::x86_64::__m512
     // SAFETY: forwarded by the caller; SSE2 is x86_64 baseline.
     unsafe {
         if NT {
-            let d = p as *mut __m128i;
-            _mm_stream_si128(d, _mm512_castsi512_si128(v));
-            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
-            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
-            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+            if (p as usize) & 63 == 0 {
+                _mm512_stream_si512(p as *mut __m512i, v);
+            } else {
+                let d = p as *mut __m128i;
+                _mm_stream_si128(d, _mm512_castsi512_si128(v));
+                _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+                _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+                _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+            }
         } else {
             _mm512_storeu_si512(p as *mut __m512i, v);
         }
