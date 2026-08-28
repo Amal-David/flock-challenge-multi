@@ -636,54 +636,252 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 }
 
 // ---------------------------------------------------------------------------
-// Lincheck circuit walker — mirrors `build_matrices`. Same structure as
-// `blake3::Blake3LincheckCircuit` but uses this module's I/O-aligned slot
-// positions (cv_bit/m_bit/etc.).
+// Compact Lincheck circuit transpose.  Each internal linear bit is one node
+// in an XOR DAG instead of an eagerly-expanded list of witness columns.  A
+// proof seeds the row roots with (alpha * eq, eq), then one reverse pass
+// propagates those adjoints to the K materialized witness leaves.  This is
+// exactly alpha*A^T*eq + B^T*eq, but O(circuit nodes) instead of streaming the
+// expanded ~21M-entry BLAKE3 CSC index set alongside the kicked z-fold.
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn scatter_add_carry_rows(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-    x: &Word,
-    y: &Word,
-    carry_base: usize,
-) -> Word {
-    for i in 0..CARRY_BITS_PER_ADD {
-        let row = carry_base + i;
-        let e = eq_inner[row];
-        let ea = alpha * e;
-        for &slot in x.bits[i].iter() {
-            comb[slot] += ea;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += ea;
-        }
-        for &slot in y.bits[i].iter() {
-            comb[slot] += e;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += e;
-        }
+type AdjointNode = u32;
+const ADJOINT_ZERO: AdjointNode = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct AdjointWord([AdjointNode; WORD_BITS]);
+
+impl AdjointWord {
+    #[inline]
+    const fn zero() -> Self {
+        Self([ADJOINT_ZERO; WORD_BITS])
     }
-    Word::add_sum(x, y, carry_base)
 }
 
-#[inline]
-fn scatter_lin_id_row(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-    row: usize,
-    word_bits_i: &[usize],
-) {
-    let e = eq_inner[row];
-    let ea = alpha * e;
-    for &slot in word_bits_i.iter() {
-        comb[slot] += ea;
+struct Blake3AdjointPlan {
+    /// Internal nodes only.  Node ids below K are witness-column leaves;
+    /// internal node `K + i` has the two parents stored at `parents[i]`.
+    parents: Box<[[AdjointNode; 2]]>,
+    a_roots: Box<[AdjointNode]>,
+    b_roots: Box<[AdjointNode]>,
+}
+
+struct Blake3AdjointBuilder {
+    parents: Vec<[AdjointNode; 2]>,
+    a_roots: Vec<AdjointNode>,
+    b_roots: Vec<AdjointNode>,
+}
+
+impl Blake3AdjointBuilder {
+    fn new() -> Self {
+        Self {
+            parents: Vec::with_capacity(N_G * ADDS_PER_G * WORD_BITS * 3),
+            a_roots: vec![ADJOINT_ZERO; K],
+            b_roots: vec![ADJOINT_ZERO; K],
+        }
     }
-    comb[Z_CONST_POS] += e;
+
+    #[inline(always)]
+    fn leaf(slot: usize) -> AdjointNode {
+        debug_assert!(slot < K);
+        slot as AdjointNode
+    }
+
+    #[inline(always)]
+    fn xor(&mut self, a: AdjointNode, b: AdjointNode) -> AdjointNode {
+        if a == ADJOINT_ZERO {
+            return b;
+        }
+        if b == ADJOINT_ZERO {
+            return a;
+        }
+        if a == b {
+            return ADJOINT_ZERO;
+        }
+        let id = K + self.parents.len();
+        debug_assert!(id < AdjointNode::MAX as usize);
+        self.parents.push([a, b]);
+        id as AdjointNode
+    }
+
+    #[inline]
+    fn word_from_slot(base: usize) -> AdjointWord {
+        AdjointWord(std::array::from_fn(|i| Self::leaf(base + i)))
+    }
+
+    fn word_from_const(value: u32) -> AdjointWord {
+        AdjointWord(std::array::from_fn(|i| {
+            if ((value >> i) & 1) != 0 {
+                Self::leaf(Z_CONST_POS)
+            } else {
+                ADJOINT_ZERO
+            }
+        }))
+    }
+
+    fn xor_words(&mut self, a: AdjointWord, b: AdjointWord) -> AdjointWord {
+        AdjointWord(std::array::from_fn(|i| self.xor(a.0[i], b.0[i])))
+    }
+
+    #[inline]
+    fn rotr(word: AdjointWord, n: usize) -> AdjointWord {
+        AdjointWord(std::array::from_fn(|i| word.0[(i + n) % WORD_BITS]))
+    }
+
+    /// Emit the 31 carry rows for x+y and return its 32 sum-bit DAG nodes.
+    /// `prefix` is cin[i] = carry[0] xor ... xor carry[i-1], represented by
+    /// a length-31 chain rather than re-expanding every prefix into every row.
+    fn add(&mut self, x: AdjointWord, y: AdjointWord, carry_base: usize) -> AdjointWord {
+        let mut prefix = ADJOINT_ZERO;
+        let mut sum = [ADJOINT_ZERO; WORD_BITS];
+        for i in 0..WORD_BITS {
+            if i < CARRY_BITS_PER_ADD {
+                let row = carry_base + i;
+                let a_root = self.xor(x.0[i], prefix);
+                let b_root = self.xor(y.0[i], prefix);
+                self.a_roots[row] = a_root;
+                self.b_roots[row] = b_root;
+            }
+            let xy = self.xor(x.0[i], y.0[i]);
+            sum[i] = self.xor(xy, prefix);
+            if i < CARRY_BITS_PER_ADD {
+                prefix = self.xor(prefix, Self::leaf(carry_base + i));
+            }
+        }
+        AdjointWord(sum)
+    }
+
+    /// Emit 32 materialized lin-id rows and return the corresponding leaf
+    /// word used by subsequent gates (the row expression itself is not used
+    /// as state after materialization).
+    fn emit_lin_id(&mut self, expression: AdjointWord, base: usize) -> AdjointWord {
+        for i in 0..WORD_BITS {
+            self.a_roots[base + i] = expression.0[i];
+            self.b_roots[base + i] = Self::leaf(Z_CONST_POS);
+        }
+        Self::word_from_slot(base)
+    }
+}
+
+impl Blake3AdjointPlan {
+    fn build() -> Self {
+        let mut builder = Blake3AdjointBuilder::new();
+
+        // Constant and input self-loop rows.
+        builder.a_roots[Z_CONST_POS] = Blake3AdjointBuilder::leaf(Z_CONST_POS);
+        builder.b_roots[Z_CONST_POS] = Blake3AdjointBuilder::leaf(Z_CONST_POS);
+        for (base, len) in [
+            (CV_BASE, 8 * WORD_BITS),
+            (M_BASE, 16 * WORD_BITS),
+            (T_LO_BASE, WORD_BITS),
+            (T_HI_BASE, WORD_BITS),
+            (BLEN_BASE, WORD_BITS),
+            (FLAGS_BASE, WORD_BITS),
+        ] {
+            for s in base..base + len {
+                builder.a_roots[s] = Blake3AdjointBuilder::leaf(s);
+                builder.b_roots[s] = Blake3AdjointBuilder::leaf(Z_CONST_POS);
+            }
+        }
+
+        let mut state = [AdjointWord::zero(); 16];
+        for w in 0..8 {
+            state[w] = Blake3AdjointBuilder::word_from_slot(cv_bit(w, 0));
+        }
+        for i in 0..4 {
+            state[8 + i] = Blake3AdjointBuilder::word_from_const(BLAKE3_IV[i]);
+        }
+        state[12] = Blake3AdjointBuilder::word_from_slot(T_LO_BASE);
+        state[13] = Blake3AdjointBuilder::word_from_slot(T_HI_BASE);
+        state[14] = Blake3AdjointBuilder::word_from_slot(BLEN_BASE);
+        state[15] = Blake3AdjointBuilder::word_from_slot(FLAGS_BASE);
+
+        let msg_idx = per_round_msg_idx();
+        for r in 0..N_ROUNDS {
+            for g_in_round in 0..N_G_PER_ROUND {
+                let g = r * N_G_PER_ROUND + g_in_round;
+                let [la, lb, lc, ld] = G_LANES[g_in_round];
+                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
+                let a = state[la];
+                let b = state[lb];
+                let c = state[lc];
+                let d = state[ld];
+                let mx = Blake3AdjointBuilder::word_from_slot(m_bit(mx_idx, 0));
+                let my = Blake3AdjointBuilder::word_from_slot(m_bit(my_idx, 0));
+
+                let tmp_0 = builder.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = builder.add(tmp_0, mx, g_add_carry_bit(g, ADD_A1, 0));
+                let d_xor_a1 = builder.xor_words(d, a_1);
+                let d_1 = Blake3AdjointBuilder::rotr(d_xor_a1, 16);
+                let c_1 = builder.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let b_xor_c1 = builder.xor_words(b, c_1);
+                let b_1 = Blake3AdjointBuilder::rotr(b_xor_c1, 12);
+                let tmp_1 = builder.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = builder.add(tmp_1, my, g_add_carry_bit(g, ADD_A2, 0));
+                let d1_xor_a2 = builder.xor_words(d_1, a_2);
+                let d_2 = Blake3AdjointBuilder::rotr(d1_xor_a2, 8);
+                let c_2 = builder.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+
+                let b1_xor_c2 = builder.xor_words(b_1, c_2);
+                let b_new_expr = Blake3AdjointBuilder::rotr(b1_xor_c2, 7);
+                let b_new = builder.emit_lin_id(b_new_expr, g_lin_bit(g, LIN_B_NEW, 0));
+                let d_new = builder.emit_lin_id(d_2, g_lin_bit(g, LIN_D_NEW, 0));
+                state[la] = a_2;
+                state[lb] = b_new;
+                state[lc] = c_2;
+                state[ld] = d_new;
+            }
+        }
+
+        for w in 0..8 {
+            let lo = builder.xor_words(state[w], state[w + 8]);
+            builder.emit_lin_id(lo, out_lo_bit(w, 0));
+            let cv = Blake3AdjointBuilder::word_from_slot(cv_bit(w, 0));
+            let hi = builder.xor_words(state[w + 8], cv);
+            builder.emit_lin_id(hi, out_hi_bit(w, 0));
+        }
+
+        Self {
+            parents: builder.parents.into_boxed_slice(),
+            a_roots: builder.a_roots.into_boxed_slice(),
+            b_roots: builder.b_roots.into_boxed_slice(),
+        }
+    }
+
+    fn fold(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        let mut adjoints = vec![F128::ZERO; K + self.parents.len()];
+        for row in 0..K {
+            let e = eq_inner[row];
+            let a = self.a_roots[row];
+            if a != ADJOINT_ZERO {
+                adjoints[a as usize] += alpha * e;
+            }
+            let b = self.b_roots[row];
+            if b != ADJOINT_ZERO {
+                adjoints[b as usize] += e;
+            }
+        }
+        for (i, &[a, b]) in self.parents.iter().enumerate().rev() {
+            let weight = adjoints[K + i];
+            adjoints[a as usize] += weight;
+            adjoints[b as usize] += weight;
+        }
+        adjoints.truncate(K);
+        adjoints
+    }
+}
+
+static BLAKE3_ADJOINT_PLAN: std::sync::LazyLock<Blake3AdjointPlan> =
+    std::sync::LazyLock::new(Blake3AdjointPlan::build);
+static BLAKE3_LINCHECK_CIRCUIT: Blake3LincheckCircuit = Blake3LincheckCircuit;
+
+fn ranked_adjoint_lincheck_enabled(r1cs: &BlockR1cs) -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_BLAKE3_ADJOINT").is_none());
+    *ON && r1cs.m == 32
+        && r1cs.k_log == K_LOG
+        && r1cs.k_skip == K_SKIP
+        && r1cs.useful_bits == USEFUL_BITS
+        && matches!(r1cs.layout, flock_core::r1cs::WitnessLayout::RowMajor)
 }
 
 pub struct Blake3LincheckCircuit;
@@ -695,129 +893,11 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut comb = vec![F128::ZERO; K];
+        BLAKE3_ADJOINT_PLAN.fold(alpha, eq_inner)
+    }
 
-        // Const row.
-        let e0 = eq_inner[Z_CONST_POS];
-        comb[Z_CONST_POS] += alpha * e0;
-        comb[Z_CONST_POS] += e0;
-
-        // Input self-loops for cv, m, counter, blen, flags.
-        let input_emit = |comb: &mut [F128], base: usize, len: usize| {
-            for j in 0..len {
-                let s = base + j;
-                let e = eq_inner[s];
-                comb[s] += alpha * e;
-                comb[Z_CONST_POS] += e;
-            }
-        };
-        input_emit(&mut comb, CV_BASE, 8 * WORD_BITS);
-        input_emit(&mut comb, M_BASE, 16 * WORD_BITS);
-        input_emit(&mut comb, T_LO_BASE, WORD_BITS);
-        input_emit(&mut comb, T_HI_BASE, WORD_BITS);
-        input_emit(&mut comb, BLEN_BASE, WORD_BITS);
-        input_emit(&mut comb, FLAGS_BASE, WORD_BITS);
-
-        let msg_idx = per_round_msg_idx();
-        let mut state: [Word; 16] = initial_lane_words();
-
-        for r in 0..N_ROUNDS {
-            for g_in_round in 0..N_G_PER_ROUND {
-                let g = r * N_G_PER_ROUND + g_in_round;
-                let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
-
-                let a = state[la].clone();
-                let b = state[lb].clone();
-                let c = state[lc].clone();
-                let d = state[ld].clone();
-                let mx = Word::from_slot_base(m_bit(mx_idx, 0));
-                let my = Word::from_slot_base(m_bit(my_idx, 0));
-
-                let tmp_0 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a,
-                    &b,
-                    g_add_carry_bit(g, ADD_TMP0, 0),
-                );
-                let a_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_0,
-                    &mx,
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
-                let d_1 = d.xor(&a_1).dedup().rotr(16);
-                let c_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c,
-                    &d_1,
-                    g_add_carry_bit(g, ADD_C1, 0),
-                );
-                let b_1 = b.xor(&c_1).dedup().rotr(12);
-                let tmp_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a_1,
-                    &b_1,
-                    g_add_carry_bit(g, ADD_TMP1, 0),
-                );
-                let a_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_1,
-                    &my,
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
-                let d_2 = d_1.xor(&a_2).dedup().rotr(8);
-                let c_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c_1,
-                    &d_2,
-                    g_add_carry_bit(g, ADD_C2, 0),
-                );
-
-                let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_B_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &b_new_word.bits[i]);
-                }
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_D_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &d_2.bits[i]);
-                }
-
-                state[la] = a_2;
-                state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
-                state[lc] = c_2;
-                state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
-            }
-        }
-
-        for w in 0..8 {
-            let lo = state[w].xor(&state[w + 8]).dedup();
-            for i in 0..WORD_BITS {
-                let s = out_lo_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &lo.bits[i]);
-            }
-            let cv_w = Word::from_slot_base(cv_bit(w, 0));
-            let hi = state[w + 8].xor(&cv_w).dedup();
-            for i in 0..WORD_BITS {
-                let s = out_hi_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &hi.bits[i]);
-            }
-        }
-
-        comb
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(Z_CONST_POS)
     }
 }
 
@@ -3069,7 +3149,11 @@ impl Blake3Setup {
         // Warm the CSC fold circuit here so its one-time build (a pass over
         // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
         // the prove-cycle scratch buffers (see scratch::prewarm_prover).
-        r1cs.csc_lincheck_circuit();
+        if ranked_adjoint_lincheck_enabled(&r1cs) {
+            std::sync::LazyLock::force(&BLAKE3_ADJOINT_PLAN);
+        } else {
+            r1cs.csc_lincheck_circuit();
+        }
         flock_core::scratch::prewarm_prover(r1cs.m);
         // GPU warmup + calibration for BOTH Metal pipelines, in the untimed
         // setup window (the ranked worker constructs the Setup, then runs an
@@ -3305,7 +3389,12 @@ impl Blake3Setup {
                         r
                     });
                 flock_core::gaptime::mark("witness: pool exited");
-                let lc_circuit = self.r1cs.csc_lincheck_circuit();
+                let lc_circuit: &dyn flock_core::lincheck::LincheckCircuit =
+                    if ranked_adjoint_lincheck_enabled(&self.r1cs) {
+                        &BLAKE3_LINCHECK_CIRCUIT
+                    } else {
+                        self.r1cs.csc_lincheck_circuit()
+                    };
                 flock_core::gaptime::mark("lc_circuit built");
                 crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
                     &self.r1cs,
