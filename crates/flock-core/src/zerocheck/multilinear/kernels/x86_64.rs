@@ -263,11 +263,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let g0 = row_base + 2 * x_lo;
                 // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
                 // start, so its block position decides the dead lines.
-                let dead = super::super::prefold_dead_line_mask_gated(
-                    g0,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                );
+                // `prefold_dead_line_mask_gated` is opt-in behind
+                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                // worker with a cleared environment, so the gate is off and
+                // the mask is a constant 0 on every one of the ~2.1 M leaf
+                // tiles. Feeding the constant in directly drops the per-tile
+                // `OnceLock` acquire load and the eight-bit mask build, and
+                // lets the fold kernels take their unpredicated line path.
+                let dead = 0u8;
+                let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -1593,11 +1597,15 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                    let dead = super::super::prefold_dead_line_mask_gated(
-                        4 * xg,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    );
+                    // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
+                    // worker with a cleared environment, so the gate is off and
+                    // the mask is a constant 0 on every one of the ~2.1 M leaf
+                    // tiles. Feeding the constant in directly drops the per-tile
+                    // `OnceLock` acquire load and the eight-bit mask build, and
+                    // lets the fold kernels take their unpredicated line path.
+                    let dead = 0u8;
+                    let _ = (pair_in_block_mask, useful_pairs_inclusive);
                     if use_c4 {
                         let c = cfold.unwrap();
                         if c4_bcast {
@@ -2303,9 +2311,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
     // every line `i` not marked dead, and 64 writable F128s at `out`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs(z, mats, out);
@@ -2336,9 +2352,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs_sigma(z, mats, out);
@@ -2363,9 +2387,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     // SAFETY: as for `gfni_fold64_rows_masked_tr`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
@@ -2534,9 +2566,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     // shuffle index is in range and the cfg gate supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
 
@@ -2731,9 +2771,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     // supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        for (i, slot) in z.iter_mut().enumerate() {
-            if dead_lines & (1u8 << i) == 0 {
+        if dead_lines == 0 {
+            // The ranked shape has no dead lines: one test replaces eight
+            // predicated loads.
+            for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
             }
         }
 

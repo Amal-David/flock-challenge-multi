@@ -118,10 +118,11 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            // Four independent schoolbook CLMULs feed the branchless scalar
+            // xor-fold reduction. This drops the two serial reduction CLMULs
+            // and one net port-5 CLMUL versus the 5-CLMUL Karatsuba path,
+            // without PR 1686's per-product runtime CPUID branch.
+            unsafe { x86_64::ghash_mul_schoolbook(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
