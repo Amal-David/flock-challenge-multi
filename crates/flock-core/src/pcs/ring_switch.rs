@@ -1110,9 +1110,7 @@ pub fn fold_1b_rows_split(
                 // `e · (Σ eq_lo·bit) = Σ (e·eq_lo)·bit` distributes exactly, so
                 // each term equals the materialized `t[i] = eq_lo·eq_hi` term.
                 let e = eq_hi[i_hi];
-                for r in 0..n {
-                    acc[r] += e * inner[r];
-                }
+                crate::field::f128_slice::add_scaled(&mut acc, &inner, e);
                 acc
             },
         )
@@ -1273,10 +1271,8 @@ pub fn fold_1b_rows_split_2way(
             }
             let e0 = eq_hi_0[i_hi];
             let e1 = eq_hi_1[i_hi];
-            for r in 0..n {
-                acc0[r] += e0 * inner0[r];
-                acc1[r] += e1 * inner1[r];
-            }
+            crate::field::f128_slice::add_scaled(&mut acc0, &inner0, e0);
+            crate::field::f128_slice::add_scaled(&mut acc1, &inner1, e1);
             (acc0, acc1)
         })
         .reduce(zero_acc, |(mut a0, mut a1), (b0, b1)| {
