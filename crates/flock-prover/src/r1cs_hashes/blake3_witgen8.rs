@@ -199,22 +199,22 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
+unsafe fn mix_u64x8(mut z: __m512i, k1: __m512i, k2: __m512i) -> __m512i {
     unsafe {
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<30>(z));
-        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64));
+        z = _mm512_mullo_epi64(z, k1);
         z = _mm512_xor_si512(z, _mm512_srli_epi64::<27>(z));
-        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64));
+        z = _mm512_mullo_epi64(z, k2);
         _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z))
     }
 }
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
+unsafe fn next_generator_draw(state: &mut __m512i, golden: __m512i, k1: __m512i, k2: __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
-        _mm512_cvtepi64_epi32(mix_u64x8(*state))
+        *state = _mm512_add_epi64(*state, golden);
+        _mm512_cvtepi64_epi32(mix_u64x8(*state, k1, k2))
     }
 }
 
@@ -235,9 +235,12 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
             first.wrapping_add(stride.wrapping_mul(6)) as i64,
             first.wrapping_add(stride.wrapping_mul(7)) as i64,
         );
-        let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let message = std::array::from_fn(|_| next_generator_draw(&mut state));
-        let counter_lo = next_generator_draw(&mut state);
+        let golden = _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64);
+        let k1 = _mm512_set1_epi64(0xBF58_476D_1CE4_E5B9u64 as i64);
+        let k2 = _mm512_set1_epi64(0x94D0_49BB_1331_11EBu64 as i64);
+        let cv = std::array::from_fn(|_| next_generator_draw(&mut state, golden, k1, k2));
+        let message = std::array::from_fn(|_| next_generator_draw(&mut state, golden, k1, k2));
+        let counter_lo = next_generator_draw(&mut state, golden, k1, k2);
         PreparedInputs {
             cv,
             message,
@@ -352,19 +355,10 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    {
-        // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
-        // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
-        // Bit-identical; the carry-packing is the hot half of the witness
-        // G-functions, and on the ranked runner the ternlog saves one op per
-        // push (~16 per G, ~900 per 8-block call). The mask is a compile-time
-        // constant here (N is literal), so it folds into the ternlog's memory
-        // operand or a constant broadcast; no register pressure change.
-        unsafe {
-            let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
-            _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
-        }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+    unsafe {
+        let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
     unsafe {
@@ -373,9 +367,50 @@ fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
     }
 }
 
+/// 8×8 u32 transpose on 4x 512-bit ZMM registers using 2-level `_mm512_permutex2var_epi32`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn tr8_zmm(z01: __m512i, z23: __m512i, z45: __m512i, z67: __m512i) -> [V8; 8] {
+    let idx0 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
+    let idx1 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
+    let idx_col01 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+    let idx_col23 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
+
+    let t_low_0 = _mm512_permutex2var_epi32(z01, idx0, z23);
+    let t_high_0 = _mm512_permutex2var_epi32(z01, idx1, z23);
+    let t_low_1 = _mm512_permutex2var_epi32(z45, idx0, z67);
+    let t_high_1 = _mm512_permutex2var_epi32(z45, idx1, z67);
+
+    let out01 = _mm512_permutex2var_epi32(t_low_0, idx_col01, t_low_1);
+    let out23 = _mm512_permutex2var_epi32(t_low_0, idx_col23, t_low_1);
+    let out45 = _mm512_permutex2var_epi32(t_high_0, idx_col01, t_high_1);
+    let out67 = _mm512_permutex2var_epi32(t_high_0, idx_col23, t_high_1);
+
+    [
+        _mm512_castsi512_si256(out01),
+        _mm512_extracti64x4_epi64::<1>(out01),
+        _mm512_castsi512_si256(out23),
+        _mm512_extracti64x4_epi64::<1>(out23),
+        _mm512_castsi512_si256(out45),
+        _mm512_extracti64x4_epi64::<1>(out45),
+        _mm512_castsi512_si256(out67),
+        _mm512_extracti64x4_epi64::<1>(out67),
+    ]
+}
+
 /// 8×8 u32 transpose. `r[i]` lane `j` becomes `out[j]` lane `i`.
 #[inline(always)]
 fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    unsafe {
+        let z01 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v0), v1);
+        let z23 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v2), v3);
+        let z45 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v4), v5);
+        let z67 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v6), v7);
+        tr8_zmm(z01, z23, z45, z67)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
     unsafe {
         let t0 = _mm256_unpacklo_epi32(v0, v1);
         let t1 = _mm256_unpackhi_epi32(v0, v1);
