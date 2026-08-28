@@ -18,6 +18,7 @@
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
 pub mod bits;
+pub use bits::BitOps;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;

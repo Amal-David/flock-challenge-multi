@@ -55,7 +55,41 @@ impl TensorAlgebra {
 
     /// Multiply by an element of the vertical subring: each `elems[i]` is
     /// scaled by `scalar` in `F_{2^128}`.
+    /// Multiply by an element of the vertical subring: each `elems[i]` is
+    /// scaled by `scalar` in `F_{2^128}`.
     pub fn scale_vertical(mut self, scalar: F128) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            use crate::field::gf2_128::x86_64::{
+                ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4,
+            };
+            use core::arch::x86_64::*;
+            let s_bcast =
+                _mm512_broadcast_i32x4(_mm_set_epi64x(scalar.hi as i64, scalar.lo as i64));
+            if scalar.hi == 0 {
+                for i in (0..DEGREE).step_by(4) {
+                    let v = _mm512_loadu_si512(self.elems.as_ptr().add(i) as *const __m512i);
+                    let prod = ghash_mul_x4_low_rhs(v, s_bcast);
+                    _mm512_storeu_si512(self.elems.as_mut_ptr().add(i) as *mut __m512i, prod);
+                }
+            } else {
+                let s_x64 = ghash_shift64_x4(s_bcast);
+                for i in (0..DEGREE).step_by(4) {
+                    let v = _mm512_loadu_si512(self.elems.as_ptr().add(i) as *const __m512i);
+                    let prod = ghash_mul_x4_split(v, s_bcast, s_x64);
+                    _mm512_storeu_si512(self.elems.as_mut_ptr().add(i) as *mut __m512i, prod);
+                }
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         for e in self.elems.iter_mut() {
             *e *= scalar;
         }
@@ -111,14 +145,32 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
     }
 }
 
+#[inline(always)]
+fn transpose_64x64_u64s(m: &[u64; 64], out: &mut [u64; 64]) {
+    let mut chunk_bytes = [[0u8; 64]; 8];
+    for r in 0..8 {
+        let chunk: &[u64; 8] = m[r * 8..r * 8 + 8].try_into().unwrap();
+        crate::bits::transpose_8_u64s_to_64_bytes(chunk, &mut chunk_bytes[r]);
+    }
+    for k in 0..64 {
+        out[k] = u64::from_le_bytes([
+            chunk_bytes[0][k],
+            chunk_bytes[1][k],
+            chunk_bytes[2][k],
+            chunk_bytes[3][k],
+            chunk_bytes[4][k],
+            chunk_bytes[5][k],
+            chunk_bytes[6][k],
+            chunk_bytes[7][k],
+        ]);
+    }
+}
+
 /// In-place 128×128 F_2 matrix transpose of the F128 coefficient table.
 ///
 /// On input: `elems[i]` viewed as a 128-bit row; bit `j` is the F_2 coefficient
 /// at position `(i, j)`.
 /// On output: bit `j` of `elems[i]` becomes the old bit `i` of `elems[j]`.
-///
-/// V1 implementation: naive O(D²) bit-scan. Each of 128² output bits is read
-/// from exactly one input bit.
 fn square_transpose(elems: &mut [F128]) {
     assert_eq!(
         elems.len(),
@@ -126,26 +178,38 @@ fn square_transpose(elems: &mut [F128]) {
         "square_transpose: input must be length 128"
     );
 
-    let mut out = [F128::ZERO; DEGREE];
-    for j in 0..DEGREE {
-        let src_bit = |k: usize| -> u64 {
-            if j < 64 {
-                (elems[k].lo >> j) & 1
-            } else {
-                (elems[k].hi >> (j - 64)) & 1
-            }
-        };
-        let mut lo: u64 = 0;
-        let mut hi: u64 = 0;
-        for i in 0..64 {
-            lo |= src_bit(i) << i;
-        }
-        for i in 64..128 {
-            hi |= src_bit(i) << (i - 64);
-        }
-        out[j] = F128 { lo, hi };
+    let mut tl_in = [0u64; 64];
+    let mut tr_in = [0u64; 64];
+    let mut bl_in = [0u64; 64];
+    let mut br_in = [0u64; 64];
+
+    for i in 0..64 {
+        tl_in[i] = elems[i].lo;
+        tr_in[i] = elems[i].hi;
+        bl_in[i] = elems[64 + i].lo;
+        br_in[i] = elems[64 + i].hi;
     }
-    elems.copy_from_slice(&out);
+
+    let mut tl_out = [0u64; 64];
+    let mut tr_out = [0u64; 64];
+    let mut bl_out = [0u64; 64];
+    let mut br_out = [0u64; 64];
+
+    transpose_64x64_u64s(&tl_in, &mut tl_out);
+    transpose_64x64_u64s(&tr_in, &mut tr_out);
+    transpose_64x64_u64s(&bl_in, &mut bl_out);
+    transpose_64x64_u64s(&br_in, &mut br_out);
+
+    for k in 0..64 {
+        elems[k] = F128 {
+            lo: tl_out[k],
+            hi: bl_out[k],
+        };
+        elems[64 + k] = F128 {
+            lo: tr_out[k],
+            hi: br_out[k],
+        };
+    }
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@
 //! [`super::univariate_skip_optimized`] drops a constant F₈ factor
 //! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
 
-use crate::field::{F8, F128, mul_by_x, phi8};
+use crate::field::{F8, F128, F256Unreduced, mul_by_x, phi8};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
 // ---------------------------------------------------------------------------
@@ -27,24 +27,12 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
 /// Build the multilinear-eq evaluation table over `r`:
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
+/// Build the multilinear-eq evaluation table over `r`:
+/// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
+#[inline]
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    let n = r.len();
-    // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
-    // every slot in t[0..2^n] is written exactly once before any read.
-    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
-    for i in 0..n {
-        let r_i = r[i];
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
-        // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
-        for x in (0..(1usize << i)).rev() {
-            let hi = t[x] * r_i;
-            t[x | (1 << i)] = hi;
-            t[x] += hi;
-        }
-    }
-    t
+    crate::lincheck::build_eq_table(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +291,14 @@ pub fn round1_extract_c_packed(
     // C accumulator stays in S-domain; we NTT-extend once at the end.
     let mut res_c_s = vec![F128::ZERO; ell];
 
-    let mut partial_ab = vec![F128::ZERO; ell];
+    let mut partial_ab = vec![F256Unreduced::ZERO; ell];
     let mut partial_c = vec![F128::ZERO; ell];
 
     let mut a_col = vec![F8::ZERO; ell];
     let mut b_col = vec![F8::ZERO; ell];
 
     for x_hi in 0..hi_size {
-        partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+        partial_ab.iter_mut().for_each(|p| *p = F256Unreduced::ZERO);
         partial_c.iter_mut().for_each(|p| *p = F128::ZERO);
 
         for x_lo in 0..lo_size {
@@ -323,10 +311,10 @@ pub fn round1_extract_c_packed(
 
             let eq_lo = eq.lo[x_lo];
 
-            // AB on Λ.
+            // AB on Λ — deferred unreduced product accumulation across x_lo.
             for lambda in 0..ell {
                 let ab = a_col[lambda] * b_col[lambda];
-                partial_ab[lambda] += eq_lo * phi8(ab);
+                partial_ab[lambda] ^= eq_lo.mul_unreduced(phi8(ab));
             }
 
             // C on S — read original bits, no NTT yet.
@@ -340,7 +328,7 @@ pub fn round1_extract_c_packed(
 
         let eq_hi = eq.hi[x_hi];
         for lambda in 0..ell {
-            res_ab[lambda] += eq_hi * partial_ab[lambda];
+            res_ab[lambda] += eq_hi * partial_ab[lambda].reduce();
             res_c_s[lambda] += eq_hi * partial_c[lambda];
         }
     }
@@ -412,7 +400,7 @@ pub fn round1_extract_c_packed_with_s_hat_v(
     let mut res_c_s_0 = vec![F128::ZERO; ell];
     let mut res_c_s_1 = vec![F128::ZERO; ell];
 
-    let mut partial_ab = vec![F128::ZERO; ell];
+    let mut partial_ab = vec![F256Unreduced::ZERO; ell];
     let mut partial_c_0 = vec![F128::ZERO; ell];
     let mut partial_c_1 = vec![F128::ZERO; ell];
 
@@ -420,7 +408,7 @@ pub fn round1_extract_c_packed_with_s_hat_v(
     let mut b_col = vec![F8::ZERO; ell];
 
     for x_hi in 0..hi_size {
-        partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+        partial_ab.iter_mut().for_each(|p| *p = F256Unreduced::ZERO);
         partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
         partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
@@ -435,10 +423,10 @@ pub fn round1_extract_c_packed_with_s_hat_v(
 
             let eq_lo = eq.lo[x_lo];
 
-            // AB on Λ — unchanged.
+            // AB on Λ — deferred unreduced product accumulation across x_lo.
             for lambda in 0..ell {
                 let ab = a_col[lambda] * b_col[lambda];
-                partial_ab[lambda] += eq_lo * phi8(ab);
+                partial_ab[lambda] ^= eq_lo.mul_unreduced(phi8(ab));
             }
 
             // C on S — route into bank 0 or bank 1 based on b_7. The eq
@@ -460,7 +448,7 @@ pub fn round1_extract_c_packed_with_s_hat_v(
 
         let eq_hi = eq.hi[x_hi];
         for lambda in 0..ell {
-            res_ab[lambda] += eq_hi * partial_ab[lambda];
+            res_ab[lambda] += eq_hi * partial_ab[lambda].reduce();
             res_c_s_0[lambda] += eq_hi * partial_c_0[lambda];
             res_c_s_1[lambda] += eq_hi * partial_c_1[lambda];
         }

@@ -628,7 +628,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -638,6 +638,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -648,7 +649,11 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_ab = ghash_mul_x4_split(
+                f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]),
+                eq,
+                eq_x64,
+            );
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -728,7 +733,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
@@ -770,6 +775,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -808,8 +814,8 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let scaled0 = ghash_mul_x4_split(aos0, eq, eq_x64);
+                let scaled1 = ghash_mul_x4_split(aos1, eq, eq_x64);
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
@@ -1804,16 +1810,18 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                     *slot = _mm512_gf2p8affine_epi64_epi8::<0>(ident, cols[bank]);
                 }
             }
-            // One VGF2P8AFFINEQB per (mask half, output byte plane); both
-            // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
-            for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
-                for bank in 0..N_C_BANKS {
-                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
-                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
-                    let ptr =
-                        planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
+            // Loop over bank outer and plane inner for sequential streaming memory access
+            // and reduced live register pressure.
+            for bank in 0..N_C_BANKS {
+                let mask0 = masks[0][bank];
+                let mask1 = masks[1][bank];
+                let bank_ptr = planes.add((q * N_C_BANKS + bank) * 16 * ELL) as *mut __m512i;
+                for plane in 0..16usize {
+                    let m_lo = _mm512_set1_epi64(mats[plane] as i64);
+                    let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(mask0, m_lo);
+                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(mask1, m_hi);
+                    let ptr = bank_ptr.add(plane);
                     _mm512_storeu_si512(
                         ptr,
                         _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),

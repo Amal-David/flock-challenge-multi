@@ -3419,8 +3419,7 @@ impl AdditiveNttF128 {
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
                         hint: u8|
          -> bool {
-            if fuse_blocks && block_cb.is_some() {
-                let cb = block_cb.unwrap();
+            if fuse_blocks {
                 // Sweep 1: fused-four over the whole sub-group (layers
                 // n_top..n_top+4) — verbatim the incumbent's first pass.
                 {
@@ -3513,11 +3512,13 @@ impl AdditiveNttF128 {
                             );
                         }
                     }
-                    let lo = sub_idx * sub_size_positions + b * block_size4;
-                    cb(
-                        lo..lo + block_size4,
-                        &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
-                    );
+                    if let Some(cb) = block_cb {
+                        let lo = sub_idx * sub_size_positions + b * block_size4;
+                        cb(
+                            lo..lo + block_size4,
+                            &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
+                        );
+                    }
                 }
                 return true;
             }
@@ -3816,16 +3817,27 @@ impl AdditiveNttF128 {
                     crate::gaptime::mark("ntt: deep pass done");
                     return;
                 }
-                data.par_chunks_mut(sub_bytes)
-                    .enumerate()
-                    .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
-                            if let Some(cb) = on_sub_done {
-                                let lo = sub_idx * sub_size_positions;
-                                cb(lo..lo + sub_size_positions, sub_data);
-                            }
+                let n_subs = n_total / sub_bytes;
+                let next_sub = std::sync::atomic::AtomicUsize::new(0);
+                let base_addr = data.as_mut_ptr() as usize;
+                (0..n_subs).into_par_iter().with_max_len(1).for_each(|_| {
+                    let sub_idx = next_sub.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if sub_idx >= n_subs {
+                        return;
+                    }
+                    let sub_data = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (base_addr as *mut F128).add(sub_idx * sub_bytes),
+                            sub_bytes,
+                        )
+                    };
+                    if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if let Some(cb) = on_sub_done {
+                            let lo = sub_idx * sub_size_positions;
+                            cb(lo..lo + sub_size_positions, sub_data);
                         }
-                    });
+                    }
+                });
                 if big {
                     crate::gaptime::mark("ntt: deep pass done");
                 }
