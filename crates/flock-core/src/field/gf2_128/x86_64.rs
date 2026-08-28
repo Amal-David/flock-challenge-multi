@@ -575,3 +575,205 @@ impl WideGhashX4 {
         }
     }
 }
+
+// -----------------------------------------------------------------------
+// PCLMULQDQ carryless mul with precomputed Barrett/poly reduction +
+// 4× unrolled batched loop.
+//
+// `ghash_mul_pclmulqdq_barrett` is a single-F128 product path that
+// keeps every intermediate in `__m128i` (no `_mm_extract_epi64` lane
+// extracts on the reduction side) and uses a **precomputed reduction
+// polynomial `poly = 0x87` in a register** so the standard binius
+// 2-stage fold reaches the answer with two PCLMULQDQ instructions and
+// only two register-resident shifts. Field-identical to the existing
+// karatsuba/vec path the `Mul` impl calls — this kernel is offered as
+// a separate entry so the ranker can route the hot slice fold through
+// a body that pipelines 4 products in parallel without ever spilling
+// to scalars.
+//
+// `ghash_mul_pclmulqdq_barrett_x4` issues four independent Karatsuba
+// CLMULs back-to-back (so the `pclmulqdq` unit sees 12 in flight
+// feeding the next set), then four 2-stage reductions with a single
+// precomputed `poly` register reused across all four, and finally
+// extracts. This is the "4× unrolled batched loop" the
+// `x86-pclmul-gf128-slice-batch` method family ports through the slice
+// fold below.
+//
+// # Safety
+// Both functions require `pclmulqdq` + `sse4.1` (declared via the
+// `#[target_feature]` attribute). Callers must run on a CPU that
+// exposes those features; the CPUID-gated dispatch in `f128_slice.rs`
+// guards this at runtime with `is_x86_feature_detected!`.
+// -----------------------------------------------------------------------
+
+/// Precomputed GHASH reduction polynomial `p = 0x87` packed in an XMM:
+/// `{lo = 0x87, hi = 0}`. The single PCLMULQDQ reduction constant for
+/// `x^128 + x^7 + x^2 + x + 1`. Building it once per call and reusing
+/// across the whole batched loop avoids the constant load on every
+/// reduction CLMUL.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+unsafe fn ghash_poly_xmm() -> __m128i {
+    // SAFETY: caller carries the required target features.
+    unsafe { _mm_set_epi64x(0, 0x87) }
+}
+
+/// `a · b` mod p via PCLMULQDQ carryless mul with precomputed
+/// Barrett/poly reduction. Karatsuba (3 CLMUL) product followed by
+/// the binius 2-stage fold with a precomputed `poly = 0x87` XMM — total
+/// 5 CLMUL, the same as the existing `ghash_mul_karatsuba_vec`/
+/// `ghash_mul_binius` paths but with no lane extracts on the reduction
+/// side and one fewer register spill.
+///
+/// # Safety
+/// Requires `pclmulqdq` + `sse4.1`. The CPUID-gated dispatcher in
+/// `f128_slice.rs` is the expected call site.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq_barrett(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Karatsuba: 3 independent CLMULs, all in XMM.
+        let p0 = pmull(a.lo, b.lo);
+        let p2 = pmull(a.hi, b.hi);
+        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        // cross = (a.lo ^ a.hi)(b.lo ^ b.hi) ⊕ p0 ⊕ p2; the x^64..x^127
+        // limb of the 256-bit product. F2-linear, computed in registers.
+        let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p2);
+        let mut t0 = p0;
+
+        // First reduce: t1 = t1 + x^64 · p2 (mod p). p2 occupies the top
+        // 128 bits of the unreduced product; folding it down needs one
+        // shift of `p2` into `t1`'s high lane and one PCLMULQDQ of
+        // `p2.hi` with the precomputed `poly` constant.
+        let p2_shifted = _mm_slli_si128::<8>(p2); // {0, p2.lo}
+        t1 = _mm_xor_si128(t1, p2_shifted);
+        let poly = ghash_poly_xmm();
+        let p2_red = pmull(lane1(p2), poly);
+        t1 = _mm_xor_si128(t1, p2_red);
+
+        // Second reduce: t0 = t0 + x^64 · t1 (mod p). Same shape, with
+        // t1's high limb now in play.
+        let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
+        t0 = _mm_xor_si128(t0, t1_shifted);
+        let t1_red = pmull(lane1(t1), poly);
+        t0 = _mm_xor_si128(t0, t1_red);
+
+        F128 {
+            lo: lane0(t0),
+            hi: lane1(t0),
+        }
+    }
+}
+
+/// 4× unrolled batched PCLMULQDQ+Barrett loop: produce 4 reduced
+/// `F128` products from 4 `(a, b)` pairs in one tight body, with no
+/// per-product loop overhead — the CLMUL pipeline sees 12 back-to-back
+/// PCLMULQDQ product instructions on the same XMM lanes and the 8
+/// reduction CLMULs follow immediately, all reusing the single
+/// precomputed `poly = 0x87` register. Field-identical to calling
+/// [`ghash_mul_pclmulqdq_barrett`] four times, but keeps every XMM
+/// register hot and exposes the 4× unrolling the slice fold below
+/// consumes.
+///
+/// # Safety
+/// Requires `pclmulqdq` + `sse4.1`. All four `(a, b)` pairs must
+/// contain valid F128 values (any bit pattern is allowed).
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq_barrett_x4(
+    a: [F128; 4],
+    b: [F128; 4],
+) -> [F128; 4] {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Stage 1: 12 independent Karatsuba product CLMULs.
+        let p0_0 = pmull(a[0].lo, b[0].lo);
+        let p0_1 = pmull(a[1].lo, b[1].lo);
+        let p0_2 = pmull(a[2].lo, b[2].lo);
+        let p0_3 = pmull(a[3].lo, b[3].lo);
+
+        let p2_0 = pmull(a[0].hi, b[0].hi);
+        let p2_1 = pmull(a[1].hi, b[1].hi);
+        let p2_2 = pmull(a[2].hi, b[2].hi);
+        let p2_3 = pmull(a[3].hi, b[3].hi);
+
+        let pm_0 = pmull(a[0].lo ^ a[0].hi, b[0].lo ^ b[0].hi);
+        let pm_1 = pmull(a[1].lo ^ a[1].hi, b[1].lo ^ b[1].hi);
+        let pm_2 = pmull(a[2].lo ^ a[2].hi, b[2].lo ^ b[2].hi);
+        let pm_3 = pmull(a[3].lo ^ a[3].hi, b[3].lo ^ b[3].hi);
+
+        // F2-linear cross per product.
+        let t1_0 = _mm_xor_si128(_mm_xor_si128(pm_0, p0_0), p2_0);
+        let t1_1 = _mm_xor_si128(_mm_xor_si128(pm_1, p0_1), p2_1);
+        let t1_2 = _mm_xor_si128(_mm_xor_si128(pm_2, p0_2), p2_2);
+        let t1_3 = _mm_xor_si128(_mm_xor_si128(pm_3, p0_3), p2_3);
+
+        let poly = ghash_poly_xmm();
+
+        // Stage 2: first reduce on each of the 4 lanes. The reduction
+        // CLMUL (`p2.hi * poly`) depends only on `p2`, so 4 back-to-back
+        // PCLMULQDQ instructions issue in a tight loop.
+        let t1_0 = {
+            let shifted = _mm_slli_si128::<8>(p2_0);
+            let red = pmull(lane1(p2_0), poly);
+            _mm_xor_si128(_mm_xor_si128(t1_0, shifted), red)
+        };
+        let t1_1 = {
+            let shifted = _mm_slli_si128::<8>(p2_1);
+            let red = pmull(lane1(p2_1), poly);
+            _mm_xor_si128(_mm_xor_si128(t1_1, shifted), red)
+        };
+        let t1_2 = {
+            let shifted = _mm_slli_si128::<8>(p2_2);
+            let red = pmull(lane1(p2_2), poly);
+            _mm_xor_si128(_mm_xor_si128(t1_2, shifted), red)
+        };
+        let t1_3 = {
+            let shifted = _mm_slli_si128::<8>(p2_3);
+            let red = pmull(lane1(p2_3), poly);
+            _mm_xor_si128(_mm_xor_si128(t1_3, shifted), red)
+        };
+
+        // Stage 3: second reduce on each of the 4 lanes. Same shape.
+        let t0_0 = {
+            let shifted = _mm_slli_si128::<8>(t1_0);
+            let red = pmull(lane1(t1_0), poly);
+            _mm_xor_si128(_mm_xor_si128(p0_0, shifted), red)
+        };
+        let t0_1 = {
+            let shifted = _mm_slli_si128::<8>(t1_1);
+            let red = pmull(lane1(t1_1), poly);
+            _mm_xor_si128(_mm_xor_si128(p0_1, shifted), red)
+        };
+        let t0_2 = {
+            let shifted = _mm_slli_si128::<8>(t1_2);
+            let red = pmull(lane1(t1_2), poly);
+            _mm_xor_si128(_mm_xor_si128(p0_2, shifted), red)
+        };
+        let t0_3 = {
+            let shifted = _mm_slli_si128::<8>(t1_3);
+            let red = pmull(lane1(t1_3), poly);
+            _mm_xor_si128(_mm_xor_si128(p0_3, shifted), red)
+        };
+
+        [
+            F128 {
+                lo: lane0(t0_0),
+                hi: lane1(t0_0),
+            },
+            F128 {
+                lo: lane0(t0_1),
+                hi: lane1(t0_1),
+            },
+            F128 {
+                lo: lane0(t0_2),
+                hi: lane1(t0_2),
+            },
+            F128 {
+                lo: lane0(t0_3),
+                hi: lane1(t0_3),
+            },
+        ]
+    }
+}

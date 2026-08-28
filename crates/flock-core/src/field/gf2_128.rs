@@ -589,4 +589,50 @@ mod tests {
             assert_eq!(folded.reduce(), scalar.reduce(), "reduced values differ");
         }
     }
+
+    /// The PCLMULQDQ+Barrett scalar and 4× batched kernels must agree with
+    /// the canonical scalar `F128::mul`, lane for lane, on the same random
+    /// inputs as `ghash_mul_x4_matches_scalar`. Same field element, different
+    /// reduction path.
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
+    fn ghash_mul_pclmulqdq_barrett_matches_scalar() {
+        let mut rng = Rng::new(0xBA12_7077_BA12_7077);
+        for _ in 0..256 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            // SAFETY: pclmulqdq+sse4.1 enabled at compile time (cfg gate).
+            let got = unsafe { x86_64::ghash_mul_pclmulqdq_barrett(a, b) };
+            assert_eq!(got, a * b, "pclmulqdq barrett != scalar mul");
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
+    fn ghash_mul_pclmulqdq_barrett_x4_matches_scalar() {
+        let mut rng = Rng::new(0xBA12_7077_400L_1337);
+        for _ in 0..256 {
+            let a = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let b = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            // SAFETY: pclmulqdq+sse4.1 enabled at compile time (cfg gate).
+            let got = unsafe { x86_64::ghash_mul_pclmulqdq_barrett_x4(a, b) };
+            for lane in 0..4 {
+                assert_eq!(
+                    got[lane],
+                    a[lane] * b[lane],
+                    "lane {lane}: pclmulqdq barrett x4 != scalar mul"
+                );
+            }
+        }
+    }
 }
