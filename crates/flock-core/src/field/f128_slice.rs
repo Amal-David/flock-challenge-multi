@@ -21,11 +21,7 @@ mod portable;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 mod aarch64;
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
 
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
@@ -51,6 +47,22 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
         x86_64::fold_pairs(src, base, dst, r);
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))
+    ))]
+    {
+        if fold8_bind_x4_enabled() {
+            // SAFETY: fold8_bind_x4_enabled requires pclmulqdq+ssse3 at
+            // runtime; the bounds check above covers every output pair.
+            unsafe {
+                x86_64::fold_pairs_4x(src, base, dst, r);
+            }
+        } else {
+            portable::fold_pairs(src, base, dst, r);
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     // SAFETY: the cfg gate guarantees PMULL support through the aes feature;
     // the bounds check above guarantees both source elements for every output.
@@ -59,26 +71,32 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     }
 
     #[cfg(not(any(
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ),
+        target_arch = "x86_64",
         all(target_arch = "aarch64", target_feature = "aes")
     )))]
     portable::fold_pairs(src, base, dst, r);
 }
 
 /// Ranked default routes DirectFold8 factor-state binds through the AVX-512
-/// `fold_pairs` permute plus deferred `WideGhashX4` message accumulate.
+/// `fold_pairs` permute plus deferred `WideGhashX4` message accumulate, or
+/// the PCLMUL 4-lane leaf when AVX-512 is not compiled in.
 /// `FLOCK_NO_OPEN_FOLD8_BIND_X4=1` restores the compact scalar scan. Read once
-/// per process; default ON. The selector is outside the bind, so there is no
-/// per-element dispatch — the historical "avoid dispatch" scalar comment no
-/// longer applies on Sapphire Rapids.
+/// per process; default ON when `pclmulqdq` and `ssse3` are present.
 #[allow(dead_code)] // Retained same-binary rollback selector.
 fn fold8_bind_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_none());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_OPEN_FOLD8_BIND_X4").is_some() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("pclmulqdq") && std::is_x86_feature_detected!("ssse3")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    });
     *ON
 }
 
@@ -106,6 +124,16 @@ pub(crate) fn fold_two_and_msg_in_place(
         // assertions match the kernel contract (even pair count, in-place
         // prefix write of already-consumed sources).
         return unsafe { x86_64::fold_two_and_msg_in_place(f, b, r) };
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))
+    ))]
+    if fold8_bind_x4_enabled() {
+        // SAFETY: fold8_bind_x4_enabled requires pclmulqdq+ssse3; the length
+        // assertions match the kernel contract.
+        return unsafe { x86_64::fold_two_and_msg_in_place_4x(f, b, r) };
     }
 
     fold_two_and_msg_in_place_scalar(f, b, r)
