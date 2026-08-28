@@ -104,9 +104,9 @@ pub struct PackedDirectClaim {
 /// is actually narrower; `FLOCK_NO_OPEN_POOL=1` is the kill switch (local
 /// diagnostics; the ranked worker's cleared env never sets it). Pool width
 /// cannot change wire bytes: every parallel reduction here is an XOR sum.
-fn in_wide_combine_pool<R: Send>(_l: usize, op: impl FnOnce() -> R + Send) -> R {
+fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if _l >= (1 << 22)
+    if l >= (1 << 22)
         && std::thread::available_parallelism()
             .is_ok_and(|n| n.get() > rayon::current_num_threads())
         && std::env::var_os("FLOCK_NO_OPEN_POOL").is_none()
@@ -125,7 +125,7 @@ fn in_wide_combine_pool<R: Send>(_l: usize, op: impl FnOnce() -> R + Send) -> R 
 ///
 /// `lig_config.initial_k` must equal `commitment.params.log_batch_size` so that
 /// `prover_data`'s codeword/tree shape matches what Ligerito expects for L0.
-#[allow(clippy::explicit_auto_deref, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     packed_witness: Vec<F128>,
     prover_data: &ProverData,
@@ -289,10 +289,8 @@ struct CombinedClaim {
     /// Direct-fold4 round-3 trivariate lookahead (coefficients in r0, r1, r2).
     round3_lookahead: Option<Fold4Lookahead3>,
     /// Direct-fold8 round-4 quadrivariate lookahead.
-    #[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
     round4_lookahead: Option<Fold8Lookahead4>,
     /// Direct-fold8 round-5 quintivariate lookahead.
-    #[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
     round5_lookahead: Option<Fold8Lookahead5>,
     /// AB sufficient statistics for direct materialization after rounds 0/1.
     /// `b_combined` contains the ordinary C contribution only.
@@ -541,7 +539,6 @@ pub(crate) fn messages_from_direct_products_fold4(
 /// Selected banks always form a subcube, so the product sum iterates set
 /// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
 /// F128 adds total — scalar-negligible).
-#[allow(dead_code)] // Scalar oracle for the factorized DirectFold8 path.
 fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F128>, Vec<F128>) {
     debug_assert!(round < 6);
     let grid_len = 3usize.pow(round as u32);
@@ -1162,8 +1159,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     let mut round2_lookahead = None;
     let mut round3_lookahead = None;
-    let round4_lookahead = None;
-    let round5_lookahead = None;
+    let mut round4_lookahead = None;
+    let mut round5_lookahead = None;
     if let Some(direct) = direct_fold8.as_ref() {
         for claim in direct {
             round0_u0 += claim.round0.0;

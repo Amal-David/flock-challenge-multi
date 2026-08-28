@@ -392,9 +392,12 @@ pub(crate) unsafe fn gfni_fold_tile(
     unsafe {
         for block in 0..n_blocks64 {
             let bs = block * 64;
-            let rows: [__m512i; 8] = core::array::from_fn(|t| {
-                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
-            });
+            let mut rows = [_mm512_setzero_si512(); 8];
+            for (t, row) in rows.iter_mut().enumerate() {
+                *row = _mm512_loadu_si512(
+                    tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i
+                );
+            }
             let planes = out_planes_ptr.add(block * 1024);
             for byte_k in 0..16 {
                 let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
@@ -637,12 +640,10 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
 
 /// Nibble sum tables for one stripe (8 outer weights): `[TL lo(16), TL hi(16),
 /// TH lo(16), TH hi(16)]` as qwords, i.e. `TL_t[l]` = `(lo[l], hi[l])`.
-#[allow(dead_code)] // Kept as the scalar/table oracle for the active GFNI path.
 pub(crate) type NibbleTables = [u64; 64];
 
 /// Build the lo/hi-nibble subset-sum tables from eight outer weights.
 #[inline]
-#[allow(dead_code)] // Kept as the scalar/table oracle for the active GFNI path.
 pub(crate) fn build_nibble_tables(eq8: &[F128; 8], out: &mut NibbleTables) {
     let mut tl = [F128::ZERO; 16];
     let mut th = [F128::ZERO; 16];

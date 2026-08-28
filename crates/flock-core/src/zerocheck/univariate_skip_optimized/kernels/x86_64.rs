@@ -103,7 +103,6 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
 /// `FLOCK_NO_URM_APPLY_2IMG=1` restores the one-image inverse-NTT table
 /// apply (ten port-5 shuffles per apply) in the shift-reduce AB kernel.
 /// Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_apply_2img_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_APPLY_2IMG").is_none());
@@ -113,7 +112,6 @@ pub(crate) fn urm_apply_2img_enabled() -> bool {
 /// `FLOCK_NO_URM_PIDX=1` restores per-byte index scaling (`movzbl` + `shl $6`)
 /// in the shift-reduce AB kernel instead of the pre-scaled `u16` offset
 /// buffer. Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_pidx_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_PIDX").is_none());
@@ -124,7 +122,6 @@ pub(crate) fn urm_pidx_enabled() -> bool {
 /// prologue in the shift-reduce AB kernel (and disables the producer-side
 /// fused offset arena that feeds the split consume body). Resolved once per
 /// process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_off_arena_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFF_ARENA").is_none());
@@ -134,7 +131,6 @@ pub(crate) fn urm_off_arena_enabled() -> bool {
 /// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
 /// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
 /// 64-bit reads split with shifts. Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_offw_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFFW").is_none());

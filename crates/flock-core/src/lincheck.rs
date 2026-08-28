@@ -846,7 +846,6 @@ pub fn partial_fold_packed_z_block_major_padded(
         k_log,
         useful_bits,
         |outer_base| std::array::from_fn(|r| eq_outer[outer_base + r]),
-        None,
     )
 }
 
@@ -863,29 +862,6 @@ fn partial_fold_packed_z_block_major_factorized_padded(
     useful_bits: usize,
     eq_lo: &[F128],
     eq_hi: &[F128],
-) -> Vec<F128> {
-    partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
-        z_packed,
-        m,
-        k_log,
-        useful_bits,
-        eq_lo,
-        eq_hi,
-        None,
-    )
-}
-
-/// Factorized block-major fold with an optional immediate bind of the top
-/// remaining inner coordinate. The GFNI arm fuses that bind into its existing
-/// cross-worker plane reduce; other targets bind the completed vector.
-fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
-    z_packed: &[F128],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    eq_lo: &[F128],
-    eq_hi: &[F128],
-    top_bind: Option<F128>,
 ) -> Vec<F128> {
     assert!(m >= k_log);
     assert!(eq_lo.len().is_power_of_two());
@@ -906,7 +882,6 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
                 eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
             })
         },
-        top_bind,
     )
 }
 
@@ -939,45 +914,6 @@ pub(crate) fn fold_block_major_one_shot(
     } else {
         let eq_x_outer = build_eq_table(x_outer);
         partial_fold_packed_z_block_major_padded(z, m, k_log, useful_bits, &eq_x_outer)
-    }
-}
-
-/// One-shot block-major outer fold followed immediately by binding the top
-/// remaining inner coordinate. On the ranked GFNI path the bind is fused into
-/// the worker-plane reduce, so the full inner vector is never materialized.
-pub(crate) fn fold_block_major_one_shot_bind_top(
-    z: &[F128],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    x_outer: &[F128],
-    r_top: F128,
-) -> Vec<F128> {
-    let n_log = m - k_log;
-    debug_assert_eq!(x_outer.len(), n_log);
-    if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
-        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
-        let eq_lo = build_eq_table(outer_lo);
-        let eq_hi = build_eq_table(outer_hi);
-        partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
-            z,
-            m,
-            k_log,
-            useful_bits,
-            &eq_lo,
-            &eq_hi,
-            Some(r_top),
-        )
-    } else {
-        let eq_x_outer = build_eq_table(x_outer);
-        partial_fold_packed_z_block_major_padded_with_tables(
-            z,
-            m,
-            k_log,
-            useful_bits,
-            |outer_base| std::array::from_fn(|lane| eq_x_outer[outer_base + lane]),
-            Some(r_top),
-        )
     }
 }
 
@@ -1097,7 +1033,6 @@ fn lc_zfold_pf_spread_enabled() -> bool {
     *ON
 }
 
-#[allow(dead_code)] // Retained same-binary rollback selector.
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
@@ -1319,86 +1254,6 @@ fn gather_transpose_tile_x86<const FUSE: bool>(
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
-#[inline(always)]
-fn transpose_8x8_bytes(mut rows: [u64; 8]) -> [u64; 8] {
-    const M1: u64 = 0x00FF_00FF_00FF_00FF;
-    for i in (0..8).step_by(2) {
-        let t = ((rows[i] >> 8) ^ rows[i + 1]) & M1;
-        rows[i + 1] ^= t;
-        rows[i] ^= t << 8;
-    }
-
-    const M2: u64 = 0x0000_FFFF_0000_FFFF;
-    for i in [0, 1, 4, 5] {
-        let t = ((rows[i] >> 16) ^ rows[i + 2]) & M2;
-        rows[i + 2] ^= t;
-        rows[i] ^= t << 16;
-    }
-
-    const M4: u64 = 0x0000_0000_FFFF_FFFF;
-    for i in 0..4 {
-        let t = ((rows[i] >> 32) ^ rows[i + 4]) & M4;
-        rows[i + 4] ^= t;
-        rows[i] ^= t << 32;
-    }
-    rows
-}
-
-/// Reduce one 64-column GFNI plane block across workers and transpose it
-/// back to the canonical F128 column layout.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "gfni"
-))]
-#[inline(always)]
-fn reduce_worker_plane_block(
-    planes: &[u8],
-    worker_stride: usize,
-    n_workers: usize,
-    blk: usize,
-    out: &mut [F128],
-) {
-    debug_assert_eq!(out.len(), 64);
-    let base = blk * 1024;
-    let mut acc = [0u8; 1024];
-    acc.copy_from_slice(&planes[base..base + 1024]);
-    for w in 1..n_workers {
-        let src = &planes[w * worker_stride + base..w * worker_stride + base + 1024];
-        // SAFETY: both slices are 1024 bytes (16 x 64); XOR is bitwise so
-        // VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
-        unsafe {
-            kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
-        }
-    }
-    // The plane rows are contiguous, while the old per-column loop made 16
-    // strided byte loads for every F128. Transpose eight 8-byte groups with
-    // GPR delta-swaps so every load is a contiguous u64.
-    for group in 0..8 {
-        let mut lo_rows = [0u64; 8];
-        let mut hi_rows = [0u64; 8];
-        for byte in 0..8 {
-            let lo = byte * 64 + group * 8;
-            let hi = (byte + 8) * 64 + group * 8;
-            lo_rows[byte] = u64::from_le_bytes(acc[lo..lo + 8].try_into().unwrap());
-            hi_rows[byte] = u64::from_le_bytes(acc[hi..hi + 8].try_into().unwrap());
-        }
-        let lo_cols = transpose_8x8_bytes(lo_rows);
-        let hi_cols = transpose_8x8_bytes(hi_rows);
-        for col in 0..8 {
-            out[group * 8 + col] = F128 {
-                lo: lo_cols[col],
-                hi: hi_cols[col],
-            };
-        }
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "gfni"
-))]
 #[allow(clippy::too_many_arguments)]
 fn fold_block_major_gfni(
     z_packed: &[F128],
@@ -1411,7 +1266,6 @@ fn fold_block_major_gfni(
     n_tiles: usize,
     dynamic: bool,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
-    top_bind: Option<F128>,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
@@ -1622,20 +1476,30 @@ fn fold_block_major_gfni(
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
-    // read+write pass — the class this arm deletes). When the caller will
-    // immediately bind the top coordinate, pair each low/high plane block
-    // here and write only the already-bound low half. This preserves the
-    // incumbent reduction and transpose leaves while avoiding a length-k
-    // intermediate allocation plus its complete readback.
-    let worker_stride = k * 16;
-    let out_len = if top_bind.is_some() { k / 2 } else { k };
-    let mut out = vec![F128::ZERO; out_len];
+    // read+write pass — the class this arm deletes).
+    let mut out = vec![F128::ZERO; k];
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
-        reduce_worker_plane_block(&planes, worker_stride, n_workers, blk, o);
-        if let Some(r) = top_bind {
-            let mut hi = [F128::ZERO; 64];
-            reduce_worker_plane_block(&planes, worker_stride, n_workers, blk + k / 128, &mut hi);
-            crate::field::f128_slice::bind_split_half(o, &hi, r);
+        let base = blk * 1024;
+        let mut acc = [0u8; 1024];
+        acc.copy_from_slice(&planes[base..base + 1024]);
+        for w in 1..n_workers {
+            let src = &planes[w * k * 16 + base..w * k * 16 + base + 1024];
+            // SAFETY: both slices are 1024 bytes (16 × 64); XOR is bitwise
+            // so VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
+            unsafe {
+                kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
+            }
+        }
+        for (col, slot) in o.iter_mut().enumerate() {
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for byte in 0..8 {
+                lo |= (acc[byte * 64 + col] as u64) << (8 * byte);
+            }
+            for byte in 8..16 {
+                hi |= (acc[byte * 64 + col] as u64) << (8 * (byte - 8));
+            }
+            *slot = F128 { lo, hi };
         }
     });
     out
@@ -1652,7 +1516,6 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     k_log: usize,
     useful_bits: usize,
     eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
-    top_bind: Option<F128>,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -1711,7 +1574,6 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             n_tiles,
             dynamic,
             &eq8_at,
-            top_bind,
         );
     }
 
@@ -1981,12 +1843,6 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             (probe_t2 - probe_t1).as_secs_f64() * 1e3,
             probe_t2.elapsed().as_secs_f64() * 1e3
         );
-    }
-    if let Some(r) = top_bind {
-        let half = out.len() / 2;
-        let (lo, hi) = out.split_at_mut(half);
-        crate::field::f128_slice::bind_split_half(lo, hi, r);
-        out.truncate(half);
     }
     out
 }

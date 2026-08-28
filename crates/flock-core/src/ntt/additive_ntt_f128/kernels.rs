@@ -24,7 +24,6 @@
 
 use crate::field::F128;
 
-#[allow(dead_code)] // Portable fallbacks remain available for rollback builds.
 mod portable;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -492,7 +491,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
 ))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
-#[allow(dead_code)] // Retained fused-kernel rollback/oracle entry point.
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     src: *const F128,
     src_quarter: usize,

@@ -115,10 +115,6 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 /// Karatsuba 3 CLMUL product + binius 2-stage vector reduction (2 CLMUL,
 /// only 2 lane extracts) = 5 CLMUL total, one fewer than the 6-CLMUL binius
 /// schoolbook with the same fully-vector reduction shape. Field-identical.
-///
-/// # Safety
-/// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
-/// features required by this function.
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.

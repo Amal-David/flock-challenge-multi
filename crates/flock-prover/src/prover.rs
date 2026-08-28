@@ -89,10 +89,10 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
     let mut slot = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_digest, value)) = *slot
-        && cached_digest == digest
-    {
-        return value;
+    if let Some((cached_digest, value)) = *slot {
+        if cached_digest == digest {
+            return value;
+        }
     }
     let value = r1cs.c0_is_identity();
     *slot = Some((digest, value));

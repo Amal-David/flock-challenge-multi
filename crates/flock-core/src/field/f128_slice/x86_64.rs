@@ -49,8 +49,10 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
         while i < lanes {
             let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
             let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
-            let corrected =
-                _mm512_xor_si512(current, ghash_mul_x4_split(extra, scale_x4, scale_x64));
+            let corrected = _mm512_xor_si512(
+                current,
+                ghash_mul_x4_split(extra, scale_x4, scale_x64),
+            );
             _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
             i += 4;
         }
@@ -256,7 +258,9 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     debug_assert_eq!(f.len(), b.len());
@@ -442,7 +446,9 @@ pub(super) unsafe fn bind_both_and_msg_split(
     n: usize,
 ) -> (F128, F128) {
     use crate::field::gf2_128::F256Unreduced;
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees features and that every slice covers `n`.

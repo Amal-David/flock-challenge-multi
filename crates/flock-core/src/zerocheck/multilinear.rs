@@ -125,7 +125,7 @@ fn duplicate_lookahead_inv_factors(r: F128) -> (F128, F128) {
 fn lookahead_inv_factors(r: F128) -> (F128, F128) {
     if dup_inv_elide_enabled() {
         let r_inv = r.inv();
-        (r_inv + F128::ONE, r_inv)
+        ((F128::ONE + r) * r_inv, r_inv)
     } else {
         duplicate_lookahead_inv_factors(r)
     }
@@ -1131,25 +1131,6 @@ fn packed_split_n_hi(n_vars: usize) -> usize {
     base.max(PACKED_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
-/// Build the split used by the packed round-two sweep. The no-materialize
-/// caller retains this tiny pair of tensors for the packed rounds-3+4 pass:
-/// its high coordinates are identical, while its low tensor is round two's
-/// low tensor with the first two coordinates marginalized out.
-pub(crate) fn packed_round2_split_eq(mlv_challenges: &[F128]) -> SplitEqGhash {
-    let n_vars = mlv_challenges.len() - 1;
-    SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars))
-}
-
-/// Remove the two least-significant coordinates from an eq tensor. In
-/// characteristic two, the four weights of those coordinates XOR to one, so
-/// each four-entry group collapses to the untouched suffix weight exactly.
-pub(crate) fn marginalize_eq_low2(eq: &[F128]) -> Vec<F128> {
-    assert!(eq.len().is_power_of_two() && eq.len() >= 4);
-    eq.chunks_exact(4)
-        .map(|v| v[0] + v[1] + v[2] + v[3])
-        .collect()
-}
-
 /// Round-two fused fold **plus** the deferred round-three coefficients.
 ///
 /// The folded tables and the round-two wire message are bit-identical to
@@ -1384,29 +1365,6 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (F128, F128, Round3Lookahead) {
-    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        table,
-        mlv_challenges,
-        padding,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    mlv_challenges: &[F128],
-    padding: &PaddingSpec,
-    eq_override: Option<&SplitEqGhash>,
-) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1441,14 +1399,8 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
-    let eq_owned;
-    let eq = if let Some(eq) = eq_override {
-        eq
-    } else {
-        let n_vars = mlv_challenges.len() - 1;
-        eq_owned = SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars));
-        &eq_owned
-    };
+    let n_vars = mlv_challenges.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -1588,26 +1540,6 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     rho2: F128,
     r_next4: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
-    fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-        a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    padding: &PaddingSpec,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-    eq_override: Option<(&[F128], &[F128])>,
-) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1689,20 +1621,15 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         "cascade lookahead requires a non-zero parity weight"
     );
 
-    let eq_owned;
-    let (eq_lo, eq_hi) = if let Some(eq) = eq_override {
-        eq
-    } else {
-        let n_vars = r_next4.len() - 1;
-        eq_owned = SplitEqGhash::with_n_hi(&r_next4[1..], packed_split_n_hi(n_vars));
-        (&eq_owned.lo[..], &eq_owned.hi[..])
-    };
-    let lo_size = eq_lo.len();
-    let hi_size = eq_hi.len();
+    let n_vars = r_next4.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], packed_split_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
     let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
     // functions of the odd eq_lo lanes, hoisted out of the sweep (the
     // companion CLMUL sat on the head of the chain feeding all eight
@@ -1723,6 +1650,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let wtab_arg = wtab_vec.as_deref();
+    let eq_hi = &eq.hi;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     // NT publish of the fold outputs: only when the outputs are too large to
@@ -1942,7 +1870,7 @@ pub(crate) fn round2_lookahead_chunk_scalar<const WRITE: bool>(
     debug_assert!(lo_size.is_multiple_of(2));
     let mut acc = [F256Unreduced::ZERO; 8];
 
-    let fold_pair = |x_lo: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| {
+    let mut fold_pair = |x_lo: usize, a_chunk: &mut [F128], b_chunk: &mut [F128]| {
         let x0l = 2 * x_lo;
         let x1l = x0l + 1;
         if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
@@ -2279,7 +2207,6 @@ pub(crate) fn fold_and_compute_round_pair_into_with_n_hi(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )))]
-        #[allow(unused_labels)] // Used by the aarch64-only early exits below.
         let (p1, pinf) = 'msg: {
             // Large rounds: fused fold + register-sourced message with
             // `stnp` output stores — no write-allocate, no reload. Value-
@@ -3642,7 +3569,7 @@ mod tests {
                 tail_n_hi_for(half)
             };
             assert!(n_hi <= SplitEqGhash::MAX_N_HI, "log_n={log_n}");
-            assert!(n_hi < log_n - 2, "log_n={log_n} n_hi={n_hi}");
+            assert!(n_hi + 1 <= log_n - 2, "log_n={log_n} n_hi={n_hi}");
         }
     }
 
@@ -3655,7 +3582,7 @@ mod tests {
             let n_hi = packed_split_n_hi(n_vars);
             let base = lookahead_n_hi(n_vars);
             assert!(n_hi >= base, "n_vars={n_vars} n_hi={n_hi} base={base}");
-            assert!(n_hi < n_vars, "n_vars={n_vars} n_hi={n_hi}");
+            assert!(n_hi + 1 <= n_vars, "n_vars={n_vars} n_hi={n_hi}");
             let n_lo = n_vars - n_hi;
             assert!(n_lo >= 1, "n_vars={n_vars} n_lo={n_lo}");
             let lo_size = 1usize << n_lo;

@@ -241,11 +241,6 @@ pub(crate) fn wide_hash_pool() -> &'static rayon::ThreadPool {
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-#[allow(
-    clippy::collapsible_if,
-    clippy::manual_is_multiple_of,
-    clippy::manual_slice_size_calculation
-)] // Preserve the ranked CPU control-flow and arithmetic source shape.
 fn finalize_commit(
     mut codeword: Vec<F128>,
     z_packed: &[F128],
@@ -735,11 +730,7 @@ pub(crate) fn lig_fused_commit_enabled() -> bool {
 /// caller finishes with `build_upper_levels(tree, n_leaves, n_leaves >>
 /// depth, kind)`. Bit-identical to encode-then-`fill_merkle_tree`: same
 /// leaves, same pair hashes, only the pass structure changes.
-#[allow(
-    clippy::manual_is_multiple_of,
-    clippy::manual_slice_size_calculation,
-    clippy::too_many_arguments
-)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_encode_leaves_subtree(
     ntt: &AdditiveNttF128,
     msg: &[F128],
@@ -853,7 +844,6 @@ pub(crate) fn build_upper_levels(
 /// yet, caller falls through to the pure-CPU path). Any failure AFTER the
 /// session starts is repaired here on the CPU (the codeword is always fully
 /// encoded by the CPU regardless of GPU health) and still returns `Some`.
-#[allow(clippy::ptr_arg)] // The owned Vec is pooled/truncated by this path.
 fn gpu_streamed_commit(
     ntt: &AdditiveNttF128,
     codeword: &mut Vec<F128>,
@@ -889,7 +879,7 @@ fn gpu_streamed_commit(
         gpu::merkle::begin(
             core::slice::from_raw_parts(cw_ptr, cw_len),
             leaf_size,
-            tree.as_mut_ptr(),
+            tree.as_mut_ptr() as *mut [u8; 32],
             tree.len(),
             stop_nodes,
         )
@@ -1104,7 +1094,7 @@ pub fn gpu_merkle_warmup_calibrate() {
             gpu::merkle::begin(
                 bytes,
                 leaf_size,
-                tree.as_mut_ptr(),
+                tree.as_mut_ptr() as *mut [u8; 32],
                 tree.len(),
                 2 * n_leaves, // leaves only — no parent levels in the probe
             )

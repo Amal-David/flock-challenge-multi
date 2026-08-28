@@ -342,7 +342,6 @@ fn deep_block_fuse_enabled() -> bool {
 /// binary. Resolved once per process; requires an even pool that covers
 /// exactly one logical CPU per sibling of each core, all inside this
 /// process's affinity set.
-#[allow(clippy::manual_is_multiple_of)]
 #[cfg(target_os = "linux")]
 fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
     static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
@@ -2570,7 +2569,6 @@ impl AdditiveNttF128 {
         }
     }
 
-    #[allow(clippy::manual_is_multiple_of)]
     fn seed_top_fused8_pass(
         &self,
         msg: &[F128],
@@ -3149,11 +3147,6 @@ impl AdditiveNttF128 {
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
     ))]
-    #[allow(
-        clippy::collapsible_if,
-        clippy::manual_option_zip,
-        clippy::unnecessary_unwrap
-    )]
     fn forward_transform_interleaved_parallel_from_layer_impl(
         &self,
         data: &mut [F128],
@@ -4491,7 +4484,6 @@ fn rate_seed_disabled() -> bool {
 /// `FLOCK_NO_SEED_NT=1` restores write-allocate stores in
 /// [`AdditiveNttF128::seed_layers_pair_from_msg`]. Read once per process;
 /// default ON (the ranked worker clears its env).
-#[allow(dead_code)] // Retained same-binary rollback selector.
 fn seed_nt_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SEED_NT").is_none());
@@ -6654,7 +6646,7 @@ mod zero_lane_ranked_ab_probe {
         // region; `start = 17` is exactly the three tail layers the
         // fused-three sweep replaces.
         for start in [17usize, 9, 3] {
-            let mut samples = (0..4).map(|_| Vec::with_capacity(reps)).collect::<Vec<_>>();
+            let mut samples = vec![Vec::with_capacity(reps); 4];
             for rep in 0..reps {
                 // Rotate the arm order every rep so no arm keeps the same
                 // position in the sequence (removes drift bias).

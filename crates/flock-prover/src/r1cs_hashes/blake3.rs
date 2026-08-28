@@ -1852,7 +1852,7 @@ fn generate_round1_inner_octa(
                                 inv_table,
                                 plan: win_plan,
                             }
-                        }).unwrap_unchecked();
+                        });
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2112,21 +2112,12 @@ pub(crate) mod witgen_simd {
     const ELIDE_B_TAIL_CHUNK: usize = 59;
     /// Leading skippable chunks of b's MAX prefix: words 0..32.
     const ELIDE_B_PREFIX_CHUNKS: usize = 4;
-    // Retained as byte-granular geometry oracles for rollback and differential
-    // probes even though the ranked producer now works in whole dump chunks.
-    #[allow(dead_code)]
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
-    #[allow(dead_code)]
     const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
-    #[allow(dead_code)]
     const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
-    #[allow(dead_code)]
     const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
-    #[allow(dead_code)]
     const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
-    #[allow(dead_code)]
     const B_ZERO_START_BYTE: usize = USEFUL_BITS.div_ceil(8); // 1927
-    #[allow(dead_code)]
     const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
     const _ELIDE_GEOMETRY: () = {
         // Skipped zero-tail words start at or after the zero fill's first
@@ -2239,16 +2230,12 @@ pub(crate) mod witgen_simd {
         *NT
     }
 
-    // Retained as the scalar/NEON rollback selector oracle.
-    #[allow(dead_code)]
     fn z_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
         *ON
     }
 
-    // Retained for exact selector differential tests.
-    #[allow(dead_code)]
     #[inline(always)]
     pub(super) const fn select_z_nt(
         nt_enabled: bool,
@@ -2270,28 +2257,30 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        let t0 = vtrn1q_u32(w0, w1);
-        let t1 = vtrn2q_u32(w0, w1);
-        let t2 = vtrn1q_u32(w2, w3);
-        let t3 = vtrn2q_u32(w2, w3);
-        (
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-        )
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -2508,12 +2497,14 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        let sum = vaddq_u32(x, y);
-        let cin = veorq_u32(veorq_u32(sum, x), y);
-        let left = veorq_u32(x, cin);
-        let right = veorq_u32(y, cin);
-        let carry = vandq_u32(left, right);
-        (sum, left, right, carry)
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -2522,8 +2513,10 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        let v = veorq_u32(x, y);
-        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
@@ -2532,7 +2525,7 @@ pub(crate) mod witgen_simd {
     /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
     /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
         inputs: [&Compression; 4],
         z: *mut u32,
@@ -3098,8 +3091,10 @@ impl Blake3Setup {
         // Gated to shapes where a GPU pipeline can actually engage; small
         // test setups skip all of it (and any machine without Metal exits
         // immediately inside the gpu module).
-        if r1cs.m >= 26 && flock_core::gpu::metal_available() {
-            flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
+        if r1cs.m >= 26 {
+            if flock_core::gpu::metal_available() {
+                flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
+            }
         }
         let pcs_params = PcsParams {
             m: r1cs.m,
@@ -3188,10 +3183,10 @@ impl Blake3Setup {
         // the proof for these blocks may already be in flight on the seed-pipe
         // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
         // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0
-            && let Some(adopted) = crate::seed_pipe::try_adopt(blocks)
-        {
-            return adopted;
+        if call > 0 {
+            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
+                return adopted;
+            }
         }
         // HOISTED (was below, after the loop and the final warm-up prove).
         // This is the call that sets `GENERATOR_VERIFIED`, which decides
@@ -4931,7 +4926,7 @@ mod tests {
         let b_bytes = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), b.len() * 16) };
         assert_eq!(a_bytes.len(), n_blocks * BYTES_PER_BLOCK);
         // per (w, b_med, K): (const_byte_mask, first_word) for a and b.
-        let census = |src: &[u8], name: &str| {
+        let mut census = |src: &[u8], name: &str| {
             let mut first = vec![0u64; 2 * 16 * 8];
             let mut varies = vec![0u8; 2 * 16 * 8]; // bit j set ⇒ byte j varies
             for blk in 0..n_blocks {

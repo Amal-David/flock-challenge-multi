@@ -2078,7 +2078,7 @@ pub(crate) fn induce_sumcheck_poly(
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
 
-    let mut partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
+    let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
         .into_par_iter()
         .map(|t| {
             let start = t * chunk_size;
@@ -2121,12 +2121,13 @@ pub(crate) fn induce_sumcheck_poly(
         })
         .collect();
 
-    // Reuse worker zero's complete partial as the output buffer. Starting from
-    // partial zero and adding workers 1.. in order is byte-identical to
-    // allocating/zeroing another `n`-element Vec and adding workers 0.., while
-    // deleting one full allocation, zero-fill, read and add pass.
-    debug_assert!(!partials.is_empty());
-    let (mut basis_poly, mut enforced_sum) = partials.remove(0);
+    // Reduce across threads. The cross-thread accumulation is parallelised
+    // over SLOTS (each slot still sums the partials in thread order, so the
+    // result is bit-identical): serially this is `n_threads · n` reads on ONE
+    // core — 16 MiB / 1M adds at the ranked open's level-1 shape
+    // (n = 2^16, 16 threads), measured ~3 ms of that level's ~4 ms.
+    let mut basis_poly = vec![F128::ZERO; n];
+    let mut enforced_sum = F128::ZERO;
     for (_, ls) in partials.iter() {
         enforced_sum += *ls;
     }
@@ -2938,7 +2939,6 @@ fn expand_singleton_into(
 
 /// One-nonzero window as a `(w, buf)` task result. Test oracle / densify
 /// scatter shape; production expands in place through [`expand_singleton_into`].
-#[allow(dead_code)] // Retained singleton expansion oracle.
 fn transpose_forward_ntt_window_singleton(
     ntt: &AdditiveNttF128,
     log_d: usize,
@@ -3540,7 +3540,7 @@ fn gpu_merkle_tree_for_open(
         crate::gpu::merkle::begin(
             data_bytes,
             leaf_size,
-            tree.as_mut_ptr(),
+            tree.as_mut_ptr() as *mut [u8; 32],
             tree.len(),
             GPU_OPEN_STOP_NODES,
         )
@@ -4117,7 +4117,6 @@ fn open_ood_x4_enabled() -> bool {
 /// baseline.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[allow(dead_code)] // Retained same-binary non-temporal publish rollback.
 unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     use core::arch::x86_64::*;
     // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
@@ -4541,7 +4540,6 @@ fn mdf4_pf_enabled() -> bool {
 }
 
 #[inline]
-#[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
 fn eval_fold8_lookahead4(
     coefficients: &super::Fold8Lookahead4,
     r0: F128,
@@ -4556,7 +4554,6 @@ fn eval_fold8_lookahead4(
 }
 
 #[inline]
-#[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
 fn eval_fold8_lookahead5(
     coefficients: &super::Fold8Lookahead5,
     r0: F128,
@@ -4833,7 +4830,6 @@ fn materialize_direct_fold4(
 /// claims contain AB and optionally C in sufficient-stat form; a non-empty
 /// ordinary basis is the direct-AB-only fallback. All contributions already
 /// have their ring-switch batching challenge baked in.
-#[allow(clippy::assign_op_pattern)] // Preserve the hand-scheduled indexed stores.
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -5892,7 +5888,6 @@ fn direct_fold8_b_gfni_enabled() -> bool {
 /// no challenger: the early arm can only compute (not observe) the future
 /// root.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields are consumed only by the ranked AVX-512 route.
 struct DirectFold8L1Precommit {
     log_msg_cols: usize,
     log_num_interleaved: usize,
@@ -5905,10 +5900,10 @@ struct DirectFold8L1Precommit {
 /// inside materialize_direct_fold8; every other geometry keeps the incumbent
 /// single fused f+b pass.
 #[inline]
-#[allow(dead_code)] // Selector is consumed only by the ranked AVX-512 route.
 fn direct_fold8_l1_precommit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none()
+    });
     *ON
 }
 
@@ -5953,7 +5948,12 @@ fn materialize_direct_fold8_f_for_precommit(
                         m4,
                         fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
+                    crate::field::f128_slice::fold4_nested(
+                        m4,
+                        &mut f_out[slot..slot + n],
+                        r4,
+                        r5,
+                    );
                     slot += n;
                 }
             },
@@ -5987,7 +5987,8 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     assert!(block_len.is_multiple_of(64));
     assert_eq!(folded_b.len(), folded_f.len());
     assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
+        claim.eq_lo.len() == block_len
+            && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
     let direct_tables: Vec<Vec<F128>> = claims
@@ -6021,12 +6022,16 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
+                let cols0 = super::ring_switch::compose_block_cols(
+                    &direct_tables[0],
+                    claim0.eq_hi[block],
+                );
                 let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                 let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
+                let cols1 = super::ring_switch::compose_block_cols(
+                    &direct_tables[1],
+                    claim1.eq_hi[block],
+                );
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
@@ -6079,7 +6084,12 @@ fn materialize_direct_fold8(
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
     l1_precommit: Option<DirectFold8L1Precommit>,
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage, Option<LigeroWitness>) {
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    SumcheckMessage,
+    Option<LigeroWitness>,
+) {
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
@@ -6142,7 +6152,8 @@ fn materialize_direct_fold8(
         if let Some(precommit) = l1_precommit {
             assert_eq!(
                 out_len,
-                (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
+                (1usize << precommit.log_msg_cols)
+                    * (1usize << precommit.log_num_interleaved)
             );
             let mut folded_f = crate::scratch::take_f128(out_len);
             materialize_direct_fold8_f_for_precommit(
@@ -6161,8 +6172,9 @@ fn materialize_direct_fold8(
 
             let (precommitted, (folded_b, msg)) = rayon::join(
                 || {
-                    let ntt =
-                        AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
+                    let ntt = AdditiveNttF128::standard(
+                        precommit.log_msg_cols + precommit.log_inv_rate,
+                    );
                     ligero_commit(
                         &folded_f,
                         precommit.log_msg_cols,
@@ -6174,7 +6186,11 @@ fn materialize_direct_fold8(
                 },
                 || {
                     materialize_direct_fold8_b_gfni_for_precommit(
-                        &folded_f, folded_b, claims, challenges, block_len,
+                        &folded_f,
+                        folded_b,
+                        claims,
+                        challenges,
+                        block_len,
                     )
                 },
             );
@@ -7222,8 +7238,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
     round3_lookahead: Option<super::Fold4Lookahead3>,
-    _round4_lookahead: Option<super::Fold8Lookahead4>,
-    _round5_lookahead: Option<super::Fold8Lookahead5>,
+    round4_lookahead: Option<super::Fold8Lookahead4>,
+    round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
@@ -7349,9 +7365,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         && direct_fold8_l1_precommit_enabled()
         && direct_fold8_b_gfni_enabled()
         && b_initial.as_ref().is_some_and(|basis| basis.is_empty())
-        && direct_fold8
-            .as_ref()
-            .is_some_and(|claims| claims.len() == 2 && claims[0].eq_lo.len().is_multiple_of(64));
+        && direct_fold8.as_ref().is_some_and(|claims| {
+            claims.len() == 2 && claims[0].eq_lo.len().is_multiple_of(64)
+        });
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
