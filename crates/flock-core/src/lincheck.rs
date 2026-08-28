@@ -1097,6 +1097,51 @@ fn lc_zfold_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// Block-major row stride, in `F128`, at the ranked shape: `k = 2^14`, so
+/// `chunks_per_block = k / 128 = 128`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+const LC_RANKED_CHUNKS_PER_BLOCK: usize = 128;
+
+/// Sixteen T0 hints on the consecutive block-major rows `base .. base + 16`
+/// (row stride `chunks_per_block` F128). The `ranked` arm exists only so the
+/// stride is an immediate: identical addresses, identical order.
+///
+/// The sweep's row stride is `chunks_per_block = k / 128`, a value the
+/// compiler only sees at run time, so each of the sixteen hints a spread
+/// block issues rebuilds its own address with `lea` + `imul` + `shl`. At the
+/// ranked shape that value is the constant 128 and the sixteen rows are
+/// consecutive: handing the constant to the addressing collapses the whole
+/// block to one base register plus fifteen `disp32`. Same sixteen lines, same
+/// order, same look-ahead — a prefetch has no architectural effect and none
+/// of the folded values are touched, so `ẑ` is bit-identical either way.
+///
+/// # Safety
+/// `base .. base + 15 * chunks_per_block` must lie inside the witness
+/// allocation. A prefetch never dereferences, but the pointer arithmetic
+/// itself must stay in bounds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
+unsafe fn lc_prefetch_rows16(base: *const F128, chunks_per_block: usize, ranked: bool) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: bounds per the contract.
+    unsafe {
+        if ranked {
+            for i in 0..16 {
+                _mm_prefetch(
+                    base.add(i * LC_RANKED_CHUNKS_PER_BLOCK).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+        } else {
+            let mut p = base;
+            for _ in 0..16 {
+                _mm_prefetch(p.cast::<i8>(), _MM_HINT_T0);
+                p = p.add(chunks_per_block);
+            }
+        }
+    }
+}
+
 #[allow(dead_code)] // Retained same-binary rollback selector.
 fn lc_gather_tr_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -1487,6 +1532,10 @@ fn fold_block_major_gfni(
             };
             #[cfg(target_feature = "avx512vbmi")]
             let pf_spread = lc_zfold_pf_spread_enabled();
+            // Ranked-stride addressing, resolved once per worker (never
+            // inside the tile / chunk / stripe loops).
+            #[cfg(target_feature = "avx512vbmi")]
+            let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1551,25 +1600,25 @@ fn fold_block_major_gfni(
                             if pf_far && pf_spread {
                                 let qn = q + pf_chunks;
                                 if qn <= full_chunks && qn < chunks_per_block {
-                                    for t in 2 * c..2 * c + 2 {
-                                        let outer_base = 8 * (stripe_base + t);
-                                        // SAFETY: the same indices the gather
-                                        // reads on a later grouped visit; a
-                                        // prefetch never dereferences.
-                                        unsafe {
-                                            for r in 0..8 {
-                                                core::arch::x86_64::_mm_prefetch(
-                                                    z_packed
-                                                        .as_ptr()
-                                                        .add(
-                                                            (outer_base + r) * chunks_per_block
-                                                                + qn,
-                                                        )
-                                                        .cast::<i8>(),
-                                                    core::arch::x86_64::_MM_HINT_T0,
-                                                );
-                                            }
-                                        }
+                                    // Stripes 2c and 2c+1 are the SIXTEEN
+                                    // consecutive rows 8*stripe_base + 16c ..
+                                    // + 16, so one base pointer and a fixed
+                                    // row stride reach every hint the two
+                                    // eight-row blocks used to address one at
+                                    // a time. Same sixteen lines, same order.
+                                    // SAFETY: those rows are inside this
+                                    // tile's 64 and `qn < chunks_per_block`
+                                    // keeps the column inside the block, so
+                                    // every address the helper forms is in
+                                    // bounds; a prefetch never dereferences.
+                                    unsafe {
+                                        lc_prefetch_rows16(
+                                            z_packed.as_ptr().add(
+                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
+                                            ),
+                                            chunks_per_block,
+                                            cpb_ranked,
+                                        );
                                     }
                                 }
                             }
@@ -1689,8 +1738,23 @@ fn fold_block_major_gfni(
             o.fill(F128::ZERO);
         }
         if let Some(r) = top_bind {
-            let mut hi = [F128::ZERO; 64];
             let hi_blk = blk + k / 128;
+            // The zero-fill is dead on the live-block arm and load-bearing on
+            // the padding arm, so it moves into the `else` rather than being
+            // deleted. `reduce_worker_plane_block` writes all sixty-four
+            // entries and reads none: its 8x8 transpose stores
+            // `out[group * 8 + col]` for every `(group, col)` pair, and its
+            // empty-`active_workers` early return fills the whole slice. The
+            // padding arm has no backing plane writes, and `bind_split_half`
+            // *reads* the canonical algebraic zero there, so that arm must
+            // still clear. At the ranked shape 241 of 256 blocks take the
+            // live arm.
+            let mut hi_uninit = core::mem::MaybeUninit::<[F128; 64]>::uninit();
+            // SAFETY: `F128` is a plain `{ lo: u64, hi: u64 }` — no niches,
+            // no padding — so the slot is correctly sized and aligned for
+            // `[F128; 64]`, and both arms below initialize all sixty-four
+            // entries before `bind_split_half` reads any of them.
+            let hi: &mut [F128; 64] = unsafe { &mut *hi_uninit.as_mut_ptr() };
             if hi_blk < live_blocks {
                 // SAFETY: identical to the low-block call above; `hi_blk` is
                 // explicitly constrained to the fully stored live range.
@@ -1700,11 +1764,13 @@ fn fold_block_major_gfni(
                         worker_stride,
                         &active_workers,
                         hi_blk,
-                        &mut hi,
+                        hi,
                     );
                 }
+            } else {
+                hi.fill(F128::ZERO);
             }
-            crate::field::f128_slice::bind_split_half(o, &hi, r);
+            crate::field::f128_slice::bind_split_half(o, hi, r);
         }
     });
     out
@@ -2838,7 +2904,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _, _) = prove_padded_inner(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2846,10 +2912,112 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
+}
+
+/// Which form of lincheck's z table the caller wants back.
+///
+/// The PCS open needs the AB claim's ring-switch `s_hat_v`. Today the prover
+/// gets it by cloning the whole pre-sumcheck `z_vec` and then folding that
+/// clone down with `s_hat_v_fold8_from_z_vec`. At the ranked geometry that
+/// fold is **exactly this sumcheck's first top bind** — see
+/// [`ZCaptureMode::RankedFold8Tail`] — so the statistic can be read straight
+/// out of round 0 instead, deleting the clone's larger half and the whole
+/// fold pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZCaptureMode {
+    /// Return nothing.
+    None,
+    /// Return the pre-sumcheck table, length `2^k_log`.
+    PreSumcheck,
+    /// Return the table **after the first top bind**, length `2^(k_log - 1)`,
+    /// which at the ranked shape already IS the 64-bank AB statistic.
+    ///
+    /// `s_hat_v_fold8_from_z_vec(z_pre, tail)` with `tail.len() == 7` takes
+    /// `r = tail[6]`, splits `z_pre` at `64 * 2^LOG_PACKING`, and writes
+    /// `out[j] = even + r * (even + odd)`. Round 0 of this sumcheck splits
+    /// `z_vec` at `z_vec.len() / 2` and writes `*z0 = *z0 + r0 * (*z2 + *z0)`.
+    /// With `inner_rest_len == 8` the two halves coincide
+    /// (`z_vec.len() == 2^LOG_PACKING * 2^7`, so `len/2 == 64 * 2^LOG_PACKING`)
+    /// and the two challenges coincide as well, because
+    /// `tail[6] == r_inner_rest[7] == r_rounds[inner_rest_len - 1 - 7] == r_rounds[0]`.
+    /// Same halves, same challenge, same expression ⇒ same field elements.
+    ///
+    /// Requested, never assumed: if the shape does not match exactly, the
+    /// prover falls back to [`ZCaptureMode::PreSumcheck`] and says so in its
+    /// return value.
+    RankedFold8Tail,
+}
+
+/// [`prove_padded_capture_z_vec`] with an explicit capture mode. Returns the
+/// mode that was actually honoured — callers must branch on that, not on what
+/// they asked for.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(capture != ZCaptureMode::None, "capture mode must not be None");
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
+}
+
+/// Block-major counterpart of [`prove_padded_capture_z_vec_mode`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(capture != ZCaptureMode::None, "capture mode must not be None");
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
 }
 
 /// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
@@ -2871,7 +3039,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured, _actual) = prove_padded_inner(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2879,13 +3047,14 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
+    debug_assert_eq!(_actual, ZCaptureMode::PreSumcheck);
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture must produce z_vec"),
     )
 }
 
@@ -2903,7 +3072,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured, _actual) = prove_padded_inner(
         PackedZ::BlockMajor(z_packed),
         m,
         k_log,
@@ -2911,13 +3080,14 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
+    debug_assert_eq!(_actual, ZCaptureMode::PreSumcheck);
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture must produce z_vec"),
     )
 }
 
@@ -2930,9 +3100,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture: ZCaptureMode,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>, ZCaptureMode) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -3066,14 +3236,31 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
+    // 3b. Optional capture for the PCS open's AB-claim `s_hat_v`.
+    //
+    //     `RankedFold8Tail` asks for the table AFTER round 0's bind instead of
+    //     the pre-sumcheck table, because at that shape the downstream fold
+    //     `s_hat_v_fold8_from_z_vec` and round 0's bind are the same map on
+    //     the same halves with the same challenge (see [`ZCaptureMode`]).
+    //     Honour it only when the shape makes that exact, and report back
+    //     which mode actually ran.
+    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+        && inner_rest_len == 8
+        && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
+    let actual_capture = if fold8_ready {
+        ZCaptureMode::RankedFold8Tail
+    } else if capture == ZCaptureMode::None {
+        ZCaptureMode::None
     } else {
-        None
+        ZCaptureMode::PreSumcheck
     };
+    let mut captured_z_vec: Option<Vec<F128>> =
+        if capture == ZCaptureMode::None || fold8_ready {
+            // `fold8_ready` takes its snapshot below, after round 0.
+            None
+        } else {
+            Some(z_vec.clone())
+        };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -3107,6 +3294,13 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if fold8_ready && t == 0 {
+                // Round 0 has just written the fold's own output into the low
+                // half of `z_vec` and truncated to it. Half the clone the
+                // pre-sumcheck capture paid, and the fold pass never runs.
+                debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -3146,7 +3340,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim, captured_z_vec, actual_capture)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
