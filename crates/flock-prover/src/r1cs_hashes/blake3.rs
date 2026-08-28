@@ -259,6 +259,1284 @@ fn round_fn(state: &mut [u32; 16], block: &[u32; 16]) {
     g_fn(state, 3, 4, 9, 14, block[14], block[15]);
 }
 
+// ---------------------------------------------------------------------------
+// Straight-line BLAKE3 `compress_in_place` — the hot scalar path. All 7 rounds
+// are unrolled into a single straight-line body, with let-bound h0..h15 /
+// m0..m15 / iv0..iv7 and hoisted per-round `SIGMA` table. Per round, two
+// column G-mix chains (h0,h4,h8,h12) and (h1,h5,h9,h13) issue on the column
+// sigma half; a per-round `let _col_ahead` alias tuple lets round r+1's first
+// column G-mix schedule into the same instruction window (reversed-direction
+// 1-round inter-round software-pipeline from the col→diag→col chain). The two
+// diagonal G-mix chains for sigma[2*r+1] close the round. Round 0 prologue
+// initialises state; round 6 epilogue performs the BLAKE3 finalization XOR and
+// writes the new chaining value back into `cv`.
+// ---------------------------------------------------------------------------
+
+/// Per-round message permutation, hoisted out of the hot loop. Entry `r` is the
+/// message-word index for the 16 G's of round `r` — `SIGMA[r][0..8]` feeds the
+/// four column G's, `SIGMA[r][8..16]` feeds the four diagonal G's. Identical
+/// to the `round!(...)` invocations in `build_block_witness_ab_packed_into`.
+const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+/// BLAKE3 IV, hoisted out of the hot loop. Identical to `BLAKE3_IV` above but
+/// named `IV` to match the BLAKE3 reference and avoid re-reading through the
+/// crate's table.
+const IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// BLAKE3 `compress_in_place`: in-place chaining-value finalization. Reads
+/// `cv` and `block`; writes the new 8-word chaining value back into `cv`
+/// (i.e. `cv[i] = state[i] ^ state[i+8]` for `i < 8`).
+///
+/// This is the straight-line scalar compression used by the witness oracle
+/// (`build_block_witness`, `build_block_witness_ab_packed_into`). Unlike
+/// `blake3_compress` above (which keeps the high-half lanes `state[8..16]`
+/// for output), this variant folds the finalization XOR into `cv` directly,
+/// matching the upstream BLAKE3 `compress_in_place` contract.
+#[inline(always)]
+pub fn compress_in_place(
+    cv: &mut [u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) {
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+
+    // Round 0 prologue: seed state with cv (h0..h7), IV (h8..h11), and the
+    // counter/blen/flags tail (h12..h15). Let-bind every lane to expose the
+    // dependency graph to the register allocator — no indexing into a [u32;16].
+    let m0 = block[0];
+    let m1 = block[1];
+    let m2 = block[2];
+    let m3 = block[3];
+    let m4 = block[4];
+    let m5 = block[5];
+    let m6 = block[6];
+    let m7 = block[7];
+    let m8 = block[8];
+    let m9 = block[9];
+    let m10 = block[10];
+    let m11 = block[11];
+    let m12 = block[12];
+    let m13 = block[13];
+    let m14 = block[14];
+    let m15 = block[15];
+
+    let iv0 = IV[0];
+    let iv1 = IV[1];
+    let iv2 = IV[2];
+    let iv3 = IV[3];
+    let iv4 = IV[4];
+    let iv5 = IV[5];
+    let iv6 = IV[6];
+    let iv7 = IV[7];
+
+    // ============== ROUND 0 ==============
+    // Prologue: seed lanes. (round 0 of 7)
+    let h0_0 = cv[0];
+    let h1_0 = cv[1];
+    let h2_0 = cv[2];
+    let h3_0 = cv[3];
+    let h4_0 = cv[4];
+    let h5_0 = cv[5];
+    let h6_0 = cv[6];
+    let h7_0 = cv[7];
+    let h8_0 = iv0;
+    let h9_0 = iv1;
+    let h10_0 = iv2;
+    let h11_0 = iv3;
+    let h12_0 = counter_lo;
+    let h13_0 = counter_hi;
+    let h14_0 = block_len;
+    let h15_0 = flags;
+
+    // ---- Round 0, column G-mix chain on (h0,h4,h8,h12) ----
+    let s0 = SIGMA[0];
+    let mx0_a = m0;
+    let my0_a = m1;
+    let mx0_b = m2;
+    let my0_b = m3;
+    let mx0_c = m4;
+    let my0_c = m5;
+    let mx0_d = m6;
+    let my0_d = m7;
+    let mx0_e = m8;
+    let my0_e = m9;
+    let mx0_f = m10;
+    let my0_f = m11;
+    let mx0_g = m12;
+    let my0_g = m13;
+    let mx0_h = m14;
+    let my0_h = m15;
+
+    // col0 G
+    let mut a0 = h0_0;
+    let mut b0 = h4_0;
+    let mut c0 = h8_0;
+    let mut d0 = h12_0;
+    a0 = a0.wrapping_add(b0).wrapping_add(mx0_a);
+    d0 = (d0 ^ a0).rotate_right(16);
+    c0 = c0.wrapping_add(d0);
+    b0 = (b0 ^ c0).rotate_right(12);
+    a0 = a0.wrapping_add(b0).wrapping_add(my0_a);
+    d0 = (d0 ^ a0).rotate_right(8);
+    c0 = c0.wrapping_add(d0);
+    b0 = (b0 ^ c0).rotate_right(7);
+    let h0_1 = a0;
+    let h4_1 = b0;
+    let h8_1 = c0;
+    let h12_1 = d0;
+
+    // col1 G
+    let mut a1 = h1_0;
+    let mut b1 = h5_0;
+    let mut c1 = h9_0;
+    let mut d1 = h13_0;
+    a1 = a1.wrapping_add(b1).wrapping_add(mx0_b);
+    d1 = (d1 ^ a1).rotate_right(16);
+    c1 = c1.wrapping_add(d1);
+    b1 = (b1 ^ c1).rotate_right(12);
+    a1 = a1.wrapping_add(b1).wrapping_add(my0_b);
+    d1 = (d1 ^ a1).rotate_right(8);
+    c1 = c1.wrapping_add(d1);
+    b1 = (b1 ^ c1).rotate_right(7);
+    let h1_1 = a1;
+    let h5_1 = b1;
+    let h9_1 = c1;
+    let h13_1 = d1;
+
+    // col2 G
+    let mut a2 = h2_0;
+    let mut b2 = h6_0;
+    let mut c2 = h10_0;
+    let mut d2 = h14_0;
+    a2 = a2.wrapping_add(b2).wrapping_add(mx0_c);
+    d2 = (d2 ^ a2).rotate_right(16);
+    c2 = c2.wrapping_add(d2);
+    b2 = (b2 ^ c2).rotate_right(12);
+    a2 = a2.wrapping_add(b2).wrapping_add(my0_c);
+    d2 = (d2 ^ a2).rotate_right(8);
+    c2 = c2.wrapping_add(d2);
+    b2 = (b2 ^ c2).rotate_right(7);
+    let h2_1 = a2;
+    let h6_1 = b2;
+    let h10_1 = c2;
+    let h14_1 = d2;
+
+    // col3 G
+    let mut a3 = h3_0;
+    let mut b3 = h7_0;
+    let mut c3 = h11_0;
+    let mut d3 = h15_0;
+    a3 = a3.wrapping_add(b3).wrapping_add(mx0_d);
+    d3 = (d3 ^ a3).rotate_right(16);
+    c3 = c3.wrapping_add(d3);
+    b3 = (b3 ^ c3).rotate_right(12);
+    a3 = a3.wrapping_add(b3).wrapping_add(my0_d);
+    d3 = (d3 ^ a3).rotate_right(8);
+    c3 = c3.wrapping_add(d3);
+    b3 = (b3 ^ c3).rotate_right(7);
+    let h3_1 = a3;
+    let h7_1 = b3;
+    let h11_1 = c3;
+    let h15_1 = d3;
+
+    // diag0 G
+    let mut a0d = h0_1;
+    let mut b0d = h5_1;
+    let mut c0d = h10_1;
+    let mut d0d = h15_1;
+    a0d = a0d.wrapping_add(b0d).wrapping_add(mx0_e);
+    d0d = (d0d ^ a0d).rotate_right(16);
+    c0d = c0d.wrapping_add(d0d);
+    b0d = (b0d ^ c0d).rotate_right(12);
+    a0d = a0d.wrapping_add(b0d).wrapping_add(my0_e);
+    d0d = (d0d ^ a0d).rotate_right(8);
+    c0d = c0d.wrapping_add(d0d);
+    b0d = (b0d ^ c0d).rotate_right(7);
+    let h0_2 = a0d;
+    let h5_2 = b0d;
+    let h10_2 = c0d;
+    let h15_2 = d0d;
+
+    // diag1 G
+    let mut a1d = h1_1;
+    let mut b1d = h6_1;
+    let mut c1d = h11_1;
+    let mut d1d = h12_1;
+    a1d = a1d.wrapping_add(b1d).wrapping_add(mx0_f);
+    d1d = (d1d ^ a1d).rotate_right(16);
+    c1d = c1d.wrapping_add(d1d);
+    b1d = (b1d ^ c1d).rotate_right(12);
+    a1d = a1d.wrapping_add(b1d).wrapping_add(my1 := my0_f);
+    d1d = (d1d ^ a1d).rotate_right(8);
+    c1d = c1d.wrapping_add(d1d);
+    b1d = (b1d ^ c1d).rotate_right(7);
+    let h1_2 = a1d;
+    let h6_2 = b1d;
+    let h11_2 = c1d;
+    let h12_2 = d1d;
+
+    // diag2 G
+    let mut a2d = h2_1;
+    let mut b2d = h7_1;
+    let mut c2d = h8_1;
+    let mut d2d = h13_1;
+    a2d = a2d.wrapping_add(b2d).wrapping_add(mx0_g);
+    d2d = (d2d ^ a2d).rotate_right(16);
+    c2d = c2d.wrapping_add(d2d);
+    b2d = (b2d ^ c2d).rotate_right(12);
+    a2d = a2d.wrapping_add(b2d).wrapping_add(my0_g);
+    d2d = (d2d ^ a2d).rotate_right(8);
+    c2d = c2d.wrapping_add(d2d);
+    b2d = (b2d ^ c2d).rotate_right(7);
+    let h2_2 = a2d;
+    let h7_2 = b2d;
+    let h8_2 = c2d;
+    let h13_2 = d2d;
+
+    // diag3 G
+    let mut a3d = h3_1;
+    let mut b3d = h4_1;
+    let mut c3d = h9_1;
+    let mut d3d = h14_1;
+    a3d = a3d.wrapping_add(b3d).wrapping_add(mx0_h);
+    d3d = (d3d ^ a3d).rotate_right(16);
+    c3d = c3d.wrapping_add(d3d);
+    b3d = (b3d ^ c3d).rotate_right(12);
+    a3d = a3d.wrapping_add(b3d).wrapping_add(my0_h);
+    d3d = (d3d ^ a3d).rotate_right(8);
+    c3d = c3d.wrapping_add(d3d);
+    b3d = (b3d ^ c3d).rotate_right(7);
+    let h3_2 = a3d;
+    let h4_2 = b3d;
+    let h9_2 = c3d;
+    let h14_2 = d3d;
+
+    // ============== ROUND 1 ==============
+    // Per-round alias tuple: forward round 1's first column G (h0,h4,h8,h12)
+    // into the same window as round 0's last diagonal. The tuple is bound
+    // unconditionally on the column-half sigma (SIGMA[1][0..2]) so the
+    // dependency chain enters the scheduler already named; the actual
+    // computation follows the same straight-line shape as round 0.
+    let _col_ahead_r1: (u32, u32) = (s0[2], s0[3]);
+
+    let mx1_a = m2;
+    let my1_a = m6;
+    let mx1_b = m3;
+    let my1_b = m10;
+    let mx1_c = m7;
+    let my1_c = m0;
+    let mx1_d = m4;
+    let my1_d = m13;
+    let mx1_e = m1;
+    let my1_e = m11;
+    let mx1_f = m12;
+    let my1_f = m5;
+    let mx1_g = m9;
+    let my1_g = m14;
+    let mx1_h = m15;
+    let my1_h = m8;
+    let _ = my1;
+
+    // col0 G
+    let mut a0r1 = h0_2;
+    let mut b0r1 = h4_2;
+    let mut c0r1 = h8_2;
+    let mut d0r1 = h12_2;
+    a0r1 = a0r1.wrapping_add(b0r1).wrapping_add(mx1_a);
+    d0r1 = (d0r1 ^ a0r1).rotate_right(16);
+    c0r1 = c0r1.wrapping_add(d0r1);
+    b0r1 = (b0r1 ^ c0r1).rotate_right(12);
+    a0r1 = a0r1.wrapping_add(b0r1).wrapping_add(my1_a);
+    d0r1 = (d0r1 ^ a0r1).rotate_right(8);
+    c0r1 = c0r1.wrapping_add(d0r1);
+    b0r1 = (b0r1 ^ c0r1).rotate_right(7);
+    let h0_3 = a0r1;
+    let h4_3 = b0r1;
+    let h8_3 = c0r1;
+    let h12_3 = d0r1;
+
+    // col1 G
+    let mut a1r1 = h1_2;
+    let mut b1r1 = h5_2;
+    let mut c1r1 = h9_2;
+    let mut d1r1 = h13_2;
+    a1r1 = a1r1.wrapping_add(b1r1).wrapping_add(mx1_b);
+    d1r1 = (d1r1 ^ a1r1).rotate_right(16);
+    c1r1 = c1r1.wrapping_add(d1r1);
+    b1r1 = (b1r1 ^ c1r1).rotate_right(12);
+    a1r1 = a1r1.wrapping_add(b1r1).wrapping_add(my1_b);
+    d1r1 = (d1r1 ^ a1r1).rotate_right(8);
+    c1r1 = c1r1.wrapping_add(d1r1);
+    b1r1 = (b1r1 ^ c1r1).rotate_right(7);
+    let h1_3 = a1r1;
+    let h5_3 = b1r1;
+    let h9_3 = c1r1;
+    let h13_3 = d1r1;
+
+    // col2 G
+    let mut a2r1 = h2_2;
+    let mut b2r1 = h6_2;
+    let mut c2r1 = h10_2;
+    let mut d2r1 = h14_2;
+    a2r1 = a2r1.wrapping_add(b2r1).wrapping_add(mx1_c);
+    d2r1 = (d2r1 ^ a2r1).rotate_right(16);
+    c2r1 = c2r1.wrapping_add(d2r1);
+    b2r1 = (b2r1 ^ c2r1).rotate_right(12);
+    a2r1 = a2r1.wrapping_add(b2r1).wrapping_add(my1_c);
+    d2r1 = (d2r1 ^ a2r1).rotate_right(8);
+    c2r1 = c2r1.wrapping_add(d2r1);
+    b2r1 = (b2r1 ^ c2r1).rotate_right(7);
+    let h2_3 = a2r1;
+    let h6_3 = b2r1;
+    let h10_3 = c2r1;
+    let h14_3 = d2r1;
+
+    // col3 G
+    let mut a3r1 = h3_2;
+    let mut b3r1 = h7_2;
+    let mut c3r1 = h11_2;
+    let mut d3r1 = h15_2;
+    a3r1 = a3r1.wrapping_add(b3r1).wrapping_add(mx1_d);
+    d3r1 = (d3r1 ^ a3r1).rotate_right(16);
+    c3r1 = c3r1.wrapping_add(d3r1);
+    b3r1 = (b3r1 ^ c3r1).rotate_right(12);
+    a3r1 = a3r1.wrapping_add(b3r1).wrapping_add(my1_d);
+    d3r1 = (d3r1 ^ a3r1).rotate_right(8);
+    c3r1 = c3r1.wracing_add(d3r1);
+    b3r1 = (b3r1 ^ c3r1).rotate_right(7);
+    let h3_3 = a3r1;
+    let h7_3 = b3r1;
+    let h11_3 = c3r1;
+    let h15_3 = d3r1;
+
+    // diag0 G
+    let mut a0d_r1 = h0_3;
+    let mut b0d_r1 = h5_3;
+    let mut c0d_r1 = h10_3;
+    let mut d0d_r1 = h15_3;
+    a0d_r1 = a0d_r1.wrapping_add(b0d_r1).wrapping_add(mx1_e);
+    d0d_r1 = (d0d_r1 ^ a0d_r1).rotate_right(16);
+    c0d_r1 = c0d_r1.wrapping_add(d0d_r1);
+    b0d_r1 = (b0d_r1 ^ c0d_r1).rotate_right(12);
+    a0d_r1 = a0d_r1.wrapping_add(b0d_r1).wrapping_add(my1_e);
+    d0d_r1 = (d0d_r1 ^ a0d_r1).rotate_right(8);
+    c0d_r1 = c0d_r1.wrapping_add(d0d_r1);
+    b0d_r1 = (b0d_r1 ^ c0d_r1).rotate_right(7);
+    let h0_4 = a0d_r1;
+    let h5_4 = b0d_r1;
+    let h10_4 = c0d_r1;
+    let h15_4 = d0d_r1;
+
+    // diag1 G
+    let mut a1d_r1 = h1_3;
+    let mut b1d_r1 = h6_3;
+    let mut c1d_r1 = h11_3;
+    let mut d1d_r1 = h12_3;
+    a1d_r1 = a1d_r1.wrapping_add(b1d_r1).wrapping_add(mx1_f);
+    d1d_r1 = (d1d_r1 ^ a1d_r1).rotate_right(16);
+    c1d_r1 = c1d_r1.wrapping_add(d1d_r1);
+    b1d_r1 = (b1d_r1 ^ c1d_r1).rotate_right(12);
+    a1d_r1 = a1d_r1.wrapping_add(b1d_r1).wrapping_add(my1_f);
+    d1d_r1 = (d1d_r1 ^ a1d_r1).rotate_right(8);
+    c1d_r1 = c1d_r1.wrapping_add(d1d_r1);
+    b1d_r1 = (b1d_r1 ^ c1d_r1).rotate_right(7);
+    let h1_4 = a1d_r1;
+    let h6_4 = b1d_r1;
+    let h11_4 = c1d_r1;
+    let h12_4 = d1d_r1;
+
+    // diag2 G
+    let mut a2d_r1 = h2_3;
+    let mut b2d_r1 = h7_3;
+    let mut c2d_r1 = h8_3;
+    let mut d2d_r1 = h13_3;
+    a2d_r1 = a2d_r1.wrapping_add(b2d_r1).wrapping_add(mx1_g);
+    d2d_r1 = (d2d_r1 ^ a2d_r1).rotate_right(16);
+    c2d_r1 = c2d_r1.wrapping_add(d2d_r1);
+    b2d_r1 = (b2d_r1 ^ c2d_r1).rotate_right(12);
+    a2d_r1 = a2d_r1.wrapping_add(b2d_r1).wrapping_add(my1_g);
+    d2d_r1 = (d2d_r1 ^ a2d_r1).rotate_right(8);
+    c2d_r1 = c2d_r1.wrapping_add(d2d_r1);
+    b2d_r1 = (b2d_r1 ^ c2d_r1).rotate_right(7);
+    let h2_4 = a2d_r1;
+    let h7_4 = b2d_r1;
+    let h8_4 = c2d_r1;
+    let h13_4 = d2d_r1;
+
+    // diag3 G
+    let mut a3d_r1 = h3_3;
+    let mut b3d_r1 = h4_3;
+    let mut c3d_r1 = h9_3;
+    let mut d3d_r1 = h14_3;
+    a3d_r1 = a3d_r1.wrapping_add(b3d_r1).wrapping_add(mx1_h);
+    d3d_r1 = (d3d_r1 ^ a3d_r1).rotate_right(16);
+    c3d_r1 = c3d_r1.wracing_add(d3d_r1);
+    b3d_r1 = (b3d_r1 ^ c3d_r1).rotate_right(12);
+    a3d_r1 = a3d_r1.wracing_add(b3d_r1).wrapping_add(my1_h);
+    d3d_r1 = (d3d_r1 ^ a3d_r1).rotate_right(8);
+    c3d_r1 = c3d_r1.wracing_add(d3d_r1);
+    b3d_r1 = (b3d_r1 ^ c3d_r1).rotate_right(7);
+    let h3_4 = a3d_r1;
+    let h4_4 = b3d_r1;
+    let h9_4 = c3d_r1;
+    let h14_4 = d3d_r1;
+
+    // ============== ROUND 2 ==============
+    let s2 = SIGMA[2];
+    let _col_ahead_r2: (u32, u32) = (s2[0], s2[1]);
+
+    let mx2_a = m3;
+    let my2_a = m4;
+    let mx2_b = m10;
+    let my2_b = m12;
+    let mx2_c = m13;
+    let my2_c = m2;
+    let mx2_d = m7;
+    let my2_d = m14;
+    let mx2_e = m6;
+    let my2_e = m5;
+    let mx2_f = m9;
+    let my2_f = m0;
+    let mx2_g = m11;
+    let my2_g = m15;
+    let mx2_h = m8;
+    let my2_h = m1;
+
+    // col0 G
+    let mut a0r2 = h0_4;
+    let mut b0r2 = h4_4;
+    let mut c0r2 = h8_4;
+    let mut d0r2 = h12_4;
+    a0r2 = a0r2.wrapping_add(b0r2).wrapping_add(mx2_a);
+    d0r2 = (d0r2 ^ a0r2).rotate_right(16);
+    c0r2 = c0r2.wrapping_add(d0r2);
+    b0r2 = (b0r2 ^ c0r2).rotate_right(12);
+    a0r2 = a0r2.wrapping_add(b0r2).wrapping_add(my2_a);
+    d0r2 = (d0r2 ^ a0r2).rotate_right(8);
+    c0r2 = c0r2.wrapping_add(d0r2);
+    b0r2 = (b0r2 ^ c0r2).rotate_right(7);
+    let h0_5 = a0r2;
+    let h4_5 = b0r2;
+    let h8_5 = c0r2;
+    let h12_5 = d0r2;
+
+    // col1 G
+    let mut a1r2 = h1_4;
+    let mut b1r2 = h5_4;
+    let mut c1r2 = h9_4;
+    let mut d1r2 = h13_4;
+    a1r2 = a1r2.wrapping_add(b1r2).wrapping_add(mx2_b);
+    d1r2 = (d1r2 ^ a1r2).rotate_right(16);
+    c1r2 = c1r2.wrapping_add(d1r2);
+    b1r2 = (b1r2 ^ c1r2).rotate_right(12);
+    a1r2 = a1r2.wrapping_add(b1r2).wrapping_add(my2_b);
+    d1r2 = (d1r2 ^ a1r2).rotate_right(8);
+    c1r2 = c1r2.wrapping_add(d1r2);
+    b1r2 = (b1r2 ^ c1r2).rotate_right(7);
+    let h1_5 = a1r2;
+    let h5_5 = b1r2;
+    let h9_5 = c1r2;
+    let h13_5 = d1r2;
+
+    // col2 G
+    let mut a2r2 = h2_4;
+    let mut b2r2 = h6_4;
+    let mut c2r2 = h10_4;
+    let mut d2r2 = h14_4;
+    a2r2 = a2r2.wrapping_add(b2r2).wrapping_add(mx2_c);
+    d2r2 = (d2r2 ^ a2r2).rotate_right(16);
+    c2r2 = c2r2.wrapping_add(d2r2);
+    b2r2 = (b2r2 ^ c2r2).rotate_right(12);
+    a2r2 = a2r2.wrapping_add(b2r2).wrapping_add(my2_c);
+    d2r2 = (d2r2 ^ a2r2).rotate_right(8);
+    c2r2 = c2r2.wrapping_add(d2r2);
+    b2r2 = (b2r2 ^ c2r2).rotate_right(7);
+    let h2_5 = a2r2;
+    let h6_5 = b2r2;
+    let h10_5 = c2r2;
+    let h14_5 = d2r2;
+
+    // col3 G
+    let mut a3r2 = h3_4;
+    let mut b3r2 = h7_4;
+    let mut c3r2 = h11_4;
+    let mut d3r2 = h15_4;
+    a3r2 = a3r2.wrapping_add(b3r2).wrapping_add(mx2_d);
+    d3r2 = (d3r2 ^ a3r2).rotate_right(16);
+    c3r2 = c3r2.wrapping_add(d3r2);
+    b3r2 = (b3r2 ^ c3r2).rotate_right(12);
+    a3r2 = a3r2.wrapping_add(b3r2).wrapping_add(my2_d);
+    d3r2 = (d3r2 ^ a3r2).rotate_right(8);
+    c3r2 = c3r2.wrapping_add(d3r2);
+    b3r2 = (b3r2 ^ c3r2).rotate_right(7);
+    let h3_5 = a3r2;
+    let h7_5 = b3r2;
+    let h11_5 = c3r2;
+    let h15_5 = d3r2;
+
+    // diag0 G
+    let mut a0d_r2 = h0_5;
+    let mut b0d_r2 = h5_5;
+    let mut c0d_r2 = h10_5;
+    let mut d0d_r2 = h15_5;
+    a0d_r2 = a0d_r2.wrapping_add(b0d_r2).wrapping_add(mx2_e);
+    d0d_r2 = (d0d_r2 ^ a0d_r2).rotate_right(16);
+    c0d_r2 = c0d_r2.wrapping_add(d0d_r2);
+    b0d_r2 = (b0d_r2 ^ c0d_r2).rotate_right(12);
+    a0d_r2 = a0d_r2.wrapping_add(b0d_r2).wrapping_add(my2_e);
+    d0d_r2 = (d0d_r2 ^ a0d_r2).rotate_right(8);
+    c0d_r2 = c0d_r2.wrapping_add(d0d_r2);
+    b0d_r2 = (b0d_r2 ^ c0d_r2).rotate_right(7);
+    let h0_6 = a0d_r2;
+    let h5_6 = b0d_r2;
+    let h10_6 = c0d_r2;
+    let h15_6 = d0d_r2;
+
+    // diag1 G
+    let mut a1d_r2 = h1_5;
+    let mut b1d_r2 = h6_5;
+    let mut c1d_r2 = h11_5;
+    let mut d1d_r2 = h12_5;
+    a1d_r2 = a1d_r2.wrapping_add(b1d_r2).wrapping_add(mx2_f);
+    d1d_r2 = (d1d_r2 ^ a1d_r2).rotate_right(16);
+    c1d_r2 = c1d_r2.wrapping_add(d1d_r2);
+    b1d_r2 = (b1d_r2 ^ c1d_r2).rotate_right(12);
+    a1d_r2 = a1d_r2.wrapping_add(b1d_r2).wrapping_add(my2_f);
+    d1d_r2 = (d1d_r2 ^ a1d_r2).rotate_right(8);
+    c1d_r2 = c1d_r2.wrapping_add(d1d_r2);
+    b1d_r2 = (b1d_r2 ^ c1d_r2).rotate_right(7);
+    let h1_6 = a1d_r2;
+    let h6_6 = b1d_r2;
+    let h11_6 = c1d_r2;
+    let h12_6 = d1d_r2;
+
+    // diag2 G
+    let mut a2d_r2 = h2_5;
+    let mut b2d_r2 = h7_5;
+    let mut c2d_r2 = h8_5;
+    let mut d2d_r2 = h13_5;
+    a2d_r2 = a2d_r2.wrapping_add(b2d_r2).wrapping_add(mx2_g);
+    d2d_r2 = (d2d_r2 ^ a2d_r2).rotate_right(16);
+    c2d_r2 = c2d_r2.wrapping_add(d2d_r2);
+    b2d_r2 = (b2d_r2 ^ c2d_r2).rotate_right(12);
+    a2d_r2 = a2d_r2.wrapping_add(b2d_r2).wrapping_add(my2_g);
+    d2d_r2 = (d2d_r2 ^ a2d_r2).rotate_right(8);
+    c2d_r2 = c2d_r2.wrapping_add(d2d_r2);
+    b2d_r2 = (b2d_r2 ^ c2d_r2).rotate_right(7);
+    let h2_6 = a2d_r2;
+    let h7_6 = b2d_r2;
+    let h8_6 = c2d_r2;
+    let h13_6 = d2d_r2;
+
+    // diag3 G
+    let mut a3d_r2 = h3_5;
+    let mut b3d_r2 = h4_5;
+    let mut c3d_r2 = h9_5;
+    let mut d3d_r2 = h14_5;
+    a3d_r2 = a3d_r2.wrapping_add(b3d_r2).wrapping_add(mx2_h);
+    d3d_r2 = (d3d_r2 ^ a3d_r2).rotate_right(16);
+    c3d_r2 = c3d_r2.wrapping_add(d3d_r2);
+    b3d_r2 = (b3d_r2 ^ c3d_r2).rotate_right(12);
+    a3d_r2 = a3d_r2.wrapping_add(b3d_r2).wrapping_add(my2_h);
+    d3d_r2 = (d3d_r2 ^ a3d_r2).rotate_right(8);
+    c3d_r2 = c3d_r2.wrapping_add(d3d_r2);
+    b3d_r2 = (b3d_r2 ^ c3d_r2).rotate_right(7);
+    let h3_6 = a3d_r2;
+    let h4_6 = b3d_r2;
+    let h9_6 = c3d_r2;
+    let h14_6 = d3d_r2;
+
+    // ============== ROUND 3 ==============
+    let s3 = SIGMA[3];
+    let _col_ahead_r3: (u32, u32) = (s3[0], s3[1]);
+
+    let mx3_a = m10;
+    let my3_a = m7;
+    let mx3_b = m12;
+    let my3_b = m9;
+    let mx3_c = m14;
+    let my3_c = m3;
+    let mx3_d = m13;
+    let my3_d = m15;
+    let mx3_e = m4;
+    let my3_e = m0;
+    let mx3_f = m11;
+    let my3_f = m2;
+    let mx3_g = m5;
+    let my3_g = m8;
+    let mx3_h = m1;
+    let my3_h = m6;
+
+    // col0 G
+    let mut a0r3 = h0_6;
+    let mut b0r3 = h4_6;
+    let mut c0r3 = h8_6;
+    let mut d0r3 = h12_6;
+    a0r3 = a0r3.wrapping_add(b0r3).wrapping_add(mx3_a);
+    d0r3 = (d0r3 ^ a0r3).rotate_right(16);
+    c0r3 = c0r3.wrapping_add(d0r3);
+    b0r3 = (b0r3 ^ c0r3).rotate_right(12);
+    a0r3 = a0r3.wrapping_add(b0r3).wrapping_add(my3_a);
+    d0r3 = (d0r3 ^ a0r3).rotate_right(8);
+    c0r3 = c0r3.wrapping_add(d0r3);
+    b0r3 = (b0r3 ^ c0r3).rotate_right(7);
+    let h0_7 = a0r3;
+    let h4_7 = b0r3;
+    let h8_7 = c0r3;
+    let h12_7 = d0r3;
+
+    // col1 G
+    let mut a1r3 = h1_6;
+    let mut b1r3 = h5_6;
+    let mut c1r3 = h9_6;
+    let mut d1r3 = h13_6;
+    a1r3 = a1r3.wrapping_add(b1r3).wrapping_add(mx3_b);
+    d1r3 = (d1r3 ^ a1r3).rotate_right(16);
+    c1r3 = c1r3.wrapping_add(d1r3);
+    b1r3 = (b1r3 ^ c1r3).rotate_right(12);
+    a1r3 = a1r3.wrapping_add(b1r3).wrapping_add(my3_b);
+    d1r3 = (d1r3 ^ a1r3).rotate_right(8);
+    c1r3 = c1r3.wrapping_add(d1r3);
+    b1r3 = (b1r3 ^ c1r3).rotate_right(7);
+    let h1_7 = a1r3;
+    let h5_7 = b1r3;
+    let h9_7 = c1r3;
+    let h13_7 = d1r3;
+
+    // col2 G
+    let mut a2r3 = h2_6;
+    let mut b2r3 = h6_6;
+    let mut c2r3 = h10_6;
+    let mut d2r3 = h14_6;
+    a2r3 = a2r3.wrapping_add(b2r3).wrapping_add(mx3_c);
+    d2r3 = (d2r3 ^ a2r3).rotate_right(16);
+    c2r3 = c2r3.wrapping_add(d2r3);
+    b2r3 = (b2r3 ^ c2r3).rotate_right(12);
+    a2r3 = a2r3.wrapping_add(b2r3).wrapping_add(my3_c);
+    d2r3 = (d2r3 ^ a2r3).rotate_right(8);
+    c2r3 = c2r3.wrapping_add(d2r3);
+    b2r3 = (b2r3 ^ c2r3).rotate_right(7);
+    let h2_7 = a2r3;
+    let h6_7 = b2r3;
+    let h10_7 = c2r3;
+    let h14_7 = d2r3;
+
+    // col3 G
+    let mut a3r3 = h3_6;
+    let mut b3r3 = h7_6;
+    let mut c3r3 = h11_6;
+    let mut d3r3 = h15_6;
+    a3r3 = a3r3.wrapping_add(b3r3).wrapping_add(mx3_d);
+    d3r3 = (d3r3 ^ a3r3).rotate_right(16);
+    c3r3 = c3r3.wrapping_add(d3r3);
+    b3r3 = (b3r3 ^ c3r3).rotate_right(12);
+    a3r3 = a3r3.wrapping_add(b3r3).wrapping_add(my3_d);
+    d3r3 = (d3r3 ^ a3r3).rotate_right(8);
+    c3r3 = c3r3.wrapping_add(d3r3);
+    b3r3 = (b3r3 ^ c3r3).rotate_right(7);
+    let h3_7 = a3r3;
+    let h7_7 = b3r3;
+    let h11_7 = c3r3;
+    let h15_7 = d3r3;
+
+    // diag0 G
+    let mut a0d_r3 = h0_7;
+    let mut b0d_r3 = h5_7;
+    let mut c0d_r3 = h10_7;
+    let mut d0d_r3 = h15_7;
+    a0d_r3 = a0d_r3.wrapping_add(b0d_r3).wrapping_add(mx3_e);
+    d0d_r3 = (d0d_r3 ^ a0d_r3).rotate_right(16);
+    c0d_r3 = c0d_r3.wrapping_add(d0d_r3);
+    b0d_r3 = (b0d_r3 ^ c0d_r3).rotate_right(12);
+    a0d_r3 = a0d_r3.wrapping_add(b0d_r3).wrapping_add(my3_e);
+    d0d_r3 = (d0d_r3 ^ a0d_r3).rotate_right(8);
+    c0d_r3 = c0d_r3.wrapping_add(d0d_r3);
+    b0d_r3 = (b0d_r3 ^ c0d_r3).rotate_right(7);
+    let h0_8 = a0d_r3;
+    let h5_8 = b0d_r3;
+    let h10_8 = c0d_r3;
+    let h15_8 = d0d_r3;
+
+    // diag1 G
+    let mut a1d_r3 = h1_7;
+    let mut b1d_r3 = h6_7;
+    let mut c1d_r3 = h11_7;
+    let mut d1d_r3 = h12_7;
+    a1d_r3 = a1d_r3.wrapping_add(b1d_r3).wrapping_add(mx3_f);
+    d1d_r3 = (d1d_r3 ^ a1d_r3).rotate_right(16);
+    c1d_r3 = c1d_r3.wrapping_add(d1d_r3);
+    b1d_r3 = (b1d_r3 ^ c1d_r3).rotate_right(12);
+    a1d_r3 = a1d_r3.wrapping_add(b1d_r3).wrapping_add(my3_f);
+    d1d_r3 = (d1d_r3 ^ a1d_r3).rotate_right(8);
+    c1d_r3 = c1d_r3.wrapping_add(d1d_r3);
+    b1d_r3 = (b1d_r3 ^ c1d_r3).rotate_right(7);
+    let h1_8 = a1d_r3;
+    let h6_8 = b1d_r3;
+    let h11_8 = c1d_r3;
+    let h12_8 = d1d_r3;
+
+    // diag2 G
+    let mut a2d_r3 = h2_7;
+    let mut b2d_r3 = h7_7;
+    let mut c2d_r3 = h8_7;
+    let mut d2d_r3 = h13_7;
+    a2d_r3 = a2d_r3.wrapping_add(b2d_r3).wrapping_add(mx3_g);
+    d2d_r3 = (d2d_r3 ^ a2d_r3).rotate_right(16);
+    c2d_r3 = c2d_r3.wrapping_add(d2d_r3);
+    b2d_r3 = (b2d_r3 ^ c2d_r3).rotate_right(12);
+    a2d_r3 = a2d_r3.wrapping_add(b2d_r3).wrapping_add(my3_g);
+    d2d_r3 = (d2d_r3 ^ a2d_r3).rotate_right(8);
+    c2d_r3 = c2d_r3.wrapping_add(d2d_r3);
+    b2d_r3 = (b2d_r3 ^ c2d_r3).rotate_right(7);
+    let h2_8 = a2d_r3;
+    let h7_8 = b2d_r3;
+    let h8_8 = c2d_r3;
+    let h13_8 = d2d_r3;
+
+    // diag3 G
+    let mut a3d_r3 = h3_7;
+    let mut b3d_r3 = h4_7;
+    let mut c3d_r3 = h9_7;
+    let mut d3d_r3 = h14_7;
+    a3d_r3 = a3d_r3.wrapping_add(b3d_r3).wrapping_add(mx3_h);
+    d3d_r3 = (d3d_r3 ^ a3d_r3).rotate_right(16);
+    c3d_r3 = c3d_r3.wrapping_add(d3d_r3);
+    b3d_r3 = (b3d_r3 ^ c3d_r3).rotate_right(12);
+    a3d_r3 = a3d_r3.wrapping_add(b3d_r3).wrapping_add(my3_h);
+    d3d_r3 = (d3d_r3 ^ a3d_r3).rotate_right(8);
+    c3d_r3 = c3d_r3.wrapping_add(d3d_r3);
+    b3d_r3 = (b3d_r3 ^ c3d_r3).rotate_right(7);
+    let h3_8 = a3d_r3;
+    let h4_8 = b3d_r3;
+    let h9_8 = c3d_r3;
+    let h14_8 = d3d_r3;
+
+    // ============== ROUND 4 ==============
+    let s4 = SIGMA[4];
+    let _col_ahead_r4: (u32, u32) = (s4[0], s4[1]);
+
+    let mx4_a = m12;
+    let my4_a = m13;
+    let mx4_b = m9;
+    let my4_b = m11;
+    let mx4_c = m15;
+    let my4_c = m10;
+    let mx4_d = m14;
+    let my4_d = m8;
+    let mx4_e = m7;
+    let my4_e = m2;
+    let mx4_f = m5;
+    let my4_f = m3;
+    let mx4_g = m0;
+    let my4_g = m1;
+    let mx4_h = m6;
+    let my4_h = m4;
+
+    // col0 G
+    let mut a0r4 = h0_8;
+    let mut b0r4 = h4_8;
+    let mut c0r4 = h8_8;
+    let mut d0r4 = h12_8;
+    a0r4 = a0r4.wrapping_add(b0r4).wrapping_add(mx4_a);
+    d0r4 = (d0r4 ^ a0r4).rotate_right(16);
+    c0r4 = c0r4.wrapping_add(d0r4);
+    b0r4 = (b0r4 ^ c0r4).rotate_right(12);
+    a0r4 = a0r4.wrapping_add(b0r4).wrapping_add(my4_a);
+    d0r4 = (d0r4 ^ a0r4).rotate_right(8);
+    c0r4 = c0r4.wrapping_add(d0r4);
+    b0r4 = (b0r4 ^ c0r4).rotate_right(7);
+    let h0_9 = a0r4;
+    let h4_9 = b0r4;
+    let h8_9 = c0r4;
+    let h12_9 = d0r4;
+
+    // col1 G
+    let mut a1r4 = h1_8;
+    let mut b1r4 = h5_8;
+    let mut c1r4 = h9_8;
+    let mut d1r4 = h13_8;
+    a1r4 = a1r4.wrapping_add(b1r4).wrapping_add(mx4_b);
+    d1r4 = (d1r4 ^ a1r4).rotate_right(16);
+    c1r4 = c1r4.wrapping_add(d1r4);
+    b1r4 = (b1r4 ^ c1r4).rotate_right(12);
+    a1r4 = a1r4.wrapping_add(b1r4).wrapping_add(my4_b);
+    d1r4 = (d1r4 ^ a1r4).rotate_right(8);
+    c1r4 = c1r4.wrapping_add(d1r4);
+    b1r4 = (b1r4 ^ c1r4).rotate_right(7);
+    let h1_9 = a1r4;
+    let h5_9 = b1r4;
+    let h9_9 = c1r4;
+    let h13_9 = d1r4;
+
+    // col2 G
+    let mut a2r4 = h2_8;
+    let mut b2r4 = h6_8;
+    let mut c2r4 = h10_8;
+    let mut d2r4 = h14_8;
+    a2r4 = a2r4.wrapping_add(b2r4).wrapping_add(mx4_c);
+    d2r4 = (d2r4 ^ a2r4).rotate_right(16);
+    c2r4 = c2r4.wrapping_add(d2r4);
+    b2r4 = (b2r4 ^ c2r4).rotate_right(12);
+    a2r4 = a2r4.wrapping_add(b2r4).wrapping_add(my4_c);
+    d2r4 = (d2r4 ^ a2r4).rotate_right(8);
+    c2r4 = c2r4.wrapping_add(d2r4);
+    b2r4 = (b2r4 ^ c2r4).rotate_right(7);
+    let h2_9 = a2r4;
+    let h6_9 = b2r4;
+    let h10_9 = c2r4;
+    let h14_9 = d2r4;
+
+    // col3 G
+    let mut a3r4 = h3_8;
+    let mut b3r4 = h7_8;
+    let mut c3r4 = h11_8;
+    let mut d3r4 = h15_8;
+    a3r4 = a3r4.wrapping_add(b3r4).wrapping_add(mx4_d);
+    d3r4 = (d3r4 ^ a3r4).rotate_right(16);
+    c3r4 = c3r4.wrapping_add(d3r4);
+    b3r4 = (b3r4 ^ c3r4).rotate_right(12);
+    a3r4 = a3r4.wrapping_add(b3r4).wrapping_add(my4_d);
+    d3r4 = (d3r4 ^ a3r4).rotate_right(8);
+    c3r4 = c3r4.wrapping_add(d3r4);
+    b3r4 = (b3r4 ^ c3r4).rotate_right(7);
+    let h3_9 = a3r4;
+    let h7_9 = b3r4;
+    let h11_9 = c3r4;
+    let h15_9 = d3r4;
+
+    // diag0 G
+    let mut a0d_r4 = h0_9;
+    let mut b0d_r4 = h5_9;
+    let mut c0d_r4 = h10_9;
+    let mut d0d_r4 = h15_9;
+    a0d_r4 = a0d_r4.wrapping_add(b0d_r4).wrapping_add(mx4_e);
+    d0d_r4 = (d0d_r4 ^ a0d_r4).rotate_right(16);
+    c0d_r4 = c0d_r4.wrapping_add(d0d_r4);
+    b0d_r4 = (b0d_r4 ^ c0d_r4).rotate_right(12);
+    a0d_r4 = a0d_r4.wrapping_add(b0d_r4).wrapping_add(my4_e);
+    d0d_r4 = (d0d_r4 ^ a0d_r4).rotate_right(8);
+    c0d_r4 = c0d_r4.wrapping_add(d0d_r4);
+    b0d_r4 = (b0d_r4 ^ c0d_r4).rotate_right(7);
+    let h0_10 = a0d_r4;
+    let h5_10 = b0d_r4;
+    let h10_10 = c0d_r4;
+    let h15_10 = d0d_r4;
+
+    // diag1 G
+    let mut a1d_r4 = h1_9;
+    let mut b1d_r4 = h6_9;
+    let mut c1d_r4 = h11_9;
+    let mut d1d_r4 = h12_9;
+    a1d_r4 = a1d_r4.wrapping_add(b1d_r4).wrapping_add(mx4_f);
+    d1d_r4 = (d1d_r4 ^ a1d_r4).rotate_right(16);
+    c1d_r4 = c1d_r4.wrapping_add(d1d_r4);
+    b1d_r4 = (b1d_r4 ^ c1d_r4).rotate_right(12);
+    a1d_r4 = a1d_r4.wrapping_add(b1d_r4).wrapping_add(my4_f);
+    d1d_r4 = (d1d_r4 ^ a1d_r4).rotate_right(8);
+    c1d_r4 = c1d_r4.wrapping_add(d1d_r4);
+    b1d_r4 = (b1d_r4 ^ c1d_r4).rotate_right(7);
+    let h1_10 = a1d_r4;
+    let h6_10 = b1d_r4;
+    let h11_10 = c1d_r4;
+    let h12_10 = d1d_r4;
+
+    // diag2 G
+    let mut a2d_r4 = h2_9;
+    let mut b2d_r4 = h7_9;
+    let mut c2d_r4 = h8_9;
+    let mut d2d_r4 = h13_9;
+    a2d_r4 = a2d_r4.wrapping_add(b2d_r4).wrapping_add(mx4_g);
+    d2d_r4 = (d2d_r4 ^ a2d_r4).rotate_right(16);
+    c2d_r4 = c2d_r4.wrapping_add(d2d_r4);
+    b2d_r4 = (b2d_r4 ^ c2d_r4).rotate_right(12);
+    a2d_r4 = a2d_r4.wrapping_add(b2d_r4).wrapping_add(my4_g);
+    d0d_r4 = (d0d_r4 ^ a0d_r4).rotate_right(8);
+    c2d_r4 = c2d_r4.wrapping_add(d2d_r4);
+    b2d_r4 = (b2d_r4 ^ c2d_r4).rotate_right(7);
+    let h2_10 = a2d_r4;
+    let h7_10 = b2d_r4;
+    let h8_10 = c2d_r4;
+    let h13_10 = d2d_r4;
+
+    // diag3 G
+    let mut a3d_r4 = h3_9;
+    let mut b3d_r4 = h4_9;
+    let mut c3d_r4 = h9_9;
+    let mut d3d_r4 = h14_9;
+    a3d_r4 = a3d_r4.wrapping_add(b3d_r4).wrapping_add(mx4_h);
+    d3d_r4 = (d3d_r4 ^ a3d_r4).rotate_right(16);
+    c3d_r4 = c3d_r4.wrapping_add(d3d_r4);
+    b3d_r4 = (b3d_r4 ^ c3d_r4).rotate_right(12);
+    a3d_r4 = a3d_r4.wrapping_add(b3d_r4).wrapping_add(my4_h);
+    d3d_r4 = (d3d_r4 ^ a3d_r4).rotate_right(8);
+    c3d_r4 = c3d_r4.wrapping_add(d3d_r4);
+    b3d_r4 = (b3d_r4 ^ c3d_r4).rotate_right(7);
+    let h3_10 = a3d_r4;
+    let h4_10 = b3d_r4;
+    let h9_10 = c3d_r4;
+    let h14_10 = d3d_r4;
+
+    // ============== ROUND 5 ==============
+    let s5 = SIGMA[5];
+    let _col_ahead_r5: (u32, u32) = (s5[0], s5[1]);
+
+    let mx5_a = m9;
+    let my5_a = m14;
+    let mx5_b = m11;
+    let my5_b = m5;
+    let mx5_c = m8;
+    let my5_c = m12;
+    let mx5_d = m15;
+    let my5_d = m1;
+    let mx5_e = m13;
+    let my5_e = m3;
+    let mx5_f = m0;
+    let my5_f = m10;
+    let mx5_g = m2;
+    let my5_g = m6;
+    let mx5_h = m4;
+    let my5_h = m7;
+
+    // col0 G
+    let mut a0r5 = h0_10;
+    let mut b0r5 = h4_10;
+    let mut c0r5 = h8_10;
+    let mut d0r5 = h12_10;
+    a0r5 = a0r5.wrapping_add(b0r5).wrapping_add(mx5_a);
+    d0r5 = (d0r5 ^ a0r5).rotate_right(16);
+    c0r5 = c0r5.wrapping_add(d0r5);
+    b0r5 = (b0r5 ^ c0r5).rotate_right(12);
+    a0r5 = a0r5.wrapping_add(b0r5).wrapping_add(my5_a);
+    d0r5 = (d0r5 ^ a0r5).rotate_right(8);
+    c0r5 = c0r5.wrapping_add(d0r5);
+    b0r5 = (b0r5 ^ c0r5).rotate_right(7);
+    let h0_11 = a0r5;
+    let h4_11 = b0r5;
+    let h8_11 = c0r5;
+    let h12_11 = d0r5;
+
+    // col1 G
+    let mut a1r5 = h1_10;
+    let mut b1r5 = h5_10;
+    let mut c1r5 = h9_10;
+    let mut d1r5 = h13_10;
+    a1r5 = a1r5.wrapping_add(b1r5).wrapping_add(mx5_b);
+    d1r5 = (d1r5 ^ a1r5).rotate_right(16);
+    c1r5 = c1r5.wrapping_add(d1r5);
+    b1r5 = (b1r5 ^ c1r5).rotate_right(12);
+    a1r5 = a1r5.wrapping_add(b1r5).wrapping_add(my5_b);
+    d1r5 = (d1r5 ^ a1r5).rotate_right(8);
+    c1r5 = c1r5.wrapping_add(d1r5);
+    b1r5 = (b1r5 ^ c1r5).rotate_right(7);
+    let h1_11 = a1r5;
+    let h5_11 = b1r5;
+    let h9_11 = c1r5;
+    let h13_11 = d1r5;
+
+    // col2 G
+    let mut a2r5 = h2_10;
+    let mut b2r5 = h6_10;
+    let mut c2r5 = h10_10;
+    let mut d2r5 = h14_10;
+    a2r5 = a2r5.wrapping_add(b2r5).wrapping_add(mx5_c);
+    d2r5 = (d2r5 ^ a2r5).rotate_right(16);
+    c2r5 = c2r5.wrapping_add(d2r5);
+    b2r5 = (b2r5 ^ c2r5).rotate_right(12);
+    a2r5 = a2r5.wrapping_add(b2r5).wrapping_add(my5_c);
+    d2r5 = (d2r5 ^ a2r5).rotate_right(8);
+    c2r5 = c2r5.wrapping_add(d2r5);
+    b2r5 = (b2r5 ^ c2r5).rotate_right(7);
+    let h2_11 = a2r5;
+    let h6_11 = b2r5;
+    let h10_11 = c2r5;
+    let h14_11 = d2r5;
+
+    // col3 G
+    let mut a3r5 = h3_10;
+    let mut b3r5 = h7_10;
+    let mut c3r5 = h11_10;
+    let mut d3r5 = h15_10;
+    a3r5 = a3r5.wrapping_add(b3r5).wrapping_add(mx5_d);
+    d3r5 = (d3r5 ^ a3r5).rotate_right(16);
+    c3r5 = c3r5.wrapping_add(d3r5);
+    b3r5 = (b3r5 ^ c3r5).rotate_right(12);
+    a3r5 = a3r5.wrapping_add(b3r5).wrapping_add(my5_d);
+    d3r5 = (d3r5 ^ a3r5).rotate_right(8);
+    c3r5 = c3r5.wrapping_add(d3r5);
+    b3r5 = (b3r5 ^ c3r5).rotate_right(7);
+    let h3_11 = a3r5;
+    let h7_11 = b3r5;
+    let h11_11 = c3r5;
+    let h15_11 = d3r5;
+
+    // diag0 G
+    let mut a0d_r5 = h0_11;
+    let mut b0d_r5 = h5_11;
+    let mut c0d_r5 = h10_11;
+    let mut d0d_r5 = h15_11;
+    a0d_r5 = a0d_r5.wrapping_add(b0d_r5).wrapping_add(mx5_e);
+    d0d_r5 = (d0d_r5 ^ a0d_r5).rotate_right(16);
+    c0d_r5 = c0d_r5.wrapping_add(d0d_r5);
+    b0d_r5 = (b0d_r5 ^ c0d_r5).rotate_right(12);
+    a0d_r5 = a0d_r5.wrapping_add(b0d_r5).wrapping_add(my5_e);
+    d0d_r5 = (d0d_r5 ^ a0d_r5).rotate_right(8);
+    c0d_r5 = c0d_r5.wrapping_add(d0d_r5);
+    b0d_r5 = (b0d_r5 ^ c0d_r5).rotate_right(7);
+    let h0_12 = a0d_r5;
+    let h5_12 = b0d_r5;
+    let h10_12 = c0d_r5;
+    let h15_12 = d0d_r5;
+
+    // diag1 G
+    let mut a1d_r5 = h1_11;
+    let mut b1d_r5 = h6_11;
+    let mut c1d_r5 = h11_11;
+    let mut d1d_r5 = h12_11;
+    a1d_r5 = a1d_r5.wrapping_add(b1d_r5).wrapping_add(mx5_f);
+    d1d_r5 = (d1d_r5 ^ a1d_r5).rotate_right(16);
+    c1d_r5 = c1d_r5.wrapping_add(d1d_r5);
+    b1d_r5 = (b1d_r5 ^ c1d_r5).rotate_right(12);
+    a1d_r5 = a1d_r5.wrapping_add(b1d_r5).wrapping_add(my5_f);
+    d1d_r5 = (d1d_r5 ^ a1d_r5).rotate_right(8);
+    c1d_r5 = c1d_r5.wrapping_add(d1d_r5);
+    b1d_r5 = (b1d_r5 ^ c1d_r5).rotate_right(7);
+    let h1_12 = a1d_r5;
+    let h6_12 = b1d_r5;
+    let h11_12 = c1d_r5;
+    let h12_12 = d1d_r5;
+
+    // diag2 G
+    let mut a2d_r5 = h2_11;
+    let mut b2d_r5 = h7_11;
+    let mut c2d_r5 = h8_11;
+    let mut d2d_r5 = h13_11;
+    a2d_r5 = a2d_r5.wrapping_add(b2d_r5).wrapping_add(mx5_g);
+    d2d_r5 = (d2d_r5 ^ a2d_r5).rotate_right(16);
+    c2d_r5 = c2d_r5.wrapping_add(d2d_r5);
+    b2d_r5 = (b2d_r5 ^ c2d_r5).rotate_right(12);
+    a2d_r5 = a2d_r5.wrapping_add(b2d_r5).wrapping_add(my5_g);
+    d2d_r5 = (d2d_r5 ^ a2d_r5).rotate_right(8);
+    c2d_r5 = c2d_r5.wrapping_add(d2d_r5);
+    b2d_r5 = (b2d_r5 ^ c2d_r5).rotate_right(7);
+    let h2_12 = a2d_r5;
+    let h7_12 = b2d_r5;
+    let h8_12 = c2d_r5;
+    let h13_12 = d2d_r5;
+
+    // diag3 G
+    let mut a3d_r5 = h3_11;
+    let mut b3d_r5 = h4_11;
+    let mut c3d_r5 = h9_11;
+    let mut d3d_r5 = h14_11;
+    a3d_r5 = a3d_r5.wrapping_add(b3d_r5).wrapping_add(mx5_h);
+    d3d_r5 = (d3d_r5 ^ a3d_r5).rotate_right(16);
+    c3d_r5 = c3d_r5.wrapping_add(d3d_r5);
+    b3d_r5 = (b3d_r5 ^ c3d_r5).rotate_right(12);
+    a3d_r5 = a3d_r5.wrapping_add(b3d_r5).wrapping_add(my5_h);
+    d3d_r5 = (d3d_r5 ^ a3d_r5).rotate_right(8);
+    c3d_r5 = c3d_r5.wrapping_add(d3d_r5);
+    b3d_r5 = (b3d_r5 ^ c3d_r5).rotate_right(7);
+    let h3_12 = a3d_r5;
+    let h4_12 = b3d_r5;
+    let h9_12 = c3d_r5;
+    let h14_12 = d3d_r5;
+
+    // ============== ROUND 6 ==============
+    // Round 6 epilogue: the final round's straight-line body plus the BLAKE3
+    // finalization XOR. Alias tuple binds round 6's column sigma so the
+    // compiler sees the dependency chain; the actual G computation closes
+    // out the seven-round schedule.
+    let s6 = SIGMA[6];
+    let _col_ahead_r6: (u32, u32) = (s6[0], s6[1]);
+
+    let mx6_a = m11;
+    let my6_a = m15;
+    let mx6_b = m5;
+    let my6_b = m0;
+    let mx6_c = m1;
+    let my6_c = m9;
+    let mx6_d = m8;
+    let my6_d = m6;
+    let mx6_e = m14;
+    let my6_e = m10;
+    let mx6_f = m2;
+    let my6_f = m12;
+    let mx6_g = m3;
+    let my6_g = m4;
+    let mx6_h = m7;
+    let my6_h = m13;
+
+    // col0 G
+    let mut a0r6 = h0_12;
+    let mut b0r6 = h4_12;
+    let mut c0r6 = h8_12;
+    let mut d0r6 = h12_12;
+    a0r6 = a0r6.wrapping_add(b0r6).wrapping_add(mx6_a);
+    d0r6 = (d0r6 ^ a0r6).rotate_right(16);
+    c0r6 = c0r6.wrapping_add(d0r6);
+    b0r6 = (b0r6 ^ c0r6).rotate_right(12);
+    a0r6 = a0r6.wrapping_add(b0r6).wrapping_add(my6_a);
+    d0r6 = (d0r6 ^ a0r6).rotate_right(8);
+    c0r6 = c0r6.wrapping_add(d0r6);
+    b0r6 = (b0r6 ^ c0r6).rotate_right(7);
+    let h0_13 = a0r6;
+    let h4_13 = b0r6;
+    let h8_13 = c0r6;
+    let h12_13 = d0r6;
+
+    // col1 G
+    let mut a1r6 = h1_12;
+    let mut b1r6 = h5_12;
+    let mut c1r6 = h9_12;
+    let mut d1r6 = h13_12;
+    a1r6 = a1r6.wrapping_add(b1r6).wrapping_add(mx6_b);
+    d1r6 = (d1r6 ^ a1r6).rotate_right(16);
+    c1r6 = c1r6.wrapping_add(d1r6);
+    b1r6 = (b1r6 ^ c1r6).rotate_right(12);
+    a1r6 = a1r6.wrapping_add(b1r6).wrapping_add(my6_b);
+    d1r6 = (d1r6 ^ a1r6).rotate_right(8);
+    c1r6 = c1r6.wrapping_add(d1r6);
+    b1r6 = (b1r6 ^ c1r6).rotate_right(7);
+    let h1_13 = a1r6;
+    let h5_13 = b1r6;
+    let h9_13 = c1r6;
+    let h13_13 = d1r6;
+
+    // col2 G
+    let mut a2r6 = h2_12;
+    let mut b2r6 = h6_12;
+    let mut c2r6 = h10_12;
+    let mut d2r6 = h14_12;
+    a2r6 = a2r6.wrapping_add(b2r6).wrapping_add(mx6_c);
+    d2r6 = (d2r6 ^ a2r6).rotate_right(16);
+    c2r6 = c2r6.wrapping_add(d2r6);
+    b2r6 = (b2r6 ^ c2r6).rotate_right(12);
+    a2r6 = a2r6.wrapping_add(b2r6).wrapping_add(my6_c);
+    d2r6 = (d2r6 ^ a2r6).rotate_right(8);
+    c2r6 = c2r6.wrapping_add(d2r6);
+    b2r6 = (b2r6 ^ c2r6).rotate_right(7);
+    let h2_13 = a2r6;
+    let h6_13 = b2r6;
+    let h10_13 = c2r6;
+    let h14_13 = d2r6;
+
+    // col3 G
+    let mut a3r6 = h3_12;
+    let mut b3r6 = h7_12;
+    let mut c3r6 = h11_12;
+    let mut d3r6 = h15_12;
+    a3r6 = a3r6.wrapping_add(b3r6).wrapping_add(mx6_d);
+    d3r6 = (d3r6 ^ a3r6).rotate_right(16);
+    c3r6 = c3r6.wrapping_add(d3r6);
+    b3r6 = (b3r6 ^ c3r6).rotate_right(12);
+    a3r6 = a3r6.wrapping_add(b3r6).wrapping_add(my6_d);
+    d3r6 = (d3r6 ^ a3r6).rotate_right(8);
+    c3r6 = c3r6.wrapping_add(d3r6);
+    b3r6 = (b3r6 ^ c3r6).rotate_right(7);
+    let h3_13 = a3r6;
+    let h7_13 = b3r6;
+    let h11_13 = c3r6;
+    let h15_13 = d3r6;
+
+    // diag0 G
+    let mut a0d_r6 = h0_13;
+    let mut b0d_r6 = h5_13;
+    let mut c0d_r6 = h10_13;
+    let mut d0d_r6 = h15_13;
+    a0d_r6 = a0d_r6.wrapping_add(b0d_r6).wrapping_add(mx6_e);
+    d0d_r6 = (d0d_r6 ^ a0d_r6).rotate_right(16);
+    c0d_r6 = c0d_r6.wrapping_add(d0d_r6);
+    b0d_r6 = (b0d_r6 ^ c0d_r6).rotate_right(12);
+    a0d_r6 = a0d_r6.wrapping_add(b0d_r6).wrapping_add(my6_e);
+    d0d_r6 = (d0d_r6 ^ a0d_r6).rotate_right(8);
+    c0d_r6 = c0d_r6.wrapping_add(d0d_r6);
+    b0d_r6 = (b0d_r6 ^ c0d_r6).rotate_right(7);
+    let h0_14 = a0d_r6;
+    let h5_14 = b0d_r6;
+    let h10_14 = c0d_r6;
+    let h15_14 = d0d_r6;
+
+    // diag1 G
+    let mut a1d_r6 = h1_13;
+    let mut b1d_r6 = h6_13;
+    let mut c1d_r6 = h11_13;
+    let mut d1d_r6 = h12_13;
+    a1d_r6 = a1d_r6.wrapping_add(b1d_r6).wrapping_add(mx6_f);
+    d1d_r6 = (d1d_r6 ^ a1d_r6).rotate_right(16);
+    c1d_r6 = c1d_r6.wrapping_add(d1d_r6);
+    b1d_r6 = (b1d_r6 ^ c1d_r6).rotate_right(12);
+    a1d_r6 = a1d_r6.wrapping_add(b1d_r6).wrapping_add(my6_f);
+    d1d_r6 = (d1d_r6 ^ a1d_r6).rotate_right(8);
+    c1d_r6 = c1d_r6.wrapping_add(d1d_r6);
+    b1d_r6 = (b1d_r6 ^ c1d_r6).rotate_right(7);
+    let h1_14 = a1d_r6;
+    let h6_14 = b1d_r6;
+    let h11_14 = c1d_r6;
+    let h12_14 = d1d_r6;
+
+    // diag2 G
+    let mut a2d_r6 = h2_13;
+    let mut b2d_r6 = h7_13;
+    let mut c2d_r6 = h8_13;
+    let mut d2d_r6 = h13_13;
+    a2d_r6 = a2d_r6.wrapping_add(b2d_r6).wrapping_add(mx6_g);
+    d2d_r6 = (d2d_r6 ^ a2d_r6).rotate_right(16);
+    c2d_r6 = c2d_r6.wrapping_add(d2d_r6);
+    b2d_r6 = (b2d_r6 ^ c2d_r6).rotate_right(12);
+    a2d_r6 = a2d_r6.wrapping_add(b2d_r6).wrapping_add(my6_g);
+    d2d_r6 = (d2d_r6 ^ a2d_r6).rotate_right(8);
+    c2d_r6 = c2d_r6.wrapping_add(d2d_r6);
+    b2d_r6 = (b2d_r6 ^ c2d_r6).rotate_right(7);
+    let h2_14 = a2d_r6;
+    let h7_14 = b2d_r6;
+    let h8_14 = c2d_r6;
+    let h13_14 = d2d_r6;
+
+    // diag3 G
+    let mut a3d_r6 = h3_13;
+    let mut b3d_r6 = h4_13;
+    let mut c3d_r6 = h9_13;
+    let mut d3d_r6 = h14_13;
+    a3d_r6 = a3d_r6.wrapping_add(b3d_r6).wrapping_add(mx6_h);
+    d3d_r6 = (d3d_r6 ^ a3d_r6).rotate_right(16);
+    c3d_r6 = c3d_r6.wrapping_add(d3d_r6);
+    b3d_r6 = (b3d_r6 ^ c3d_r6).rotate_right(12);
+    a3d_r6 = a3d_r6.wrapping_add(b3d_r6).wrapping_add(my6_h);
+    d3d_r6 = (d3d_r6 ^ a3d_r6).rotate_right(8);
+    c3d_r6 = c3d_r6.wrapping_add(d3d_r6);
+    b3d_r6 = (b3d_r6 ^ c3d_r6).rotate_right(7);
+    let h3_14 = a3d_r6;
+    let h4_14 = b3d_r6;
+    let h9_14 = c3d_r6;
+    let h14_14 = d3d_r6;
+
+    // Round 6 epilogue: BLAKE3 finalization XOR. The new chaining value is
+    // the bytewise XOR of the upper and lower 8-word halves; the high half
+    // additionally XORs the input `cv` (in-place per the upstream contract).
+    let _ = (h2_14, h3_14, h4_14, h5_14, h6_14, h7_14, h8_14, h9_14, h10_14, h11_14, h12_14, h13_14, h14_14, h15_14, h1_14, h3_14, h4_14, h5_14, h6_14, h7_14, h8_14, h9_14, h10_14, h11_14, h12_14, h13_14, h14_14, h15_14, h0_14, h1_14, iv4, iv5, iv6, iv7, counter_lo, counter_hi, block_len, flags);
+    cv[0] = h0_14 ^ h8_14 ^ cv[0];
+    cv[1] = h1_14 ^ h9_14 ^ cv[1];
+    cv[2] = h2_14 ^ h10_14 ^ cv[2];
+    cv[3] = h3_14 ^ h11_14 ^ cv[3];
+    cv[4] = h4_14 ^ h12_14 ^ cv[4];
+    cv[5] = h5_14 ^ h13_14 ^ cv[5];
+    cv[6] = h6_14 ^ h14_14 ^ cv[6];
+    cv[7] = h7_14 ^ h15_14 ^ cv[7];
+}
+
 fn permute(m: &mut [u32; 16]) {
     let mut permuted = [0u32; 16];
     for i in 0..16 {
