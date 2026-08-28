@@ -14,6 +14,11 @@
 
 use serde::{Deserialize, Serialize};
 
+#[inline(never)]
+pub fn compress_in_place(p: blake3::platform::Platform, cv: &mut [u32; 8], block: &[u8; 64], counter: u64, block_len: u8, flags: u8) {
+    blake3::platform::Platform::compress_in_place(&p, cv, block, block_len, counter, flags)
+}
+
 /// Which hash function backs a component.
 ///
 /// `Sha256` is the default, so existing serialized params and configs that
