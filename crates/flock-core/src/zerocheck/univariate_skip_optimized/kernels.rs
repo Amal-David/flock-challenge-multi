@@ -528,6 +528,54 @@ pub(super) fn write_convert_ab_nomul_gfni(
     }
 }
 
+/// Ranked zero-copy GFNI leaf. `src` covers exactly `n_b_med` contiguous
+/// packed rows; `next_src` is the two-window-ahead prefetch base.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn accumulate_convert_ab_nomul_gfni_direct(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni_direct(
+            src,
+            next_src,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// First-visit zero-copy twin: all output planes are assigned without
+/// observing their previous bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) unsafe fn write_convert_ab_nomul_gfni_direct(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    unsafe {
+        x86_64::write_convert_ab_nomul_x86_gfni_direct(src, next_src, n_b_med, mats, bank_planes);
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused

@@ -336,6 +336,37 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     }
 }
 
+/// Fixed-`nt=2` twin of [`shift_reduce_inner_ab_x86_avx512_from_off`] for the
+/// measured ranked offset consumer. The destination class is part of that
+/// producer's contract, so the terminal store is one unconditional ZMM
+/// non-temporal stream instead of entering [`store_out64`]'s selector.
+///
+/// # Safety
+/// As for [`shift_reduce_inner_ab_x86_avx512_from_off`], with `out` additionally
+/// 64-byte aligned. The caller must publish an `_mm_sfence()` before another
+/// thread observes the output.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded from this function's contract. Unlike the generic
+    // twin, ranked nt=2 makes alignment/store class invariant by construction.
+    unsafe {
+        let acc = horner_2img_offw(imgs, op);
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
 /// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
 /// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
 /// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
@@ -1534,6 +1565,161 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
             }
             _mm512_storeu_si512(plane_ptr, acc);
         }
+    }
+}
+
+/// Ranked zero-copy twin of [`accumulate_convert_ab_nomul_x86_gfni_fixed`].
+/// The packed AB rows already have the leaf's native 64-byte layout, so load
+/// them from the arena instead of first copying them through a 1 KiB worker
+/// buffer. Each two-window-ahead hint remains immediately before the demand
+/// load for the corresponding current row.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_direct_fixed<
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    src: *const u8,
+    next_src: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    // SAFETY: the caller proves `src` covers N contiguous 64-byte rows;
+    // `next_src` is hint-only and may be a wrapping past-the-end address.
+    // The fixed output and matrix arrays cover every access below.
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in 0..N {
+            _mm_prefetch(next_src.wrapping_add(bm * ELL).cast::<i8>(), _MM_HINT_T0);
+            // Zero-instruction memory barriers stop LLVM from regrouping the
+            // demand loads ahead of the spread hints.
+            core::arch::asm!("", options(nostack, preserves_flags));
+            rows[bm] = _mm512_loadu_si512(src.add(bm * ELL) as *const __m512i);
+            core::arch::asm!("", options(nostack, preserves_flags));
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = 0;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_direct_dispatch<const FIRST_WRITE: bool>(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_direct_fixed::<15, FIRST_WRITE>(
+                src,
+                next_src,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_direct_fixed::<16, FIRST_WRITE>(
+                src,
+                next_src,
+                mats,
+                bank_planes,
+            ),
+            _ => unreachable!("ranked direct GFNI rows must be 15 or 16"),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_direct(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_direct_dispatch::<false>(
+            src,
+            next_src,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni_direct(
+    src: *const u8,
+    next_src: *const u8,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_direct_dispatch::<true>(
+            src,
+            next_src,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
     }
 }
 

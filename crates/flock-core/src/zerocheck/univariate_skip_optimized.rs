@@ -1132,6 +1132,48 @@ pub unsafe fn round1_ab_inner_window_from_offsets(
     unreachable!("offsets form is x86 AVX-512+GFNI only; gate on offsets_eligible");
 }
 
+/// Fixed-ZMM-stream-store twin of [`round1_ab_inner_window_from_offsets`] for
+/// the measured ranked path. It computes identical bytes but specializes the
+/// already-resolved `nt=2` destination class, so the terminal store has no
+/// runtime selector. Generic/cold/static callers retain the general wrapper.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets`], with `plan.nt == 2` and
+/// `out` 64-byte aligned. The producing thread must execute
+/// [`abinner_publish_fence`] before publishing the output across threads.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
@@ -2800,7 +2842,6 @@ fn zc_r1ab_first_write_enabled() -> bool {
 pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
 
@@ -2809,8 +2850,190 @@ impl WorkerStateAbOnly {
         Self {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
+        }
+    }
+}
+
+/// Incumbent staged sweep, retained verbatim for portable/dense geometry and
+/// for the two same-binary prefetch kill switches. Keeping its 1 KiB scratch
+/// here leaves no staging buffer or stack slot on the ranked direct sweep.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn process_one_x_hi_ab_only_staged(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    convert: &[F128],
+    eq_fold: Option<(&[F128], &[u64], usize)>,
+    _plane_first_write: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    let mut chunk_ab_bytes = [[0u8; 64]; 1 << N_MEDIUM];
+    let n_lo = n_lo_and_inner - N_INNER;
+    #[cfg(target_arch = "x86_64")]
+    let pf_windows = if zc_r1ab_pf_enabled() {
+        ZC_R1AB_PF_WINDOWS
+    } else {
+        0
+    };
+    #[cfg(target_arch = "x86_64")]
+    let ab_inner_ptr = ab_inner.as_ptr();
+    #[cfg(target_arch = "x86_64")]
+    let pf_spread = zc_r1ab_pf_spread_enabled();
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        #[cfg(target_arch = "x86_64")]
+        let (n_next, next_base) = if pf_windows != 0 {
+            let x_next = x_outer_lo + pf_windows;
+            (
+                b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
+                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
+            )
+        } else {
+            (0, 0)
+        };
+        #[cfg(target_arch = "x86_64")]
+        let pf_one = |b_med: usize| unsafe {
+            core::arch::x86_64::_mm_prefetch(
+                ab_inner_ptr
+                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
+                    .cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        };
+        #[cfg(target_arch = "x86_64")]
+        if !pf_spread {
+            for b_med in 0..n_next {
+                pf_one(b_med);
+            }
+        }
+        for (b_med, row) in chunk_ab_bytes.iter_mut().enumerate().take(n_b_med) {
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread && b_med < n_next {
+                pf_one(b_med);
+            }
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            row.copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if pf_spread {
+            for b_med in n_b_med..n_next {
+                pf_one(b_med);
+            }
+        }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if let Some((_, mats, bank_bits)) = eq_fold {
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & ((1usize << bank_bits) - 1);
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                [u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            if _plane_first_write && w_idx == 0 {
+                kernels::write_convert_ab_nomul_gfni(&chunk_ab_bytes, n_b_med, mats_w, bank);
+            } else {
+                kernels::accumulate_convert_ab_nomul_gfni(&chunk_ab_bytes, n_b_med, mats_w, bank);
+            }
+        } else {
+            kernels::accumulate_convert_ab(
+                &chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut state.partial_ab,
+            );
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        {
+            debug_assert!(eq_fold.is_none());
+            kernels::accumulate_convert_ab(
+                &chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut state.partial_ab,
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_ab_only_direct(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    let n_lo = n_lo_and_inner - N_INNER;
+    let ab_inner_ptr = ab_inner.as_ptr();
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let x_next = x_outer_lo + ZC_R1AB_PF_WINDOWS;
+        let n_next = b_med_counts[(x_outer + ZC_R1AB_PF_WINDOWS) & within_outer_mask] as usize;
+        debug_assert!(matches!(n_b_med, 15 | 16));
+        debug_assert_eq!(n_next, n_b_med);
+        let next_base = ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let w_idx = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & ((1usize << bank_bits) - 1);
+        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+            .try_into()
+            .expect("one 16x16 qword matrix block per w");
+        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
+            .try_into()
+            .expect("one plane bank per low index");
+        let first_write = plane_first_write && w_idx == 0;
+        let src = unsafe { ab_inner_ptr.add(chunk_byte_base) };
+        let next_src = ab_inner_ptr.wrapping_add(next_base);
+        // SAFETY: the ranked geometry check proves the current packed window
+        // covers 15/16 rows. `next_src` is used by prefetch hints only.
+        unsafe {
+            if first_write {
+                kernels::write_convert_ab_nomul_gfni_direct(src, next_src, n_b_med, mats_w, bank);
+            } else {
+                kernels::accumulate_convert_ab_nomul_gfni_direct(
+                    src, next_src, n_b_med, mats_w, bank,
+                );
+            }
         }
     }
 }
@@ -2848,132 +3071,57 @@ fn process_one_x_hi_ab_only(
             state.plane_banks.fill(0);
         }
     }
-    let n_lo = n_lo_and_inner - N_INNER;
-    // Packed-row prefetch look-ahead, resolved once per x_hi band (never
-    // inside the window loop).
-    #[cfg(target_arch = "x86_64")]
-    let pf_windows = if zc_r1ab_pf_enabled() {
-        ZC_R1AB_PF_WINDOWS
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let used_direct = if let Some((_, mats, bank_bits)) = eq_fold {
+        let direct_geometry = b_med_counts.iter().enumerate().all(|(w, &n)| {
+            matches!(n, 15 | 16) && b_med_counts[(w + ZC_R1AB_PF_WINDOWS) & within_outer_mask] == n
+        });
+        if direct_geometry && zc_r1ab_pf_enabled() && zc_r1ab_pf_spread_enabled() {
+            process_one_x_hi_ab_only_direct(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                mats,
+                bank_bits,
+                plane_first_write,
+                state,
+            );
+            true
+        } else {
+            false
+        }
     } else {
-        0
+        false
     };
-    #[cfg(target_arch = "x86_64")]
-    let ab_inner_ptr = ab_inner.as_ptr();
-    #[cfg(target_arch = "x86_64")]
-    let pf_spread = zc_r1ab_pf_spread_enabled();
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
-        // window's copy loop will demand, and exactly as many of them (the
-        // padding skip drops the last chunk of every second window). Issued
-        // BEFORE this window's own copy, so the hint sits two whole windows
-        // of work ahead of the demand load it feeds; issued after the copy it
-        // reaches only ~1.5 windows back and measures ~0.7 ms worse.
-        // `wrapping_add` keeps the past-the-end address on the last windows
-        // of the last band well defined, and that hint is simply dropped.
-        // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
-        // padding skip leaves live.
-        #[cfg(target_arch = "x86_64")]
-        let (n_next, next_base) = if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            (
-                b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
-                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
-            )
-        } else {
-            (0, 0)
-        };
-        // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
-        // possible, and the address is formed by `wrapping_add` on the base
-        // pointer.
-        #[cfg(target_arch = "x86_64")]
-        let pf_one = |b_med: usize| unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                ab_inner_ptr
-                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                    .cast::<i8>(),
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        };
-        #[cfg(target_arch = "x86_64")]
-        if !pf_spread {
-            for b_med in 0..n_next {
-                pf_one(b_med);
-            }
-        }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
-            #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
-            }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
-            }
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq",
-            target_feature = "gfni"
-        ))]
-        if let Some((_, mats, bank_bits)) = eq_fold {
-            let w_idx = x_outer_lo >> bank_bits;
-            let u = x_outer_lo & ((1usize << bank_bits) - 1);
-            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
-                .try_into()
-                .expect("one 16x16 qword matrix block per w");
-            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
-                [u * 16 * ELL..(u + 1) * 16 * ELL])
-                .try_into()
-                .expect("one plane bank per low index");
-            if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(&state.chunk_ab_bytes, n_b_med, mats_w, bank);
-            } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
-            }
-        } else {
-            kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
-        }
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq",
-            target_feature = "gfni"
-        )))]
-        {
-            debug_assert!(eq_fold.is_none());
-            kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
-        }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let used_direct = false;
+    if !used_direct {
+        process_one_x_hi_ab_only_staged(
+            x_hi,
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            b_med_counts,
+            ab_inner,
+            eq_lo_scaled,
+            convert,
+            eq_fold,
+            plane_first_write,
+            state,
+        );
     }
     if let Some((eq_bot, _, _)) = eq_fold {
         // Plane-major → F128 through the same vectorized kernel the C drain
