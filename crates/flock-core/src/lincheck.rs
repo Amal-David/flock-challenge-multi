@@ -1204,7 +1204,10 @@ fn fold_block_major_gfni(
                                                 core::arch::x86_64::_mm_prefetch(
                                                     z_packed
                                                         .as_ptr()
-                                                        .add((outer_base + r) * chunks_per_block + qn)
+                                                        .add(
+                                                            (outer_base + r) * chunks_per_block
+                                                                + qn,
+                                                        )
                                                         .cast::<i8>(),
                                                     core::arch::x86_64::_MM_HINT_T0,
                                                 );
@@ -2064,9 +2067,8 @@ fn sumcheck_x4_enabled() -> bool {
 /// `FLOCK_NO_LC_SUMCHECK_PAR_FIX=1` restores the incumbent `half2`
 /// comparison for exact same-binary A/B. Read once per process; default ON.
 fn sumcheck_par_fix_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none());
     *ON
 }
 
@@ -2154,7 +2156,11 @@ fn sumcheck_bind_both_and_eval_next(
     // this fusion replaced; the incumbent compared `half2` (see
     // [`sumcheck_par_fix_enabled`]). Same field elements either way — the
     // choice only picks serial vs chunked execution.
-    let par_gate = if sumcheck_par_fix_enabled() { half } else { half2 };
+    let par_gate = if sumcheck_par_fix_enabled() {
+        half
+    } else {
+        half2
+    };
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
@@ -2970,7 +2976,10 @@ mod tests {
             bad_comb[len / 3] += F128::ONE;
             let mut bad_z = z.clone();
             let bad_msg = sumcheck_bind_both_and_eval_next(&mut bad_comb, &mut bad_z, r);
-            assert_ne!(bad_msg, want_msg, "corrupted table went undetected len={len}");
+            assert_ne!(
+                bad_msg, want_msg,
+                "corrupted table went undetected len={len}"
+            );
         }
     }
 
@@ -4088,7 +4097,9 @@ mod tests {
             x_outer: x_ab.x_outer.clone(),
         };
         assert!(matches!(
-            verify(m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch),
+            verify(
+                m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch
+            ),
             Err(VerifyError::BadInnerRestLength { .. })
         ));
 
