@@ -98,7 +98,9 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from(
 ) {
     // SAFETY: forwarded caller contract; identical geometry on both sides.
     unsafe {
-        butterfly_fused_2layer_row_from_geo(src, quarter, r, dst, quarter, r, num_ntts, twiddles)
+        butterfly_fused_2layer_row_from_geo(
+            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+        )
     }
 }
 

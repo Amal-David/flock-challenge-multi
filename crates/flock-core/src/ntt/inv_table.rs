@@ -407,7 +407,6 @@ impl InvNttTableByteSingleGf8 {
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "avx512f")]
-    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
     pub(crate) unsafe fn apply_x86_avx512_register_2img_unchecked(
         &self,
         bytes: *const u8,
@@ -449,7 +448,6 @@ impl InvNttTableByteSingleGf8 {
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "avx512f")]
-    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
     pub(crate) unsafe fn apply_x86_avx512_register_2img_off_unchecked(
         &self,
         off: *const u16,
@@ -500,7 +498,6 @@ impl InvNttTableByteSingleGf8 {
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "avx512f")]
-    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
     pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_unchecked(
         &self,
         off: *const u16,
@@ -523,7 +520,6 @@ impl InvNttTableByteSingleGf8 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
-#[allow(dead_code)] // Retained two-image rollback/oracle entry point.
 pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
     base: *const u8,
     base8: *const u8,
@@ -538,7 +534,9 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
         unsafe {
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
-            let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+            let row = |img: *const u8, o: usize| {
+                _mm512_loadu_si512(img.add(o) as *const __m512i)
+            };
             let u0 = _mm512_xor_si512(
                 row(base, w0 as u16 as usize),
                 row(base8, (w0 >> 16) as u16 as usize),

@@ -382,7 +382,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         let pair = x_lo + 2 * lane + half;
                         let x0l = 2 * pair;
                         let x1l = x0l + 1;
-                        if ((pair_idx_base + pair) & pair_in_block_mask) >= useful_pairs_inclusive {
+                        if ((pair_idx_base + pair) & pair_in_block_mask) >= useful_pairs_inclusive
+                        {
                             if WRITE {
                                 a_chunk[x0l] = F128::ZERO;
                                 a_chunk[x1l] = F128::ZERO;
@@ -960,18 +961,8 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let ob = fold16_to_4(b_in.as_ptr().add(input), ra, rb, even_idx, odd_idx);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), oa);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), ob);
-            let (a0, a1, a2, a3) = (
-                a_out[output],
-                a_out[output + 1],
-                a_out[output + 2],
-                a_out[output + 3],
-            );
-            let (b0, b1, b2, b3) = (
-                b_out[output],
-                b_out[output + 1],
-                b_out[output + 2],
-                b_out[output + 3],
-            );
+            let (a0, a1, a2, a3) = (a_out[output], a_out[output + 1], a_out[output + 2], a_out[output + 3]);
+            let (b0, b1, b2, b3) = (b_out[output], b_out[output + 1], b_out[output + 2], b_out[output + 3]);
             let wt = eq_lo[x_lo + 1];
             let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
             tail[0] ^= a1w.mul_unreduced(b1);
@@ -1486,58 +1477,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // SAFETY: same row/table bounds as `group_from_packed`, which the
         // caller's contract supplies for all four groups.
         unsafe {
-            let (oa0, ob0) = group_from_packed(
-                table_data,
-                a_pkt,
-                b_pkt,
-                xg,
-                r1,
-                r2,
-                even_idx,
-                odd_idx,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-                cache,
-            );
-            let (oa1, ob1) = group_from_packed(
-                table_data,
-                a_pkt,
-                b_pkt,
-                xg + 4,
-                r1,
-                r2,
-                even_idx,
-                odd_idx,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-                cache,
-            );
-            let (oa2, ob2) = group_from_packed(
-                table_data,
-                a_pkt,
-                b_pkt,
-                xg + 8,
-                r1,
-                r2,
-                even_idx,
-                odd_idx,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-                cache,
-            );
-            let (oa3, ob3) = group_from_packed(
-                table_data,
-                a_pkt,
-                b_pkt,
-                xg + 12,
-                r1,
-                r2,
-                even_idx,
-                odd_idx,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-                cache,
-            );
+            let (oa0, ob0) = group_from_packed(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa1, ob1) = group_from_packed(table_data, a_pkt, b_pkt, xg + 4, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa2, ob2) = group_from_packed(table_data, a_pkt, b_pkt, xg + 8, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+            let (oa3, ob3) = group_from_packed(table_data, a_pkt, b_pkt, xg + 12, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
             [oa0, ob0, oa1, ob1, oa2, ob2, oa3, ob3]
         }
     }
@@ -1679,49 +1622,37 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
             } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
-                debug_assert_eq!(cache_base, 4 * xg);
-                let _ = cache_base;
-                let ap = fa.as_ptr();
-                let bp2 = fb.as_ptr();
-                if defer {
-                    (
-                        fold16_to_4_deferred(ap, r1, r2, r12),
-                        fold16_to_4_deferred(bp2, r1, r2, r12),
-                        fold16_to_4_deferred(ap.add(16), r1, r2, r12),
-                        fold16_to_4_deferred(bp2.add(16), r1, r2, r12),
-                        fold16_to_4_deferred(ap.add(32), r1, r2, r12),
-                        fold16_to_4_deferred(bp2.add(32), r1, r2, r12),
-                        fold16_to_4_deferred(ap.add(48), r1, r2, r12),
-                        fold16_to_4_deferred(bp2.add(48), r1, r2, r12),
-                    )
+                    debug_assert_eq!(cache_base, 4 * xg);
+                    let _ = cache_base;
+                    let ap = fa.as_ptr();
+                    let bp2 = fb.as_ptr();
+                    if defer {
+                        (
+                            fold16_to_4_deferred(ap, r1, r2, r12),
+                            fold16_to_4_deferred(bp2, r1, r2, r12),
+                            fold16_to_4_deferred(ap.add(16), r1, r2, r12),
+                            fold16_to_4_deferred(bp2.add(16), r1, r2, r12),
+                            fold16_to_4_deferred(ap.add(32), r1, r2, r12),
+                            fold16_to_4_deferred(bp2.add(32), r1, r2, r12),
+                            fold16_to_4_deferred(ap.add(48), r1, r2, r12),
+                            fold16_to_4_deferred(bp2.add(48), r1, r2, r12),
+                        )
+                    } else {
+                        (
+                            fold16_to_4(ap, r1, r2, even_idx, odd_idx),
+                            fold16_to_4(bp2, r1, r2, even_idx, odd_idx),
+                            fold16_to_4(ap.add(16), r1, r2, even_idx, odd_idx),
+                            fold16_to_4(bp2.add(16), r1, r2, even_idx, odd_idx),
+                            fold16_to_4(ap.add(32), r1, r2, even_idx, odd_idx),
+                            fold16_to_4(bp2.add(32), r1, r2, even_idx, odd_idx),
+                            fold16_to_4(ap.add(48), r1, r2, even_idx, odd_idx),
+                            fold16_to_4(bp2.add(48), r1, r2, even_idx, odd_idx),
+                        )
+                    }
                 } else {
-                    (
-                        fold16_to_4(ap, r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2, r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(16), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(16), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(32), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(32), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(48), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(48), r1, r2, even_idx, odd_idx),
-                    )
-                }
-            } else {
-                let g = groups_general(
-                    table_data,
-                    a_pkt,
-                    b_pkt,
-                    xg,
-                    r1,
-                    r2,
-                    even_idx,
-                    odd_idx,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    cache,
-                );
-                (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
-            };
+                    let g = groups_general(table_data, a_pkt, b_pkt, xg, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, cache);
+                    (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7])
+                };
             // Spread delivery: the rest of this tile's hint block, at
             // a later point in the body.
             if use_batch && pf_on && pf_spread {
@@ -1850,19 +1781,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Small instances leave whole groups: one group at a time, scalar finish.
         while x_lo + 2 <= lo_size {
             let ol = 2 * x_lo;
-            let (oa, ob) = group_from_packed(
-                table_data,
-                a_pkt,
-                b_pkt,
-                out_base + ol,
-                r1,
-                r2,
-                even_idx,
-                odd_idx,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-                None,
-            );
+            let (oa, ob) = group_from_packed(table_data, a_pkt, b_pkt, out_base + ol, r1, r2, even_idx, odd_idx, pair_in_block_mask, useful_pairs_inclusive, None);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(ol).cast::<__m512i>(), oa);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(ol).cast::<__m512i>(), ob);
             let (a0, a1, a2, a3) = (a_out[ol], a_out[ol + 1], a_out[ol + 2], a_out[ol + 3]);
@@ -2055,14 +1974,18 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
             ]
         };
         let input_planes = |rows: *const u8| -> [__m512i; 8] {
-            let z: [__m512i; 8] =
-                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i) as *const __m512i));
+            let z: [__m512i; 8] = core::array::from_fn(|i| {
+                _mm512_loadu_si512(rows.add(64 * i) as *const __m512i)
+            });
             let t = z.map(|v| _mm512_permutexvar_epi8(bt, v));
             qword_transpose(t)
         };
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
@@ -2075,7 +1998,9 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         // constants and temporaries are included, and LLVM then spills a
         // large fraction of the batch. Sequential accumulation has the same
         // GF(2) reassociation but caps the durable live set at 16 + 8 ZMMs.
-        let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
+        let (
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+        ) = {
             let p = input_planes(rows0);
             (
                 map_plane(&p, mats0, 0),
@@ -2096,7 +2021,9 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
                 map_plane(&p, mats0, 15),
             )
         };
-        let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
+        let (
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+        ) = {
             let p = input_planes(rows1);
             (
                 _mm512_xor_si512(a0, map_plane(&p, mats1, 0)),
@@ -2128,8 +2055,14 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
             let mut v0 = _mm512_permutex2var_epi64(lo, il_lo, hi);
             let mut v1 = _mm512_permutex2var_epi64(lo, il_hi, hi);
             if ADD {
-                v0 = _mm512_xor_si512(v0, _mm512_loadu_si512(add.add(8 * i) as *const __m512i));
-                v1 = _mm512_xor_si512(v1, _mm512_loadu_si512(add.add(8 * i + 4) as *const __m512i));
+                v0 = _mm512_xor_si512(
+                    v0,
+                    _mm512_loadu_si512(add.add(8 * i) as *const __m512i),
+                );
+                v1 = _mm512_xor_si512(
+                    v1,
+                    _mm512_loadu_si512(add.add(8 * i + 4) as *const __m512i),
+                );
             }
             let out_ptr = out.add(8 * i) as *mut __m512i;
             _mm512_storeu_si512(out_ptr, v0);
@@ -2210,13 +2143,17 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
             ]
         };
         let input_planes = |rows: *const u8| -> [__m512i; 8] {
-            let z: [__m512i; 8] =
-                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
+            let z: [__m512i; 8] = core::array::from_fn(|i| {
+                _mm512_loadu_si512(rows.add(64 * i).cast())
+            });
             qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
         };
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
@@ -2228,7 +2165,10 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
             let p0 = input_planes(rows0);
             let p1 = input_planes(rows1);
             for k in 0..16 {
-                let value = _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
+                let value = _mm512_xor_si512(
+                    map_plane(&p0, mats0, k),
+                    map_plane(&p1, mats1, k),
+                );
                 _mm512_storeu_si512(planes.add(k), value);
             }
         }
@@ -2236,7 +2176,10 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
             let p2 = input_planes(rows2);
             let p3 = input_planes(rows3);
             for k in 0..16 {
-                let value = _mm512_xor_si512(map_plane(&p2, mats2, k), map_plane(&p3, mats3, k));
+                let value = _mm512_xor_si512(
+                    map_plane(&p2, mats2, k),
+                    map_plane(&p3, mats3, k),
+                );
                 let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
                 _mm512_storeu_si512(planes.add(k), value);
             }
@@ -2641,24 +2584,19 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
         let w3 = quad(plane(12), plane(13), plane(14), plane(15));
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        let lo_even = _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_lo, w1));
-        let lo_odd = _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_hi, w1));
-        let hi_even = _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_lo, w3));
-        let hi_odd = _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_hi, w3));
+        let lo_even =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_lo, w1));
+        let lo_odd =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w0, s3_hi, w1));
+        let hi_even =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_lo, w3));
+        let hi_odd =
+            _mm512_permutexvar_epi8(bt, _mm512_permutex2var_epi64(w2, s3_hi, w3));
         let out_ptr = out as *mut __m512i;
         _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo_even, il_lo, hi_even));
-        _mm512_storeu_si512(
-            out_ptr.add(1),
-            _mm512_permutex2var_epi64(lo_even, il_hi, hi_even),
-        );
-        _mm512_storeu_si512(
-            out_ptr.add(2),
-            _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd),
-        );
-        _mm512_storeu_si512(
-            out_ptr.add(3),
-            _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd),
-        );
+        _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo_even, il_hi, hi_even));
+        _mm512_storeu_si512(out_ptr.add(2), _mm512_permutex2var_epi64(lo_odd, il_lo, hi_odd));
+        _mm512_storeu_si512(out_ptr.add(3), _mm512_permutex2var_epi64(lo_odd, il_hi, hi_odd));
     }
 }
 
@@ -2776,10 +2714,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
             let base = op.add(32 * h);
             // `oct[a].qword[j]` = chunk `j` of rows 32h+4t+a, t = 0..8.
             let oct = |a: usize, v: __m512i| {
-                _mm512_storeu_si512(
-                    base.add(8 * a) as *mut __m512i,
-                    _mm512_permutexvar_epi8(bt, v),
-                )
+                _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, _mm512_permutexvar_epi8(bt, v))
             };
             oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
             oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
@@ -2825,15 +2760,14 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
-                    let b: [__m512i; 8] = core::array::from_fn(|j| {
-                        _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
-                    });
+                    let b: [__m512i; 8] =
+                        core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64));
                     for hh in 0..2usize {
                         let aff = |j: usize| {
                             _mm512_gf2p8affine_epi64_epi8::<0>(
                                 b[j],
                                 _mm512_loadu_si512(
-                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
+                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i,
                                 ),
                             )
                         };
@@ -2996,7 +2930,10 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
         // eight-plane transposes.
         let plane = |k: usize| {
             let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
@@ -3033,7 +2970,10 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
             let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
             let out_ptr = (out as *mut u8).add(128 * i) as *mut __m512i;
             _mm512_storeu_si512(out_ptr, _mm512_permutex2var_epi64(lo, il_lo, hi));
-            _mm512_storeu_si512(out_ptr.add(1), _mm512_permutex2var_epi64(lo, il_hi, hi));
+            _mm512_storeu_si512(
+                out_ptr.add(1),
+                _mm512_permutex2var_epi64(lo, il_hi, hi),
+            );
         }
     }
 }
@@ -3100,10 +3040,7 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
         let mut octs = Octs([0u64; 64]);
         let op = octs.0.as_mut_ptr();
         for (i, zi) in z.iter().enumerate() {
-            _mm512_storeu_si512(
-                op.add(8 * i) as *mut __m512i,
-                _mm512_permutexvar_epi8(bt, *zi),
-            );
+            _mm512_storeu_si512(op.add(8 * i) as *mut __m512i, _mm512_permutexvar_epi8(bt, *zi));
         }
         let mp = mats.as_ptr();
         // Stage-1 qword gathers: pack `(lo,hi)` qword pairs of two residues.

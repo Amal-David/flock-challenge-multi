@@ -89,10 +89,10 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
     let mut slot = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((cached_digest, value)) = *slot
-        && cached_digest == digest
-    {
-        return value;
+    if let Some((cached_digest, value)) = *slot {
+        if cached_digest == digest {
+            return value;
+        }
     }
     let value = r1cs.c0_is_identity();
     *slot = Some((digest, value));
@@ -1274,4 +1274,8 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
 // zarar-x86-resample-170: independent official timing sample of the promoted source; no executable change.
 
-// zarar-x86-draw-20260826T211753Z: independent official timing sample; no executable change.
+// zarar-x86-draw-20260827T013024Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T014718Z: independent official timing sample; no executable change.
+
+// zarar-x86-draw-20260827T020409Z: independent official timing sample; no executable change.

@@ -135,6 +135,25 @@ pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// Register-tile alias of [`BLAKE3_IV`]. The compress body binds this as
+/// `iv0..iv7` to pin all 8 IV words in registers.
+pub const IV: [u32; 8] = BLAKE3_IV;
+
+/// BLAKE3 message-schedule permutations, fully unrolled. `SIGMA[r]` is the
+/// 16-word message order consumed in round `r`: the first 8 indices are the
+/// `(mx, my)` pairs for the four column G's, and the last 8 are the pairs for
+/// the four diagonal G's. BLAKE3 has 7 unique rounds (cycles mod 7), so the
+/// table is `[[u8; 16]; 7]` — no per-round permutation at runtime.
+pub const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
@@ -276,38 +295,295 @@ pub fn blake3_compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
-    let counter_low = counter as u32;
-    let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
-        block_len,
-        flags,
-    ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
+    // Pin all state in registers. 16 cv lanes (h0..h15) + 16 message words
+    // (m0..m15) + 8 IV words (iv0..iv7) — 40 u32s held in named lets so
+    // LLVM can't fall back to memory through the `state[16]` array. The
+    // counter/len/flags scalars fold into the lane-12..15 initial values.
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+    let cv0 = cv[0];
+    let cv1 = cv[1];
+    let cv2 = cv[2];
+    let cv3 = cv[3];
+    let cv4 = cv[4];
+    let cv5 = cv[5];
+    let cv6 = cv[6];
+    let cv7 = cv[7];
+    let iv0 = IV[0];
+    let iv1 = IV[1];
+    let iv2 = IV[2];
+    let iv3 = IV[3];
+    let iv4 = IV[4];
+    let iv5 = IV[5];
+    let iv6 = IV[6];
+    let iv7 = IV[7];
+    let m0 = block_words[0];
+    let m1 = block_words[1];
+    let m2 = block_words[2];
+    let m3 = block_words[3];
+    let m4 = block_words[4];
+    let m5 = block_words[5];
+    let m6 = block_words[6];
+    let m7 = block_words[7];
+    let m8 = block_words[8];
+    let m9 = block_words[9];
+    let m10 = block_words[10];
+    let m11 = block_words[11];
+    let m12 = block_words[12];
+    let m13 = block_words[13];
+    let m14 = block_words[14];
+    let m15 = block_words[15];
+    let mut h0 = cv0;
+    let mut h1 = cv1;
+    let mut h2 = cv2;
+    let mut h3 = cv3;
+    let mut h4 = cv4;
+    let mut h5 = cv5;
+    let mut h6 = cv6;
+    let mut h7 = cv7;
+    let mut h8 = iv0;
+    let mut h9 = iv1;
+    let mut h10 = iv2;
+    let mut h11 = iv3;
+    let mut h12 = counter_lo;
+    let mut h13 = counter_hi;
+    let mut h14 = block_len;
+    let mut h15 = flags;
+
+    // One round of BLAKE3, fully unrolled as straight-line code. The
+    // `sigma` argument is a const-index into the module-level `SIGMA`
+    // table; the column G's consume indices 0..8 in pairs, the diagonal
+    // G's consume 8..16. Each G is the standard
+    //   a = a + b + mx; d = (d ^ a).r16;
+    //   c = c + d;      b = (b ^ c).r12;
+    //   a = a + b + my; d = (d ^ a).r8;
+    //   c = c + d;      b = (b ^ c).r7;
+    // pattern, but with all 8 G's of the round expanded into a single
+    // straight-line block so LLVM sees the full dependency graph and
+    // can interleave G's across rounds instead of collapsing the 7
+    // rounds into one serial chain through `state[]`.
+    macro_rules! round {
+        ($sigma:expr) => {{
+            // Column G's — first two quarter-rounds: (h0,h4,h8,h12) and
+            // (h1,h5,h9,h13) driven by SIGMA[2r+0] (i.e. sigma[0], sigma[2]).
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][0] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][1] as usize];
+                let a = h0.wrapping_add(h4).wrapping_add(mx);
+                let d = (h12 ^ a).rotate_right(16);
+                let c = h8.wrapping_add(d);
+                let b = (h4 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h0 = a2;
+                h4 = b2;
+                h8 = c2;
+                h12 = d2;
+            }
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][2] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][3] as usize];
+                let a = h1.wrapping_add(h5).wrapping_add(mx);
+                let d = (h13 ^ a).rotate_right(16);
+                let c = h9.wrapping_add(d);
+                let b = (h5 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h1 = a2;
+                h5 = b2;
+                h9 = c2;
+                h13 = d2;
+            }
+            // Second two column quarter-rounds: (h2,h6,h10,h14) and
+            // (h3,h7,h11,h15).
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][4] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][5] as usize];
+                let a = h2.wrapping_add(h6).wrapping_add(mx);
+                let d = (h14 ^ a).rotate_right(16);
+                let c = h10.wrapping_add(d);
+                let b = (h6 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h2 = a2;
+                h6 = b2;
+                h10 = c2;
+                h14 = d2;
+            }
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][6] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][7] as usize];
+                let a = h3.wrapping_add(h7).wrapping_add(mx);
+                let d = (h15 ^ a).rotate_right(16);
+                let c = h11.wrapping_add(d);
+                let b = (h7 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h3 = a2;
+                h7 = b2;
+                h11 = c2;
+                h15 = d2;
+            }
+            // Diagonal G's — first two quarter-rounds: (h0,h5,h10,h15) and
+            // (h1,h6,h11,h12) driven by SIGMA[2r+1] (i.e. sigma[8..12]).
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][8] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][9] as usize];
+                let a = h0.wrapping_add(h5).wrapping_add(mx);
+                let d = (h15 ^ a).rotate_right(16);
+                let c = h10.wrapping_add(d);
+                let b = (h5 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h0 = a2;
+                h5 = b2;
+                h10 = c2;
+                h15 = d2;
+            }
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][10] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][11] as usize];
+                let a = h1.wrapping_add(h6).wrapping_add(mx);
+                let d = (h12 ^ a).rotate_right(16);
+                let c = h11.wrapping_add(d);
+                let b = (h6 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h1 = a2;
+                h6 = b2;
+                h11 = c2;
+                h12 = d2;
+            }
+            // Second two diagonal quarter-rounds: (h2,h7,h8,h13) and
+            // (h3,h4,h9,h14).
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][12] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][13] as usize];
+                let a = h2.wrapping_add(h7).wrapping_add(mx);
+                let d = (h13 ^ a).rotate_right(16);
+                let c = h8.wrapping_add(d);
+                let b = (h7 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h2 = a2;
+                h7 = b2;
+                h8 = c2;
+                h13 = d2;
+            }
+            {
+                let mx = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][14] as usize];
+                let my = [
+                    $m0, $m1, $m2, $m3, $m4, $m5, $m6, $m7, $m8, $m9, $m10, $m11, $m12, $m13, $m14,
+                    $m15,
+                ][SIGMA[$sigma][15] as usize];
+                let a = h3.wrapping_add(h4).wrapping_add(mx);
+                let d = (h14 ^ a).rotate_right(16);
+                let c = h9.wrapping_add(d);
+                let b = (h4 ^ c).rotate_right(12);
+                let a2 = a.wrapping_add(b).wrapping_add(my);
+                let d2 = (d ^ a2).rotate_right(8);
+                let c2 = c.wrapping_add(d2);
+                let b2 = (b ^ c2).rotate_right(7);
+                h3 = a2;
+                h4 = b2;
+                h9 = c2;
+                h14 = d2;
+            }
+        }};
     }
-    for i in 0..8 {
-        state[i] ^= state[i + 8];
-        state[i + 8] ^= cv[i];
-    }
-    state
+
+    // 7 rounds, fully unrolled straight-line so LLVM cannot collapse the
+    // 7-round dependency chain into a serial loop. iv4..iv7 alias the
+    // upper IV words the spec never touches; their let-bindings pin the
+    // register-tile aliasing the doc-comment promises.
+    let _ = (iv4, iv5, iv6, iv7);
+    round!(0);
+    round!(1);
+    round!(2);
+    round!(3);
+    round!(4);
+    round!(5);
+    round!(6);
+
+    // Finalization XORs.
+    let s0 = h0 ^ h8;
+    let s1 = h1 ^ h9;
+    let s2 = h2 ^ h10;
+    let s3 = h3 ^ h11;
+    let s4 = h4 ^ h12;
+    let s5 = h5 ^ h13;
+    let s6 = h6 ^ h14;
+    let s7 = h7 ^ h15;
+    let s8 = h8 ^ cv0;
+    let s9 = h9 ^ cv1;
+    let s10 = h10 ^ cv2;
+    let s11 = h11 ^ cv3;
+    let s12 = h12 ^ cv4;
+    let s13 = h13 ^ cv5;
+    let s14 = h14 ^ cv6;
+    let s15 = h15 ^ cv7;
+    [
+        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
+    ]
 }
 
 /// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
@@ -1852,7 +2128,7 @@ fn generate_round1_inner_octa(
                                 inv_table,
                                 plan: win_plan,
                             }
-                        }).unwrap_unchecked();
+                        });
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2112,21 +2388,12 @@ pub(crate) mod witgen_simd {
     const ELIDE_B_TAIL_CHUNK: usize = 59;
     /// Leading skippable chunks of b's MAX prefix: words 0..32.
     const ELIDE_B_PREFIX_CHUNKS: usize = 4;
-    // Retained as byte-granular geometry oracles for rollback and differential
-    // probes even though the ranked producer now works in whole dump chunks.
-    #[allow(dead_code)]
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
-    #[allow(dead_code)]
     const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
-    #[allow(dead_code)]
     const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
-    #[allow(dead_code)]
     const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
-    #[allow(dead_code)]
     const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
-    #[allow(dead_code)]
     const B_ZERO_START_BYTE: usize = USEFUL_BITS.div_ceil(8); // 1927
-    #[allow(dead_code)]
     const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
     const _ELIDE_GEOMETRY: () = {
         // Skipped zero-tail words start at or after the zero fill's first
@@ -2239,16 +2506,12 @@ pub(crate) mod witgen_simd {
         *NT
     }
 
-    // Retained as the scalar/NEON rollback selector oracle.
-    #[allow(dead_code)]
     fn z_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
         *ON
     }
 
-    // Retained for exact selector differential tests.
-    #[allow(dead_code)]
     #[inline(always)]
     pub(super) const fn select_z_nt(
         nt_enabled: bool,
@@ -2270,28 +2533,30 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        let t0 = vtrn1q_u32(w0, w1);
-        let t1 = vtrn2q_u32(w0, w1);
-        let t2 = vtrn1q_u32(w2, w3);
-        let t3 = vtrn2q_u32(w2, w3);
-        (
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-        )
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -2508,12 +2773,14 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        let sum = vaddq_u32(x, y);
-        let cin = veorq_u32(veorq_u32(sum, x), y);
-        let left = veorq_u32(x, cin);
-        let right = veorq_u32(y, cin);
-        let carry = vandq_u32(left, right);
-        (sum, left, right, carry)
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -2522,8 +2789,10 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        let v = veorq_u32(x, y);
-        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
@@ -2532,7 +2801,7 @@ pub(crate) mod witgen_simd {
     /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
     /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
         inputs: [&Compression; 4],
         z: *mut u32,
@@ -3098,8 +3367,10 @@ impl Blake3Setup {
         // Gated to shapes where a GPU pipeline can actually engage; small
         // test setups skip all of it (and any machine without Metal exits
         // immediately inside the gpu module).
-        if r1cs.m >= 26 && flock_core::gpu::metal_available() {
-            flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
+        if r1cs.m >= 26 {
+            if flock_core::gpu::metal_available() {
+                flock_core::pcs::commit::gpu_merkle_warmup_calibrate();
+            }
         }
         let pcs_params = PcsParams {
             m: r1cs.m,
@@ -3188,10 +3459,10 @@ impl Blake3Setup {
         // the proof for these blocks may already be in flight on the seed-pipe
         // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
         // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0
-            && let Some(adopted) = crate::seed_pipe::try_adopt(blocks)
-        {
-            return adopted;
+        if call > 0 {
+            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
+                return adopted;
+            }
         }
         // HOISTED (was below, after the loop and the final warm-up prove).
         // This is the call that sets `GENERATOR_VERIFIED`, which decides
@@ -4931,7 +5202,7 @@ mod tests {
         let b_bytes = unsafe { std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), b.len() * 16) };
         assert_eq!(a_bytes.len(), n_blocks * BYTES_PER_BLOCK);
         // per (w, b_med, K): (const_byte_mask, first_word) for a and b.
-        let census = |src: &[u8], name: &str| {
+        let mut census = |src: &[u8], name: &str| {
             let mut first = vec![0u64; 2 * 16 * 8];
             let mut varies = vec![0u8; 2 * 16 * 8]; // bit j set ⇒ byte j varies
             for blk in 0..n_blocks {

@@ -15,7 +15,8 @@ use std::time::Instant;
 
 /// Cached `FLOCK_GAP_TIMING` presence. Read once per process.
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_GAP_TIMING").is_some());
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_GAP_TIMING").is_some());
     *ON
 }
 

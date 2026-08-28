@@ -1,3 +1,7 @@
+#[cfg(target_feature = "gfni")]
+use super::super::{InvNttTableByteSingleGf8, F8, N_CHUNKS};
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+use super::super::{ELL, F128, N_MEDIUM};
 #[cfg(all(
     target_feature = "avx512f",
     target_feature = "avx512bw",
@@ -6,10 +10,6 @@
     target_feature = "gfni"
 ))]
 use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q};
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-use super::super::{ELL, F128, N_MEDIUM};
-#[cfg(target_feature = "gfni")]
-use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
 /// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
@@ -103,7 +103,6 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
 /// `FLOCK_NO_URM_APPLY_2IMG=1` restores the one-image inverse-NTT table
 /// apply (ten port-5 shuffles per apply) in the shift-reduce AB kernel.
 /// Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_apply_2img_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_APPLY_2IMG").is_none());
@@ -113,7 +112,6 @@ pub(crate) fn urm_apply_2img_enabled() -> bool {
 /// `FLOCK_NO_URM_PIDX=1` restores per-byte index scaling (`movzbl` + `shl $6`)
 /// in the shift-reduce AB kernel instead of the pre-scaled `u16` offset
 /// buffer. Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_pidx_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_PIDX").is_none());
@@ -124,7 +122,6 @@ pub(crate) fn urm_pidx_enabled() -> bool {
 /// prologue in the shift-reduce AB kernel (and disables the producer-side
 /// fused offset arena that feeds the split consume body). Resolved once per
 /// process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_off_arena_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFF_ARENA").is_none());
@@ -134,7 +131,6 @@ pub(crate) fn urm_off_arena_enabled() -> bool {
 /// `FLOCK_NO_URM_OFFW=1` restores the eight separate 16-bit reads of the
 /// pre-scaled offset buffer in the shift-reduce AB kernel instead of two
 /// 64-bit reads split with shifts. Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
 pub(crate) fn urm_offw_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_OFFW").is_none());
@@ -187,18 +183,9 @@ unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i
         if nt == 1 {
             let p = out.as_mut_ptr();
             _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
-            _mm_stream_si128(
-                p.add(16) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<1>(acc),
-            );
-            _mm_stream_si128(
-                p.add(32) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<2>(acc),
-            );
-            _mm_stream_si128(
-                p.add(48) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<3>(acc),
-            );
+            _mm_stream_si128(p.add(16) as *mut __m128i, _mm512_extracti32x4_epi32::<1>(acc));
+            _mm_stream_si128(p.add(32) as *mut __m128i, _mm512_extracti32x4_epi32::<2>(acc));
+            _mm_stream_si128(p.add(48) as *mut __m128i, _mm512_extracti32x4_epi32::<3>(acc));
         } else {
             _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }
@@ -254,9 +241,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         let op = core::ptr::addr_of_mut!((*off.as_mut_ptr()).0) as *mut u16;
         // byte -> byte * 64, 32 lanes at a time.
         let scale = |p: *const u8| {
-            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(
-                p as *const __m256i,
-            )))
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
         };
         _mm512_store_si512(op as *mut __m512i, scale(a0));
         _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
@@ -296,9 +281,7 @@ pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8,
     // SAFETY: forwarded from this function's contract.
     unsafe {
         let scale = |p: *const u8| {
-            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(
-                p as *const __m256i,
-            )))
+            _mm512_slli_epi16::<6>(_mm512_cvtepu8_epi16(_mm256_loadu_si256(p as *const __m256i)))
         };
         _mm512_store_si512(op as *mut __m512i, scale(a0));
         _mm512_store_si512(op.add(32) as *mut __m512i, scale(a0.add(32)));
@@ -401,7 +384,8 @@ unsafe fn horner_2img_off_narrow(
     use core::arch::x86_64::*;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
-        let apply = |o: *const u16| inv_table.apply_x86_avx512_register_2img_off_unchecked(o);
+        let apply =
+            |o: *const u16| inv_table.apply_x86_avx512_register_2img_off_unchecked(o);
         let xb = _mm512_set1_epi8(2);
         let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
         for k in (0..7usize).rev() {
@@ -925,7 +909,9 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble(
 ) {
     debug_assert_eq!(mask_tables.len(), 512);
     let lut = super::CBankNibbleLut::new(mask_tables);
-    unsafe { accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, &lut, partial_c) }
+    unsafe {
+        accumulate_c_banks_x86_avx512_nibble_prebuilt(c_block, n_b_med, &lut, partial_c)
+    }
 }
 
 /// DirectC nibble drain with the eq-dependent table already materialized.
@@ -1024,10 +1010,7 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
             }
         }
 
-        for (bank, (lo, hi)) in partial_c
-            .iter_mut()
-            .zip(lo_masks.iter().zip(hi_masks.iter()))
-        {
+        for (bank, (lo, hi)) in partial_c.iter_mut().zip(lo_masks.iter().zip(hi_masks.iter())) {
             for chunk in 0..4 {
                 let lane_base = chunk * 16;
                 let lo16 = _mm512_cvtepu8_epi32(extract16(*lo, chunk));
@@ -1139,12 +1122,13 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
 mod tests {
     use super::super::accumulate_c_banks_scalar;
     use super::{
-        F128, accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
-        accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble,
+        accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
+        accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble, F128,
     };
     #[cfg(target_feature = "gfni")]
     use super::{
-        accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
+        accumulate_convert_ab_nomul_x86_gfni,
+        accumulate_convert_ab_nomul_x86_gfni_dynamic,
         accumulate_convert_ab_nomul_x86_gfni_fixed,
     };
 
@@ -1555,12 +1539,16 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     // contract. Counts outside the ranked pair retain the incumbent body.
     unsafe {
         match n_b_med {
-            15 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(chunk_ab_bytes, mats, bank_planes)
-            }
-            16 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(chunk_ab_bytes, mats, bank_planes)
-            }
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
                 chunk_ab_bytes,
                 n_b_med,
@@ -1625,7 +1613,11 @@ unsafe fn byte_transpose_8x64<const REV: bool>(
     // 64-byte index constants; the cfg gate supplies the target features.
     unsafe {
         let mut cur = rows;
-        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
+        for (a, b, d) in [
+            (T4A, T4B, 4usize),
+            (T2A, T2B, 2),
+            (T1A, T1B, 1),
+        ] {
             let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
             let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
             let mut next = [_mm512_setzero_si512(); 8];
@@ -1762,9 +1754,9 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                     for j in 0..4usize {
                         let b_med = 4 * j + q;
                         if b_med < live {
-                            rows[4 * wj + j] =
-                                _mm512_loadu_si512(base.add(w * WINDOW_BYTES + b_med * ROW_BYTES)
-                                    as *const __m512i);
+                            rows[4 * wj + j] = _mm512_loadu_si512(
+                                base.add(w * WINDOW_BYTES + b_med * ROW_BYTES) as *const __m512i,
+                            );
                         }
                     }
                 }
@@ -1781,8 +1773,7 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                 for bank in 0..N_C_BANKS {
                     let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
                     let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
-                    let ptr =
-                        planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
+                    let ptr = planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
                     _mm512_storeu_si512(
                         ptr,
                         _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
@@ -1829,10 +1820,7 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
         let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
         let dst = out.as_mut_ptr() as *mut __m512i;
         for k in 0..8usize {
-            _mm512_storeu_si512(
-                dst.add(2 * k),
-                _mm512_permutex2var_epi64(los[k], idx0, his[k]),
-            );
+            _mm512_storeu_si512(dst.add(2 * k), _mm512_permutex2var_epi64(los[k], idx0, his[k]));
             _mm512_storeu_si512(
                 dst.add(2 * k + 1),
                 _mm512_permutex2var_epi64(los[k], idx1, his[k]),
