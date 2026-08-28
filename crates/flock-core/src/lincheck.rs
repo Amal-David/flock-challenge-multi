@@ -2348,13 +2348,9 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
 }
 
 /// Dot product of two equal-length F128 slices.
+#[inline]
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
-    assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
-    }
-    acc
+    crate::pcs::ring_switch::inner_product(a, b)
 }
 
 /// Length above which the inner product / element-wise kernels split via
