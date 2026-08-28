@@ -1446,9 +1446,10 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
     // this table slice. The cfg gate supplies the required target features.
     unsafe {
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
-        for (bm, row) in rows.iter_mut().enumerate().take(n_b_med) {
+        for (bm, row) in rows[..n_b_med].iter_mut().enumerate() {
             *row = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
+        let mats_bcast: [__m512i; 256] = core::array::from_fn(|i| _mm512_set1_epi64(mats[i] as i64));
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
             let mut acc = if FIRST_WRITE {
@@ -1463,11 +1464,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
             while bm + 1 < n_b_med {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    mats_bcast[bm * 16 + k],
                 );
                 let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm + 1],
-                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                    mats_bcast[(bm + 1) * 16 + k],
                 );
                 acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
                 bm += 2;
@@ -1475,7 +1476,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
             if bm < n_b_med {
                 let g = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    mats_bcast[bm * 16 + k],
                 );
                 acc = _mm512_xor_si512(acc, g);
             }
@@ -1509,6 +1510,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         for bm in 0..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
+        let mats_bcast: [__m512i; 256] = core::array::from_fn(|i| _mm512_set1_epi64(mats[i] as i64));
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
             let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
@@ -1516,11 +1518,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
             while bm + 1 < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    mats_bcast[bm * 16 + k],
                 );
                 let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm + 1],
-                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                    mats_bcast[(bm + 1) * 16 + k],
                 );
                 acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
                 bm += 2;
@@ -1528,7 +1530,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
             if bm < N {
                 let g = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    mats_bcast[bm * 16 + k],
                 );
                 acc = _mm512_xor_si512(acc, g);
             }
@@ -1749,6 +1751,8 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
         let planes = plane_banks.as_mut_ptr();
         let base = c_group.as_ptr();
 
+        let mats_bcast: [__m512i; 32] = core::array::from_fn(|i| _mm512_set1_epi64(mats[i] as i64));
+
         for q in 0..N_C_Q {
             let mut masks = [[_mm512_setzero_si512(); N_C_BANKS]; 2];
             for (half, mask_half) in masks.iter_mut().enumerate() {
@@ -1776,8 +1780,8 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
             // One VGF2P8AFFINEQB per (mask half, output byte plane); both
             // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
             for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                let m_lo = mats_bcast[plane];
+                let m_hi = mats_bcast[16 + plane];
                 for bank in 0..N_C_BANKS {
                     let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
                     let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);

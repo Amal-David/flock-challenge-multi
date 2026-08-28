@@ -331,19 +331,10 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    {
-        // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
-        // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
-        // Bit-identical; the carry-packing is the hot half of the witness
-        // G-functions, and on the ranked runner the ternlog saves one op per
-        // push (~16 per G, ~900 per 8-block call). The mask is a compile-time
-        // constant here (N is literal), so it folds into the ternlog's memory
-        // operand or a constant broadcast; no register pressure change.
-        unsafe {
-            let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
-            _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
-        }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+    unsafe {
+        let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl")))]
     unsafe {
