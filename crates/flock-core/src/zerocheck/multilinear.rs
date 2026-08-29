@@ -1393,7 +1393,76 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         mlv_challenges,
         padding,
         None,
+        None,
     )
+}
+
+/// Regenerates eight consecutive blocks' packed a/b rows for the block group
+/// starting at block `8·(arg/8)` — `f(first_block, a_dst, b_dst)` fills the
+/// two 64-byte-aligned destinations with exactly the `8 · 2048`-byte spans of
+/// the drained a/b buffers covering blocks `first_block .. first_block + 8`.
+/// The provider installs it only for shapes where one block is 2048 packed
+/// bytes per side (`k_log = 14`) and the block source is closed-form. The
+/// destinations are immediately consumed cache-local tiles, so the provider
+/// publishes them with ordinary temporal stores and returns with all bytes
+/// visible to its calling thread.
+pub type AbOctaRegen<'a> = &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync);
+
+const AB_REGEN_BLOCK_BYTES: usize = 2048;
+const AB_REGEN_ROWS_PER_BLOCK: usize = AB_REGEN_BLOCK_BYTES / 8;
+const AB_REGEN_BLOCKS_PER_OCTA: usize = 8;
+const AB_REGEN_OCTA_BYTES: usize = AB_REGEN_BLOCKS_PER_OCTA * AB_REGEN_BLOCK_BYTES;
+const AB_REGEN_RANKED_RAW_ROWS: usize = 8192;
+// The packed kernels may prefetch three 64-row tiles ahead. At the end of a
+// local tile that reaches 1,536 bytes beyond the last consumed byte. Keep the
+// same mapped slack after both sides (including B, which has no following
+// operand allocation to make an otherwise out-of-range hint benign).
+const AB_REGEN_PREFETCH_GUARD: usize = 3 * 64 * 8;
+
+#[inline]
+fn ranked_ab_regen_geometry(
+    m: usize,
+    k_skip: usize,
+    padding: &PaddingSpec,
+    hi_size: usize,
+    raw_rows_per_chunk: usize,
+) -> bool {
+    m == 32
+        && k_skip == 6
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && hi_size == (1 << 13)
+        && raw_rows_per_chunk == AB_REGEN_RANKED_RAW_ROWS
+}
+
+#[inline]
+fn ab_regen_tile_ptrs(chunk_bytes: usize) -> (*mut u8, *mut u8) {
+    REGEN_TILE_TLS.with(|tile| {
+        let mut tile = tile.borrow_mut();
+        let side_stride = chunk_bytes + AB_REGEN_PREFETCH_GUARD;
+        let want = 2 * side_stride + 64;
+        if tile.len() < want {
+            tile.resize(want, 0);
+        }
+        let off = (64 - (tile.as_ptr() as usize & 63)) & 63;
+        // `side_stride` is a multiple of 64 for every admitted chunk, so both
+        // returned destinations are aligned. `want` includes alignment slack
+        // and a full maximum-prefetch guard after each side.
+        unsafe {
+            let tile_a = tile.as_mut_ptr().add(off);
+            (tile_a, tile_a.add(side_stride))
+        }
+    })
+}
+
+std::thread_local! {
+    /// Per-thread regeneration tiles for the packed-operand sweep: one
+    /// allocation per Rayon worker for the whole prove, never per item.
+    /// Rayon may run a `map_init` initializer once per item under steal
+    /// pressure, which would turn even a small initialization into a large
+    /// timed memset stream.
+    static REGEN_TILE_TLS: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1406,6 +1475,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
+    ab_regen: Option<AbOctaRegen<'_>>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1479,6 +1549,18 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
+    // Regeneration arm: consume each chunk's a/b from a thread-local tile
+    // filled by the closed-form octa rebuild instead of streaming the two
+    // packed buffers from DRAM. Every row-base use in the chunk kernel is
+    // pure a/b addressing, so rebasing that tile at zero is value-identical.
+    let regen_arm = cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && ab_regen.is_some()
+        && ranked_ab_regen_geometry(m, k_skip, padding, hi_size, chunk_size);
+    let chunk_bytes = chunk_size * 8;
+
     let (sum1, sum_inf, agg) = (0..hi_size)
         .into_par_iter()
         .map(|x_hi| {
@@ -1486,6 +1568,30 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             let pair_idx_base = x_hi * lo_size;
             let mut none_a: [F128; 0] = [];
             let mut none_b: [F128; 0] = [];
+
+            #[allow(unused_variables)]
+            let (a_ptr, b_ptr, kernel_row_base) = if regen_arm
+                && row_base.is_multiple_of(AB_REGEN_ROWS_PER_BLOCK * AB_REGEN_BLOCKS_PER_OCTA)
+            {
+                let f = ab_regen.unwrap();
+                let (tile_a, tile_b) = ab_regen_tile_ptrs(chunk_bytes);
+                // SAFETY: exact ranked geometry makes this four complete,
+                // in-range octas. Both destinations are aligned temporal TLS
+                // storage and have a kernel-prefetch guard after the payload.
+                unsafe {
+                    let first_block = row_base / AB_REGEN_ROWS_PER_BLOCK;
+                    for octa in 0..4 {
+                        f(
+                            first_block + octa * AB_REGEN_BLOCKS_PER_OCTA,
+                            tile_a.add(octa * AB_REGEN_OCTA_BYTES),
+                            tile_b.add(octa * AB_REGEN_OCTA_BYTES),
+                        );
+                    }
+                    (tile_a as *const u8, tile_b as *const u8, 0usize)
+                }
+            } else {
+                (a_packed.as_ptr(), b_packed.as_ptr(), row_base)
+            };
 
             #[cfg(all(
                 target_arch = "x86_64",
@@ -1500,9 +1606,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
                     table.data.as_ptr(),
                     r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
+                    a_ptr,
+                    b_ptr,
+                    kernel_row_base,
                     &mut none_a,
                     &mut none_b,
                     eq_lo,
@@ -1589,7 +1695,19 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     r_next4: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-        a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        padding,
+        a_out,
+        b_out,
+        rho1,
+        rho2,
+        r_next4,
+        None,
+        None,
     )
 }
 
@@ -1607,6 +1725,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     rho2: F128,
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
+    ab_regen: Option<AbOctaRegen<'_>>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1725,6 +1844,21 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
+    // At ranked geometry each output chunk consumes four raw rows per output:
+    // 2,048 outputs become the same 8,192-row / 64-KiB-per-side tile used by
+    // round two. Other shapes stay on the materialized buffers, even if a
+    // caller accidentally supplies a provider.
+    let raw_rows_per_chunk = 4 * chunk_out;
+    let chunk_bytes = raw_rows_per_chunk * 8;
+    let regen_arm = cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && ab_regen.is_some()
+        && ranked_ab_regen_geometry(m, k_skip, padding, hi_size, raw_rows_per_chunk)
+        && chunk_out == 2048
+        && chunk_bytes == 4 * AB_REGEN_OCTA_BYTES;
+
     // NT publish of the fold outputs: only when the outputs are too large to
     // be LLC-resident when the next cascade level reads them (2^23 F128 =
     // 128 MiB per array selects the rounds-3+4 level alone at the ranked
@@ -1747,6 +1881,41 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         .map(|(x_hi, (a_out, b_out))| {
             // Output x of this chunk ← packed rows 4x..4x+4 (pairs 2x, 2x+1).
             let out_base = x_hi * chunk_out;
+            let raw_row_base = 4 * out_base;
+
+            // Rebasing the packed pointer and passing local out_base=0 is
+            // correct only when both periodic address-dependent behaviours
+            // restart here: block padding (256 rows) and pair skipping (64
+            // composed outputs). Octa alignment is deliberately stronger and
+            // makes the provider's first block a multiple of eight. Fail
+            // closed to the global packed buffers for any other chunk start.
+            let local_rebase_ok = raw_row_base.is_multiple_of(AB_REGEN_ROWS_PER_BLOCK)
+                && out_base.is_multiple_of(AB_REGEN_ROWS_PER_BLOCK / 4)
+                && (raw_row_base / AB_REGEN_ROWS_PER_BLOCK)
+                    .is_multiple_of(AB_REGEN_BLOCKS_PER_OCTA);
+
+            #[allow(unused_variables)]
+            let (a_ptr, b_ptr, kernel_out_base) = if regen_arm && local_rebase_ok {
+                let f = ab_regen.unwrap();
+                let (tile_a, tile_b) = ab_regen_tile_ptrs(chunk_bytes);
+                // SAFETY: the exact gate fixes four whole octas and a 64-KiB
+                // payload per side. The chunk begins on an eight-block
+                // boundary, and the TLS allocation carries sufficient guard
+                // for every packed-kernel software-prefetch address.
+                unsafe {
+                    let first_block = raw_row_base / AB_REGEN_ROWS_PER_BLOCK;
+                    for octa in 0..4 {
+                        f(
+                            first_block + octa * AB_REGEN_BLOCKS_PER_OCTA,
+                            tile_a.add(octa * AB_REGEN_OCTA_BYTES),
+                            tile_b.add(octa * AB_REGEN_OCTA_BYTES),
+                        );
+                    }
+                    (tile_a as *const u8, tile_b as *const u8, 0usize)
+                }
+            } else {
+                (a_packed.as_ptr(), b_packed.as_ptr(), out_base)
+            };
 
             #[cfg(all(
                 target_arch = "x86_64",
@@ -1760,9 +1929,9 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                     table.data.as_ptr(),
                     r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
+                    a_ptr,
+                    b_ptr,
+                    kernel_out_base,
                     a_out,
                     b_out,
                     rho1,

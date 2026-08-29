@@ -526,14 +526,26 @@ const _RING_GEOMETRY: () = {
 /// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
 /// of off two full-block window buffers.
 ///
-/// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
-/// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks.
+/// With `horner`, `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side,
+/// eight 16-word block rows each) and is 64-byte aligned, while `out` owns
+/// this octa's eight `BYTES_PER_BLOCK` ab_inner blocks. Without `horner`,
+/// neither pointer is dereferenced.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     pub(crate) out: *mut u8,
-    pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
-    pub(crate) plan: Round1AbWindowPlan,
+    /// Present exactly when `horner` is true. `Option<&T>` retains the
+    /// reference's pointer-sized representation while giving the dedicated
+    /// regeneration entry a valid absent state.
+    pub(crate) inv_table: Option<&'t InvNttTableByteSingleGf8>,
+    /// Initialized exactly when `horner` is true. Keeping the plan in its
+    /// original storage preserves the ranked projection layout without
+    /// constructing an unused plan for regeneration.
+    pub(crate) plan: core::mem::MaybeUninit<Round1AbWindowPlan>,
+    /// When false, the generic drain publishes complete a/b rows with
+    /// ordinary temporal stores and skips z plus every `out` store. Round-two
+    /// regeneration needs only the drained operand bytes, not another
+    /// `ab_inner` image.
+    pub(crate) horner: bool,
 }
 
 #[repr(C, align(64))]
@@ -557,8 +569,26 @@ static RANKED_ZERO: RankedStaticWindow = RankedStaticWindow([0u8; 64]);
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
-        // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
+        // SAFETY: Horner staging owns `STREAM_STAGE_WORDS` u32s. The
+        // non-Horner wrapper uses its full A tile as an inert in-bounds base;
+        // neither returned pointer is dereferenced on that branch.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
+    }
+
+    #[inline(always)]
+    fn inv_table(&self) -> &InvNttTableByteSingleGf8 {
+        debug_assert!(self.horner);
+        // SAFETY: every Horner constructor supplies the table, and only the
+        // Horner projection methods call this accessor.
+        unsafe { self.inv_table.unwrap_unchecked() }
+    }
+
+    #[inline(always)]
+    fn plan(&self) -> Round1AbWindowPlan {
+        debug_assert!(self.horner);
+        // SAFETY: every Horner constructor initializes the plan, and the
+        // non-Horner path returns before any plan access.
+        unsafe { *self.plan.assume_init_ref() }
     }
 
     /// The window's per-block invariants: its static-B eligibility and the
@@ -567,8 +597,8 @@ impl StreamProj<'_> {
     /// resolves them ONCE and hands them to every piece.
     #[inline(always)]
     fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
-        let p = self.plan.for_window(blk);
-        (p, round1_ab_table_images(self.inv_table, p))
+        let p = self.plan().for_window(blk);
+        (p, round1_ab_table_images(self.inv_table(), p))
     }
 
     #[rustfmt::skip]
@@ -589,7 +619,7 @@ impl StreamProj<'_> {
                 while j!=8 {
                     rows.publish(j,sa,sb);
                     let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                    round1_ab_inner_window_with_images(&*sa.add(j*STEP_WORDS).cast::<[u8;64]>(),&*sb.add(j*STEP_WORDS).cast::<[u8;64]>(),out,blk,self.inv_table,plan,imgs);
+                    round1_ab_inner_window_with_images(&*sa.add(j*STEP_WORDS).cast::<[u8;64]>(),&*sb.add(j*STEP_WORDS).cast::<[u8;64]>(),out,blk,self.inv_table(),plan,imgs);
                     j+=1;
                 }
             }
@@ -638,7 +668,7 @@ impl StreamProj<'_> {
                     &RANKED_B_MAX.0,
                     out,
                     BLK,
-                    self.inv_table,
+                    self.inv_table(),
                     plan,
                     imgs,
                 );
@@ -665,7 +695,7 @@ impl StreamProj<'_> {
                     &RANKED_ZERO.0,
                     out,
                     31,
-                    self.inv_table,
+                    self.inv_table(),
                     plan,
                     imgs,
                 );
@@ -690,7 +720,7 @@ impl StreamProj<'_> {
                 rows.publish_sparse_30(j,q.add(j));
                 let a=&*q.add(j).cast::<[u8;64]>();
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+30*64).cast::<[u8;64]>();
-                round1_ab_inner_window_with_images(a,&RANKED_B30.0,out,30,self.inv_table,plan,imgs);
+                round1_ab_inner_window_with_images(a,&RANKED_B30.0,out,30,self.inv_table(),plan,imgs);
                 j+=1;
             }
         }
@@ -1301,6 +1331,30 @@ impl Drain8<'_> {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
+                // The opt-in round-two regenerator selects the generic
+                // monomorph and needs only complete A/B. Publish straight
+                // from the live transpose vectors with ordinary stores,
+                // avoiding the staging round-trip plus all z,
+                // projection-plan, offset-arena, and `out` work. `E` is a
+                // const, so the ranked E=true hot path contains none of this
+                // branch after monomorphization.
+                if !E && !proj.horner {
+                    let a_lo=tr8_chunk(self.ast,rw);
+                    let a_hi=tr8_chunk(self.ast,rw+8);
+                    for r in 0..8 {
+                        let p=self.a.add(abs_word+r*U32_PER_BLOCK);
+                        store_v8(p,a_lo[r]);
+                        store_v8(p.add(8),a_hi[r]);
+                    }
+                    let b_lo=tr8_chunk(self.bs,rw);
+                    let b_hi=tr8_chunk(self.bs,rw+8);
+                    for r in 0..8 {
+                        let p=self.b.add(abs_word+r*U32_PER_BLOCK);
+                        store_v8(p,b_lo[r]);
+                        store_v8(p.add(8),b_hi[r]);
+                    }
+                    continue;
+                }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
                     let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
@@ -1556,18 +1610,23 @@ unsafe fn dump_elide_win(
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
-/// `proj` selects the STREAMING form of the a/b fusion: a/b are
-/// published non-temporally, and each drain step's
-/// eight 64-byte round-1 medium windows are transformed straight into the
-/// caller's ab_inner blocks out of a small staging pair, so no full-block
-/// window buffer exists.
+/// With `proj.horner`, `proj` selects the STREAMING form of the a/b fusion:
+/// a/b are published non-temporally, and each drain step's eight 64-byte
+/// round-1 medium windows are transformed straight into the caller's
+/// ab_inner blocks out of a small staging pair, so no full-block window
+/// buffer exists. Without `proj.horner`, the generic `[false; 3]` form is a
+/// dedicated round-two regenerator: it ignores z and `proj.out` and publishes
+/// complete a/b rows with ordinary temporal stores.
 ///
 /// # Safety
-/// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
-/// `proj`'s staging and `out` satisfy [`StreamProj`]'s contract. In every
-/// non-temporal arm the caller must `_mm_sfence()` on this thread after its
-/// last octa, before releasing a/b to another thread (same-thread reads are
-/// self-consistent regardless).
+/// Caller must have AVX2. With `proj.horner`, `z`/`a`/`b` each own 8
+/// contiguous 512-word blocks, `proj`'s staging and `out` satisfy
+/// [`StreamProj`]'s contract, and the caller must `_mm_sfence()` on this
+/// thread after its last octa before releasing a/b to another thread. Without
+/// `proj.horner`, `elide` is `[false; 3]`, z and `proj.out` may be null,
+/// `proj.stage` must support the in-bounds side-pointer calculation but is not
+/// dereferenced, the inverse table is absent, the plan may be uninitialized,
+/// a/b each own 8 contiguous 512-word blocks, and no fence is required.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: OctaInputs<'_>,
@@ -1578,9 +1637,10 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     elide: [bool; 3],
 ) {
     unsafe {
+        debug_assert!(proj.horner || elide == [false; 3]);
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        let ranked_static = elide == [true; 3] && proj.plan().offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -1860,6 +1920,49 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
         }
         drain.drain_range(0, 0, 16);
+    }
+}
+
+/// Rebuild only the complete packed A/B rows for eight compressions.
+///
+/// This is the round-two provider's dedicated entry: it carries no projection
+/// staging, inverse-NTT table, window plan, z destination, or output image.
+/// The fixed generic `[false; 3]` drain publishes every A/B byte directly with
+/// ordinary temporal stores and returns before any absent projection state is
+/// observed.
+///
+/// # Safety
+/// Caller must have AVX2. `a` and `b` each own eight contiguous 512-word
+/// blocks. `inputs` contains eight valid compressions (or one valid closed
+/// octa). The destinations must not alias the inputs or each other.
+pub(crate) unsafe fn build_octa_witness_ab_temporal(
+    inputs: OctaInputs<'_>,
+    a: *mut u32,
+    b: *mut u32,
+) {
+    let proj = StreamProj {
+        // `sides()` is shared with the ranked projection and retains its
+        // incumbent in-bounds `add`. The complete A tile is a valid inert base
+        // for that calculation; the direct branch never dereferences it as
+        // projection staging.
+        stage: a,
+        out: core::ptr::null_mut(),
+        inv_table: None,
+        plan: core::mem::MaybeUninit::uninit(),
+        horner: false,
+    };
+    // SAFETY: `[false; 3]` fixes `ranked_static = false`; every drain selects
+    // the direct temporal A/B branch before dereferencing z, stage, out, the
+    // inverse table, or the uninitialized plan.
+    unsafe {
+        build_octa_witness_ab_stream_elide(
+            inputs,
+            core::ptr::null_mut(),
+            a,
+            b,
+            proj,
+            [false; 3],
+        )
     }
 }
 

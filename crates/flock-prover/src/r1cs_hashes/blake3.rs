@@ -1811,6 +1811,65 @@ fn live_witgen_simd_enabled() -> bool {
     }
 }
 
+/// Ranked round-two a/b regeneration selector. The challenge worker's cleared
+/// environment selects regeneration; the negative kill switch preserves the
+/// materialized-buffer oracle for controlled same-binary A/B runs.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn r2_regen_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_REGEN").is_none());
+    *ON
+}
+
+/// Build the ranked closed-form round-two regenerator. Each invocation
+/// rebuilds one octa with the same witness kernel and inputs as the original
+/// drain through the dedicated temporal A/B-only entry, with no z, projection
+/// staging, inverse table, or window plan. Other shapes and slice-backed
+/// inputs retain streamed reads.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn make_r2_regen(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    k_log: usize,
+    n_blocks_log: usize,
+) -> Option<Box<dyn Fn(usize, *mut u8, *mut u8) + Sync>> {
+    let crate::seed_pipe::BlockSource::Closed { init, len } = blocks else {
+        return None;
+    };
+    if k_log != K_LOG
+        || n_blocks_log != 18
+        || len != (1usize << n_blocks_log)
+        || !r2_regen_enabled()
+    {
+        return None;
+    }
+
+    Some(Box::new(move |first_block: usize, a_dst: *mut u8, b_dst: *mut u8| {
+        // SAFETY: `AbOctaRegen` supplies two disjoint aligned 16-KiB outputs
+        // and requests only complete in-range octas from the same closed
+        // source used for witness generation. The dedicated builder publishes
+        // complete A/B with ordinary temporal stores before returning.
+        unsafe {
+            blake3_witgen8::build_octa_witness_ab_temporal(
+                blake3_witgen8::OctaInputs::Closed {
+                    init,
+                    base: first_block,
+                },
+                a_dst.cast::<u32>(),
+                b_dst.cast::<u32>(),
+            );
+        }
+    }))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn make_r2_regen(
+    _blocks: crate::seed_pipe::BlockSource<'_>,
+    _k_log: usize,
+    _n_blocks_log: usize,
+) -> Option<Box<dyn Fn(usize, *mut u8, *mut u8) + Sync>> {
+    None
+}
+
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
 /// explicit staged-NT toggle so tests can assert byte equality of the paths.
 /// SIMD dispatch follows [`live_witgen_simd_enabled`].
@@ -1973,6 +2032,82 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             z.as_ptr(),
             witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
         );
+        // Diagnostic oracle only. With `FLOCK_REGEN_CHECK=1`, regenerate
+        // representative closed-form octas into aligned scratch and assert
+        // that A/B are bit-for-bit identical to the original drain. The
+        // ranked harness clears this variable, so the check and its
+        // allocations are absent there.
+        if std::env::var_os("FLOCK_REGEN_CHECK").is_some() {
+            if let crate::seed_pipe::BlockSource::Closed { init, len } = blocks {
+                const SIMD: usize = 8;
+                if len == n_total && n_total >= SIMD {
+                    let align_off16 = |ptr: *const F128| {
+                        (64 - (ptr as usize & 63) & 63) / core::mem::size_of::<F128>()
+                    };
+                    let mut scratch_a = vec![F128::ZERO; SIMD * F128_PER_BLOCK + 4];
+                    let mut scratch_b = vec![F128::ZERO; SIMD * F128_PER_BLOCK + 4];
+                    let (a_off, b_off) = (
+                        align_off16(scratch_a.as_ptr()),
+                        align_off16(scratch_b.as_ptr()),
+                    );
+                    let n = SIMD * F128_PER_BLOCK;
+                    let sentinel_a = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+                    let sentinel_b = F128::new(0x3c3c_3c3c_3c3c_3c3c, 0xc3c3_c3c3_c3c3_c3c3);
+
+                    for &base in &[0usize, (n_total / 2) & !7, n_total - SIMD] {
+                        scratch_a[a_off..a_off + n].fill(sentinel_a);
+                        scratch_b[b_off..b_off + n].fill(sentinel_b);
+                        // SAFETY: all destinations are aligned by the offsets
+                        // above and own a complete octa; each selected base is
+                        // within the same closed source as the original drain.
+                        unsafe {
+                            blake3_witgen8::build_octa_witness_ab_temporal(
+                                blake3_witgen8::OctaInputs::Closed { init, base },
+                                scratch_a.as_mut_ptr().add(a_off).cast::<u32>(),
+                                scratch_b.as_mut_ptr().add(b_off).cast::<u32>(),
+                            );
+                        }
+                        let original =
+                            base * F128_PER_BLOCK..(base + SIMD) * F128_PER_BLOCK;
+                        assert!(
+                            scratch_a[a_off..a_off + n] == a[original.clone()],
+                            "[regen-check] A mismatch at octa base {base}",
+                        );
+                        assert!(
+                            scratch_b[b_off..b_off + n] == b[original],
+                            "[regen-check] B mismatch at octa base {base}",
+                        );
+                        eprintln!("[regen-check] base={base} a=true b=true");
+                    }
+
+                    // Optional diagnostic cost sample: repeated sequential
+                    // octa rebuilds into the same L1-resident scratch.
+                    let reps = 4096usize;
+                    let started = std::time::Instant::now();
+                    for i in 0..reps {
+                        let base = (i * SIMD) & (n_total - SIMD);
+                        // SAFETY: same allocation and closed-range guarantees
+                        // as the representative equality loop above.
+                        unsafe {
+                            blake3_witgen8::build_octa_witness_ab_temporal(
+                                blake3_witgen8::OctaInputs::Closed { init, base },
+                                scratch_a.as_mut_ptr().add(a_off).cast::<u32>(),
+                                scratch_b.as_mut_ptr().add(b_off).cast::<u32>(),
+                            );
+                        }
+                    }
+                    let elapsed = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[regen-cost] {} octas in {:.3} ms = {:.2} us/octa (1 thread)",
+                        reps,
+                        elapsed * 1e3,
+                        elapsed * 1e6 / reps as f64,
+                    );
+                }
+            } else {
+                eprintln!("[regen-check] non-closed source; skipped");
+            }
+        }
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -2281,8 +2416,9 @@ fn generate_round1_inner_octa(
                             blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                inv_table,
-                                plan: win_plan,
+                                inv_table: Some(inv_table),
+                                plan: core::mem::MaybeUninit::new(win_plan),
+                                horner: true,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
@@ -3750,6 +3886,8 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         flock_core::gaptime::begin("blake3 prove_fast");
+        let regen_owned = make_r2_regen(blocks, self.r1cs.k_log, self.n_blocks_log());
+        let regen_arg = regen_owned.as_deref();
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
@@ -3776,6 +3914,7 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    regen_arg,
                     challenger,
                 )
             }
@@ -3828,6 +3967,12 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        let regen_owned = make_r2_regen(
+            crate::seed_pipe::BlockSource::Slice(blocks),
+            self.r1cs.k_log,
+            self.n_blocks_log(),
+        );
+        let regen_arg = regen_owned.as_deref();
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 let (z_packed, a_packed_f128, b_packed_f128) =
@@ -3843,6 +3988,7 @@ impl Blake3Setup {
                         b_packed_f128,
                         lc_circuit,
                         None,
+                        regen_arg,
                         challenger,
                     );
                 timings.witness_s = witness_s;

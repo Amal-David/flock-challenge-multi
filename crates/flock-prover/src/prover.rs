@@ -452,6 +452,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -480,6 +481,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -497,6 +499,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
     ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    ab_regen: Option<zerocheck::multilinear::AbOctaRegen<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_inner(
@@ -509,6 +512,7 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        ab_regen,
         challenger,
     )
 }
@@ -524,6 +528,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    ab_regen: Option<zerocheck::multilinear::AbOctaRegen<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -551,6 +556,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        ab_regen,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -782,6 +788,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -797,6 +804,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    ab_regen: Option<zerocheck::multilinear::AbOctaRegen<'_>>,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -905,8 +913,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             flock_core::gaptime::mark("zerocheck: views built");
             let r = match c_identity_z {
             Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_and_regen(
                     a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                    ab_regen,
                     challenger,
                 )
             }
@@ -1038,6 +1047,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -1052,6 +1062,7 @@ pub fn prove_fast_ligerito_timed_from_block_major_witness<Ch: Challenger>(
     b_packed_f128: Vec<F128>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    ab_regen: Option<zerocheck::multilinear::AbOctaRegen<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     prove_fast_ligerito_timed_inner(
@@ -1063,6 +1074,7 @@ pub fn prove_fast_ligerito_timed_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        ab_regen,
         challenger,
     )
 }
@@ -1077,6 +1089,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    ab_regen: Option<zerocheck::multilinear::AbOctaRegen<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
@@ -1156,8 +1169,9 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             };
             match c_identity_z {
             Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_and_regen(
                     a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                    ab_regen,
                     challenger,
                 )
             }
