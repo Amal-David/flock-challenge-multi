@@ -111,6 +111,12 @@ pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
 
+/// Witness generation retains its local inverse-transform table.
+#[inline(always)]
+fn witgen_urm_share_enabled() -> bool {
+    false
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -1914,9 +1920,19 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
