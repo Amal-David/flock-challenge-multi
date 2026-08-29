@@ -433,6 +433,46 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// `acc XOR (v * t)` for two independent 4-lane groups. Same 5-CLMUL split
+/// diet as [`ghash_mul_x4_split`], with `acc` XORed into the unreduced low limb
+/// (reduction is F2-linear in `lo`) so the post-mul XOR is free.
+///
+/// # Safety
+/// Same contract as [`ghash_mul_x4_split`] on every lane of both operands.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_muladd_x4_split_x2(
+    acc0: __m512i,
+    v0: __m512i,
+    acc1: __m512i,
+    v1: __m512i,
+    t: __m512i,
+    t_x64: __m512i,
+) -> (__m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the companion contract.
+    unsafe {
+        let p00_0 = _mm512_clmulepi64_epi128::<0x00>(v0, t);
+        let p00_1 = _mm512_clmulepi64_epi128::<0x00>(v1, t);
+        let p01_0 = _mm512_clmulepi64_epi128::<0x01>(v0, t_x64);
+        let p01_1 = _mm512_clmulepi64_epi128::<0x01>(v1, t_x64);
+        let p10_0 = _mm512_clmulepi64_epi128::<0x10>(v0, t);
+        let p10_1 = _mm512_clmulepi64_epi128::<0x10>(v1, t);
+        let p11_0 = _mm512_clmulepi64_epi128::<0x11>(v0, t_x64);
+        let p11_1 = _mm512_clmulepi64_epi128::<0x11>(v1, t_x64);
+        let lo0 = _mm512_xor_si512(acc0, _mm512_xor_si512(p00_0, p01_0));
+        let lo1 = _mm512_xor_si512(acc1, _mm512_xor_si512(p00_1, p01_1));
+        let hi0 = _mm512_xor_si512(p10_0, p11_0);
+        let hi1 = _mm512_xor_si512(p10_1, p11_1);
+        let poly = ghash_poly_x4();
+        let s0 = _mm512_xor_si512(lo0, _mm512_bslli_epi128::<8>(hi0));
+        let s1 = _mm512_xor_si512(lo1, _mm512_bslli_epi128::<8>(hi1));
+        let c0 = _mm512_clmulepi64_epi128::<0x01>(hi0, poly);
+        let c1 = _mm512_clmulepi64_epi128::<0x01>(hi1, poly);
+        (_mm512_xor_si512(s0, c0), _mm512_xor_si512(s1, c1))
+    }
+}
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many
