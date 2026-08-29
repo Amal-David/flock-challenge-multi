@@ -2100,11 +2100,20 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
     // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
+    // Eight independent columns at a time: the mul_by_x walk is serial, the
+    // folds go through the 8-slot vpgatherqq XOR-tree.
     let mut cols = [F128::ZERO; 128];
     let mut w = e_hi; // X^0 · e_hi
-    for c in cols.iter_mut() {
-        *c = fold_one_slot(w, base);
-        w = crate::field::mul_by_x(w);
+    let mut i = 0usize;
+    while i < 128 {
+        let mut elems = [F128::ZERO; 8];
+        for e in &mut elems {
+            *e = w;
+            w = crate::field::mul_by_x(w);
+        }
+        let got = fold_eight_slots(&elems, base);
+        cols[i..i + 8].copy_from_slice(&got);
+        i += 8;
     }
     cols
 }
@@ -2232,6 +2241,129 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let r1 = q2 + q3;
     // Level 4.
     r0 + r1
+}
+
+/// Eight-slot fold: two `gather_width=4` `vpgatherqq` waves per table bank,
+/// XOR-tree reduced across the 16 banks. Bit-identical to eight independent
+/// [`fold_one_slot`] calls. Compiled-in `slot_unroll=8`; scalar fallback when
+/// the crate is not built with AVX-512F (lint x86-64-v3).
+#[inline(always)]
+pub(crate) fn fold_eight_slots(elems: &[F128; 8], tables: &[F128]) -> [F128; 8] {
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        // SAFETY: crate RUSTFLAGS include avx512f (native SPR bench).
+        unsafe { fold_eight_slots_avx512(elems, tables) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                // SAFETY: runtime ISA check; body is `target_feature(avx512f)`.
+                return unsafe { fold_eight_slots_avx512(elems, tables) };
+            }
+        }
+        [
+            fold_one_slot(elems[0], tables),
+            fold_one_slot(elems[1], tables),
+            fold_one_slot(elems[2], tables),
+            fold_one_slot(elems[3], tables),
+            fold_one_slot(elems[4], tables),
+            fold_one_slot(elems[5], tables),
+            fold_one_slot(elems[6], tables),
+            fold_one_slot(elems[7], tables),
+        ]
+    }
+}
+
+/// Assign `out[0..8] = fold(eq_lo[0..8])`.
+#[inline(always)]
+pub(crate) fn fold_eight_assign(eq_lo: &[F128], tables: &[F128], out: &mut [F128]) {
+    debug_assert!(eq_lo.len() >= 8 && out.len() >= 8);
+    // SAFETY: caller length-checked; F128 is `repr(C)` so the 8-wide load is
+    // a tight `[F128; 8]`.
+    let elems = unsafe { &*eq_lo.as_ptr().cast::<[F128; 8]>() };
+    let got = fold_eight_slots(elems, tables);
+    unsafe {
+        core::ptr::copy_nonoverlapping(got.as_ptr(), out.as_mut_ptr(), 8);
+    }
+}
+
+/// XOR-add `fold(eq_lo[0..8])` into `out[0..8]`.
+#[inline(always)]
+pub(crate) fn fold_eight_add(eq_lo: &[F128], tables: &[F128], out: &mut [F128]) {
+    debug_assert!(eq_lo.len() >= 8 && out.len() >= 8);
+    // SAFETY: same contract as [`fold_eight_assign`].
+    let elems = unsafe { &*eq_lo.as_ptr().cast::<[F128; 8]>() };
+    let got = fold_eight_slots(elems, tables);
+    for i in 0..8 {
+        out[i] += got[i];
+    }
+}
+
+/// Per bank: two `vpgatherqq` of 4 F128 (8 qwords each). 16 banks XOR-tree
+/// reduced in groups of 4. Indices are qword offsets into `tables` (scale 8).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn fold_eight_slots_avx512(elems: &[F128; 8], tables: &[F128]) -> [F128; 8] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let tables_i64 = tables.as_ptr().cast::<i64>();
+        let mut bytes = [[0u8; 8]; FOLD_N_BYTES];
+        for slot in 0..8 {
+            let lo = elems[slot].lo.to_le_bytes();
+            let hi = elems[slot].hi.to_le_bytes();
+            for b in 0..8 {
+                bytes[b][slot] = lo[b];
+                bytes[b + 8][slot] = hi[b];
+            }
+        }
+        macro_rules! gather4 {
+            ($bank:expr, $s0:expr, $s1:expr, $s2:expr, $s3:expr) => {{
+                let off = ($bank * FOLD_TABLE_SIZE) as i64;
+                let i0 = (off + $s0 as i64) * 2;
+                let i1 = (off + $s1 as i64) * 2;
+                let i2 = (off + $s2 as i64) * 2;
+                let i3 = (off + $s3 as i64) * 2;
+                _mm512_i64gather_epi64::<8>(
+                    _mm512_set_epi64(i3 + 1, i3, i2 + 1, i2, i1 + 1, i1, i0 + 1, i0),
+                    tables_i64,
+                )
+            }};
+        }
+        let mut acc0 = _mm512_setzero_si512();
+        let mut acc1 = _mm512_setzero_si512();
+        let mut bank = 0usize;
+        while bank < FOLD_N_BYTES {
+            let b0 = &bytes[bank];
+            let b1 = &bytes[bank + 1];
+            let b2 = &bytes[bank + 2];
+            let b3 = &bytes[bank + 3];
+            // Wave 0: slots 0..3. Wave 1: slots 4..7. XOR-tree of 4 banks.
+            let g00 = gather4!(bank, b0[0], b0[1], b0[2], b0[3]);
+            let g01 = gather4!(bank, b0[4], b0[5], b0[6], b0[7]);
+            let g10 = gather4!(bank + 1, b1[0], b1[1], b1[2], b1[3]);
+            let g11 = gather4!(bank + 1, b1[4], b1[5], b1[6], b1[7]);
+            let g20 = gather4!(bank + 2, b2[0], b2[1], b2[2], b2[3]);
+            let g21 = gather4!(bank + 2, b2[4], b2[5], b2[6], b2[7]);
+            let g30 = gather4!(bank + 3, b3[0], b3[1], b3[2], b3[3]);
+            let g31 = gather4!(bank + 3, b3[4], b3[5], b3[6], b3[7]);
+            acc0 = _mm512_xor_si512(
+                acc0,
+                _mm512_xor_si512(_mm512_xor_si512(g00, g10), _mm512_xor_si512(g20, g30)),
+            );
+            acc1 = _mm512_xor_si512(
+                acc1,
+                _mm512_xor_si512(_mm512_xor_si512(g01, g11), _mm512_xor_si512(g21, g31)),
+            );
+            bank += 4;
+        }
+        let mut out = [F128::ZERO; 8];
+        _mm512_storeu_si512(out.as_mut_ptr().cast::<__m512i>(), acc0);
+        _mm512_storeu_si512(out.as_mut_ptr().add(4).cast::<__m512i>(), acc1);
+        out
+    }
 }
 
 #[allow(dead_code)] // Scalar oracle for the generator-based table builder.
@@ -5316,6 +5448,29 @@ mod tests {
                     acc += fold_weight[d] * fold_one_slot(low_eq[d] * x, &base);
                 }
                 assert_eq!(fold_one_slot(x, &got), acc, "trial {trial} slot");
+            }
+        }
+    }
+
+    /// Eight-slot gather fold is bit-identical to eight independent scalar
+    /// [`fold_one_slot`] evaluations (XOR-tree of 16 table banks).
+    #[test]
+    fn fold_eight_slots_matches_fold_one_slot() {
+        let mut rng = Rng::new(0xF01D_5107_8);
+        for trial in 0..4 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let table = build_direct_fold8_table_from_generators(&generators);
+            let mut elems = [F128::ZERO; 8];
+            for e in &mut elems {
+                *e = rng.f128();
+            }
+            let got = fold_eight_slots(&elems, &table);
+            for i in 0..8 {
+                assert_eq!(
+                    got[i],
+                    fold_one_slot(elems[i], &table),
+                    "trial {trial} slot {i}"
+                );
             }
         }
     }

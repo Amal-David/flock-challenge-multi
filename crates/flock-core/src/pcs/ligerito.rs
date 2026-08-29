@@ -4741,8 +4741,9 @@ fn materialize_direct_fold4(
                 // Deletes the `b_out.fill(ZERO)` memset that used to paint the
                 // whole chunk before the same += loop. Same F128 values — XOR
                 // with zero is the identity; the assign *is* that identity
-                // without the store. Existing 4-wide stride kept (not unrolled
-                // further; #120's 8-wide was cancelled with no official score).
+                // without the store. 8-slot vpgatherqq XOR-tree (two width-4
+                // waves) so this b-side issues gathers while fold16_banked's
+                // DRAM pipeline is still draining.
                 let table = &mut scratch[..table_len];
                 let mut claims_iter = claims.iter().zip(direct_tables.iter());
                 if !has_ordinary {
@@ -4751,7 +4752,7 @@ fn materialize_direct_fold4(
                         .expect("materialize_direct_fold4: claims non-empty");
                     super::ring_switch::compose_block_table(first_table, first.eq_hi[block], table);
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 8 <= block_len {
                         #[cfg(target_arch = "x86_64")]
                         if !pf_base.is_null() && pf_at < pf_span {
                             // SAFETY: `pf_at < pf_span` and the slab is
@@ -4767,11 +4768,12 @@ fn materialize_direct_fold4(
                             }
                             pf_at += 64;
                         }
-                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
-                        b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
-                        b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
-                        b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
-                        s += 4;
+                        super::ring_switch::fold_eight_assign(
+                            &first.eq_lo[s..],
+                            table,
+                            &mut b_out[s..],
+                        );
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
@@ -4785,7 +4787,7 @@ fn materialize_direct_fold4(
                         table,
                     );
                     let mut s = 0usize;
-                    while s + 3 < block_len {
+                    while s + 8 <= block_len {
                         #[cfg(target_arch = "x86_64")]
                         if !pf_base.is_null() && pf_at < pf_span {
                             // SAFETY: `pf_at < pf_span` and the slab is
@@ -4801,14 +4803,12 @@ fn materialize_direct_fold4(
                             }
                             pf_at += 64;
                         }
-                        b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
-                        b_out[s + 1] +=
-                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
-                        b_out[s + 2] +=
-                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
-                        b_out[s + 3] +=
-                            super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
-                        s += 4;
+                        super::ring_switch::fold_eight_add(
+                            &claim.eq_lo[s..],
+                            table,
+                            &mut b_out[s..],
+                        );
+                        s += 8;
                     }
                     while s < block_len {
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
@@ -6466,7 +6466,24 @@ fn materialize_direct_fold8(
                         first_claim.eq_hi[block],
                         scratch,
                     );
-                    for slot in 0..block_len {
+                    let mut slot = 0usize;
+                    while slot + 8 <= block_len {
+                        if has_ordinary {
+                            super::ring_switch::fold_eight_add(
+                                &first_claim.eq_lo[slot..],
+                                scratch,
+                                &mut b_out[slot..],
+                            );
+                        } else {
+                            super::ring_switch::fold_eight_assign(
+                                &first_claim.eq_lo[slot..],
+                                scratch,
+                                &mut b_out[slot..],
+                            );
+                        }
+                        slot += 8;
+                    }
+                    while slot < block_len {
                         let direct =
                             super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                         b_out[slot] = if has_ordinary {
@@ -6474,11 +6491,23 @@ fn materialize_direct_fold8(
                         } else {
                             direct
                         };
+                        slot += 1;
                     }
                     for (claim, table) in rest_claims.iter().zip(direct_tables.iter().skip(1)) {
                         super::ring_switch::compose_block_table(table, claim.eq_hi[block], scratch);
-                        for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                        let mut slot = 0usize;
+                        while slot + 8 <= block_len {
+                            super::ring_switch::fold_eight_add(
+                                &claim.eq_lo[slot..],
+                                scratch,
+                                &mut b_out[slot..],
+                            );
+                            slot += 8;
+                        }
+                        while slot < block_len {
+                            b_out[slot] +=
+                                super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                            slot += 1;
                         }
                     }
                 }
