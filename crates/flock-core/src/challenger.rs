@@ -268,8 +268,53 @@ impl FsChallenger {
 
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
-        self.absorb(&v.lo.to_le_bytes());
-        self.absorb(&v.hi.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            // `F128` is `repr(C, align(16)) { lo, hi }`, with no padding.
+            // On little-endian targets its object representation is exactly
+            // the transcript's canonical `lo_le || hi_le` encoding. Feed it
+            // in one update instead of two tiny updates; hashing a byte stream
+            // is independent of how that stream is split across updates.
+            const { assert!(core::mem::size_of::<F128>() == 16) };
+            // SAFETY: `v` is live for this call and the asserted 16-byte
+            // representation is fully initialized by its two `u64` fields.
+            let bytes =
+                unsafe { core::slice::from_raw_parts((&v as *const F128).cast::<u8>(), 16) };
+            self.absorb(bytes);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            self.absorb(&v.lo.to_le_bytes());
+            self.absorb(&v.hi.to_le_bytes());
+        }
+    }
+
+    #[inline]
+    fn absorb_f128_slice(&mut self, values: &[F128]) {
+        #[cfg(target_endian = "little")]
+        {
+            // Same canonical representation as `absorb_f128`, now exposed as
+            // one contiguous byte slice. This collapses 2 * values.len()
+            // hasher updates to one on transcript messages such as the
+            // zerocheck round-1 vectors and ring-switch statistics.
+            const { assert!(core::mem::size_of::<F128>() == 16) };
+            // SAFETY: `[F128]` is contiguous and contains no padding; the byte
+            // view has exactly the allocation-bounded size of the input slice
+            // and is consumed synchronously by `absorb`.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(values),
+                )
+            };
+            self.absorb(bytes);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            for &v in values {
+                self.absorb_f128(v);
+            }
+        }
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
@@ -335,9 +380,7 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
-        for v in values {
-            self.absorb_f128(*v);
-        }
+        self.absorb_f128_slice(values);
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
@@ -364,17 +407,42 @@ impl Challenger for FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
         self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+        #[cfg(target_endian = "little")]
+        {
+            // Allocate the returned field vector once and let the XOF fill its
+            // canonical little-endian representation directly. The previous
+            // byte Vec stayed live while `collect` allocated and populated a
+            // second Vec<F128>; this removes that allocation and conversion.
+            const { assert!(core::mem::size_of::<F128>() == 16) };
+            let mut values = vec![F128::ZERO; n];
+            // SAFETY: `F128` has the asserted initialized, padding-free
+            // representation. `squeeze_into` overwrites the complete byte
+            // view before it is observed as fields, and both self calls are
+            // synchronous (the view does not escape this block).
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    values.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of_val(values.as_slice()),
+                )
+            };
+            self.squeeze_into(bytes);
+            self.absorb(bytes);
+            values
+        }
+        #[cfg(target_endian = "big")]
+        {
+            let mut buf = vec![0u8; n * 16];
+            self.squeeze_into(&mut buf);
+            self.absorb(&buf);
+            buf.as_chunks::<16>()
+                .0
+                .iter()
+                .map(|c| F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -1905,6 +1973,95 @@ mod tests {
             let r1 = c1.sample_f128_vec(8);
             let r2 = c2.sample_f128_vec(8);
             assert_eq!(r1, r2);
+        }
+    }
+
+    /// The little-endian zero-copy absorption path must be byte-for-byte the
+    /// canonical scalar encoding it replaces, including empty and ragged
+    /// lengths either side of likely batching boundaries. This pins the
+    /// transcript, not merely prover/verifier agreement on the new code.
+    #[test]
+    fn fs_challenger_f128_absorption_matches_canonical_bytes() {
+        for kind in KINDS {
+            for n in [0usize, 1, 7, 31, 32, 33, 127] {
+                let values: Vec<F128> = (0..n)
+                    .map(|i| F128 {
+                        lo: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        hi: !(i as u64).rotate_left(23),
+                    })
+                    .collect();
+
+                let mut optimized = FsChallenger::with_hash(b"absorb-oracle", kind);
+                optimized.observe_f128_slice(&values);
+
+                let mut canonical = FsChallenger::with_hash(b"absorb-oracle", kind);
+                canonical.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                canonical.absorb(&(values.len() as u64).to_le_bytes());
+                for value in &values {
+                    canonical.absorb(&value.lo.to_le_bytes());
+                    canonical.absorb(&value.hi.to_le_bytes());
+                }
+
+                assert_eq!(
+                    optimized.sample_f128_vec(8),
+                    canonical.sample_f128_vec(8),
+                    "{kind}: slice length {n} changed the transcript"
+                );
+            }
+
+            let value = F128 {
+                lo: 0x0123_4567_89AB_CDEF,
+                hi: 0xFEDC_BA98_7654_3210,
+            };
+            let mut optimized = FsChallenger::with_hash(b"absorb-oracle", kind);
+            optimized.observe_f128(value);
+            let mut canonical = FsChallenger::with_hash(b"absorb-oracle", kind);
+            canonical.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+            canonical.absorb(&value.lo.to_le_bytes());
+            canonical.absorb(&value.hi.to_le_bytes());
+            assert_eq!(
+                optimized.sample_f128_vec(8),
+                canonical.sample_f128_vec(8),
+                "{kind}: scalar encoding changed the transcript"
+            );
+        }
+    }
+
+    /// Filling the returned F128 allocation directly must preserve both the
+    /// sampled values and the re-absorbed duplex state of the former byte-Vec
+    /// implementation.
+    #[test]
+    fn fs_challenger_f128_vec_squeeze_matches_canonical_bytes() {
+        for kind in KINDS {
+            for n in [0usize, 1, 2, 3, 8, 33, 257] {
+                let mut optimized = FsChallenger::with_hash(b"squeeze-oracle", kind);
+                optimized.observe_bytes(b"prefix");
+                let got = optimized.sample_f128_vec(n);
+
+                let mut canonical = FsChallenger::with_hash(b"squeeze-oracle", kind);
+                canonical.observe_bytes(b"prefix");
+                canonical.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+                canonical.absorb(&(n as u64).to_le_bytes());
+                let mut bytes = vec![0u8; n * 16];
+                canonical.squeeze_into(&mut bytes);
+                canonical.absorb(&bytes);
+                let want: Vec<F128> = bytes
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|c| F128 {
+                        lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                        hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                    })
+                    .collect();
+
+                assert_eq!(got, want, "{kind}: vector length {n}");
+                assert_eq!(
+                    optimized.sample_f128(),
+                    canonical.sample_f128(),
+                    "{kind}: vector length {n} changed the duplex state"
+                );
+            }
         }
     }
 

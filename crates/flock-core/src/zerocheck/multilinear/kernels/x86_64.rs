@@ -224,6 +224,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             && mats.is_some()
             && lo_size >= 32
             && lo_size.is_multiple_of(32);
+        // Process-constant feature switch: resolve it once per worker chunk.
+        // This predicate guards every eight-pair message iteration below, so
+        // leaving the LazyLock accessor there adds an acquire/load and branch
+        // to each of the ranked leaf sweep's millions of hot iterations.
+        let regfold = zc_regfold_enabled();
         let mut fa_store = FoldCache([F128::ZERO; 64]);
         let mut fb_store = FoldCache([F128::ZERO; 64]);
         let fa = &mut fa_store.0;
@@ -245,11 +250,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // scalar tail (and the regfold-off arm) index the cache BY ROW and
         // must never see the residue-major layout.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        let tr_emit = !WRITE
-            && use_batch
-            && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
-            && zc_r2_tr_enabled();
+        let tr_emit =
+            !WRITE && use_batch && lo_size.is_multiple_of(8) && regfold && zc_r2_tr_enabled();
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
@@ -330,7 +332,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
-            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && regfold {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
                     // Residue-major cache: a_k for this window is the
@@ -1566,13 +1568,16 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // batch per side per iteration.
         let use_batch =
             cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni")) && mats.is_some();
+        // As in round two, this process-constant switch is used by the hot
+        // cache-consumer branch and must not be reloaded per eight outputs.
+        let regfold = zc_regfold_enabled();
         // Composed-fold baking: the (ρ₁, ρ₂) pair fold is `out = Σ_k c_k ·
         // fold(row 4x+k)` with `c = (1+ρ₁)(1+ρ₂), ρ₁(1+ρ₂), (1+ρ₁)ρ₂, ρ₁ρ₂`.
         // Every `c_k` rides inside the batch's bit matrices, so the three
         // constant multiplies per output (14 CLMUL per sixteen rows) and the
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
-        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        let use_c4 = use_batch && cfold.is_some() && regfold;
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
@@ -1686,7 +1691,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
                     _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
-            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| regfold) {
                 debug_assert_eq!(cache_base, 4 * xg);
                 let _ = cache_base;
                 let ap = fa.as_ptr();
