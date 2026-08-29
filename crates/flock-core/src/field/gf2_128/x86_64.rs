@@ -288,6 +288,42 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     }
 }
 
+/// [`gf2_128_reduce_x4`] with the leftover `t1.hi · 0x87` CLMUL replaced by
+/// four 64-bit shifts + XORs. `0x87 = 1 + x + x^2 + x^7`, so the 64×8
+/// carry-less product is `h ⊕ (h≪1) ⊕ (h≪2) ⊕ (h≪7)` as a 128-bit
+/// polynomial (bits 64..70 of each shift land in the high qword). On SPR
+/// `VPSLLQ` issues on p0 while `VPCLMULQDQ` is p5-only; NTT butterflies
+/// already spent the other p5 CLMUL on the diet product.
+///
+/// Byte-identical to [`gf2_128_reduce_x4`]. Used only by the NTT mul_x4
+/// shift-red arm (`FLOCK_NO_NTT_SHIFT_RED`); lincheck/open keep the CLMUL
+/// fold.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn gf2_128_reduce_x4_shift(mut t0: __m512i, t1: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
+        // h = t1.hi in the low qword of each 128-bit lane (high qword zero).
+        let h = _mm512_bsrli_epi128::<8>(t1);
+        let c1 = _mm512_xor_si512(
+            _mm512_slli_epi64::<1>(h),
+            _mm512_bslli_epi128::<8>(_mm512_srli_epi64::<63>(h)),
+        );
+        let c2 = _mm512_xor_si512(
+            _mm512_slli_epi64::<2>(h),
+            _mm512_bslli_epi128::<8>(_mm512_srli_epi64::<62>(h)),
+        );
+        let c7 = _mm512_xor_si512(
+            _mm512_slli_epi64::<7>(h),
+            _mm512_bslli_epi128::<8>(_mm512_srli_epi64::<57>(h)),
+        );
+        let prod = _mm512_xor_si512(_mm512_xor_si512(h, c1), _mm512_xor_si512(c2, c7));
+        _mm512_xor_si512(t0, prod)
+    }
+}
+
 /// Reduce four lanes of an XOR-accumulated unreduced product triple
 /// `(lo = Σ x.lo·y.lo, mid = Σ (x.hi·y.lo ^ x.lo·y.hi), hi = Σ x.hi·y.hi)`
 /// — the same two-step fold [`ghash_mul_x4`] applies to a single product.
@@ -356,6 +392,20 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
         let t1 = _mm512_clmulepi64_epi128::<0x10>(x, y);
         let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
         gf2_128_reduce_x4(t0, t1)
+    }
+}
+
+/// [`ghash_mul_x4_low_lhs`] with [`gf2_128_reduce_x4_shift`].
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_low_lhs_shift(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the zero-high-limb
+    // precondition, forwarded from [`ghash_mul_x4_low_lhs`].
+    unsafe {
+        let t1 = _mm512_clmulepi64_epi128::<0x10>(x, y);
+        let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        gf2_128_reduce_x4_shift(t0, t1)
     }
 }
 
@@ -430,6 +480,26 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
         // One fold: lo + x^64·hi (mod p). The top limb is 64 bits wide, so the
         // single `0x87` CLMUL finishes it (degree ≤ 70 < 128).
         gf2_128_reduce_x4(lo, hi)
+    }
+}
+
+/// [`ghash_mul_x4_split`] with [`gf2_128_reduce_x4_shift`].
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_shift(v: __m512i, t: __m512i, t_x64: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the companion contract,
+    // forwarded from [`ghash_mul_x4_split`].
+    unsafe {
+        let lo = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(v, t),
+            _mm512_clmulepi64_epi128::<0x01>(v, t_x64),
+        );
+        let hi = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(v, t),
+            _mm512_clmulepi64_epi128::<0x11>(v, t_x64),
+        );
+        gf2_128_reduce_x4_shift(lo, hi)
     }
 }
 
@@ -532,6 +602,33 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
+    }
+
+    /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
+    /// operand, specialized.
+    ///
+    /// With `y = F128::ONE = { lo: 1, hi: 0 }` the three limbs of
+    /// [`Self::mul_acc`] degenerate exactly:
+    ///   `lo  = x.lo*1 = x.lo`  (low qword of each lane, high qword zero),
+    ///   `hi  = x.hi*0 = 0`,
+    ///   `mid = x.hi*1 ^ x.lo*0 = x.hi`  (moved into the lane's low qword).
+    /// So the four CLMULs collapse to one masked move and one lane-wise byte
+    /// shift. Bit-identical to `mul_acc(x, ONE)` -- asserted by
+    /// `mul_acc_one_matches_mul_acc_with_one`.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
+        // Register-only; cfg-gated. `hi` is untouched (it stays zero).
+        self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
+        // `hi` of each lane moved into that lane's low qword: pick qwords
+        // 1/3/5/7 into slots 0/2/4/6 and zero the odd slots. `vpermq` with a
+        // zeroing mask is AVX512F-only (a lane-wise byte shift would need
+        // AVX512BW, which AVX512F does not imply).
+        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
+        self.mid = _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

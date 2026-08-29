@@ -10,6 +10,15 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_SHIFT_RED=1` restores the leftover `0x87` Barrett CLMUL in
+/// NTT `mul_x4`'s diet/LOW folds. Default ON: the same fold is four 64-bit
+/// shifts + XOR, which is field-identical (`0x87 = 1+x+x^2+x^7`) and moves
+/// the last p5 CLMUL of the butterfly off SPR's saturated VPCLMULQDQ port.
+fn ntt_shift_red_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SHIFT_RED").is_none())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -54,13 +63,25 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
     t: TwX4,
     v: core::arch::x86_64::__m512i,
 ) -> core::arch::x86_64::__m512i {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_low_lhs, ghash_mul_x4_split};
+    use crate::field::gf2_128::x86_64::{
+        ghash_mul_x4, ghash_mul_x4_low_lhs, ghash_mul_x4_low_lhs_shift, ghash_mul_x4_split,
+        ghash_mul_x4_split_shift,
+    };
     // SAFETY: caller carries the features and the twiddle-form preconditions.
     unsafe {
+        let shift = ntt_shift_red_enabled();
         if LOW {
-            ghash_mul_x4_low_lhs(t.0, v)
+            if shift {
+                ghash_mul_x4_low_lhs_shift(t.0, v)
+            } else {
+                ghash_mul_x4_low_lhs(t.0, v)
+            }
         } else if DIET {
-            ghash_mul_x4_split(v, t.0, t.1)
+            if shift {
+                ghash_mul_x4_split_shift(v, t.0, t.1)
+            } else {
+                ghash_mul_x4_split(v, t.0, t.1)
+            }
         } else {
             ghash_mul_x4(t.0, v)
         }
@@ -1944,6 +1965,75 @@ mod diet_tests {
                             hi: u64::MAX,
                         },
                     ],
+                );
+            }
+        }
+    }
+
+    /// Shift-xor `t1.hi · 0x87` fold must match the leftover Barrett CLMUL
+    /// fold, and the NTT split/LOW products that use it must match the
+    /// incumbent 5/3-CLMUL products lane-for-lane.
+    #[test]
+    fn shift_red_matches_clmul_reduce() {
+        use crate::field::gf2_128::x86_64::{
+            gf2_128_reduce_x4_shift, ghash_mul_x4, ghash_mul_x4_low_lhs,
+            ghash_mul_x4_low_lhs_shift, ghash_mul_x4_split, ghash_mul_x4_split_shift,
+            ghash_shift64_x4,
+        };
+        use core::arch::x86_64::*;
+
+        let mut next = rng(0x51F7_5EED);
+        unsafe {
+            let pack4 = |v: [F128; 4]| {
+                _mm512_set_epi64(
+                    v[3].hi as i64,
+                    v[3].lo as i64,
+                    v[2].hi as i64,
+                    v[2].lo as i64,
+                    v[1].hi as i64,
+                    v[1].lo as i64,
+                    v[0].hi as i64,
+                    v[0].lo as i64,
+                )
+            };
+            let store = |x: __m512i| {
+                let mut w = [0u64; 8];
+                _mm512_storeu_si512(w.as_mut_ptr() as *mut __m512i, x);
+                w
+            };
+            for _ in 0..512 {
+                let t0 = pack4([next(), next(), next(), next()]);
+                let t1 = pack4([next(), next(), next(), next()]);
+                let clmul = {
+                    let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+                    let mut acc = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
+                    acc = _mm512_xor_si512(acc, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
+                    acc
+                };
+                let shift = gf2_128_reduce_x4_shift(t0, t1);
+                assert_eq!(store(shift), store(clmul), "reduce t0/t1");
+
+                let t = next();
+                let v = [next(), next(), next(), next()];
+                let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+                let vv = pack4(v);
+                let companion = ghash_shift64_x4(tv);
+                assert_eq!(
+                    store(ghash_mul_x4_split_shift(vv, tv, companion)),
+                    store(ghash_mul_x4_split(vv, tv, companion)),
+                    "split t={t:?}"
+                );
+                assert_eq!(
+                    store(ghash_mul_x4_split_shift(vv, tv, companion)),
+                    store(ghash_mul_x4(tv, vv)),
+                    "split vs 6-CLMUL t={t:?}"
+                );
+                let low = F128 { lo: t.lo, hi: 0 };
+                let lv = _mm512_broadcast_i32x4(_mm_set_epi64x(0, low.lo as i64));
+                assert_eq!(
+                    store(ghash_mul_x4_low_lhs_shift(lv, vv)),
+                    store(ghash_mul_x4_low_lhs(lv, vv)),
+                    "low t={low:?}"
                 );
             }
         }
