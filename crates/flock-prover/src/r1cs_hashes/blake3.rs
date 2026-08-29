@@ -755,6 +755,23 @@ impl AdjBuilder {
 /// The XOR-DAG adjoint plan for BLAKE3's `(A_0, B_0)` — a drop-in
 /// [`flock_core::lincheck::LincheckCircuit`] that computes the same `comb_vec`
 /// as [`flock_core::lincheck::CscCircuit`] without either matrix existing.
+/// A row whose B-support root is the common B-root (`Z_CONST_POS`).
+/// In `fold_alpha_batched`, `e` is accumulated into a local F128 register
+/// rather than performing an individual read-modify-write on `acc[common_b_root]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommonBRow {
+    pub row: u32,
+    pub a_root: u32,
+}
+
+/// A row whose B-support root is not the common B-root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UncommonBRow {
+    pub row: u32,
+    pub a_root: u32,
+    pub b_root: u32,
+}
+
 pub struct Blake3AdjointPlan {
     /// `children[i]` are the two child node ids of internal node `ADJ_BASE + i`.
     /// Both are `< ADJ_BASE + i`, so descending `i` is reverse topological.
@@ -762,6 +779,12 @@ pub struct Blake3AdjointPlan {
     /// Root node of row `r`'s A-support / B-support.
     a_roots: Box<[u32]>,
     b_roots: Box<[u32]>,
+    /// Partition of rows whose B-support root is `common_b_root`.
+    common_b_rows: Box<[CommonBRow]>,
+    /// Partition of rows whose B-support root is not `common_b_root`.
+    uncommon_b_rows: Box<[UncommonBRow]>,
+    /// The most frequent nonzero B-root (e.g. `Z_CONST_POS as u32`).
+    common_b_root: Option<u32>,
     /// `a_roots[r] == b_roots[r] == ADJ_ZERO` for every `r >= n_rows`; the
     /// injection loop stops there instead of multiplying by α for nothing.
     n_rows: usize,
@@ -951,12 +974,59 @@ impl Blake3AdjointPlan {
             n_rows -= 1;
         }
 
+        // Enumerate B-root frequencies across active rows 0..n_rows.
+        let mut b_freq = std::collections::HashMap::new();
+        for &b_root in &b_roots[..n_rows] {
+            if b_root != ADJ_ZERO {
+                *b_freq.entry(b_root).or_insert(0usize) += 1;
+            }
+        }
+
+        let common_b_root = b_freq
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .filter(|&(_, count)| count > 1)
+            .map(|(root, _)| root);
+
+        let mut common_b_rows = Vec::new();
+        let mut uncommon_b_rows = Vec::new();
+
+        if let Some(cz) = common_b_root {
+            for r in 0..n_rows {
+                let a = a_roots[r];
+                let b = b_roots[r];
+                if b == cz {
+                    common_b_rows.push(CommonBRow {
+                        row: r as u32,
+                        a_root: a,
+                    });
+                } else {
+                    uncommon_b_rows.push(UncommonBRow {
+                        row: r as u32,
+                        a_root: a,
+                        b_root: b,
+                    });
+                }
+            }
+        } else {
+            for r in 0..n_rows {
+                uncommon_b_rows.push(UncommonBRow {
+                    row: r as u32,
+                    a_root: a_roots[r],
+                    b_root: b_roots[r],
+                });
+            }
+        }
+
         let children = b.children;
         let n_nodes = K + 1 + children.len();
         Self {
             children: children.into_boxed_slice(),
             a_roots: a_roots.into_boxed_slice(),
             b_roots: b_roots.into_boxed_slice(),
+            common_b_rows: common_b_rows.into_boxed_slice(),
+            uncommon_b_rows: uncommon_b_rows.into_boxed_slice(),
+            common_b_root,
             n_rows,
             n_nodes,
             const_pin: Some(Z_CONST_POS),
@@ -970,6 +1040,30 @@ impl Blake3AdjointPlan {
     /// Internal-node count.
     pub fn n_internal(&self) -> usize {
         self.children.len()
+    }
+    /// Common B-root node id if one was identified (e.g. `Z_CONST_POS as u32`).
+    pub fn common_b_root(&self) -> Option<u32> {
+        self.common_b_root
+    }
+    /// Partition of rows with common B-root.
+    pub fn common_b_rows(&self) -> &[CommonBRow] {
+        &self.common_b_rows
+    }
+    /// Partition of rows with uncommon B-roots.
+    pub fn uncommon_b_rows(&self) -> &[UncommonBRow] {
+        &self.uncommon_b_rows
+    }
+    /// Root node of row `r`'s A-support.
+    pub fn a_roots(&self) -> &[u32] {
+        &self.a_roots
+    }
+    /// Root node of row `r`'s B-support.
+    pub fn b_roots(&self) -> &[u32] {
+        &self.b_roots
+    }
+    /// Active row count.
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
     }
 }
 
@@ -1025,17 +1119,34 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut acc = vec![F128::ZERO; self.n_nodes];
 
-        // Inject. Writes land on leaves, internal nodes, or the zero node —
-        // the zero node has no children and is dropped by the truncate below,
-        // so empty rows need no branch.
-        for r in 0..self.n_rows {
-            let e = eq_inner[r];
+        // 1. Inject common B-root rows: accumulate `e` terms into local `b_common_sum`
+        // and inject `ea = alpha * e` into `acc[a_root]`.
+        let mut b_common_sum = F128::ZERO;
+        for entry in self.common_b_rows.as_ref() {
+            let e = unsafe { *eq_inner.get_unchecked(entry.row as usize) };
             let ea = alpha * e;
-            // SAFETY: every root is a valid node id (`< n_nodes`) by
-            // construction in `build`, and `r < n_rows <= K == eq_inner.len()`.
             unsafe {
-                *acc.get_unchecked_mut(*self.a_roots.get_unchecked(r) as usize) += ea;
-                *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
+                *acc.get_unchecked_mut(entry.a_root as usize) += ea;
+            }
+            b_common_sum += e;
+        }
+
+        // 2. Inject uncommon B-root rows: inject `ea = alpha * e` into `acc[a_root]`
+        // and `e` into `acc[b_root]`.
+        for entry in self.uncommon_b_rows.as_ref() {
+            let e = unsafe { *eq_inner.get_unchecked(entry.row as usize) };
+            let ea = alpha * e;
+            unsafe {
+                *acc.get_unchecked_mut(entry.a_root as usize) += ea;
+                *acc.get_unchecked_mut(entry.b_root as usize) += e;
+            }
+        }
+
+        // 3. Apply the single accumulated write for the common B-root after the row loops,
+        // ensuring the preexisting value at `acc[common_b_root]` is preserved and included exactly once.
+        if let Some(cz) = self.common_b_root {
+            unsafe {
+                *acc.get_unchecked_mut(cz as usize) += b_common_sum;
             }
         }
 
@@ -5034,6 +5145,70 @@ mod tests {
             for c in 0..K {
                 assert_eq!(want[c], got[c], "trial {trial}, column {c}");
             }
+        }
+    }
+
+    /// Runtime oracle that enumerates all B-root variants from the built plan,
+    /// verifies frequency counts, and proves common-root partition completeness.
+    #[test]
+    fn adjoint_plan_b_root_partition_oracle() {
+        use flock_core::lincheck::LincheckCircuit;
+        let plan = Blake3AdjointPlan::build();
+        let cz = Z_CONST_POS as u32;
+
+        // 1. Enumerate B-root frequency across all active rows.
+        let mut b_freq = std::collections::HashMap::new();
+        for r in 0..plan.n_rows() {
+            let b_root = plan.b_roots()[r];
+            *b_freq.entry(b_root).or_insert(0usize) += 1;
+        }
+
+        // Z_CONST_POS must be the most frequent nonzero B-root (exactly 4,993 occurrences).
+        let cz_count = *b_freq.get(&cz).expect("Z_CONST_POS must be present in B-roots");
+        assert_eq!(cz_count, 4_993, "Z_CONST_POS must appear exactly 4,993 times in active rows");
+        assert_eq!(plan.common_b_root(), Some(cz));
+
+        // 2. Verify partition completeness and exact sizes.
+        let common = plan.common_b_rows();
+        let uncommon = plan.uncommon_b_rows();
+        assert_eq!(common.len(), cz_count);
+        assert_eq!(common.len() + uncommon.len(), plan.n_rows());
+
+        let mut seen_rows = vec![false; plan.n_rows()];
+        for entry in common {
+            let r = entry.row as usize;
+            assert!(!seen_rows[r], "duplicate row {r} in common partition");
+            seen_rows[r] = true;
+            assert_eq!(plan.b_roots()[r], cz, "common partition row must have b_root == cz");
+            assert_eq!(entry.a_root, plan.a_roots()[r], "common partition row a_root mismatch");
+        }
+        for entry in uncommon {
+            let r = entry.row as usize;
+            assert!(!seen_rows[r], "duplicate row {r} in uncommon partition");
+            seen_rows[r] = true;
+            assert_ne!(plan.b_roots()[r], cz, "uncommon partition row must not have b_root == cz");
+            assert_eq!(entry.a_root, plan.a_roots()[r], "uncommon partition row a_root mismatch");
+            assert_eq!(entry.b_root, plan.b_roots()[r], "uncommon partition row b_root mismatch");
+        }
+        assert!(seen_rows.into_iter().all(|s| s), "all active rows must be partitioned");
+
+        // 3. Verify bit-identical output against unpartitioned scalar reference across random inputs.
+        let (a_0, b_0) = build_matrices();
+        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
+        let mut rng = Rng::new(0xB007_0001);
+        let mut samp = || {
+            let a = rng.next_u32() as u64;
+            let b = rng.next_u32() as u64;
+            let c = rng.next_u32() as u64;
+            let d = rng.next_u32() as u64;
+            F128::new((a << 32) | b, (c << 32) | d)
+        };
+        for trial in 0..8 {
+            let alpha = samp();
+            let eq: Vec<F128> = (0..K).map(|_| samp()).collect();
+            let want = csc.fold_alpha_batched(alpha, &eq);
+            let got = plan.fold_alpha_batched(alpha, &eq);
+            assert_eq!(want, got, "oracle fold mismatch on trial {trial}");
         }
     }
 
