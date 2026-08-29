@@ -1176,7 +1176,8 @@ mod tests {
     #[cfg(target_feature = "gfni")]
     use super::{
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
-        accumulate_convert_ab_nomul_x86_gfni_fixed,
+        accumulate_convert_ab_nomul_x86_gfni_fixed, accumulate_convert_ab_nomul_x86_gfni_impl,
+        write_convert_ab_nomul_x86_gfni_fixed,
     };
 
     #[test]
@@ -1389,6 +1390,54 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
+    /// Ranked first-visit fixed body must match the dynamic `impl::<true>`
+    /// overwrite, including into a poisoned destination.
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn write_convert_ab_gfni_fixed_matches_dynamic_first_write() {
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for (row, bytes) in chunk_ab_bytes.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0x9d)
+                    ^ (lane as u8).wrapping_mul(0x53)
+                    ^ ((row * 17 + lane * 29) >> 3) as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for (i, matrix) in mats.iter_mut().enumerate() {
+            *matrix = (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i & 63) as u32)
+                ^ 0xd6e8_feb8_6659_fd93;
+        }
+        for n_b_med in [15usize, 16] {
+            let mut dynamic = [0xA5u8; 16 * 64];
+            let mut fixed = [0xA5u8; 16 * 64];
+            unsafe {
+                accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &mats,
+                    &mut dynamic,
+                );
+                if n_b_med == 15 {
+                    write_convert_ab_nomul_x86_gfni_fixed::<15>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut fixed,
+                    );
+                } else {
+                    write_convert_ab_nomul_x86_gfni_fixed::<16>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut fixed,
+                    );
+                }
+            }
+            assert_eq!(fixed, dynamic, "write_fixed vs impl true n_b_med={n_b_med}");
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1444,16 +1493,101 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
-    // SAFETY: forwarded unchanged to the shared target-feature body; the
-    // caller's write-before-read proof permits the overwrite specialization.
+    // SAFETY: each callee has this entry point's fixed-array and feature
+    // contract. The caller proves write-before-read.
     unsafe {
-        accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
-            chunk_ab_bytes,
-            n_b_med,
-            mats,
-            bank_planes,
-        );
+        if zc_r1ab_write_fixed_enabled() {
+            match n_b_med {
+                15 => write_convert_ab_nomul_x86_gfni_fixed::<15>(
+                    chunk_ab_bytes,
+                    mats,
+                    bank_planes,
+                ),
+                16 => write_convert_ab_nomul_x86_gfni_fixed::<16>(
+                    chunk_ab_bytes,
+                    mats,
+                    bank_planes,
+                ),
+                _ => accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                    chunk_ab_bytes,
+                    n_b_med,
+                    mats,
+                    bank_planes,
+                ),
+            }
+        } else {
+            accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            )
+        }
     }
+}
+
+/// First-visit twin of [`accumulate_convert_ab_nomul_x86_gfni_fixed`].
+/// Accumulators start at register zero so a poisoned destination cannot
+/// leak into the bank. `FLOCK_NO_ZC_R1AB_WRITE_FIXED=1` restores the
+/// dynamic `impl::<true>` body.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn write_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in 0..N {
+            rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = _mm512_setzero_si512();
+            let mut bm = 0;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1ab_write_fixed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_WRITE_FIXED").is_none());
+    *ON
 }
 
 #[inline]
