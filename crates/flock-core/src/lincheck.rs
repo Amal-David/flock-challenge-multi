@@ -1037,10 +1037,9 @@ fn block_major_gfni_enabled() -> bool {
 /// the block-major GFNI fold (exact A/B control; the fused single-column arm
 /// then serves every chunk). Resolved once per process.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
 fn lc_gather4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER4").is_none());
-    *ON
+    true
 }
 
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
@@ -1067,10 +1066,9 @@ const LC_ZFOLD_PF_CHUNKS: usize = 4;
 /// different address: no work is added, and prefetches have no architectural
 /// effect, so the folded values are bit-identical either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
 fn lc_zfold_pf_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF").is_none());
-    *ON
+    true
 }
 
 /// `FLOCK_NO_LC_ZFOLD_PF_NEAR=1` restores the incumbent two-visit look-ahead
@@ -1078,10 +1076,9 @@ fn lc_zfold_pf_enabled() -> bool {
 /// prefetch instructions per stripe, one line further out; a prefetch has no
 /// architectural effect, so the folded values are identical either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
 fn lc_zfold_pf_near_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_NEAR").is_none());
-    *ON
+    true
 }
 
 /// `FLOCK_NO_LC_ZFOLD_PF_SPREAD=1` restores the incumbent delivery of the
@@ -1091,10 +1088,9 @@ fn lc_zfold_pf_near_enabled() -> bool {
 /// two stripes' worth per fold call. Exact same-binary A/B: a prefetch has
 /// no architectural effect, so the folded values are identical either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
 fn lc_zfold_pf_spread_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_SPREAD").is_none());
-    *ON
+    true
 }
 
 /// Block-major row stride, in `F128`, at the ranked shape: `k = 2^14`, so
@@ -1143,10 +1139,9 @@ unsafe fn lc_prefetch_rows16(base: *const F128, chunks_per_block: usize, ranked:
 }
 
 #[allow(dead_code)] // Retained same-binary rollback selector.
+#[inline(always)]
 fn lc_gather_tr_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
-    *ON
+    true
 }
 
 /// `FLOCK_NO_LINCHECK_GT_FUSE=1` restores the two-instruction
@@ -1172,11 +1167,9 @@ fn lincheck_gt_fuse_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
+#[inline(always)]
 fn lincheck_gt_fuse_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        !lincheck_gt_fuse_disabled_value(std::env::var_os("FLOCK_NO_LINCHECK_GT_FUSE").as_deref())
-    });
-    *ON
+    true
 }
 
 /// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
@@ -2887,7 +2880,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _, _) = prove_padded_inner(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2895,10 +2888,89 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
+}
+
+/// Which form of lincheck's z table the caller wants back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZCaptureMode {
+    /// Return nothing.
+    None,
+    /// Return the pre-sumcheck table.
+    PreSumcheck,
+    /// Return the table after the first top bind. At the ranked shape this is
+    /// already the fold8 statistic consumed by the PCS opening.
+    RankedFold8Tail,
+}
+
+/// Capture lincheck's z table in the requested form, reporting the form that
+/// the shape actually allowed.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(capture != ZCaptureMode::None, "capture mode must not be None");
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
+}
+
+/// Block-major counterpart of [`prove_padded_capture_z_vec_mode`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(capture != ZCaptureMode::None, "capture mode must not be None");
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
 }
 
 /// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
@@ -2920,7 +2992,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured, _actual) = prove_padded_inner(
         PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
@@ -2928,13 +3000,13 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture must produce z_vec"),
     )
 }
 
@@ -2952,7 +3024,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured, _actual) = prove_padded_inner(
         PackedZ::BlockMajor(z_packed),
         m,
         k_log,
@@ -2960,13 +3032,13 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture must produce z_vec"),
     )
 }
 
@@ -2979,9 +3051,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture: ZCaptureMode,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>, ZCaptureMode) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -3115,13 +3187,22 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
+    // At the ranked shape, the first lincheck bind and the downstream fold8
+    // map use the same halves and challenge. Capture that output directly.
+    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+        && inner_rest_len == 8
+        && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
+    let actual_capture = if fold8_ready {
+        ZCaptureMode::RankedFold8Tail
+    } else if capture == ZCaptureMode::None {
+        ZCaptureMode::None
     } else {
+        ZCaptureMode::PreSumcheck
+    };
+    let mut captured_z_vec = if capture == ZCaptureMode::None || fold8_ready {
         None
+    } else {
+        Some(z_vec.clone())
     };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
@@ -3156,6 +3237,10 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if fold8_ready && t == 0 {
+                debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -3195,7 +3280,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim, captured_z_vec, actual_capture)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,

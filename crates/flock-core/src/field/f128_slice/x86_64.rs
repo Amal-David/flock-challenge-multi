@@ -205,23 +205,13 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
     }
 }
 
-/// Lines of the sixteen-bank source asked for ahead of the quad the kernel
-/// is folding, in F128 elements. `FLOCK_NO_FOLD16_PF=1` removes the hints
-/// (they move no data of their own and change no value, so the fold is
-/// byte-identical either way); `FLOCK_FOLD16_PF=<n>` overrides the distance.
+/// Lines of the sixteen-bank source asked for ahead of the quad the ranked
+/// kernel is folding, in F128 elements.
 const FOLD16_PF_AHEAD: usize = 512;
 
+#[inline(always)]
 fn fold16_pf_ahead() -> usize {
-    static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_FOLD16_PF").is_some() {
-            return 0;
-        }
-        std::env::var("FLOCK_FOLD16_PF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(FOLD16_PF_AHEAD)
-    });
-    *D
+    FOLD16_PF_AHEAD
 }
 
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
