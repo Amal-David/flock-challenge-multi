@@ -26,7 +26,7 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
-    round1_ab_inner_window_with_images, round1_ab_table_images,
+    round1_ab_inner_window_with_images,
 };
 
 const REC_C0: usize = 0;
@@ -534,6 +534,10 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) out: *mut u8,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
+    /// The kernel's table images. `for_window` varies only the static-B
+    /// eligibility, never the kernel, so the images are one resolve per
+    /// projection rather than one per (task, window).
+    pub(crate) imgs: Round1AbTableImages,
 }
 
 #[repr(C, align(64))]
@@ -567,8 +571,7 @@ impl StreamProj<'_> {
     /// resolves them ONCE and hands them to every piece.
     #[inline(always)]
     fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
-        let p = self.plan.for_window(blk);
-        (p, round1_ab_table_images(self.inv_table, p))
+        (self.plan.for_window(blk), self.imgs)
     }
 
     #[rustfmt::skip]
@@ -1690,10 +1693,19 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         ];
 
         let zero = dup_u32(0);
-        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        // 64-byte-aligned rings: the ZMM transpose reads them with eight
+        // 64-byte loads at multiples of 64 from the base, so a 32-aligned
+        // frame slot would make every one of those loads a cache-line split
+        // (14.7 M loads per prove) purely at the linker/frame allocator's
+        // whim. Alignment is now guaranteed, not incidental.
+        #[repr(C, align(64))]
+        struct Ring([V8; RING_WORDS]);
+        let mut ast = core::mem::MaybeUninit::<Ring>::uninit();
+        let mut bs = core::mem::MaybeUninit::<Ring>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
+        debug_assert!((ast as usize).is_multiple_of(64));
+        debug_assert!((bs as usize).is_multiple_of(64));
 
         let mut drain = Drain8 {
             ast,
