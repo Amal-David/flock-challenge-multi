@@ -493,6 +493,68 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[allow(dead_code)] // Retained fused-kernel rollback/oracle entry point.
+/// Build the seed sparse+dense leaf's pass-constant broadcast table once.
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq` (guaranteed by the cfg gate).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_sd_prepare(
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+) -> x86_64::Fused2SdTw {
+    // SAFETY: target features are guaranteed by cfg.
+    unsafe { x86_64::butterfly_fused_2layer_sd_prepare(right_twiddle, dense_tw) }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse_dense_geo`] taking the
+/// caller-prepared table (see the x86 kernel of the same name).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`];
+/// `tw` must be built by [`butterfly_fused_2layer_sd_prepare`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_tw(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    tw: &x86_64::Fused2SdTw,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src: *const F128,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo_tw(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            num_ntts,
+            tw,
+            right_twiddle,
+            dense_tw,
+            pf_src,
+        );
+    }
+}
+
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     src: *const F128,
     src_quarter: usize,
@@ -670,23 +732,25 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // constants equal the runtime shape, so they are value-identical.
     unsafe {
         if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
+            if matches!(sixteenth, 128 | 8 | 1) {
+                let tw = x86_64::butterfly_fused_4layer_prepare(twiddles);
+                match sixteenth {
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0, 0>(
+                            ptr, lanes, r, &tw, twiddles, 0,
+                        );
+                    }
+                    8 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0, 0>(
+                            ptr, lanes, r, &tw, twiddles, 0,
+                        );
+                    }
+                    _ => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0, 0>(
+                            ptr, lanes, r, &tw, twiddles, 0,
+                        );
+                    }
                 }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                1 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                _ => {}
             }
         }
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
@@ -731,18 +795,20 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // constants equal the runtime shape, so they are value-identical.
     unsafe {
         if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
-                    );
+            if matches!(sixteenth, 128 | 8) {
+                let tw = x86_64::butterfly_fused_4layer_prepare(twiddles);
+                match sixteenth {
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H, 0>(
+                            ptr, lanes, r, &tw, twiddles, pf_r,
+                        );
+                    }
+                    _ => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H, 0>(
+                            ptr, lanes, r, &tw, twiddles, pf_r,
+                        );
+                    }
                 }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H>(
-                        ptr, lanes, r, twiddles, pf_r,
-                    );
-                }
-                _ => {}
             }
         }
         x86_64::butterfly_fused_4layer_row_pf::<H>(
@@ -758,6 +824,132 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         let _ = pf_r;
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+    }
+}
+
+/// Prepared fused-four twiddle table for [`butterfly_fused_4layer_row_tw`]:
+/// the x86 broadcast/companion form where that kernel runs, the plain
+/// twiddles elsewhere.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) type Fused4Prepared = x86_64::Fused4Tw;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+pub(super) type Fused4Prepared = [F128; 15];
+
+/// Build the block-invariant fused-four table once, ahead of a row loop.
+///
+/// # Safety
+/// Same target-feature contract as [`butterfly_fused_4layer_row`].
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_prepare(twiddles: &[F128; 15]) -> Fused4Prepared {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg.
+    unsafe {
+        x86_64::butterfly_fused_4layer_prepare(twiddles)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        *twiddles
+    }
+}
+
+/// [`butterfly_fused_4layer_row_pf`] taking the caller-prepared table, so a
+/// block's row loop pays the fifteen broadcasts once instead of per row
+/// group. `H = 0` runs un-hinted and ignores `pf_r`. The deep lane counts
+/// (60 and 64 at the production shape) also pin the lane bound as a
+/// compile-time constant, which deletes the provably-empty scalar tails from
+/// those monomorphizations.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row_pf`]; `tw` must be built
+/// from `twiddles` by [`butterfly_fused_4layer_prepare`] in this process.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    tw: &Fused4Prepared,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    debug_assert!(lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry and disjointness contract. The shaped arms only fire when the
+    // constants equal the runtime shape, so they are value-identical.
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match (sixteenth, lanes) {
+                (128, 64) => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H, 64>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                (128, 60) => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H, 60>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                (8, 64) => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H, 64>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                (8, 60) => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H, 60>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                // Consecutive-row form (the deep 3+4 second pass): `pf_r`
+                // may address past this sixteen-row group — the caller's
+                // contract extends to the hinted rows being in-bounds.
+                (1, 64) => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, H, 64>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                _ => {}
+            }
+        }
+        if H == 0 {
+            x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        } else {
+            x86_64::butterfly_fused_4layer_row_pf::<H>(
+                ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
+            );
+        }
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = (tw, pf_r);
         portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
 }
@@ -790,7 +982,14 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // fires when the constant equals the runtime shape (value-identical).
     unsafe {
         if super::ntt_shaped_enabled() && num_ntts == 64 {
-            x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
+            // The production shape's one dense-lane count is pinned as a
+            // compile-time constant: every lane loop gets a constant trip
+            // count and the two scalar tails are provably empty.
+            if dense_lanes == 60 {
+                x86_64::butterfly_fused_3layer_rows_shaped::<64, 60, 1>(ptr, dense_lanes, twiddles);
+            } else {
+                x86_64::butterfly_fused_3layer_rows_shaped::<64, 0, 1>(ptr, dense_lanes, twiddles);
+            }
             return;
         }
         x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
@@ -804,6 +1003,107 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
+    }
+}
+
+/// Strided-presentation fused-three rows: row `i` starts at
+/// `ptr + i * stride * num_ntts`. Same value contract as
+/// [`butterfly_fused_3layer_rows`] on the strided row set; `pf_base`, when
+/// non-null, is row 0 of the next group to hint.
+///
+/// # Safety
+/// Same as [`butterfly_fused_3layer_rows`] with the strided geometry; a
+/// non-null `pf_base` must keep the hinted group in-bounds.
+pub(super) unsafe fn butterfly_fused_3layer_rows_strided(
+    ptr: *mut F128,
+    stride: usize,
+    num_ntts: usize,
+    dense_lanes: usize,
+    pf_base: *const F128,
+    twiddles: &[F128; 7],
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry, disjointness and zero-tail contract. The shaped arms only
+    // fire when the constants equal the runtime shape (value-identical).
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 && stride == 16 {
+            match dense_lanes {
+                60 => {
+                    return x86_64::butterfly_fused_3layer_rows_strided_shaped::<64, 60, 16>(
+                        ptr,
+                        dense_lanes,
+                        pf_base,
+                        twiddles,
+                    );
+                }
+                64 => {
+                    return x86_64::butterfly_fused_3layer_rows_strided_shaped::<64, 64, 16>(
+                        ptr,
+                        dense_lanes,
+                        pf_base,
+                        twiddles,
+                    );
+                }
+                _ => {
+                    return x86_64::butterfly_fused_3layer_rows_strided_shaped::<64, 0, 16>(
+                        ptr,
+                        dense_lanes,
+                        pf_base,
+                        twiddles,
+                    );
+                }
+            }
+        }
+        let _ = pf_base;
+        butterfly_fused_3layer_rows_strided_fallback(ptr, stride, num_ntts, dense_lanes, twiddles);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = pf_base;
+        butterfly_fused_3layer_rows_strided_fallback(ptr, stride, num_ntts, dense_lanes, twiddles);
+    }
+}
+
+/// Scalar gather/butterfly/scatter form of the strided fused-three group —
+/// value-identical, used off the shaped fast path.
+///
+/// # Safety
+/// Same strided row-geometry contract as the caller.
+unsafe fn butterfly_fused_3layer_rows_strided_fallback(
+    ptr: *mut F128,
+    stride: usize,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut vals = [F128::ZERO; 8];
+            for (i, v) in vals.iter_mut().enumerate() {
+                *v = *ptr.add(i * stride * num_ntts + lane);
+            }
+            if lane < dense_lanes {
+                portable::butterfly_fused_3layer(&mut vals, twiddles);
+            } else {
+                portable::butterfly_fused_3layer_zero_odd(&mut vals, twiddles);
+            }
+            for (i, v) in vals.iter().enumerate() {
+                *ptr.add(i * stride * num_ntts + lane) = *v;
+            }
+        }
     }
 }
 

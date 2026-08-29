@@ -279,6 +279,17 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NTT_DEEP_43=1` selects the 3+4 per-block deep schedule inside the
+/// same binary, so a candidate/control pair differs only in the row-group
+/// presentation. Off by default: the strided first pass fixes the L1-set
+/// geometry but the consecutive-row fused-four second pass currently runs
+/// un-hinted, and the measured whole-prove balance on the production part
+/// favours the incumbent schedule.
+fn deep_43_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NTT_DEEP_43").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -2685,6 +2696,15 @@ impl AdditiveNttF128 {
         //
         // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
         // `bufp` addresses the 512 staging rows that only this task writes.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // Pass-constant seed twiddle broadcasts, built once for the whole
+        // 64-group gather loop of every task (see the `_tw` leaf).
+        // SAFETY: the cfg gate carries the target features.
+        let seed_sd_tw = unsafe { kernels::butterfly_fused_2layer_sd_prepare(seed_right, &seed_dense) };
         let seed = |bufp: *mut F128, r: usize| {
             unsafe {
                 let src = src_addr as *const F128;
@@ -2725,7 +2745,7 @@ impl AdditiveNttF128 {
                         target_feature = "vpclmulqdq"
                     ))]
                     if !ntt_seed_hold4_disabled() {
-                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo_tw(
                             src,
                             block_size,
                             r_s,
@@ -2733,6 +2753,7 @@ impl AdditiveNttF128 {
                             bufp.add((256 + kp) * row_len),
                             64,
                             row_len,
+                            &seed_sd_tw,
                             seed_right,
                             &seed_dense,
                             pf_next,
@@ -3463,8 +3484,108 @@ impl AdditiveNttF128 {
                 let dense_lanes = num_ntts - odd_tail;
                 #[cfg(test)]
                 FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Deep 3+4 presentation: the incumbent fused-four first pass
+                // walks sixteen rows 8 KiB apart — sixteen lines competing
+                // for ONE 12-way L1d set every lane step (the same disease
+                // the seed staging documents and fixes for its own fold).
+                // Running layers +4..+7 as fused-three over sixteen
+                // 16-position-strided row groups presents eight lines per
+                // set (fits the ways), then layers +7..+11 run fused-four
+                // over sixteen CONSECUTIVE rows (1 KiB stride: four lines in
+                // each of four sets). Same layers in the same order on the
+                // same data — bit-identical stores, different presentation.
+                let deep43 = block_size4 == 128 && num_ntts == 64 && deep_43_enabled();
                 for b in 0..16usize {
                     let g4 = sub_idx * 16 + b;
+                    if deep43 {
+                        let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+                        tw3[0] = self.twiddle(layer4, g4);
+                        for s in 0..2 {
+                            tw3[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+                        }
+                        for s in 0..4 {
+                            tw3[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+                        }
+                        let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
+                        let base = blk.as_mut_ptr();
+                        for r in 0..16usize {
+                            let lanes = row_lanes(r, num_ntts, odd_tail);
+                            let pf = if r + 1 < 16 {
+                                // SAFETY: group r+1's rows are inside `blk`.
+                                unsafe { base.add((r + 1) * num_ntts) as *const F128 }
+                            } else {
+                                core::ptr::null()
+                            };
+                            // SAFETY: the eight strided rows {i*16 + r} are
+                            // valid, disjoint across r, and owned by this
+                            // task; lanes beyond `lanes` hold the zero tail
+                            // whose rows all share r's parity.
+                            unsafe {
+                                kernels::butterfly_fused_3layer_rows_strided(
+                                    base.add(r * num_ntts),
+                                    16,
+                                    num_ntts,
+                                    lanes,
+                                    pf,
+                                    &tw3,
+                                );
+                            }
+                        }
+                        let layer7 = n_top + 7;
+                        for m in 0..8usize {
+                            let g7 = g4 * 8 + m;
+                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                            tw[0] = self.twiddle(layer7, g7);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer7 + 1, 2 * g7 + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer7 + 2, 4 * g7 + s);
+                            }
+                            for s in 0..8 {
+                                tw[7 + s] = self.twiddle(layer7 + 3, 8 * g7 + s);
+                            }
+                            // SAFETY: sixteen consecutive rows of `num_ntts`
+                            // lanes inside `blk`; the full lane width is
+                            // processed (tail lanes carry zero odd rows, and
+                            // a butterfly against a zero row reproduces the
+                            // published-copy semantics exactly). For m < 7
+                            // the hinted rows 16..32 from this base are the
+                            // NEXT sub-block, still inside `blk`.
+                            unsafe {
+                                let tw4 = kernels::butterfly_fused_4layer_prepare(&tw);
+                                if m + 1 < 8 {
+                                    kernels::butterfly_fused_4layer_row_tw::<1>(
+                                        base.add(m * 16 * num_ntts),
+                                        1,
+                                        num_ntts,
+                                        num_ntts,
+                                        0,
+                                        &tw4,
+                                        &tw,
+                                        16,
+                                    );
+                                } else {
+                                    kernels::butterfly_fused_4layer_row_tw::<0>(
+                                        base.add(m * 16 * num_ntts),
+                                        1,
+                                        num_ntts,
+                                        num_ntts,
+                                        0,
+                                        &tw4,
+                                        &tw,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                        let lo = sub_idx * sub_size_positions + b * block_size4;
+                        cb(
+                            lo..lo + block_size4,
+                            &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
+                        );
+                        continue;
+                    }
                     let mut tw = [F128 { lo: 0, hi: 0 }; 15];
                     tw[0] = self.twiddle(layer4, g4);
                     for s in 0..2 {
@@ -4423,6 +4544,10 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    // The broadcast/companion table is invariant across the whole row loop;
+    // build it once here instead of once per row group.
+    // SAFETY: same target-feature contract as the row kernels below.
+    let tw = unsafe { kernels::butterfly_fused_4layer_prepare(t) };
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line
@@ -4433,24 +4558,28 @@ fn butterfly_interleaved_fused_4layer_rows(
         // hinted group is inside the same block.
         unsafe {
             if hint == 0 || r + 1 >= sixteenth {
-                kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
+                kernels::butterfly_fused_4layer_row_tw::<0>(
+                    base, sixteenth, num_ntts, lanes, r, &tw, t, 0,
+                )
             } else if hint == 1 {
-                kernels::butterfly_fused_4layer_row_pf::<1>(
+                kernels::butterfly_fused_4layer_row_tw::<1>(
                     base,
                     sixteenth,
                     num_ntts,
                     lanes,
                     r,
+                    &tw,
                     t,
                     r + 1,
                 )
             } else {
-                kernels::butterfly_fused_4layer_row_pf::<2>(
+                kernels::butterfly_fused_4layer_row_tw::<2>(
                     base,
                     sixteenth,
                     num_ntts,
                     lanes,
                     r,
+                    &tw,
                     t,
                     r + 1,
                 )
