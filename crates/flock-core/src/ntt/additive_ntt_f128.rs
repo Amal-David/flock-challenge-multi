@@ -4530,9 +4530,10 @@ mod tests {
     /// constants substituted for equal runtime values — bit-identical by
     /// construction. Pin that: run every shaped dispatch arm against the
     /// generic form (via the test latch) on random data and compare bytes.
-    /// Covers the fused-four shapes (128, 8, 1) across their reachable hint
-    /// levels and a short odd-tail lane count, and the fused-three shape
-    /// with both inner-twiddle classes (low and general products).
+    /// Covers the fused-four shapes (128, 64, 32, 16, 8, 4, 1) across their
+    /// reachable hint levels and a short odd-tail lane count, and the
+    /// fused-three shape with both inner-twiddle classes (low and general
+    /// products).
     #[test]
     fn shaped_row_kernels_match_generic() {
         use std::sync::atomic::Ordering;
@@ -4554,9 +4555,13 @@ mod tests {
         const NN: usize = 64;
 
         // Fused-four: (sixteenth, reachable hint levels, lane counts).
-        let cases: [(usize, &[u8], &[usize]); 3] = [
+        let cases: [(usize, &[u8], &[usize]); 7] = [
             (128, &[0, 1, 2], &[NN]),
+            (64, &[0, 1], &[NN]),
+            (32, &[0], &[NN]),
+            (16, &[0, 1], &[NN]),
             (8, &[0, 1, 2], &[NN, NN - 3]),
+            (4, &[0, 1, 2], &[NN, NN - 3]),
             (1, &[0], &[NN, NN - 3]),
         ];
         for &(sixteenth, hints, lane_counts) in cases.iter() {

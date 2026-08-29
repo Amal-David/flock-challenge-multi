@@ -676,8 +676,28 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                         ptr, lanes, r, twiddles, 0,
                     );
                 }
+                64 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<64, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                32 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<32, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                16 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<16, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
                 8 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                4 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, 0>(
                         ptr, lanes, r, twiddles, 0,
                     );
                 }
@@ -737,8 +757,33 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                         ptr, lanes, r, twiddles, pf_r,
                     );
                 }
+                64 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<64, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                32 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<32, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                16 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<16, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
                 8 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                4 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                1 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, H>(
                         ptr, lanes, r, twiddles, pf_r,
                     );
                 }
