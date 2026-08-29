@@ -1022,6 +1022,29 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, w
 
 /// Transpose the eight stage words at `w` (one `dump` chunk) into eight
 /// row-major 32-byte runs.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let z01 = _mm512_loadu_si512(stage.add(w) as *const __m512i);
+        let z23 = _mm512_loadu_si512(stage.add(w + 2) as *const __m512i);
+        let z45 = _mm512_loadu_si512(stage.add(w + 4) as *const __m512i);
+        let z67 = _mm512_loadu_si512(stage.add(w + 6) as *const __m512i);
+        tr8(
+            _mm512_castsi512_si256(z01),
+            _mm512_extracti64x4_epi64::<1>(z01),
+            _mm512_castsi512_si256(z23),
+            _mm512_extracti64x4_epi64::<1>(z23),
+            _mm512_castsi512_si256(z45),
+            _mm512_extracti64x4_epi64::<1>(z45),
+            _mm512_castsi512_si256(z67),
+            _mm512_extracti64x4_epi64::<1>(z67),
+        )
+    }
+}
+
+#[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
     unsafe {
