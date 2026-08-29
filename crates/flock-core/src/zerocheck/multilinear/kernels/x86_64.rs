@@ -67,7 +67,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
@@ -79,10 +79,11 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     unsafe fn fold_x4(
         src: *const F128,
         r: __m512i,
+        r_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
         use core::arch::x86_64::*;
 
         // SAFETY: caller supplies eight readable F128 values at src.
@@ -91,7 +92,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+            )
         }
     }
 
@@ -99,6 +103,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     // cfg gate supplies every intrinsic feature.
     unsafe {
         let r = _mm512_broadcast_i32x4(_mm_set_epi64x(r_fold.hi as i64, r_fold.lo as i64));
+        let r_x64 = ghash_shift64_x4(r);
         // Select even/odd F128 lanes from two concatenated ZMM inputs. The same
         // selectors deinterleave fold inputs and gather message a0/a1 lanes.
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
@@ -111,10 +116,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 
         while x_lo + 4 <= eq_lo.len() {
             let output = 2 * x_lo;
-            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let a_hi = fold_x4(a_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
-            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_hi = fold_x4(b_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
+            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, r_x64, even_idx, odd_idx);
+            let a_hi = fold_x4(a_in.as_ptr().add(2 * (output + 4)), r, r_x64, even_idx, odd_idx);
+            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, r_x64, even_idx, odd_idx);
+            let b_hi = fold_x4(b_in.as_ptr().add(2 * (output + 4)), r, r_x64, even_idx, odd_idx);
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -137,8 +142,8 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         if x_lo < eq_lo.len() {
             debug_assert_eq!(eq_lo.len() - x_lo, 2);
             let output = 2 * x_lo;
-            let a_folded = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_folded = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
+            let a_folded = fold_x4(a_in.as_ptr().add(2 * output), r, r_x64, even_idx, odd_idx);
+            let b_folded = fold_x4(b_in.as_ptr().add(2 * output), r, r_x64, even_idx, odd_idx);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -263,15 +268,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let g0 = row_base + 2 * x_lo;
                 // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
                 // start, so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
-                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
-                // worker with a cleared environment, so the gate is off and
-                // the mask is a constant 0 on every one of the ~2.1 M leaf
-                // tiles. Feeding the constant in directly drops the per-tile
-                // `OnceLock` acquire load and the eight-bit mask build, and
-                // lets the fold kernels take their unpredicated line path.
-                let dead = 0u8;
-                let _ = (pair_in_block_mask, useful_pairs_inclusive);
+                let dead = super::super::prefold_dead_line_mask_gated(
+                    g0,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -568,7 +569,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     rho2: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(a_in.len(), 4 * a_out.len());
@@ -580,6 +581,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     unsafe fn fold_x4(
         src: *const F128,
         r: __m512i,
+        r_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
@@ -588,7 +590,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
         unsafe {
             let lo = _mm512_loadu_si512(src.cast::<__m512i>());
             let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
-            fold_regs(lo, hi, r, even_idx, odd_idx)
+            fold_regs(lo, hi, r, r_x64, even_idx, odd_idx)
         }
     }
 
@@ -599,16 +601,20 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
         lo: __m512i,
         hi: __m512i,
         r: __m512i,
+        r_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+            )
         }
     }
 
@@ -616,7 +622,9 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     // cfg gate supplies every intrinsic feature.
     unsafe {
         let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho1.hi as i64, rho1.lo as i64));
+        let r1_x64 = ghash_shift64_x4(r1);
         let r2 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho2.hi as i64, rho2.lo as i64));
+        let r2_x64 = ghash_shift64_x4(r2);
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut p1_wide = WideGhashX4::zero();
@@ -631,19 +639,19 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
             // Level 1 (ρ₁): 32 inputs → 16 values in four ZMMs.
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let ta2 = fold_x4(a_src.add(16), r1, even_idx, odd_idx);
-            let ta3 = fold_x4(a_src.add(24), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let tb2 = fold_x4(b_src.add(16), r1, even_idx, odd_idx);
-            let tb3 = fold_x4(b_src.add(24), r1, even_idx, odd_idx);
+            let ta0 = fold_x4(a_src, r1, r1_x64, even_idx, odd_idx);
+            let ta1 = fold_x4(a_src.add(8), r1, r1_x64, even_idx, odd_idx);
+            let ta2 = fold_x4(a_src.add(16), r1, r1_x64, even_idx, odd_idx);
+            let ta3 = fold_x4(a_src.add(24), r1, r1_x64, even_idx, odd_idx);
+            let tb0 = fold_x4(b_src, r1, r1_x64, even_idx, odd_idx);
+            let tb1 = fold_x4(b_src.add(8), r1, r1_x64, even_idx, odd_idx);
+            let tb2 = fold_x4(b_src.add(16), r1, r1_x64, even_idx, odd_idx);
+            let tb3 = fold_x4(b_src.add(24), r1, r1_x64, even_idx, odd_idx);
             // Level 2 (ρ₂): 16 → 8 outputs in two ZMMs per array.
-            let a_lo = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let a_hi = fold_regs(ta2, ta3, r2, even_idx, odd_idx);
-            let b_lo = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
-            let b_hi = fold_regs(tb2, tb3, r2, even_idx, odd_idx);
+            let a_lo = fold_regs(ta0, ta1, r2, r2_x64, even_idx, odd_idx);
+            let a_hi = fold_regs(ta2, ta3, r2, r2_x64, even_idx, odd_idx);
+            let b_lo = fold_regs(tb0, tb1, r2, r2_x64, even_idx, odd_idx);
+            let b_hi = fold_regs(tb2, tb3, r2, r2_x64, even_idx, odd_idx);
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -669,12 +677,12 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let a_folded = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let b_folded = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
+            let ta0 = fold_x4(a_src, r1, r1_x64, even_idx, odd_idx);
+            let ta1 = fold_x4(a_src.add(8), r1, r1_x64, even_idx, odd_idx);
+            let tb0 = fold_x4(b_src, r1, r1_x64, even_idx, odd_idx);
+            let tb1 = fold_x4(b_src.add(8), r1, r1_x64, even_idx, odd_idx);
+            let a_folded = fold_regs(ta0, ta1, r2, r2_x64, even_idx, odd_idx);
+            let b_folded = fold_regs(tb0, tb1, r2, r2_x64, even_idx, odd_idx);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -729,7 +737,7 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     wtab: Option<&[F128]>,
     nt_out: bool,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -743,16 +751,20 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         lo: __m512i,
         hi: __m512i,
         r: __m512i,
+        r_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+            )
         }
     }
 
@@ -762,7 +774,9 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     unsafe fn fold16_to_4(
         src: *const F128,
         ra: __m512i,
+        ra_x64: __m512i,
         rb: __m512i,
+        rb_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
@@ -773,9 +787,9 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
             let i1 = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let i2 = _mm512_loadu_si512(src.add(8).cast::<__m512i>());
             let i3 = _mm512_loadu_si512(src.add(12).cast::<__m512i>());
-            let t0 = fold_regs(i0, i1, ra, even_idx, odd_idx);
-            let t1 = fold_regs(i2, i3, ra, even_idx, odd_idx);
-            fold_regs(t0, t1, rb, even_idx, odd_idx)
+            let t0 = fold_regs(i0, i1, ra, ra_x64, even_idx, odd_idx);
+            let t1 = fold_regs(i2, i3, ra, ra_x64, even_idx, odd_idx);
+            fold_regs(t0, t1, rb, rb_x64, even_idx, odd_idx)
         }
     }
 
@@ -803,7 +817,9 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     // cfg gate supplies every intrinsic feature.
     unsafe {
         let ra = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_a.hi as i64, rho_a.lo as i64));
+        let ra_x64 = ghash_shift64_x4(ra);
         let rb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_b.hi as i64, rho_b.lo as i64));
+        let rb_x64 = ghash_shift64_x4(rb);
         let rho_ab = rho_a * rho_b;
         let rarb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_ab.hi as i64, rho_ab.lo as i64));
         let defer = zc_fold_defer_enabled();
@@ -846,14 +862,14 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                 )
             } else {
                 (
-                    fold16_to_4(a_src, ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(16), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(32), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(48), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src, ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(16), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(32), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(48), ra, rb, even_idx, odd_idx),
+                    fold16_to_4(a_src, ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(a_src.add(16), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(a_src.add(32), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(a_src.add(48), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(b_src, ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(b_src.add(16), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(b_src.add(32), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
+                    fold16_to_4(b_src.add(48), ra, ra_x64, rb, rb_x64, even_idx, odd_idx),
                 )
             };
             // Spread delivery: the rest of this body's hint block, at
@@ -960,8 +976,8 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         while x_lo + 2 <= lo_size {
             let output = 2 * x_lo;
             let input = 4 * output;
-            let oa = fold16_to_4(a_in.as_ptr().add(input), ra, rb, even_idx, odd_idx);
-            let ob = fold16_to_4(b_in.as_ptr().add(input), ra, rb, even_idx, odd_idx);
+            let oa = fold16_to_4(a_in.as_ptr().add(input), ra, ra_x64, rb, rb_x64, even_idx, odd_idx);
+            let ob = fold16_to_4(b_in.as_ptr().add(input), ra, ra_x64, rb, rb_x64, even_idx, odd_idx);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), oa);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), ob);
             let (a0, a1, a2, a3) = (
@@ -1332,7 +1348,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     cfold: Option<&CFoldMats>,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -1345,16 +1361,20 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         lo: __m512i,
         hi: __m512i,
         r: __m512i,
+        r_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+            )
         }
     }
 
@@ -1365,7 +1385,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     unsafe fn fold16_to_4(
         src: *const F128,
         ra: __m512i,
+        ra_x64: __m512i,
         rb: __m512i,
+        rb_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
@@ -1376,9 +1398,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             let i1 = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let i2 = _mm512_loadu_si512(src.add(8).cast::<__m512i>());
             let i3 = _mm512_loadu_si512(src.add(12).cast::<__m512i>());
-            let t0 = fold_regs(i0, i1, ra, even_idx, odd_idx);
-            let t1 = fold_regs(i2, i3, ra, even_idx, odd_idx);
-            fold_regs(t0, t1, rb, even_idx, odd_idx)
+            let t0 = fold_regs(i0, i1, ra, ra_x64, even_idx, odd_idx);
+            let t1 = fold_regs(i2, i3, ra, ra_x64, even_idx, odd_idx);
+            fold_regs(t0, t1, rb, rb_x64, even_idx, odd_idx)
         }
     }
 
@@ -1411,7 +1433,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         b_pkt: *const u8,
         x0: usize,
         r1: __m512i,
+        r1_x64: __m512i,
         r2: __m512i,
+        r2_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
         pair_in_block_mask: usize,
@@ -1453,18 +1477,30 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             let ao_lo = f128x4_loadu(ao.as_ptr());
             let ae_hi = f128x4_loadu(ae.as_ptr().add(4));
             let ao_hi = f128x4_loadu(ao.as_ptr().add(4));
-            let ta_lo = _mm512_xor_si512(ae_lo, ghash_mul_x4(r1, _mm512_xor_si512(ae_lo, ao_lo)));
-            let ta_hi = _mm512_xor_si512(ae_hi, ghash_mul_x4(r1, _mm512_xor_si512(ae_hi, ao_hi)));
+            let ta_lo = _mm512_xor_si512(
+                ae_lo,
+                ghash_mul_x4_split(_mm512_xor_si512(ae_lo, ao_lo), r1, r1_x64),
+            );
+            let ta_hi = _mm512_xor_si512(
+                ae_hi,
+                ghash_mul_x4_split(_mm512_xor_si512(ae_hi, ao_hi), r1, r1_x64),
+            );
             let be_lo = f128x4_loadu(be.as_ptr());
             let bo_lo = f128x4_loadu(bo.as_ptr());
             let be_hi = f128x4_loadu(be.as_ptr().add(4));
             let bo_hi = f128x4_loadu(bo.as_ptr().add(4));
-            let tb_lo = _mm512_xor_si512(be_lo, ghash_mul_x4(r1, _mm512_xor_si512(be_lo, bo_lo)));
-            let tb_hi = _mm512_xor_si512(be_hi, ghash_mul_x4(r1, _mm512_xor_si512(be_hi, bo_hi)));
+            let tb_lo = _mm512_xor_si512(
+                be_lo,
+                ghash_mul_x4_split(_mm512_xor_si512(be_lo, bo_lo), r1, r1_x64),
+            );
+            let tb_hi = _mm512_xor_si512(
+                be_hi,
+                ghash_mul_x4_split(_mm512_xor_si512(be_hi, bo_hi), r1, r1_x64),
+            );
             // Level 2 (ρ₂): eight → four outputs.
             (
-                fold_regs(ta_lo, ta_hi, r2, even_idx, odd_idx),
-                fold_regs(tb_lo, tb_hi, r2, even_idx, odd_idx),
+                fold_regs(ta_lo, ta_hi, r2, r2_x64, even_idx, odd_idx),
+                fold_regs(tb_lo, tb_hi, r2, r2_x64, even_idx, odd_idx),
             )
         }
     }
@@ -1480,7 +1516,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         b_pkt: *const u8,
         xg: usize,
         r1: __m512i,
+        r1_x64: __m512i,
         r2: __m512i,
+        r2_x64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
         pair_in_block_mask: usize,
@@ -1496,7 +1534,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 b_pkt,
                 xg,
                 r1,
+                r1_x64,
                 r2,
+                r2_x64,
                 even_idx,
                 odd_idx,
                 pair_in_block_mask,
@@ -1509,7 +1549,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 b_pkt,
                 xg + 4,
                 r1,
+                r1_x64,
                 r2,
+                r2_x64,
                 even_idx,
                 odd_idx,
                 pair_in_block_mask,
@@ -1522,7 +1564,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 b_pkt,
                 xg + 8,
                 r1,
+                r1_x64,
                 r2,
+                r2_x64,
                 even_idx,
                 odd_idx,
                 pair_in_block_mask,
@@ -1535,7 +1579,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 b_pkt,
                 xg + 12,
                 r1,
+                r1_x64,
                 r2,
+                r2_x64,
                 even_idx,
                 odd_idx,
                 pair_in_block_mask,
@@ -1550,7 +1596,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     // read and output store; the cfg gate supplies every intrinsic feature.
     unsafe {
         let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho1.hi as i64, rho1.lo as i64));
+        let r1_x64 = ghash_shift64_x4(r1);
         let r2 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho2.hi as i64, rho2.lo as i64));
+        let r2_x64 = ghash_shift64_x4(r2);
         let rho12 = rho1 * rho2;
         let r12 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho12.hi as i64, rho12.lo as i64));
         let defer = zc_fold_defer_enabled();
@@ -1597,15 +1645,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
-                    // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
-                    // worker with a cleared environment, so the gate is off and
-                    // the mask is a constant 0 on every one of the ~2.1 M leaf
-                    // tiles. Feeding the constant in directly drops the per-tile
-                    // `OnceLock` acquire load and the eight-bit mask build, and
-                    // lets the fold kernels take their unpredicated line path.
-                    let dead = 0u8;
-                    let _ = (pair_in_block_mask, useful_pairs_inclusive);
+                    let dead = super::super::prefold_dead_line_mask_gated(
+                        4 * xg,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
                     if use_c4 {
                         let c = cfold.unwrap();
                         if c4_bcast {
@@ -1704,14 +1748,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 } else {
                     (
-                        fold16_to_4(ap, r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2, r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(16), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(16), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(32), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(32), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(ap.add(48), r1, r2, even_idx, odd_idx),
-                        fold16_to_4(bp2.add(48), r1, r2, even_idx, odd_idx),
+                        fold16_to_4(ap, r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(bp2, r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(ap.add(16), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(bp2.add(16), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(ap.add(32), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(bp2.add(32), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(ap.add(48), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
+                        fold16_to_4(bp2.add(48), r1, r1_x64, r2, r2_x64, even_idx, odd_idx),
                     )
                 }
             } else {
@@ -1721,7 +1765,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     b_pkt,
                     xg,
                     r1,
+                    r1_x64,
                     r2,
+                    r2_x64,
                     even_idx,
                     odd_idx,
                     pair_in_block_mask,
@@ -1864,7 +1910,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 b_pkt,
                 out_base + ol,
                 r1,
+                r1_x64,
                 r2,
+                r2_x64,
                 even_idx,
                 odd_idx,
                 pair_in_block_mask,
@@ -2311,17 +2359,9 @@ pub(crate) unsafe fn gfni_fold64_rows_masked(
     // every line `i` not marked dead, and 64 writable F128s at `out`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
             }
         }
         gfni_fold64_regs(z, mats, out);
@@ -2352,17 +2392,9 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     // SAFETY: as for the row-major form; SIGMA_C4 indices are in range.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
             }
         }
         gfni_fold64_regs_sigma(z, mats, out);
@@ -2387,17 +2419,9 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     // SAFETY: as for `gfni_fold64_rows_masked_tr`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
             }
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
@@ -2566,17 +2590,9 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4(
     // shuffle index is in range and the cfg gate supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
             }
         }
 
@@ -2771,17 +2787,9 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     // supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
+        for (i, slot) in z.iter_mut().enumerate() {
+            if dead_lines & (1u8 << i) == 0 {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
             }
         }
 
@@ -2870,39 +2878,24 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 // pair `(v2, v3)`, and the running pair absorbs it in one more
                 // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
                 // 32-input tree, with the four-residue reduction inside it.
-                //
-                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
-                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
-                // the eight affine results of `(a, hh)` are born and consumed
-                // inside one four-op window while the eight broadcasts of residue
-                // `a` and both accumulator pairs are still live, and the register
-                // allocator spills: the emitted body pays four stack stores and
-                // seven reloads per call that the map never asks for. Materialising
-                // all sixteen results of the residue first widens the window the
-                // scheduler has to place the reduction in without widening the peak
-                // live set. The uop map and the port split are untouched: 128
-                // affines, 32 port-5 shuffles, 64 XOR-class, 64 broadcasts.
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
                     let b: [__m512i; 8] = core::array::from_fn(|j| {
                         _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
                     });
-                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
-                        core::array::from_fn(|j| {
+                    for hh in 0..2usize {
+                        let aff = |j: usize| {
                             _mm512_gf2p8affine_epi64_epi8::<0>(
                                 b[j],
                                 _mm512_loadu_si512(
                                     mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
                                 ),
                             )
-                        })
-                    });
-                    for hh in 0..2usize {
-                        let g = f[hh];
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
+                        };
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
                         if a == 0 {
                             accp[hh] = v2;
                             accq[hh] = v3;
