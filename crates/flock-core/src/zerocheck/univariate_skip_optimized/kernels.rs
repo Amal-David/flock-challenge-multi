@@ -528,6 +528,73 @@ pub(super) fn write_convert_ab_nomul_gfni(
     }
 }
 
+/// Piped twin of [`accumulate_convert_ab_nomul_gfni`]: XOR-accumulate the
+/// current window and copy `next_n` 64-byte rows from `next_src` into
+/// `next_dst` while the 16-plane battery runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn accumulate_convert_ab_nomul_gfni_pipe(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; 64]; 16],
+) {
+    // SAFETY: cfg gate plus the caller's in-bounds next-window proof.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni_pipe(
+            chunk_ab_bytes,
+            n_b_med,
+            mats,
+            bank_planes,
+            next_src,
+            next_n,
+            next_dst,
+        );
+    }
+}
+
+/// Piped twin of [`write_convert_ab_nomul_gfni`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn write_convert_ab_nomul_gfni_pipe(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; 64]; 16],
+) {
+    // SAFETY: write-before-read is the caller's proof; next-window copy is
+    // independent of the bank.
+    unsafe {
+        x86_64::write_convert_ab_nomul_x86_gfni_pipe(
+            chunk_ab_bytes,
+            n_b_med,
+            mats,
+            bank_planes,
+            next_src,
+            next_n,
+            next_dst,
+        );
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused

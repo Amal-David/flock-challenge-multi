@@ -1176,7 +1176,8 @@ mod tests {
     #[cfg(target_feature = "gfni")]
     use super::{
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
-        accumulate_convert_ab_nomul_x86_gfni_fixed,
+        accumulate_convert_ab_nomul_x86_gfni_fixed, accumulate_convert_ab_nomul_x86_gfni_pipe,
+        write_convert_ab_nomul_x86_gfni, write_convert_ab_nomul_x86_gfni_pipe,
     };
 
     #[test]
@@ -1389,6 +1390,100 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn accumulate_convert_ab_gfni_pipe_matches_serial_and_copies_next() {
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        let mut next_rows = [[0u8; 64]; 16];
+        for (row, bytes) in chunk_ab_bytes.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0x9d)
+                    ^ (lane as u8).wrapping_mul(0x53)
+                    ^ ((row * 17 + lane * 29) >> 3) as u8;
+            }
+        }
+        for (row, bytes) in next_rows.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0xa7)
+                    ^ (lane as u8).wrapping_mul(0x1d)
+                    ^ ((row * 11 + lane * 19) >> 2) as u8;
+            }
+        }
+        let mut next_src = [0u8; 16 * 64];
+        for (row, bytes) in next_rows.iter().enumerate() {
+            next_src[row * 64..row * 64 + 64].copy_from_slice(bytes);
+        }
+        let mut mats = [0u64; 256];
+        for (i, matrix) in mats.iter_mut().enumerate() {
+            *matrix = (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i & 63) as u32)
+                ^ 0xd6e8_feb8_6659_fd93;
+        }
+        let mut seed = [0u8; 16 * 64];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0xa7) ^ (i >> 2) as u8;
+        }
+
+        for n_b_med in [15usize, 16] {
+            for n_follow in [15usize, 16] {
+                let mut serial = seed;
+                let mut piped = seed;
+                let mut piped_next = [[0u8; 64]; 16];
+                unsafe {
+                    accumulate_convert_ab_nomul_x86_gfni(
+                        &chunk_ab_bytes,
+                        n_b_med,
+                        &mats,
+                        &mut serial,
+                    );
+                    accumulate_convert_ab_nomul_x86_gfni_pipe(
+                        &chunk_ab_bytes,
+                        n_b_med,
+                        &mats,
+                        &mut piped,
+                        next_src.as_ptr(),
+                        n_follow,
+                        &mut piped_next,
+                    );
+                }
+                assert_eq!(
+                    piped, serial,
+                    "pipe vs serial n_b_med={n_b_med} n_follow={n_follow}"
+                );
+                for row in 0..n_follow {
+                    assert_eq!(
+                        &piped_next[row], &next_rows[row],
+                        "next row {row} n_b_med={n_b_med} n_follow={n_follow}"
+                    );
+                }
+            }
+        }
+
+        // First-visit pipe starts from register zero, matching write_convert.
+        for n_b_med in [15usize, 16] {
+            let mut serial = seed;
+            let mut piped = seed;
+            let mut piped_next = [[0u8; 64]; 16];
+            unsafe {
+                write_convert_ab_nomul_x86_gfni(&chunk_ab_bytes, n_b_med, &mats, &mut serial);
+                write_convert_ab_nomul_x86_gfni_pipe(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &mats,
+                    &mut piped,
+                    next_src.as_ptr(),
+                    16,
+                    &mut piped_next,
+                );
+            }
+            assert_eq!(piped, serial, "write-pipe vs write n_b_med={n_b_med}");
+            for row in 0..16 {
+                assert_eq!(&piped_next[row], &next_rows[row], "write-pipe next row {row}");
+            }
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1598,6 +1693,208 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
                 mats,
                 bank_planes,
             ),
+        }
+    }
+}
+
+/// Copy `next_n` contiguous 64-byte rows from `next_src` into `next_dst`.
+/// Used by the non-15/16 fallback of the piped dispatcher; the ranked 15/16
+/// bodies issue the same copies one row per GFNI plane.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn copy_next_ab_window(
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; ELL]; 1 << N_MEDIUM],
+) {
+    debug_assert!(next_n <= 1 << N_MEDIUM);
+    // SAFETY: caller proves `next_src` covers `next_n` 64-byte rows and
+    // `next_dst` has 16 slots of 64 bytes.
+    unsafe {
+        for b in 0..next_n {
+            core::ptr::copy_nonoverlapping(next_src.add(b * ELL), next_dst[b].as_mut_ptr(), ELL);
+        }
+    }
+}
+
+/// Ranked 15/16-row GFNI body with the current window's rows in named ZMMs
+/// (so the 16-plane loop cannot SROA-fail back onto a runtime-indexed array)
+/// and the next window's rows copied one 64-byte line per output plane.
+/// `FIRST_WRITE` starts each plane from register zero; otherwise the plane
+/// is XOR-accumulated onto the bank's existing bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_pipe<const N: usize, const FIRST_WRITE: bool>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; ELL]; 1 << N_MEDIUM],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    debug_assert!(next_n <= 1 << N_MEDIUM);
+    // SAFETY: fixed arrays cover every row/plane load and store. `N` is a
+    // ranked live-row count; `next_src` covers `next_n` 64-byte rows. The
+    // cfg gate supplies GFNI.
+    unsafe {
+        let load = |bm: usize| _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        let r0 = load(0);
+        let r1 = load(1);
+        let r2 = load(2);
+        let r3 = load(3);
+        let r4 = load(4);
+        let r5 = load(5);
+        let r6 = load(6);
+        let r7 = load(7);
+        let r8 = load(8);
+        let r9 = load(9);
+        let r10 = load(10);
+        let r11 = load(11);
+        let r12 = load(12);
+        let r13 = load(13);
+        let r14 = load(14);
+        let r15 = if N == 16 {
+            load(15)
+        } else {
+            _mm512_setzero_si512()
+        };
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mat = |bm: usize| _mm512_set1_epi64(mats[bm * 16 + k] as i64);
+            let affine = |row: __m512i, bm: usize| _mm512_gf2p8affine_epi64_epi8::<0>(row, mat(bm));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r0, 0), affine(r1, 1));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r2, 2), affine(r3, 3));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r4, 4), affine(r5, 5));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r6, 6), affine(r7, 7));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r8, 8), affine(r9, 9));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r10, 10), affine(r11, 11));
+            acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r12, 12), affine(r13, 13));
+            if N == 16 {
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, affine(r14, 14), affine(r15, 15));
+            } else {
+                acc = _mm512_xor_si512(acc, affine(r14, 14));
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+            if k < next_n {
+                let nxt = _mm512_loadu_si512(next_src.add(k * ELL) as *const __m512i);
+                _mm512_storeu_si512(next_dst[k].as_mut_ptr() as *mut __m512i, nxt);
+            }
+        }
+    }
+}
+
+/// Piped twin of [`accumulate_convert_ab_nomul_x86_gfni`]: XOR-accumulate the
+/// current window, and while those 16 planes run, copy the next window's
+/// rows into `next_dst` so the caller can skip that window's serial bounce.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_pipe(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; ELL]; 1 << N_MEDIUM],
+) {
+    // SAFETY: each callee has this entry point's fixed-array and feature
+    // contract. Counts outside the ranked pair retain the incumbent body
+    // plus a post-kernel copy of the next window.
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed_pipe::<15, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+                next_src,
+                next_n,
+                next_dst,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed_pipe::<16, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+                next_src,
+                next_n,
+                next_dst,
+            ),
+            _ => {
+                accumulate_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
+                copy_next_ab_window(next_src, next_n, next_dst);
+            }
+        }
+    }
+}
+
+/// Piped twin of [`write_convert_ab_nomul_x86_gfni`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni_pipe(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+    next_src: *const u8,
+    next_n: usize,
+    next_dst: &mut [[u8; ELL]; 1 << N_MEDIUM],
+) {
+    // SAFETY: write-before-read is the caller's proof, forwarded unchanged;
+    // next-window copy is independent of the bank.
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed_pipe::<15, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+                next_src,
+                next_n,
+                next_dst,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed_pipe::<16, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+                next_src,
+                next_n,
+                next_dst,
+            ),
+            _ => {
+                write_convert_ab_nomul_x86_gfni(chunk_ab_bytes, n_b_med, mats, bank_planes);
+                copy_next_ab_window(next_src, next_n, next_dst);
+            }
         }
     }
 }

@@ -2822,6 +2822,29 @@ fn zc_r1ab_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_R1AB_PIPE=1` restores the serial copy-then-GFNI round-1 AB
+/// window: every live window is copied into `chunk_ab_bytes` and then the
+/// GFNI battery runs. Default ON: the GFNI body software-pipelines the
+/// *next* window's 64-byte rows (one row per output plane) into a second
+/// stack buffer while the current window occupies the named row registers,
+/// so the DRAM demand load of window `W+1` rides the same 16-plane affine
+/// battery as window `W`. The bounce itself stays — skip-copy's official
+/// sample showed that feeding GFNI from DRAM-cold `ab_inner` is slower than
+/// a 1 KiB L1 staging buffer. Ranked `env_clear()` so default ON. Exact
+/// same-binary A/B: the copied bytes and the XOR-accumulated planes are
+/// identical either way.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1ab_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PIPE").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_R1AB_FIRST_WRITE=1` restores the per-band plane-bank clear
 /// and load/XOR first visit. The default arm is used only when every padding
 /// window is live, which proves that `w_idx == 0` overwrites each bank before
@@ -2888,6 +2911,9 @@ pub(crate) struct WorkerStateAbOnly {
     plane_banks: Vec<u8>,
     cached_plane_banks: bool,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    /// Second 1 KiB window buffer for [`zc_r1ab_pipe_enabled`]: GFNI of the
+    /// current window fills this with the next window's rows.
+    chunk_ab_next: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
 
@@ -2898,6 +2924,7 @@ impl WorkerStateAbOnly {
             plane_banks: Vec::new(),
             cached_plane_banks: false,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_ab_next: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
         }
     }
@@ -2967,10 +2994,20 @@ fn process_one_x_hi_ab_only(
     let ab_inner_ptr = ab_inner.as_ptr();
     #[cfg(target_arch = "x86_64")]
     let pf_spread = zc_r1ab_pf_spread_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let pipe_on = zc_r1ab_pipe_enabled();
+    let mut piped = false;
+    let mut cur_is_next = false;
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
         if n_b_med == 0 {
+            piped = false;
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
@@ -3012,22 +3049,36 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+        if piped {
+            // Current rows already live in the sibling buffer from the
+            // previous window's piped copy. Spread hints still need a home
+            // because the copy loop that used to issue them is skipped.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
+            if pf_spread {
+                for b_med in 0..n_next {
+                    pf_one(b_med);
+                }
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
+        } else {
+            for b_med in 0..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             }
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread {
+                for b_med in n_b_med..n_next {
+                    pf_one(b_med);
+                }
+            }
+            cur_is_next = false;
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -3045,24 +3096,75 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(&state.chunk_ab_bytes, n_b_med, mats_w, bank);
+            let n_follow = if pipe_on && x_outer_lo + 1 < big_lo_size {
+                b_med_counts[(x_outer + 1) & within_outer_mask] as usize
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                0
+            };
+            let first_write = plane_first_write && w_idx == 0;
+            if n_follow > 0 {
+                let follow_base =
+                    (((x_outer_lo + 1) << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+                let (cur, nxt) = if cur_is_next {
+                    (&state.chunk_ab_next, &mut state.chunk_ab_bytes)
+                } else {
+                    (&state.chunk_ab_bytes, &mut state.chunk_ab_next)
+                };
+                // SAFETY: `follow_base` addresses `n_follow` contiguous 64-byte
+                // rows inside `ab_inner` (same formula as the serial copy);
+                // `n_follow > 0` and `x_outer_lo + 1 < big_lo_size`.
+                unsafe {
+                    if first_write {
+                        kernels::write_convert_ab_nomul_gfni_pipe(
+                            cur,
+                            n_b_med,
+                            mats_w,
+                            bank,
+                            ab_inner_ptr.add(follow_base),
+                            n_follow,
+                            nxt,
+                        );
+                    } else {
+                        kernels::accumulate_convert_ab_nomul_gfni_pipe(
+                            cur,
+                            n_b_med,
+                            mats_w,
+                            bank,
+                            ab_inner_ptr.add(follow_base),
+                            n_follow,
+                            nxt,
+                        );
+                    }
+                }
+                piped = true;
+                cur_is_next = !cur_is_next;
+            } else {
+                let cur = if cur_is_next {
+                    &state.chunk_ab_next
+                } else {
+                    &state.chunk_ab_bytes
+                };
+                if first_write {
+                    kernels::write_convert_ab_nomul_gfni(cur, n_b_med, mats_w, bank);
+                } else {
+                    kernels::accumulate_convert_ab_nomul_gfni(cur, n_b_med, mats_w, bank);
+                }
+                piped = false;
             }
         } else {
+            let cur = if cur_is_next {
+                &state.chunk_ab_next
+            } else {
+                &state.chunk_ab_bytes
+            };
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                cur,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
                 &mut state.partial_ab,
             );
+            piped = false;
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -3072,13 +3174,19 @@ fn process_one_x_hi_ab_only(
         )))]
         {
             debug_assert!(eq_fold.is_none());
+            let cur = if cur_is_next {
+                &state.chunk_ab_next
+            } else {
+                &state.chunk_ab_bytes
+            };
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                cur,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
                 &mut state.partial_ab,
             );
+            piped = false;
         }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
