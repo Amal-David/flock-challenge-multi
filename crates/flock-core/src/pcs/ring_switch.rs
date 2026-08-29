@@ -2080,26 +2080,26 @@ unsafe fn expand_256_subset_sums(col8: &[F128], block: *mut F128) {
         let h2 = _mm512_xor_si512(h0, c7_vec);
         let h3 = _mm512_xor_si512(h1, c7_vec);
 
-        let mut hi_16 = [F128::ZERO; 16];
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(0) as *mut __m512i, h0);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(4) as *mut __m512i, h1);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(8) as *mut __m512i, h2);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(12) as *mut __m512i, h3);
+        let apply_hi = |h: __m512i, base_hi: usize| {
+            let b0 = _mm512_shuffle_i64x2::<0x00>(h, h);
+            let b1 = _mm512_shuffle_i64x2::<0x55>(h, h);
+            let b2 = _mm512_shuffle_i64x2::<0xAA>(h, h);
+            let b3 = _mm512_shuffle_i64x2::<0xFF>(h, h);
 
-        for hi_idx in 0..16 {
-            let h_elem = hi_16[hi_idx];
-            let h_broadcast = _mm512_set_epi64(
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-            );
-            let out_ptr = block.add(hi_idx * 16);
-            _mm512_storeu_si512(out_ptr.add(0) as *mut __m512i, _mm512_xor_si512(lo_quads[0], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(4) as *mut __m512i, _mm512_xor_si512(lo_quads[1], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(8) as *mut __m512i, _mm512_xor_si512(lo_quads[2], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(12) as *mut __m512i, _mm512_xor_si512(lo_quads[3], h_broadcast));
-        }
+            let bs = [b0, b1, b2, b3];
+            for (idx, &b) in bs.iter().enumerate() {
+                let out_ptr = block.add((base_hi + idx) * 16);
+                _mm512_storeu_si512(out_ptr.add(0) as *mut __m512i, _mm512_xor_si512(lo_quads[0], b));
+                _mm512_storeu_si512(out_ptr.add(4) as *mut __m512i, _mm512_xor_si512(lo_quads[1], b));
+                _mm512_storeu_si512(out_ptr.add(8) as *mut __m512i, _mm512_xor_si512(lo_quads[2], b));
+                _mm512_storeu_si512(out_ptr.add(12) as *mut __m512i, _mm512_xor_si512(lo_quads[3], b));
+            }
+        };
+
+        apply_hi(h0, 0);
+        apply_hi(h1, 4);
+        apply_hi(h2, 8);
+        apply_hi(h3, 12);
     }
 }
 
