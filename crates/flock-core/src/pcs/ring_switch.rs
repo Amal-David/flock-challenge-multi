@@ -941,29 +941,49 @@ pub fn fold_1b_rows_2way_mfr_16wide_padded(
                 let t1_2 = subset_sums_4([t1_chunk[8], t1_chunk[9], t1_chunk[10], t1_chunk[11]]);
                 let t1_3 = subset_sums_4([t1_chunk[12], t1_chunk[13], t1_chunk[14], t1_chunk[15]]);
 
-                let mut m_bytes = [[0u8; 16]; 16];
-                for (e, slot) in m_bytes.iter_mut().enumerate() {
-                    slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                    slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                }
-
                 for r_byte in 0..16 {
-                    let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                        | ((m_bytes[1][r_byte] as u64) << 8)
-                        | ((m_bytes[2][r_byte] as u64) << 16)
-                        | ((m_bytes[3][r_byte] as u64) << 24)
-                        | ((m_bytes[4][r_byte] as u64) << 32)
-                        | ((m_bytes[5][r_byte] as u64) << 40)
-                        | ((m_bytes[6][r_byte] as u64) << 48)
-                        | ((m_bytes[7][r_byte] as u64) << 56);
-                    let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                        | ((m_bytes[9][r_byte] as u64) << 8)
-                        | ((m_bytes[10][r_byte] as u64) << 16)
-                        | ((m_bytes[11][r_byte] as u64) << 24)
-                        | ((m_bytes[12][r_byte] as u64) << 32)
-                        | ((m_bytes[13][r_byte] as u64) << 40)
-                        | ((m_bytes[14][r_byte] as u64) << 48)
-                        | ((m_bytes[15][r_byte] as u64) << 56);
+                    let lo8: u64 = if r_byte < 8 {
+                        let shift = r_byte * 8;
+                        ((m_chunk[0].lo >> shift) & 0xFF)
+                            | (((m_chunk[1].lo >> shift) & 0xFF) << 8)
+                            | (((m_chunk[2].lo >> shift) & 0xFF) << 16)
+                            | (((m_chunk[3].lo >> shift) & 0xFF) << 24)
+                            | (((m_chunk[4].lo >> shift) & 0xFF) << 32)
+                            | (((m_chunk[5].lo >> shift) & 0xFF) << 40)
+                            | (((m_chunk[6].lo >> shift) & 0xFF) << 48)
+                            | (((m_chunk[7].lo >> shift) & 0xFF) << 56)
+                    } else {
+                        let shift = (r_byte - 8) * 8;
+                        ((m_chunk[0].hi >> shift) & 0xFF)
+                            | (((m_chunk[1].hi >> shift) & 0xFF) << 8)
+                            | (((m_chunk[2].hi >> shift) & 0xFF) << 16)
+                            | (((m_chunk[3].hi >> shift) & 0xFF) << 24)
+                            | (((m_chunk[4].hi >> shift) & 0xFF) << 32)
+                            | (((m_chunk[5].hi >> shift) & 0xFF) << 40)
+                            | (((m_chunk[6].hi >> shift) & 0xFF) << 48)
+                            | (((m_chunk[7].hi >> shift) & 0xFF) << 56)
+                    };
+                    let hi8: u64 = if r_byte < 8 {
+                        let shift = r_byte * 8;
+                        ((m_chunk[8].lo >> shift) & 0xFF)
+                            | (((m_chunk[9].lo >> shift) & 0xFF) << 8)
+                            | (((m_chunk[10].lo >> shift) & 0xFF) << 16)
+                            | (((m_chunk[11].lo >> shift) & 0xFF) << 24)
+                            | (((m_chunk[12].lo >> shift) & 0xFF) << 32)
+                            | (((m_chunk[13].lo >> shift) & 0xFF) << 40)
+                            | (((m_chunk[14].lo >> shift) & 0xFF) << 48)
+                            | (((m_chunk[15].lo >> shift) & 0xFF) << 56)
+                    } else {
+                        let shift = (r_byte - 8) * 8;
+                        ((m_chunk[8].hi >> shift) & 0xFF)
+                            | (((m_chunk[9].hi >> shift) & 0xFF) << 8)
+                            | (((m_chunk[10].hi >> shift) & 0xFF) << 16)
+                            | (((m_chunk[11].hi >> shift) & 0xFF) << 24)
+                            | (((m_chunk[12].hi >> shift) & 0xFF) << 32)
+                            | (((m_chunk[13].hi >> shift) & 0xFF) << 40)
+                            | (((m_chunk[14].hi >> shift) & 0xFF) << 48)
+                            | (((m_chunk[15].hi >> shift) & 0xFF) << 56)
+                    };
                     let tlo = transpose_8x8_bits(lo8).to_le_bytes();
                     let thi = transpose_8x8_bits(hi8).to_le_bytes();
                     let base = r_byte * 8;

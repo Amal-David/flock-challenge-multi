@@ -567,21 +567,13 @@ fn close_fd(fd: i32) {
 /// `path` itself is only ever created by the rename, so a partial `.tmp` can
 /// never be observed by the harness.
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
-    use std::io::Write;
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
     let bytes = bundle.to_bytes();
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.set_len(bytes.len() as u64)?;
-    drop(file);
+    std::fs::write(&temporary, &bytes)?;
     std::fs::rename(temporary, path)
 }
 
