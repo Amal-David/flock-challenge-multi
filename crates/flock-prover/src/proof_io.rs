@@ -293,15 +293,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
+    let want = HEADER_LEN + stash.sec_lens.iter().sum::<u64>() as usize;
     (stash.bytes.len() == want).then_some(stash.bytes)
 }
 
@@ -438,9 +430,9 @@ fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
 #[inline]
 fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
-    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
+    out.extend_from_slice(bytes);
 }
 
 fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
