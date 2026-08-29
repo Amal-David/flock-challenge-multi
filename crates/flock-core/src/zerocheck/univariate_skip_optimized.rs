@@ -32,11 +32,11 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{mul_by_x, phi8, F128, F8, PHI_8_TABLE};
 use crate::ntt::InvNttTableByteSingleGf8;
 
+use super::univariate_skip::{build_eq, ntt_extend_f128_vec_ghash, pack_bits, SplitEqGhash};
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
 
@@ -1512,16 +1512,25 @@ fn process_one_x_hi_with_precomputed_ab(
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let skip_copy = zc_r1ab_skip_copy_enabled();
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            if !skip_copy {
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
             bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
+        let chunk_ab: &[[u8; 64]; 1 << N_MEDIUM] = if skip_copy {
+            ab_inner_window_rows(ab_inner, chunk_byte_base)
+        } else {
+            &state.chunk_ab_bytes
+        };
         kernels::accumulate_convert_ab(
-            &state.chunk_ab_bytes,
+            chunk_ab,
             n_b_med,
             convert,
             eq_lo_scaled[x_outer_lo],
@@ -2405,11 +2414,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                 continue;
             }
             // AB completion: identical to the incumbent per-window path.
-            for b_med in 0..n_b_med {
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                state.chunk_ab_bytes[b_med]
-                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            let skip_copy = zc_r1ab_skip_copy_enabled();
+            if !skip_copy {
+                for b_med in 0..n_b_med {
+                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                    state.chunk_ab_bytes[b_med]
+                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+                }
             }
+            let chunk_ab: &[[u8; 64]; 1 << N_MEDIUM] = if skip_copy {
+                ab_inner_window_rows(ab_inner, chunk_byte_base)
+            } else {
+                &state.chunk_ab_bytes
+            };
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -2426,15 +2443,10 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
                     [u * 16 * ELL..(u + 1) * 16 * ELL])
                     .try_into()
                     .expect("one plane bank per low index");
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                kernels::accumulate_convert_ab_nomul_gfni(chunk_ab, n_b_med, mats_w, bank);
             } else {
                 kernels::accumulate_convert_ab(
-                    &state.chunk_ab_bytes,
+                    chunk_ab,
                     n_b_med,
                     convert,
                     eq_lo_scaled[x_outer_lo],
@@ -2450,7 +2462,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             {
                 debug_assert!(eq_fold.is_none());
                 kernels::accumulate_convert_ab(
-                    &state.chunk_ab_bytes,
+                    chunk_ab,
                     n_b_med,
                     convert,
                     eq_lo_scaled[x_outer_lo],
@@ -2769,7 +2781,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
 /// Look-ahead, in 1 KiB outer windows, for the round-1 AB packed-row
 /// prefetch. One window is `2^N_INNER * N_CHUNKS = 1024` bytes of
 /// `ab_inner` — the sixteen contiguous 64-byte chunks one `x_outer_lo` step
-/// copies into `chunk_ab_bytes` before the GFNI accumulate consumes them.
+/// feeds the GFNI accumulate (direct view; the kill-switch bounce copies
+/// them into `chunk_ab_bytes` first).
 ///
 /// The incumbent issues NO software prefetch here at all. The sweep
 /// demand-loads a window's sixteen lines back to back at the head of the
@@ -2819,6 +2832,45 @@ fn zc_r1ab_pf_enabled() -> bool {
 fn zc_r1ab_pf_spread_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_PF_SPREAD").is_none());
+    *ON
+}
+
+/// One round-1 AB window is `1 << N_MEDIUM` contiguous 64-byte rows
+/// (`N_INNER = 7`, `N_CHUNKS = 8` → 1024 B). The GFNI accumulate already
+/// `_mm512_loadu`s those rows; copying them into `chunk_ab_bytes` first
+/// bounces the entire 512 MiB `ab_inner` stream through a stack array.
+/// This view is the same bytes, so the loaded rows are bit-identical.
+///
+/// The 16th slot exists even when padding leaves `n_b_med == 15`: windows
+/// are packed at 1024 B, and the kernel only loads the live prefix.
+#[inline]
+fn ab_inner_window_rows(ab_inner: &[u8], chunk_byte_base: usize) -> &[[u8; 64]; 1 << N_MEDIUM] {
+    debug_assert!(
+        chunk_byte_base + ((1 << N_MEDIUM) * 64) <= ab_inner.len(),
+        "AB window must sit inside ab_inner (base={chunk_byte_base} len={})",
+        ab_inner.len()
+    );
+    // SAFETY: 16 contiguous 64-byte slots. Ranked layout packs them with
+    // stride `N_CHUNKS * 8 == 64`, so the window is a `[[u8; 64]; 16]`.
+    unsafe { &*ab_inner.as_ptr().add(chunk_byte_base).cast() }
+}
+
+/// Test-only forced-off latch for the skip-copy view, so the round-1
+/// identity test can drive both arms without mutating the process env.
+#[cfg(test)]
+pub(crate) static ZC_R1AB_SKIP_COPY_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_R1AB_SKIP_COPY=1` restores the incumbent bounce of each
+/// window into `chunk_ab_bytes` before the GFNI accumulate. Default ON
+/// (the ranked worker clears its env).
+fn zc_r1ab_skip_copy_enabled() -> bool {
+    #[cfg(test)]
+    if ZC_R1AB_SKIP_COPY_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_SKIP_COPY").is_none());
     *ON
 }
 
@@ -3012,23 +3064,41 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
-        for b_med in 0..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+        let skip_copy = zc_r1ab_skip_copy_enabled();
+        if skip_copy {
+            // No copy step to interleave with: issue the next-window hints
+            // as a block ahead of the GFNI demand loads off `ab_inner`.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
-                pf_one(b_med);
+            if pf_spread {
+                for b_med in 0..n_next {
+                    pf_one(b_med);
+                }
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med..n_next {
-                pf_one(b_med);
+        } else {
+            for b_med in 0..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread {
+                for b_med in n_b_med..n_next {
+                    pf_one(b_med);
+                }
             }
         }
+        let chunk_ab: &[[u8; 64]; 1 << N_MEDIUM] = if skip_copy {
+            ab_inner_window_rows(ab_inner, chunk_byte_base)
+        } else {
+            &state.chunk_ab_bytes
+        };
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -3046,18 +3116,13 @@ fn process_one_x_hi_ab_only(
                 .try_into()
                 .expect("one plane bank per low index");
             if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(&state.chunk_ab_bytes, n_b_med, mats_w, bank);
+                kernels::write_convert_ab_nomul_gfni(chunk_ab, n_b_med, mats_w, bank);
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                kernels::accumulate_convert_ab_nomul_gfni(chunk_ab, n_b_med, mats_w, bank);
             }
         } else {
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -3073,7 +3138,7 @@ fn process_one_x_hi_ab_only(
         {
             debug_assert!(eq_fold.is_none());
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -3914,8 +3979,8 @@ mod tests {
     ///     (this is the only shape that exercises the full-skip case.)
     #[test]
     fn padded_matches_dense_with_zero_padding() {
-        use crate::zerocheck::PaddingSpec;
         use crate::zerocheck::univariate_skip::pack_bits;
+        use crate::zerocheck::PaddingSpec;
 
         // (k_log, useful_bits, n_blocks_log) — pick n_blocks_log so
         // m = k_log + n_blocks_log is small enough to keep the test fast
@@ -4404,6 +4469,70 @@ mod tests {
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
         }
+    }
+
+    /// Direct view of a packed AB window must equal the incumbent
+    /// `copy_from_slice` bounce. The ranked GFNI kernel `_mm512_loadu`s
+    /// the same 64-byte rows; skipping the bounce is a layout-preserving alias.
+    #[test]
+    fn r1_ab_window_view_matches_copied_rows() {
+        let mut buf = vec![0u8; 2 * 16 * 64];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(17) ^ (i >> 3)) as u8;
+        }
+        for base in [0usize, 1024] {
+            let view = ab_inner_window_rows(&buf, base);
+            let mut copied = [[0u8; 64]; 16];
+            for (b_med, row) in copied.iter_mut().enumerate() {
+                row.copy_from_slice(&buf[base + b_med * 64..base + b_med * 64 + 64]);
+            }
+            assert_eq!(view, &copied, "window view drifted at base={base}");
+        }
+    }
+
+    /// Ranked AB-only round 1 with the skip-copy view must match the
+    /// incumbent bounce (`FLOCK_NO_ZC_R1AB_SKIP_COPY` / test latch).
+    #[test]
+    fn r1_ab_skip_copy_matches_bounce_round1() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        use std::sync::atomic::Ordering;
+        let m = 15usize;
+        let mut rng = Rng::new(0x51C0_C0DE);
+        let a = pack_bits(&rng.bits(1 << m));
+        let b = pack_bits(&rng.bits(1 << m));
+        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let r = build_protocol_r(m, &outer);
+        let inv_table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+
+        let mut pre_on =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+        let on = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut pre_on,
+            &a,
+            &b,
+            m,
+            K_SKIP,
+            &r,
+            &inv_table,
+            &padding,
+        );
+
+        ZC_R1AB_SKIP_COPY_FORCED_OFF.store(true, Ordering::Relaxed);
+        let mut pre_off =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+        let off = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &mut pre_off,
+            &a,
+            &b,
+            m,
+            K_SKIP,
+            &r,
+            &inv_table,
+            &padding,
+        );
+        ZC_R1AB_SKIP_COPY_FORCED_OFF.store(false, Ordering::Relaxed);
+        assert_eq!(on, off, "skip-copy round1 AB drifted from bounce");
     }
 
     /// **GPU split acceptance (season-1 hook shape)**: a forced CPU/GPU split
