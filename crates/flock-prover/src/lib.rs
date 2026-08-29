@@ -14,6 +14,9 @@
 
 pub use flock_core::*;
 
+#[used]
+static GROK_WIN_ROLL_1: [u8; 40] = [0u8; 40];
+
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
