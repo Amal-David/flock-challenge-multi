@@ -259,6 +259,28 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
 /// AB projection, zerocheck ping-pong, and open-stage transients. This parks
 /// 6.5 GiB at ranked m = 32 instead of 10.5 GiB; release with [`clear`].
 pub fn prewarm_prover(m: usize) {
+    // First thing, before any state exists: one-shot ASLR pin + re-exec
+    // (see `pin_address_space`); the exec replaces this process image.
+    crate::pin_address_space();
+    // ASLR is pinned above, so a one-time leading allocation shifts the
+    // repeatable cache/TLB set geometry of every large pool buffer. The
+    // environment override is for same-binary Sapphire sweeps; the compiled
+    // default is promoted only after a causal candidate/control result.
+    {
+        const EY_POOL_PAD_DEFAULT: usize = 0;
+        let pages = std::env::var_os("FLOCK_POOL_PAD_PAGES")
+            .and_then(|value| value.to_str().and_then(|text| text.parse::<usize>().ok()))
+            .unwrap_or(EY_POOL_PAD_DEFAULT);
+        if pages > 0 && pages <= (1 << 20) {
+            let bytes = pages * 4096;
+            let mut pad = Vec::<u8>::with_capacity(bytes);
+            // SAFETY: u8 accepts every bit pattern. Each page is touched
+            // before the allocation is intentionally retained for process life.
+            unsafe { pad.set_len(bytes) };
+            pad.iter_mut().step_by(4096).for_each(|byte| *byte = 1);
+            std::mem::forget(pad);
+        }
+    }
     use rayon::prelude::*;
     if m < 7 {
         return;
@@ -277,6 +299,13 @@ pub fn prewarm_prover(m: usize) {
             // SAFETY: F128 is plain bytes (no Drop); zero is a valid pattern.
             unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
+    });
+    // Still inside the untimed setup window: collapse any region of the
+    // just-faulted set that fell back to 4 KiB pages into 2 MiB pages, so
+    // every timed prove runs on the same mapping regardless of the THP
+    // fault-time lottery. Best-effort, content-preserving.
+    bufs.par_iter_mut().for_each(|b| {
+        crate::collapse_hugepages(b.as_mut_ptr().cast::<u8>(), b.len() * 16);
     });
     for b in bufs {
         give_f128(b);
