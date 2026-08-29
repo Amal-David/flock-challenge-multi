@@ -1345,29 +1345,51 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 }};
             }
 
+            macro_rules! butterfly2 {
+                ($u0:expr, $v0:expr, $tw0:expr, $u1:expr, $v1:expr, $tw1:expr) => {{
+                    let p0 = mul_x4::<false, DIET>($tw0, values[$v0]);
+                    let p1 = mul_x4::<false, DIET>($tw1, values[$v1]);
+                    let new_u0 = _mm512_xor_si512(values[$u0], p0);
+                    let new_u1 = _mm512_xor_si512(values[$u1], p1);
+                    values[$v0] = _mm512_xor_si512(values[$v0], new_u0);
+                    values[$v1] = _mm512_xor_si512(values[$v1], new_u1);
+                    values[$u0] = new_u0;
+                    values[$u1] = new_u1;
+                }};
+                ($u0:expr, $v0:expr, $tw0:expr, $low0:expr, $u1:expr, $v1:expr, $tw1:expr, $low1:expr) => {{
+                    let p0 = mul_x4::<$low0, DIET>($tw0, values[$v0]);
+                    let p1 = mul_x4::<$low1, DIET>($tw1, values[$v1]);
+                    let new_u0 = _mm512_xor_si512(values[$u0], p0);
+                    let new_u1 = _mm512_xor_si512(values[$u1], p1);
+                    values[$v0] = _mm512_xor_si512(values[$v0], new_u0);
+                    values[$v1] = _mm512_xor_si512(values[$v1], new_u1);
+                    values[$u0] = new_u0;
+                    values[$u1] = new_u1;
+                }};
+            }
+
             pf_quad!(0);
             let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+            for i in (0..8).step_by(2) {
+                butterfly2!(i, i + 8, outer, i + 1, i + 9, outer);
             }
             pf_quad!(1);
             for s in 0..2 {
                 let twiddle = tw[1 + s];
-                for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
-                }
+                butterfly2!(8 * s + 0, 8 * s + 4, twiddle, 8 * s + 1, 8 * s + 5, twiddle);
+                butterfly2!(8 * s + 2, 8 * s + 6, twiddle, 8 * s + 3, 8 * s + 7, twiddle);
             }
             pf_quad!(2);
             for s in 0..4 {
                 let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
-                }
+                butterfly2!(4 * s + 0, 4 * s + 2, twiddle, 4 * s + 1, 4 * s + 3, twiddle);
             }
             pf_quad!(3);
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle, LOW_L4);
+            for s in (0..8).step_by(2) {
+                butterfly2!(
+                    2 * s, 2 * s + 1, tw[7 + s], LOW_L4,
+                    2 * (s + 1), 2 * (s + 1) + 1, tw[7 + s + 1], LOW_L4
+                );
             }
 
             for (i, value) in values.iter().enumerate() {
