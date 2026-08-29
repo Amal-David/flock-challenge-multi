@@ -14,6 +14,9 @@
 
 pub use flock_core::*;
 
+#[used]
+static FABLE_F2B_ROLL_4: [u8; 712] = [0u8; 712];
+
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
