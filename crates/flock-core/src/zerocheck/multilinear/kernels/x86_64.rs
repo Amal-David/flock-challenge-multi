@@ -217,6 +217,32 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
+        // Static `b == 1` window plan (see `zc_b_ones_enabled`). A BLAKE3
+        // K-block is 256 post-URM rows = 128 pairs, and the census of the
+        // shipped static-B plan (`zerocheck::univariate_skip_optimized::
+        // kernels::x86_64_bstatic_plan`) shows rows 0..18 and 236..240 of
+        // every block hold the all-ones word -- i.e. pairs 0..8 and 118..119
+        // fold to `F128::ONE`. This message window is eight pairs wide and
+        // the accumulators are lane-parallel, so only a window whose FOUR
+        // lanes are all degenerate can take the shortcut: exactly pairs 0..7,
+        // at every global pair index that is a multiple of 128.
+        //
+        // This is a PLAN, not a per-pair test. The loop compares `x_lo`
+        // against the next planned window and does nothing else per iteration
+        // (one macro-fused cmp+jne) -- deliberately unlike the per-tile
+        // `prefold_dead_line_mask` build that was folded to a constant here
+        // because its mask build plus predicated fold path cost more than it
+        // saved. The window itself still VERIFIES the sixteen folded `b`
+        // values against ONE before taking the shortcut, so the kernel stays
+        // bit-exact for any witness and any layout; the plan only decides
+        // where it is worth looking.
+        const B_ONES_BLOCK_PAIRS: usize = 128;
+        let mut b_ones_head = if zc_b_ones_enabled() {
+            (B_ONES_BLOCK_PAIRS - (pair_idx_base & (B_ONES_BLOCK_PAIRS - 1)))
+                & (B_ONES_BLOCK_PAIRS - 1)
+        } else {
+            usize::MAX
+        };
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
         // rows; the consume path below skips them exactly as before).
@@ -253,6 +279,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let unmasked = zc_unmasked_fold_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -261,26 +289,44 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 // gather path reads.
                 let m = mats.unwrap();
                 let g0 = row_base + 2 * x_lo;
-                // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
-                // start, so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
-                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
-                // worker with a cleared environment, so the gate is off and
-                // the mask is a constant 0 on every one of the ~2.1 M leaf
-                // tiles. Feeding the constant in directly drops the per-tile
-                // `OnceLock` acquire load and the eight-bit mask build, and
-                // lets the fold kernels take their unpredicated line path.
-                let dead = 0u8;
+                // Ranked env never sets `FLOCK_PREFOLD_ROW_SKIP`, so every
+                // tile has eight readable lines. The unmasked leaf drops the
+                // dead-line `u8` from the outlined ABI; the masked sibling
+                // with `dead = 0` is the same-binary rollback.
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
-                if tr_bcast {
-                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
-                } else if tr_emit {
-                    gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                if unmasked {
+                    if tr_bcast {
+                        gfni_fold64_rows_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    } else if tr_emit {
+                        gfni_fold64_rows_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    } else {
+                        gfni_fold64_rows(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    }
                 } else {
-                    gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    let dead = 0u8;
+                    if tr_bcast {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            a_pkt.add(g0 * 8),
+                            m,
+                            fa.as_mut_ptr(),
+                            dead,
+                        );
+                        gfni_fold64_rows_masked_tr_bcast(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    } else if tr_emit {
+                        gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    } else {
+                        gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    }
                 }
                 // The packed bursts `pf_tiles` refills ahead — a gap the
                 // hardware prefetcher does not bridge across the strided
@@ -432,6 +478,59 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
+            // Constant-fiber window: every lane's four folded `b` rows are
+            // `F128::ONE`. In characteristic two that gives
+            //     b(1) = 1,  b0 + b1 = 0,  b2 + b3 = 0,
+            //     b0 + b2 = 0,  b1 + b3 = 0,  (b0+b2) + (b1+b3) = 0,
+            // so acc[1], acc[3], acc[5], acc[6] and acc[7] all take a zero
+            // factor and vanish, acc[0], acc[2] and acc[4] take the identity,
+            // and `a0w` -- used only by the three accumulators that vanish --
+            // is never needed. 52 CLMUL per window become 15.
+            if x_lo == b_ones_head {
+                b_ones_head = b_ones_head.wrapping_add(B_ONES_BLOCK_PAIRS);
+                let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
+                let all = _mm512_cmpeq_epi64_mask(b0, one)
+                    & _mm512_cmpeq_epi64_mask(b1, one)
+                    & _mm512_cmpeq_epi64_mask(b2, one)
+                    & _mm512_cmpeq_epi64_mask(b3, one);
+                if all == 0xff {
+                    let (a1w, a2w, a3w) = if let Some(wt) = wtab {
+                        let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                        let w = _mm512_loadu_si512(wp);
+                        let w64 = _mm512_loadu_si512(wp.add(1));
+                        (
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                        )
+                    } else {
+                        let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                        let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                        let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                        if wsplit {
+                            let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                            (
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                            )
+                        } else {
+                            (
+                                ghash_mul_x4(w, a1),
+                                ghash_mul_x4(w, a2),
+                                ghash_mul_x4(w, a3),
+                            )
+                        }
+                    };
+                    #[cfg(test)]
+                    B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    acc[0].mul_acc_one(a1w);
+                    acc[2].mul_acc_one(a3w);
+                    acc[4].mul_acc_one(a2w);
+                    x_lo += 8;
+                    continue;
+                }
+            }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
@@ -1189,6 +1288,43 @@ pub(crate) fn zc_wtab_enabled() -> bool {
 pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
+    *ON
+}
+
+/// Constant-fiber `b == 1` windows in the round-2 lookahead sweep.
+///
+/// The BLAKE3 R1CS sets `B_row = [Z_CONST]` on every const-one input wire, so
+/// a contiguous prefix of each K-block's post-URM `b` rows is the all-ones
+/// word, and the fold table's partition of unity makes
+/// `T(u64::MAX) = sum_i L_i(z) = F128::ONE` exactly. In characteristic two
+/// that collapses a whole eight-pair message window (see the call site).
+/// Same-binary rollback: `FLOCK_NO_ZC_B_ONES=1`.
+///
+/// Mechanism ported from the Apple-track aarch64 kernel
+/// (`zerocheck/multilinear/kernels/aarch64.rs`, the `b == 1` shortcut), which
+/// tests per pair; the x86 message window is four lanes wide, so the port is
+/// a static window plan instead.
+/// Count of eight-pair windows that actually took the constant-fiber
+/// shortcut, so tests can assert the plan FIRES and is not silently inert.
+#[cfg(test)]
+pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn zc_b_ones_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_ONES").is_none());
+    *ON
+}
+
+/// Ranked refill loops pass a literal `0` dead-line mask into an
+/// `#[inline(never)]` GFNI leaf. LLVM cannot fold that `u8` across the
+/// outlined ABI, so each of ~2.1 M tiles still takes a mask register and a
+/// `dead_lines == 0` test inside the kernel. This selector calls a sibling
+/// leaf with no mask parameter. `FLOCK_NO_ZC_UNMASKED_FOLD=1` restores the
+/// masked ABI with `dead = 0`.
+fn zc_unmasked_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_UNMASKED_FOLD").is_none());
     *ON
 }
 
@@ -1976,10 +2112,11 @@ pub(crate) fn build_row_fold_mats_from_cols(cols: &[F128]) -> [u64; 128] {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-// Retained as the unpredicated reference the dead-line skip is proved
-// byte-identical to (`gfni_masked_prefold_matches_unpredicated_kernel`); the
-// hot paths call `gfni_fold64_rows_masked`.
-#[cfg_attr(not(test), allow(dead_code))]
+// Unpredicated reference the dead-line skip is proved byte-identical to
+// (`gfni_masked_prefold_matches_unpredicated_kernel`). Ranked refill calls
+// this when `zc_unmasked_fold_enabled`; `#[inline(never)]` keeps the eight
+// loads off the rayon leaf's ABI.
+#[inline(never)]
 pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
@@ -2399,6 +2536,47 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
                     *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
                 }
             }
+        }
+        gfni_fold64_regs_sigma_bcast(z, mats, out);
+    }
+}
+
+/// Unmasked sibling of [`gfni_fold64_rows_masked_tr`].
+/// The non-tr unmasked leaf is the existing oracle [`gfni_fold64_rows`].
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr`] with every line live.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_tr(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        }
+        gfni_fold64_regs_sigma(z, mats, out);
+    }
+}
+
+/// Unmasked sibling of [`gfni_fold64_rows_masked_tr_bcast`]. Ranked default.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr_bcast`] with every line live.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
     }
