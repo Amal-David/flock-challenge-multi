@@ -889,6 +889,263 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     (sum, left, right, carry)
 }
 
+/// 16×u32 lockstep lane. G, ror, ternlog, and the VBMI2 packer stay in ZMM;
+/// each packed word is split to two octa rings so the existing
+/// [`tr8x16_zmm`] drain can publish each half.
+type V16 = __m512i;
+
+/// Compressions in one V16 lockstep call. Matches the rayon `GROUP`.
+pub(crate) const HEXA: usize = 16;
+/// Two octa staging pairs: V16 drain reuses [`StreamProj`] ×2.
+pub(crate) const HEXA_STAGE_WORDS: usize = 2 * STREAM_STAGE_WORDS;
+
+/// Input form for one sixteen-compression witness kernel invocation.
+pub(crate) enum HexaInputs<'a> {
+    Blocks([&'a Compression; 16]),
+    Closed { init: u64, base: usize },
+}
+
+/// Runtime AVX-512 gate for the V16 G path. Compile-time AVX2 hosts keep the
+/// octa builder; Sapphire Rapids (`target-cpu=native`) takes this arm.
+#[inline]
+pub(crate) fn v16_lockstep_enabled() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512vl")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vbmi2")
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn dup_u32_v16(x: u32) -> V16 {
+    unsafe { _mm512_set1_epi32(x as i32) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_xor_si512(a, b) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn or_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_or_si512(a, b) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn and_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_and_si512(a, b) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn add_v16(a: V16, b: V16) -> V16 {
+    unsafe { _mm512_add_epi32(a, b) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn shr_v16<const N: i32>(v: V16) -> V16 {
+    unsafe { _mm512_srli_epi32::<N>(v) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn shl_v16<const N: i32>(v: V16) -> V16 {
+    unsafe { _mm512_slli_epi32::<N>(v) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn merge_v8(lo: V8, hi: V8) -> V16 {
+    unsafe { _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn store_split_v16(lo: *mut V8, hi: *mut V8, idx: usize, v: V16) {
+    unsafe {
+        store_v8(lo.add(idx) as *mut u32, _mm512_castsi512_si256(v));
+        store_v8(hi.add(idx) as *mut u32, _mm512_extracti64x4_epi64::<1>(v));
+    }
+}
+
+/// ZMM twin of [`vsli_v8`]: `out = (b << N) | (a & mask)` as one `vpternlogd`.
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn vsli_v16<const N: i32>(a: V16, b: V16) -> V16 {
+    unsafe {
+        let mask = _mm512_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        _mm512_ternarylogic_epi32::<0xF8>(_mm512_slli_epi32::<N>(b), a, mask)
+    }
+}
+
+/// ZMM twin of [`ror_v8`]: one `vprold`.
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn ror_v16<const N: i32>(v: V16) -> V16 {
+    unsafe { _mm512_ror_epi32::<N>(v) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
+    debug_assert_eq!(N + M, 32);
+    unsafe { ror_v16::<N>(xor_v16(x, y)) }
+}
+
+/// Lane-wise [`add_carry_parts_v8`] on 16 compressions. Same algebra:
+/// `left = sum ^ y`, `right = sum ^ x`, `carry = left & right`.
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn add_carry_parts_v16(x: V16, y: V16) -> (V16, V16, V16, V16) {
+    unsafe {
+        let sum = add_v16(x, y);
+        let left = xor_v16(sum, y);
+        let right = xor_v16(sum, x);
+        let carry = and_v16(left, right);
+        (sum, left, right, carry)
+    }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn packer_initial_bit_v16(bit: V16) -> V16 {
+    unsafe { shl_v16::<31>(bit) }
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn packer_high_to_low_v16<const BACK: i32>(pending: V16) -> V16 {
+    const {
+        assert!(BACK > 0 && BACK < 32);
+    }
+    unsafe { shr_v16::<BACK>(pending) }
+}
+
+/// 16-lane VBMI2 packer. Pending bits sit high-aligned so `vpshldd` joins
+/// the next field in one uop; each completed word is split across two octa
+/// rings for the incumbent [`Drain8`] / [`tr8x16_zmm`] publisher.
+struct W16<'t, const FLUSH: bool> {
+    pending: V16,
+    stage0: *mut V8,
+    stage1: *mut V8,
+    drain0: *mut Drain8<'t>,
+    drain1: *mut Drain8<'t>,
+    ranked_static: bool,
+}
+
+impl<'t, const FLUSH: bool> W16<'t, FLUSH> {
+    #[inline(always)]
+    fn at(
+        stage0: *mut V8,
+        stage1: *mut V8,
+        pending: V16,
+        drain0: *mut Drain8<'t>,
+        drain1: *mut Drain8<'t>,
+        ranked_static: bool,
+    ) -> Self {
+        Self {
+            pending,
+            stage0,
+            stage1,
+            drain0,
+            drain1,
+            ranked_static,
+        }
+    }
+
+    #[inline(always)]
+    #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "avx512bw", enable = "avx512vbmi2")]
+    unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
+        unsafe {
+            let static_b = FLUSH
+                && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
+                && self.ranked_static;
+            if !static_b {
+                store_split_v16(self.stage0, self.stage1, WORD & (RING_WORDS - 1), v);
+            }
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
+                if WORD + 1 == RING_WORDS {
+                    (*self.drain0).drain_range(16, 16, RING_WORDS - 16);
+                    (*self.drain1).drain_range(16, 16, RING_WORDS - 16);
+                } else {
+                    (*self.drain0).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                    (*self.drain1).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "avx512bw", enable = "avx512vbmi2")]
+    unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
+        &mut self,
+        v: V16,
+    ) {
+        const {
+            assert!(USED >= 0 && USED < 32);
+            assert!(WIDTH == 31 || WIDTH == 32);
+            assert!(BACK >= 1 && BACK < 32);
+            assert!(WORD < U32_PER_BLOCK);
+        }
+        debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+        unsafe {
+            if USED == 0 {
+                if WIDTH == 32 {
+                    self.write_word::<WORD>(v);
+                    self.pending = dup_u32_v16(0);
+                } else {
+                    self.pending = shl_v16::<1>(v);
+                }
+            } else {
+                let out = _mm512_shldi_epi32::<USED>(v, self.pending);
+                self.write_word::<WORD>(out);
+                self.pending = if WIDTH == 31 { shl_v16::<1>(v) } else { v };
+            }
+        }
+    }
+
+    #[inline(always)]
+    #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "avx512bw", enable = "avx512vbmi2")]
+    unsafe fn finish(&mut self) {
+        const {
+            assert!(USEFUL_BITS % 32 == 17);
+        }
+        unsafe {
+            let pending = packer_high_to_low_v16::<15>(self.pending);
+            self.write_word::<LAST_WORD>(pending);
+        }
+    }
+}
+
+macro_rules! pushf16 {
+    ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+        $w.push::<{ ($pos % 32) as i32 }, $width, {
+            let u = ($pos % 32) as i32;
+            if u == 0 { 1 } else { 32 - u }
+        }, { $pos / 32 }>($v);
+    }};
+}
+
+#[inline(always)]
+#[target_feature(enable = "avx512f")]
+unsafe fn merge_prepared(lo: PreparedInputs, hi: PreparedInputs) -> ([V16; 8], [V16; 16], V16, V16, V16, V16)
+{
+    unsafe {
+        (
+            std::array::from_fn(|i| merge_v8(lo.cv[i], hi.cv[i])),
+            std::array::from_fn(|i| merge_v8(lo.message[i], hi.message[i])),
+            merge_v8(lo.counter_lo, hi.counter_lo),
+            merge_v8(lo.counter_hi, hi.counter_hi),
+            merge_v8(lo.block_len, hi.block_len),
+            merge_v8(lo.flags, hi.flags),
+        )
+    }
+}
+
 #[inline(always)]
 fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     debug_assert_eq!(N + M, 32);
