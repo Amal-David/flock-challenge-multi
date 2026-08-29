@@ -2240,47 +2240,84 @@ fn generate_round1_inner_octa(
                 // token-verified constant chunks of a/b/z; the windows are
                 // always written in full.
                 unsafe {
-                    for half in 0..(n_here / SIMD) {
-                        let base = GROUP * g + half * SIMD;
-                        // Lead 2: a full closed-form octa carries only init/base
-                        // into the witness kernel, which generates all 25 draws
-                        // directly in word-major SIMD lanes. Slice input still
-                        // borrows in place; only a ragged closed octa uses the
-                        // scalar staging needed to preserve padding semantics.
-                        let staged: [Compression; SIMD];
-                        let octa = match blocks {
-                            crate::seed_pipe::BlockSource::Slice(s) => {
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    s.get(base + j).unwrap_or(padding)
-                                }))
+                    // Ranked streaming + AVX-512: one 16-wide ZMM G-function
+                    // (width=16, unroll=2 drain) per GROUP. AVX2 (or the
+                    // fused whole-block window arm) keeps the incumbent V8 octa.
+                    let wide16 = stage.is_some()
+                        && n_here >= 16
+                        && std::is_x86_feature_detected!("avx512f");
+                    let simd_g = if wide16 { 16 } else { SIMD };
+                    for half in 0..(n_here / simd_g) {
+                        let base = GROUP * g + half * simd_g;
+                        // Lead 2: a full closed-form octa/hexa carries only
+                        // init/base into the witness kernel, which generates
+                        // all 25 draws directly in word-major SIMD lanes.
+                        // Slice input still borrows in place; only a ragged
+                        // closed group uses the scalar staging needed to
+                        // preserve padding semantics.
+                        let staged8: [Compression; SIMD];
+                        let staged16: [Compression; 16];
+                        let octa = if simd_g == 16 {
+                            match blocks {
+                                crate::seed_pipe::BlockSource::Slice(s) => {
+                                    blake3_witgen8::OctaInputs::Blocks16(std::array::from_fn(|j| {
+                                        s.get(base + j).unwrap_or(padding)
+                                    }))
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len }
+                                    if base + 16 <= len =>
+                                {
+                                    blake3_witgen8::OctaInputs::Closed16 { init, base }
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                    staged16 = std::array::from_fn(|j| {
+                                        let idx = base + j;
+                                        if idx < len {
+                                            crate::seed_pipe::gen_block(init, idx)
+                                        } else {
+                                            *padding
+                                        }
+                                    });
+                                    blake3_witgen8::OctaInputs::Blocks16(std::array::from_fn(|j| {
+                                        &staged16[j]
+                                    }))
+                                }
                             }
-                            crate::seed_pipe::BlockSource::Closed { init, len }
-                                if base + SIMD <= len =>
-                            {
-                                blake3_witgen8::OctaInputs::Closed { init, base }
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len } => {
-                                staged = std::array::from_fn(|j| {
-                                    let idx = base + j;
-                                    if idx < len {
-                                        crate::seed_pipe::gen_block(init, idx)
-                                    } else {
-                                        *padding
-                                    }
-                                });
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    &staged[j]
-                                }))
+                        } else {
+                            match blocks {
+                                crate::seed_pipe::BlockSource::Slice(s) => {
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        s.get(base + j).unwrap_or(padding)
+                                    }))
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len }
+                                    if base + SIMD <= len =>
+                                {
+                                    blake3_witgen8::OctaInputs::Closed { init, base }
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                    staged8 = std::array::from_fn(|j| {
+                                        let idx = base + j;
+                                        if idx < len {
+                                            crate::seed_pipe::gen_block(init, idx)
+                                        } else {
+                                            *padding
+                                        }
+                                    });
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        &staged8[j]
+                                    }))
+                                }
                             }
                         };
-                        let off = half * SIMD * F128_PER_BLOCK;
+                        let off = half * simd_g * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks.
+                        // this octa/hexa's ab_inner blocks.
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
                                 stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                                out: ab_out.as_mut_ptr().add(half * simd_g * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
                             }

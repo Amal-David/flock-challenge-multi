@@ -84,15 +84,23 @@ const _ELIDE_GEOMETRY: () = {
 
 type V8 = __m256i;
 
-/// Input form for one eight-compression witness kernel invocation.
+/// Input form for one eight-compression witness kernel invocation, or the
+/// sixteen-compression AVX-512 ZMM lockstep arm (`Closed16` / `Blocks16`).
 ///
 /// The ranked speculative path carries the generator's closed form all the
 /// way here. Producing the 25 draws directly as eight SIMD lanes avoids
 /// materializing and immediately transposing an 896-byte `[Compression; 8]`.
 /// Slice callers retain the original borrowed-input route verbatim.
+///
+/// Width=16 / unroll=2: `Closed16` / `Blocks16` run the G-function on
+/// `__m512i` (16×u32) and drain through two 8-wide V8 pipelines. AVX2 hosts
+/// never construct those variants; [`build_octa_witness_ab_stream_elide`]
+/// keeps the incumbent V8 path.
 pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
     Closed { init: u64, base: usize },
+    Blocks16([&'a Compression; 16]),
+    Closed16 { init: u64, base: usize },
 }
 
 struct PreparedInputs {
@@ -1553,6 +1561,91 @@ unsafe fn dump_elide_win(
     unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
 }
 
+/// Word-major V8 inputs from eight borrowed compressions. Shared by the
+/// incumbent 8-wide kernel and the high/low halves of the 16-wide ZMM arm.
+#[inline(always)]
+unsafe fn prepare_slice_inputs(inputs: [&Compression; 8]) -> PreparedInputs {
+    unsafe {
+        let ptrs = [
+            inputs[0].0.as_ptr(),
+            inputs[1].0.as_ptr(),
+            inputs[2].0.as_ptr(),
+            inputs[3].0.as_ptr(),
+            inputs[4].0.as_ptr(),
+            inputs[5].0.as_ptr(),
+            inputs[6].0.as_ptr(),
+            inputs[7].0.as_ptr(),
+        ];
+        let cv_rows = [
+            load_v8(ptrs[0]),
+            load_v8(ptrs[1]),
+            load_v8(ptrs[2]),
+            load_v8(ptrs[3]),
+            load_v8(ptrs[4]),
+            load_v8(ptrs[5]),
+            load_v8(ptrs[6]),
+            load_v8(ptrs[7]),
+        ];
+        let cv = tr8(
+            cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5], cv_rows[6],
+            cv_rows[7],
+        );
+
+        let mptrs = [
+            inputs[0].1.as_ptr(),
+            inputs[1].1.as_ptr(),
+            inputs[2].1.as_ptr(),
+            inputs[3].1.as_ptr(),
+            inputs[4].1.as_ptr(),
+            inputs[5].1.as_ptr(),
+            inputs[6].1.as_ptr(),
+            inputs[7].1.as_ptr(),
+        ];
+        let m_lo = tr8(
+            load_v8(mptrs[0]),
+            load_v8(mptrs[1]),
+            load_v8(mptrs[2]),
+            load_v8(mptrs[3]),
+            load_v8(mptrs[4]),
+            load_v8(mptrs[5]),
+            load_v8(mptrs[6]),
+            load_v8(mptrs[7]),
+        );
+        let m_hi = tr8(
+            load_v8(mptrs[0].add(8)),
+            load_v8(mptrs[1].add(8)),
+            load_v8(mptrs[2].add(8)),
+            load_v8(mptrs[3].add(8)),
+            load_v8(mptrs[4].add(8)),
+            load_v8(mptrs[5].add(8)),
+            load_v8(mptrs[6].add(8)),
+            load_v8(mptrs[7].add(8)),
+        );
+        let mut message = [dup_u32(0); 16];
+        message[..8].copy_from_slice(&m_lo);
+        message[8..].copy_from_slice(&m_hi);
+
+        let mut tlo_a = [0u32; 8];
+        let mut thi_a = [0u32; 8];
+        let mut bl_a = [0u32; 8];
+        let mut fl_a = [0u32; 8];
+        for j in 0..8 {
+            tlo_a[j] = inputs[j].2 as u32;
+            thi_a[j] = (inputs[j].2 >> 32) as u32;
+            bl_a[j] = inputs[j].3;
+            fl_a[j] = inputs[j].4;
+        }
+        PreparedInputs {
+            cv,
+            message,
+            counter_lo: load_v8(tlo_a.as_ptr()),
+            counter_hi: load_v8(thi_a.as_ptr()),
+            block_len: load_v8(bl_a.as_ptr()),
+            flags: load_v8(fl_a.as_ptr()),
+        }
+    }
+}
+
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
@@ -1580,88 +1673,21 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     unsafe {
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
+        match inputs {
+            OctaInputs::Blocks16(_) | OctaInputs::Closed16 { .. } => {
+                debug_assert!(
+                    std::is_x86_feature_detected!("avx512f"),
+                    "16-wide ZMM witgen requires AVX-512F"
+                );
+                return build_hexa_witness_ab_stream_elide(inputs, z, a, b, proj, elide);
+            }
+            OctaInputs::Blocks(_) | OctaInputs::Closed { .. } => {}
+        }
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
-            OctaInputs::Blocks(inputs) => {
-                let ptrs = [
-                    inputs[0].0.as_ptr(),
-                    inputs[1].0.as_ptr(),
-                    inputs[2].0.as_ptr(),
-                    inputs[3].0.as_ptr(),
-                    inputs[4].0.as_ptr(),
-                    inputs[5].0.as_ptr(),
-                    inputs[6].0.as_ptr(),
-                    inputs[7].0.as_ptr(),
-                ];
-                let cv_rows = [
-                    load_v8(ptrs[0]),
-                    load_v8(ptrs[1]),
-                    load_v8(ptrs[2]),
-                    load_v8(ptrs[3]),
-                    load_v8(ptrs[4]),
-                    load_v8(ptrs[5]),
-                    load_v8(ptrs[6]),
-                    load_v8(ptrs[7]),
-                ];
-                let cv = tr8(
-                    cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
-                    cv_rows[6], cv_rows[7],
-                );
-
-                let mptrs = [
-                    inputs[0].1.as_ptr(),
-                    inputs[1].1.as_ptr(),
-                    inputs[2].1.as_ptr(),
-                    inputs[3].1.as_ptr(),
-                    inputs[4].1.as_ptr(),
-                    inputs[5].1.as_ptr(),
-                    inputs[6].1.as_ptr(),
-                    inputs[7].1.as_ptr(),
-                ];
-                let m_lo = tr8(
-                    load_v8(mptrs[0]),
-                    load_v8(mptrs[1]),
-                    load_v8(mptrs[2]),
-                    load_v8(mptrs[3]),
-                    load_v8(mptrs[4]),
-                    load_v8(mptrs[5]),
-                    load_v8(mptrs[6]),
-                    load_v8(mptrs[7]),
-                );
-                let m_hi = tr8(
-                    load_v8(mptrs[0].add(8)),
-                    load_v8(mptrs[1].add(8)),
-                    load_v8(mptrs[2].add(8)),
-                    load_v8(mptrs[3].add(8)),
-                    load_v8(mptrs[4].add(8)),
-                    load_v8(mptrs[5].add(8)),
-                    load_v8(mptrs[6].add(8)),
-                    load_v8(mptrs[7].add(8)),
-                );
-                let mut message = [dup_u32(0); 16];
-                message[..8].copy_from_slice(&m_lo);
-                message[8..].copy_from_slice(&m_hi);
-
-                let mut tlo_a = [0u32; 8];
-                let mut thi_a = [0u32; 8];
-                let mut bl_a = [0u32; 8];
-                let mut fl_a = [0u32; 8];
-                for j in 0..8 {
-                    tlo_a[j] = inputs[j].2 as u32;
-                    thi_a[j] = (inputs[j].2 >> 32) as u32;
-                    bl_a[j] = inputs[j].3;
-                    fl_a[j] = inputs[j].4;
-                }
-                PreparedInputs {
-                    cv,
-                    message,
-                    counter_lo: load_v8(tlo_a.as_ptr()),
-                    counter_hi: load_v8(thi_a.as_ptr()),
-                    block_len: load_v8(bl_a.as_ptr()),
-                    flags: load_v8(fl_a.as_ptr()),
-                }
-            }
+            OctaInputs::Blocks(inputs) => prepare_slice_inputs(inputs),
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+            OctaInputs::Blocks16(_) | OctaInputs::Closed16 { .. } => unreachable!(),
         };
         let cv_v = prepared.cv;
         let m = prepared.message;
@@ -1860,6 +1886,361 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
         }
         drain.drain_range(0, 0, 16);
+    }
+}
+
+/// 16-wide ZMM lockstep G-function (width=16, unroll=2 drain pipelines).
+///
+/// G-function / state cascade run on `__m512i` (16×u32). Packed-row drain
+/// reuses two incumbent 8-wide [`Drain8`] / [`W8`] pipelines (unroll=2):
+/// low 8 lanes then high 8 lanes, sharing one [`StreamProj`] staging pair.
+/// Bit-identical to two consecutive V8 octas; AVX-512F required.
+///
+/// # Safety
+/// Caller has AVX-512F. `z`/`a`/`b` each own 16 contiguous 512-word blocks.
+/// `proj.out` covers 16 `BYTES_PER_BLOCK` ab_inner blocks. Same NT fence
+/// contract as [`build_octa_witness_ab_stream_elide`].
+#[target_feature(enable = "avx512f")]
+unsafe fn build_hexa_witness_ab_stream_elide(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    elide: [bool; 3],
+) {
+    type V16 = __m512i;
+
+    #[inline(always)]
+    fn dup16(x: u32) -> V16 {
+        unsafe { _mm512_set1_epi32(x as i32) }
+    }
+    #[inline(always)]
+    fn xor16(x: V16, y: V16) -> V16 {
+        unsafe { _mm512_xor_si512(x, y) }
+    }
+    #[inline(always)]
+    fn or16(x: V16, y: V16) -> V16 {
+        unsafe { _mm512_or_si512(x, y) }
+    }
+    #[inline(always)]
+    fn and16(x: V16, y: V16) -> V16 {
+        unsafe { _mm512_and_si512(x, y) }
+    }
+    #[inline(always)]
+    fn add16(x: V16, y: V16) -> V16 {
+        unsafe { _mm512_add_epi32(x, y) }
+    }
+    #[inline(always)]
+    fn shr16<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_srli_epi32(v, N) }
+    }
+    #[inline(always)]
+    fn shl16<const N: u32>(v: V16) -> V16 {
+        unsafe { _mm512_slli_epi32(v, N) }
+    }
+    #[inline(always)]
+    fn ror16<const N: i32>(v: V16) -> V16 {
+        unsafe { _mm512_ror_epi32::<N>(v) }
+    }
+    #[inline(always)]
+    fn split16(v: V16) -> (V8, V8) {
+        unsafe {
+            (
+                _mm512_castsi512_si256(v),
+                _mm512_extracti64x4_epi64::<1>(v),
+            )
+        }
+    }
+    #[inline(always)]
+    fn merge16(lo: V8, hi: V8) -> V16 {
+        unsafe { _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi) }
+    }
+    #[inline(always)]
+    fn add_carry_parts_v16(x: V16, y: V16) -> (V16, V16, V16, V16) {
+        let sum = add16(x, y);
+        let left = xor16(sum, y);
+        let right = xor16(sum, x);
+        let carry = and16(left, right);
+        (sum, left, right, carry)
+    }
+    #[inline(always)]
+    fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
+        debug_assert_eq!(N + M, 32);
+        ror16::<N>(xor16(x, y))
+    }
+    #[inline(always)]
+    unsafe fn store16_rings(lo: *mut V8, hi: *mut V8, w: usize, v: V16) {
+        unsafe {
+            let (vl, vh) = split16(v);
+            store_v8(lo.add(w & (RING_WORDS - 1)) as *mut u32, vl);
+            store_v8(hi.add(w & (RING_WORDS - 1)) as *mut u32, vh);
+        }
+    }
+
+    unsafe {
+        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        let (lo_in, hi_in) = match inputs {
+            OctaInputs::Closed16 { init, base } => (
+                prepare_closed_inputs(init, base),
+                prepare_closed_inputs(init, base + 8),
+            ),
+            OctaInputs::Blocks16(b) => (
+                prepare_slice_inputs(std::array::from_fn(|i| b[i])),
+                prepare_slice_inputs(std::array::from_fn(|i| b[i + 8])),
+            ),
+            OctaInputs::Blocks(_) | OctaInputs::Closed { .. } => unreachable!(),
+        };
+        let cv_v: [V16; 8] = core::array::from_fn(|i| merge16(lo_in.cv[i], hi_in.cv[i]));
+        let m: [V16; 16] = core::array::from_fn(|i| merge16(lo_in.message[i], hi_in.message[i]));
+        let tlo = merge16(lo_in.counter_lo, hi_in.counter_lo);
+        let thi = merge16(lo_in.counter_hi, hi_in.counter_hi);
+        let blen = merge16(lo_in.block_len, hi_in.block_len);
+        let flags = merge16(lo_in.flags, hi_in.flags);
+
+        let mut state: [V16; 16] = [
+            cv_v[0],
+            cv_v[1],
+            cv_v[2],
+            cv_v[3],
+            cv_v[4],
+            cv_v[5],
+            cv_v[6],
+            cv_v[7],
+            dup16(BLAKE3_IV[0]),
+            dup16(BLAKE3_IV[1]),
+            dup16(BLAKE3_IV[2]),
+            dup16(BLAKE3_IV[3]),
+            tlo,
+            thi,
+            blen,
+            flags,
+        ];
+
+        let zero = dup16(0);
+        let mut ast_lo = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut ast_hi = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut bs_lo = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut bs_hi = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let ast_lo = ast_lo.as_mut_ptr().cast::<V8>();
+        let ast_hi = ast_hi.as_mut_ptr().cast::<V8>();
+        let bs_lo = bs_lo.as_mut_ptr().cast::<V8>();
+        let bs_hi = bs_hi.as_mut_ptr().cast::<V8>();
+
+        let proj_hi = StreamProj {
+            stage: proj.stage,
+            out: proj.out.add(8 * BYTES_PER_BLOCK),
+            inv_table: proj.inv_table,
+            plan: proj.plan,
+        };
+        let mut drain_lo = Drain8 {
+            ast: ast_lo,
+            bs: bs_lo,
+            z,
+            a,
+            b,
+            proj,
+            elide,
+            ranked_static,
+        };
+        let mut drain_hi = Drain8 {
+            ast: ast_hi,
+            bs: bs_hi,
+            z: z.add(8 * U32_PER_BLOCK),
+            a: a.add(8 * U32_PER_BLOCK),
+            b: b.add(8 * U32_PER_BLOCK),
+            proj: proj_hi,
+            elide,
+            ranked_static,
+        };
+
+        let maxv = dup16(u32::MAX);
+        let one = dup16(1);
+        let chain: [V16; 20] = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
+            m[13], m[14], m[15], tlo, thi, blen, flags,
+        ];
+        for k in 0..20usize {
+            let v = if k == 0 {
+                or16(one, shl16::<1>(chain[0]))
+            } else {
+                or16(shr16::<31>(chain[k - 1]), shl16::<1>(chain[k]))
+            };
+            store16_rings(ast_lo, ast_hi, 16 + k, v);
+        }
+        if !ranked_static {
+            for w in 16..RANKED_STATIC_B_PREFIX_END {
+                store16_rings(bs_lo, bs_hi, w, maxv);
+            }
+        }
+        for w in RANKED_STATIC_B_PREFIX_END..16 + PROLOGUE_WORDS {
+            store16_rings(bs_lo, bs_hi, w, maxv);
+        }
+        if RING_WORDS <= PROLOGUE_WORDS + 16 {
+            drain_lo.drain_range(16, 16, RING_WORDS - 16);
+            drain_hi.drain_range(16, 16, RING_WORDS - 16);
+        }
+
+        let pending_bit = packer_initial_bit(shr_v8::<31>(_mm512_castsi512_si256(flags)));
+        let pending_bit_hi = packer_initial_bit(shr_v8::<31>(_mm512_extracti64x4_epi64::<1>(flags)));
+        let drain_lo_ptr = &mut drain_lo as *mut Drain8;
+        let drain_hi_ptr = &mut drain_hi as *mut Drain8;
+        let mut wa_lo = W8::<false>::at(ast_lo, pending_bit, drain_lo_ptr, false);
+        let mut wa_hi = W8::<false>::at(ast_hi, pending_bit_hi, drain_hi_ptr, false);
+        let mut wb_lo = W8::<true>::at(
+            bs_lo,
+            packer_initial_bit(dup_u32(1)),
+            drain_lo_ptr,
+            ranked_static,
+        );
+        let mut wb_hi = W8::<true>::at(
+            bs_hi,
+            packer_initial_bit(dup_u32(1)),
+            drain_hi_ptr,
+            ranked_static,
+        );
+
+        macro_rules! push16 {
+            ($w_lo:ident, $w_hi:ident, $pos:expr, $width:literal, $v:expr) => {{
+                let (vl, vh) = split16($v);
+                pushf8!($w_lo, $pos, $width, vl);
+                pushf8!($w_hi, $pos, $width, vh);
+            }};
+        }
+        // Width=16 G, unroll=2: two independent G's share the ADD/XOR ILP
+        // window before their packed pushes (column pairs, then diagonal).
+        macro_rules! g2 {
+            ($g0:expr, $la0:literal, $lb0:literal, $lc0:literal, $ld0:literal,
+             $mx0:literal, $my0:literal,
+             $g1:expr, $la1:literal, $lb1:literal, $lc1:literal, $ld1:literal,
+             $mx1:literal, $my1:literal) => {{
+                let (t00, l00, r00, _) = add_carry_parts_v16(state[$la0], state[$lb0]);
+                let (t01, l01, r01, _) = add_carry_parts_v16(state[$la1], state[$lb1]);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C0, 31, l00);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C0, 31, r00);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C0, 31, l01);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C0, 31, r01);
+                let (a10, l10, r10, _) = add_carry_parts_v16(t00, m[$mx0]);
+                let (a11, l11, r11, _) = add_carry_parts_v16(t01, m[$mx1]);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C1, 31, l10);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C1, 31, r10);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C1, 31, l11);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C1, 31, r11);
+                let d10 = xor_rotr16::<16, 16>(state[$ld0], a10);
+                let d11 = xor_rotr16::<16, 16>(state[$ld1], a11);
+                let (c10, l20, r20, _) = add_carry_parts_v16(state[$lc0], d10);
+                let (c11, l21, r21, _) = add_carry_parts_v16(state[$lc1], d11);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C2, 31, l20);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C2, 31, r20);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C2, 31, l21);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C2, 31, r21);
+                let b10 = xor_rotr16::<12, 20>(state[$lb0], c10);
+                let b11 = xor_rotr16::<12, 20>(state[$lb1], c11);
+                let (t10, l30, r30, _) = add_carry_parts_v16(a10, b10);
+                let (t11, l31, r31, _) = add_carry_parts_v16(a11, b11);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C3, 31, l30);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C3, 31, r30);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C3, 31, l31);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C3, 31, r31);
+                let (a20, l40, r40, _) = add_carry_parts_v16(t10, m[$my0]);
+                let (a21, l41, r41, _) = add_carry_parts_v16(t11, m[$my1]);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C4, 31, l40);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C4, 31, r40);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C4, 31, l41);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C4, 31, r41);
+                let d20 = xor_rotr16::<8, 24>(d10, a20);
+                let d21 = xor_rotr16::<8, 24>(d11, a21);
+                let (c20, l50, r50, _) = add_carry_parts_v16(c10, d20);
+                let (c21, l51, r51, _) = add_carry_parts_v16(c11, d21);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_C5, 31, l50);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_C5, 31, r50);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_C5, 31, l51);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_C5, 31, r51);
+                let bn0 = xor_rotr16::<7, 25>(b10, c20);
+                let bn1 = xor_rotr16::<7, 25>(b11, c21);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_LIN0, 32, bn0);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_LIN0, 32, maxv);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g0 + REC_LIN1, 32, d20);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g0 + REC_LIN1, 32, maxv);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_LIN0, 32, bn1);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_LIN0, 32, maxv);
+                push16!(wa_lo, wa_hi, GS_BASE + G_STRIDE * $g1 + REC_LIN1, 32, d21);
+                push16!(wb_lo, wb_hi, GS_BASE + G_STRIDE * $g1 + REC_LIN1, 32, maxv);
+                state[$la0] = a20;
+                state[$lb0] = bn0;
+                state[$lc0] = c20;
+                state[$ld0] = d20;
+                state[$la1] = a21;
+                state[$lb1] = bn1;
+                state[$lc1] = c21;
+                state[$ld1] = d21;
+            }};
+        }
+        macro_rules! round16 {
+            ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+             $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+             $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+             $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                g2!($gb, 0, 4, 8, 12, $m0, $m1, $gb + 1, 1, 5, 9, 13, $m2, $m3);
+                g2!($gb + 2, 2, 6, 10, 14, $m4, $m5, $gb + 3, 3, 7, 11, 15, $m6, $m7);
+                g2!($gb + 4, 0, 5, 10, 15, $m8, $m9, $gb + 5, 1, 6, 11, 12, $m10, $m11);
+                g2!($gb + 6, 2, 7, 8, 13, $m12, $m13, $gb + 7, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+        round16!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        round16!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        round16!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        round16!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        round16!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        round16!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        round16!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+        const {
+            assert!(OUT_HI_BASE % 32 == 17);
+        }
+        macro_rules! oh16 {
+            ($w:literal) => {{
+                let hv = xor16(state[$w + 8], cv_v[$w]);
+                push16!(wa_lo, wa_hi, OUT_HI_BASE + 32 * $w, 32, hv);
+                push16!(wb_lo, wb_hi, OUT_HI_BASE + 32 * $w, 32, maxv);
+            }};
+        }
+        oh16!(0);
+        oh16!(1);
+        oh16!(2);
+        oh16!(3);
+        oh16!(4);
+        oh16!(5);
+        oh16!(6);
+        oh16!(7);
+        wa_lo.finish();
+        wa_hi.finish();
+        wb_lo.finish();
+        wb_hi.finish();
+
+        const ZF: usize = USEFUL_BITS.div_ceil(32);
+        if !ranked_static {
+            for w in ZF..U32_PER_BLOCK {
+                store16_rings(ast_lo, ast_hi, w, zero);
+                store16_rings(bs_lo, bs_hi, w, zero);
+            }
+        }
+        drain_lo.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain_hi.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+
+        for w in 0..8usize {
+            let lo = xor16(state[w], state[w + 8]);
+            store16_rings(ast_lo, ast_hi, w, cv_v[w]);
+            store16_rings(ast_lo, ast_hi, 8 + w, lo);
+        }
+        if !ranked_static {
+            for w in 0..8usize {
+                store16_rings(bs_lo, bs_hi, w, maxv);
+                store16_rings(bs_lo, bs_hi, 8 + w, maxv);
+            }
+        }
+        drain_lo.drain_range(0, 0, 16);
+        drain_hi.drain_range(0, 0, 16);
     }
 }
 
