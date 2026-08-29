@@ -111,6 +111,18 @@ pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
 
+#[inline]
+fn witgen_urm_share_enabled() -> bool {
+    // Opt-in (`FLOCK_WITGEN_URM_SHARE=1`): the shared process-cached table
+    // measured -0.096% in its own author's official isolation (`bb445b2` vs
+    // its unmask parent), and the two highest-scoring third-party trees of
+    // 2026-08-29 both run witness-local tables. Cleared ranked environment
+    // therefore builds the table locally.
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_URM_SHARE").is_some());
+    *ON
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -1914,9 +1926,19 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2277,14 +2299,24 @@ fn generate_round1_inner_octa(
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
+                        let proj = match stage {
+                            Some(st) => blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
-                            }
-                        }).unwrap_unchecked();
+                                imgs:
+                                    flock_core::zerocheck::univariate_skip_optimized::round1_ab_table_images(
+                                        inv_table, win_plan,
+                                    ),
+                            },
+                            // The streaming drain is this arm's only octa
+                            // path; a disarmed stage must fail loudly, not
+                            // hand the drain an uninitialized projection.
+                            None => panic!(
+                                "witgen AB stream staging absent (FLOCK_NO_WITGEN_AB_NT / FLOCK_NO_WITGEN_AB_WINSTREAM)"
+                            ),
+                        };
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),

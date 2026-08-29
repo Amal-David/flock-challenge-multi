@@ -40,3 +40,7 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+// EY_V_ROLL marker
+#[used]
+static EY_V_ROLL: [u8; 40] = [0u8; 40];

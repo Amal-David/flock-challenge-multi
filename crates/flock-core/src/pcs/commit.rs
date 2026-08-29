@@ -374,14 +374,25 @@ fn finalize_commit(
                 0
             };
             // Publish this sub-group's depth; every sub-group must agree.
-            let seen = match local_levels.compare_exchange(
-                usize::MAX,
-                depth,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => depth,
-                Err(prev) => prev,
+            // Fast path: once a depth is published, every later sub-group
+            // agrees and only needs the acquire load — the locked RMW on this
+            // shared line is reserved for the first publisher and for actual
+            // disagreement.
+            let cur = local_levels.load(Ordering::Acquire);
+            let seen = if cur == depth {
+                depth
+            } else if cur == usize::MAX {
+                match local_levels.compare_exchange(
+                    usize::MAX,
+                    depth,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => depth,
+                    Err(prev) => prev,
+                }
+            } else {
+                cur
             };
             if seen != depth {
                 local_levels.store(0, Ordering::Release);
@@ -781,14 +792,25 @@ pub(crate) fn fused_encode_leaves_subtree(
             } else {
                 0
             };
-        let seen = match local_levels.compare_exchange(
-            usize::MAX,
-            depth,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => depth,
-            Err(prev) => prev,
+        // Fast path: once a depth is published, every later sub-group
+        // agrees and only needs the acquire load — the locked RMW on this
+        // shared line is reserved for the first publisher and for actual
+        // disagreement.
+        let cur = local_levels.load(Ordering::Acquire);
+        let seen = if cur == depth {
+            depth
+        } else if cur == usize::MAX {
+            match local_levels.compare_exchange(
+                usize::MAX,
+                depth,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => depth,
+                Err(prev) => prev,
+            }
+        } else {
+            cur
         };
         if seen != depth {
             local_levels.store(0, Ordering::Release);
