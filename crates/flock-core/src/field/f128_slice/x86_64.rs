@@ -202,49 +202,82 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
-#[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r0_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r0.hi as i64, r0.lo as i64));
-        let r0_x64 = ghash_shift64_x4(r0_bcast);
         let r1_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r1.hi as i64, r1.lo as i64));
-        let r1_x64 = ghash_shift64_x4(r1_bcast);
         let lanes = dst.len() & !3;
         let mut t = 0;
-        while t < lanes {
-            let s = 4 * t;
-            let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
-            let v2 = _mm512_loadu_si512(src.as_ptr().add(s + 8) as *const __m512i);
-            let v3 = _mm512_loadu_si512(src.as_ptr().add(s + 12) as *const __m512i);
+        if r0.hi == 0 && r1.hi == 0 {
+            while t < lanes {
+                let s = 4 * t;
+                let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let v2 = _mm512_loadu_si512(src.as_ptr().add(s + 8) as *const __m512i);
+                let v3 = _mm512_loadu_si512(src.as_ptr().add(s + 12) as *const __m512i);
 
-            // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
-            let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
-            let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
-            let mid01 = _mm512_xor_si512(
-                even01,
-                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
-            );
-            let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
-            let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
-            let mid23 = _mm512_xor_si512(
-                even23,
-                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
-            );
+                // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
+                let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
+                let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
+                let mid01 = _mm512_xor_si512(
+                    even01,
+                    ghash_mul_x4_low_rhs(_mm512_xor_si512(even01, odd01), r0_bcast),
+                );
+                let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
+                let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
+                let mid23 = _mm512_xor_si512(
+                    even23,
+                    ghash_mul_x4_low_rhs(_mm512_xor_si512(even23, odd23), r0_bcast),
+                );
 
-            // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
-            let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
-            let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
-            let out = _mm512_xor_si512(
-                low,
-                ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
-            );
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
-            t += 4;
+                // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
+                let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
+                let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
+                let out = _mm512_xor_si512(
+                    low,
+                    ghash_mul_x4_low_rhs(_mm512_xor_si512(low, high), r1_bcast),
+                );
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+                t += 4;
+            }
+        } else {
+            let r0_x64 = ghash_shift64_x4(r0_bcast);
+            let r1_x64 = ghash_shift64_x4(r1_bcast);
+            while t < lanes {
+                let s = 4 * t;
+                let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let v2 = _mm512_loadu_si512(src.as_ptr().add(s + 8) as *const __m512i);
+                let v3 = _mm512_loadu_si512(src.as_ptr().add(s + 12) as *const __m512i);
+
+                // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
+                let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
+                let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
+                let mid01 = _mm512_xor_si512(
+                    even01,
+                    ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
+                );
+                let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
+                let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
+                let mid23 = _mm512_xor_si512(
+                    even23,
+                    ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
+                );
+
+                // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
+                let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
+                let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
+                let out = _mm512_xor_si512(
+                    low,
+                    ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
+                );
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+                t += 4;
+            }
         }
         while t < dst.len() {
             let a0 = src[4 * t];
