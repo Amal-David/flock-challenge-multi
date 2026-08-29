@@ -1780,6 +1780,13 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
         let planes = plane_banks.as_mut_ptr();
         let base = c_group.as_ptr();
 
+        let mut mats_lo = [_mm512_setzero_si512(); 16];
+        let mut mats_hi = [_mm512_setzero_si512(); 16];
+        for plane in 0..16usize {
+            mats_lo[plane] = _mm512_set1_epi64(mats[plane] as i64);
+            mats_hi[plane] = _mm512_set1_epi64(mats[16 + plane] as i64);
+        }
+
         for q in 0..N_C_Q {
             let mut masks = [[_mm512_setzero_si512(); N_C_BANKS]; 2];
             for (half, mask_half) in masks.iter_mut().enumerate() {
@@ -1811,10 +1818,8 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                 let mask1 = masks[1][bank];
                 let bank_ptr = planes.add((q * N_C_BANKS + bank) * 16 * ELL) as *mut __m512i;
                 for plane in 0..16usize {
-                    let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                    let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
-                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(mask0, m_lo);
-                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(mask1, m_hi);
+                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(mask0, mats_lo[plane]);
+                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(mask1, mats_hi[plane]);
                     let ptr = bank_ptr.add(plane);
                     _mm512_storeu_si512(
                         ptr,
