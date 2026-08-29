@@ -28,6 +28,7 @@
 //! 192 (positions on Λ₄ = V₈ \ S) are the fresh extension that the zerocheck
 //! round-1 message uses.
 
+use crate::bits::BitOps;
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
