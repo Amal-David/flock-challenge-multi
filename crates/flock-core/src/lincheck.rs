@@ -382,7 +382,11 @@ impl CscCircuit {
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).collect();
         }
-        let mut out = vec![F128::ZERO; self.n_cols];
+        let mut out = if lc_uninit_acc_enabled() {
+            crate::alloc_uninit_f128_vec(self.n_cols)
+        } else {
+            vec![F128::ZERO; self.n_cols]
+        };
         out.par_iter_mut()
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
@@ -1049,6 +1053,29 @@ fn lc_gather4_enabled() -> bool {
 fn lc_alpha_overlap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ALPHA_OVERLAP").is_none());
+    *ON
+}
+
+/// Test-only forced-off latch for the uninit accumulator, so the identity
+/// test can drive both arms without mutating the process env.
+#[cfg(test)]
+static LC_UNINIT_ACC_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static LC_UNINIT_ACC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `FLOCK_NO_LC_UNINIT_ACC=1` restores `vec![F128::ZERO; n]` for the CSC
+/// `map_cols` rayon buffer and the GFNI fold output. Default ON: every
+/// slot is overwritten before any read (live reduce writes 64 lanes;
+/// padding fills zero; `map_cols` assigns every column). Ranked
+/// `env_clear()` so default ON.
+fn lc_uninit_acc_enabled() -> bool {
+    #[cfg(test)]
+    if LC_UNINIT_ACC_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_UNINIT_ACC").is_none());
     *ON
 }
 
@@ -1719,10 +1746,14 @@ fn fold_block_major_gfni(
         .collect();
     let live_blocks = useful_bits.div_ceil(64);
     let out_len = if top_bind.is_some() { k / 2 } else { k };
-    // Keep output initialized as F128 throughout. The much larger plane
-    // buffer carries the dead zero-fill; avoiding this comparatively small
-    // clear would require a separate MaybeUninit ownership conversion.
-    let mut out = vec![F128::ZERO; out_len];
+    // Live 64-lane blocks are fully overwritten by `reduce_worker_plane_block`
+    // (or `bind_split_half` after a live/zero hi reduce). Padding fills
+    // algebraic zero. Skipping the eager F128 clear is a pure memset delete.
+    let mut out = if lc_uninit_acc_enabled() {
+        crate::alloc_uninit_f128_vec(out_len)
+    } else {
+        vec![F128::ZERO; out_len]
+    };
     out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
         if blk < live_blocks {
             // SAFETY: `active_workers` contains exactly producer chunks that
@@ -3594,6 +3625,29 @@ mod tests {
             let reference = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
             assert_eq!(want, reference, "k={k} reference");
         }
+    }
+
+    /// Uninit `map_cols` (every slot assigned before any read) must match
+    /// the zeroed rayon buffer on the parallel CSC path.
+    #[test]
+    fn uninit_map_cols_matches_zeroed_fold_alpha() {
+        use std::sync::atomic::Ordering;
+        let k = 1usize << 12;
+        let nnz = 40_000usize;
+        let mut rng = Rng::new(0x0111_0ACC);
+        let a = random_sparse_matrix(k, nnz, &mut rng);
+        let b = random_sparse_matrix(k, nnz, &mut rng);
+        let csc = CscCircuit::from_matrices_narrow(&a, &b, true);
+        let alpha = rng.f128();
+        let eq: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        let _g = LC_UNINIT_ACC_TEST_LOCK.lock().unwrap();
+        LC_UNINIT_ACC_FORCED_OFF.store(true, Ordering::Relaxed);
+        let zeroed = csc.fold_alpha_batched(alpha, &eq);
+        LC_UNINIT_ACC_FORCED_OFF.store(false, Ordering::Relaxed);
+        let uninit = csc.fold_alpha_batched(alpha, &eq);
+        assert_eq!(uninit, zeroed, "uninit map_cols drifted from zeroed");
+        let reference = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
+        assert_eq!(uninit, reference, "uninit map_cols drifted from reference");
     }
 
     /// `build_eq_table` produces eq(point, i) for all boolean i.
