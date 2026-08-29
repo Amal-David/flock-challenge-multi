@@ -143,7 +143,7 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///   dst[t] = low + r1·(low+high)
 ///
 /// Four slots (16 source F128) per iteration. Same even/odd pairing and
-/// `ghash_mul_x4(r, even XOR odd)` body as [`fold_pairs`], applied twice
+/// `ghash_mul_x4_split(even XOR odd, r, r·x^64)` body as [`fold_pairs`], applied twice
 /// in registers. Stores `dst` only — no mid buffer.
 ///
 /// # Safety
@@ -229,16 +229,16 @@ fn fold16_pf_ahead() -> usize {
 ///
 /// The 16 slot-major loads of a 4-slot block are transposed (128-bit lanes)
 /// into bank-major vectors, each multiplied by its broadcast weight into ONE
-/// four-lane unreduced accumulator (`WideGhashX4::mul_acc`, 4 CLMUL per
-/// vector), and reduced once per lane at the end — 18 vector CLMULs per four
-/// outputs against 36 for the two nested pair-fold passes it replaces.
-/// Field-identical (reduction is F₂-linear).
+/// four-lane unreduced accumulator (`WideGhashX4::mul_acc_const_rhs`,
+/// Karatsuba 3 CLMUL per vector with `w.lo^w.hi` hoisted once per weight),
+/// and reduced once per lane at the end. Field-identical (reduction is
+/// F₂-linear).
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use crate::field::gf2_128::x86_64::{WideGhashX4, xor_halves_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
@@ -246,6 +246,9 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let wb: [__m512i; 16] = core::array::from_fn(|b| {
             _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
         });
+        // (w.lo^w.hi) in both qwords, once per weight — Karatsuba mid term
+        // skips shuffling the broadcast rhs inside every 4-slot pass.
+        let wb_sum: [__m512i; 16] = core::array::from_fn(|b| xor_halves_x4(wb[b]));
         // 4×4 transpose of 128-bit lanes: stage-1 index vectors interleave
         // lanes {0,1} / {2,3} of two inputs; stage 2 gathers lanes {0,1} /
         // {2,3} of the two stage-1 results.
@@ -285,10 +288,10 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
                 let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
                 let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                acc.mul_acc_const_rhs(u0, wb[4 * g], wb_sum[4 * g]);
+                acc.mul_acc_const_rhs(u1, wb[4 * g + 1], wb_sum[4 * g + 1]);
+                acc.mul_acc_const_rhs(u2, wb[4 * g + 2], wb_sum[4 * g + 2]);
+                acc.mul_acc_const_rhs(u3, wb[4 * g + 3], wb_sum[4 * g + 3]);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
