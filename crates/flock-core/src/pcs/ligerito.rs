@@ -2639,9 +2639,24 @@ unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
     unsafe {
         let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
         let eb_x64 = ghash_shift64_x4(eb);
-        let lanes = out.len() & !3;
+        let n = out.len();
+        let lanes8 = n & !7;
         let mut i = 0usize;
-        while i < lanes {
+        while i < lanes8 {
+            let v0 = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            let v1 = _mm512_loadu_si512(lo.as_ptr().add(i + 4) as *const __m512i);
+            _mm512_storeu_si512(
+                out.as_mut_ptr().add(i) as *mut __m512i,
+                ghash_mul_x4_split(v0, eb, eb_x64),
+            );
+            _mm512_storeu_si512(
+                out.as_mut_ptr().add(i + 4) as *mut __m512i,
+                ghash_mul_x4_split(v1, eb, eb_x64),
+            );
+            i += 8;
+        }
+        let lanes4 = n & !3;
+        while i < lanes4 {
             let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
             _mm512_storeu_si512(
                 out.as_mut_ptr().add(i) as *mut __m512i,
@@ -4069,30 +4084,7 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
-    use core::arch::x86_64::*;
-    debug_assert_eq!(acc.len(), src.len());
-    // SAFETY: caller carries the target features; the slices are equal-length
-    // and every offset below stays inside both.
-    unsafe {
-        let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
-        let ab_x64 = ghash_shift64_x4(ab);
-        let lanes = acc.len() & !3;
-        let mut i = 0usize;
-        while i < lanes {
-            let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
-            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
-            _mm512_storeu_si512(
-                acc.as_mut_ptr().add(i) as *mut __m512i,
-                _mm512_xor_si512(a, ghash_mul_x4_split(v, ab, ab_x64)),
-            );
-            i += 4;
-        }
-        while i < acc.len() {
-            acc[i] += alpha * src[i];
-            i += 1;
-        }
-    }
+    crate::field::f128_slice::add_scaled(acc, src, alpha);
 }
 
 /// `FLOCK_NO_OPEN_OOD_X4=1` restores the scalar per-pair loops of
