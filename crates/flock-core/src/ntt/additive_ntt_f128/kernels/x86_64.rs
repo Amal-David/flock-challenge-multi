@@ -1293,14 +1293,8 @@ unsafe fn butterfly_fused_4layer_row_impl<
         for (slot, value) in tw[7..15].iter_mut().zip(twiddles[7..15].iter()) {
             *slot = tw_x4::<LOW_L4, DIET>(*value);
         }
-        let base_row = ptr.add(r * num_ntts);
-        let stride = sixteenth * num_ntts;
-        let row_ptrs: [*mut F128; 16] = core::array::from_fn(|i| base_row.add(i * stride));
-        let row = |i: usize| row_ptrs[i];
-        let base_pf = ptr.add(pf_r * num_ntts) as *const i8;
-        let pf_stride = stride * core::mem::size_of::<F128>();
-        let pf_row_ptrs: [*const i8; 16] = core::array::from_fn(|i| base_pf.add(i * pf_stride));
-        let pf_row = |i: usize| pf_row_ptrs[i];
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+        let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
