@@ -398,15 +398,43 @@ unsafe fn horner_2img_offw(
         let apply = |o: *const u16| {
             crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
         };
-        let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
-        for k in (0..7usize).rev() {
-            let av = apply(op.add(k * 8));
-            let bv = apply(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        // Flattened form of the same sum: Σ_k x^k·(a_k·b_k) with the eight
+        // x^k = 2^k (k ≤ 7) as byte constants, so every product and every
+        // scaling is independent and the seven-deep serial `vgf2p8mulb`
+        // accumulator chain becomes a two-level product/scale layer plus a
+        // three-deep XOR tree. Same multiply count (8 products + 7 scalings;
+        // x^0 = 1 needs none); GF(2^8) multiplication distributes over XOR
+        // and is associative/commutative, so the value is bit-identical to
+        // the Horner form.
+        let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
+        let mut t = [core::mem::MaybeUninit::<__m512i>::uninit(); 7];
+        macro_rules! scaled {
+            ($k:literal) => {{
+                let av = apply(op.add($k * 8));
+                let bv = apply(op.add(64 + $k * 8));
+                let product = _mm512_gf2p8mul_epi8(av, bv);
+                t[$k - 1].write(_mm512_gf2p8mul_epi8(
+                    product,
+                    _mm512_set1_epi8((1u8 << $k) as i8),
+                ));
+            }};
         }
-        acc
+        scaled!(1);
+        scaled!(2);
+        scaled!(3);
+        scaled!(4);
+        scaled!(5);
+        scaled!(6);
+        scaled!(7);
+        let t = core::mem::transmute::<_, [__m512i; 7]>(t);
+        let s01 = _mm512_xor_si512(p0, t[0]);
+        let s23 = _mm512_xor_si512(t[1], t[2]);
+        let s45 = _mm512_xor_si512(t[3], t[4]);
+        let s67 = _mm512_xor_si512(t[5], t[6]);
+        _mm512_xor_si512(
+            _mm512_xor_si512(s01, s23),
+            _mm512_xor_si512(s45, s67),
+        )
     }
 }
 
