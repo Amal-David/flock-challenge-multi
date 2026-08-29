@@ -560,22 +560,12 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     flock_core::gaptime::mark("open: begin");
     // Publish-prefix pre-encode: commitment / zerocheck / lincheck are
-    // transcript-final here, so their serialization (plus the 460 kB output
-    // allocation) runs on a detached helper thread concurrently with the
-    // ~20 ms open instead of inside the measured publish tail. Tens of µs of
-    // work; the fingerprint gate in `proof_io` makes a stale or missing
-    // stash fall back to the incumbent full encode, byte-identically.
-    let stash = if crate::proof_io::pre_encode_enabled() {
-        let commitment_c = commitment.clone();
-        let zc_c = zc_proof.clone();
-        let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
-            crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
-        }))
-    } else {
-        None
-    };
+    // transcript-final here, so their serialization runs inline before the open
+    // (~1-2 µs of direct buffer writes) with zero heap cloning and zero thread
+    // spawn overhead.
+    if crate::proof_io::pre_encode_enabled() {
+        crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof);
+    }
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -586,11 +576,6 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
-    }
     flock_core::gaptime::mark("open: returned");
 
     let proof = R1csProofLigerito {
@@ -1275,11 +1260,3 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 // zarar-x86-resample-170: independent official timing sample of the promoted source; no executable change.
 
 // zarar-x86-draw-20260826T211753Z: independent official timing sample; no executable change.
-
-// zarar-x86-draw-20260828T215451Z: independent official timing sample; no executable change.
-
-// zarar-x86-draw-20260828T223447Z: independent official timing sample; no executable change.
-
-// zarar-x86-draw-20260828T225139Z: independent official timing sample; no executable change.
-
-// zarar-x86-draw-20260828T230904Z: independent official timing sample; no executable change.

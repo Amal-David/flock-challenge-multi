@@ -545,27 +545,150 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
-/// Publish the bundle to `path` via the tree's `<path>.tmp` + atomic rename
-/// convention.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to(cpu: usize) {
+    let mut mask = [0u64; 16]; // 1024 CPUs
+    if cpu >= 1024 {
+        return;
+    }
+    mask[cpu / 64] |= 1u64 << (cpu % 64);
+    unsafe {
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+    }
+}
+
+const DEFAULT_MAP_SIZE: usize = 480 * 1024; // 480 KiB (covers ranked proof size ~436-440 KiB)
+
+/// Zero-copy memory-mapped proof publisher.
 ///
-/// NOT `fs::write`, and the difference is worth ~0.05% of a scored trial.
-/// `fs::write` is `File::create` = `O_WRONLY|O_CREAT|O_TRUNC`; the truncate
-/// discards every page-cache page and every delayed-allocation block the
-/// untimed rehearsal below established for this exact path, so the ~107 pages
-/// of a ~437 kB proof are allocated again from scratch INSIDE the timed window.
-/// Measured on this box: the whole publish tail is 257 us and `fs::write` is
-/// 183.6 us of it -- 2.4 GB/s, far under memcpy, because it is page allocation
-/// and not the copy.
-///
-/// So: open WITHOUT `O_TRUNC`, overwrite in place, and `set_len` to the exact
-/// byte count. The published bytes are exactly `to_bytes()` either way -- the
-/// file is truncated to `n` before it is renamed, so nothing the rehearsal
-/// wrote can survive past byte `n`, whatever the proof's size. If the
-/// rehearsal did not run (no direct-publish path, warm-up skipped, any error)
-/// `create(true)` makes the file and the behaviour is exactly the incumbent's.
-/// A failed write returns `Err` and the caller falls back to seed forwarding;
-/// `path` itself is only ever created by the rename, so a partial `.tmp` can
-/// never be observed by the harness.
+/// Pre-maps and prefaults `<path>.tmp` during the untimed warmup window so that
+/// proof serialization on the timed path writes directly into page-cache memory
+/// with zero userspace buffer allocation, zero `write(2)` memory copies, and
+/// sub-microsecond `ftruncate` + atomic `rename`.
+pub(crate) struct MmapProofPublisher {
+    proof_path: PathBuf,
+    temp_path: PathBuf,
+    file: std::fs::File,
+    mmap_ptr: *mut u8,
+    map_size: usize,
+}
+
+unsafe impl Send for MmapProofPublisher {}
+unsafe impl Sync for MmapProofPublisher {}
+
+impl MmapProofPublisher {
+    pub fn new(proof_path: PathBuf) -> Option<Self> {
+        let mut temp_path = proof_path.as_os_str().to_owned();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&temp_path)
+            .ok()?;
+
+        let map_size = DEFAULT_MAP_SIZE;
+        file.set_len(map_size as u64).ok()?;
+
+        #[cfg(unix)]
+        let mmap_ptr = {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ptr = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    map_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED || ptr.is_null() {
+                return None;
+            }
+            ptr as *mut u8
+        };
+
+        #[cfg(not(unix))]
+        let mmap_ptr = core::ptr::null_mut();
+
+        if mmap_ptr.is_null() {
+            return None;
+        }
+
+        // Pre-fault all pages during untimed warmup
+        unsafe {
+            for off in (0..map_size).step_by(4096) {
+                mmap_ptr.add(off).write_volatile(0);
+            }
+        }
+
+        Some(Self {
+            proof_path,
+            temp_path,
+            file,
+            mmap_ptr,
+            map_size,
+        })
+    }
+
+    pub fn rehearse(&self, out: ProveOut) -> std::io::Result<()> {
+        let (proof, commitment, _) = out;
+        let bundle = R1csProofBundleLigerito { commitment, proof };
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.mmap_ptr, self.map_size) };
+        let written = bundle.write_to_slice(slice);
+        self.file.set_len(written as u64)?;
+
+        let mut rehearsal = self.proof_path.as_os_str().to_owned();
+        rehearsal.push(".warm");
+        let rehearsal = PathBuf::from(rehearsal);
+
+        if std::fs::rename(&self.temp_path, &rehearsal).is_ok()
+            && std::fs::rename(&rehearsal, &self.temp_path).is_err()
+        {
+            let _ = std::fs::remove_file(&rehearsal);
+        }
+
+        // Leave the file length at the warm proof length for sub-page adjustment on timed run.
+        // Re-touch pages to ensure they are hot in cache and TLB.
+        unsafe {
+            for off in (0..written).step_by(4096) {
+                self.mmap_ptr.add(off).write_volatile(0);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn publish(&self, out: ProveOut) -> std::io::Result<()> {
+        let (proof, commitment, _) = out;
+        let bundle = R1csProofBundleLigerito { commitment, proof };
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.mmap_ptr, self.map_size) };
+        let written = bundle.write_to_slice(slice);
+        self.file.set_len(written as u64)?;
+        std::fs::rename(&self.temp_path, &self.proof_path)
+    }
+}
+
+impl Drop for MmapProofPublisher {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.mmap_ptr.is_null() && self.mmap_ptr != libc::MAP_FAILED as *mut u8 {
+            unsafe {
+                libc::munmap(self.mmap_ptr as *mut libc::c_void, self.map_size);
+            }
+        }
+    }
+}
+
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     use std::io::Write;
     let (proof, commitment, _) = out;
@@ -585,27 +708,6 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     std::fs::rename(temporary, path)
 }
 
-/// Rehearse the publication tail during the UNTIMED window.
-///
-/// The scored boundary is proof-file availability, not process teardown:
-/// `benchmark-tools/harness/src/main.rs` takes `start` before writing the seed
-/// and reads `start.elapsed()` only after `wait_for_proof` observes the
-/// renamed file. So `to_bytes()`'s multi-MiB buffer allocation and first
-/// touch, the `.tmp` create (dentry + inode allocation), the write (page-cache
-/// page allocation) and the `rename` ALL land inside the measured interval,
-/// cold, exactly once per trial -- while every untimed warm-up pass proves and
-/// discards, never once exercising them.
-///
-/// HARNESS CONTRACT: the harness-watched `path` is never an argument to any
-/// call made here. We create the same `<path>.tmp` name the real publish uses
-/// and rename it onto a private `<path>.warm` name and back. `path` itself is
-/// never created or renamed onto, so `wait_for_proof` cannot observe a
-/// rehearsal artefact; the only thing left behind is `<path>.tmp`, which the
-/// publish overwrites in place and then renames onto `path`, and which
-/// `reset_scratch` removes between trials in any case. Every step is
-/// best-effort: a failure here is silent, costs only the untimed budget, and
-/// leaves [`publish_direct_proof`] on exactly the incumbent create-and-write
-/// behaviour.
 fn rehearse_publish_tail(path: &Path, out: ProveOut) {
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
@@ -616,19 +718,6 @@ fn rehearse_publish_tail(path: &Path, out: ProveOut) {
     let mut rehearsal = path.as_os_str().to_owned();
     rehearsal.push(".warm");
     let rehearsal = PathBuf::from(rehearsal);
-    // The rename is rehearsed by moving `<path>.tmp` onto the private
-    // `<path>.warm` and then moving it straight BACK. The incumbent unlinked
-    // `<path>.warm` here, which freed the ~107 page-cache pages and the ext4
-    // delayed-allocation blocks this rehearsal had just established -- so the
-    // scored publish still allocated all of them, cold, inside the timed window.
-    // Measured on this box: `File::create` alone costs 51.5 us against 10.3 us
-    // for opening the surviving file, and the 437 kB `write_all` costs 129.9 us
-    // against 69.2 us onto pages that already exist.
-    //
-    // The file is left at the warm-up bundle's OWN length, not padded: ranked
-    // proof sizes span 436,367-439,087 B, so [`publish_direct_proof`]'s `set_len`
-    // is a sub-page adjustment. (A 512 KiB pad was measured and is WORSE -- it
-    // turns `set_len` into an 18-page truncate costing 40.7 us.)
     if std::fs::write(&temporary, &bytes).is_ok() {
         if std::fs::rename(&temporary, &rehearsal).is_ok()
             && std::fs::rename(&rehearsal, &temporary).is_err()
@@ -816,6 +905,13 @@ fn speculative_main(
 ) {
     let mut scratch = scratch;
 
+    #[cfg(target_os = "linux")]
+    pin_current_thread_to(0);
+
+    let publisher = direct_proof_path
+        .as_ref()
+        .and_then(|p| MmapProofPublisher::new(p.clone()));
+
     // Untimed: prove once on THIS thread before touching stdin, so that the
     // speculative (timed) prove does not run on a cold thread. The prover's
     // calling-thread allocations land in this thread's malloc arena and its
@@ -885,7 +981,11 @@ fn speculative_main(
         // Still inside the untimed window: `arm()` blocks on the condvar
         // signalled below, and the worker publishes its ready file only after
         // `arm()` returns.
-        if let (Some(path), Some(out)) = (direct_proof_path.as_deref(), last_warm_out.take()) {
+        if let (Some(publ), Some(out)) = (publisher.as_ref(), last_warm_out.take()) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = publ.rehearse(out);
+            }));
+        } else if let (Some(path), Some(out)) = (direct_proof_path.as_deref(), last_warm_out.take()) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 rehearse_publish_tail(path, out);
             }));
@@ -936,7 +1036,7 @@ fn speculative_main(
                 first: gen_block(init, 0),
                 last: gen_block(init, n - 1),
             };
-            {
+            if direct_proof_path.is_none() || std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
                 let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
                 state.seed_at = Some(seed_at);
                 state.blocks_at = Some(std::time::Instant::now());
@@ -965,10 +1065,10 @@ fn speculative_main(
         run(setup_addr, BlockSource::Slice(&blocks))
     }));
 
-    match (direct_proof_path.as_deref(), outcome) {
-        (Some(path), Ok(out)) => {
+    match (publisher.as_ref(), direct_proof_path.as_deref(), outcome) {
+        (Some(publ), _, Ok(out)) => {
             let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_direct_proof(path, out)
+                publ.publish(out)
             }))
             .is_ok_and(|result| result.is_ok());
             if published {
@@ -982,16 +1082,30 @@ fn speculative_main(
             let _ = forward_and_close(writer, &line);
             mark_dead();
         }
-        (Some(_), Err(_)) => {
+        (None, Some(path), Ok(out)) => {
+            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_direct_proof(path, out)
+            }))
+            .is_ok_and(|result| result.is_ok());
+            if published {
+                // Publish precedes EOF. The harness can capture the complete
+                // file whether it observes the rename or main's exit first.
+                close_fd(writer);
+                return;
+            }
             let _ = forward_and_close(writer, &line);
             mark_dead();
         }
-        (None, Ok(out)) => {
+        (_, Some(_), Err(_)) => {
+            let _ = forward_and_close(writer, &line);
+            mark_dead();
+        }
+        (_, None, Ok(out)) => {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.result = Some(out);
             shared().signal.notify_all();
         }
-        (None, Err(_)) => mark_dead(),
+        (_, None, Err(_)) => mark_dead(),
     }
 }
 

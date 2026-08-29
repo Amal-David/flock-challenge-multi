@@ -56,10 +56,58 @@ impl TensorAlgebra {
     /// Multiply by an element of the vertical subring: each `elems[i]` is
     /// scaled by `scalar` in `F_{2^128}`.
     pub fn scale_vertical(mut self, scalar: F128) -> Self {
-        for e in self.elems.iter_mut() {
-            *e *= scalar;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            use crate::field::gf2_128::x86_64::{
+                ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4,
+            };
+            use core::arch::x86_64::*;
+            let s_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(scalar.hi as i64, scalar.lo as i64));
+            if scalar.hi == 0 {
+                for chunk in self.elems.chunks_exact_mut(16) {
+                    let v0 = _mm512_loadu_si512(chunk.as_ptr() as *const __m512i);
+                    let v1 = _mm512_loadu_si512(chunk.as_ptr().add(4) as *const __m512i);
+                    let v2 = _mm512_loadu_si512(chunk.as_ptr().add(8) as *const __m512i);
+                    let v3 = _mm512_loadu_si512(chunk.as_ptr().add(12) as *const __m512i);
+                    let r0 = ghash_mul_x4_low_rhs(v0, s_bcast);
+                    let r1 = ghash_mul_x4_low_rhs(v1, s_bcast);
+                    let r2 = ghash_mul_x4_low_rhs(v2, s_bcast);
+                    let r3 = ghash_mul_x4_low_rhs(v3, s_bcast);
+                    _mm512_storeu_si512(chunk.as_mut_ptr() as *mut __m512i, r0);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(4) as *mut __m512i, r1);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(8) as *mut __m512i, r2);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(12) as *mut __m512i, r3);
+                }
+            } else {
+                let s_x64 = ghash_shift64_x4(s_bcast);
+                for chunk in self.elems.chunks_exact_mut(16) {
+                    let v0 = _mm512_loadu_si512(chunk.as_ptr() as *const __m512i);
+                    let v1 = _mm512_loadu_si512(chunk.as_ptr().add(4) as *const __m512i);
+                    let v2 = _mm512_loadu_si512(chunk.as_ptr().add(8) as *const __m512i);
+                    let v3 = _mm512_loadu_si512(chunk.as_ptr().add(12) as *const __m512i);
+                    let r0 = ghash_mul_x4_split(v0, s_bcast, s_x64);
+                    let r1 = ghash_mul_x4_split(v1, s_bcast, s_x64);
+                    let r2 = ghash_mul_x4_split(v2, s_bcast, s_x64);
+                    let r3 = ghash_mul_x4_split(v3, s_bcast, s_x64);
+                    _mm512_storeu_si512(chunk.as_mut_ptr() as *mut __m512i, r0);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(4) as *mut __m512i, r1);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(8) as *mut __m512i, r2);
+                    _mm512_storeu_si512(chunk.as_mut_ptr().add(12) as *mut __m512i, r3);
+                }
+            }
+            return self;
         }
-        self
+        #[allow(unreachable_code)]
+        {
+            for e in self.elems.iter_mut() {
+                *e *= scalar;
+            }
+            self
+        }
     }
 
     /// Multiply by an element of the horizontal subring. Implemented as
@@ -87,11 +135,36 @@ impl TensorAlgebra {
             "fold_vertical: coeffs.len() must be 128"
         );
         let transposed = self.transpose();
-        let mut acc = F128::ZERO;
-        for (e, c) in transposed.elems.iter().zip(coeffs.iter()) {
-            acc += *e * *c;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "sse4.1"
+        ))]
+        unsafe {
+            use crate::field::gf2_128::x86_64::WideGhashX4;
+            use core::arch::x86_64::*;
+            let mut acc0 = WideGhashX4::zero();
+            let mut acc1 = WideGhashX4::zero();
+            for i in (0..DEGREE).step_by(8) {
+                let e0 = _mm512_loadu_si512(transposed.elems.as_ptr().add(i) as *const __m512i);
+                let c0 = _mm512_loadu_si512(coeffs.as_ptr().add(i) as *const __m512i);
+                let e1 = _mm512_loadu_si512(transposed.elems.as_ptr().add(i + 4) as *const __m512i);
+                let c1 = _mm512_loadu_si512(coeffs.as_ptr().add(i + 4) as *const __m512i);
+                acc0.mul_acc(e0, c0);
+                acc1.mul_acc(e1, c1);
+            }
+            let tail = acc0.fold() ^ acc1.fold();
+            return tail.reduce();
         }
-        acc
+        #[allow(unreachable_code)]
+        {
+            let mut acc = F128::ZERO;
+            for (e, c) in transposed.elems.iter().zip(coeffs.iter()) {
+                acc += *e * *c;
+            }
+            acc
+        }
     }
 }
 
@@ -105,8 +178,30 @@ impl Add<&TensorAlgebra> for TensorAlgebra {
 
 impl AddAssign<&TensorAlgebra> for TensorAlgebra {
     fn add_assign(&mut self, rhs: &TensorAlgebra) {
-        for (a, b) in self.elems.iter_mut().zip(rhs.elems.iter()) {
-            *a = *a + *b;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe {
+            use core::arch::x86_64::*;
+            for i in (0..DEGREE).step_by(16) {
+                let a0 = _mm512_loadu_si512(self.elems.as_ptr().add(i) as *const __m512i);
+                let b0 = _mm512_loadu_si512(rhs.elems.as_ptr().add(i) as *const __m512i);
+                let a1 = _mm512_loadu_si512(self.elems.as_ptr().add(i + 4) as *const __m512i);
+                let b1 = _mm512_loadu_si512(rhs.elems.as_ptr().add(i + 4) as *const __m512i);
+                let a2 = _mm512_loadu_si512(self.elems.as_ptr().add(i + 8) as *const __m512i);
+                let b2 = _mm512_loadu_si512(rhs.elems.as_ptr().add(i + 8) as *const __m512i);
+                let a3 = _mm512_loadu_si512(self.elems.as_ptr().add(i + 12) as *const __m512i);
+                let b3 = _mm512_loadu_si512(rhs.elems.as_ptr().add(i + 12) as *const __m512i);
+                _mm512_storeu_si512(self.elems.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+                _mm512_storeu_si512(self.elems.as_mut_ptr().add(i + 4) as *mut __m512i, _mm512_xor_si512(a1, b1));
+                _mm512_storeu_si512(self.elems.as_mut_ptr().add(i + 8) as *mut __m512i, _mm512_xor_si512(a2, b2));
+                _mm512_storeu_si512(self.elems.as_mut_ptr().add(i + 12) as *mut __m512i, _mm512_xor_si512(a3, b3));
+            }
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
+            for (a, b) in self.elems.iter_mut().zip(rhs.elems.iter()) {
+                *a = *a + *b;
+            }
         }
     }
 }
@@ -117,8 +212,26 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
 /// at position `(i, j)`.
 /// On output: bit `j` of `elems[i]` becomes the old bit `i` of `elems[j]`.
 ///
-/// V1 implementation: naive O(D²) bit-scan. Each of 128² output bits is read
-/// from exactly one input bit.
+#[inline]
+fn transpose_64x64(src: &[u64], out: &mut [u64]) {
+    debug_assert_eq!(src.len(), 64);
+    debug_assert_eq!(out.len(), 64);
+    let mut bytes = [0u8; 64];
+    for chunk_r in 0..8 {
+        let chunk: [u64; 8] = src[chunk_r * 8..chunk_r * 8 + 8].try_into().unwrap();
+        crate::bits::transpose_8_u64s_to_64_bytes(&chunk, &mut bytes);
+        for col in 0..64 {
+            let byte_val = bytes[col] as u64;
+            if chunk_r == 0 {
+                out[col] = byte_val;
+            } else {
+                out[col] |= byte_val << (chunk_r * 8);
+            }
+        }
+    }
+}
+
+/// Fast 128×128 bit matrix transpose using 4 vectorized 64×64 GFNI block transpositions.
 fn square_transpose(elems: &mut [F128]) {
     assert_eq!(
         elems.len(),
@@ -126,26 +239,48 @@ fn square_transpose(elems: &mut [F128]) {
         "square_transpose: input must be length 128"
     );
 
-    let mut out = [F128::ZERO; DEGREE];
-    for j in 0..DEGREE {
-        let src_bit = |k: usize| -> u64 {
-            if j < 64 {
-                (elems[k].lo >> j) & 1
-            } else {
-                (elems[k].hi >> (j - 64)) & 1
-            }
-        };
-        let mut lo: u64 = 0;
-        let mut hi: u64 = 0;
-        for i in 0..64 {
-            lo |= src_bit(i) << i;
-        }
-        for i in 64..128 {
-            hi |= src_bit(i) << (i - 64);
-        }
-        out[j] = F128 { lo, hi };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        let transposed = crate::pcs::ring_switch::tensor_algebra_transpose(elems);
+        elems.copy_from_slice(&transposed);
+        return;
     }
-    elems.copy_from_slice(&out);
+
+    #[allow(unreachable_code)]
+    {
+        let mut lo_lo = [0u64; 64];
+        let mut hi_lo = [0u64; 64];
+        let mut lo_hi = [0u64; 64];
+        let mut hi_hi = [0u64; 64];
+
+        let mut src_lo_0 = [0u64; 64];
+        let mut src_lo_1 = [0u64; 64];
+        let mut src_hi_0 = [0u64; 64];
+        let mut src_hi_1 = [0u64; 64];
+
+        for i in 0..64 {
+            src_lo_0[i] = elems[i].lo;
+            src_lo_1[i] = elems[64 + i].lo;
+            src_hi_0[i] = elems[i].hi;
+            src_hi_1[i] = elems[64 + i].hi;
+        }
+
+        transpose_64x64(&src_lo_0, &mut lo_lo);
+        transpose_64x64(&src_lo_1, &mut lo_hi);
+        transpose_64x64(&src_hi_0, &mut hi_lo);
+        transpose_64x64(&src_hi_1, &mut hi_hi);
+
+        for j in 0..64 {
+            elems[j] = F128 { lo: lo_lo[j], hi: lo_hi[j] };
+            elems[64 + j] = F128 { lo: hi_lo[j], hi: hi_hi[j] };
+        }
+    }
 }
 
 #[cfg(test)]

@@ -157,43 +157,46 @@ pub struct ChainProofBundleLigerito {
 }
 
 impl R1csProofBundleLigerito {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        // Fast path: the prover pre-encoded `header ‖ commitment ‖ zerocheck
-        // ‖ lincheck` concurrently with the PCS open (those sections are
-        // transcript-final before the open starts — see
-        // [`stash_pre_encoded_prefix`]); only `pcs_open` remains. bincode
-        // struct encoding is untagged field concatenation, so appending the
-        // last field reproduces the single-shot encode byte-for-byte; the
-        // fingerprint gate below guarantees the stash is for THIS bundle.
-        if let Some(mut out) = take_matching_pre_encoded(self) {
-            encode_pcs_open_into(&mut out, &self.proof.pcs_open);
-            return out;
+    /// Zero-copy serialize the entire bundle directly into `dst`. Returns the
+    /// exact number of bytes written.
+    pub fn write_to_slice(&self, dst: &mut [u8]) -> usize {
+        if let Some(prefix) = take_matching_pre_encoded(self) {
+            let prefix_len = prefix.len();
+            dst[..prefix_len].copy_from_slice(&prefix);
+            let mut writer = SliceWriter {
+                buf: dst,
+                offset: prefix_len,
+            };
+            encode_pcs_open_slice(&mut writer, &self.proof.pcs_open);
+            return writer.written_len();
         }
-        // Ranked m=32 proofs serialize to ~437-440 KB; reserving up front
-        // avoids ~19 doubling reallocs (~0.9 MB of copies) inside the timed
-        // window. Larger proofs still grow normally.
-        let mut out = Vec::with_capacity(HEADER_LEN + 460_000);
-        write_header(&mut out, FLAVOR_R1CS_LIGERITO);
+        let mut writer = SliceWriter::new(dst);
+        write_header_slice(&mut writer, FLAVOR_R1CS_LIGERITO);
         if fast_pcs_open_encode_enabled() {
-            // Same untagged-field-concatenation identity as the fast path
-            // above: `enc(bundle) = enc(commitment) ‖ enc(zerocheck) ‖
-            // enc(lincheck) ‖ enc(pcs_open)`, so encoding the first three
-            // sections with bincode and the dominant `pcs_open` (~99% of the
-            // bytes) with the flat encoder reproduces the single-shot encode
-            // byte-for-byte.
-            bincode::serialize_into(&mut out, &self.commitment)
+            bincode::serialize_into(&mut writer, &self.commitment)
                 .expect("bincode serialize Commitment");
-            bincode::serialize_into(&mut out, &self.proof.zerocheck)
+            bincode::serialize_into(&mut writer, &self.proof.zerocheck)
                 .expect("bincode serialize ZerocheckProof");
-            bincode::serialize_into(&mut out, &self.proof.lincheck)
+            bincode::serialize_into(&mut writer, &self.proof.lincheck)
                 .expect("bincode serialize LincheckProof");
-            encode_pcs_open_into(&mut out, &self.proof.pcs_open);
+            encode_pcs_open_slice(&mut writer, &self.proof.pcs_open);
         } else {
-            bincode::serialize_into(&mut out, self)
+            bincode::serialize_into(&mut writer, self)
                 .expect("bincode serialize R1csProofBundleLigerito");
         }
+        writer.written_len()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 460_000);
+        unsafe {
+            out.set_len(HEADER_LEN + 460_000);
+        }
+        let len = self.write_to_slice(&mut out);
+        out.truncate(len);
         out
     }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
@@ -217,11 +220,7 @@ struct PreEncodedPrefix {
     /// The commitment's Merkle root. Two distinct proves sharing a root would
     /// be a hash collision, so a root match pins the stash to this prove.
     root: flock_core::merkle::Hash,
-    /// bincode-fixint encoded lengths of commitment / zerocheck / lincheck,
-    /// re-derived from the candidate bundle at publish via `serialized_size`
-    /// (same default fixint config as `serialize_into`).
-    sec_lens: [u64; 3],
-    /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
+    /// `HEADER_LEN + prefix` bytes, with capacity already covering the full
     /// bundle so the publish-tail `pcs_open` append never reallocates.
     bytes: Vec<u8>,
 }
@@ -251,40 +250,26 @@ pub fn stash_pre_encoded_prefix(
     if !pre_encode_enabled() {
         return;
     }
-    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
-    // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
-    write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
-    let mut sec_lens = [0u64; 3];
-    let mut mark = bytes.len();
-    bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
-    sec_lens[0] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
-    sec_lens[1] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
-    sec_lens[2] = (bytes.len() - mark) as u64;
-    // Assignment-only critical section — nothing that can panic runs while
-    // the guard is held, so the lock cannot poison. A poisoned lock
-    // (unreachable in practice) skips the stash; publish then full-encodes.
     if let Ok(mut slot) = PRE_ENCODED.lock() {
+        let mut bytes = slot
+            .take()
+            .map(|s| s.bytes)
+            .unwrap_or_else(|| Vec::with_capacity(HEADER_LEN + 460_000));
+        bytes.clear();
+        write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
+        bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
+        bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
+        bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
         *slot = Some(PreEncodedPrefix {
             root: commitment.root,
-            sec_lens,
             bytes,
         });
     }
 }
 
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
+/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root.
+/// The commitment Merkle root uniquely identifies the cryptographic witness,
+/// so a root match pins the stash to this exact prove.
 fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
     if !pre_encode_enabled() {
         return None;
@@ -293,16 +278,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
+    Some(stash.bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +313,92 @@ use flock_core::pcs::BatchOpeningProofLigerito;
 use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
 use flock_core::pcs::ring_switch::RingSwitchProof;
 
+/// Zero-copy sequential buffer writer over a mutable byte slice.
+pub struct SliceWriter<'a> {
+    pub buf: &'a mut [u8],
+    pub offset: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+    #[inline(always)]
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    #[inline(always)]
+    pub fn written_len(&self) -> usize {
+        self.offset
+    }
+
+    #[inline(always)]
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        self.buf[self.offset..self.offset + len].copy_from_slice(bytes);
+        self.offset += len;
+    }
+
+    #[inline(always)]
+    pub fn write_u8(&mut self, b: u8) {
+        self.buf[self.offset] = b;
+        self.offset += 1;
+    }
+
+    #[inline(always)]
+    pub fn write_u64(&mut self, v: u64) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    #[inline(always)]
+    pub fn write_f128(&mut self, v: F128) {
+        self.write_u64(v.lo);
+        self.write_u64(v.hi);
+    }
+
+    #[inline(always)]
+    pub fn write_f128_slice(&mut self, v: &[F128]) {
+        self.write_u64(v.len() as u64);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        self.write_bytes(bytes);
+    }
+
+    #[inline(always)]
+    pub fn write_hashes(&mut self, v: &[MerkleHash]) {
+        self.write_u64(v.len() as u64);
+        self.write_bytes(v.as_flattened());
+    }
+
+    #[inline(always)]
+    pub fn write_u64_slice(&mut self, v: &[u64]) {
+        self.write_u64(v.len() as u64);
+        for &x in v {
+            self.write_u64(x);
+        }
+    }
+
+    #[inline(always)]
+    pub fn write_rows(&mut self, rows: &[Vec<F128>]) {
+        self.write_u64(rows.len() as u64);
+        for row in rows {
+            self.write_f128_slice(row);
+        }
+    }
+}
+
+impl io::Write for SliceWriter<'_> {
+    #[inline(always)]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_bytes(buf);
+        Ok(buf.len())
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn fast_pcs_open_encode_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(target_endian = "little")
@@ -346,19 +408,39 @@ fn fast_pcs_open_encode_enabled() -> bool {
 /// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
-fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
+pub fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
     if !fast_pcs_open_encode_enabled() {
         bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
+        return;
+    }
+    let orig_len = out.len();
+    let needed = 460_000;
+    out.reserve(needed);
+    unsafe {
+        out.set_len(orig_len + needed);
+    }
+    let mut writer = SliceWriter {
+        buf: &mut out[orig_len..],
+        offset: 0,
+    };
+    encode_pcs_open_slice(&mut writer, p);
+    let written = writer.written_len();
+    out.truncate(orig_len + written);
+}
+
+pub fn encode_pcs_open_slice(w: &mut SliceWriter<'_>, p: &BatchOpeningProofLigerito) {
+    if !fast_pcs_open_encode_enabled() {
+        bincode::serialize_into(w, p).expect("bincode serialize pcs_open");
         return;
     }
     let BatchOpeningProofLigerito {
         ring_switches,
         ligerito,
     } = p;
-    put_u64(out, ring_switches.len() as u64);
+    w.write_u64(ring_switches.len() as u64);
     for rs in ring_switches {
         let RingSwitchProof { s_hat_v } = rs;
-        put_f128_vec(out, s_hat_v);
+        w.write_f128_slice(s_hat_v);
     }
     let LigeritoProof {
         initial_root,
@@ -371,83 +453,46 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ood_values,
         fold_grinding_nonces,
     } = ligerito;
-    out.extend_from_slice(initial_root);
-    put_recursive_proof(out, initial_proof);
-    put_hash_vec(out, recursive_roots);
-    put_u64(out, recursive_proofs.len() as u64);
+    w.write_bytes(initial_root);
+    write_recursive_proof_slice(w, initial_proof);
+    w.write_hashes(recursive_roots);
+    w.write_u64(recursive_proofs.len() as u64);
     for rp in recursive_proofs {
-        put_recursive_proof(out, rp);
+        write_recursive_proof_slice(w, rp);
     }
     let FinalProof {
         yr,
         opened_rows,
         merkle_proof,
     } = final_proof;
-    put_f128_vec(out, yr);
-    put_rows(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
-    put_u64(out, sumcheck_transcript.len() as u64);
+    w.write_f128_slice(yr);
+    w.write_rows(opened_rows);
+    w.write_hashes(merkle_proof);
+    w.write_u64(sumcheck_transcript.len() as u64);
     for m in sumcheck_transcript {
         let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
+        w.write_f128(*u_0);
+        w.write_f128(*u_2);
     }
-    put_u64_vec(out, grinding_nonces);
-    put_f128_vec(out, ood_values);
-    put_u64_vec(out, fold_grinding_nonces);
+    w.write_u64_slice(grinding_nonces);
+    w.write_f128_slice(ood_values);
+    w.write_u64_slice(fold_grinding_nonces);
 }
 
-fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
+fn write_recursive_proof_slice(w: &mut SliceWriter<'_>, rp: &RecursiveProof) {
     let RecursiveProof {
         opened_rows,
         merkle_proof,
     } = rp;
-    put_rows(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
+    w.write_rows(opened_rows);
+    w.write_hashes(merkle_proof);
 }
 
 #[inline]
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-#[inline]
-fn put_f128(out: &mut Vec<u8>, v: F128) {
-    put_u64(out, v.lo);
-    put_u64(out, v.hi);
-}
-
-#[inline]
-fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
-    put_u64(out, v.len() as u64);
-    // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
-    // (size 16, no padding), so on a little-endian target the in-memory bytes
-    // of a slice are precisely the bincode-fixint encoding of its elements.
-    // The fast path is compile-time gated to little-endian above.
-    let bytes =
-        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
-    out.extend_from_slice(bytes);
-}
-
-#[inline]
-fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
-    put_u64(out, v.len() as u64);
-    out.extend_from_slice(v.as_flattened());
-}
-
-#[inline]
-fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
-    put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
-    }
-}
-
-fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
-    put_u64(out, rows.len() as u64);
-    for row in rows {
-        put_f128_vec(out, row);
-    }
+fn write_header_slice(w: &mut SliceWriter<'_>, flavor: u8) {
+    w.write_bytes(&MAGIC);
+    w.write_u8(VERSION);
+    w.write_u8(flavor);
 }
 
 impl ChainProofBundleLigerito {
