@@ -88,6 +88,11 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                             &mut mats[t * 16..(t + 1) * 16],
                         );
                     }
+                    let mats_bcast: [core::arch::x86_64::__m512i; 128] = unsafe {
+                        core::array::from_fn(|i| {
+                            core::arch::x86_64::_mm512_set1_epi64(mats[i] as i64)
+                        })
+                    };
                     // SAFETY: tile_rel < n_tiles_in_chunk keeps the tile in
                     // bounds; the block loop stays within k columns and the
                     // plane buffer is k*16 bytes. tile_rel == 0 seeds from
@@ -97,7 +102,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
                             chunk_bytes.as_ptr().add(tile_rel * TILE_T * k),
                             k,
                             n_blocks64,
-                            &mats,
+                            &mats_bcast,
                             out_planes.as_mut_ptr(),
                             tile_rel == 0,
                         );
@@ -170,18 +175,14 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
     unsafe {
         let ld = |r: usize| _mm_loadu_si128(z_ptr.add(r * stride) as *const __m128i);
         // Build two ZMMs of four lanes each (lane r occupies 128-bit slot r%4).
-        let z0 = {
-            let a = _mm512_castsi128_si512(ld(0));
-            let a = _mm512_inserti32x4::<1>(a, ld(1));
-            let a = _mm512_inserti32x4::<2>(a, ld(2));
-            _mm512_inserti32x4::<3>(a, ld(3))
-        };
-        let z1 = {
-            let a = _mm512_castsi128_si512(ld(4));
-            let a = _mm512_inserti32x4::<1>(a, ld(5));
-            let a = _mm512_inserti32x4::<2>(a, ld(6));
-            _mm512_inserti32x4::<3>(a, ld(7))
-        };
+        let y0 = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(0)), ld(1));
+        let y1 = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(2)), ld(3));
+        let z0 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(y0), y1);
+
+        let y2 = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(4)), ld(5));
+        let y3 = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(6)), ld(7));
+        let z1 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(y2), y3);
+
         let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
         if FUSE {
             // One VPERMT2B composes the old lo/hi qword split with the 8x8
@@ -339,26 +340,36 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline]
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
 
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
-    let mut lo_bytes = [0u8; 64];
-    let mut hi_bytes = [0u8; 64];
-    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+    use core::arch::x86_64::*;
+    #[repr(C, align(64))]
+    struct BasisIdx([u8; 64]);
+    static BASIS_IDX: BasisIdx = BasisIdx([
+        0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50,
+        58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45,
+        53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+    ]);
 
-    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
-    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
-    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    unsafe {
+        let z0 = _mm512_loadu_si512(eq8.as_ptr().cast::<__m512i>());
+        let z1 = _mm512_loadu_si512(eq8.as_ptr().add(4).cast::<__m512i>());
+        let lo_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        let hi_idx = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        let x_lo = _mm512_permutex2var_epi64(z0, lo_idx, z1);
+        let x_hi = _mm512_permutex2var_epi64(z0, hi_idx, z1);
+
+        let idx = _mm512_load_si512(BASIS_IDX.0.as_ptr().cast::<__m512i>());
+        let id = _mm512_set1_epi64(0x8040_2010_0804_0201u64 as i64);
+
+        let res_lo = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(idx, x_lo));
+        let res_hi = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(idx, x_hi));
+
+        _mm512_storeu_si512(mats.as_mut_ptr().cast::<__m512i>(), res_lo);
+        _mm512_storeu_si512(mats.as_mut_ptr().add(8).cast::<__m512i>(), res_hi);
     }
 }
 
@@ -387,7 +398,7 @@ pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
     n_blocks64: usize,
-    mats: &[u64; 128],
+    mats: &[core::arch::x86_64::__m512i; 128],
     out_planes_ptr: *mut u8,
     seed_zero: bool,
 ) {
@@ -400,25 +411,30 @@ pub(crate) unsafe fn gfni_fold_tile(
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
             let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
-                    _mm512_setzero_si512()
-                } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
-                };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+
+            let mut acc: [__m512i; 16] = if seed_zero {
+                [_mm512_setzero_si512(); 16]
+            } else {
+                core::array::from_fn(|k| {
+                    _mm512_loadu_si512(planes.add(k * 64) as *const __m512i)
+                })
+            };
+
+            for t in (0..8).step_by(2) {
+                let r0 = rows[t];
+                let r1 = rows[t + 1];
+                let m_base0 = t * 16;
+                let m_base1 = (t + 1) * 16;
+
+                for k in 0..16 {
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, mats[m_base0 + k]);
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, mats[m_base1 + k]);
+                    acc[k] = _mm512_ternarylogic_epi64::<0x96>(acc[k], g0, g1);
                 }
-                _mm512_storeu_si512(plane_ptr, acc);
+            }
+
+            for k in 0..16 {
+                _mm512_storeu_si512(planes.add(k * 64) as *mut __m512i, acc[k]);
             }
         }
     }

@@ -618,446 +618,6 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     (to_mat(a_rows), to_mat(b_rows))
 }
 
-// ---------------------------------------------------------------------------
-// Adjoint XOR-DAG plan for `fold_alpha_batched` (the ranked BLAKE3 shape).
-//
-// `CscCircuit::fold_alpha_batched` materializes the transposed base matrices
-// and, once per prove, streams ~21 M row indices to gather `eq_inner` into the
-// column marginals. But `A_0`/`B_0` are not arbitrary sparse matrices: every
-// row is a GF(2) combination built by `build_matrices` from a handful of
-// `Word::xor` / `Word::add_sum` steps over a few thousand *shared*
-// subexpressions. Materializing the rows expands that shared DAG into ~21 M
-// explicit nonzeros; the fold then pays for the expansion on every prove.
-//
-// Keep the DAG instead. Each node is `n = p XOR q` over the leaf set
-// `{ column 0 .. column K-1 }`, so row `r`'s A-support is the leaf set reached
-// from `a_roots[r]` an ODD number of times. The column marginal
-//
-//   comb[c] = α·Σ_{r : c ∈ suppA(r)} eq[r] + Σ_{r : c ∈ suppB(r)} eq[r]
-//
-// is exactly the ADJOINT of that DAG evaluated at the injected weights: seed
-// `α·eq[r]` at `a_roots[r]` and `eq[r]` at `b_roots[r]`, then push every node's
-// accumulator into both of its children in reverse topological order. A node's
-// children are created before it, so node ids are already a topological order
-// and one descending sweep suffices.
-//
-// This is EXACT, not approximate: `F128` has characteristic 2, so a leaf
-// reached twice cancels — precisely what `xor_dedup` does when the rows are
-// materialized — and `+` is associative/commutative XOR, so the accumulation
-// order is irrelevant. `α·Σ eq[r]` vs `Σ α·eq[r]` is field distributivity.
-// The comb vector is therefore bit-identical to the CSC gather's, which is
-// what makes this a pure implementation change: the transcript cannot move.
-//
-// Cost at the ranked shape: 16,384 muls + ~16 K adds to inject, then ~39 K
-// nodes × 2 adds to sweep — against ~21 M gathers and ~40 MiB of streamed u16
-// indices. Single-threaded and ~0.9 MiB of scratch, so the pool stays free for
-// the concurrently-kicked z-fold instead of contending with it.
-// ---------------------------------------------------------------------------
-
-/// Node id `0 .. K` are the leaves (leaf `c` == column `c`); `K` is the
-/// constant-zero node; `K + 1 + i` is internal node `i`, whose two children are
-/// `ADJ_CHILDREN`-indexed at `i`.
-const ADJ_ZERO: u32 = K as u32;
-/// First internal node id.
-const ADJ_BASE: u32 = K as u32 + 1;
-
-/// A 32-bit symbolic word whose bit `i` is the DAG node whose leaf set XORs to
-/// that bit. The node-valued mirror of [`Word`].
-#[derive(Clone, Copy)]
-struct SymWord {
-    bits: [u32; WORD_BITS],
-}
-
-impl SymWord {
-    fn zero() -> Self {
-        Self {
-            bits: [ADJ_ZERO; WORD_BITS],
-        }
-    }
-    fn from_slot_base(base: usize) -> Self {
-        Self {
-            bits: std::array::from_fn(|i| (base + i) as u32),
-        }
-    }
-    fn from_const(val: u32) -> Self {
-        Self {
-            bits: std::array::from_fn(|i| {
-                if (val >> i) & 1 == 1 {
-                    Z_CONST_POS as u32
-                } else {
-                    ADJ_ZERO
-                }
-            }),
-        }
-    }
-    /// `rotr(n)` — pure index permutation, exactly as [`Word::rotr`].
-    fn rotr(&self, n: usize) -> SymWord {
-        SymWord {
-            bits: std::array::from_fn(|i| self.bits[(i + n) % WORD_BITS]),
-        }
-    }
-}
-
-/// Interning builder for the XOR DAG. `xor` is the only node constructor, and
-/// it applies the two GF(2) identities (`x ⊕ 0 = x`, `x ⊕ x = 0`) plus
-/// structural hash-consing, so common subexpressions — which is most of a
-/// BLAKE3 round — cost one node, not one per use.
-struct AdjBuilder {
-    children: Vec<[u32; 2]>,
-    intern: std::collections::HashMap<[u32; 2], u32>,
-}
-
-impl AdjBuilder {
-    fn new() -> Self {
-        Self {
-            children: Vec::with_capacity(1 << 16),
-            intern: std::collections::HashMap::with_capacity(1 << 17),
-        }
-    }
-
-    fn xor(&mut self, a: u32, b: u32) -> u32 {
-        if a == ADJ_ZERO {
-            return b;
-        }
-        if b == ADJ_ZERO {
-            return a;
-        }
-        if a == b {
-            return ADJ_ZERO;
-        }
-        let key = if a < b { [a, b] } else { [b, a] };
-        if let Some(&n) = self.intern.get(&key) {
-            return n;
-        }
-        let id = ADJ_BASE + self.children.len() as u32;
-        self.children.push(key);
-        self.intern.insert(key, id);
-        id
-    }
-
-    fn xor_word(&mut self, x: &SymWord, y: &SymWord) -> SymWord {
-        SymWord {
-            bits: std::array::from_fn(|i| self.xor(x.bits[i], y.bits[i])),
-        }
-    }
-
-    /// Carry-in prefix chain of one ADD: `P[i] = ⊕_{j<i} carry_aux[j]`.
-    /// `P[0] = 0`, `P[i] = P[i-1] ⊕ leaf(carry_base + i - 1)`.
-    fn carry_prefixes(&mut self, carry_base: usize) -> [u32; WORD_BITS] {
-        let mut p = [ADJ_ZERO; WORD_BITS];
-        for i in 1..WORD_BITS {
-            p[i] = self.xor(p[i - 1], (carry_base + i - 1) as u32);
-        }
-        p
-    }
-}
-
-/// The XOR-DAG adjoint plan for BLAKE3's `(A_0, B_0)` — a drop-in
-/// [`flock_core::lincheck::LincheckCircuit`] that computes the same `comb_vec`
-/// as [`flock_core::lincheck::CscCircuit`] without either matrix existing.
-pub struct Blake3AdjointPlan {
-    /// `children[i]` are the two child node ids of internal node `ADJ_BASE + i`.
-    /// Both are `< ADJ_BASE + i`, so descending `i` is reverse topological.
-    children: Box<[[u32; 2]]>,
-    /// Root node of row `r`'s A-support / B-support.
-    a_roots: Box<[u32]>,
-    b_roots: Box<[u32]>,
-    /// `a_roots[r] == b_roots[r] == ADJ_ZERO` for every `r >= n_rows`; the
-    /// injection loop stops there instead of multiplying by α for nothing.
-    n_rows: usize,
-    /// Total node count = `K + 1 + children.len()`.
-    n_nodes: usize,
-    const_pin: Option<usize>,
-}
-
-impl Blake3AdjointPlan {
-    /// Build the plan by re-walking `build_matrices`' construction with
-    /// node ids in place of slot lists. Every step below mirrors one step
-    /// there; keep the two in sync.
-    pub fn build() -> Self {
-        let mut b = AdjBuilder::new();
-        let mut a_roots = vec![ADJ_ZERO; K];
-        let mut b_roots = vec![ADJ_ZERO; K];
-        let cz = Z_CONST_POS as u32;
-
-        // z[0]·z[0] = z[0].
-        a_roots[Z_CONST_POS] = cz;
-        b_roots[Z_CONST_POS] = cz;
-
-        // Input rows: A = {s}, B = {const}.
-        let mut input_emit = |base: usize, len: usize| {
-            for j in 0..len {
-                let s = base + j;
-                a_roots[s] = s as u32;
-                b_roots[s] = cz;
-            }
-        };
-        input_emit(CV_BASE, 8 * WORD_BITS);
-        input_emit(M_BASE, 16 * WORD_BITS);
-        input_emit(T_LO_BASE, WORD_BITS);
-        input_emit(T_HI_BASE, WORD_BITS);
-        input_emit(BLEN_BASE, WORD_BITS);
-        input_emit(FLAGS_BASE, WORD_BITS);
-
-        // The ADD gadget: writes the 31 carry_aux rows and returns the sum-bit
-        // word. Mirrors `write_add_carry_rows` + `Word::add_sum`.
-        //
-        //   a_rows[carry_base + i] = x[i] ⊕ cin[i]
-        //   b_rows[carry_base + i] = y[i] ⊕ cin[i]
-        //   sum[i]                 = x[i] ⊕ y[i] ⊕ cin[i]
-        fn add_carry(
-            b: &mut AdjBuilder,
-            a_roots: &mut [u32],
-            b_roots: &mut [u32],
-            x: &SymWord,
-            y: &SymWord,
-            carry_base: usize,
-        ) -> SymWord {
-            let p = b.carry_prefixes(carry_base);
-            let mut out = SymWord::zero();
-            for i in 0..CARRY_BITS_PER_ADD {
-                // `a_row = x[i] ⊕ cin[i]` is a node we have to build anyway, and
-                // `sum[i] = x[i] ⊕ y[i] ⊕ cin[i] = a_row ⊕ y[i]`. Reusing it
-                // saves one interned node per bit per ADD (~10 K over the
-                // circuit) versus building `x[i] ⊕ y[i]` separately.
-                let a_row = b.xor(x.bits[i], p[i]);
-                a_roots[carry_base + i] = a_row;
-                b_roots[carry_base + i] = b.xor(y.bits[i], p[i]);
-                out.bits[i] = b.xor(a_row, y.bits[i]);
-            }
-            // Bit 31 has no carry_aux row of its own (the mod-2^32 carry-out is
-            // discarded), so its sum bit is built directly.
-            let xy = b.xor(x.bits[WORD_BITS - 1], y.bits[WORD_BITS - 1]);
-            out.bits[WORD_BITS - 1] = b.xor(xy, p[WORD_BITS - 1]);
-            out
-        }
-
-        let msg_idx = per_round_msg_idx();
-        let mut state: [SymWord; 16] = std::array::from_fn(|_| SymWord::zero());
-        for w in 0..8 {
-            state[w] = SymWord::from_slot_base(cv_bit(w, 0));
-        }
-        for i in 0..4 {
-            state[8 + i] = SymWord::from_const(BLAKE3_IV[i]);
-        }
-        state[12] = SymWord::from_slot_base(T_LO_BASE);
-        state[13] = SymWord::from_slot_base(T_HI_BASE);
-        state[14] = SymWord::from_slot_base(BLEN_BASE);
-        state[15] = SymWord::from_slot_base(FLAGS_BASE);
-
-        for r in 0..N_ROUNDS {
-            for g_in_round in 0..N_G_PER_ROUND {
-                let g = r * N_G_PER_ROUND + g_in_round;
-                let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
-
-                let a = state[la];
-                let bb = state[lb];
-                let c = state[lc];
-                let d = state[ld];
-                let mx = SymWord::from_slot_base(m_bit(mx_idx, 0));
-                let my = SymWord::from_slot_base(m_bit(my_idx, 0));
-
-                let tmp_0 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &a,
-                    &bb,
-                    g_add_carry_bit(g, ADD_TMP0, 0),
-                );
-                let a_1 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &tmp_0,
-                    &mx,
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
-                let d_1 = b.xor_word(&d, &a_1).rotr(16);
-                let c_1 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &c,
-                    &d_1,
-                    g_add_carry_bit(g, ADD_C1, 0),
-                );
-                let b_1 = b.xor_word(&bb, &c_1).rotr(12);
-                let tmp_1 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &a_1,
-                    &b_1,
-                    g_add_carry_bit(g, ADD_TMP1, 0),
-                );
-                let a_2 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &tmp_1,
-                    &my,
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
-                let d_2 = b.xor_word(&d_1, &a_2).rotr(8);
-                let c_2 = add_carry(
-                    &mut b,
-                    &mut a_roots,
-                    &mut b_roots,
-                    &c_1,
-                    &d_2,
-                    g_add_carry_bit(g, ADD_C2, 0),
-                );
-                let b_new = b.xor_word(&b_1, &c_2).rotr(7);
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_B_NEW, i);
-                    a_roots[s] = b_new.bits[i];
-                    b_roots[s] = cz;
-                }
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_D_NEW, i);
-                    a_roots[s] = d_2.bits[i];
-                    b_roots[s] = cz;
-                }
-
-                state[la] = a_2;
-                state[lb] = SymWord::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
-                state[lc] = c_2;
-                state[ld] = SymWord::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
-            }
-        }
-
-        // Finalization XORs.
-        for w in 0..8 {
-            let lo = b.xor_word(&state[w], &state[w + 8]);
-            for i in 0..WORD_BITS {
-                let s = out_lo_bit(w, i);
-                a_roots[s] = lo.bits[i];
-                b_roots[s] = cz;
-            }
-            let cv_w = SymWord::from_slot_base(cv_bit(w, 0));
-            let hi = b.xor_word(&state[w + 8], &cv_w);
-            for i in 0..WORD_BITS {
-                let s = out_hi_bit(w, i);
-                a_roots[s] = hi.bits[i];
-                b_roots[s] = cz;
-            }
-        }
-
-        // Rows [USEFUL_BITS..K) are padding: A = B = ∅, i.e. the zero node.
-        let mut n_rows = K;
-        while n_rows > 0 && a_roots[n_rows - 1] == ADJ_ZERO && b_roots[n_rows - 1] == ADJ_ZERO {
-            n_rows -= 1;
-        }
-
-        let children = b.children;
-        let n_nodes = K + 1 + children.len();
-        Self {
-            children: children.into_boxed_slice(),
-            a_roots: a_roots.into_boxed_slice(),
-            b_roots: b_roots.into_boxed_slice(),
-            n_rows,
-            n_nodes,
-            const_pin: Some(Z_CONST_POS),
-        }
-    }
-
-    /// Node count (leaves + zero + internal) — the scratch length.
-    pub fn n_nodes(&self) -> usize {
-        self.n_nodes
-    }
-    /// Internal-node count.
-    pub fn n_internal(&self) -> usize {
-        self.children.len()
-    }
-}
-
-/// The process-wide plan. Built on first touch — `Blake3Setup::with_profile_and_rate`
-/// forces it in the untimed setup window, exactly where the CSC transpose used
-/// to be warmed.
-static BLAKE3_ADJOINT_PLAN: std::sync::LazyLock<Blake3AdjointPlan> =
-    std::sync::LazyLock::new(Blake3AdjointPlan::build);
-
-/// `FLOCK_NO_LC_ADJOINT=1` restores the materialized CSC gather (exact A/B
-/// control: same `comb_vec`, ~21 M gathers instead of ~55 K adds). Default ON —
-/// the ranked runner calls `env_clear()`, so the compiled-in default is what
-/// ships.
-fn lc_adjoint_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ADJOINT").is_none());
-    *ON
-}
-
-/// FAIL-CLOSED shape gate. [`Blake3AdjointPlan`] hard-codes the geometry that
-/// `build_matrices` produces; it is valid for that `(A_0, B_0)` pair and
-/// nothing else. Every dimension the plan assumes is checked here, and any
-/// mismatch routes the caller back to the materialized CSC gather.
-///
-/// `m` is deliberately NOT part of the gate: `fold_alpha_batched` is a function
-/// of the per-block base matrices only, and those do not depend on the batch
-/// size. `k_log`/`k_skip`/`useful_bits`/`const_pin`/the matrix shape do, and
-/// all five are pinned. (`killed.md:10175` establishes the ranked shape is
-/// `k_log=14 k_skip=6 m=32 RowMajor` on every seed, so the gate arms there.)
-fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
-    r1cs.k_log == K_LOG
-        && r1cs.k_skip == K_SKIP
-        && r1cs.useful_bits == USEFUL_BITS
-        && r1cs.a_0.num_rows == K
-        && r1cs.a_0.num_cols == K
-        && r1cs.b_0.num_rows == K
-        && r1cs.b_0.num_cols == K
-        && r1cs.const_pin == Some(Z_CONST_POS)
-        && matches!(r1cs.layout, flock_core::r1cs::WitnessLayout::RowMajor)
-        && lc_adjoint_enabled()
-}
-
-impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
-    fn n_cols(&self) -> usize {
-        K
-    }
-
-    fn const_pin_col(&self) -> Option<usize> {
-        self.const_pin
-    }
-
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
-        assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut acc = vec![F128::ZERO; self.n_nodes];
-
-        // Inject. Writes land on leaves, internal nodes, or the zero node —
-        // the zero node has no children and is dropped by the truncate below,
-        // so empty rows need no branch.
-        for r in 0..self.n_rows {
-            let e = eq_inner[r];
-            let ea = alpha * e;
-            // SAFETY: every root is a valid node id (`< n_nodes`) by
-            // construction in `build`, and `r < n_rows <= K == eq_inner.len()`.
-            unsafe {
-                *acc.get_unchecked_mut(*self.a_roots.get_unchecked(r) as usize) += ea;
-                *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
-            }
-        }
-
-        // One reverse-topological sweep: a node's children were interned
-        // before it, so `ADJ_BASE + i`'s children are both `< ADJ_BASE + i`
-        // and descending `i` visits every parent before either child.
-        let base = ADJ_BASE as usize;
-        for i in (0..self.children.len()).rev() {
-            let v = acc[base + i];
-            // SAFETY: children are node ids `< base + i < n_nodes`.
-            let [p, q] = unsafe { *self.children.get_unchecked(i) };
-            unsafe {
-                *acc.get_unchecked_mut(p as usize) += v;
-                *acc.get_unchecked_mut(q as usize) += v;
-            }
-        }
-
-        acc.truncate(K);
-        acc
-    }
-}
-
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
 /// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
@@ -3474,18 +3034,6 @@ impl Blake3Setup {
         }
     }
 
-    /// The lincheck circuit for this setup's R1CS: the XOR-DAG adjoint plan
-    /// when its shape gate arms, else the materialized CSC gather. Both
-    /// produce the identical `comb_vec`, so the transcript is unaffected by
-    /// which one answers.
-    fn lincheck_circuit(&self) -> &dyn flock_core::lincheck::LincheckCircuit {
-        if adjoint_plan_arms(&self.r1cs) {
-            &*BLAKE3_ADJOINT_PLAN
-        } else {
-            self.r1cs.csc_lincheck_circuit()
-        }
-    }
-
     pub fn new(n_blocks: usize) -> Self {
         Self::with_log_inv_rate(n_blocks, 1)
     }
@@ -3518,18 +3066,10 @@ impl Blake3Setup {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
         let r1cs = build_block_r1cs(n_log);
-        // Warm the lincheck fold circuit here so its one-time build stays out
-        // of the first prove/verify, and pre-fault the prove-cycle scratch
-        // buffers (see scratch::prewarm_prover). On the shape the XOR-DAG
-        // adjoint plan arms for, that is ~55 K interned nodes and the CSC
-        // transpose is never built at all — no pass over ~21 M nonzeros and no
-        // ~40 MiB of u16 row streams resident for the life of the process.
-        // Off-shape we fall back to the CSC gather, so warm that instead.
-        if adjoint_plan_arms(&r1cs) {
-            std::sync::LazyLock::force(&BLAKE3_ADJOINT_PLAN);
-        } else {
-            r1cs.csc_lincheck_circuit();
-        }
+        // Warm the CSC fold circuit here so its one-time build (a pass over
+        // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
+        // the prove-cycle scratch buffers (see scratch::prewarm_prover).
+        r1cs.csc_lincheck_circuit();
         flock_core::scratch::prewarm_prover(r1cs.m);
         // GPU warmup + calibration for BOTH Metal pipelines, in the untimed
         // setup window (the ranked worker constructs the Setup, then runs an
@@ -3765,7 +3305,7 @@ impl Blake3Setup {
                         r
                     });
                 flock_core::gaptime::mark("witness: pool exited");
-                let lc_circuit = self.lincheck_circuit();
+                let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
                 crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
                     &self.r1cs,
@@ -3797,7 +3337,7 @@ impl Blake3Setup {
                     flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                         self.generate_witness_ab(blocks)
                     });
-                let lc_circuit = self.lincheck_circuit();
+                let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 crate::prover::prove_fast_ligerito_from_witness(
                     &self.r1cs,
                     &self.pcs_params,
@@ -3833,7 +3373,7 @@ impl Blake3Setup {
                 let (z_packed, a_packed_f128, b_packed_f128) =
                     generate_witness_with_ab_packed(blocks, self.n_blocks_log());
                 let witness_s = t0.elapsed().as_secs_f64();
-                let lc_circuit = self.lincheck_circuit();
+                let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 let (proof, commitment, claim, mut timings) =
                     crate::prover::prove_fast_ligerito_timed_from_block_major_witness(
                         &self.r1cs,
@@ -3852,7 +3392,7 @@ impl Blake3Setup {
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
                     self.generate_witness_ab(blocks);
                 let witness_s = t0.elapsed().as_secs_f64();
-                let lc_circuit = self.lincheck_circuit();
+                let lc_circuit = self.r1cs.csc_lincheck_circuit();
                 let (proof, commitment, claim, mut timings) =
                     crate::prover::prove_fast_ligerito_timed(
                         &self.r1cs,
@@ -3877,7 +3417,7 @@ impl Blake3Setup {
         proof: &flock_core::proof::R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.lincheck_circuit();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         verifier::verify_ligerito(
             &self.r1cs,
             commitment,
@@ -3945,7 +3485,7 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         assert_eq!(self.n_blocks, self.n_block_slots());
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
-        let lc_circuit = self.lincheck_circuit();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -3971,7 +3511,7 @@ impl Blake3Setup {
         let n_log = self.n_blocks_log();
         let cv_0_phys = cv_to_phys_bits(cv_0);
         let cv_last_phys = cv_to_phys_bits(cv_last);
-        let lc_circuit = self.lincheck_circuit();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::verify_chain_ligerito_generic(
             &self.r1cs,
             &CHAIN_LAYOUT,
@@ -4996,44 +4536,6 @@ mod tests {
                 reference.as_bytes_mut(),
                 "streamed ab_inner differs from the incumbent reference (ranked_meta={ranked_meta})"
             );
-        }
-    }
-
-    /// The XOR-DAG adjoint plan must reproduce the CSC gather's `comb_vec`
-    /// EXACTLY — same field elements, not merely the same distribution. This
-    /// is what makes the swap a pure implementation change: `lincheck::prove`
-    /// consumes `comb_vec` and nothing else from the circuit, so bit-equality
-    /// here is bit-equality of the proof.
-    #[test]
-    fn adjoint_plan_matches_csc_fold() {
-        use flock_core::lincheck::LincheckCircuit;
-        let (a_0, b_0) = build_matrices();
-        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
-        let plan = Blake3AdjointPlan::build();
-        assert_eq!(plan.n_cols(), csc.n_cols());
-        eprintln!(
-            "adjoint plan: {} internal nodes, {} total nodes, {} KiB scratch",
-            plan.n_internal(),
-            plan.n_nodes(),
-            plan.n_nodes() * 16 / 1024
-        );
-        let mut rng = Rng::new(0xADD0_1234);
-        let mut samp = || {
-            let a = rng.next_u32() as u64;
-            let b = rng.next_u32() as u64;
-            let c = rng.next_u32() as u64;
-            let d = rng.next_u32() as u64;
-            F128::new((a << 32) | b, (c << 32) | d)
-        };
-        for trial in 0..4 {
-            let alpha = samp();
-            let eq: Vec<F128> = (0..K).map(|_| samp()).collect();
-            let want = csc.fold_alpha_batched(alpha, &eq);
-            let got = plan.fold_alpha_batched(alpha, &eq);
-            assert_eq!(want.len(), got.len());
-            for c in 0..K {
-                assert_eq!(want[c], got[c], "trial {trial}, column {c}");
-            }
         }
     }
 
