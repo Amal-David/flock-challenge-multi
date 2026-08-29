@@ -180,6 +180,12 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
+/// Borrow the transcript-independent table shared by every ranked proof.
+#[inline]
+pub fn shared_urm_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
+
 /// Witness padding descriptor for URM work-skipping.
 ///
 /// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
@@ -560,10 +566,24 @@ fn prove_packed_padded_inner<C: Challenger>(
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) => rayon::join(
-                        || ab_pool.install(ab_closure),
-                        || c_pool.install(c_closure),
-                    ),
+                    Some((ab_pool, c_pool)) => {
+                        // Hand AB to its own pool and run C's install from the
+                        // calling worker directly: one global worker blocks for
+                        // the window instead of two, and the second
+                        // cross-registry latch round-trip disappears. Same
+                        // closures over the same inputs on the same pinned
+                        // pools; the proof bytes are unchanged.
+                        let mut ab_closure = ab_closure;
+                        let mut ab_out = None;
+                        let mut c_out = None;
+                        let ab_slot = &mut ab_out;
+                        let c_slot = &mut c_out;
+                        ab_pool.in_place_scope(move |s| {
+                            s.spawn(move |_| *ab_slot = Some(ab_closure()));
+                            *c_slot = Some(c_pool.install(c_closure));
+                        });
+                        (ab_out.unwrap(), c_out.unwrap())
+                    }
                     None => rayon::join(ab_closure, c_closure),
                 };
             if zc_timing {
