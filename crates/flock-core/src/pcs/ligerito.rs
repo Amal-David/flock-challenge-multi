@@ -2333,7 +2333,7 @@ fn tntt_block_enabled() -> bool {
 ///    incumbent one parallel sweep per layer.
 fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
     if tntt_block_enabled() {
-        transpose_forward_ntt_dense_layers_blocked(ntt, data, top);
+        transpose_forward_ntt_dense_layers_blocked(ntt, data, top, false);
     } else {
         transpose_forward_ntt_dense_layers_per_layer(ntt, data, top);
     }
@@ -2401,10 +2401,21 @@ fn transpose_forward_ntt_dense_layers_per_layer(
 /// and layer order of the incumbent (layers commute only within a group, and
 /// the groups are applied in the same relative order), so the output is
 /// bit-identical.
+const TRANSPOSE_CHUNK_LOG: usize = 16;
+
+#[inline]
+fn transpose_forward_ntt_dense_split(log_d: usize, top: usize) -> usize {
+    log_d
+        .saturating_sub(TRANSPOSE_CHUNK_LOG)
+        .max(ceil_log2(rayon::current_num_threads().max(1)))
+        .min(top)
+}
+
 fn transpose_forward_ntt_dense_layers_blocked(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
     top: usize,
+    local_layers_done: bool,
 ) {
     use rayon::prelude::*;
     let log_d = data.len().trailing_zeros() as usize;
@@ -2424,15 +2435,10 @@ fn transpose_forward_ntt_dense_layers_blocked(
     // CHUNK_LOG=16 and 17 share split=4 (pass (a) chunk = 1 MiB both). Only
     // pass (b) tile doubles: 16 → 1 MiB resident, 17 → 2 MiB (= full SPR L2).
     // 16 keeps the Zen-5 split without the 2 MiB tile that evicted L2 on SPR.
-    const CHUNK_LOG: usize = 16;
-
-    let split = log_d
-        .saturating_sub(CHUNK_LOG)
-        .max(ceil_log2(n_threads))
-        .min(top);
+    let split = transpose_forward_ntt_dense_split(log_d, top);
 
     // ---- (a) chunk-local layers `split .. top`, applied high → low. ----
-    if top > split {
+    if !local_layers_done && top > split {
         let chunk_len = 1usize << (log_d - split);
         data.par_chunks_mut(chunk_len)
             .enumerate()
@@ -2461,7 +2467,7 @@ fn transpose_forward_ntt_dense_layers_blocked(
         let nseg = 1usize << split;
         let seg = 1usize << (log_d - split);
         // Tile so the resident set is ~2^CHUNK_LOG F128 across all columns.
-        let mut tile = ((1usize << CHUNK_LOG) / nseg).max(1).min(seg);
+        let mut tile = ((1usize << TRANSPOSE_CHUNK_LOG) / nseg).max(1).min(seg);
         // Starvation floor: the tile loop is pass (b)'s ONLY parallel
         // decomposition, so a cache-sized tile that leaves fewer tiles than
         // threads simply idles cores. Cap the tile at `seg >> log2(threads)`
@@ -2535,9 +2541,6 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    let n = 1usize << log_msg_cols;
-    let log_block = log_msg_cols + log_inv_rate;
-    let block_len = 1usize << log_block;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
 
@@ -2560,6 +2563,44 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         enforced_sum += dot * alpha_pows[i];
     }
 
+    let coeffs =
+        induce_basis_poly_via_ntt_with_weights(log_msg_cols, log_inv_rate, queries, &alpha_pows);
+    (coeffs, enforced_sum)
+}
+
+/// Basis-only half of [`induce_sumcheck_poly_via_ntt`].  The induced basis
+/// depends only on the sampled query positions and alpha tensor; opened rows
+/// are needed solely for the independent enforced-sum dot product.  Keeping
+/// this leaf separate lets the ranked prover build the basis while another
+/// Rayon branch gathers those rows and their Merkle octopus.
+fn induce_basis_poly_via_ntt(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    queries: &[usize],
+    alpha: &[F128],
+) -> Vec<F128> {
+    let n_queries = queries.len();
+    let alpha_pows: Vec<F128> = if n_queries == 0 {
+        Vec::new()
+    } else {
+        let table = build_eq_table(alpha);
+        debug_assert!(table.len() >= n_queries);
+        table.into_iter().take(n_queries).collect()
+    };
+    induce_basis_poly_via_ntt_with_weights(log_msg_cols, log_inv_rate, queries, &alpha_pows)
+}
+
+fn induce_basis_poly_via_ntt_with_weights(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    queries: &[usize],
+    alpha_pows: &[F128],
+) -> Vec<F128> {
+    let n = 1usize << log_msg_cols;
+    let log_block = log_msg_cols + log_inv_rate;
+    let block_len = 1usize << log_block;
+    let n_queries = queries.len();
+    debug_assert_eq!(alpha_pows.len(), n_queries);
     let mut coeffs = if log_block == 0 {
         let mut c = vec![F128::ZERO; block_len];
         for i in 0..n_queries {
@@ -2571,7 +2612,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
     };
     coeffs.truncate(n);
-    (coeffs, enforced_sum)
+    coeffs
 }
 
 /// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
@@ -2743,6 +2784,42 @@ fn induce_ntt_crossover_c() -> usize {
     if induce_sched_enabled() { 1 } else { 4 }
 }
 
+#[inline]
+fn induce_auto_uses_ntt(log_msg_cols: usize, log_inv_rate: usize, n_queries: usize) -> bool {
+    let log_block = log_msg_cols + log_inv_rate;
+    log_msg_cols >= 12
+        && n_queries > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1)
+}
+
+/// Exact ranked selector for overlapping the two F^T-NTT induced-basis
+/// builds with the independent row + Merkle opening gathers.  Only L0 and L1
+/// take the NTT arm at this shape; deeper dense induces retain their incumbent
+/// schedule.  `FLOCK_NO_LIG_OPEN_INDUCE_OVERLAP=1` is the same-binary
+/// rollback.
+#[inline]
+fn ranked_open_induce_overlap_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    direct_fold8_mode: bool,
+) -> bool {
+    cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && std::env::var_os("FLOCK_NO_LIG_OPEN_INDUCE_OVERLAP").is_none()
+        && direct_fold8_mode
+        && log_n == 25
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_steps == 5
+        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
+        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
+        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
+        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
+        && config.merkle_hash == HashKind::Blake3
+}
+
 /// `sks_vks` feeds ONLY the dense arm (the Fᵀ-NTT arm never reads it); pass
 /// `None` to have the dense arm build the table itself when — and only
 /// when — it is actually taken. `Some` keeps the caller's precomputed table
@@ -2756,9 +2833,7 @@ pub(crate) fn induce_sumcheck_poly_auto(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt = log_msg_cols >= 12
-        && queries.len() > induce_ntt_crossover_c() * (1usize << log_inv_rate) * log_block.max(1);
+    let use_ntt = induce_auto_uses_ntt(log_msg_cols, log_inv_rate, queries.len());
     if use_ntt {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
@@ -2836,6 +2911,248 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
     data
 }
 
+/// Opt-in selector for joining sparse densification to the blocked
+/// transpose's chunk-local layers. The cross-chunk layers still run in their
+/// established second pass. Default OFF: on the 8-core+HT Sapphire/Emerald
+/// Rapids shape this fusion measured 1.5-3.5% slower (min-of-20, 14/20 pairs),
+/// so the ranked build keeps the established two-pass densify unless
+/// FLOCK_LIG_DENSIFY_LOCAL_NTT_FUSE=1 is set.
+fn induce_densify_local_ntt_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_LIG_DENSIFY_LOCAL_NTT_FUSE").is_some()
+    });
+    *ON
+}
+
+/// Fill each blocked-transpose chunk from its sparse windows and immediately
+/// apply every layer confined to that chunk. This preserves the exact layer
+/// and butterfly order of pass (a), but consumes the freshly written data
+/// before ending the densify parallel region.
+fn densify_windows_fused_local_ntt(
+    ntt: &AdditiveNttF128,
+    n: usize,
+    k: usize,
+    top: usize,
+    mut slots: Vec<Option<Vec<F128>>>,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let log_d = n.trailing_zeros() as usize;
+    debug_assert_eq!(n, 1usize << log_d);
+    debug_assert!(k <= log_d && top <= log_d);
+    debug_assert_eq!(slots.len(), n >> k);
+    let split = transpose_forward_ntt_dense_split(log_d, top);
+    let chunk_len = 1usize << (log_d - split);
+    let window_len = 1usize << k;
+    debug_assert!(chunk_len >= window_len);
+    debug_assert!(chunk_len.is_multiple_of(window_len));
+    let windows_per_chunk = chunk_len / window_len;
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(chunk_len)
+        .zip(slots.par_chunks_mut(windows_per_chunk))
+        .enumerate()
+        .for_each(|(chunk_index, (chunk, chunk_slots))| {
+            for (dst, src) in chunk.chunks_mut(window_len).zip(chunk_slots) {
+                match src.take() {
+                    Some(buf) => dst.copy_from_slice(&buf),
+                    None => dst.fill(F128::ZERO),
+                }
+            }
+            for layer in (split..top).rev() {
+                let nblocks = 1usize << (layer - split);
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..nblocks {
+                    let twiddle = ntt.twiddle(layer, (chunk_index << (layer - split)) + block);
+                    let range = &mut chunk[block * block_size..(block + 1) * block_size];
+                    let (top_half, bottom_half) = range.split_at_mut(half);
+                    transpose_butterfly(top_half, bottom_half, twiddle);
+                }
+            }
+        });
+    data
+}
+
+
+/// Expand each active sparse window directly into its final dense slot, then
+/// zero the inactive slots. No chunk-local NTT layers — those stay on the
+/// established second pass (`transpose_forward_ntt_dense_layers`). Byte
+/// identical to `processed` windows + `densify_windows_fused`: same expand
+/// kernels, same XOR of multi-hits, same zeros.
+#[allow(clippy::too_many_arguments)]
+fn densify_sparse_runs(
+    ntt: &AdditiveNttF128,
+    n: usize,
+    k: usize,
+    positions: &[usize],
+    values: &[F128],
+    order: &[u32],
+    mut run_slots: Vec<Option<(usize, usize)>>,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let log_d = n.trailing_zeros() as usize;
+    let window_len = 1usize << k;
+    let window_mask = window_len - 1;
+    let multi_max = k / 2;
+    debug_assert_eq!(run_slots.len(), n >> k);
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(window_len)
+        .zip(run_slots.par_iter_mut())
+        .enumerate()
+        .for_each(|(window, (dst, run))| {
+            let Some((rs, re)) = run.take() else {
+                dst.fill(F128::ZERO);
+                return;
+            };
+            let nnz = re - rs;
+            if nnz <= multi_max {
+                let first = order[rs] as usize;
+                expand_singleton_into(
+                    ntt,
+                    log_d,
+                    k,
+                    window,
+                    positions[first] & window_mask,
+                    values[first],
+                    dst,
+                );
+                if nnz > 1 {
+                    let mut scratch = take_singleton_buf(k);
+                    for &index in &order[rs + 1..re] {
+                        let index = index as usize;
+                        expand_singleton_into(
+                            ntt,
+                            log_d,
+                            k,
+                            window,
+                            positions[index] & window_mask,
+                            values[index],
+                            &mut scratch[..window_len],
+                        );
+                        for (out, &extra) in dst.iter_mut().zip(&scratch) {
+                            *out += extra;
+                        }
+                    }
+                }
+            } else {
+                dst.fill(F128::ZERO);
+                for &index in &order[rs..re] {
+                    let index = index as usize;
+                    dst[positions[index] & window_mask] += values[index];
+                }
+                transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, window, dst);
+            }
+        });
+    data
+}
+
+/// Same-binary rollback for expanding each active sparse window directly into
+/// its final dense chunk. This removes the per-window result allocation and
+/// the following copy while retaining the banked local-layer fusion.
+fn induce_direct_windows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_INDUCE_DIRECT_WINDOWS").is_none()
+    });
+    *ON
+}
+
+#[allow(clippy::too_many_arguments)]
+fn densify_sparse_runs_local_ntt(
+    ntt: &AdditiveNttF128,
+    n: usize,
+    k: usize,
+    top: usize,
+    positions: &[usize],
+    values: &[F128],
+    order: &[u32],
+    mut run_slots: Vec<Option<(usize, usize)>>,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let log_d = n.trailing_zeros() as usize;
+    let split = transpose_forward_ntt_dense_split(log_d, top);
+    let chunk_len = 1usize << (log_d - split);
+    let window_len = 1usize << k;
+    let windows_per_chunk = chunk_len / window_len;
+    let window_mask = window_len - 1;
+    let multi_max = k / 2;
+    debug_assert_eq!(run_slots.len(), n >> k);
+    debug_assert!(chunk_len >= window_len && chunk_len.is_multiple_of(window_len));
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(chunk_len)
+        .zip(run_slots.par_chunks_mut(windows_per_chunk))
+        .enumerate()
+        .for_each(|(chunk_index, (chunk, chunk_runs))| {
+            let mut scratch = Vec::<F128>::new();
+            for (local_window, (dst, run)) in
+                chunk.chunks_mut(window_len).zip(chunk_runs).enumerate()
+            {
+                let Some((rs, re)) = run.take() else {
+                    dst.fill(F128::ZERO);
+                    continue;
+                };
+                let window = chunk_index * windows_per_chunk + local_window;
+                let nnz = re - rs;
+                if nnz <= multi_max {
+                    let first = order[rs] as usize;
+                    expand_singleton_into(
+                        ntt,
+                        log_d,
+                        k,
+                        window,
+                        positions[first] & window_mask,
+                        values[first],
+                        dst,
+                    );
+                    if nnz > 1 {
+                        if scratch.len() < window_len {
+                            scratch = take_singleton_buf(k);
+                        }
+                        for &index in &order[rs + 1..re] {
+                            let index = index as usize;
+                            expand_singleton_into(
+                                ntt,
+                                log_d,
+                                k,
+                                window,
+                                positions[index] & window_mask,
+                                values[index],
+                                &mut scratch[..window_len],
+                            );
+                            for (out, &extra) in dst.iter_mut().zip(&scratch) {
+                                *out += extra;
+                            }
+                        }
+                    }
+                } else {
+                    dst.fill(F128::ZERO);
+                    for &index in &order[rs..re] {
+                        let index = index as usize;
+                        dst[positions[index] & window_mask] += values[index];
+                    }
+                    transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, window, dst);
+                }
+            }
+
+            for layer in (split..top).rev() {
+                let nblocks = 1usize << (layer - split);
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..nblocks {
+                    let twiddle = ntt.twiddle(layer, (chunk_index << (layer - split)) + block);
+                    let range = &mut chunk[block * block_size..(block + 1) * block_size];
+                    let (top_half, bottom_half) = range.split_at_mut(half);
+                    transpose_butterfly(top_half, bottom_half, twiddle);
+                }
+            }
+        });
+    data
+}
+
 /// Dense `2^k` transpose for one sparse-prefix window. This is the incumbent
 /// path and remains the exact collision fallback for the singleton shortcut.
 #[inline]
@@ -2846,6 +3163,19 @@ fn transpose_forward_ntt_window_dense(
     w: usize,
     mut buf: Vec<F128>,
 ) -> (usize, Vec<F128>) {
+    transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, w, &mut buf);
+    (w, buf)
+}
+
+#[inline]
+fn transpose_forward_ntt_window_dense_in_place(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    buf: &mut [F128],
+) {
+    debug_assert_eq!(buf.len(), 1usize << k);
     for s in 0..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
@@ -2858,7 +3188,6 @@ fn transpose_forward_ntt_window_dense(
             transpose_butterfly(top_h, bot, t);
         }
     }
-    (w, buf)
 }
 
 /// Ranked default skips the singleton window buffers' zero-fill (every slot
@@ -3131,11 +3460,20 @@ fn transpose_forward_ntt_sparse_inner(
     } else {
         InduceSingletonStats::default()
     };
+    let local_ntt_fused = induce_fused_densify_enabled()
+        && tntt_block_enabled()
+        && induce_densify_local_ntt_fuse_enabled();
+    // Direct-into-chunk expansion does not require local-NTT fusion: it only
+    // deletes the per-window Vec and the later copy into densify. Fusion still
+    // has its own selector (default OFF on the ranked 8+SMT shape).
+    let direct_windows = fill && singleton_on && induce_direct_windows_enabled();
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
+    let processed: Vec<(usize, Vec<F128>)> = if direct_windows {
+        Vec::new()
+    } else if fill {
         runs.par_iter()
             .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
                 let first = order[rs] as usize;
@@ -3208,10 +3546,46 @@ fn transpose_forward_ntt_sparse_inner(
     let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
         // FUSED: one parallel pass writes every window exactly once, from an
         // UNINITIALIZED buffer. See `densify_windows_fused`.
-        let slots = window_slots(n >> k, processed);
+        let mut direct_run_slots = Vec::new();
+        let slots = if direct_windows {
+            direct_run_slots = vec![None; n >> k];
+            for &(rs, re) in &runs {
+                let window = positions[order[rs] as usize] >> k;
+                debug_assert!(direct_run_slots[window].is_none());
+                direct_run_slots[window] = Some((rs, re));
+            }
+            Vec::new()
+        } else {
+            window_slots(n >> k, processed)
+        };
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
         let _td = std::time::Instant::now();
-        let data = densify_windows_fused(n, k, slots);
+        let data = if direct_windows && local_ntt_fused {
+            densify_sparse_runs_local_ntt(
+                ntt,
+                n,
+                k,
+                log_d - k,
+                positions,
+                values,
+                &order,
+                direct_run_slots,
+            )
+        } else if direct_windows {
+            densify_sparse_runs(
+                ntt,
+                n,
+                k,
+                positions,
+                values,
+                &order,
+                direct_run_slots,
+            )
+        } else if local_ntt_fused {
+            densify_windows_fused_local_ntt(ntt, n, k, log_d - k, slots)
+        } else {
+            densify_windows_fused(n, k, slots)
+        };
         (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
     } else {
         let mut data = vec![F128::ZERO; n];
@@ -3225,7 +3599,11 @@ fn transpose_forward_ntt_sparse_inner(
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let _ts = std::time::Instant::now();
-    transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    if local_ntt_fused {
+        transpose_forward_ntt_dense_layers_blocked(ntt, &mut data, log_d - k, true);
+    } else {
+        transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    }
     if ot {
         eprintln!(
             "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
@@ -7469,6 +7847,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let direct_fold4_mode = direct_fold4.is_some();
     let direct_fold8_mode = direct_fold8.is_some();
     let direct_mode = direct_fold2.is_some() || direct_fold4_mode || direct_fold8_mode;
+    let open_induce_overlap = ranked_open_induce_overlap_enabled(config, log_n, direct_fold8_mode);
     if direct_fold8_mode {
         assert_eq!(initial_k, 6, "direct fold8 needs six initial rounds");
     } else if direct_fold4_mode {
@@ -7811,12 +8190,34 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> =
-        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let overlap_ntt_0 =
+        open_induce_overlap && induce_auto_uses_ntt(n1, log_inv_rate_0, queries_0.len());
+    let (((opened_rows_0, merkle_proof_0), open_elapsed_0), (prebuilt_basis_0, basis_elapsed_0)) =
+        if overlap_ntt_0 {
+            rayon::join(
+                || {
+                    let t = std::time::Instant::now();
+                    let rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+                    let proof = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+                    ((rows, proof), t.elapsed())
+                },
+                || {
+                    let t = std::time::Instant::now();
+                    let basis = induce_basis_poly_via_ntt(n1, log_inv_rate_0, &queries_0, &alpha_0);
+                    (Some(basis), t.elapsed())
+                },
+            )
+        } else {
+            let t = std::time::Instant::now();
+            let rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+            let proof = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+            (
+                ((rows, proof), t.elapsed()),
+                (None, std::time::Duration::ZERO),
+            )
+        };
     if trace {
-        t_opens += _t.elapsed();
+        t_opens += open_elapsed_0;
     }
     // The proof's copy of the opened rows is the SAME data the induce below
     // reads. The incumbent cloned all 218 rows (218 allocations, 223 KiB) here,
@@ -7842,17 +8243,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         Some(eval_sk_at_vks(n1))
     };
     let _t = std::time::Instant::now();
-    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
-        n1,
-        log_inv_rate_0,
-        sks_vks_n1.as_deref(),
-        &opened_rows_0,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
-    );
+    let (basis_0_induced, enforced_sum_0) = match prebuilt_basis_0 {
+        Some(basis) => (
+            basis,
+            induce_sumcheck_enforced_sum(&opened_rows_0, &r_lane_fold, &queries_0, &alpha_0),
+        ),
+        None => induce_sumcheck_poly_auto(
+            n1,
+            log_inv_rate_0,
+            sks_vks_n1.as_deref(),
+            &opened_rows_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+        ),
+    };
     if trace {
-        let d = _t.elapsed();
+        let d = basis_elapsed_0 + _t.elapsed();
         t_induce += d;
         let lb = n1 + log_inv_rate_0;
         induce_diag.push((
@@ -8070,13 +8477,48 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> =
-            gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        // The dispatcher builds the dense arm's table itself on the lazy
+        // path (see [`induce_lazy_sks_enabled`]); the sched-disabled arm
+        // below always runs dense and so always needs it eagerly.
+        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
+            None
+        } else {
+            Some(eval_sk_at_vks(n_next))
+        };
+        let rate_i = config.log_inv_rates[i + 1];
+        let overlap_ntt_i = open_induce_overlap
+            && induce_sched_enabled()
+            && induce_auto_uses_ntt(n_next, rate_i, queries_i.len());
+        let (
+            ((opened_rows_i, merkle_proof_i), open_elapsed_i),
+            (prebuilt_basis_i, basis_elapsed_i),
+        ) = if overlap_ntt_i {
+            rayon::join(
+                || {
+                    let t = std::time::Instant::now();
+                    let rows =
+                        gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
+                    let proof =
+                        merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+                    ((rows, proof), t.elapsed())
+                },
+                || {
+                    let t = std::time::Instant::now();
+                    let basis = induce_basis_poly_via_ntt(n_next, rate_i, &queries_i, &alpha_i);
+                    (Some(basis), t.elapsed())
+                },
+            )
+        } else {
+            let t = std::time::Instant::now();
+            let rows = gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
+            let proof = merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+            (
+                ((rows, proof), t.elapsed()),
+                (None, std::time::Duration::ZERO),
+            )
+        };
         if trace {
-            t_opens += _t.elapsed();
+            t_opens += open_elapsed_i;
         }
         // Same deletion as the L0 block: the rows move into the proof after the
         // induce has read them instead of being cloned before it.
@@ -8088,32 +8530,27 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             });
         }
 
-        // The dispatcher builds the dense arm's table itself on the lazy
-        // path (see [`induce_lazy_sks_enabled`]); the sched-disabled arm
-        // below always runs dense and so always needs it eagerly.
-        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
-            None
-        } else {
-            Some(eval_sk_at_vks(n_next))
-        };
         let _t = std::time::Instant::now();
         // `n_next` is exactly wtns_prev's message-column count and
         // `log_inv_rates[i+1]` its rate, so the same dense-vs-Fᵀ-NTT cost
         // dispatch L0 uses applies here. (Was hard-wired to the dense arm
         // back when the transposed NTT cost one DRAM pass per layer; the
         // blocked sweep moved the crossover well below level 1's shape.)
-        let (basis_i_induced, enforced_sum_i) = if induce_sched_enabled() {
-            induce_sumcheck_poly_auto(
+        let (basis_i_induced, enforced_sum_i) = match prebuilt_basis_i {
+            Some(basis) => (
+                basis,
+                induce_sumcheck_enforced_sum(&opened_rows_i, &level_rs, &queries_i, &alpha_i),
+            ),
+            None if induce_sched_enabled() => induce_sumcheck_poly_auto(
                 n_next,
-                config.log_inv_rates[i + 1],
+                rate_i,
                 sks_vks_i.as_deref(),
                 &opened_rows_i,
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
-        } else {
-            induce_sumcheck_poly(
+            ),
+            None => induce_sumcheck_poly(
                 n_next,
                 sks_vks_i
                     .as_deref()
@@ -8122,12 +8559,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
+            ),
         };
         if trace {
-            let d = _t.elapsed();
+            let d = basis_elapsed_i + _t.elapsed();
             t_induce += d;
-            let rate = config.log_inv_rates[i + 1];
             induce_diag.push((
                 i + 1,
                 n_next,
@@ -8136,7 +8572,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 induce_sched_enabled()
                     && n_next >= 12
                     && queries_i.len()
-                        > induce_ntt_crossover_c() * (1usize << rate) * (n_next + rate).max(1),
+                        > induce_ntt_crossover_c() * (1usize << rate_i) * (n_next + rate_i).max(1),
             ));
         }
 
@@ -11155,8 +11591,10 @@ mod tests {
                 &queries,
                 &alpha,
             );
+            let basis_only = induce_basis_poly_via_ntt(log_msg, log_inv_rate, &queries, &alpha);
             assert_eq!(ntt.1, dense.1, "shape {si}: enforced_sum");
             assert_eq!(ntt.0, dense.0, "shape {si}: basis_poly");
+            assert_eq!(basis_only, ntt.0, "shape {si}: basis-only split");
         }
     }
 
@@ -11863,7 +12301,7 @@ mod tests {
                 let mut a = base.clone();
                 let mut b = base;
                 transpose_forward_ntt_dense_layers_per_layer(&ntt, &mut a, top);
-                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top);
+                transpose_forward_ntt_dense_layers_blocked(&ntt, &mut b, top, false);
                 assert_eq!(a, b, "log_d={log_d}, top={top}");
             }
         }
