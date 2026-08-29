@@ -152,9 +152,26 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
     unsafe {
         debug_assert!(!LOW || twiddle.hi == 0);
         let tw = tw_x4::<LOW, DIET>(twiddle);
-        let lanes = top.len() & !3;
+        let len = top.len();
         let mut i = 0;
-        while i < lanes {
+        while i + 8 <= len {
+            let top0 = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+            let bot0 = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+            let top1 = _mm512_loadu_si512(top.as_ptr().add(i + 4) as *const __m512i);
+            let bot1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4) as *const __m512i);
+            let m0 = mul_x4::<LOW, DIET>(tw, bot0);
+            let m1 = mul_x4::<LOW, DIET>(tw, bot1);
+            let new_top0 = _mm512_xor_si512(top0, m0);
+            let new_top1 = _mm512_xor_si512(top1, m1);
+            let new_bot0 = _mm512_xor_si512(bot0, new_top0);
+            let new_bot1 = _mm512_xor_si512(bot1, new_top1);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, new_top0);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot0);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i + 4) as *mut __m512i, new_top1);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i + 4) as *mut __m512i, new_bot1);
+            i += 8;
+        }
+        while i + 4 <= len {
             let top_lanes = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let bot_lanes = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
             let new_top = _mm512_xor_si512(top_lanes, mul_x4::<LOW, DIET>(tw, bot_lanes));
@@ -237,9 +254,63 @@ unsafe fn butterfly_fused_2layer_impl<
         let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
         let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
-        let lanes = a.len() & !3;
+        let len = a.len();
         let mut i = 0;
-        while i < lanes {
+        while i + 8 <= len {
+            let mut va0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
+            let mut va1 = _mm512_loadu_si512(a.as_ptr().add(i + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(b.as_ptr().add(i + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(c.as_ptr().add(i + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(d.as_ptr().add(i + 4) as *const __m512i);
+
+            let ma0 = mul_x4::<OUTER_LOW, DIET>(outer, vc0);
+            let ma1 = mul_x4::<OUTER_LOW, DIET>(outer, vc1);
+            let mb0 = mul_x4::<OUTER_LOW, DIET>(outer, vd0);
+            let mb1 = mul_x4::<OUTER_LOW, DIET>(outer, vd1);
+            let new_a0 = _mm512_xor_si512(va0, ma0);
+            let new_a1 = _mm512_xor_si512(va1, ma1);
+            vc0 = _mm512_xor_si512(vc0, new_a0);
+            vc1 = _mm512_xor_si512(vc1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+            let new_b0 = _mm512_xor_si512(vb0, mb0);
+            let new_b1 = _mm512_xor_si512(vb1, mb1);
+            vd0 = _mm512_xor_si512(vd0, new_b0);
+            vd1 = _mm512_xor_si512(vd1, new_b1);
+            vb0 = new_b0;
+            vb1 = new_b1;
+
+            let ma0 = mul_x4::<INNER_LOW, DIET>(inner_a, vb0);
+            let ma1 = mul_x4::<INNER_LOW, DIET>(inner_a, vb1);
+            let mc0 = mul_x4::<INNER_LOW, DIET>(inner_b, vd0);
+            let mc1 = mul_x4::<INNER_LOW, DIET>(inner_b, vd1);
+            let new_a0 = _mm512_xor_si512(va0, ma0);
+            let new_a1 = _mm512_xor_si512(va1, ma1);
+            vb0 = _mm512_xor_si512(vb0, new_a0);
+            vb1 = _mm512_xor_si512(vb1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+            let new_c0 = _mm512_xor_si512(vc0, mc0);
+            let new_c1 = _mm512_xor_si512(vc1, mc1);
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va0);
+            _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb0);
+            _mm512_storeu_si512(c.as_mut_ptr().add(i) as *mut __m512i, vc0);
+            _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd0);
+            _mm512_storeu_si512(a.as_mut_ptr().add(i + 4) as *mut __m512i, va1);
+            _mm512_storeu_si512(b.as_mut_ptr().add(i + 4) as *mut __m512i, vb1);
+            _mm512_storeu_si512(c.as_mut_ptr().add(i + 4) as *mut __m512i, vc1);
+            _mm512_storeu_si512(d.as_mut_ptr().add(i + 4) as *mut __m512i, vd1);
+            i += 8;
+        }
+        while i + 4 <= len {
             let mut va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let mut vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
             let mut vc = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
@@ -844,6 +915,51 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        while lane + 8 <= num_ntts {
+            if PF {
+                let off0 = lane * core::mem::size_of::<F128>();
+                let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                }
+            }
+            let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+            let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+            // t_outer = 0, t_inner_a = 0: a stays a.
+            vc0 = _mm512_xor_si512(vc0, va0);
+            vc1 = _mm512_xor_si512(vc1, va1);
+            vd0 = _mm512_xor_si512(vd0, vb0);
+            vd1 = _mm512_xor_si512(vd1, vb1);
+            vb0 = _mm512_xor_si512(vb0, va0);
+            vb1 = _mm512_xor_si512(vb1, va1);
+
+            let m0 = mul_x4::<false, DIET>(inner_b, vd0);
+            let m1 = mul_x4::<false, DIET>(inner_b, vd1);
+            let new_c0 = _mm512_xor_si512(vc0, m0);
+            let new_c1 = _mm512_xor_si512(vc1, m1);
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            store_row4::<NT>(dst_row(0).add(lane), va0);
+            store_row4::<NT>(dst_row(1).add(lane), vb0);
+            store_row4::<NT>(dst_row(2).add(lane), vc0);
+            store_row4::<NT>(dst_row(3).add(lane), vd0);
+            store_row4::<NT>(dst_row(0).add(lane + 4), va1);
+            store_row4::<NT>(dst_row(1).add(lane + 4), vb1);
+            store_row4::<NT>(dst_row(2).add(lane + 4), vc1);
+            store_row4::<NT>(dst_row(3).add(lane + 4), vd1);
+            lane += 8;
+        }
         while lane < lanes {
             if PF {
                 let off = lane * core::mem::size_of::<F128>();
@@ -1239,18 +1355,126 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
-        while lane < lanes {
+        while lane + 8 <= active_lanes {
             // Hint DELIVERY, not hint content: the same sixteen lines of the
             // next row group are still requested exactly once per lane step,
             // four at a time at four points spaced through the body instead
-            // of all sixteen back to back at its head. The incumbent burst
-            // put sixteen prefetch uops on the load ports immediately in
-            // front of the sixteen DEMAND loads of this lane step, which are
-            // on the critical path; the three other hot prefetch sites in
-            // this prover (`seed_pf_spread`, `zc_r1ab_pf_spread`,
-            // `zc_tail_pf_spread`) already ship exactly this delivery and
-            // each is worth several percent of its window. Architecturally
+            // of all sixteen back to back at its head. Dual-chunk issues the
+            // same sixteen lines at `lane` and `lane+4`. Architecturally
             // invisible: a prefetch moves no value.
+            macro_rules! pf_quad {
+                ($g:expr) => {{
+                    if H != 0 {
+                        for off_lane in [lane, lane + 4] {
+                            let off = off_lane * core::mem::size_of::<F128>();
+                            for i in (4 * $g)..(4 * $g + 4) {
+                                let p = pf_row(i).add(off);
+                                if H == 1 {
+                                    _mm_prefetch::<_MM_HINT_T0>(p);
+                                } else {
+                                    _mm_prefetch::<_MM_HINT_T1>(p);
+                                }
+                            }
+                        }
+                    }
+                }};
+            }
+            let mut values = [zero; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            macro_rules! butterfly {
+                ($u:expr, $v:expr, $twiddle:expr) => {{
+                    let new_u =
+                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    values[$u] = new_u;
+                }};
+            }
+
+            pf_quad!(0);
+            let outer = tw[0];
+            for i in 0..8 {
+                butterfly!(i, i + 8, outer);
+            }
+            pf_quad!(1);
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..4 {
+                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                }
+            }
+            pf_quad!(2);
+            for s in 0..4 {
+                let twiddle = tw[3 + s];
+                for i in 0..2 {
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            pf_quad!(3);
+            for s in 0..8 {
+                let twiddle = tw[7 + s];
+                butterfly!(2 * s, 2 * s + 1, twiddle);
+            }
+
+            // Two successive 16-ZMM chunks, one 16-reg file. Fire two
+            // independent outer VPCLMULs of chunk1 so they stay in flight
+            // across the sixteen chunk0 stores (port-5 hide).
+            let lane1 = lane + 4;
+            let u0 = _mm512_loadu_si512(row(0).add(lane1) as *const __m512i);
+            let v8 = _mm512_loadu_si512(row(8).add(lane1) as *const __m512i);
+            let u1 = _mm512_loadu_si512(row(1).add(lane1) as *const __m512i);
+            let v9 = _mm512_loadu_si512(row(9).add(lane1) as *const __m512i);
+            let m8 = mul_x4::<false, DIET>(outer, v8);
+            let m9 = mul_x4::<false, DIET>(outer, v9);
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+
+            values[0] = u0;
+            values[1] = u1;
+            values[8] = v8;
+            values[9] = v9;
+            for i in 2..8 {
+                values[i] = _mm512_loadu_si512(row(i).add(lane1) as *const __m512i);
+            }
+            for i in 10..16 {
+                values[i] = _mm512_loadu_si512(row(i).add(lane1) as *const __m512i);
+            }
+            let new_u = _mm512_xor_si512(values[0], m8);
+            values[8] = _mm512_xor_si512(values[8], new_u);
+            values[0] = new_u;
+            let new_u = _mm512_xor_si512(values[1], m9);
+            values[9] = _mm512_xor_si512(values[9], new_u);
+            values[1] = new_u;
+            for i in 2..8 {
+                butterfly!(i, i + 8, outer);
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..4 {
+                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                }
+            }
+            for s in 0..4 {
+                let twiddle = tw[3 + s];
+                for i in 0..2 {
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            for s in 0..8 {
+                let twiddle = tw[7 + s];
+                butterfly!(2 * s, 2 * s + 1, twiddle);
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane1) as *mut __m512i, *value);
+            }
+            lane += 8;
+        }
+        while lane < lanes {
             macro_rules! pf_quad {
                 ($g:expr) => {{
                     if H != 0 {
