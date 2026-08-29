@@ -534,6 +534,25 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// XOR-accumulate four unreduced products `x[i] * 1` without issuing
+    /// carryless multiplies.
+    ///
+    /// With `F128::ONE = { lo: 1, hi: 0 }`, the three widened limbs are
+    /// exactly `lo = x.lo`, `hi = 0`, and `mid = x.hi`.  A masked move and a
+    /// masked qword permute therefore reproduce [`Self::mul_acc`] with an
+    /// identity right operand, limb for limb.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
+        self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
+        // Select qwords 1/3/5/7 into slots 0/2/4/6 and zero the odd slots.
+        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
+        self.mid = _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.

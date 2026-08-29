@@ -217,6 +217,20 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
+        // Static constant-fiber plan for the ranked BLAKE3 witness. One
+        // K-block is 256 post-URM rows (128 pairs); rows 0..18 are the
+        // all-ones word, so the first complete eight-pair message window of
+        // every block folds to `b0 = b1 = b2 = b3 = F128::ONE` in all four
+        // SIMD lanes. The planned window is still verified below before the
+        // arithmetic shortcut is taken, preserving exact behavior for every
+        // witness and every non-ranked layout.
+        const B_ONES_BLOCK_PAIRS: usize = 128;
+        let mut b_ones_head = if zc_b_ones_enabled() {
+            (B_ONES_BLOCK_PAIRS - (pair_idx_base & (B_ONES_BLOCK_PAIRS - 1)))
+                & (B_ONES_BLOCK_PAIRS - 1)
+        } else {
+            usize::MAX
+        };
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
         // rows; the consume path below skips them exactly as before).
@@ -432,6 +446,57 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
+            // Constant-fiber window. When every folded B value is ONE,
+            // characteristic-two cancellations make message accumulators
+            // 1/3/5/6/7 vanish; accumulators 0/2/4 retain only A values with
+            // identity factors. This turns 52 CLMULs into 15 for the planned
+            // window and avoids computing a0*w, which only feeds vanished
+            // terms.
+            if x_lo == b_ones_head {
+                b_ones_head = b_ones_head.wrapping_add(B_ONES_BLOCK_PAIRS);
+                let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
+                let all = _mm512_cmpeq_epi64_mask(b0, one)
+                    & _mm512_cmpeq_epi64_mask(b1, one)
+                    & _mm512_cmpeq_epi64_mask(b2, one)
+                    & _mm512_cmpeq_epi64_mask(b3, one);
+                if all == 0xff {
+                    let (a1w, a2w, a3w) = if let Some(wt) = wtab {
+                        let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                        let w = _mm512_loadu_si512(wp);
+                        let w64 = _mm512_loadu_si512(wp.add(1));
+                        (
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                        )
+                    } else {
+                        let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                        let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                        let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                        if wsplit {
+                            let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                            (
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                            )
+                        } else {
+                            (
+                                ghash_mul_x4(w, a1),
+                                ghash_mul_x4(w, a2),
+                                ghash_mul_x4(w, a3),
+                            )
+                        }
+                    };
+                    #[cfg(test)]
+                    B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    acc[0].mul_acc_one(a1w);
+                    acc[2].mul_acc_one(a3w);
+                    acc[4].mul_acc_one(a2w);
+                    x_lo += 8;
+                    continue;
+                }
+            }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
                 // (w, w·x⁶⁴) precomputed once per pass: both are pure
                 // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
@@ -1189,6 +1254,22 @@ pub(crate) fn zc_wtab_enabled() -> bool {
 pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
+    *ON
+}
+
+/// Constant-fiber `b == 1` windows in the round-two lookahead sweep.
+///
+/// The BLAKE3 static-B plan has an all-ones prefix in every K-block. The
+/// univariate fold of that word is exactly one by partition of unity, which
+/// collapses one complete x86 message window per block. Same-binary rollback:
+/// `FLOCK_NO_ZC_B_ONES=1`.
+#[cfg(test)]
+pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn zc_b_ones_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_ONES").is_none());
     *ON
 }
 
