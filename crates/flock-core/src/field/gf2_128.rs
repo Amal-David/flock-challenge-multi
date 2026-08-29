@@ -359,6 +359,54 @@ mod tests {
         assert_eq!(direct, acc.reduce());
     }
 
+    /// `WideGhashX4::mul_acc_one(x)` is `mul_acc(x, ONE)`, limb for limb.
+    ///
+    /// This is the identity the round-2 constant-fiber window rests on: with
+    /// `y = F128::ONE` the four CLMULs of the widening degenerate to
+    /// `lo = x.lo`, `hi = 0`, `mid = x.hi`. Checked on a MIX of ordinary and
+    /// identity accumulations so the deferred limbs are compared, not just a
+    /// single reduced value.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn mul_acc_one_matches_mul_acc_with_one() {
+        use super::x86_64::{WideGhashX4, f128x4_set};
+        let mut rng = Rng::new(0xB0E5);
+        // SAFETY: the cfg gate supplies avx512f + vpclmulqdq.
+        unsafe {
+            let one = f128x4_set(F128::ONE, F128::ONE, F128::ONE, F128::ONE);
+            let mut generic = WideGhashX4::zero();
+            let mut special = WideGhashX4::zero();
+            for step in 0..32 {
+                let x = f128x4_set(
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                );
+                if step % 3 == 0 {
+                    // Ordinary term, identical on both sides.
+                    let y = f128x4_set(
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                        rng.next_f128(),
+                    );
+                    generic.mul_acc(x, y);
+                    special.mul_acc(x, y);
+                } else {
+                    generic.mul_acc(x, one);
+                    special.mul_acc_one(x);
+                }
+            }
+            assert_eq!(generic.fold(), special.fold(), "unreduced limbs differ");
+            assert_eq!(generic.fold().reduce(), special.fold().reduce());
+        }
+    }
+
     #[test]
     fn inverse_roundtrip() {
         let mut rng = Rng::new(6);
