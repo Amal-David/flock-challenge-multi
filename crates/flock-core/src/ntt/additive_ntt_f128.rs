@@ -331,6 +331,37 @@ fn deep_block_fuse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
 }
 
+/// Test-only latch: force the in-place deep fused-four row driver so a
+/// same-process A/B can pin gather/scatter against it.
+#[cfg(test)]
+static NTT_DEEP_F4_GATHER_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How many times the gather arm of [`butterfly_interleaved_fused_4layer_rows`]
+/// actually ran (so the identity test can assert it did not fall through).
+#[cfg(test)]
+static DEEP_F4_GATHER_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `FLOCK_NO_NTT_DEEP_F4_GATHER=1` restores in-place fused-four over the
+/// ranked deep first sweep (`sixteenth=128`, `num_ntts=64`). Default ON:
+/// gather the sixteen 128 KiB-strided rows into a 16 KiB contiguous stage,
+/// run the already-shipped `sixteenth=1` shaped kernel there, scatter back.
+/// Same butterflies, same order, bit-identical stores. Ranked `env_clear()`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_deep_f4_gather_enabled() -> bool {
+    #[cfg(test)]
+    if NTT_DEEP_F4_GATHER_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_F4_GATHER").is_none())
+}
+
 /// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
 /// when this machine or pool cannot be paired.
 ///
@@ -4408,6 +4439,70 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     }
 }
 
+/// Ranked deep first fused-four: sixteen rows sit `128 · 64 · 16 = 128 KiB`
+/// apart, a power-of-two stride that maps every row onto the same L1/L2
+/// sets. Copy them into a 16 KiB contiguous stage (`sixteenth=1` layout),
+/// run the already-shipped shaped kernel, scatter back. Prefetch of the
+/// next DRAM group is issued one row at a time next to that row's gather
+/// so the fill-buffer queue is not bursted in front of the demand loads.
+///
+/// # Safety
+/// `block` is `16 * 128 * 64` F128; each row group `{i*128+r}` is disjoint.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn butterfly_fused_4layer_rows_gathered_128_64(
+    block: &mut [F128],
+    t: &[F128; 15],
+    odd_tail: usize,
+    hint: u8,
+) {
+    const S16: usize = 128;
+    const NN: usize = 64;
+    debug_assert_eq!(block.len(), 16 * S16 * NN);
+    #[cfg(test)]
+    DEEP_F4_GATHER_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = block.as_mut_ptr();
+    let mut stage: Vec<F128> = crate::alloc_uninit_vec(16 * NN);
+    let stage_ptr = stage.as_mut_ptr();
+    for r in 0..S16 {
+        let lanes = row_lanes(r, NN, odd_tail);
+        // SAFETY: each source row `i*S16+r` is inside `block`; stage owns
+        // 16 packed rows of NN; next-group prefetch is a hint.
+        unsafe {
+            for i in 0..16 {
+                core::ptr::copy_nonoverlapping(
+                    base.add((i * S16 + r) * NN),
+                    stage_ptr.add(i * NN),
+                    NN,
+                );
+                if hint != 0 && r + 1 < S16 {
+                    use core::arch::x86_64::{_MM_HINT_T0, _MM_HINT_T1, _mm_prefetch};
+                    let p = base.add((i * S16 + r + 1) * NN) as *const i8;
+                    for line in 0..16 {
+                        let q = p.add(line * 64);
+                        if hint == 1 {
+                            _mm_prefetch::<_MM_HINT_T0>(q);
+                        } else {
+                            _mm_prefetch::<_MM_HINT_T1>(q);
+                        }
+                    }
+                }
+            }
+            kernels::butterfly_fused_4layer_row(stage_ptr, 1, NN, lanes, 0, t);
+            for i in 0..16 {
+                core::ptr::copy_nonoverlapping(
+                    stage_ptr.add(i * NN),
+                    base.add((i * S16 + r) * NN),
+                    NN,
+                );
+            }
+        }
+    }
+}
+
 /// Sequential row driver for a fused-four block. The caller already runs one
 /// disjoint cache-sized subgroup per Rayon task, so spawning nested Rayon work
 /// here would add dispatch overhead and disrupt subgroup cache locality.
@@ -4422,6 +4517,15 @@ fn butterfly_interleaved_fused_4layer_rows(
 ) {
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if sixteenth == 128 && num_ntts == 64 && ntt_deep_f4_gather_enabled() {
+        butterfly_fused_4layer_rows_gathered_128_64(block, t, odd_tail, hint);
+        return;
+    }
     let base = block.as_mut_ptr();
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
@@ -4648,6 +4752,56 @@ mod tests {
                 let shaped = run(false);
                 assert_eq!(generic, shaped, "fused3 low={low} dense={dense}");
             }
+        }
+    }
+
+    /// Gather/scatter of the ranked deep first fused-four (`sixteenth=128`,
+    /// `num_ntts=64`) must match the in-place driver byte-for-byte. Drives the
+    /// shipped [`butterfly_interleaved_fused_4layer_rows`].
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn deep_f4_gather_matches_inplace() {
+        use std::sync::atomic::Ordering;
+
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        fn rnd(seed: &mut u64) -> F128 {
+            F128 {
+                lo: next(seed),
+                hi: next(seed),
+            }
+        }
+
+        let mut seed = 0xF41C_1280_64u64;
+        const S16: usize = 128;
+        const NN: usize = 64;
+        let n = 16 * S16 * NN;
+        let src: Vec<F128> = (0..n).map(|_| rnd(&mut seed)).collect();
+        let tw: [F128; 15] = std::array::from_fn(|_| rnd(&mut seed));
+        for &hint in &[0u8, 1, 2] {
+            let run = |off: bool| {
+                let mut data = src.clone();
+                NTT_DEEP_F4_GATHER_TEST_OFF.store(off, Ordering::Relaxed);
+                butterfly_interleaved_fused_4layer_rows(&mut data, &tw, S16, NN, 0, hint);
+                NTT_DEEP_F4_GATHER_TEST_OFF.store(false, Ordering::Relaxed);
+                data
+            };
+            let hits_before = DEEP_F4_GATHER_HITS.load(Ordering::Relaxed);
+            let gathered = run(false);
+            assert!(
+                DEEP_F4_GATHER_HITS.load(Ordering::Relaxed) > hits_before,
+                "gather arm did not run hint={hint}"
+            );
+            let inplace = run(true);
+            assert_eq!(gathered, inplace, "gather vs inplace hint={hint}");
         }
     }
 
