@@ -327,10 +327,10 @@ fn blake3_hash_many<const N: usize>(
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
     let base_ptr = data.as_ptr();
+    let mut inputs = [core::ptr::null::<u8>(); BLAKE3_BATCH];
     for (chunk_idx, outs) in out.chunks_mut(BLAKE3_BATCH).enumerate() {
         let n = outs.len();
         let chunk_offset = chunk_idx * BLAKE3_BATCH * N;
-        let mut inputs = [core::ptr::null::<u8>(); BLAKE3_BATCH];
         for i in 0..n {
             inputs[i] = unsafe { base_ptr.add(chunk_offset + i * N) };
         }
