@@ -277,49 +277,104 @@ pub fn fold_1b_rows_multi_padded(
 /// [`crate::zerocheck::univariate_skip::build_eq`] (byte-identical), but
 /// parallelizes the inner doubling loop across rayon threads.
 ///
-/// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
-/// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
-/// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
-/// independent and trivially parallelize. Earlier levels are tiny so
-/// rayon's per-task overhead dominates; we keep them sequential and only
-/// switch to parallel above a threshold.
-fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-    let n = r.len();
-    // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
-    // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
-    // (purely written, never read first). So every slot is written before any
-    // read; uninit is safe.
-    let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
-    // Threshold below which rayon dispatch overhead beats the parallel work.
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
-        let half = 1usize << i;
-        let (lo, hi_rest) = t.split_at_mut(half);
-        let hi = &mut hi_rest[..half];
-        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
-        if half < PAR_THRESHOLD {
-            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                let old = *lo_x;
-                let prod = old * r_i;
-                *hi_x = prod;
-                *lo_x = old + prod;
+    /// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
+    /// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
+    /// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
+    /// independent and trivially parallelize. Earlier levels are tiny so
+    /// rayon's per-task overhead dominates; we keep them sequential and only
+    /// switch to parallel above a threshold.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    unsafe fn double_eq_chunk_simd(lo: &mut [F128], hi: &mut [F128], r_i: F128) {
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_rhs, ghash_mul_x4_split, ghash_shift64_x4};
+        use core::arch::x86_64::*;
+        let len = lo.len();
+        let lanes = len & !3;
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r_i.hi as i64, r_i.lo as i64));
+        let mut i = 0usize;
+        if r_i.hi == 0 {
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                let prod = ghash_mul_x4_low_rhs(v, r_bcast);
+                let new_lo = _mm512_xor_si512(v, prod);
+                _mm512_storeu_si512(hi.as_mut_ptr().add(i) as *mut __m512i, prod);
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new_lo);
+                i += 4;
             }
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| {
+            let r_x64 = ghash_shift64_x4(r_bcast);
+            while i < lanes {
+                let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                let prod = ghash_mul_x4_split(v, r_bcast, r_x64);
+                let new_lo = _mm512_xor_si512(v, prod);
+                _mm512_storeu_si512(hi.as_mut_ptr().add(i) as *mut __m512i, prod);
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new_lo);
+                i += 4;
+            }
+        }
+        while i < len {
+            let old = lo[i];
+            let prod = old * r_i;
+            hi[i] = prod;
+            lo[i] = old + prod;
+            i += 1;
+        }
+    }
+
+    /// Parallel `build_eq` for ring-switching's suffix tensors. Same output as
+    /// [`crate::zerocheck::univariate_skip::build_eq`] (byte-identical), but
+    /// parallelizes the inner doubling loop across rayon threads.
+    ///
+    /// Each level `i` doubles a table of size `2^i` → `2^(i+1)`: for each
+    /// `x ∈ 0..2^i`, write `t[x | (1<<i)] = t[x] * r_i` and
+    /// `t[x] = t[x] * (1-r_i)`. The iterations within one level are
+    /// independent and trivially parallelize. Earlier levels are tiny so
+    /// rayon's per-task overhead dominates; we keep them sequential and only
+    /// switch to parallel above a threshold.
+    fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+        let n = r.len();
+        // Uninit alloc — at iter `i`, the loop reads from t[..2^i] (always written
+        // by an earlier iter or the t[0] = ONE seed) and writes to t[2^i..2^(i+1)]
+        // (purely written, never read first). So every slot is written before any
+        // read; uninit is safe.
+        let mut t = crate::alloc_uninit_f128_vec(1usize << n);
+        t[0] = F128::ONE;
+        // Threshold below which rayon dispatch overhead beats the parallel work.
+        const PAR_THRESHOLD: usize = 1 << 12;
+        for i in 0..n {
+            let r_i = r[i];
+            let half = 1usize << i;
+            let (lo, hi_rest) = t.split_at_mut(half);
+            let hi = &mut hi_rest[..half];
+            // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+            if half < PAR_THRESHOLD {
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                unsafe { double_eq_chunk_simd(lo, hi, r_i); }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                     let old = *lo_x;
                     let prod = old * r_i;
                     *hi_x = prod;
                     *lo_x = old + prod;
-                });
+                }
+            } else {
+                lo.par_chunks_mut(1024)
+                    .zip(hi.par_chunks_mut(1024))
+                    .for_each(|(lo_chunk, hi_chunk)| {
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                        unsafe { double_eq_chunk_simd(lo_chunk, hi_chunk, r_i); }
+                        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                        for (lo_x, hi_x) in lo_chunk.iter_mut().zip(hi_chunk.iter_mut()) {
+                            let old = *lo_x;
+                            let prod = old * r_i;
+                            *hi_x = prod;
+                            *lo_x = old + prod;
+                        }
+                    });
+            }
         }
+        t
     }
-    t
-}
 
 /// Tensor-factored `build_eq`: split the point `r` (length `n`) into a low
 /// part `r[..n_lo]` and a high part `r[n_lo..]`, returning the two smaller
@@ -1015,35 +1070,24 @@ pub fn fold_1b_rows_split(
                     let m_chunk = &w_block[c * 16..c * 16 + 16];
                     let [tbl0, tbl1, tbl2, tbl3] = &tables[c];
 
-                    let mut m_bytes = [[0u8; 16]; 16];
-                    for (e, slot) in m_bytes.iter_mut().enumerate() {
-                        slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                        slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                    }
+                    let mut tlo_all = [0u8; 128];
+                    let mut thi_all = [0u8; 128];
+
+                    let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                    let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                    let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                    let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                     for r_byte in 0..16 {
-                        let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                            | ((m_bytes[1][r_byte] as u64) << 8)
-                            | ((m_bytes[2][r_byte] as u64) << 16)
-                            | ((m_bytes[3][r_byte] as u64) << 24)
-                            | ((m_bytes[4][r_byte] as u64) << 32)
-                            | ((m_bytes[5][r_byte] as u64) << 40)
-                            | ((m_bytes[6][r_byte] as u64) << 48)
-                            | ((m_bytes[7][r_byte] as u64) << 56);
-                        let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                            | ((m_bytes[9][r_byte] as u64) << 8)
-                            | ((m_bytes[10][r_byte] as u64) << 16)
-                            | ((m_bytes[11][r_byte] as u64) << 24)
-                            | ((m_bytes[12][r_byte] as u64) << 32)
-                            | ((m_bytes[13][r_byte] as u64) << 40)
-                            | ((m_bytes[14][r_byte] as u64) << 48)
-                            | ((m_bytes[15][r_byte] as u64) << 56);
-                        let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                        let thi = transpose_8x8_bits(hi8).to_le_bytes();
                         let base = r_byte * 8;
                         for p in 0..8 {
-                            let m_lo = tlo[p];
-                            let m_hi = thi[p];
+                            let m_lo = tlo_all[base + p];
+                            let m_hi = thi_all[base + p];
                             inner[base + p] += tbl0[(m_lo & 0x0F) as usize]
                                 + tbl1[(m_lo >> 4) as usize]
                                 + tbl2[(m_hi & 0x0F) as usize]
@@ -1055,9 +1099,7 @@ pub fn fold_1b_rows_split(
                 // `e · (Σ eq_lo·bit) = Σ (e·eq_lo)·bit` distributes exactly, so
                 // each term equals the materialized `t[i] = eq_lo·eq_hi` term.
                 let e = eq_hi[i_hi];
-                for r in 0..n {
-                    acc[r] += e * inner[r];
-                }
+                crate::field::f128_slice::add_scaled(&mut acc, &inner, e);
                 acc
             },
         )
@@ -1178,35 +1220,24 @@ pub fn fold_1b_rows_split_2way(
                 let [t0a, t0b, t0c, t0d] = &tables_0[c];
                 let [t1a, t1b, t1c, t1d] = &tables_1[c];
 
-                let mut m_bytes = [[0u8; 16]; 16];
-                for (e, slot) in m_bytes.iter_mut().enumerate() {
-                    slot[..8].copy_from_slice(&m_chunk[e].lo.to_le_bytes());
-                    slot[8..].copy_from_slice(&m_chunk[e].hi.to_le_bytes());
-                }
+                let mut tlo_all = [0u8; 128];
+                let mut thi_all = [0u8; 128];
+
+                let lo_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[i].lo);
+                let lo_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[i].hi);
+                let hi_lo: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].lo);
+                let hi_hi: [u64; 8] = core::array::from_fn(|i| m_chunk[8 + i].hi);
+
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_lo, &mut tlo_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&lo_hi, &mut tlo_all[64..128]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_lo, &mut thi_all[0..64]);
+                crate::bits::transpose_8_u64s_to_64_bytes(&hi_hi, &mut thi_all[64..128]);
 
                 for r_byte in 0..16 {
-                    let lo8: u64 = (m_bytes[0][r_byte] as u64)
-                        | ((m_bytes[1][r_byte] as u64) << 8)
-                        | ((m_bytes[2][r_byte] as u64) << 16)
-                        | ((m_bytes[3][r_byte] as u64) << 24)
-                        | ((m_bytes[4][r_byte] as u64) << 32)
-                        | ((m_bytes[5][r_byte] as u64) << 40)
-                        | ((m_bytes[6][r_byte] as u64) << 48)
-                        | ((m_bytes[7][r_byte] as u64) << 56);
-                    let hi8: u64 = (m_bytes[8][r_byte] as u64)
-                        | ((m_bytes[9][r_byte] as u64) << 8)
-                        | ((m_bytes[10][r_byte] as u64) << 16)
-                        | ((m_bytes[11][r_byte] as u64) << 24)
-                        | ((m_bytes[12][r_byte] as u64) << 32)
-                        | ((m_bytes[13][r_byte] as u64) << 40)
-                        | ((m_bytes[14][r_byte] as u64) << 48)
-                        | ((m_bytes[15][r_byte] as u64) << 56);
-                    let tlo = transpose_8x8_bits(lo8).to_le_bytes();
-                    let thi = transpose_8x8_bits(hi8).to_le_bytes();
                     let base = r_byte * 8;
                     for p in 0..8 {
-                        let m_lo = tlo[p];
-                        let m_hi = thi[p];
+                        let m_lo = tlo_all[base + p];
+                        let m_hi = thi_all[base + p];
                         let i_lo4 = (m_lo & 0x0F) as usize;
                         let i_hi4 = (m_lo >> 4) as usize;
                         let i_lo4h = (m_hi & 0x0F) as usize;
@@ -1218,10 +1249,8 @@ pub fn fold_1b_rows_split_2way(
             }
             let e0 = eq_hi_0[i_hi];
             let e1 = eq_hi_1[i_hi];
-            for r in 0..n {
-                acc0[r] += e0 * inner0[r];
-                acc1[r] += e1 * inner1[r];
-            }
+            crate::field::f128_slice::add_scaled(&mut acc0, &inner0, e0);
+            crate::field::f128_slice::add_scaled(&mut acc1, &inner1, e1);
             (acc0, acc1)
         })
         .reduce(zero_acc, |(mut a0, mut a1), (b0, b1)| {
@@ -1741,66 +1770,14 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
 #[allow(clippy::uninit_vec)]
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v.len(), 128);
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi",
-        target_feature = "gfni"
-    ))]
-    {
-        let mut out = Vec::<F128>::with_capacity(128);
-        // SAFETY: the `cfg` supplies exactly the features the callee enables,
-        // and the callee initializes all 128 elements before `set_len`.
-        unsafe {
-            transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
-            out.set_len(128);
-        }
-        out
+    let mut out = Vec::<F128>::with_capacity(128);
+    unsafe {
+        transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
+        out.set_len(128);
     }
-    // Portable tiling: sixteen 8-row stripes through the shared
-    // architecture-dispatching 8x64 bit transpose. Value-identical to the
-    // GFNI form; this is the body that shipped before the GFNI rewrite.
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi",
-        target_feature = "gfni"
-    )))]
-    {
-        assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
-        let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
-        for row_group in 0..16 {
-            let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
-            let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
-            let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
-            let mut lo_columns = [0u8; 64];
-            let mut hi_columns = [0u8; 64];
-            crate::bits::transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
-            crate::bits::transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
-            for bit in 0..64 {
-                out_bytes[bit][row_group] = lo_columns[bit];
-                out_bytes[bit + 64][row_group] = hi_columns[bit];
-            }
-        }
-        out_bytes
-            .iter()
-            .map(|b| F128 {
-                lo: u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-                hi: u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
-            })
-            .collect()
-    }
+    out
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1833,13 +1810,6 @@ unsafe fn transpose128_gfni(p: *const F128, out: *mut F128) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
@@ -1858,13 +1828,6 @@ unsafe fn transpose64_gfni(p: *const F128, idx: core::arch::x86_64::__m512i) -> 
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
 #[rustfmt::skip]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
@@ -2056,6 +2019,99 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn expand_256_subset_sums(col8: &[F128], block: *mut F128) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let c0 = col8[0];
+        let c1 = col8[1];
+        let c2 = col8[2];
+        let c3 = col8[3];
+        let c4 = col8[4];
+        let c5 = col8[5];
+        let c6 = col8[6];
+        let c7 = col8[7];
+
+        let v0 = _mm512_set_epi64(
+            (c0.hi ^ c1.hi) as i64, (c0.lo ^ c1.lo) as i64,
+            c1.hi as i64, c1.lo as i64,
+            c0.hi as i64, c0.lo as i64,
+            0, 0,
+        );
+        let c2_vec = _mm512_set_epi64(
+            c2.hi as i64, c2.lo as i64,
+            c2.hi as i64, c2.lo as i64,
+            c2.hi as i64, c2.lo as i64,
+            c2.hi as i64, c2.lo as i64,
+        );
+        let v1 = _mm512_xor_si512(v0, c2_vec);
+        let c3_vec = _mm512_set_epi64(
+            c3.hi as i64, c3.lo as i64,
+            c3.hi as i64, c3.lo as i64,
+            c3.hi as i64, c3.lo as i64,
+            c3.hi as i64, c3.lo as i64,
+        );
+        let v2 = _mm512_xor_si512(v0, c3_vec);
+        let v3 = _mm512_xor_si512(v1, c3_vec);
+
+        let lo_quads = [v0, v1, v2, v3];
+
+        let h0 = _mm512_set_epi64(
+            (c4.hi ^ c5.hi) as i64, (c4.lo ^ c5.lo) as i64,
+            c5.hi as i64, c5.lo as i64,
+            c4.hi as i64, c4.lo as i64,
+            0, 0,
+        );
+        let c6_vec = _mm512_set_epi64(
+            c6.hi as i64, c6.lo as i64,
+            c6.hi as i64, c6.lo as i64,
+            c6.hi as i64, c6.lo as i64,
+            c6.hi as i64, c6.lo as i64,
+        );
+        let h1 = _mm512_xor_si512(h0, c6_vec);
+        let c7_vec = _mm512_set_epi64(
+            c7.hi as i64, c7.lo as i64,
+            c7.hi as i64, c7.lo as i64,
+            c7.hi as i64, c7.lo as i64,
+            c7.hi as i64, c7.lo as i64,
+        );
+        let h2 = _mm512_xor_si512(h0, c7_vec);
+        let h3 = _mm512_xor_si512(h1, c7_vec);
+
+        let mut hi_16 = [F128::ZERO; 16];
+        _mm512_storeu_si512(hi_16.as_mut_ptr().add(0) as *mut __m512i, h0);
+        _mm512_storeu_si512(hi_16.as_mut_ptr().add(4) as *mut __m512i, h1);
+        _mm512_storeu_si512(hi_16.as_mut_ptr().add(8) as *mut __m512i, h2);
+        _mm512_storeu_si512(hi_16.as_mut_ptr().add(12) as *mut __m512i, h3);
+
+        for hi_idx in 0..16 {
+            let h_elem = hi_16[hi_idx];
+            let h_broadcast = _mm512_set_epi64(
+                h_elem.hi as i64, h_elem.lo as i64,
+                h_elem.hi as i64, h_elem.lo as i64,
+                h_elem.hi as i64, h_elem.lo as i64,
+                h_elem.hi as i64, h_elem.lo as i64,
+            );
+            let out_ptr = block.add(hi_idx * 16);
+            _mm512_storeu_si512(out_ptr.add(0) as *mut __m512i, _mm512_xor_si512(lo_quads[0], h_broadcast));
+            _mm512_storeu_si512(out_ptr.add(4) as *mut __m512i, _mm512_xor_si512(lo_quads[1], h_broadcast));
+            _mm512_storeu_si512(out_ptr.add(8) as *mut __m512i, _mm512_xor_si512(lo_quads[2], h_broadcast));
+            _mm512_storeu_si512(out_ptr.add(12) as *mut __m512i, _mm512_xor_si512(lo_quads[3], h_broadcast));
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[inline]
+fn expand_256_subset_sums_scalar(col8: &[F128], block: &mut [F128]) {
+    block[0] = F128::ZERO;
+    for v in 1..FOLD_TABLE_SIZE {
+        block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+    }
+}
+
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
@@ -2063,16 +2119,13 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
-        let bit_base = byte_idx * 8;
-        for value in 0..FOLD_TABLE_SIZE {
-            let mut acc = F128::ZERO;
-            for bit_in_byte in 0..8 {
-                if (value >> bit_in_byte) & 1 == 1 {
-                    acc += eq_r_dprime[bit_base + bit_in_byte];
-                }
-            }
-            tables[byte_idx * FOLD_TABLE_SIZE + value] = acc;
+        let col8 = &eq_r_dprime[byte_idx * 8..byte_idx * 8 + 8];
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe {
+            expand_256_subset_sums(col8, tables.as_mut_ptr().add(byte_idx * FOLD_TABLE_SIZE));
         }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+        expand_256_subset_sums_scalar(col8, &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE]);
     }
     tables
 }
@@ -2082,20 +2135,6 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 /// element `e_hi`: fills `out` (length [`FOLD_TABLE_TOTAL`]) so that for
 /// every `x`,
 /// `fold_one_slot(x, out) == fold_one_slot(x * e_hi, base)` **bit-exactly**.
-///
-/// Why this is exact algebra, not an approximation: GF(2^128) multiplication
-/// is F2-bilinear, so with `e_b` the basis element having only bit `b` set,
-/// `x·e_hi = Σ_{b: bit b of x set} (e_b · e_hi)`; and `fold_one_slot(·, base)`
-/// IS the F2-linear map `M`, hence
-/// `M(x·e_hi) = Σ_b x_b · M(e_b·e_hi)`. The columns `col[b] = M(X^b·e_hi)`
-/// are produced by the exact `mul_by_x` doubling chain (bit `b` of the
-/// GHASH layout is the coefficient of `X^b`) + a fold through `base`; the
-/// 16×256 byte tables are their subset sums (`out[k·256+v] =
-/// Σ_{bit j of v} col[8k+j]`). Every step is an exact F2 operation, so the
-/// composed fold is bit-identical to multiply-then-fold.
-///
-/// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
-/// per block, amortized by the caller over ≥ 2048 fold evaluations.
 #[inline(always)]
 pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
@@ -2113,16 +2152,14 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
 pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
     debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
     let cols = compose_block_cols(base, e_hi);
-    // Expand each 8-column group into its 256-entry subset-sum table. Every
-    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
-    // may be uninitialized on entry.
     for k in 0..FOLD_N_BYTES {
         let col8 = &cols[k * 8..k * 8 + 8];
-        let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        block[0] = F128::ZERO;
-        for v in 1..FOLD_TABLE_SIZE {
-            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe {
+            expand_256_subset_sums(col8, out.as_mut_ptr().add(k * FOLD_TABLE_SIZE));
         }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+        expand_256_subset_sums_scalar(col8, &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE]);
     }
 }
 
@@ -3918,16 +3955,18 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
         z_vals_suffix.len() <= 32,
         "y_bits is u32; suffix > 32 not supported"
     );
-    let mut eval = prefix.clone();
+    let mut total_scalar = F128::ONE;
     for (j, &z_i) in z_vals_suffix.iter().enumerate() {
         let scalar = if (y_bits >> j) & 1 == 1 {
             z_i
         } else {
             F128::ONE + z_i
         };
-        for e in eval.elems.iter_mut() {
-            *e *= scalar;
-        }
+        total_scalar *= scalar;
+    }
+    let mut eval = prefix.clone();
+    for e in eval.elems.iter_mut() {
+        *e *= total_scalar;
     }
     eval.fold_vertical(eq_r_dprime)
 }
