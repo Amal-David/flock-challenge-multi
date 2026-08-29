@@ -278,7 +278,7 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+pub(crate) unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
@@ -429,6 +429,29 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
         );
         // One fold: lo + x^64·hi (mod p). The top limb is 64 bits wide, so the
         // single `0x87` CLMUL finishes it (degree ≤ 70 < 128).
+        gf2_128_reduce_x4(lo, hi)
+    }
+}
+
+/// 4 independent GF(2^128) products `v[i]·t` when the multiplier `t` has its
+/// high 64-bit limb equal to zero in every lane (`t.hi == 0`).
+///
+/// Needs only 3 CLMULs (2 product CLMULs + 1 reduction CLMUL) and 2 XORs,
+/// saving 40% of Port 5 execution latency over the general 5-CLMUL split path.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` and that `t.hi == 0` in every lane.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_low_rhs(v: __m512i, t: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and zero-high-limb precondition.
+    unsafe {
+        // lo = v.lo · t.lo (imm 0x00)
+        let lo = _mm512_clmulepi64_epi128::<0x00>(v, t);
+        // hi = v.hi · t.lo (imm 0x01: high qword of v × low qword of t)
+        let hi = _mm512_clmulepi64_epi128::<0x01>(v, t);
+        // Reduce lo + x^64 · hi (mod p): 1 reduction CLMUL with 0x87
         gf2_128_reduce_x4(lo, hi)
     }
 }
