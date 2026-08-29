@@ -1583,12 +1583,15 @@ fn write_aligned_lin_words(
 
 const B_SPEED_BITS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const B_SPEED_BYTES_PER_G: usize = B_SPEED_BITS_PER_G.div_ceil(8);
+pub(crate) const B_SIDE_BYTES_PER_BLOCK: usize = N_G * B_SPEED_BYTES_PER_G;
 const B_SPEED_TAIL_MASK: u8 = u8::MAX << (B_SPEED_BITS_PER_G % 8);
 const B_DENSE_BYTES_PER_BLOCK: usize = K / 8;
 const B_LOW31_MASK: u32 = (1u32 << CARRY_BITS_PER_ADD) - 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BSideSpeedBlock([[u8; B_SPEED_BYTES_PER_G]; N_G]);
+
+const _: () = assert!(B_SIDE_BYTES_PER_BLOCK == 1344);
 
 impl BSideSpeedBlock {
     #[inline(always)]
@@ -1963,6 +1966,94 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Ranked Sapphire-Rapids witness route with PACKED186 as B's sole
+/// persistent representation. The rolling B ring in the octa producer still
+/// exists long enough to derive Z and the complete round-one AB projection;
+/// it is never drained into a dense witness allocation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn generate_ranked_witness_with_b_sidecar(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const B_SIDE_F128_PER_BLOCK: usize = B_SIDE_BYTES_PER_BLOCK / core::mem::size_of::<F128>();
+    const {
+        assert!(B_SIDE_BYTES_PER_BLOCK.is_multiple_of(core::mem::size_of::<F128>()));
+        assert!(B_SIDE_F128_PER_BLOCK == 84);
+    }
+
+    // This exact geometry is the only one whose consumer descriptors and
+    // block/quadrant mapping are admitted. Any drift fails before allocation.
+    assert_eq!(n_blocks_log, 18, "B sidecar is ranked m=32 only");
+    assert_eq!(K_LOG, 14);
+    let n_total = 1usize << n_blocks_log;
+    assert!(blocks.len() <= n_total);
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let mut b_sidecar = flock_core::scratch::take_f128(n_total * B_SIDE_F128_PER_BLOCK);
+    let mut ab_inner =
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        );
+    // No dense B survives the octa. Therefore round one must be fully
+    // materialized by the producer; a deferred GPU prefix would have no
+    // canonical operand to reconstruct from and is rejected atomically.
+    let skip_bytes =
+        flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        );
+    assert_eq!(skip_bytes, 0, "B sidecar forbids a deferred round1 prefix");
+    ab_inner.set_invalid_prefix_bytes(0);
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l =
+        flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let elide_on = witgen_simd::const_elide_enabled();
+    generate_round1_inner_octa(
+        blocks,
+        0,
+        &mut z,
+        &mut a,
+        &mut [],
+        &mut b_sidecar,
+        &mut ab_inner,
+        &inv_table,
+        &padding,
+        [z_tok && elide_on, a_tok && elide_on, true],
+        true,
+    );
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    (z, a, b_sidecar, ab_inner)
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -2115,6 +2206,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut z,
             &mut a,
             &mut b,
+            &mut [],
             &mut ab_inner,
             &inv_table,
             &padding,
@@ -2315,6 +2407,7 @@ fn generate_round1_inner_octa(
     z: &mut [F128],
     a: &mut [F128],
     b: &mut [F128],
+    b_sidecar: &mut [F128],
     ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
     inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
     padding: &Compression,
@@ -2333,6 +2426,16 @@ fn generate_round1_inner_octa(
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let sidecar_mode = !b_sidecar.is_empty();
+    assert_eq!(a.len(), z.len());
+    assert_eq!(b.is_empty(), sidecar_mode);
+    if sidecar_mode {
+        assert_eq!(
+            b_sidecar.len() * core::mem::size_of::<F128>(),
+            (z.len() / F128_PER_BLOCK) * B_SIDE_BYTES_PER_BLOCK
+        );
+        assert!(skip_blocks == 0, "B sidecar requires a fully emitted round1_inner");
+    }
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
 
@@ -2352,9 +2455,10 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
+    let a_addr = a.as_mut_ptr() as usize;
+    let b_addr = b.as_mut_ptr() as usize;
+    let sidecar_addr = b_sidecar.as_mut_ptr() as usize;
     z.par_chunks_mut(group_f128)
-        .zip(a.par_chunks_mut(group_f128))
-        .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
@@ -2381,8 +2485,25 @@ fn generate_round1_inner_octa(
                 }
                 v
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+            |win, (g, (z_out, ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
+                let base_f128 = g * group_f128;
+                let a_out = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (a_addr as *mut F128).add(base_f128),
+                        z_out.len(),
+                    )
+                };
+                let b_out = if sidecar_mode {
+                    &mut [][..]
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (b_addr as *mut F128).add(base_f128),
+                            z_out.len(),
+                        )
+                    }
+                };
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
@@ -2456,7 +2577,17 @@ fn generate_round1_inner_octa(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            if sidecar_mode {
+                                a_out.as_mut_ptr().add(off).cast::<u32>()
+                            } else {
+                                b_out.as_mut_ptr().add(off).cast::<u32>()
+                            },
+                            if sidecar_mode {
+                                (sidecar_addr as *mut u8)
+                                    .add((GROUP * g + half * SIMD) * B_SIDE_BYTES_PER_BLOCK)
+                            } else {
+                                core::ptr::null_mut()
+                            },
                             proj,
                             elide,
                         );
@@ -3919,6 +4050,48 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx2",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                {
+                    if self.r1cs.m == 32
+                        && self.r1cs.k_log == 14
+                        && self.r1cs.useful_bits == USEFUL_BITS
+                    {
+                    let (codeword, (z_packed, a_packed_f128, b_sidecar, ab_inner)) =
+                        crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                            flock_core::gaptime::mark("witness: pool entered");
+                            let r =
+                                flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                                    generate_ranked_witness_with_b_sidecar(
+                                        blocks,
+                                        self.n_blocks_log(),
+                                    )
+                                });
+                            flock_core::gaptime::mark("witness: work done (incl. prefault)");
+                            r
+                        });
+                    flock_core::gaptime::mark("witness: pool exited");
+                    let lc_circuit = self.lincheck_circuit();
+                    flock_core::gaptime::mark("lc_circuit built");
+                    return crate::prover::prove_fast_ligerito_from_block_major_witness_with_b_sidecar(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_sidecar,
+                        ab_inner,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    );
+                    }
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -4322,93 +4495,8 @@ pub fn generate_witness_batch_major(
 }
 
 #[cfg(test)]
-#[allow(unexpected_cfgs)] // internal `flock_bside_t1_probe` assembly/test gate
 mod tests {
     use super::*;
-
-    #[cfg(all(
-        flock_bside_t1_probe,
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    unsafe extern "C" {
-        #[link_name = "flock_t1_bside_tr_bcast_burst"]
-        fn t1_tr_burst(packed: *const u8, phase: usize, mats: *const [u64; 128], out: *mut F128);
-        #[link_name = "flock_t1_bside_tr_bcast_dense"]
-        fn t1_tr_dense(rows: *const u8, mats: *const [u64; 128], out: *mut F128);
-        #[link_name = "flock_t1_bside_c4_bcast_burst"]
-        fn t1_c4_burst(
-            packed: *const u8,
-            phase: usize,
-            mats: *const T1ProbeCFoldMats,
-            out: *mut F128,
-        );
-        #[link_name = "flock_t1_bside_c4_bcast_dense"]
-        fn t1_c4_dense(rows: *const u8, mats: *const T1ProbeCFoldMats, out: *mut F128);
-    }
-
-    #[cfg(all(
-        flock_bside_t1_probe,
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[repr(C, align(64))]
-    struct T1ProbeCFoldMats([[u64; 8]; 128], [[u64; 8]; 64]);
-
-    #[cfg(all(
-        flock_bside_t1_probe,
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    fn t1_compare_b_side_consumers(
-        encoded: &BSideSpeedBlock,
-        dense: &[u8; B_DENSE_BYTES_PER_BLOCK],
-        phase: usize,
-    ) {
-        let mix = |i: usize| {
-            (i as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left((i % 63 + 1) as u32)
-                ^ 0xB51D_71C4_D3C0_DE01
-        };
-        let tr_mats: [u64; 128] = std::array::from_fn(mix);
-        let c4_mats = T1ProbeCFoldMats(
-            std::array::from_fn(|i| std::array::from_fn(|j| mix(8 * i + j))),
-            std::array::from_fn(|i| std::array::from_fn(|j| mix(1024 + 8 * i + j))),
-        );
-        let mut tr_sidecar = [F128::ZERO; 64];
-        let mut tr_dense = [F128::ZERO; 64];
-        let mut c4_sidecar = [F128::ZERO; 16];
-        let mut c4_dense = [F128::ZERO; 16];
-        let rows = dense[phase * 512..].as_ptr();
-        unsafe {
-            t1_tr_burst(
-                encoded.0.as_ptr().cast(),
-                phase,
-                &tr_mats,
-                tr_sidecar.as_mut_ptr(),
-            );
-            t1_tr_dense(rows, &tr_mats, tr_dense.as_mut_ptr());
-            t1_c4_burst(
-                encoded.0.as_ptr().cast(),
-                phase,
-                &c4_mats,
-                c4_sidecar.as_mut_ptr(),
-            );
-            t1_c4_dense(rows, &c4_mats, c4_dense.as_mut_ptr());
-        }
-        assert_eq!(tr_sidecar, tr_dense, "round-2 consumer at phase={phase}");
-        assert_eq!(c4_sidecar, c4_dense, "rounds-3+4 consumer at phase={phase}");
-    }
 
     /// The 4-wide lockstep quad builder must reproduce the scalar driver
     /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and
@@ -4586,51 +4674,6 @@ mod tests {
                 incumbent,
                 "dense B mismatch at randomized case {case}"
             );
-        }
-    }
-
-    #[cfg(all(
-        flock_bside_t1_probe,
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn b_side_t1_sidecar_and_dense_consumers_match_randomized() {
-        let mut rng = Rng::new(0xB51D_71B1_CAFE_0001);
-        for _case in 0..32 {
-            let block: Compression = (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-                rng.next_u32(),
-                rng.next_u32(),
-            );
-            let encoded = speed_encode(&block);
-            let dense = expand_b_side_speed_block(&encoded);
-            for phase in 0..4 {
-                t1_compare_b_side_consumers(&encoded, &dense, phase);
-            }
-        }
-    }
-
-    #[cfg(all(
-        flock_bside_t1_probe,
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn b_side_t1_sidecar_and_dense_consumers_match_padding_block() {
-        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
-        let encoded = speed_encode(&padding);
-        let dense = expand_b_side_speed_block(&encoded);
-        for phase in 0..4 {
-            t1_compare_b_side_consumers(&encoded, &dense, phase);
         }
     }
 
@@ -5166,6 +5209,7 @@ mod tests {
                     &mut z,
                     &mut a,
                     &mut b,
+                    &mut [],
                     &mut ab_inner,
                     &inv_table,
                     &padding,

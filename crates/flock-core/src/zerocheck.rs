@@ -327,7 +327,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, None, None, challenger,
     );
     (proof, claim)
 }
@@ -348,7 +348,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, None, None, challenger,
     );
     (
         proof,
@@ -393,6 +393,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         true,
         Some(ab_inner),
         None,
+        None,
         challenger,
     );
     (
@@ -428,6 +429,44 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
         true,
         Some(ab_inner),
         Some(c_identity_z),
+        None,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Exact ranked BLAKE3 specialization whose B input is PACKED186 instead of
+/// the dense 512-MiB witness. Round one must already be complete; rounds two
+/// and composed three+four decode directly into the admitted GFNI register
+/// consumers.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_identity_c_b_sidecar<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_sidecar: &[u8],
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        &[],
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(c_identity_z),
+        Some(b_sidecar),
         challenger,
     );
     (
@@ -447,6 +486,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     c_identity_z: Option<&[F128]>,
+    b_sidecar: Option<&[u8]>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -458,7 +498,19 @@ fn prove_packed_padded_inner<C: Challenger>(
     );
     let expected_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    if let Some(sidecar) = b_sidecar {
+        assert!(b_packed.is_empty());
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+        assert_eq!(sidecar.len(), (1usize << 18) * 1344);
+        assert_eq!(
+            precomputed_ab.as_ref().map(|ab| ab.invalid_prefix_bytes()),
+            Some(0)
+        );
+    } else {
+        assert_eq!(b_packed.len(), expected_bytes);
+    }
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -713,6 +765,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     // round-five lookahead too, so it needs `r[k_skip+3] ≠ 0` (β₀ at the
     // ranked shape). Kill switch: FLOCK_NO_ZC_SWEEP_NOMAT.
     let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
+    assert!(
+        b_sidecar.is_none() || use_nomat,
+        "B sidecar requires the complete no-materialize route"
+    );
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
@@ -736,6 +792,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
             packed_eq.as_ref(),
+            b_sidecar,
         );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
@@ -919,6 +976,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[1],
                 &r_next,
                 eq_override,
+                b_sidecar,
             );
             a_mlv = a4;
             b_mlv = b4;

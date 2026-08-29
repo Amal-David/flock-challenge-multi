@@ -191,6 +191,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
     b_pkt: *const u8,
+    b_sidecar: Option<*const u8>,
     row_base: usize,
     a_chunk: &mut [F128],
     b_chunk: &mut [F128],
@@ -253,6 +254,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        assert!(
+            b_sidecar.is_none() || tr_bcast,
+            "B sidecar requires the default round-two GFNI TR-bcast consumer"
+        );
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -274,7 +279,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    if let Some(sidecar) = b_sidecar {
+                        blake3_b_sidecar_fold64_tr_bcast(sidecar, g0, m, fb.as_mut_ptr());
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    }
                 } else if tr_emit {
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -294,10 +308,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_sidecar.is_none() {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
             }
@@ -315,10 +331,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
@@ -401,6 +419,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let r = 2 * (pair % 32);
                             [fa[r], fa[r + 1], fb[r], fb[r + 1]]
                         } else {
+                            assert!(b_sidecar.is_none());
                             fold_round2_pair_x86_unchecked_8(
                                 table_data,
                                 a_pkt.add(x0g * 8),
@@ -1320,6 +1339,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
     b_pkt: *const u8,
+    b_sidecar: Option<*const u8>,
     out_base: usize,
     a_out: &mut [F128],
     b_out: &mut [F128],
@@ -1576,6 +1596,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
+        assert!(
+            b_sidecar.is_none() || c4_bcast,
+            "B sidecar requires the default rounds-3+4 GFNI C4-bcast consumer"
+        );
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1615,12 +1639,21 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 fa.as_mut_ptr(),
                                 dead,
                             );
-                            gfni_fold64_rows_masked_c4_bcast(
-                                b_pkt.add(4 * xg * 8),
-                                c,
-                                fb.as_mut_ptr(),
-                                dead,
-                            );
+                            if let Some(sidecar) = b_sidecar {
+                                blake3_b_sidecar_fold64_c4_bcast(
+                                    sidecar,
+                                    4 * xg,
+                                    c,
+                                    fb.as_mut_ptr(),
+                                );
+                            } else {
+                                gfni_fold64_rows_masked_c4_bcast(
+                                    b_pkt.add(4 * xg * 8),
+                                    c,
+                                    fb.as_mut_ptr(),
+                                    dead,
+                                );
+                            }
                         } else {
                             gfni_fold64_rows_masked_c4(
                                 a_pkt.add(4 * xg * 8),
@@ -1651,10 +1684,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_sidecar.is_none() {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                 }
@@ -1715,6 +1750,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             } else {
+                assert!(b_sidecar.is_none());
                 let g = groups_general(
                     table_data,
                     a_pkt,
@@ -1739,10 +1775,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let ap = a_out.as_mut_ptr().add(ol);
@@ -1781,10 +1819,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
@@ -1798,10 +1838,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -2930,7 +2972,6 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -2964,7 +3005,6 @@ unsafe fn b_side_t1_load_64_rows_masked(
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3050,7 +3090,6 @@ unsafe fn b_side_t1_gfni_fold64_regs_sigma_bcast(
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3224,7 +3263,6 @@ unsafe fn b_side_t1_gfni_fold64_regs_c4_bcast(
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3242,7 +3280,6 @@ struct BSideT1BurstZmmDesc {
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3256,7 +3293,6 @@ const _: () = {
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3359,7 +3395,6 @@ const fn b_side_t1_make_desc(quadrant: usize, zmm: usize) -> BSideT1BurstZmmDesc
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3411,7 +3446,6 @@ const B_SIDE_T1_BURST_PHASES: [[BSideT1BurstZmmDesc; 8]; 4] = [
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3465,7 +3499,6 @@ unsafe fn b_side_t1_decode_zmm(
 
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
@@ -3497,14 +3530,12 @@ unsafe fn b_side_t1_decode_burst_regs(
 /// residue-major register body. No ranked call site references this symbol.
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[unsafe(export_name = "flock_t1_bside_tr_bcast_burst")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_tr_bcast_burst(
     packed: *const u8,
@@ -3524,14 +3555,12 @@ unsafe extern "C" fn b_side_t1_tr_bcast_burst(
 /// composed register body. No ranked call site references this symbol.
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[unsafe(export_name = "flock_t1_bside_c4_bcast_burst")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_c4_bcast_burst(
     packed: *const u8,
@@ -3551,18 +3580,64 @@ unsafe extern "C" fn b_side_t1_c4_bcast_burst(
     }
 }
 
+const BLAKE3_B_SIDE_BYTES_PER_BLOCK: usize = 1344;
+const BLAKE3_DENSE_ROWS_PER_BLOCK_AFTER_URM: usize = 256;
+
+/// Decode one aligned 64-row quadrant from the ranked BLAKE3 PACKED186
+/// sidecar and enter the round-two residue-major register consumer.
+#[inline(always)]
+pub(crate) unsafe fn blake3_b_sidecar_fold64_tr_bcast(
+    sidecar: *const u8,
+    dense_row: usize,
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    assert!(dense_row.is_multiple_of(64));
+    let block = dense_row / BLAKE3_DENSE_ROWS_PER_BLOCK_AFTER_URM;
+    let phase = (dense_row % BLAKE3_DENSE_ROWS_PER_BLOCK_AFTER_URM) / 64;
+    let packed = unsafe { sidecar.add(block * BLAKE3_B_SIDE_BYTES_PER_BLOCK) };
+    let descs = &B_SIDE_T1_BURST_PHASES[phase];
+    unsafe {
+        b_side_t1_gfni_fold64_regs_sigma_bcast(
+            b_side_t1_decode_burst_regs(packed, descs),
+            mats,
+            out,
+        );
+    }
+}
+
+/// PACKED186 twin for the composed rounds-3+4 C4 register consumer.
+#[inline(always)]
+pub(crate) unsafe fn blake3_b_sidecar_fold64_c4_bcast(
+    sidecar: *const u8,
+    dense_row: usize,
+    mats: &CFoldMats,
+    out: *mut F128,
+) {
+    assert!(dense_row.is_multiple_of(64));
+    let block = dense_row / BLAKE3_DENSE_ROWS_PER_BLOCK_AFTER_URM;
+    let phase = (dense_row % BLAKE3_DENSE_ROWS_PER_BLOCK_AFTER_URM) / 64;
+    let packed = unsafe { sidecar.add(block * BLAKE3_B_SIDE_BYTES_PER_BLOCK) };
+    let descs = &B_SIDE_T1_BURST_PHASES[phase];
+    unsafe {
+        b_side_t1_gfni_fold64_regs_c4_bcast(
+            b_side_t1_decode_burst_regs(packed, descs),
+            mats,
+            out,
+        );
+    }
+}
+
 /// T1 dense control for [`b_side_t1_tr_bcast_burst`]. Both sinks enter the
 /// identical downstream register body; only the input loader differs.
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[unsafe(export_name = "flock_t1_bside_tr_bcast_dense")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_tr_bcast_dense(
     rows: *const u8,
@@ -3578,14 +3653,12 @@ unsafe extern "C" fn b_side_t1_tr_bcast_dense(
 /// identical downstream register body; only the input loader differs.
 #[allow(unexpected_cfgs)]
 #[cfg(all(
-    flock_bside_t1_probe,
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[unsafe(export_name = "flock_t1_bside_c4_bcast_dense")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_c4_bcast_dense(
     rows: *const u8,

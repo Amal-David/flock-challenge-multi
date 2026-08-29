@@ -1288,6 +1288,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
                     r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
+                    None,
                     row_base,
                     a_chunk,
                     b_chunk,
@@ -1393,6 +1394,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         mlv_challenges,
         padding,
         None,
+        None,
     )
 }
 
@@ -1406,6 +1408,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
+    b_sidecar: Option<&[u8]>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1436,7 +1439,14 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
     assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    if let Some(sidecar) = b_sidecar {
+        assert!(b_packed.is_empty());
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(sidecar.len(), (1usize << 18) * 1344);
+    } else {
+        assert_eq!(b_packed.len(), n_out * n_chunks);
+    }
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -1502,6 +1512,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
+                    b_sidecar.map(<[u8]>::as_ptr),
                     row_base,
                     &mut none_a,
                     &mut none_b,
@@ -1529,6 +1540,12 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 pair_in_block_mask,
                 useful_pairs_inclusive,
             );
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            assert!(b_sidecar.is_none());
 
             let eq_h = eq_hi[x_hi];
             let p1 = kappa * out[0] + out[2];
@@ -1589,7 +1606,19 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     r_next4: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-        a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        padding,
+        a_out,
+        b_out,
+        rho1,
+        rho2,
+        r_next4,
+        None,
+        None,
     )
 }
 
@@ -1607,6 +1636,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     rho2: F128,
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
+    b_sidecar: Option<&[u8]>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1677,7 +1707,14 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let n = 1usize << (m - k_skip);
     assert!(n >= 16);
     assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    if let Some(sidecar) = b_sidecar {
+        assert!(b_packed.is_empty());
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(sidecar.len(), (1usize << 18) * 1344);
+    } else {
+        assert_eq!(b_packed.len(), n * n_chunks);
+    }
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
     assert_eq!(b_out.len(), quarter);
@@ -1762,6 +1799,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
+                    b_sidecar.map(<[u8]>::as_ptr),
                     out_base,
                     a_out,
                     b_out,
@@ -1793,6 +1831,12 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 pair_in_block_mask,
                 useful_pairs_inclusive,
             );
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            assert!(b_sidecar.is_none());
 
             let eq_h = eq_hi[x_hi];
             let p1 = kappa * out[0] + out[2];
@@ -4211,6 +4255,7 @@ mod tests {
                     r2_mats_arg,
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
+                    None,
                     row_base,
                     &mut a_v,
                     &mut b_v,
@@ -4767,6 +4812,7 @@ mod tests {
                             r2_mats_arg,
                             a_packed.as_ptr(),
                             b_packed.as_ptr(),
+                            None,
                             out_base,
                             &mut a_v,
                             &mut b_v,

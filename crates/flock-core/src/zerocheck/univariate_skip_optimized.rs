@@ -1939,7 +1939,12 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    if ab_inner.invalid_prefix_bytes() == 0 && b_packed.is_empty() {
+        // PACKED186 ranked route: the producer emitted every AB window and
+        // intentionally retained no dense B allocation.
+    } else {
+        assert_eq!(b_packed.len(), total_bytes);
+    }
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);

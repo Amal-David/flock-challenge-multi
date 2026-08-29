@@ -18,8 +18,8 @@
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
 
 use super::{
-    ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE,
-    USEFUL_BITS, WORD_BITS,
+    ADDS_PER_G, B_SIDE_BYTES_PER_BLOCK, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE,
+    GS_BASE, K, OUT_HI_BASE, USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
@@ -40,6 +40,12 @@ const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 const U32_PER_BLOCK: usize = K / 32;
 const BYTES_PER_BLOCK: usize = K / 8;
 const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
+const B_SIDE_BYTES_PER_G: usize = 24;
+const B_SIDE_LOW31: u64 = (1u64 << CARRY_BITS_PER_ADD) - 1;
+const _: () = {
+    assert!(ADDS_PER_G == 6);
+    assert!(B_SIDE_BYTES_PER_BLOCK == 56 * B_SIDE_BYTES_PER_G);
+};
 /// Words a drain step publishes at once — sixteen, which is exactly one
 /// 64-byte round-1 medium window per block.
 const STEP_WORDS: usize = 16;
@@ -710,6 +716,7 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    persist_b: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -1169,18 +1176,24 @@ struct RankedRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    persist_b: bool,
 }
 
 impl RankedRows {
     #[inline(always)]
-    fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
+    fn new(z: *mut u32, a: *mut u32, b: *mut u32, persist_b: bool) -> Self {
         #[cfg(target_feature = "avx512f")]
         {
             debug_assert!((z as usize).is_multiple_of(64));
             debug_assert!((a as usize).is_multiple_of(64));
-            debug_assert!((b as usize).is_multiple_of(64));
+            debug_assert!(!persist_b || (b as usize).is_multiple_of(64));
         }
-        Self { z, a, b }
+        Self {
+            z,
+            a,
+            b,
+            persist_b,
+        }
     }
 
     /// Dense ranked windows 2..29: z, a, and b are all fully live.
@@ -1196,7 +1209,9 @@ impl RankedRows {
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
                 stream_ranked_line(self.a.add(o), av);
-                stream_ranked_line(self.b.add(o), bv);
+                if self.persist_b {
+                    stream_ranked_line(self.b.add(o), bv);
+                }
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
@@ -1206,7 +1221,9 @@ impl RankedRows {
                 let b_hi = load_v8(bp.add(8));
                 stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
-                stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                if self.persist_b {
+                    stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                }
             }
         }
     }
@@ -1303,7 +1320,7 @@ impl Drain8<'_> {
                 let blk = abs_word / STEP_WORDS;
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word),self.persist_b);
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -1381,7 +1398,7 @@ impl Drain8<'_> {
                             store_v8(p.add(8),b_hi[r]);
                         }
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word),self.persist_b);
                     proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
@@ -1424,10 +1441,10 @@ impl Drain8<'_> {
                     if g + 1 < a_g1 {
                         flags |= 8;
                     }
-                    if g >= b_g0 && g < b_g1 {
+                    if self.persist_b && g >= b_g0 && g < b_g1 {
                         flags |= 0x10;
                     }
-                    if g + 1 >= b_g0 && g + 1 < b_g1 {
+                    if self.persist_b && g + 1 >= b_g0 && g + 1 < b_g1 {
                         flags |= 0x20;
                     }
                     let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), flags };
@@ -1574,10 +1591,12 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_sidecar: *mut u8,
     proj: StreamProj<'_>,
     elide: [bool; 3],
 ) {
     unsafe {
+        debug_assert!(b_sidecar.is_null() || core::ptr::eq(a, b));
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
@@ -1704,6 +1723,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             ranked_static,
+            persist_b: b_sidecar.is_null(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -1749,6 +1769,43 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         // once both rings contain the completed word. Z is derived there.
         let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
+        #[inline(always)]
+        unsafe fn emit_b_side_g(dst: *mut u8, g: usize, rhs: [V8; ADDS_PER_G]) {
+            if dst.is_null() {
+                return;
+            }
+            // The six live right operands are already available in lane form.
+            // Store them once, then concatenate each block's low-31 fields as
+            // three little-endian u64s: [0..63], [64..127], [128..185].
+            // Bits 186..191 are zero by construction.
+            let mut lanes = [[0u32; 8]; ADDS_PER_G];
+            for i in 0..ADDS_PER_G {
+                unsafe { _mm256_storeu_si256(lanes[i].as_mut_ptr().cast(), rhs[i]) };
+            }
+            for lane in 0..8 {
+                let r0 = u64::from(lanes[0][lane]) & B_SIDE_LOW31;
+                let r1 = u64::from(lanes[1][lane]) & B_SIDE_LOW31;
+                let r2 = u64::from(lanes[2][lane]) & B_SIDE_LOW31;
+                let r3 = u64::from(lanes[3][lane]) & B_SIDE_LOW31;
+                let r4 = u64::from(lanes[4][lane]) & B_SIDE_LOW31;
+                let r5 = u64::from(lanes[5][lane]) & B_SIDE_LOW31;
+                let words = [
+                    r0 | (r1 << 31) | ((r2 & 0x3) << 62),
+                    (r2 >> 2) | (r3 << 29) | ((r4 & 0xf) << 60),
+                    (r4 >> 4) | (r5 << 27),
+                ];
+                let p = unsafe {
+                    dst.add(lane * B_SIDE_BYTES_PER_BLOCK + g * B_SIDE_BYTES_PER_G)
+                        .cast::<u64>()
+                };
+                unsafe {
+                    p.write_unaligned(words[0]);
+                    p.add(1).write_unaligned(words[1]);
+                    p.add(2).write_unaligned(words[2]);
+                }
+            }
+        }
+
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
@@ -1773,6 +1830,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                emit_b_side_g(b_sidecar, $g, [r0, r1, r2, r3, r4, r5]);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
