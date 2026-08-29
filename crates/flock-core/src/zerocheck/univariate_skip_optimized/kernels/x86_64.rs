@@ -1806,14 +1806,16 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
             }
             // One VGF2P8AFFINEQB per (mask half, output byte plane); both
             // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
-            for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
-                for bank in 0..N_C_BANKS {
-                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
-                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
-                    let ptr =
-                        planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
+            for bank in 0..N_C_BANKS {
+                let mask0 = masks[0][bank];
+                let mask1 = masks[1][bank];
+                let bank_ptr = planes.add((q * N_C_BANKS + bank) * 16 * ELL) as *mut __m512i;
+                for plane in 0..16usize {
+                    let m_lo = _mm512_set1_epi64(mats[plane] as i64);
+                    let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(mask0, m_lo);
+                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(mask1, m_hi);
+                    let ptr = bank_ptr.add(plane);
                     _mm512_storeu_si512(
                         ptr,
                         _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
