@@ -394,7 +394,45 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
-        for block in 0..n_blocks64 {
+        let mut block = 0;
+        while block + 1 < n_blocks64 {
+            let bs = block * 64;
+            let rows0: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
+            });
+            let rows1: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs + 64) as *const __m512i)
+            });
+            let planes0 = out_planes_ptr.add(block * 1024);
+            let planes1 = planes0.add(1024);
+            for byte_k in 0..16 {
+                let plane0_ptr = planes0.add(byte_k * 64) as *mut __m512i;
+                let plane1_ptr = planes1.add(byte_k * 64) as *mut __m512i;
+                let (mut acc0, mut acc1) = if seed_zero {
+                    (_mm512_setzero_si512(), _mm512_setzero_si512())
+                } else {
+                    (
+                        _mm512_loadu_si512(plane0_ptr as *const __m512i),
+                        _mm512_loadu_si512(plane1_ptr as *const __m512i),
+                    )
+                };
+                for t in (0..8).step_by(2) {
+                    let mat0 = _mm512_set1_epi64(mats[t * 16 + byte_k] as i64);
+                    let mat1 = _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64);
+                    let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t], mat0);
+                    let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t + 1], mat1);
+                    let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t], mat0);
+                    let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t + 1], mat1);
+                    acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g00, g01);
+                    acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g10, g11);
+                }
+                _mm512_storeu_si512(plane0_ptr, acc0);
+                _mm512_storeu_si512(plane1_ptr, acc1);
+            }
+            block += 2;
+        }
+
+        if block < n_blocks64 {
             let bs = block * 64;
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)

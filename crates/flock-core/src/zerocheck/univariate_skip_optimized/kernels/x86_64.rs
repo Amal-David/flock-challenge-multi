@@ -367,12 +367,10 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
     }
 }
 
-/// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
-/// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
-/// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
-/// `shl %cl` / `vpbroadcastb` that rebuilt x^k disappear. GF(2^8)
-/// multiplication is associative and distributes over XOR, so the value is
-/// bit-identical.
+/// Balanced evaluation of Σ_k x^k·y_k for x = 0x02. The products and their
+/// constant scalings are independent, followed by a balanced XOR tree.
+/// GF(2^8) multiplication is associative and distributes over XOR, so the
+/// value is bit-identical to the serial Horner form.
 ///
 /// The eight pre-scaled `u16` offsets of every apply are fetched as two
 /// 64-bit reads and split with shifts. `imgs` are the table images the caller
@@ -398,15 +396,27 @@ unsafe fn horner_2img_offw(
         let apply = |o: *const u16| {
             crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
         };
-        let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
-        for k in (0..7usize).rev() {
+        let product = |k: usize| {
             let av = apply(op.add(k * 8));
             let bv = apply(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
-        }
-        acc
+            _mm512_gf2p8mul_epi8(av, bv)
+        };
+        let scale = |v, x| _mm512_gf2p8mul_epi8(v, _mm512_set1_epi8(x));
+
+        let t0 = product(0);
+        let t1 = scale(product(1), 2);
+        let t2 = scale(product(2), 4);
+        let t3 = scale(product(3), 8);
+        let t4 = scale(product(4), 16);
+        let t5 = scale(product(5), 32);
+        let t6 = scale(product(6), 64);
+        let t7 = scale(product(7), -128);
+
+        let s01 = _mm512_xor_si512(t0, t1);
+        let s23 = _mm512_xor_si512(t2, t3);
+        let s45 = _mm512_xor_si512(t4, t5);
+        let s67 = _mm512_xor_si512(t6, t7);
+        _mm512_xor_si512(_mm512_xor_si512(s01, s23), _mm512_xor_si512(s45, s67))
     }
 }
 
@@ -433,15 +443,27 @@ unsafe fn horner_2img_off_narrow(
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         let apply = |o: *const u16| inv_table.apply_x86_avx512_register_2img_off_unchecked(o);
-        let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
-        for k in (0..7usize).rev() {
+        let product = |k: usize| {
             let av = apply(op.add(k * 8));
             let bv = apply(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
-        }
-        acc
+            _mm512_gf2p8mul_epi8(av, bv)
+        };
+        let scale = |v, x| _mm512_gf2p8mul_epi8(v, _mm512_set1_epi8(x));
+
+        let t0 = product(0);
+        let t1 = scale(product(1), 2);
+        let t2 = scale(product(2), 4);
+        let t3 = scale(product(3), 8);
+        let t4 = scale(product(4), 16);
+        let t5 = scale(product(5), 32);
+        let t6 = scale(product(6), 64);
+        let t7 = scale(product(7), -128);
+
+        let s01 = _mm512_xor_si512(t0, t1);
+        let s23 = _mm512_xor_si512(t2, t3);
+        let s45 = _mm512_xor_si512(t4, t5);
+        let s67 = _mm512_xor_si512(t6, t7);
+        _mm512_xor_si512(_mm512_xor_si512(s01, s23), _mm512_xor_si512(s45, s67))
     }
 }
 
