@@ -6,24 +6,58 @@ use crate::field::F128;
 /// Requires `avx512f` and `vpclmulqdq`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
         let r_x64 = ghash_shift64_x4(r_bcast);
-        let lanes = dst.len() & !3;
+
+        #[inline(always)]
+        unsafe fn fold_x4(src: *const F128, s: usize, r: __m512i, r_x64: __m512i) -> __m512i {
+            use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
+            use core::arch::x86_64::*;
+            unsafe {
+                let lo = _mm512_loadu_si512(src.add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(src.add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                _mm512_xor_si512(
+                    even,
+                    ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+                )
+            }
+        }
+
+        let hex = dst.len() & !15;
         let mut t = 0;
+        while t < hex {
+            let s = 2 * (base + t);
+            let n0 = fold_x4(src.as_ptr(), s, r_bcast, r_x64);
+            let n1 = fold_x4(src.as_ptr(), s + 8, r_bcast, r_x64);
+            let n2 = fold_x4(src.as_ptr(), s + 16, r_bcast, r_x64);
+            let n3 = fold_x4(src.as_ptr(), s + 24, r_bcast, r_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, n0);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, n1);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 8) as *mut __m512i, n2);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 12) as *mut __m512i, n3);
+            t += 16;
+        }
+        let oct = dst.len() & !7;
+        while t < oct {
+            let s = 2 * (base + t);
+            let n0 = fold_x4(src.as_ptr(), s, r_bcast, r_x64);
+            let n1 = fold_x4(src.as_ptr(), s + 8, r_bcast, r_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, n0);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t + 4) as *mut __m512i, n1);
+            t += 8;
+        }
+        let lanes = dst.len() & !3;
         while t < lanes {
             let s = 2 * (base + t);
-            let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            let diff = _mm512_xor_si512(even, odd);
-            let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+            let n0 = fold_x4(src.as_ptr(), s, r_bcast, r_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, n0);
             t += 4;
         }
         portable_tail(src, base, dst, r, t);
@@ -319,7 +353,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(f.len(), b.len());
@@ -332,15 +366,24 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
         let r_x64 = ghash_shift64_x4(r_bcast);
 
-        let fold4 = |ptr: *const F128, t: usize| -> __m512i {
-            let s = 2 * t;
-            let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            let diff = _mm512_xor_si512(even, odd);
-            _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64))
-        };
+        #[inline(always)]
+        unsafe fn fold_x4(ptr: *const F128, t: usize, r: __m512i, r_x64: __m512i) -> __m512i {
+            use crate::field::gf2_128::x86_64::ghash_mul_x4_split;
+            use core::arch::x86_64::*;
+            // SAFETY: caller supplies eight readable F128 at `ptr` and the
+            // enclosing function is `#[target_feature(avx512f,vpclmulqdq)]`.
+            unsafe {
+                let s = 2 * t;
+                let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                _mm512_xor_si512(
+                    even,
+                    ghash_mul_x4_split(_mm512_xor_si512(even, odd), r, r_x64),
+                )
+            }
+        }
 
         let mut u0_acc = WideGhashX4::zero();
         let mut u2_acc = WideGhashX4::zero();
@@ -349,10 +392,10 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let lanes = half & !7;
         let mut t = 0usize;
         while t < lanes {
-            let f0 = fold4(f_ptr, t);
-            let f1 = fold4(f_ptr, t + 4);
-            let b0 = fold4(b_ptr, t);
-            let b1 = fold4(b_ptr, t + 4);
+            let f0 = fold_x4(f_ptr, t, r_bcast, r_x64);
+            let f1 = fold_x4(f_ptr, t + 4, r_bcast, r_x64);
+            let b0 = fold_x4(b_ptr, t, r_bcast, r_x64);
+            let b1 = fold_x4(b_ptr, t + 4, r_bcast, r_x64);
             _mm512_storeu_si512(f_ptr.add(t) as *mut __m512i, f0);
             _mm512_storeu_si512(f_ptr.add(t + 4) as *mut __m512i, f1);
             _mm512_storeu_si512(b_ptr.add(t) as *mut __m512i, b0);
