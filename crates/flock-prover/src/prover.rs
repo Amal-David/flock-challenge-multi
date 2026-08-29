@@ -109,7 +109,7 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
 /// because this gate runs *before* round one produces one; the stripe path
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
 #[inline]
-fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
+pub(crate) fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_ab_precompute_enabled(r1cs)
         && pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
@@ -449,6 +449,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         a_packed_f128,
         b_packed_f128,
         None,
+        None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
@@ -476,6 +477,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
+        None,
         None,
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
@@ -505,6 +507,35 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         z_packed,
         a_packed_f128,
         b_packed_f128,
+        None,
+        Some(ab_inner),
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+/// Ranked BLAKE3 row-major path with PACKED186 as B's sole persistent owner.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_block_major_witness_with_b_sidecar<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_sidecar: crate::r1cs_hashes::blake3::PackedBSide,
+    ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        Vec::new(),
+        Some(b_sidecar),
         Some(ab_inner),
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
@@ -520,6 +551,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
+    b_sidecar: Option<crate::r1cs_hashes::blake3::PackedBSide>,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
@@ -547,6 +579,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
+        b_sidecar,
         ab_inner,
         lincheck_input,
         lincheck_circuit,
@@ -779,6 +812,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         a_packed_f128,
         b_packed_f128,
         None,
+        None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
@@ -793,6 +827,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
+    mut b_sidecar: Option<crate::r1cs_hashes::blake3::PackedBSide>,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
@@ -805,6 +840,11 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             flock_core::r1cs::WitnessLayout::RowMajor,
             "direct lincheck fold requires canonical block-major z"
         );
+    }
+    if b_sidecar.is_some() {
+        assert!(ranked_identity_c_fold_enabled(r1cs));
+        assert!(b_packed_f128.is_empty());
+        assert!(ab_inner.is_some());
     }
     let padding = r1cs.padding_spec();
     flock_core::gaptime::mark("core: padding built");
@@ -880,49 +920,69 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || {
-            flock_core::gaptime::mark("zerocheck: pool entered");
-            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-            let a_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    a_packed_f128.as_ptr() as *const u8,
-                    a_packed_f128.len() * core::mem::size_of::<F128>(),
+    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        flock_core::gaptime::mark("zerocheck: pool entered");
+        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_sidecar_view = b_sidecar.as_ref().map(|sidecar| {
+            zerocheck::multilinear::PackedB186::new(sidecar.as_bytes(), sidecar.len_blocks())
+        });
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        flock_core::gaptime::mark("zerocheck: views built");
+        let r = match (c_identity_z, b_sidecar_view) {
+            (Some(c_identity_z), Some(b_sidecar)) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_identity_c_b_sidecar(
+                    a_packed,
+                    b_sidecar,
+                    c_packed,
+                    c_identity_z,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
                 )
-            };
-            let b_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    b_packed_f128.as_ptr() as *const u8,
-                    b_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let c_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    z_packed.as_ptr() as *const u8,
-                    z_packed.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            flock_core::gaptime::mark("zerocheck: views built");
-            let r = match c_identity_z {
-            Some(c_identity_z) => {
+            }
+            (Some(c_identity_z), None) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
                     a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
                     challenger,
                 )
             }
-            None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+            (None, None) => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             ),
+            (None, Some(_)) => unreachable!("B sidecar requires ranked identity-C"),
         };
-            flock_core::gaptime::mark("zerocheck: work done");
-            r
-        });
+        flock_core::gaptime::mark("zerocheck: work done");
+        r
+    });
     flock_core::gaptime::mark("zerocheck: pool exited");
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if b_packed_f128.is_empty() {
+        debug_assert!(b_sidecar.is_some());
+    } else {
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
+    drop(b_sidecar.take());
     flock_core::gaptime::mark("a/b recycled to scratch pool");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);

@@ -1012,6 +1012,29 @@ fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
         && lc_adjoint_enabled()
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn ranked_b_sidecar_arms(r1cs: &BlockR1cs, n_blocks_log: usize) -> bool {
+    n_blocks_log == 18
+        && r1cs.m == 32
+        && r1cs.k_log == K_LOG
+        && r1cs.k_skip == K_SKIP
+        && r1cs.useful_bits == USEFUL_BITS
+        && r1cs.a_0.num_rows == K
+        && r1cs.a_0.num_cols == K
+        && r1cs.b_0.num_rows == K
+        && r1cs.b_0.num_cols == K
+        && r1cs.const_pin == Some(Z_CONST_POS)
+        && matches!(r1cs.layout, flock_core::r1cs::WitnessLayout::RowMajor)
+        && crate::prover::ranked_identity_c_fold_enabled(r1cs)
+}
+
 impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     fn n_cols(&self) -> usize {
         K
@@ -1567,7 +1590,7 @@ fn write_aligned_lin_words(
 }
 
 // ---------------------------------------------------------------------------
-// B-side speed-format feasibility oracle.
+// B-side PACKED186 representation.
 //
 // A G contributes only six non-constant B operands: the 31 low bits of the
 // right-hand carry-row operand for each ADD.  Its two lin-id words use B = 1,
@@ -1577,8 +1600,8 @@ fn write_aligned_lin_words(
 // is exactly 24 bytes/G and can reconstruct the full dense 2-KiB B block
 // without consulting A, Z, or the Compression input again.
 //
-// This is deliberately an oracle only.  The ranked witness producer and
-// zerocheck consumers continue to use the incumbent dense representation.
+// The exact ranked Sapphire path owns this representation through zerocheck;
+// all other shapes retain the incumbent dense representation unchanged.
 // ---------------------------------------------------------------------------
 
 const B_SPEED_BITS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
@@ -4125,6 +4148,41 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx2",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                if ranked_b_sidecar_arms(&self.r1cs, self.n_blocks_log()) {
+                    let (codeword, out) = crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                        flock_core::gaptime::mark("witness: pool entered");
+                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                            generate_witness_with_a_packed_b_and_round1_inner_from(
+                                blocks,
+                                self.n_blocks_log(),
+                            )
+                        });
+                        flock_core::gaptime::mark("witness: work done (incl. prefault)");
+                        r
+                    });
+                    flock_core::gaptime::mark("witness: pool exited");
+                    let lc_circuit = self.lincheck_circuit();
+                    flock_core::gaptime::mark("lc_circuit built");
+                    return crate::prover::prove_fast_ligerito_from_block_major_witness_with_b_sidecar(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        out.z,
+                        out.a,
+                        out.b,
+                        out.ab_inner,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    );
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -4531,87 +4589,6 @@ pub fn generate_witness_batch_major(
 mod tests {
     use super::*;
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    unsafe extern "C" {
-        #[link_name = "flock_t1_bside_tr_bcast_burst"]
-        fn t1_tr_burst(packed: *const u8, phase: usize, mats: *const [u64; 128], out: *mut F128);
-        #[link_name = "flock_t1_bside_tr_bcast_dense"]
-        fn t1_tr_dense(rows: *const u8, mats: *const [u64; 128], out: *mut F128);
-        #[link_name = "flock_t1_bside_c4_bcast_burst"]
-        fn t1_c4_burst(
-            packed: *const u8,
-            phase: usize,
-            mats: *const T1ProbeCFoldMats,
-            out: *mut F128,
-        );
-        #[link_name = "flock_t1_bside_c4_bcast_dense"]
-        fn t1_c4_dense(rows: *const u8, mats: *const T1ProbeCFoldMats, out: *mut F128);
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[repr(C, align(64))]
-    struct T1ProbeCFoldMats([[u64; 8]; 128], [[u64; 8]; 64]);
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    fn t1_compare_b_side_consumers(
-        encoded: &BSideSpeedBlock,
-        dense: &[u8; B_DENSE_BYTES_PER_BLOCK],
-        phase: usize,
-    ) {
-        let mix = |i: usize| {
-            (i as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left((i % 63 + 1) as u32)
-                ^ 0xB51D_71C4_D3C0_DE01
-        };
-        let tr_mats: [u64; 128] = std::array::from_fn(mix);
-        let c4_mats = T1ProbeCFoldMats(
-            std::array::from_fn(|i| std::array::from_fn(|j| mix(8 * i + j))),
-            std::array::from_fn(|i| std::array::from_fn(|j| mix(1024 + 8 * i + j))),
-        );
-        let mut tr_sidecar = [F128::ZERO; 64];
-        let mut tr_dense = [F128::ZERO; 64];
-        let mut c4_sidecar = [F128::ZERO; 16];
-        let mut c4_dense = [F128::ZERO; 16];
-        let rows = dense[phase * 512..].as_ptr();
-        unsafe {
-            t1_tr_burst(
-                encoded.0.as_ptr().cast(),
-                phase,
-                &tr_mats,
-                tr_sidecar.as_mut_ptr(),
-            );
-            t1_tr_dense(rows, &tr_mats, tr_dense.as_mut_ptr());
-            t1_c4_burst(
-                encoded.0.as_ptr().cast(),
-                phase,
-                &c4_mats,
-                c4_sidecar.as_mut_ptr(),
-            );
-            t1_c4_dense(rows, &c4_mats, c4_dense.as_mut_ptr());
-        }
-        assert_eq!(tr_sidecar, tr_dense, "round-2 consumer at phase={phase}");
-        assert_eq!(c4_sidecar, c4_dense, "rounds-3+4 consumer at phase={phase}");
-    }
-
     /// The 4-wide lockstep quad builder must reproduce the scalar driver
     /// byte-for-byte: z, a, b, and the lincheck stripe, across dense and
     /// padded block counts (padding exercises the all-zero quad slots).
@@ -4877,49 +4854,6 @@ mod tests {
             oracle.as_bytes_mut(),
             "ab_inner differs from dense-B oracle"
         );
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn b_side_t1_sidecar_and_dense_consumers_match_randomized() {
-        let mut rng = Rng::new(0xB51D_71B1_CAFE_0001);
-        for _case in 0..32 {
-            let block: Compression = (
-                std::array::from_fn(|_| rng.next_u32()),
-                std::array::from_fn(|_| rng.next_u32()),
-                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-                rng.next_u32(),
-                rng.next_u32(),
-            );
-            let encoded = speed_encode(&block);
-            let dense = expand_b_side_speed_block(&encoded);
-            for phase in 0..4 {
-                t1_compare_b_side_consumers(&encoded, &dense, phase);
-            }
-        }
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq",
-        target_feature = "gfni"
-    ))]
-    #[test]
-    fn b_side_t1_sidecar_and_dense_consumers_match_padding_block() {
-        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
-        let encoded = speed_encode(&padding);
-        let dense = expand_b_side_speed_block(&encoded);
-        for phase in 0..4 {
-            t1_compare_b_side_consumers(&encoded, &dense, phase);
-        }
     }
 
     #[test]

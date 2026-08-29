@@ -1939,7 +1939,12 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    if ab_inner.invalid_prefix_bytes() == 0 && b_packed.is_empty() {
+        // The ranked PACKED186 producer emitted every AB window and retained
+        // no dense B allocation. `fill_invalid_prefix` is a no-op below.
+    } else {
+        assert_eq!(b_packed.len(), total_bytes);
+    }
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
@@ -3156,7 +3161,11 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    if ab_inner.invalid_prefix_bytes() == 0 && b_packed.is_empty() {
+        // Fully populated PACKED186 route; no dense B is available or needed.
+    } else {
+        assert_eq!(b_packed.len(), total_bytes);
+    }
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
