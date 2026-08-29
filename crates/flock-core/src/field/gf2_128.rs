@@ -547,6 +547,53 @@ mod tests {
         }
     }
 
+    /// DirectFold8 diet split (shift/xor 0x87) must match CLMUL split and scalar.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ghash_mul_x4_split_diet_matches_split_and_scalar() {
+        use core::arch::x86_64::*;
+        let mut rng = Rng::new(0xD1E7_F01D);
+        for _ in 0..256 {
+            let vs = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let t = rng.next_f128();
+            // SAFETY: vpclmulqdq+avx512f enabled at compile time (cfg gate).
+            let (got_diet, got_split, got_pair): ([F128; 4], [F128; 4], [F128; 4]) = unsafe {
+                let v = _mm512_loadu_si512(vs.as_ptr() as *const __m512i);
+                let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+                let tx = x86_64::ghash_shift64_x4(tb);
+                let mut diet = [F128::ZERO; 4];
+                let mut split = [F128::ZERO; 4];
+                let mut pair = [F128::ZERO; 4];
+                _mm512_storeu_si512(
+                    diet.as_mut_ptr() as *mut __m512i,
+                    x86_64::ghash_mul_x4_split_diet(v, tb, tx),
+                );
+                _mm512_storeu_si512(
+                    split.as_mut_ptr() as *mut __m512i,
+                    x86_64::ghash_mul_x4_split(v, tb, tx),
+                );
+                let (p0, _) = x86_64::ghash_mul_x4_split_diet_pair(v, v, tb, tx);
+                _mm512_storeu_si512(pair.as_mut_ptr() as *mut __m512i, p0);
+                (diet, split, pair)
+            };
+            for lane in 0..4 {
+                let want = vs[lane] * t;
+                assert_eq!(got_diet[lane], want, "lane {lane}: diet != scalar");
+                assert_eq!(got_split[lane], want, "lane {lane}: split != scalar");
+                assert_eq!(got_pair[lane], want, "lane {lane}: diet_pair != scalar");
+            }
+        }
+    }
+
     /// The 4-lane deferred-reduction accumulator must equal the scalar
     /// XOR-of-`mul_unreduced` it replaces, both before and after `reduce()`.
     #[cfg(all(

@@ -433,6 +433,89 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// Per-lane `t0 + x^64·t1 (mod p)` with the 0x87 fold done by shift/xor.
+///
+/// `t1.hi · 0x87` is degree ≤ 70, so it is exactly
+/// `p<<7 ⊕ p<<2 ⊕ p<<1 ⊕ p` as a 128-bit carryless product — same field
+/// element as `gf2_128_reduce_x4`'s VPCLMUL, without occupying port 5.
+/// DirectFold8 diet only; NTT keeps the CLMUL reduce.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn gf2_128_reduce_x4_diet(t0: __m512i, t1: __m512i) -> __m512i {
+    // SAFETY: avx512f cfg-gated; byte/bit shifts are lane-local.
+    unsafe {
+        let t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
+        let p = _mm512_bsrli_epi128::<8>(t1);
+        let lo = _mm512_xor_si512(
+            _mm512_xor_si512(p, _mm512_slli_epi64(p, 1)),
+            _mm512_xor_si512(_mm512_slli_epi64(p, 2), _mm512_slli_epi64(p, 7)),
+        );
+        let hi = _mm512_xor_si512(
+            _mm512_xor_si512(_mm512_srli_epi64(p, 63), _mm512_srli_epi64(p, 62)),
+            _mm512_srli_epi64(p, 57),
+        );
+        _mm512_xor_si512(t0, _mm512_xor_si512(lo, _mm512_bslli_epi128::<8>(hi)))
+    }
+}
+
+/// DirectFold8 / slice-fold split product: same four VPCLMUL immediates as
+/// [`ghash_mul_x4_split`] (`t` and `t_x64 = t·x^64`), 0x87 fold via
+/// [`gf2_128_reduce_x4_diet`]. Field-identical; 4 CLMUL instead of 5.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` and that `t_x64` is
+/// `t·x^64 mod p` in every lane (typically [`ghash_shift64_x4`] of a
+/// broadcast `r`).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_diet(v: __m512i, t: __m512i, t_x64: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the companion contract.
+    unsafe {
+        let lo = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(v, t),
+            _mm512_clmulepi64_epi128::<0x01>(v, t_x64),
+        );
+        let hi = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(v, t),
+            _mm512_clmulepi64_epi128::<0x11>(v, t_x64),
+        );
+        gf2_128_reduce_x4_diet(lo, hi)
+    }
+}
+
+/// Two independent [`ghash_mul_x4_split_diet`] products with the eight
+/// product CLMULs issued before either 0x87 fold — hides VPCLMUL latency
+/// across a DirectFold8 8-lane (two×4) batch sharing one broadcast companion.
+///
+/// # Safety
+/// Same contract as [`ghash_mul_x4_split_diet`] on both `v0` and `v1`.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_diet_pair(
+    v0: __m512i,
+    v1: __m512i,
+    t: __m512i,
+    t_x64: __m512i,
+) -> (__m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the companion contract.
+    unsafe {
+        let a00 = _mm512_clmulepi64_epi128::<0x00>(v0, t);
+        let a10 = _mm512_clmulepi64_epi128::<0x00>(v1, t);
+        let a01 = _mm512_clmulepi64_epi128::<0x01>(v0, t_x64);
+        let a11 = _mm512_clmulepi64_epi128::<0x01>(v1, t_x64);
+        let b00 = _mm512_clmulepi64_epi128::<0x10>(v0, t);
+        let b10 = _mm512_clmulepi64_epi128::<0x10>(v1, t);
+        let b01 = _mm512_clmulepi64_epi128::<0x11>(v0, t_x64);
+        let b11 = _mm512_clmulepi64_epi128::<0x11>(v1, t_x64);
+        (
+            gf2_128_reduce_x4_diet(_mm512_xor_si512(a00, a01), _mm512_xor_si512(b00, b01)),
+            gf2_128_reduce_x4_diet(_mm512_xor_si512(a10, a11), _mm512_xor_si512(b10, b11)),
+        )
+    }
+}
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many

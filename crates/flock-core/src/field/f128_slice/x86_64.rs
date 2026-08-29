@@ -1,29 +1,60 @@
 use crate::field::F128;
 
+/// Deinterleave 8 adjacent source F128 at `s` into even/odd 4-lane vectors.
+///
+/// # Safety
+/// `avx512f`; `s..s+8` readable.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn fold4_even_diff(
+    src: *const F128,
+    s: usize,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller covers eight F128 and avx512f.
+    unsafe {
+        let lo = _mm512_loadu_si512(src.add(s) as *const __m512i);
+        let hi = _mm512_loadu_si512(src.add(s + 4) as *const __m512i);
+        let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+        let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+        (even, _mm512_xor_si512(even, odd))
+    }
+}
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
+/// Broadcast-`r` companion is hoisted once (`ghash_shift64_x4`); the 8-lane
+/// DirectFold8 batch issues two diet split-muls against that live companion.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        ghash_mul_x4_split_diet, ghash_mul_x4_split_diet_pair, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
         let r_x64 = ghash_shift64_x4(r_bcast);
-        let lanes = dst.len() & !3;
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
+        let lanes8 = dst.len() & !7;
         let mut t = 0;
-        while t < lanes {
-            let s = 2 * (base + t);
-            let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            let diff = _mm512_xor_si512(even, odd);
-            let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+        while t < lanes8 {
+            let (e0, d0) = fold4_even_diff(src_ptr, 2 * (base + t));
+            let (e1, d1) = fold4_even_diff(src_ptr, 2 * (base + t + 4));
+            let (m0, m1) = ghash_mul_x4_split_diet_pair(d0, d1, r_bcast, r_x64);
+            _mm512_storeu_si512(dst_ptr.add(t) as *mut __m512i, _mm512_xor_si512(e0, m0));
+            _mm512_storeu_si512(dst_ptr.add(t + 4) as *mut __m512i, _mm512_xor_si512(e1, m1));
+            t += 8;
+        }
+        let lanes4 = dst.len() & !3;
+        while t < lanes4 {
+            let (even, diff) = fold4_even_diff(src_ptr, 2 * (base + t));
+            let new = _mm512_xor_si512(even, ghash_mul_x4_split_diet(diff, r_bcast, r_x64));
+            _mm512_storeu_si512(dst_ptr.add(t) as *mut __m512i, new);
             t += 4;
         }
         portable_tail(src, base, dst, r, t);
@@ -36,7 +67,7 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
 /// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split_diet, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(dst.len(), addend.len());
@@ -50,7 +81,7 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
             let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
             let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
             let corrected =
-                _mm512_xor_si512(current, ghash_mul_x4_split(extra, scale_x4, scale_x64));
+                _mm512_xor_si512(current, ghash_mul_x4_split_diet(extra, scale_x4, scale_x64));
             _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
             i += 4;
         }
@@ -76,7 +107,9 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
     r: F128,
     scale: F128,
 ) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        ghash_mul_x4_split_diet, ghash_mul_x4_split_diet_pair, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     // SAFETY: caller supplies target features and source bounds.
@@ -93,21 +126,21 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
             let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
             let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
             let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
-            let src_folded = _mm512_xor_si512(
-                src_even,
-                ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
-            );
             let addend_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
             let addend_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
             let addend_even = _mm512_shuffle_i32x4::<0x88>(addend_lo, addend_hi);
             let addend_odd = _mm512_shuffle_i32x4::<0xDD>(addend_lo, addend_hi);
-            let addend_folded = _mm512_xor_si512(
-                addend_even,
-                ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
+            let (src_m, addend_m) = ghash_mul_x4_split_diet_pair(
+                _mm512_xor_si512(src_even, src_odd),
+                _mm512_xor_si512(addend_even, addend_odd),
+                r_x4,
+                r_x64,
             );
+            let src_folded = _mm512_xor_si512(src_even, src_m);
+            let addend_folded = _mm512_xor_si512(addend_even, addend_m);
             let output = _mm512_xor_si512(
                 src_folded,
-                ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
+                ghash_mul_x4_split_diet(addend_folded, scale_x4, scale_x64),
             );
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
             t += 4;
@@ -142,15 +175,18 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///   high = a2 + r0·(a2+a3)
 ///   dst[t] = low + r1·(low+high)
 ///
-/// Four slots (16 source F128) per iteration. Same even/odd pairing and
-/// `ghash_mul_x4(r, even XOR odd)` body as [`fold_pairs`], applied twice
-/// in registers. Stores `dst` only — no mid buffer.
+/// Four slots (16 source F128) per iteration. Same even/odd pairing as
+/// [`fold_pairs`]: diet split-mul against companions hoisted once per
+/// function (`r0_x64`, `r1_x64`). The two r0 products share one pair issue.
+/// Stores `dst` only — no mid buffer.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        ghash_mul_x4_split_diet, ghash_mul_x4_split_diet_pair, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     // SAFETY: caller guarantees the target features and source bounds.
@@ -171,23 +207,23 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
             let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
             let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
-            let mid01 = _mm512_xor_si512(
-                even01,
-                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
-            );
             let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
             let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
-            let mid23 = _mm512_xor_si512(
-                even23,
-                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
+            let (m01, m23) = ghash_mul_x4_split_diet_pair(
+                _mm512_xor_si512(even01, odd01),
+                _mm512_xor_si512(even23, odd23),
+                r0_bcast,
+                r0_x64,
             );
+            let mid01 = _mm512_xor_si512(even01, m01);
+            let mid23 = _mm512_xor_si512(even23, m23);
 
             // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
             let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
             let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
             let out = _mm512_xor_si512(
                 low,
-                ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
+                ghash_mul_x4_split_diet(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
             );
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
             t += 4;
@@ -319,7 +355,9 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut Vec<F128>,
     r: F128,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{
+        WideGhashX4, ghash_mul_x4_split_diet_pair, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
 
     debug_assert_eq!(f.len(), b.len());
@@ -332,16 +370,6 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
         let r_x64 = ghash_shift64_x4(r_bcast);
 
-        let fold4 = |ptr: *const F128, t: usize| -> __m512i {
-            let s = 2 * t;
-            let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
-            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
-            let diff = _mm512_xor_si512(even, odd);
-            _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64))
-        };
-
         let mut u0_acc = WideGhashX4::zero();
         let mut u2_acc = WideGhashX4::zero();
         let f_ptr = f.as_mut_ptr();
@@ -349,10 +377,16 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let lanes = half & !7;
         let mut t = 0usize;
         while t < lanes {
-            let f0 = fold4(f_ptr, t);
-            let f1 = fold4(f_ptr, t + 4);
-            let b0 = fold4(b_ptr, t);
-            let b1 = fold4(b_ptr, t + 4);
+            let (fe0, fd0) = fold4_even_diff(f_ptr, 2 * t);
+            let (fe1, fd1) = fold4_even_diff(f_ptr, 2 * (t + 4));
+            let (be0, bd0) = fold4_even_diff(b_ptr, 2 * t);
+            let (be1, bd1) = fold4_even_diff(b_ptr, 2 * (t + 4));
+            let (fm0, fm1) = ghash_mul_x4_split_diet_pair(fd0, fd1, r_bcast, r_x64);
+            let (bm0, bm1) = ghash_mul_x4_split_diet_pair(bd0, bd1, r_bcast, r_x64);
+            let f0 = _mm512_xor_si512(fe0, fm0);
+            let f1 = _mm512_xor_si512(fe1, fm1);
+            let b0 = _mm512_xor_si512(be0, bm0);
+            let b1 = _mm512_xor_si512(be1, bm1);
             _mm512_storeu_si512(f_ptr.add(t) as *mut __m512i, f0);
             _mm512_storeu_si512(f_ptr.add(t + 4) as *mut __m512i, f1);
             _mm512_storeu_si512(b_ptr.add(t) as *mut __m512i, b0);
