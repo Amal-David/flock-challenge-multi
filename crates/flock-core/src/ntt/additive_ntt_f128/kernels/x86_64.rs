@@ -1063,6 +1063,287 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     }
 }
 
+/// Two independent HOLD4 groups: eight message-row loads issued before the
+/// first CLMUL, then the same two 2-layer butterflies HOLD4 would have run
+/// as separate calls. Destinations must not alias each other or `src`.
+///
+/// # Safety
+/// Union of two HOLD4 contracts. When a `pf_src*` is non-null, its four
+/// rows are valid.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo2(
+    src: *const F128,
+    src_quarter: usize,
+    src_r0: usize,
+    src_r1: usize,
+    dst_sparse0: *mut F128,
+    dst_dense0: *mut F128,
+    dst_sparse1: *mut F128,
+    dst_dense1: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src0: *const F128,
+    pf_src1: *const F128,
+) {
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_dense_geo2_impl::<false>(
+                src,
+                src_quarter,
+                src_r0,
+                src_r1,
+                dst_sparse0,
+                dst_dense0,
+                dst_sparse1,
+                dst_dense1,
+                dst_quarter,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                pf_src0,
+                pf_src1,
+            )
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_geo2_impl::<true>(
+                src,
+                src_quarter,
+                src_r0,
+                src_r1,
+                dst_sparse0,
+                dst_dense0,
+                dst_sparse1,
+                dst_dense1,
+                dst_quarter,
+                num_ntts,
+                right_twiddle,
+                dense_tw,
+                pf_src0,
+                pf_src1,
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo2`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo2_impl<const DIET: bool>(
+    src: *const F128,
+    src_quarter: usize,
+    src_r0: usize,
+    src_r1: usize,
+    dst_sparse0: *mut F128,
+    dst_dense0: *mut F128,
+    dst_sparse1: *mut F128,
+    dst_dense1: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src0: *const F128,
+    pf_src1: *const F128,
+) {
+    use core::arch::x86_64::*;
+    let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
+    let pf0 = !pf_src0.is_null();
+    let pf1 = !pf_src1.is_null();
+    unsafe {
+        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
+        let outer = tw_x4::<false, DIET>(t_outer);
+        let inner_a = tw_x4::<false, DIET>(t_inner_a);
+        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let src0 = |i: usize| src.add((i * src_quarter + src_r0) * num_ntts);
+        let src1 = |i: usize| src.add((i * src_quarter + src_r1) * num_ntts);
+        let sp0 = |i: usize| dst_sparse0.add((i * dst_quarter) * num_ntts);
+        let dn0 = |i: usize| dst_dense0.add((i * dst_quarter) * num_ntts);
+        let sp1 = |i: usize| dst_sparse1.add((i * dst_quarter) * num_ntts);
+        let dn1 = |i: usize| dst_dense1.add((i * dst_quarter) * num_ntts);
+        let pf0_row = |i: usize| pf_src0.add(i * src_quarter * num_ntts) as *const i8;
+        let pf1_row = |i: usize| pf_src1.add(i * src_quarter * num_ntts) as *const i8;
+        let lanes = num_ntts & !3;
+        let mut lane = 0;
+        while lane < lanes {
+            let off = lane * core::mem::size_of::<F128>();
+            if pf0 {
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf0_row(i).add(off));
+                }
+            }
+            if pf1 {
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf1_row(i).add(off));
+                }
+            }
+            // Eight independent 64-byte gathers in flight before CLMUL.
+            let a0 = _mm512_loadu_si512(src0(0).add(lane) as *const __m512i);
+            let b0 = _mm512_loadu_si512(src0(1).add(lane) as *const __m512i);
+            let c0 = _mm512_loadu_si512(src0(2).add(lane) as *const __m512i);
+            let d0 = _mm512_loadu_si512(src0(3).add(lane) as *const __m512i);
+            let a1 = _mm512_loadu_si512(src1(0).add(lane) as *const __m512i);
+            let b1 = _mm512_loadu_si512(src1(1).add(lane) as *const __m512i);
+            let c1 = _mm512_loadu_si512(src1(2).add(lane) as *const __m512i);
+            let d1 = _mm512_loadu_si512(src1(3).add(lane) as *const __m512i);
+
+            let (sa0, sb0, sc0, sd0, da0, db0, dc0, dd0) =
+                seed_hold4_regs::<DIET>(a0, b0, c0, d0, sparse_b, outer, inner_a, inner_b);
+            let (sa1, sb1, sc1, sd1, da1, db1, dc1, dd1) =
+                seed_hold4_regs::<DIET>(a1, b1, c1, d1, sparse_b, outer, inner_a, inner_b);
+            _mm512_storeu_si512(sp0(0).add(lane) as *mut __m512i, sa0);
+            _mm512_storeu_si512(sp0(1).add(lane) as *mut __m512i, sb0);
+            _mm512_storeu_si512(sp0(2).add(lane) as *mut __m512i, sc0);
+            _mm512_storeu_si512(sp0(3).add(lane) as *mut __m512i, sd0);
+            _mm512_storeu_si512(dn0(0).add(lane) as *mut __m512i, da0);
+            _mm512_storeu_si512(dn0(1).add(lane) as *mut __m512i, db0);
+            _mm512_storeu_si512(dn0(2).add(lane) as *mut __m512i, dc0);
+            _mm512_storeu_si512(dn0(3).add(lane) as *mut __m512i, dd0);
+            _mm512_storeu_si512(sp1(0).add(lane) as *mut __m512i, sa1);
+            _mm512_storeu_si512(sp1(1).add(lane) as *mut __m512i, sb1);
+            _mm512_storeu_si512(sp1(2).add(lane) as *mut __m512i, sc1);
+            _mm512_storeu_si512(sp1(3).add(lane) as *mut __m512i, sd1);
+            _mm512_storeu_si512(dn1(0).add(lane) as *mut __m512i, da1);
+            _mm512_storeu_si512(dn1(1).add(lane) as *mut __m512i, db1);
+            _mm512_storeu_si512(dn1(2).add(lane) as *mut __m512i, dc1);
+            _mm512_storeu_si512(dn1(3).add(lane) as *mut __m512i, dd1);
+            lane += 4;
+        }
+        while lane < num_ntts {
+            seed_hold4_scalar(
+                src0,
+                sp0,
+                dn0,
+                lane,
+                right_twiddle,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+            seed_hold4_scalar(
+                src1,
+                sp1,
+                dn1,
+                lane,
+                right_twiddle,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+            lane += 1;
+        }
+    }
+}
+
+/// One HOLD4 group in registers: sparse 2-layer then dense 2-layer.
+/// Bit-identical to the body of [`butterfly_fused_2layer_row_from_sparse_dense_geo_impl`].
+/// Inlined into the `#[target_feature]` caller; must not carry its own
+/// `target_feature` (`inline(always)` + `target_feature` is rejected).
+#[inline(always)]
+unsafe fn seed_hold4_regs<const DIET: bool>(
+    va: core::arch::x86_64::__m512i,
+    vb: core::arch::x86_64::__m512i,
+    vc: core::arch::x86_64::__m512i,
+    vd: core::arch::x86_64::__m512i,
+    sparse_b: TwX4,
+    outer: TwX4,
+    inner_a: TwX4,
+    inner_b: TwX4,
+) -> (
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        // Sparse group keeps the original `va`; dense overwrites a working copy.
+        let mut sb = vb;
+        let mut sc = _mm512_xor_si512(vc, va);
+        let mut sd = _mm512_xor_si512(vd, vb);
+        sb = _mm512_xor_si512(sb, va);
+        let new_c = _mm512_xor_si512(sc, mul_x4::<false, DIET>(sparse_b, sd));
+        sd = _mm512_xor_si512(sd, new_c);
+        sc = new_c;
+
+        let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
+        let mut dvc = _mm512_xor_si512(vc, new_a);
+        let mut dva = new_a;
+        let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
+        let mut dvd = _mm512_xor_si512(vd, new_b);
+        let mut dvb = new_b;
+        let new_a = _mm512_xor_si512(dva, mul_x4::<false, DIET>(inner_a, dvb));
+        dvb = _mm512_xor_si512(dvb, new_a);
+        dva = new_a;
+        let new_c = _mm512_xor_si512(dvc, mul_x4::<false, DIET>(inner_b, dvd));
+        dvd = _mm512_xor_si512(dvd, new_c);
+        dvc = new_c;
+        (va, sb, sc, sd, dva, dvb, dvc, dvd)
+    }
+}
+
+/// Scalar HOLD4 tail for leftover lanes. `src`/`sp`/`dn` close over the
+/// group's row bases.
+///
+/// # Safety
+/// `lane` is in-bounds for every row closure.
+#[inline(always)]
+unsafe fn seed_hold4_scalar(
+    src: impl Fn(usize) -> *const F128,
+    sp: impl Fn(usize) -> *mut F128,
+    dn: impl Fn(usize) -> *mut F128,
+    lane: usize,
+    right_twiddle: F128,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    unsafe {
+        let a = *src(0).add(lane);
+        let b = *src(1).add(lane);
+        let c = *src(2).add(lane);
+        let d = *src(3).add(lane);
+        let mut sb = b;
+        let mut sc = c + a;
+        let mut sd = d + b;
+        sb += a;
+        let new_c = sc + sd * right_twiddle;
+        sd += new_c;
+        sc = new_c;
+        *sp(0).add(lane) = a;
+        *sp(1).add(lane) = sb;
+        *sp(2).add(lane) = sc;
+        *sp(3).add(lane) = sd;
+        let mut va = a;
+        let mut vb = b;
+        let mut vc = c;
+        let mut vd = d;
+        let new_a = va + vc * t_outer;
+        vc += new_a;
+        va = new_a;
+        let new_b = vb + vd * t_outer;
+        vd += new_b;
+        vb = new_b;
+        let new_a = va + vb * t_inner_a;
+        vb += new_a;
+        va = new_a;
+        let new_c = vc + vd * t_inner_b;
+        vd += new_c;
+        vc = new_c;
+        *dn(0).add(lane) = va;
+        *dn(1).add(lane) = vb;
+        *dn(2).add(lane) = vc;
+        *dn(3).add(lane) = vd;
+    }
+}
+
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]

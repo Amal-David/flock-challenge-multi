@@ -279,6 +279,22 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_HOLD8=1` restores the four-row HOLD4 seed step.
+/// Default ON: one kernel issues eight message-row loads (two HOLD4 groups)
+/// before any CLMUL, then runs the two independent 2-layer butterflies.
+/// Same bytes as two HOLD4 calls; the extra in-flight gathers are the MLP
+/// experiment the 4-stream seed was still bound by (~0.66 uops/cycle).
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_seed_hold8_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD8").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -2725,18 +2741,71 @@ impl AdditiveNttF128 {
                         target_feature = "vpclmulqdq"
                     ))]
                     if !ntt_seed_hold4_disabled() {
-                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
-                            src,
-                            block_size,
-                            r_s,
-                            bufp.add(kp * row_len),
-                            bufp.add((256 + kp) * row_len),
-                            64,
-                            row_len,
-                            seed_right,
-                            &seed_dense,
-                            pf_next,
-                        );
+                        if !ntt_seed_hold8_disabled() {
+                            // Odd k was issued with the previous even k.
+                            if k.is_multiple_of(2) {
+                                let r_s1 = r_s + sub_stride;
+                                let kp1 = perm(k + 1);
+                                let mut pf_next1: *const F128 = core::ptr::null();
+                                if pf_dist != 0 && k + 2 < 64 {
+                                    if pf_spread {
+                                        pf_next = src.add((r + (k + 2) * sub_stride) * row_len);
+                                        if k + 3 < 64 {
+                                            pf_next1 =
+                                                src.add((r + (k + 3) * sub_stride) * row_len);
+                                        }
+                                    } else {
+                                        pf_msg_rows(
+                                            src,
+                                            r + (k + 2) * sub_stride,
+                                            block_size,
+                                            row_len,
+                                            pf_lines,
+                                        );
+                                        if k + 3 < 64 {
+                                            pf_msg_rows(
+                                                src,
+                                                r + (k + 3) * sub_stride,
+                                                block_size,
+                                                row_len,
+                                                pf_lines,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    pf_next = core::ptr::null();
+                                }
+                                kernels::butterfly_fused_2layer_row_from_sparse_dense_geo2(
+                                    src,
+                                    block_size,
+                                    r_s,
+                                    r_s1,
+                                    bufp.add(kp * row_len),
+                                    bufp.add((256 + kp) * row_len),
+                                    bufp.add(kp1 * row_len),
+                                    bufp.add((256 + kp1) * row_len),
+                                    64,
+                                    row_len,
+                                    seed_right,
+                                    &seed_dense,
+                                    pf_next,
+                                    pf_next1,
+                                );
+                            }
+                        } else {
+                            kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                                src,
+                                block_size,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                bufp.add((256 + kp) * row_len),
+                                64,
+                                row_len,
+                                seed_right,
+                                &seed_dense,
+                                pf_next,
+                            );
+                        }
                     } else if pf_next.is_null() {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo(
                             src,
@@ -5735,6 +5804,83 @@ mod tests {
         assert!(!direct_fused2_publish_shape(19, 64, 4));
         assert!(!direct_fused2_publish_shape(20, 32, 4));
         assert!(!direct_fused2_publish_shape(20, 64, 8));
+    }
+
+    /// HOLD8 (eight in-flight message rows) matches two HOLD4 calls on the
+    /// same pair of source rows. AVX-512 only; the portable geo2 wrapper is
+    /// two HOLD4 calls by construction.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn seed_hold8_kernel_matches_two_hold4_calls() {
+        let mut rng = Rng::new(0x5018_0008);
+        const SRC_Q: usize = 8;
+        const DST_Q: usize = 8;
+        const N: usize = 8;
+        let n_src = 4 * SRC_Q * N;
+        let n_dst = 4 * DST_Q * N;
+        let src = rand_vec(&mut rng, n_src);
+        let right = rng.f128();
+        let dense = [rng.f128(), rng.f128(), rng.f128()];
+        let r0 = 1usize;
+        let r1 = 3usize;
+        let mut sp0 = vec![F128::ZERO; n_dst];
+        let mut dn0 = vec![F128::ZERO; n_dst];
+        let mut sp1 = vec![F128::ZERO; n_dst];
+        let mut dn1 = vec![F128::ZERO; n_dst];
+        let mut sp0b = vec![F128::ZERO; n_dst];
+        let mut dn0b = vec![F128::ZERO; n_dst];
+        let mut sp1b = vec![F128::ZERO; n_dst];
+        let mut dn1b = vec![F128::ZERO; n_dst];
+        unsafe {
+            super::kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                src.as_ptr(),
+                SRC_Q,
+                r0,
+                sp0.as_mut_ptr(),
+                dn0.as_mut_ptr(),
+                DST_Q,
+                N,
+                right,
+                &dense,
+                core::ptr::null(),
+            );
+            super::kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                src.as_ptr(),
+                SRC_Q,
+                r1,
+                sp1.as_mut_ptr(),
+                dn1.as_mut_ptr(),
+                DST_Q,
+                N,
+                right,
+                &dense,
+                core::ptr::null(),
+            );
+            super::kernels::butterfly_fused_2layer_row_from_sparse_dense_geo2(
+                src.as_ptr(),
+                SRC_Q,
+                r0,
+                r1,
+                sp0b.as_mut_ptr(),
+                dn0b.as_mut_ptr(),
+                sp1b.as_mut_ptr(),
+                dn1b.as_mut_ptr(),
+                DST_Q,
+                N,
+                right,
+                &dense,
+                core::ptr::null(),
+                core::ptr::null(),
+            );
+        }
+        assert_eq!(sp0, sp0b, "sparse0");
+        assert_eq!(dn0, dn0b, "dense0");
+        assert_eq!(sp1, sp1b, "sparse1");
+        assert_eq!(dn1, dn1b, "dense1");
     }
 
     /// Seed fusion (layers 1–2 folded into the first six-layer top task) vs

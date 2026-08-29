@@ -556,6 +556,93 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     }
 }
 
+/// Two HOLD4 groups. x86 AVX-512 issues eight loads then both butterflies;
+/// other builds run two HOLD4 calls (same bytes).
+///
+/// # Safety
+/// Union of two [`butterfly_fused_2layer_row_from_sparse_dense_geo`] contracts.
+/// Destinations must not alias.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[allow(dead_code)] // Ranked seed path; portable dual is the rollback/oracle.
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo2(
+    src: *const F128,
+    src_quarter: usize,
+    src_r0: usize,
+    src_r1: usize,
+    dst_sparse0: *mut F128,
+    dst_dense0: *mut F128,
+    dst_sparse1: *mut F128,
+    dst_dense1: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src0: *const F128,
+    pf_src1: *const F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo2(
+            src,
+            src_quarter,
+            src_r0,
+            src_r1,
+            dst_sparse0,
+            dst_dense0,
+            dst_sparse1,
+            dst_dense1,
+            dst_quarter,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            pf_src0,
+            pf_src1,
+        );
+        return;
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    unsafe {
+        butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r0,
+            dst_sparse0,
+            dst_dense0,
+            dst_quarter,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            pf_src0,
+        );
+        butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r1,
+            dst_sparse1,
+            dst_dense1,
+            dst_quarter,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            pf_src1,
+        );
+    }
+}
+
 /// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
 ///
 /// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only
