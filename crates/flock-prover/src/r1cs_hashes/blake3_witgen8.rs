@@ -26,7 +26,8 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
-    round1_ab_inner_window_with_images, round1_ab_table_images,
+    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
+    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -534,6 +535,8 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) out: *mut u8,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
+    /// Ranked residual representation; dense producers leave this off.
+    pub(crate) one_rows_elided: bool,
 }
 
 #[repr(C, align(64))]
@@ -605,12 +608,36 @@ impl StreamProj<'_> {
     unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
+            if self.one_rows_elided && blk == 2 {
+                self.project_blocks_ranked_hot_offsets_residual::<2,0xfc>(plan,imgs,rows,off);
+                return;
+            }
+            if self.one_rows_elided && blk == 29 {
+                self.project_blocks_ranked_hot_offsets_residual::<29,0x0f>(plan,imgs,rows,off);
+                return;
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_residual<const BLK:usize,const KEEP:u8>(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            const { assert!((BLK==2 && KEEP==0xfc)||(BLK==29 && KEEP==0x0f)); }
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
         }
@@ -1331,9 +1358,19 @@ impl Drain8<'_> {
                         }
                     }
                     if blk == 0 {
-                        proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                        if proj.one_rows_elided {
+                            let mut j=0usize;
+                            while j!=8 { rows.publish_static::<0>(j,proj.stage); j+=1; }
+                        } else {
+                            proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                        }
                     } else if blk == 1 {
-                        proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                        if proj.one_rows_elided {
+                            let mut j=0usize;
+                            while j!=8 { rows.publish_static::<1>(j,proj.stage); j+=1; }
+                        } else {
+                            proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                        }
                     } else {
                         proj.project_blocks_ranked_zero(plan, imgs);
                     }

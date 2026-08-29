@@ -981,6 +981,42 @@ pub(crate) fn fold_block_major_one_shot_bind_top(
     }
 }
 
+/// Ranked identity-C fold plus the contribution of complete K-rows whose B
+/// multilinear extension is one.
+pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+    r_top: F128,
+) -> (Vec<F128>, Vec<F128>) {
+    assert_eq!(m, 32);
+    assert_eq!(k_log, 14);
+    assert_eq!(useful_bits, 15409);
+    assert_eq!(x_outer.len(), BLOCK_MAJOR_FACTORED_EQ_N_LOG);
+    let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+    let eq_lo = build_eq_table(outer_lo);
+    let eq_hi = build_eq_table(outer_hi);
+    let log_b = eq_lo.len().trailing_zeros() as usize;
+    let lo_mask = eq_lo.len() - 1;
+    let (full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
+        z,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base| {
+            std::array::from_fn(|lane| {
+                let outer = outer_base + lane;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            })
+        },
+        Some(r_top),
+        true,
+    );
+    (full, one.expect("ranked one-row fold requested"))
+}
+
 /// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
 /// of the block-major sweep (exact A/B control: the scalar 256-entry
 /// byte-table loop runs instead). Resolved once per process.
@@ -1478,7 +1514,8 @@ fn fold_block_major_gfni(
     dynamic: bool,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     top_bind: Option<F128>,
-) -> Vec<F128> {
+    ranked_one_rows: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
@@ -1723,7 +1760,9 @@ fn fold_block_major_gfni(
     // buffer carries the dead zero-fill; avoiding this comparatively small
     // clear would require a separate MaybeUninit ownership conversion.
     let mut out = vec![F128::ZERO; out_len];
-    out.par_chunks_mut(64).enumerate().for_each(|(blk, o)| {
+    let mut one = ranked_one_rows.then(|| vec![F128::ZERO; out_len]);
+    debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
+    let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
         if blk < live_blocks {
             // SAFETY: `active_workers` contains exactly producer chunks that
             // claimed a tile. Their first tile used `seed_zero=true` and
@@ -1753,10 +1792,34 @@ fn fold_block_major_gfni(
                     );
                 }
             }
+            if let Some(one_o) = one_o {
+                if blk < 18 {
+                    let scale = F128::ONE + r;
+                    for (dst, src) in one_o.iter_mut().zip(o.iter()) {
+                        *dst = scale * *src;
+                    }
+                } else if (108..112).contains(&blk) {
+                    for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
+                        *dst = r * *src;
+                    }
+                } else {
+                    one_o.fill(F128::ZERO);
+                }
+            }
             crate::field::f128_slice::bind_split_half(o, &hi, r);
         }
-    });
-    out
+    };
+    if let Some(one) = one.as_mut() {
+        out.par_chunks_mut(64)
+            .zip(one.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(blk, (o, one_o))| reduce_block(blk, o, Some(one_o)));
+    } else {
+        out.par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(blk, o)| reduce_block(blk, o, None));
+    }
+    (out, one)
 }
 
 /// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
@@ -1772,6 +1835,27 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
     top_bind: Option<F128>,
 ) -> Vec<F128> {
+    partial_fold_packed_z_block_major_padded_with_tables_result(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq8_at,
+        top_bind,
+        false,
+    )
+    .0
+}
+
+fn partial_fold_packed_z_block_major_padded_with_tables_result(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
+    top_bind: Option<F128>,
+    ranked_one_rows: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
 
     assert!(m >= k_log);
@@ -1830,6 +1914,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             dynamic,
             &eq8_at,
             top_bind,
+            ranked_one_rows,
         );
     }
 
@@ -2100,13 +2185,29 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
             probe_t2.elapsed().as_secs_f64() * 1e3
         );
     }
+    let one = if ranked_one_rows {
+        let r = top_bind.expect("ranked one-row contribution needs top bind");
+        assert_eq!(k, 1 << 14);
+        let half = k / 2;
+        let mut one = vec![F128::ZERO; half];
+        let scale_lo = F128::ONE + r;
+        for i in 0..1152 {
+            one[i] = scale_lo * out[i];
+        }
+        for i in 15104..15360 {
+            one[i - half] = r * out[i];
+        }
+        Some(one)
+    } else {
+        None
+    };
     if let Some(r) = top_bind {
         let half = out.len() / 2;
         let (lo, hi) = out.split_at_mut(half);
         crate::field::f128_slice::bind_split_half(lo, hi, r);
         out.truncate(half);
     }
-    out
+    (out, one)
 }
 
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
