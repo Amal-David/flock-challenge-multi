@@ -479,6 +479,57 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
+/// Best-effort `madvise(MADV_COLLAPSE)` for an already-faulted buffer:
+/// synchronously collapse any of its regions that faulted in as 4 KiB pages
+/// (THP allocation is opportunistic and can fail under fragmentation) into
+/// 2 MiB pages. Called only from the untimed setup-phase prewarm, after the
+/// first-touch pass, so a trial whose arena lost the hugepage lottery at
+/// fault time still enters the timed prove on 2 MiB mappings. On kernels
+/// without `MADV_COLLAPSE` (< 6.1) or with THP disabled the syscall fails
+/// and the buffer is left exactly as faulted; contents and mapping validity
+/// are never altered. `FLOCK_NO_MADV_COLLAPSE` is a local-diagnostics kill
+/// switch mirroring `FLOCK_NO_HUGEPAGES`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
+    if *DISABLED {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = ptr as usize + bytes;
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_COLLAPSE: usize = 25;
+    // SAFETY: the advised range lies within the caller's live buffer, and
+    // MADV_COLLAPSE never alters contents or mapping validity; failure is
+    // ignored (pure hint).
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_COLLAPSE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
