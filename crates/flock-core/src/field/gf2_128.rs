@@ -492,14 +492,170 @@ mod tests {
             let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, bi, "binius");
             assert_eq!(sw, un, "unreduced");
+        }
+    }
+
+    /// Dynamic source-enumerated test oracle: parses `x86_64.rs` at runtime,
+    /// enumerates all `ghash_mul_*` and wide variants, and validates bit-identical
+    /// results against the canonical portable reference.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn x86_source_enumerated_oracle() {
+        use core::arch::x86_64::*;
+        let src = include_str!("gf2_128/x86_64.rs");
+        let mut enumerated_fns: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("pub unsafe fn ghash_mul_") {
+                let fn_name = trimmed["pub unsafe fn ".len()..]
+                    .split('(')
+                    .next()
+                    .unwrap()
+                    .trim();
+                enumerated_fns.push(fn_name.to_string());
+            }
+        }
+        assert!(
+            !enumerated_fns.is_empty(),
+            "Source enumeration found 0 ghash_mul variants in x86_64.rs"
+        );
+
+        let mut rng = Rng::new(0x828_2026);
+        for _ in 0..256 {
+            let xs = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let ys = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+
+            for fn_name in &enumerated_fns {
+                match fn_name.as_str() {
+                    "ghash_mul_schoolbook" => {
+                        for i in 0..4 {
+                            let got = unsafe { x86_64::ghash_mul_schoolbook(xs[i], ys[i]) };
+                            assert_eq!(got, software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_binius" => {
+                        for i in 0..4 {
+                            let got = unsafe { x86_64::ghash_mul_binius(xs[i], ys[i]) };
+                            assert_eq!(got, software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_karatsuba_vec" => {
+                        for i in 0..4 {
+                            let got = unsafe { x86_64::ghash_mul_karatsuba_vec(xs[i], ys[i]) };
+                            assert_eq!(got, software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_karatsuba" => {
+                        for i in 0..4 {
+                            let got = unsafe { x86_64::ghash_mul_karatsuba(xs[i], ys[i]) };
+                            assert_eq!(got, software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_karatsuba_barrett" => {
+                        for i in 0..4 {
+                            let got = unsafe { x86_64::ghash_mul_karatsuba_barrett(xs[i], ys[i]) };
+                            assert_eq!(got, software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_low_rhs" => {
+                        for i in 0..4 {
+                            let rhs = F128 { lo: ys[i].lo, hi: 0 };
+                            let got = unsafe { x86_64::ghash_mul_low_rhs(xs[i], ys[i].lo) };
+                            assert_eq!(got, software::ghash_mul(xs[i], rhs));
+                        }
+                    }
+                    "ghash_mul_unreduced_x86" => {
+                        for i in 0..4 {
+                            let unreduced = unsafe { x86_64::ghash_mul_unreduced_x86(xs[i], ys[i]) };
+                            assert_eq!(unreduced.reduce(), software::ghash_mul(xs[i], ys[i]));
+                        }
+                    }
+                    "ghash_mul_x4" => {
+                        let got: [F128; 4] = unsafe {
+                            let xv = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
+                            let yv = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
+                            let r = x86_64::ghash_mul_x4(xv, yv);
+                            let mut out = [F128::ZERO; 4];
+                            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
+                            out
+                        };
+                        for lane in 0..4 {
+                            assert_eq!(
+                                got[lane],
+                                software::ghash_mul(xs[lane], ys[lane]),
+                                "lane {lane} mismatch for ghash_mul_x4"
+                            );
+                        }
+                    }
+                    "ghash_mul_x4_low_lhs" => {
+                        let mut xs_low = xs;
+                        for x in &mut xs_low {
+                            x.hi = 0;
+                        }
+                        let got: [F128; 4] = unsafe {
+                            let xv = _mm512_loadu_si512(xs_low.as_ptr() as *const __m512i);
+                            let yv = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
+                            let r = x86_64::ghash_mul_x4_low_lhs(xv, yv);
+                            let mut out = [F128::ZERO; 4];
+                            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
+                            out
+                        };
+                        for lane in 0..4 {
+                            assert_eq!(
+                                got[lane],
+                                software::ghash_mul(xs_low[lane], ys[lane]),
+                                "lane {lane} mismatch for ghash_mul_x4_low_lhs"
+                            );
+                        }
+                    }
+                    "ghash_mul_x4_split" => {
+                        let t = ys[0];
+                        let tv = unsafe { _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64)) };
+                        let tv_x64 = unsafe { x86_64::ghash_shift64_x4(tv) };
+                        let got: [F128; 4] = unsafe {
+                            let xv = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
+                            let r = x86_64::ghash_mul_x4_split(xv, tv, tv_x64);
+                            let mut out = [F128::ZERO; 4];
+                            _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r);
+                            out
+                        };
+                        for lane in 0..4 {
+                            assert_eq!(
+                                got[lane],
+                                software::ghash_mul(xs[lane], t),
+                                "lane {lane} mismatch for ghash_mul_x4_split"
+                            );
+                        }
+                    }
+                    other => {
+                        panic!("Unrecognized enumerated variant in x86_64.rs: {other}");
+                    }
+                }
+            }
         }
     }
 
