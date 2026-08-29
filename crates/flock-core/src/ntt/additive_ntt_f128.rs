@@ -506,7 +506,7 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
+    const DEFAULT_DEPTH: usize = 16;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)

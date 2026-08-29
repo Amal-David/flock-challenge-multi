@@ -577,10 +577,9 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(true)
         .open(&temporary)?;
     file.write_all(&bytes)?;
-    file.set_len(bytes.len() as u64)?;
     drop(file);
     std::fs::rename(temporary, path)
 }
