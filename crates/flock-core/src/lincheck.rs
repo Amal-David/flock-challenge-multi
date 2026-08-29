@@ -1043,6 +1043,36 @@ fn lc_gather4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_FUSE_FOLD=1` restores gather-to-`transposed` then
+/// [`kernels::gfni_fold_tile`] reload. Default ON: keep each column's
+/// eight stripe halves in ZMMs and fold without the 4 KiB byte buffer.
+/// Ranked `env_clear()`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lc_fuse_fold_enabled() -> bool {
+    #[cfg(test)]
+    if LC_FUSE_FOLD_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FUSE_FOLD").is_none());
+    *ON
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+pub(crate) static LC_FUSE_FOLD_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
@@ -1303,6 +1333,78 @@ fn gather_transpose_group4_x86<const FUSE: bool>(
     }
 }
 
+/// Prefetch twin of [`gather_transpose_group4_x86`] that keeps each
+/// column's eight stripe halves in ZMMs instead of the 4 KiB byte slab.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gather_transpose_group4_x86_halves<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    full_chunks: usize,
+    pf_far: bool,
+    pf_spread: bool,
+    pf_chunks: usize,
+    col_lo: &mut [[core::arch::x86_64::__m512i; 8]; 4],
+    col_hi: &mut [[core::arch::x86_64::__m512i; 8]; 4],
+) {
+    use core::arch::x86_64::*;
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        if pf_far && !pf_spread {
+            let qn = q + pf_chunks;
+            if qn <= full_chunks && qn < chunks_per_block {
+                unsafe {
+                    for r in 0..8 {
+                        _mm_prefetch(
+                            z_packed
+                                .as_ptr()
+                                .add((outer_base + r) * chunks_per_block + qn)
+                                .cast::<i8>(),
+                            _MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+        } else if pf_far {
+        } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            unsafe {
+                for r in 0..8 {
+                    _mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        _MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        unsafe {
+            let mut lo_t = [_mm512_setzero_si512(); 4];
+            let mut hi_t = [_mm512_setzero_si512(); 4];
+            kernels::gather_transpose_stripe4_x86_halves::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+                &mut lo_t,
+                &mut hi_t,
+            );
+            for c in 0..4 {
+                col_lo[c][t] = lo_t[c];
+                col_hi[c][t] = hi_t[c];
+            }
+        }
+    }
+}
+
 /// Single-column counterpart of [`gather_transpose_group4_x86`].
 #[cfg(all(
     target_arch = "x86_64",
@@ -1349,9 +1451,53 @@ fn gather_transpose_tile_x86<const FUSE: bool>(
     }
 }
 
+/// Single-column gather that keeps each stripe's 64-col halves in ZMMs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn gather_transpose_tile_x86_halves<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    rows_lo: &mut [core::arch::x86_64::__m512i; 8],
+    rows_hi: &mut [core::arch::x86_64::__m512i; 8],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            unsafe {
+                for r in 0..8 {
+                    core::arch::x86_64::_mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        // SAFETY: same readable lanes as [`gather_transpose_tile_x86`].
+        unsafe {
+            let (lo, hi) = kernels::gather_transpose_stripe_x86_halves::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+            );
+            rows_lo[t] = lo;
+            rows_hi[t] = hi;
+        }
+    }
+}
+
 /// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
 /// chunk) the eight gathered+transposed stripe rows drain through
-/// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
+/// [`kernels::gfni_fold_eight_rows`] (default) or [`kernels::gfni_fold_tile`]
 /// (16 planes x 64 columns per 64-column block); one transpose back to F128
 /// happens inside the cross-worker reduce. Bit-identical to the
 /// scalar/nibble arms: F128 addition IS bitwise XOR, so plane-domain
@@ -1536,6 +1682,8 @@ fn fold_block_major_gfni(
             // inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+            #[cfg(target_feature = "avx512vbmi")]
+            let fuse_fold = lc_fuse_fold_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1567,7 +1715,73 @@ fn fold_block_major_gfni(
                 if gather_tr_fused && lc_gather4_enabled() {
                     let full_chunks = useful_bits / 128;
                     while q + 4 <= full_chunks {
-                        if gather_tr_vpermt2b {
+                        if fuse_fold {
+                            use core::arch::x86_64::*;
+                            let mut col_lo = unsafe { [[_mm512_setzero_si512(); 8]; 4] };
+                            let mut col_hi = unsafe { [[_mm512_setzero_si512(); 8]; 4] };
+                            if gather_tr_vpermt2b {
+                                gather_transpose_group4_x86_halves::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut col_lo,
+                                    &mut col_hi,
+                                );
+                            } else {
+                                gather_transpose_group4_x86_halves::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut col_lo,
+                                    &mut col_hi,
+                                );
+                            }
+                            for c in 0..4 {
+                                if pf_far && pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        unsafe {
+                                            lc_prefetch_rows16(
+                                                z_packed.as_ptr().add(
+                                                    (8 * stripe_base + 16 * c) * chunks_per_block
+                                                        + qn,
+                                                ),
+                                                chunks_per_block,
+                                                cpb_ranked,
+                                            );
+                                        }
+                                    }
+                                }
+                                unsafe {
+                                    let out = wplanes
+                                        .as_mut_ptr()
+                                        .cast::<u8>()
+                                        .add(2 * (q + c) * 1024);
+                                    kernels::gfni_fold_eight_rows(
+                                        col_lo[c],
+                                        &mats,
+                                        out,
+                                        first_tile,
+                                    );
+                                    kernels::gfni_fold_eight_rows(
+                                        col_hi[c],
+                                        &mats,
+                                        out.add(1024),
+                                        first_tile,
+                                    );
+                                }
+                            }
+                        } else if gather_tr_vpermt2b {
                             gather_transpose_group4_x86::<true>(
                                 z_packed,
                                 chunks_per_block,
@@ -1579,6 +1793,33 @@ fn fold_block_major_gfni(
                                 pf_chunks,
                                 &mut transposed,
                             );
+                            for c in 0..4 {
+                                if pf_far && pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        unsafe {
+                                            lc_prefetch_rows16(
+                                                z_packed.as_ptr().add(
+                                                    (8 * stripe_base + 16 * c) * chunks_per_block
+                                                        + qn,
+                                                ),
+                                                chunks_per_block,
+                                                cpb_ranked,
+                                            );
+                                        }
+                                    }
+                                }
+                                unsafe {
+                                    kernels::gfni_fold_tile(
+                                        transposed.as_ptr().add(c * 1024),
+                                        128,
+                                        2,
+                                        &mats,
+                                        wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                        first_tile,
+                                    );
+                                }
+                            }
                         } else {
                             gather_transpose_group4_x86::<false>(
                                 z_packed,
@@ -1591,48 +1832,32 @@ fn fold_block_major_gfni(
                                 pf_chunks,
                                 &mut transposed,
                             );
-                        }
-                        for c in 0..4 {
-                            // Spread delivery: the same eight-hints-per-stripe
-                            // block, issued from the fold that follows the
-                            // gather instead of from the gather itself, two
-                            // stripes at a time. Same lines, same look-ahead.
-                            if pf_far && pf_spread {
-                                let qn = q + pf_chunks;
-                                if qn <= full_chunks && qn < chunks_per_block {
-                                    // Stripes 2c and 2c+1 are the SIXTEEN
-                                    // consecutive rows 8*stripe_base + 16c ..
-                                    // + 16, so one base pointer and a fixed
-                                    // row stride reach every hint the two
-                                    // eight-row blocks used to address one at
-                                    // a time. Same sixteen lines, same order.
-                                    // SAFETY: those rows are inside this
-                                    // tile's 64 and `qn < chunks_per_block`
-                                    // keeps the column inside the block, so
-                                    // every address the helper forms is in
-                                    // bounds; a prefetch never dereferences.
-                                    unsafe {
-                                        lc_prefetch_rows16(
-                                            z_packed.as_ptr().add(
-                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
-                                            ),
-                                            chunks_per_block,
-                                            cpb_ranked,
-                                        );
+                            for c in 0..4 {
+                                if pf_far && pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        unsafe {
+                                            lc_prefetch_rows16(
+                                                z_packed.as_ptr().add(
+                                                    (8 * stripe_base + 16 * c) * chunks_per_block
+                                                        + qn,
+                                                ),
+                                                chunks_per_block,
+                                                cpb_ranked,
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            // SAFETY: as for the single-column call below;
-                            // every grouped chunk is full (2 blocks of 64).
-                            unsafe {
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
-                                    &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
-                                    first_tile,
-                                );
+                                unsafe {
+                                    kernels::gfni_fold_tile(
+                                        transposed.as_ptr().add(c * 1024),
+                                        128,
+                                        2,
+                                        &mats,
+                                        wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                        first_tile,
+                                    );
+                                }
                             }
                         }
                         q += 4;
@@ -1642,25 +1867,85 @@ fn fold_block_major_gfni(
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
                     #[cfg(target_feature = "avx512vbmi")]
-                    if gather_tr_fused {
-                        if gather_tr_vpermt2b {
-                            gather_transpose_tile_x86::<true>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                &mut transposed,
-                            );
+                    {
+                        if gather_tr_fused && fuse_fold {
+                            use core::arch::x86_64::*;
+                            let mut rows_lo = unsafe { [_mm512_setzero_si512(); 8] };
+                            let mut rows_hi = unsafe { [_mm512_setzero_si512(); 8] };
+                            if gather_tr_vpermt2b {
+                                gather_transpose_tile_x86_halves::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
+                                    &mut rows_lo,
+                                    &mut rows_hi,
+                                );
+                            } else {
+                                gather_transpose_tile_x86_halves::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
+                                    &mut rows_lo,
+                                    &mut rows_hi,
+                                );
+                            }
+                            let n_blocks = chunk_bits.div_ceil(64);
+                            unsafe {
+                                let out = wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024);
+                                kernels::gfni_fold_eight_rows(rows_lo, &mats, out, first_tile);
+                                if n_blocks > 1 {
+                                    kernels::gfni_fold_eight_rows(
+                                        rows_hi,
+                                        &mats,
+                                        out.add(1024),
+                                        first_tile,
+                                    );
+                                }
+                            }
                         } else {
-                            gather_transpose_tile_x86::<false>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                &mut transposed,
-                            );
+                            if gather_tr_fused {
+                                if gather_tr_vpermt2b {
+                                    gather_transpose_tile_x86::<true>(
+                                        z_packed,
+                                        chunks_per_block,
+                                        stripe_base,
+                                        q,
+                                        &mut transposed,
+                                    );
+                                } else {
+                                    gather_transpose_tile_x86::<false>(
+                                        z_packed,
+                                        chunks_per_block,
+                                        stripe_base,
+                                        q,
+                                        &mut transposed,
+                                    );
+                                }
+                            } else {
+                                gather_transpose_tile_scalar(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base,
+                                    q,
+                                    &mut transposed,
+                                );
+                            }
+                            unsafe {
+                                kernels::gfni_fold_tile(
+                                    transposed.as_ptr(),
+                                    128,
+                                    chunk_bits.div_ceil(64),
+                                    &mats,
+                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                                    first_tile,
+                                );
+                            }
                         }
-                    } else {
+                    }
+                    #[cfg(not(target_feature = "avx512vbmi"))]
+                    {
                         gather_transpose_tile_scalar(
                             z_packed,
                             chunks_per_block,
@@ -1668,29 +1953,16 @@ fn fold_block_major_gfni(
                             q,
                             &mut transposed,
                         );
-                    }
-                    #[cfg(not(target_feature = "avx512vbmi"))]
-                    gather_transpose_tile_scalar(
-                        z_packed,
-                        chunks_per_block,
-                        stripe_base,
-                        q,
-                        &mut transposed,
-                    );
-                    // SAFETY: `transposed` holds 8 stripes x 128 bytes at
-                    // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
-                    // the worker planes cover (2q + chunk blocks) * 1024
-                    // bytes for every q < useful_chunks <= k/128. first_tile
-                    // is true iff this worker has not yet stored into wplanes.
-                    unsafe {
-                        kernels::gfni_fold_tile(
-                            transposed.as_ptr(),
-                            128,
-                            chunk_bits.div_ceil(64),
-                            &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
-                            first_tile,
-                        );
+                        unsafe {
+                            kernels::gfni_fold_tile(
+                                transposed.as_ptr(),
+                                128,
+                                chunk_bits.div_ceil(64),
+                                &mats,
+                                wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                                first_tile,
+                            );
+                        }
                     }
                     q += 1;
                 }
@@ -4021,6 +4293,89 @@ mod tests {
                                 .all(|&byte| byte == 0x5A)
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// Register-source GFNI fold must match gather-to-bytes then
+    /// [`kernels::gfni_fold_tile`] reload, including n_blocks64 = 1 and 2.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fuse_fold_matches_tile_reload() {
+        use core::arch::x86_64::*;
+        let mut rng = Rng::new(0xF05E_F01D);
+        for stride in [1usize, 4, 17, 128] {
+            let z: Vec<F128> = (0..8 * 8 * stride).map(|_| rng.f128()).collect();
+            let mut mats = [0u64; 128];
+            for t in 0..8 {
+                let eq8: [F128; 8] = std::array::from_fn(|_| rng.f128());
+                kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+            }
+            for fuse in [false, true] {
+                let mut tile = [0u8; 8 * 128];
+                let mut lo = unsafe { [_mm512_setzero_si512(); 8] };
+                let mut hi = unsafe { [_mm512_setzero_si512(); 8] };
+                unsafe {
+                    for t in 0..8 {
+                        let ptr = z.as_ptr().add(t * 8 * stride);
+                        if fuse {
+                            kernels::gather_transpose_stripe_x86::<true>(
+                                ptr,
+                                stride,
+                                tile.as_mut_ptr().add(t * 128),
+                            );
+                            let (l, h) = kernels::gather_transpose_stripe_x86_halves::<true>(
+                                ptr, stride,
+                            );
+                            lo[t] = l;
+                            hi[t] = h;
+                        } else {
+                            kernels::gather_transpose_stripe_x86::<false>(
+                                ptr,
+                                stride,
+                                tile.as_mut_ptr().add(t * 128),
+                            );
+                            let (l, h) = kernels::gather_transpose_stripe_x86_halves::<false>(
+                                ptr, stride,
+                            );
+                            lo[t] = l;
+                            hi[t] = h;
+                        }
+                    }
+                }
+                for n_blocks in [1usize, 2] {
+                    let mut want = vec![0u8; 2 * 1024];
+                    let mut got = vec![0u8; 2 * 1024];
+                    unsafe {
+                        kernels::gfni_fold_tile(
+                            tile.as_ptr(),
+                            128,
+                            n_blocks,
+                            &mats,
+                            want.as_mut_ptr(),
+                            true,
+                        );
+                        kernels::gfni_fold_eight_rows(lo, &mats, got.as_mut_ptr(), true);
+                        if n_blocks > 1 {
+                            kernels::gfni_fold_eight_rows(
+                                hi,
+                                &mats,
+                                got.as_mut_ptr().add(1024),
+                                true,
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        &want[..n_blocks * 1024],
+                        &got[..n_blocks * 1024],
+                        "stride={stride} fuse={fuse} n_blocks={n_blocks}"
+                    );
                 }
             }
         }

@@ -150,8 +150,8 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
 /// (asserted by the oracle test).
 ///
 /// # Safety
-/// Eight readable F128 at `z_ptr + r*stride` for r in 0..8; `out` covers
-/// 128 writable bytes; avx512f + avx512vbmi + gfni (module/cfg-gated).
+/// Eight readable F128 at `z_ptr + r*stride` for r in 0..8; avx512f +
+/// avx512vbmi + gfni (module/cfg-gated).
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -159,11 +159,10 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
+pub(crate) unsafe fn gather_transpose_stripe_x86_halves<const FUSE: bool>(
     z_ptr: *const F128,
     stride: usize,
-    out: *mut u8,
-) {
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
     use core::arch::x86_64::*;
     const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
     // SAFETY: bounds per the contract; features per the cfg gate.
@@ -192,8 +191,7 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_lo, z1));
             let t_hi =
                 _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_hi, z1));
-            _mm512_storeu_si512(out as *mut __m512i, t_lo);
-            _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+            (t_lo, t_hi)
         } else {
             // Incumbent: split into lo/hi qwords, then transpose bytes.
             let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
@@ -216,9 +214,36 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
             let t_hi =
                 _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
-            _mm512_storeu_si512(out as *mut __m512i, t_lo);
-            _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
+            (t_lo, t_hi)
         }
+    }
+}
+
+/// Store the two halves from [`gather_transpose_stripe_x86_halves`] into a
+/// 128-byte `out` tile. Kill-switch / oracle path; the fused fold keeps the
+/// halves in ZMMs instead.
+///
+/// # Safety
+/// Same readable lanes as [`gather_transpose_stripe_x86_halves`]; `out`
+/// covers 128 writable bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
+    z_ptr: *const F128,
+    stride: usize,
+    out: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: same contract as [`gather_transpose_stripe_x86_halves`].
+    unsafe {
+        let (t_lo, t_hi) = gather_transpose_stripe_x86_halves::<FUSE>(z_ptr, stride);
+        _mm512_storeu_si512(out as *mut __m512i, t_lo);
+        _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
     }
 }
 
@@ -249,8 +274,40 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     out_stride: usize,
 ) {
     use core::arch::x86_64::*;
-    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
     // SAFETY: bounds per the contract; features per the cfg gate.
+    unsafe {
+        let mut lo = [_mm512_setzero_si512(); 4];
+        let mut hi = [_mm512_setzero_si512(); 4];
+        gather_transpose_stripe4_x86_halves::<FUSE>(z_ptr, stride, &mut lo, &mut hi);
+        for c in 0..4 {
+            let dst = out.add(c * out_stride);
+            _mm512_storeu_si512(dst as *mut __m512i, lo[c]);
+            _mm512_storeu_si512(dst.add(64) as *mut __m512i, hi[c]);
+        }
+    }
+}
+
+/// As [`gather_transpose_stripe4_x86`], but keep each column's two 64-byte
+/// halves in ZMMs so [`gfni_fold_eight_rows`] can consume them without a
+/// byte-buffer store+reload. Grouped 64-byte row loads are unchanged.
+///
+/// # Safety
+/// Same readable lanes as [`gather_transpose_stripe4_x86`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gather_transpose_stripe4_x86_halves<const FUSE: bool>(
+    z_ptr: *const F128,
+    stride: usize,
+    lo: &mut [core::arch::x86_64::__m512i; 4],
+    hi: &mut [core::arch::x86_64::__m512i; 4],
+) {
+    use core::arch::x86_64::*;
+    const BIT_TRANSPOSE_ID: i64 = 0x8040_2010_0804_0201u64 as i64;
     unsafe {
         // Row r's columns q..q+3 in one wide load (64-aligned in production —
         // the pool's recyclable class — but loadu tolerates test vectors).
@@ -259,38 +316,34 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
         // 4×4 transpose of 128-bit lanes: cols[c] = lanes {row0..row3 at c}.
         #[inline(always)]
         unsafe fn tr4(a: __m512i, b: __m512i, c: __m512i, d: __m512i) -> [__m512i; 4] {
-            // SAFETY: caller carries avx512f.
             unsafe {
-                let ab_lo = _mm512_shuffle_i64x2::<0x44>(a, b); // a0 a1 b0 b1
-                let ab_hi = _mm512_shuffle_i64x2::<0xEE>(a, b); // a2 a3 b2 b3
+                let ab_lo = _mm512_shuffle_i64x2::<0x44>(a, b);
+                let ab_hi = _mm512_shuffle_i64x2::<0xEE>(a, b);
                 let cd_lo = _mm512_shuffle_i64x2::<0x44>(c, d);
                 let cd_hi = _mm512_shuffle_i64x2::<0xEE>(c, d);
                 [
-                    _mm512_shuffle_i64x2::<0x88>(ab_lo, cd_lo), // a0 b0 c0 d0
-                    _mm512_shuffle_i64x2::<0xDD>(ab_lo, cd_lo), // a1 b1 c1 d1
-                    _mm512_shuffle_i64x2::<0x88>(ab_hi, cd_hi), // a2 b2 c2 d2
-                    _mm512_shuffle_i64x2::<0xDD>(ab_hi, cd_hi), // a3 b3 c3 d3
+                    _mm512_shuffle_i64x2::<0x88>(ab_lo, cd_lo),
+                    _mm512_shuffle_i64x2::<0xDD>(ab_lo, cd_lo),
+                    _mm512_shuffle_i64x2::<0x88>(ab_hi, cd_hi),
+                    _mm512_shuffle_i64x2::<0xDD>(ab_hi, cd_hi),
                 ]
             }
         }
-        let z0s = tr4(r[0], r[1], r[2], r[3]); // per column: rows 0..3
-        let z1s = tr4(r[4], r[5], r[6], r[7]); // per column: rows 4..7
+        let z0s = tr4(r[0], r[1], r[2], r[3]);
+        let z1s = tr4(r[4], r[5], r[6], r[7]);
         let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
         if FUSE {
             let f_lo = _mm512_load_si512(FUSED_GATHER_LO.0.as_ptr() as *const __m512i);
             let f_hi = _mm512_load_si512(FUSED_GATHER_HI.0.as_ptr() as *const __m512i);
             for c in 0..4 {
-                let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
+                lo[c] = _mm512_gf2p8affine_epi64_epi8::<0>(
                     ident,
                     _mm512_permutex2var_epi8(z0s[c], f_lo, z1s[c]),
                 );
-                let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
+                hi[c] = _mm512_gf2p8affine_epi64_epi8::<0>(
                     ident,
                     _mm512_permutex2var_epi8(z0s[c], f_hi, z1s[c]),
                 );
-                let dst = out.add(c * out_stride);
-                _mm512_storeu_si512(dst as *mut __m512i, t_lo);
-                _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
             }
         } else {
             let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
@@ -310,13 +363,10 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
             for c in 0..4 {
                 let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
                 let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
-                let t_lo =
+                lo[c] =
                     _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
-                let t_hi =
+                hi[c] =
                     _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
-                let dst = out.add(c * out_stride);
-                _mm512_storeu_si512(dst as *mut __m512i, t_lo);
-                _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
             }
         }
     }
@@ -383,6 +433,43 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_eight_rows(
+    rows: [core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    planes: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        for byte_k in 0..16 {
+            let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+            let mut acc = if seed_zero {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            for t in (0..8).step_by(2) {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[t],
+                    _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[t + 1],
+                    _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
 pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
@@ -399,27 +486,12 @@ pub(crate) unsafe fn gfni_fold_tile(
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
-            let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
-                    _mm512_setzero_si512()
-                } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
-                };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                }
-                _mm512_storeu_si512(plane_ptr, acc);
-            }
+            gfni_fold_eight_rows(
+                rows,
+                mats,
+                out_planes_ptr.add(block * 1024),
+                seed_zero,
+            );
         }
     }
 }
