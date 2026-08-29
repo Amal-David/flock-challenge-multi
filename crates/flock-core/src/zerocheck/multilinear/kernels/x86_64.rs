@@ -1,3 +1,8 @@
+// `flock_bside_t1_probe` is an internal compile-only assembly/test gate. The
+// benchmark manifest cannot declare custom cfgs outside its editable surface,
+// so keep the lint allowance local to this x86 kernel module.
+#![allow(unexpected_cfgs)]
+
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -2375,21 +2380,21 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked_tr`].
-#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
-    rows: *const u8,
-    mats: &[u64; 128],
-    out: *mut F128,
-    dead_lines: u8,
-) {
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn load_64_rows_masked(rows: *const u8, dead_lines: u8) -> [core::arch::x86_64::__m512i; 8] {
     use core::arch::x86_64::*;
-    // SAFETY: as for `gfni_fold64_rows_masked_tr`.
+    // SAFETY: the caller supplies one readable 64-byte line for each live
+    // bit. Dead lines are represented by zero registers and are not read.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
         if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
             for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
             }
@@ -2400,6 +2405,27 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
                 }
             }
         }
+        z
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    // SAFETY: as for `gfni_fold64_rows_masked_tr`.
+    unsafe {
+        let z = load_64_rows_masked(rows, dead_lines);
         gfni_fold64_regs_sigma_bcast(z, mats, out);
     }
 }
@@ -2763,28 +2789,31 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     out: *mut F128,
     dead_lines: u8,
 ) {
-    use core::arch::x86_64::*;
-    // SAFETY (whole body): caller guarantees 64 readable bytes at
-    // `rows.add(64 * i)` for every line not marked dead and 16 writable
-    // `F128`s at `out`; the scratch is a local 512-byte array written and
-    // read in full; every shuffle index is in range and the cfg gate
-    // supplies each intrinsic.
+    // SAFETY: the wrapper owns the pointer/dead-line contract and the private
+    // body owns only eight initialized row registers plus output bounds.
     unsafe {
-        let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
-            // The ranked shape has no dead lines: one test replaces eight
-            // predicated loads.
-            for (i, slot) in z.iter_mut().enumerate() {
-                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-            }
-        } else {
-            for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
-                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
-                }
-            }
-        }
+        gfni_fold64_regs_c4_bcast(load_64_rows_masked(rows, dead_lines), m, out);
+    }
+}
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_regs_c4_bcast(
+    z: [core::arch::x86_64::__m512i; 8],
+    m: &CFoldMats,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller supplies eight initialized row registers
+    // and 16 writable `F128`s at `out`; the broadcast scratch is written and
+    // read in full and every shuffle index is in range.
+    unsafe {
         // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
         #[rustfmt::skip]
         const BT: [i8; 64] = [
@@ -2925,6 +2954,378 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
         }
         pass!(0);
         pass!(1);
+    }
+}
+
+// -------------------------------------------------------------------------
+// T1-only B-side burst feasibility prototype.
+//
+// The ranked prover does not reference these symbols. They answer one codegen
+// question only: can the canonical 186-bit/G sidecar be expanded one 4096-bit
+// quadrant at a time directly into the existing register consumers without a
+// decoded 512-byte input tile? Descriptor construction is const-evaluated;
+// the emitted decoder is eight unrolled AVX-512 qword gathers and funnel
+// shifts with no scalar row/bit loop and no runtime division or modulo.
+// -------------------------------------------------------------------------
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[derive(Copy, Clone)]
+struct BSideT1BurstZmmDesc {
+    source_base_bytes: u16,
+    idx_lo: [u8; 8],
+    shift_right: [u8; 8],
+    output_shift: [u8; 8],
+    variable_len: [u8; 8],
+}
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+const _: () = {
+    assert!(core::mem::size_of::<BSideT1BurstZmmDesc>() <= 64);
+    assert!(core::mem::size_of::<[[BSideT1BurstZmmDesc; 8]; 4]>() <= 2048);
+};
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+const fn b_side_t1_make_desc(quadrant: usize, zmm: usize) -> BSideT1BurstZmmDesc {
+    const GS_BASE: usize = 1153;
+    const G_STRIDE: usize = 250;
+    const PACKED_BITS_PER_G: usize = 186;
+
+    let mut source_chunks = [0usize; 8];
+    let mut source_shifts = [0u8; 8];
+    let mut output_shifts = [0u8; 8];
+    let mut variable_len = [0u8; 8];
+    let mut any_variable = false;
+    let mut min_chunk = usize::MAX;
+    let mut max_chunk = 0usize;
+    let mut lane = 0usize;
+    while lane < 8 {
+        let word_start = quadrant * 4096 + zmm * 512 + lane * 64;
+        let word_end = word_start + 64;
+        let mut var_start = 0usize;
+        let mut var_end = 0usize;
+        let mut var_g = 0usize;
+        let mut g = 0usize;
+        while g < 56 {
+            let g_start = GS_BASE + g * G_STRIDE;
+            let g_end = g_start + PACKED_BITS_PER_G;
+            let lo = if word_start > g_start {
+                word_start
+            } else {
+                g_start
+            };
+            let hi = if word_end < g_end { word_end } else { g_end };
+            if lo < hi {
+                var_start = lo;
+                var_end = hi;
+                var_g = g;
+                break;
+            }
+            g += 1;
+        }
+        if var_start < var_end {
+            any_variable = true;
+            let dst = var_start - word_start;
+            let len = var_end - var_start;
+            let g_start = GS_BASE + var_g * G_STRIDE;
+            let source_bit = var_g * 192 + (var_start - g_start);
+            let chunk = source_bit / 64;
+            let shift = source_bit % 64;
+            source_chunks[lane] = chunk;
+            source_shifts[lane] = shift as u8;
+            output_shifts[lane] = dst as u8;
+            variable_len[lane] = len as u8;
+            if chunk < min_chunk {
+                min_chunk = chunk;
+            }
+            if chunk > max_chunk {
+                max_chunk = chunk;
+            }
+        }
+        lane += 1;
+    }
+
+    // Three quadrants contain uniform fixed-one complements around their
+    // variable payloads. Q3's final two ZMMs cross the out_hi/padding seam and
+    // are represented by sentinels handled before any sidecar load.
+    let special = if quadrant == 0 && zmm < 2 {
+        u16::MAX
+    } else if quadrant == 3 && zmm == 6 {
+        u16::MAX - 1
+    } else if quadrant == 3 && zmm == 7 {
+        u16::MAX - 2
+    } else {
+        0
+    };
+    let source_base_chunk = if any_variable { (min_chunk / 8) * 8 } else { 0 };
+    assert!(!any_variable || max_chunk + 1 <= source_base_chunk + 15);
+    let mut idx_lo = [0u8; 8];
+    lane = 0;
+    while lane < 8 {
+        if variable_len[lane] != 0 {
+            idx_lo[lane] = (source_chunks[lane] - source_base_chunk) as u8;
+        }
+        lane += 1;
+    }
+    BSideT1BurstZmmDesc {
+        source_base_bytes: if special != 0 {
+            special
+        } else {
+            (source_base_chunk * 8) as u16
+        },
+        idx_lo,
+        shift_right: source_shifts,
+        output_shift: output_shifts,
+        variable_len,
+    }
+}
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+const B_SIDE_T1_BURST_PHASES: [[BSideT1BurstZmmDesc; 8]; 4] = [
+    [
+        b_side_t1_make_desc(0, 0),
+        b_side_t1_make_desc(0, 1),
+        b_side_t1_make_desc(0, 2),
+        b_side_t1_make_desc(0, 3),
+        b_side_t1_make_desc(0, 4),
+        b_side_t1_make_desc(0, 5),
+        b_side_t1_make_desc(0, 6),
+        b_side_t1_make_desc(0, 7),
+    ],
+    [
+        b_side_t1_make_desc(1, 0),
+        b_side_t1_make_desc(1, 1),
+        b_side_t1_make_desc(1, 2),
+        b_side_t1_make_desc(1, 3),
+        b_side_t1_make_desc(1, 4),
+        b_side_t1_make_desc(1, 5),
+        b_side_t1_make_desc(1, 6),
+        b_side_t1_make_desc(1, 7),
+    ],
+    [
+        b_side_t1_make_desc(2, 0),
+        b_side_t1_make_desc(2, 1),
+        b_side_t1_make_desc(2, 2),
+        b_side_t1_make_desc(2, 3),
+        b_side_t1_make_desc(2, 4),
+        b_side_t1_make_desc(2, 5),
+        b_side_t1_make_desc(2, 6),
+        b_side_t1_make_desc(2, 7),
+    ],
+    [
+        b_side_t1_make_desc(3, 0),
+        b_side_t1_make_desc(3, 1),
+        b_side_t1_make_desc(3, 2),
+        b_side_t1_make_desc(3, 3),
+        b_side_t1_make_desc(3, 4),
+        b_side_t1_make_desc(3, 5),
+        b_side_t1_make_desc(3, 6),
+        b_side_t1_make_desc(3, 7),
+    ],
+];
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn b_side_t1_decode_zmm(
+    packed: *const u8,
+    desc: &BSideT1BurstZmmDesc,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        if desc.source_base_bytes == u16::MAX {
+            return _mm512_set1_epi64(-1);
+        }
+        if desc.source_base_bytes == u16::MAX - 1 {
+            return _mm512_setr_epi64(0x0001_ffff_ffff_ffff, 0, 0, 0, 0, 0, 0, 0);
+        }
+        if desc.source_base_bytes == u16::MAX - 2 {
+            return _mm512_setzero_si512();
+        }
+        let source = packed.add(desc.source_base_bytes as usize) as *const i64;
+        let s0 = _mm512_loadu_si512(source as *const __m512i);
+        let s1 = if desc.source_base_bytes as usize + 128 <= 56 * 24 {
+            _mm512_loadu_si512(source.add(8) as *const __m512i)
+        } else {
+            _mm512_setzero_si512()
+        };
+        let load_u8x8 = |p: *const u8| _mm512_cvtepu8_epi64(_mm_loadl_epi64(p as *const __m128i));
+        let idx_lo = load_u8x8(desc.idx_lo.as_ptr());
+        let idx_hi = _mm512_add_epi64(idx_lo, _mm512_set1_epi64(1));
+        let shift_right = load_u8x8(desc.shift_right.as_ptr());
+        let shift_left = _mm512_sub_epi64(_mm512_set1_epi64(64), shift_right);
+        let dst = load_u8x8(desc.output_shift.as_ptr());
+        let len = load_u8x8(desc.variable_len.as_ptr());
+        let len_shift = _mm512_sub_epi64(_mm512_set1_epi64(64), len);
+        let mask = _mm512_sllv_epi64(_mm512_srlv_epi64(_mm512_set1_epi64(-1), len_shift), dst);
+        let lo = _mm512_permutex2var_epi64(s0, idx_lo, s1);
+        let hi = _mm512_permutex2var_epi64(s0, idx_hi, s1);
+        let funnel = _mm512_or_si512(
+            _mm512_srlv_epi64(lo, shift_right),
+            _mm512_sllv_epi64(hi, shift_left),
+        );
+        _mm512_or_si512(
+            _mm512_and_si512(_mm512_sllv_epi64(funnel, dst), mask),
+            _mm512_xor_si512(mask, _mm512_set1_epi64(-1)),
+        )
+    }
+}
+
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn b_side_t1_decode_burst_regs(
+    packed: *const u8,
+    d: &[BSideT1BurstZmmDesc; 8],
+) -> [core::arch::x86_64::__m512i; 8] {
+    // Each descriptor is fully const-evaluated and the eight calls are
+    // intentionally unrolled.
+    unsafe {
+        [
+            b_side_t1_decode_zmm(packed, &d[0]),
+            b_side_t1_decode_zmm(packed, &d[1]),
+            b_side_t1_decode_zmm(packed, &d[2]),
+            b_side_t1_decode_zmm(packed, &d[3]),
+            b_side_t1_decode_zmm(packed, &d[4]),
+            b_side_t1_decode_zmm(packed, &d[5]),
+            b_side_t1_decode_zmm(packed, &d[6]),
+            b_side_t1_decode_zmm(packed, &d[7]),
+        ]
+    }
+}
+
+/// T1 assembly sink: decode one sidecar quadrant into the existing round-2
+/// residue-major register body. No ranked call site references this symbol.
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[unsafe(export_name = "flock_t1_bside_tr_bcast_burst")]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe extern "C" fn b_side_t1_tr_bcast_burst(
+    packed: *const u8,
+    phase: usize,
+    mats: *const [u64; 128],
+    out: *mut F128,
+) {
+    let Some(descs) = B_SIDE_T1_BURST_PHASES.get(phase) else {
+        return;
+    };
+    unsafe {
+        gfni_fold64_regs_sigma_bcast(b_side_t1_decode_burst_regs(packed, descs), &*mats, out);
+    }
+}
+
+/// T1 assembly sink: decode one sidecar quadrant into the existing rounds-3+4
+/// composed register body. No ranked call site references this symbol.
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[unsafe(export_name = "flock_t1_bside_c4_bcast_burst")]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe extern "C" fn b_side_t1_c4_bcast_burst(
+    packed: *const u8,
+    phase: usize,
+    mats: *const CFoldMats,
+    out: *mut F128,
+) {
+    let Some(descs) = B_SIDE_T1_BURST_PHASES.get(phase) else {
+        return;
+    };
+    unsafe {
+        gfni_fold64_regs_c4_bcast(b_side_t1_decode_burst_regs(packed, descs), &*mats, out);
+    }
+}
+
+/// T1 dense control for [`b_side_t1_tr_bcast_burst`]. Both sinks enter the
+/// identical downstream register body; only the input loader differs.
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[unsafe(export_name = "flock_t1_bside_tr_bcast_dense")]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe extern "C" fn b_side_t1_tr_bcast_dense(
+    rows: *const u8,
+    mats: *const [u64; 128],
+    out: *mut F128,
+) {
+    unsafe {
+        gfni_fold64_regs_sigma_bcast(load_64_rows_masked(rows, 0), &*mats, out);
+    }
+}
+
+/// T1 dense control for [`b_side_t1_c4_bcast_burst`]. Both sinks enter the
+/// identical downstream register body; only the input loader differs.
+#[cfg(all(
+    flock_bside_t1_probe,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[unsafe(export_name = "flock_t1_bside_c4_bcast_dense")]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe extern "C" fn b_side_t1_c4_bcast_dense(
+    rows: *const u8,
+    mats: *const CFoldMats,
+    out: *mut F128,
+) {
+    unsafe {
+        gfni_fold64_regs_c4_bcast(load_64_rows_masked(rows, 0), &*mats, out);
     }
 }
 
@@ -3136,7 +3537,7 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[cfg_attr(flock_bside_t1_probe, inline(always))]
 unsafe fn gfni_fold64_regs_sigma_bcast(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],
