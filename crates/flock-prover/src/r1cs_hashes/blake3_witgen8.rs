@@ -495,6 +495,25 @@ unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op
     }
 }
 
+/// `FLOCK_NO_WITGEN_FUSE_PUBLISH=1` restores store-to-stage then reload in
+/// [`RankedRows::publish_dense`]. Default ON: windows 2..29 publish z/a/b
+/// from the transpose ZMMs while offsets are widened, so the 2 KiB
+/// stage store+reload is deleted. Ranked `env_clear()`.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+fn witgen_fuse_publish_enabled() -> bool {
+    #[cfg(test)]
+    if WITGEN_FUSE_PUB_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_FUSE_PUBLISH").is_none());
+    *ON
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "avx512bw"))]
+pub(crate) static WITGEN_FUSE_PUB_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
@@ -609,6 +628,23 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    /// Same offset kernel as [`Self::project_blocks_ranked_hot_offsets`] after
+    /// z/a/b have already been NT-published from the transpose ZMMs.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_prepub(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, off: *const u16) {
+        unsafe {
+            debug_assert!(blk > 1 && blk < 30);
+            let mut j=0usize;
+            while j!=8 {
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
@@ -1211,6 +1247,18 @@ impl RankedRows {
         }
     }
 
+    /// Dense publish from live transpose ZMMs (no stage reload).
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_dense_regs(&self, j: usize, av: __m512i, bv: __m512i) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+            stream_ranked_line(self.a.add(o), av);
+            stream_ranked_line(self.b.add(o), bv);
+        }
+    }
+
     /// Static-B ranked windows 0/1: B=1, so the complete z and a lines match.
     #[inline(always)]
     unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
@@ -1354,12 +1402,27 @@ impl Drain8<'_> {
 
                 if E {
                     // Ranked dense path: each side's two AVX2 half-transposes
-                    // become one 16-word ZMM transpose, one aligned store per
-                    // block row, and the same live ZMM feeds offset widening.
+                    // become one 16-word ZMM transpose. Default ON also
+                    // NT-publishes z/a/b from those ZMMs (no stage store+reload).
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        stage_ranked_dense_side(self.ast,rw,sa,op);
-                        stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        if witgen_fuse_publish_enabled() {
+                            let a_rows=tr8x16_zmm(self.ast,rw);
+                            let b_rows=tr8x16_zmm(self.bs,rw);
+                            let mut r=0usize;
+                            while r!=8 {
+                                widen_off_line(a_rows[r],op.add(r*ROUND1_AB_OFF_WORDS));
+                                widen_off_line(b_rows[r],op.add(r*ROUND1_AB_OFF_WORDS+64));
+                                rows.publish_dense_regs(r,a_rows[r],b_rows[r]);
+                                r+=1;
+                            }
+                            proj.project_blocks_ranked_hot_offsets_prepub(blk,plan,imgs,op as *const u16);
+                        } else {
+                            stage_ranked_dense_side(self.ast,rw,sa,op);
+                            stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
+                            proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
+                        }
                     }
                     // Portable builds cannot select E=true: the ranked gate
                     // requires the AVX-512 offset plan. Retain the old staging
@@ -1380,9 +1443,9 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
                     // transposes and its per-window offset eligibility gate.
@@ -2153,6 +2216,51 @@ mod tests {
                 assert_eq!(got, expected, "block {block}");
             }
         }
+    }
+
+    /// Register-source dense publish must match the stage-reload publisher.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn publish_dense_regs_matches_stage_reload() {
+        #[repr(C, align(64))]
+        struct Stage([u32; 8 * STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct Rows([u32; 8 * U32_PER_BLOCK]);
+        let mut sa = Stage([0; 8 * STEP_WORDS]);
+        let mut sb = Stage([0; 8 * STEP_WORDS]);
+        let mut z0 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut a0 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut b0 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut z1 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut a1 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut b1 = Rows([0; 8 * U32_PER_BLOCK]);
+        let mut state = 0xF05E_0001_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        for x in sa.0.iter_mut() {
+            *x = next();
+        }
+        for x in sb.0.iter_mut() {
+            *x = next();
+        }
+        unsafe {
+            let r0 = RankedRows::new(z0.0.as_mut_ptr(), a0.0.as_mut_ptr(), b0.0.as_mut_ptr());
+            let r1 = RankedRows::new(z1.0.as_mut_ptr(), a1.0.as_mut_ptr(), b1.0.as_mut_ptr());
+            for j in 0..8 {
+                r0.publish_dense(j, sa.0.as_ptr(), sb.0.as_ptr());
+                let av = _mm512_load_si512(sa.0.as_ptr().add(j * STEP_WORDS).cast::<__m512i>());
+                let bv = _mm512_load_si512(sb.0.as_ptr().add(j * STEP_WORDS).cast::<__m512i>());
+                r1.publish_dense_regs(j, av, bv);
+            }
+            _mm_sfence();
+        }
+        assert_eq!(z0.0, z1.0);
+        assert_eq!(a0.0, a1.0);
+        assert_eq!(b0.0, b1.0);
     }
 
     unsafe fn tr8_check() {

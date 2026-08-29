@@ -4738,6 +4738,64 @@ mod tests {
         }
     }
 
+    /// Fuse-publish (default ON) must match the stage-store-then-reload drain
+    /// on the ranked octa path. Latch drives both arms without mutating env.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn fuse_publish_matches_stage_reload() {
+        use std::sync::atomic::Ordering;
+        const F128_PER_BLOCK: usize = K / 128;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        let n_total = 16usize;
+        let skip_blocks = 0usize;
+        let mut rng = Rng::new(0xF05E_B11D);
+        let blocks: Vec<Compression> = (0..n_total)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (cv, m, counter, 64u32, rng.next_u32() & 0xFF)
+            })
+            .collect();
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let n_f128 = n_total * F128_PER_BLOCK;
+        let run = |off: bool| -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+            super::blake3_witgen8::WITGEN_FUSE_PUB_TEST_OFF.store(off, Ordering::Relaxed);
+            let mut z = vec![F128::ZERO; n_f128];
+            let mut a = vec![F128::ZERO; n_f128];
+            let mut b = vec![F128::ZERO; n_f128];
+            let mut ab_inner =
+                flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+                    n_total * BYTES_PER_BLOCK,
+                );
+            generate_round1_inner_octa(
+                crate::seed_pipe::BlockSource::Slice(&blocks),
+                skip_blocks,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                [true; 3],
+                true,
+            );
+            super::blake3_witgen8::WITGEN_FUSE_PUB_TEST_OFF.store(false, Ordering::Relaxed);
+            let ab = ab_inner.as_bytes_mut().to_vec();
+            (z, a, b, ab)
+        };
+        let fused = run(false);
+        let staged = run(true);
+        assert_eq!(fused.0, staged.0, "z");
+        assert_eq!(fused.1, staged.1, "a");
+        assert_eq!(fused.2, staged.2, "b");
+        assert_eq!(fused.3, staged.3, "ab_inner");
+    }
+
     /// Recycled-scratch constant-elision oracle (witgen-stack item B, x86
     /// octa path): prove 1 (full writes) arms pool provenance through the
     /// prover's plain `give_f128` release (pending-tag registry); prove 2
