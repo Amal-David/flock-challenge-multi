@@ -1176,7 +1176,7 @@ mod tests {
     #[cfg(target_feature = "gfni")]
     use super::{
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
-        accumulate_convert_ab_nomul_x86_gfni_fixed,
+        accumulate_convert_ab_nomul_x86_gfni_fixed, accumulate_convert_ab_nomul_x86_gfni_fixed_k2,
     };
 
     #[test]
@@ -1389,6 +1389,61 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
+    /// Dual-plane `k` unroll must match the serial fixed body.
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn accumulate_convert_ab_gfni_k2_matches_serial_k() {
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for (row, bytes) in chunk_ab_bytes.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0x9d)
+                    ^ (lane as u8).wrapping_mul(0x53)
+                    ^ ((row * 17 + lane * 29) >> 3) as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for (i, matrix) in mats.iter_mut().enumerate() {
+            *matrix = (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i & 63) as u32)
+                ^ 0xd6e8_feb8_6659_fd93;
+        }
+        let mut seed = [0u8; 16 * 64];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0xa7) ^ (i >> 2) as u8;
+        }
+        for n_b_med in [15usize, 16] {
+            let mut serial = seed;
+            let mut k2 = seed;
+            unsafe {
+                if n_b_med == 15 {
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut serial,
+                    );
+                    accumulate_convert_ab_nomul_x86_gfni_fixed_k2::<15>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut k2,
+                    );
+                } else {
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut serial,
+                    );
+                    accumulate_convert_ab_nomul_x86_gfni_fixed_k2::<16>(
+                        &chunk_ab_bytes,
+                        &mats,
+                        &mut k2,
+                    );
+                }
+            }
+            assert_eq!(k2, serial, "k2 vs serial n_b_med={n_b_med}");
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1568,6 +1623,89 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
     }
 }
 
+/// Twin of [`accumulate_convert_ab_nomul_x86_gfni_fixed`] with two plane
+/// chains in flight. Bit-identical XOR accumulation; the second plane fills
+/// the first's GFNI latency. `FLOCK_NO_ZC_R1AB_GFNI_K2=1` stays on the
+/// serial `k` loop.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_k2<const N: usize>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in 0..N {
+            rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        let mut k = 0;
+        while k + 1 < 16 {
+            let p0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let p1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = _mm512_loadu_si512(p0 as *const __m512i);
+            let mut acc1 = _mm512_loadu_si512(p1 as *const __m512i);
+            let mut bm = 0;
+            while bm + 1 < N {
+                let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g00, g01);
+                let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g10, g11);
+                bm += 2;
+            }
+            if bm < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc0 = _mm512_xor_si512(acc0, g0);
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                acc1 = _mm512_xor_si512(acc1, g1);
+            }
+            _mm512_storeu_si512(p0, acc0);
+            _mm512_storeu_si512(p1, acc1);
+            k += 2;
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1ab_gfni_k2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_GFNI_K2").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1585,11 +1723,22 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     // SAFETY: each callee has this entry point's fixed-array and feature
     // contract. Counts outside the ranked pair retain the incumbent body.
     unsafe {
-        match n_b_med {
-            15 => {
+        let k2 = zc_r1ab_gfni_k2_enabled();
+        match (n_b_med, k2) {
+            (15, true) => accumulate_convert_ab_nomul_x86_gfni_fixed_k2::<15>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            (16, true) => accumulate_convert_ab_nomul_x86_gfni_fixed_k2::<16>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            (15, false) => {
                 accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(chunk_ab_bytes, mats, bank_planes)
             }
-            16 => {
+            (16, false) => {
                 accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(chunk_ab_bytes, mats, bank_planes)
             }
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
