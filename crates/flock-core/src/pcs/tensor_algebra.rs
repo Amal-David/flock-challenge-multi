@@ -117,8 +117,26 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
 /// at position `(i, j)`.
 /// On output: bit `j` of `elems[i]` becomes the old bit `i` of `elems[j]`.
 ///
-/// V1 implementation: naive O(D²) bit-scan. Each of 128² output bits is read
-/// from exactly one input bit.
+#[inline]
+fn transpose_64x64(src: &[u64], out: &mut [u64]) {
+    debug_assert_eq!(src.len(), 64);
+    debug_assert_eq!(out.len(), 64);
+    let mut bytes = [0u8; 64];
+    for chunk_r in 0..8 {
+        let chunk: [u64; 8] = src[chunk_r * 8..chunk_r * 8 + 8].try_into().unwrap();
+        crate::bits::transpose_8_u64s_to_64_bytes(&chunk, &mut bytes);
+        for col in 0..64 {
+            let byte_val = bytes[col] as u64;
+            if chunk_r == 0 {
+                out[col] = byte_val;
+            } else {
+                out[col] |= byte_val << (chunk_r * 8);
+            }
+        }
+    }
+}
+
+/// Fast 128×128 bit matrix transpose using 4 vectorized 64×64 GFNI block transpositions.
 fn square_transpose(elems: &mut [F128]) {
     assert_eq!(
         elems.len(),
@@ -126,26 +144,32 @@ fn square_transpose(elems: &mut [F128]) {
         "square_transpose: input must be length 128"
     );
 
-    let mut out = [F128::ZERO; DEGREE];
-    for j in 0..DEGREE {
-        let src_bit = |k: usize| -> u64 {
-            if j < 64 {
-                (elems[k].lo >> j) & 1
-            } else {
-                (elems[k].hi >> (j - 64)) & 1
-            }
-        };
-        let mut lo: u64 = 0;
-        let mut hi: u64 = 0;
-        for i in 0..64 {
-            lo |= src_bit(i) << i;
-        }
-        for i in 64..128 {
-            hi |= src_bit(i) << (i - 64);
-        }
-        out[j] = F128 { lo, hi };
+    let mut lo_lo = [0u64; 64];
+    let mut hi_lo = [0u64; 64];
+    let mut lo_hi = [0u64; 64];
+    let mut hi_hi = [0u64; 64];
+
+    let mut src_lo_0 = [0u64; 64];
+    let mut src_lo_1 = [0u64; 64];
+    let mut src_hi_0 = [0u64; 64];
+    let mut src_hi_1 = [0u64; 64];
+
+    for i in 0..64 {
+        src_lo_0[i] = elems[i].lo;
+        src_lo_1[i] = elems[64 + i].lo;
+        src_hi_0[i] = elems[i].hi;
+        src_hi_1[i] = elems[64 + i].hi;
     }
-    elems.copy_from_slice(&out);
+
+    transpose_64x64(&src_lo_0, &mut lo_lo);
+    transpose_64x64(&src_lo_1, &mut lo_hi);
+    transpose_64x64(&src_hi_0, &mut hi_lo);
+    transpose_64x64(&src_hi_1, &mut hi_hi);
+
+    for j in 0..64 {
+        elems[j] = F128 { lo: lo_lo[j], hi: lo_hi[j] };
+        elems[64 + j] = F128 { lo: hi_lo[j], hi: hi_hi[j] };
+    }
 }
 
 #[cfg(test)]

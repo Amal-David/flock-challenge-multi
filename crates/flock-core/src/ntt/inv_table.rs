@@ -20,6 +20,7 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
+use crate::bits::BitOps;
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
