@@ -1811,6 +1811,107 @@ fn live_witgen_simd_enabled() -> bool {
     }
 }
 
+thread_local! {
+    /// Per-thread scratch for the round-two octa regenerator: the 2 KiB
+    /// projection staging pair and a 16 KiB z sink (the rebuild derives z
+    /// alongside a/b; round two never reads it).
+    static R2_REGEN_TLS: std::cell::RefCell<
+        Option<(
+            Vec<u8>,
+            Vec<u8>,
+            Option<flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan>,
+        )>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Same-binary rollback for the round-two a/b regeneration
+/// (`FLOCK_NO_R2_REGEN=1` restores the streamed packed-buffer reads).
+/// Resolved once per process; the ranked worker's cleared environment takes
+/// the regeneration path. The per-chunk tile lives in a per-THREAD
+/// `thread_local` (never a rayon `map_init`), so the defect that sank the
+/// first default-on form — one zeroed 128 KiB allocation per stolen task —
+/// cannot recur.
+fn r2_regen_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_REGEN").is_none());
+    *ON
+}
+
+/// Round-two a/b octa regenerator for the ranked closed-form block source:
+/// rebuilds any eight consecutive blocks' drained a/b bytes from
+/// `(init, first_block)` through the witness kernel with the round-1 window
+/// projection disabled (`horner: false`), writing the two 16 KiB tiles the
+/// caller supplies. The bytes equal the drained buffers exactly — same
+/// kernel, same inputs, projection skipped. Arms only for the ranked shape
+/// (`k_log = 14`, full closed range); everything else gets `None` and round
+/// two keeps its incumbent streamed reads.
+fn make_r2_regen(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    k_log: usize,
+    n_blocks_log: usize,
+) -> Option<Box<dyn Fn(usize, *mut u8, *mut u8) + Sync>> {
+    const BYTES_PER_BLOCK: usize = K / 8;
+    let crate::seed_pipe::BlockSource::Closed { init, len } = blocks else {
+        return None;
+    };
+    if k_log != K_LOG || len != (1usize << n_blocks_log) || !r2_regen_enabled() {
+        return None;
+    }
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    Some(Box::new(move |first_block: usize, a_dst: *mut u8, b_dst: *mut u8| {
+        R2_REGEN_TLS.with(|tls| {
+            let mut tls = tls.borrow_mut();
+            let (stage_v, zscrap, plan_slot) = tls.get_or_insert_with(|| {
+                (
+                    vec![0u8; blake3_witgen8::STREAM_STAGE_WORDS * 4 + 64],
+                    vec![0u8; 8 * BYTES_PER_BLOCK + 64],
+                    None,
+                )
+            });
+            let st_off = (64 - (stage_v.as_ptr() as usize & 63)) & 63;
+            let z_off = (64 - (zscrap.as_ptr() as usize & 63)) & 63;
+            // SAFETY: the caller supplies two 64-aligned 16 KiB tiles per the
+            // `AbOctaRegen` contract; the scratch pointers are 64-aligned by
+            // the offsets; `first_block + 8 <= len` because round two's chunks
+            // cover whole octas of the same range the witness drained.
+            unsafe {
+                let stage_ptr = stage_v.as_mut_ptr().add(st_off);
+                // The window plan is process-invariant for one prove's table
+                // and a fixed destination class; resolve it once per thread
+                // instead of once per octa (the projection it steers is
+                // skipped in regeneration mode, so only its `nt` class and
+                // static-B eligibility matter, and both are constant here).
+                let plan = *plan_slot.get_or_insert_with(|| {
+                    flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                        &inv_table,
+                        std::slice::from_raw_parts(stage_ptr, 64),
+                        false,
+                    )
+                });
+                let proj = blake3_witgen8::StreamProj {
+                    stage: stage_ptr.cast::<u32>(),
+                    out: stage_ptr,
+                    inv_table: &inv_table,
+                    plan,
+                    horner: false,
+                };
+                blake3_witgen8::build_octa_witness_ab_stream_elide(
+                    blake3_witgen8::OctaInputs::Closed { init, base: first_block },
+                    zscrap.as_mut_ptr().add(z_off).cast::<u32>(),
+                    a_dst.cast::<u32>(),
+                    b_dst.cast::<u32>(),
+                    proj,
+                    [false; 3],
+                );
+                core::arch::x86_64::_mm_sfence();
+            }
+        })
+    }))
+}
+
+
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
 /// explicit staged-NT toggle so tests can assert byte equality of the paths.
 /// SIMD dispatch follows [`live_witgen_simd_enabled`].
@@ -1973,6 +2074,112 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             z.as_ptr(),
             witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
         );
+        // `FLOCK_REGEN_CHECK=1` — diagnostic only, never set by the ranked
+        // harness's cleared environment: regenerate a few octas from the
+        // closed form into 64-aligned scratch tiles and compare bitwise
+        // against the freshly drained z/a/b, proving per-octa closed-form
+        // regeneration reproduces the drained bytes exactly.
+        if std::env::var_os("FLOCK_REGEN_CHECK").is_some() {
+            if let crate::seed_pipe::BlockSource::Closed { init, len } = blocks {
+                const SIMD: usize = 8;
+                if len == n_total && n_total >= SIMD {
+                    let align_off16 = |p: *const F128| (64 - (p as usize & 63) & 63) / 16;
+                    let mut sz = vec![F128::ZERO; SIMD * F128_PER_BLOCK + 4];
+                    let mut sa = vec![F128::ZERO; SIMD * F128_PER_BLOCK + 4];
+                    let mut sb = vec![F128::ZERO; SIMD * F128_PER_BLOCK + 4];
+                    let mut sab = vec![0u8; SIMD * BYTES_PER_BLOCK + 64];
+                    let mut stage_v = vec![0u8; blake3_witgen8::STREAM_STAGE_WORDS * 4 + 64];
+                    let (zo, ao, bo) = (
+                        align_off16(sz.as_ptr()),
+                        align_off16(sa.as_ptr()),
+                        align_off16(sb.as_ptr()),
+                    );
+                    let sab_off = (64 - (sab.as_ptr() as usize & 63)) & 63;
+                    let st_off = (64 - (stage_v.as_ptr() as usize & 63)) & 63;
+                    let abinner_nt2 =
+                        flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+                    for &base in &[0usize, (n_total / 2) & !7, n_total - SIMD] {
+                        let sab_ptr = unsafe { sab.as_mut_ptr().add(sab_off) };
+                        let plan2 = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                            &inv_table,
+                            unsafe { std::slice::from_raw_parts(sab_ptr, SIMD * BYTES_PER_BLOCK) },
+                            abinner_nt2,
+                        );
+                        // SAFETY: every destination is 64-byte aligned by the
+                        // offsets above and owns a full 8-block tile; the
+                        // closed octa at `base` is in range (`base + 8 <= len`).
+                        unsafe {
+                            let proj = blake3_witgen8::StreamProj {
+                                stage: stage_v.as_mut_ptr().add(st_off).cast::<u32>(),
+                                out: sab_ptr,
+                                inv_table: &inv_table,
+                                plan: plan2,
+                                horner: std::env::var_os("FLOCK_REGEN_HORNER").is_some(),
+                            };
+                            blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                blake3_witgen8::OctaInputs::Closed { init, base },
+                                sz.as_mut_ptr().add(zo).cast::<u32>(),
+                                sa.as_mut_ptr().add(ao).cast::<u32>(),
+                                sb.as_mut_ptr().add(bo).cast::<u32>(),
+                                proj,
+                                [false; 3],
+                            );
+                            core::arch::x86_64::_mm_sfence();
+                        }
+                        let r = base * F128_PER_BLOCK..(base + SIMD) * F128_PER_BLOCK;
+                        let n = SIMD * F128_PER_BLOCK;
+                        eprintln!(
+                            "[regen-check] base={base} z={} a={} b={}",
+                            sz[zo..zo + n] == z[r.clone()],
+                            sa[ao..ao + n] == a[r.clone()],
+                            sb[bo..bo + n] == b[r],
+                        );
+                    }
+                    // Single-thread regen cost: N sequential octa rebuilds
+                    // into the same scratch tile (L1-resident), full pipeline
+                    // including the (r2-wasted) window projection.
+                    let reps = 4096usize;
+                    let t0 = std::time::Instant::now();
+                    for i in 0..reps {
+                        let base = (i * SIMD) & (n_total - SIMD);
+                        let sab_ptr = unsafe { sab.as_mut_ptr().add(sab_off) };
+                        let plan2 = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                            &inv_table,
+                            unsafe { std::slice::from_raw_parts(sab_ptr, SIMD * BYTES_PER_BLOCK) },
+                            abinner_nt2,
+                        );
+                        // SAFETY: as for the equality loop above.
+                        unsafe {
+                            let proj = blake3_witgen8::StreamProj {
+                                stage: stage_v.as_mut_ptr().add(st_off).cast::<u32>(),
+                                out: sab_ptr,
+                                inv_table: &inv_table,
+                                plan: plan2,
+                                horner: std::env::var_os("FLOCK_REGEN_HORNER").is_some(),
+                            };
+                            blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                blake3_witgen8::OctaInputs::Closed { init, base },
+                                sz.as_mut_ptr().add(zo).cast::<u32>(),
+                                sa.as_mut_ptr().add(ao).cast::<u32>(),
+                                sb.as_mut_ptr().add(bo).cast::<u32>(),
+                                proj,
+                                [false; 3],
+                            );
+                        }
+                    }
+                    unsafe { core::arch::x86_64::_mm_sfence() };
+                    let el = t0.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[regen-cost] {} octas in {:.3} ms = {:.2} us/octa (1 thread, incl. wasted projection)",
+                        reps,
+                        el * 1e3,
+                        el * 1e6 / reps as f64
+                    );
+                }
+            } else {
+                eprintln!("[regen-check] non-closed source; skipped");
+            }
+        }
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -2283,6 +2490,7 @@ fn generate_round1_inner_octa(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
+                                horner: true,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
@@ -3750,6 +3958,8 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         flock_core::gaptime::begin("blake3 prove_fast");
+        let regen_owned = make_r2_regen(blocks, self.r1cs.k_log, self.n_blocks_log());
+        let regen_arg = regen_owned.as_deref();
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
@@ -3776,6 +3986,7 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    regen_arg,
                     challenger,
                 )
             }
@@ -3828,6 +4039,12 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        let regen_owned = make_r2_regen(
+            crate::seed_pipe::BlockSource::Slice(blocks),
+            self.r1cs.k_log,
+            self.n_blocks_log(),
+        );
+        let regen_arg = regen_owned.as_deref();
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 let (z_packed, a_packed_f128, b_packed_f128) =
@@ -3843,6 +4060,7 @@ impl Blake3Setup {
                         b_packed_f128,
                         lc_circuit,
                         None,
+                        regen_arg,
                         challenger,
                     );
                 timings.witness_s = witness_s;
