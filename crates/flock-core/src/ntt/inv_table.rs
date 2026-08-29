@@ -20,6 +20,7 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
+use crate::bits::BitOps;
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
@@ -422,7 +423,7 @@ impl InvNttTableByteSingleGf8 {
         // hold 256 rows of 64 readable bytes.
         unsafe {
             let row = |img: *const u8, b: usize| {
-                _mm512_loadu_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
+                _mm512_load_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
             };
             let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
             let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
@@ -465,7 +466,7 @@ impl InvNttTableByteSingleGf8 {
         // of 64 readable bytes per row.
         unsafe {
             let row = |img: *const u8, b: usize| {
-                _mm512_loadu_si512(img.add(*off.add(b) as usize) as *const __m512i)
+                _mm512_load_si512(img.add(*off.add(b) as usize) as *const __m512i)
             };
             let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
             let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
@@ -538,7 +539,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
         unsafe {
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
-            let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+            let row = |img: *const u8, o: usize| _mm512_load_si512(img.add(o) as *const __m512i);
             let u0 = _mm512_xor_si512(
                 row(base, w0 as u16 as usize),
                 row(base8, (w0 >> 16) as u16 as usize),
