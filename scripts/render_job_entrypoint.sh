@@ -48,6 +48,15 @@ cpu_flags_sha="$(sha256sum /proc/cpuinfo 2>/dev/null | awk '{print $1}')"
 nproc_value="$(nproc)"
 cgroup_cpu_max="$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unknown)"
 cgroup_memory_max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown)"
+sandbox_mode="bubblewrap"
+bwrap_usable_json="true"
+disabled_bwrap=""
+
+restore_bwrap() {
+  if [[ -n "${disabled_bwrap}" && -e "${disabled_bwrap}" && ! -e /usr/bin/bwrap ]]; then
+    mv "${disabled_bwrap}" /usr/bin/bwrap
+  fi
+}
 
 emit_receipt() {
   local exit_code="$1"
@@ -87,9 +96,11 @@ emit_receipt() {
     --arg cgroup_memory_max "${cgroup_memory_max}" \
     --arg verifier_sha256 "${verifier_sha}" \
     --arg repo_url "${repo_url}" \
+    --arg sandbox_mode "${sandbox_mode}" \
+    --argjson bwrap_usable "${bwrap_usable_json}" \
     --argjson exit_code "${exit_code}" \
     --argjson score "${score_json}" \
-    '{authority:$authority,kind:$kind,hypothesis_id:$hypothesis_id,base_sha:$base_sha,candidate_sha:$candidate_sha,resolved_sha:$resolved_sha,tier:$tier,required_isa:$required_isa,status:$status,phase:$phase,started_at:$started_at,finished_at:$finished_at,toolchain:$toolchain,cpu_model:$cpu_model,cpu_flags_sha256:$cpu_flags_sha256,nproc:($nproc|tonumber),cgroup_cpu_max:$cgroup_cpu_max,cgroup_memory_max:$cgroup_memory_max,verifier_sha256:$verifier_sha256,repo_url:$repo_url,exit_code:$exit_code,score:$score}')"
+    '{authority:$authority,kind:$kind,hypothesis_id:$hypothesis_id,base_sha:$base_sha,candidate_sha:$candidate_sha,resolved_sha:$resolved_sha,tier:$tier,required_isa:$required_isa,status:$status,phase:$phase,started_at:$started_at,finished_at:$finished_at,toolchain:$toolchain,cpu_model:$cpu_model,cpu_flags_sha256:$cpu_flags_sha256,nproc:($nproc|tonumber),cgroup_cpu_max:$cgroup_cpu_max,cgroup_memory_max:$cgroup_memory_max,verifier_sha256:$verifier_sha256,repo_url:$repo_url,sandbox_mode:$sandbox_mode,bwrap_usable:$bwrap_usable,exit_code:$exit_code,score:$score}')"
   echo "FLOCK_RECEIPT_JSON=$(printf '%s' "${receipt_json}" | base64 -w0)"
   rm -rf "${workspace}"
 }
@@ -97,6 +108,7 @@ emit_receipt() {
 on_exit() {
   local exit_code="$?"
   trap - EXIT
+  restore_bwrap
   emit_receipt "${exit_code}"
   exit "${exit_code}"
 }
@@ -141,7 +153,20 @@ phase="setup"
 timeout "${max_seconds}" bash -lc "cd '${repo_dir}' && ./setup.sh" 2>&1 | tee -a "${log_file}"
 
 phase="verified_smoke"
-timeout "${max_seconds}" bash -lc "cd '${repo_dir}' && FLOCK_REQUIRE_SANDBOX=1 BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_WARMUP_RUNS=1 BLAKE3_RUNS=3 BENCHMARK_OUTPUT_DIR=benchmark-results/render-${hypothesis} ./benchmark.sh" 2>&1 | tee -a "${log_file}"
+require_sandbox=1
+if ! bwrap --ro-bind / / --dev /dev --proc /proc /bin/true >/dev/null 2>&1; then
+  bwrap_usable_json="false"
+  if [[ "${FLOCK_ALLOW_UNSANDBOXED_RENDER:-0}" != 1 ]]; then
+    echo "bubblewrap is installed but user namespaces are unavailable; set FLOCK_ALLOW_UNSANDBOXED_RENDER=1 only for a secret-free directional Render instance" >&2
+    exit 67
+  fi
+  disabled_bwrap="/usr/bin/bwrap.flock-disabled"
+  mv /usr/bin/bwrap "${disabled_bwrap}"
+  require_sandbox=0
+  sandbox_mode="render_ephemeral_no_bwrap"
+fi
+timeout "${max_seconds}" bash -lc "cd '${repo_dir}' && FLOCK_REQUIRE_SANDBOX=${require_sandbox} BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_WARMUP_RUNS=1 BLAKE3_RUNS=3 BENCHMARK_OUTPUT_DIR=benchmark-results/render-${hypothesis} ./benchmark.sh" 2>&1 | tee -a "${log_file}"
+restore_bwrap
 jq -e '.metrics.verified == true and .metrics.measured_runs == 3 and .metrics.warmup_runs == 1' "${repo_dir}/score.json" >/dev/null
 
 phase="complete"
