@@ -86,12 +86,13 @@ fn init_global_pool() -> Option<usize> {
 /// guest scheduler is free to migrate and to double up on one core while a
 /// sibling core idles. This builds the global pool explicitly and pins worker
 /// `i` to one logical CPU chosen from `/sys/devices/system/cpu/cpu*/topology/
-/// thread_siblings_list`: mode `pin16` (default here) keeps the harness's
-/// thread count but gives every worker a fixed logical CPU, alternating
-/// physical cores first (worker 0 → core 0 sibling 0, worker 1 → core 1
-/// sibling 0, … worker 8 → core 0 sibling 1, …), so a partially-idle pool
-/// still spreads across cores; mode `phys8` uses one worker per physical
-/// core. Selected at build time by `POOL_MODE`; `FLOCK_NO_TOPOLOGY_POOL=1`
+/// thread_siblings_list`: mode `pin16` keeps the harness's thread count but
+/// gives every worker a fixed logical CPU, alternating physical cores first
+/// (worker 0 → core 0 sibling 0, worker 1 → core 1 sibling 0, … worker 8 →
+/// core 0 sibling 1, …), so a partially-idle pool still spreads across cores;
+/// mode `phys8` (default here) uses one worker per physical core, pinned to
+/// sibling 0 of each group — the same CPU list `half(0, …)` builds. Selected
+/// at build time by `POOL_MODE`; `FLOCK_NO_TOPOLOGY_POOL=1`
 /// disables it (rayon then builds its default pool from `RAYON_NUM_THREADS`).
 /// Engages only when the machine has exactly 2 SMT threads per core and
 /// `RAYON_NUM_THREADS` equals the logical CPU count (i.e. the ranked shape);
@@ -99,7 +100,7 @@ fn init_global_pool() -> Option<usize> {
 /// no arithmetic changes, proof bytes identical.
 pub(crate) mod topology_pool {
     /// "pin16" | "phys8"
-    pub(crate) const POOL_MODE: &str = "pin16";
+    pub(crate) const POOL_MODE: &str = "phys8";
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
@@ -171,15 +172,19 @@ pub(crate) mod topology_pool {
             if cores == 0 || logical != 2 * cores || groups.iter().any(|g| g.len() != 2) {
                 return None;
             }
-            // Worker → CPU map: cores first (sibling 0 of each core), then the
-            // second siblings; phys8 uses only the first half.
-            let mut order: Vec<usize> = Vec::with_capacity(logical);
-            for s in 0..2 {
-                for g in &groups {
-                    order.push(g[s]);
-                }
-            }
-            let n = if POOL_MODE == "phys8" { cores } else { logical };
+            // Worker → CPU map. phys8: sibling 0 of each core — the same list
+            // `half(0, s0, _)` pins — sized by `linux_physical_cores` (clamped
+            // to the topology we just read). pin16 then appends sibling 1.
+            let mut order: Vec<usize> = groups.iter().map(|g| g[0]).collect();
+            let n = if POOL_MODE == "phys8" {
+                super::linux_physical_cores()
+                    .filter(|&p| p > 0)
+                    .unwrap_or(cores)
+                    .min(cores)
+            } else {
+                order.extend(groups.iter().map(|g| g[1]));
+                logical
+            };
             let order = std::sync::Arc::new(order);
             let o2 = order.clone();
             match rayon::ThreadPoolBuilder::new()
