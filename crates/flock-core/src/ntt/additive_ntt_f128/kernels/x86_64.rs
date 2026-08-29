@@ -1271,38 +1271,46 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
             }
 
-            macro_rules! butterfly {
-                ($u:expr, $v:expr, $twiddle:expr) => {{
-                    let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
-                    values[$v] = _mm512_xor_si512(values[$v], new_u);
-                    values[$u] = new_u;
+            macro_rules! butterfly2 {
+                ($u0:expr, $v0:expr, $twiddle0:expr, $u1:expr, $v1:expr, $twiddle1:expr) => {{
+                    let product0 = mul_x4::<false, DIET>($twiddle0, values[$v0]);
+                    let product1 = mul_x4::<false, DIET>($twiddle1, values[$v1]);
+                    let new_u0 = _mm512_xor_si512(values[$u0], product0);
+                    let new_u1 = _mm512_xor_si512(values[$u1], product1);
+                    values[$v0] = _mm512_xor_si512(values[$v0], new_u0);
+                    values[$v1] = _mm512_xor_si512(values[$v1], new_u1);
+                    values[$u0] = new_u0;
+                    values[$u1] = new_u1;
                 }};
             }
 
             pf_quad!(0);
             let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+            for i in (0..8).step_by(2) {
+                butterfly2!(i, i + 8, outer, i + 1, i + 9, outer);
             }
             pf_quad!(1);
             for s in 0..2 {
                 let twiddle = tw[1 + s];
-                for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                for i in (0..4).step_by(2) {
+                    butterfly2!(
+                        8 * s + i,
+                        8 * s + i + 4,
+                        twiddle,
+                        8 * s + i + 1,
+                        8 * s + i + 5,
+                        twiddle
+                    );
                 }
             }
             pf_quad!(2);
             for s in 0..4 {
                 let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
-                }
+                butterfly2!(4 * s, 4 * s + 2, twiddle, 4 * s + 1, 4 * s + 3, twiddle);
             }
             pf_quad!(3);
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+            for s in (0..8).step_by(2) {
+                butterfly2!(2 * s, 2 * s + 1, tw[7 + s], 2 * s + 2, 2 * s + 3, tw[8 + s]);
             }
 
             for (i, value) in values.iter().enumerate() {

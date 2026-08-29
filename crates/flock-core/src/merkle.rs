@@ -315,8 +315,10 @@ const BLAKE3_BATCH: usize = 16;
 /// node type (chunk vs parent).
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
-/// `Vec`-per-call formulation this costs nothing per batch.
-#[inline]
+/// `Vec`-per-call formulation this costs nothing per batch. Only the live
+/// prefix is initialized before each call; `hash_many` never observes the
+/// unused tail.
+#[inline(never)]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
     out: &mut [Hash],
@@ -326,26 +328,32 @@ fn blake3_hash_many<const N: usize>(
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
+    let mut input_slots: [core::mem::MaybeUninit<&[u8; N]>; BLAKE3_BATCH] =
+        [const { core::mem::MaybeUninit::uninit() }; BLAKE3_BATCH];
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+        debug_assert_eq!(msgs.len(), n * N);
+        for (i, slot) in input_slots[..n].iter_mut().enumerate() {
+            // SAFETY: `msgs` contains exactly `n` contiguous `N`-byte
+            // messages, so every pointer formed here covers one complete
+            // message and remains live through the `hash_many` call below.
+            let input = unsafe { &*msgs.as_ptr().add(i * N).cast::<[u8; N]>() };
+            slot.write(input);
         }
+        // SAFETY: the loop above initialized exactly this prefix. The tail is
+        // excluded from the slice and may remain uninitialized.
+        let inputs =
+            unsafe { core::slice::from_raw_parts(input_slots.as_ptr().cast::<&[u8; N]>(), n) };
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
-            &inputs[..n],
+            inputs,
             &BLAKE3_IV,
             0,
             blake3::IncrementCounter::No,
