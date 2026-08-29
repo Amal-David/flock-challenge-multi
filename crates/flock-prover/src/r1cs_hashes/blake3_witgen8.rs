@@ -18,8 +18,8 @@
 //! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
 
 use super::{
-    ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE,
-    USEFUL_BITS, WORD_BITS,
+    ADDS_PER_G, B_SIDE_PACKED_BYTES_PER_BLOCK, B_SPEED_BYTES_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD,
+    Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE, USEFUL_BITS, WORD_BITS,
 };
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
@@ -710,6 +710,7 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    publish_b: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -887,6 +888,37 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     let right = xor_v8(sum, x);
     let carry = and_v8(left, right);
     (sum, left, right, carry)
+}
+
+/// Publish one G's six live B operands directly from the octa registers into
+/// PACKED186. No input is reloaded and no compression state is replayed.
+///
+/// Per block the three little-endian qwords are the 186-bit concatenation
+/// `r0 || r1 || ... || r5`; q2 bits 58..63 are canonical zero.
+#[inline(always)]
+unsafe fn store_packed_b_g(dst: *mut u8, g: usize, rhs: [V8; ADDS_PER_G]) {
+    const MASK31: u64 = (1u64 << CARRY_BITS_PER_ADD) - 1;
+    let mut lanes = [[0u32; 8]; ADDS_PER_G];
+    unsafe {
+        for add in 0..ADDS_PER_G {
+            _mm256_storeu_si256(lanes[add].as_mut_ptr().cast::<__m256i>(), rhs[add]);
+        }
+        for block in 0..8 {
+            let r0 = u64::from(lanes[0][block]) & MASK31;
+            let r1 = u64::from(lanes[1][block]) & MASK31;
+            let r2 = u64::from(lanes[2][block]) & MASK31;
+            let r3 = u64::from(lanes[3][block]) & MASK31;
+            let r4 = u64::from(lanes[4][block]) & MASK31;
+            let r5 = u64::from(lanes[5][block]) & MASK31;
+            let q0 = r0 | (r1 << 31) | ((r2 & 0x3) << 62);
+            let q1 = (r2 >> 2) | (r3 << 29) | ((r4 & 0xf) << 60);
+            let q2 = (r4 >> 4) | (r5 << 27);
+            let p = dst.add(block * B_SIDE_PACKED_BYTES_PER_BLOCK + g * B_SPEED_BYTES_PER_G);
+            core::ptr::write_unaligned(p.cast::<u64>(), q0.to_le());
+            core::ptr::write_unaligned(p.add(8).cast::<u64>(), q1.to_le());
+            core::ptr::write_unaligned(p.add(16).cast::<u64>(), q2.to_le());
+        }
+    }
 }
 
 #[inline(always)]
@@ -1104,6 +1136,7 @@ struct StepRows {
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
+    publish_b: bool,
 }
 
 impl StepRows {
@@ -1141,15 +1174,17 @@ impl StepRows {
                 true,
                 wide,
             );
-            emit_pair(
-                self.b.add(o),
-                b_lo,
-                b_hi,
-                f & 0x10 != 0,
-                f & 0x20 != 0,
-                true,
-                wide,
-            );
+            if self.publish_b {
+                emit_pair(
+                    self.b.add(o),
+                    b_lo,
+                    b_hi,
+                    f & 0x10 != 0,
+                    f & 0x20 != 0,
+                    true,
+                    wide,
+                );
+            }
         }
     }
 }
@@ -1169,18 +1204,19 @@ struct RankedRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    publish_b: bool,
 }
 
 impl RankedRows {
     #[inline(always)]
-    fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
+    fn new(z: *mut u32, a: *mut u32, b: *mut u32, publish_b: bool) -> Self {
         #[cfg(target_feature = "avx512f")]
         {
             debug_assert!((z as usize).is_multiple_of(64));
             debug_assert!((a as usize).is_multiple_of(64));
             debug_assert!((b as usize).is_multiple_of(64));
         }
-        Self { z, a, b }
+        Self { z, a, b, publish_b }
     }
 
     /// Dense ranked windows 2..29: z, a, and b are all fully live.
@@ -1196,7 +1232,9 @@ impl RankedRows {
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
                 stream_ranked_line(self.a.add(o), av);
-                stream_ranked_line(self.b.add(o), bv);
+                if self.publish_b {
+                    stream_ranked_line(self.b.add(o), bv);
+                }
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
@@ -1206,7 +1244,9 @@ impl RankedRows {
                 let b_hi = load_v8(bp.add(8));
                 stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
-                stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                if self.publish_b {
+                    stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                }
             }
         }
     }
@@ -1303,7 +1343,7 @@ impl Drain8<'_> {
                 let blk = abs_word / STEP_WORDS;
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word),self.publish_b);
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -1381,7 +1421,7 @@ impl Drain8<'_> {
                             store_v8(p.add(8),b_hi[r]);
                         }
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word),self.publish_b);
                     proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
@@ -1430,7 +1470,7 @@ impl Drain8<'_> {
                     if g + 1 >= b_g0 && g + 1 < b_g1 {
                         flags |= 0x20;
                     }
-                    let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), flags };
+                    let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), flags, publish_b:self.publish_b };
                     proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
                 }
             }
@@ -1578,6 +1618,46 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     elide: [bool; 3],
 ) {
     unsafe {
+        build_octa_witness_stream_impl(inputs, z, a, b, proj, elide, core::ptr::null_mut(), true)
+    }
+}
+
+/// Production PACKED186 twin of [`build_octa_witness_ab_stream_elide`].
+///
+/// B remains in the rolling ring long enough to derive z and every round-one
+/// projection window, but it is never published to a dense witness owner.
+/// `packed_b` owns eight consecutive 1344-byte blocks and receives the six
+/// live RHS vectors at each G directly from the compression kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_a_packed_b_stream_elide(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    packed_b: *mut u8,
+    proj: StreamProj<'_>,
+    elide: [bool; 3],
+) {
+    unsafe {
+        // Alias the dormant dense-B destination to z rather than using null:
+        // the drain computes in-bounds row pointers before its publication
+        // policy decides whether to store B.
+        build_octa_witness_stream_impl(inputs, z, a, z, proj, elide, packed_b, false)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn build_octa_witness_stream_impl(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    elide: [bool; 3],
+    packed_b: *mut u8,
+    publish_b: bool,
+) {
+    unsafe {
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
@@ -1704,6 +1784,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             ranked_static,
+            publish_b,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -1773,6 +1854,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                if !publish_b {
+                    store_packed_b_g(packed_b, $g, [r0, r1, r2, r3, r4, r5]);
+                }
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);

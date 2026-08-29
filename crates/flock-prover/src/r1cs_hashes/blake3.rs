@@ -1582,15 +1582,84 @@ fn write_aligned_lin_words(
 // ---------------------------------------------------------------------------
 
 const B_SPEED_BITS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
-const B_SPEED_BYTES_PER_G: usize = B_SPEED_BITS_PER_G.div_ceil(8);
+pub(super) const B_SPEED_BYTES_PER_G: usize = B_SPEED_BITS_PER_G.div_ceil(8);
 const B_SPEED_TAIL_MASK: u8 = u8::MAX << (B_SPEED_BITS_PER_G % 8);
 const B_DENSE_BYTES_PER_BLOCK: usize = K / 8;
 const B_LOW31_MASK: u32 = (1u32 << CARRY_BITS_PER_ADD) - 1;
+pub(super) const B_SIDE_PACKED_BYTES_PER_BLOCK: usize = N_G * B_SPEED_BYTES_PER_G;
+
+/// Scratch-backed owner for the production PACKED186 B representation.
+///
+/// Each compression occupies 56 G records of 24 bytes. The backing allocation
+/// is borrowed from the existing F128 scratch pool, so replacing dense B does
+/// not add a second long-lived allocator class. Every producer must overwrite
+/// all bytes before exposing the owner.
+pub(crate) struct PackedBSide {
+    storage: Vec<F128>,
+    n_blocks: usize,
+}
+
+impl PackedBSide {
+    fn take_uninit(n_blocks: usize) -> Self {
+        const {
+            assert!(B_SIDE_PACKED_BYTES_PER_BLOCK.is_multiple_of(std::mem::size_of::<F128>()));
+        }
+        let n_f128 = n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK / std::mem::size_of::<F128>();
+        Self {
+            storage: flock_core::scratch::take_f128(n_f128),
+            n_blocks,
+        }
+    }
+
+    pub(crate) fn len_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.storage.as_ptr().cast::<u8>(),
+                self.n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK,
+            )
+        }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.storage.as_mut_ptr().cast::<u8>(),
+                self.n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK,
+            )
+        }
+    }
+
+    pub(crate) fn block(&self, block: usize) -> &[u8] {
+        assert!(block < self.n_blocks);
+        let start = block * B_SIDE_PACKED_BYTES_PER_BLOCK;
+        &self.as_bytes()[start..start + B_SIDE_PACKED_BYTES_PER_BLOCK]
+    }
+}
+
+impl Drop for PackedBSide {
+    fn drop(&mut self) {
+        flock_core::scratch::give_f128(std::mem::take(&mut self.storage));
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BSideSpeedBlock([[u8; B_SPEED_BYTES_PER_G]; N_G]);
 
 impl BSideSpeedBlock {
+    #[inline]
+    fn as_bytes(&self) -> &[u8; B_SIDE_PACKED_BYTES_PER_BLOCK] {
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .cast::<[u8; B_SIDE_PACKED_BYTES_PER_BLOCK]>()
+        }
+    }
+
     #[inline(always)]
     fn put_rhs(&mut self, g: usize, add: usize, rhs: u32) {
         debug_assert!(g < N_G && add < ADDS_PER_G);
@@ -2277,6 +2346,143 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
     (z, a, b, ab_inner)
+}
+
+/// Producer-only result for the PACKED186 B representation. This is kept
+/// separate from prover plumbing until both zerocheck consumers accept the
+/// compact layout.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) struct PackedBSideProducerOutput {
+    pub(crate) z: Vec<F128>,
+    pub(crate) a: Vec<F128>,
+    pub(crate) b: PackedBSide,
+    pub(crate) ab_inner: flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+}
+
+/// Build z/A, PACKED186 B, and the complete round-one projection in one AVX2
+/// octa pass. Dense B exists only as the kernel's rolling register/ring state;
+/// it has no persistent allocation and is never published to memory.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) fn generate_witness_with_a_packed_b_and_round1_inner_from(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> PackedBSideProducerOutput {
+    use rayon::prelude::*;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+
+    let n_total = 1usize << n_blocks_log;
+    assert!(n_total >= SIMD && blocks.len() <= n_total);
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let mut b = PackedBSide::take_uninit(n_total);
+    let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+        n_total * BYTES_PER_BLOCK,
+    );
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        &inv_table,
+        ab_inner_bytes,
+        abinner_nt,
+    );
+
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let group_packed = GROUP * B_SIDE_PACKED_BYTES_PER_BLOCK;
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.as_bytes_mut().par_chunks_mut(group_packed))
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each_init(
+            || {
+                let mut stage: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                stage.reserve_exact(STAGE_LINES);
+                unsafe { stage.set_len(STAGE_LINES) };
+                stage
+            },
+            |stage, (group, (((z_out, a_out), packed_out), ab_out))| unsafe {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                for half in 0..(n_here / SIMD) {
+                    let base = GROUP * group + half * SIMD;
+                    let staged: [Compression; SIMD];
+                    let octa = match blocks {
+                        crate::seed_pipe::BlockSource::Slice(s) => {
+                            blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                s.get(base + j).unwrap_or(&padding)
+                            }))
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len }
+                            if base + SIMD <= len =>
+                        {
+                            blake3_witgen8::OctaInputs::Closed { init, base }
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len } => {
+                            staged = std::array::from_fn(|j| {
+                                let idx = base + j;
+                                if idx < len {
+                                    crate::seed_pipe::gen_block(init, idx)
+                                } else {
+                                    padding
+                                }
+                            });
+                            blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| &staged[j]))
+                        }
+                    };
+                    let off = half * SIMD * F128_PER_BLOCK;
+                    let stage_ptr = stage.as_mut_ptr().cast::<u32>();
+                    let proj = blake3_witgen8::StreamProj {
+                        stage: stage_ptr,
+                        out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                    };
+                    // Sidecar B supplies its fixed prefix/tail independently;
+                    // z/a still require real provenance before static windows
+                    // may skip their persistent stores.
+                    let elide = [z_tok, a_tok, true];
+                    blake3_witgen8::build_octa_witness_a_packed_b_stream_elide(
+                        octa,
+                        z_out.as_mut_ptr().add(off).cast::<u32>(),
+                        a_out.as_mut_ptr().add(off).cast::<u32>(),
+                        packed_out
+                            .as_mut_ptr()
+                            .add(half * SIMD * B_SIDE_PACKED_BYTES_PER_BLOCK),
+                        proj,
+                        elide,
+                    );
+                }
+                // a and ab_inner are streamed in every octa; publish before a
+                // task can hand its chunks to a later phase.
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            },
+        );
+
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    PackedBSideProducerOutput { z, a, b, ab_inner }
 }
 
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
@@ -4587,6 +4793,94 @@ mod tests {
                 "dense B mismatch at randomized case {case}"
             );
         }
+    }
+
+    #[test]
+    fn b_side_packed_owner_has_exact_scalar_block_bytes() {
+        let mut rng = Rng::new(0xB51D_0A11_CAFE_0001);
+        let blocks: [Compression; 2] = std::array::from_fn(|_| {
+            (
+                std::array::from_fn(|_| rng.next_u32()),
+                std::array::from_fn(|_| rng.next_u32()),
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                rng.next_u32(),
+                rng.next_u32(),
+            )
+        });
+        let expected = blocks.map(|block| speed_encode(&block));
+        let mut owner = PackedBSide::take_uninit(2);
+        for (dst, src) in owner
+            .as_bytes_mut()
+            .chunks_exact_mut(B_SIDE_PACKED_BYTES_PER_BLOCK)
+            .zip(&expected)
+        {
+            dst.copy_from_slice(src.as_bytes());
+        }
+        assert_eq!(owner.len_blocks(), 2);
+        assert_eq!(owner.block(0), expected[0].as_bytes());
+        assert_eq!(owner.block(1), expected[1].as_bytes());
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn b_side_packed_octa_matches_scalar_and_full_projection_with_padding() {
+        let mut rng = Rng::new(0xB51D_0C7A_CAFE_0001);
+        let blocks: Vec<Compression> = (0..5)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            })
+            .collect();
+        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+        let mut out = generate_witness_with_a_packed_b_and_round1_inner_from(
+            crate::seed_pipe::BlockSource::Slice(&blocks),
+            3,
+        );
+        assert_eq!(out.b.len_blocks(), 8);
+        for block in 0..8 {
+            let scalar = speed_encode(blocks.get(block).unwrap_or(&padding));
+            assert_eq!(
+                out.b.block(block),
+                scalar.as_bytes(),
+                "packed B block {block}"
+            );
+        }
+
+        let (z_ref, a_ref, b_ref) = generate_witness_with_ab_packed(&blocks, 3);
+        assert_eq!(out.z, z_ref, "z differs from dense producer");
+        assert_eq!(out.a, a_ref, "A differs from dense producer");
+        let total_bytes = 8 * B_DENSE_BYTES_PER_BLOCK;
+        let a_bytes =
+            unsafe { std::slice::from_raw_parts(a_ref.as_ptr().cast::<u8>(), total_bytes) };
+        let b_bytes =
+            unsafe { std::slice::from_raw_parts(b_ref.as_ptr().cast::<u8>(), total_bytes) };
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let padding_spec = flock_core::zerocheck::PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+        let mut oracle =
+            flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_bytes,
+                b_bytes,
+                K_LOG + 3,
+                K_SKIP,
+                &inv_table,
+                &padding_spec,
+            );
+        assert_eq!(
+            out.ab_inner.as_bytes_mut(),
+            oracle.as_bytes_mut(),
+            "ab_inner differs from dense-B oracle"
+        );
     }
 
     #[cfg(all(
