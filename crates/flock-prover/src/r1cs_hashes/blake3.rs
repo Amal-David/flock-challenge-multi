@@ -1914,9 +1914,16 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let owned_inv;
+    let inv_table = if std::env::var_os("FLOCK_NO_WITGEN_SHARED_INV").is_none() {
+        flock_core::zerocheck::ranked_k_skip_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        owned_inv = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &owned_inv
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]

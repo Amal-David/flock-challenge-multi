@@ -180,6 +180,13 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
+/// Process-cached k_skip=6 inverse table. Witgen's round-1 window projection
+/// uses the same S/Λ pair as URM; rebuilding it every prove was dead work.
+/// `FLOCK_NO_WITGEN_SHARED_INV=1` (in the prover) restores a local `new()`.
+pub fn ranked_k_skip_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
+
 /// Witness padding descriptor for URM work-skipping.
 ///
 /// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
@@ -560,10 +567,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) => rayon::join(
-                        || ab_pool.install(ab_closure),
-                        || c_pool.install(c_closure),
-                    ),
+                    Some((ab_pool, c_pool)) => {
+                        rayon::join(|| ab_pool.install(ab_closure), || c_pool.install(c_closure))
+                    }
                     None => rayon::join(ab_closure, c_closure),
                 };
             if zc_timing {
@@ -1279,6 +1285,27 @@ mod tests {
     fn pack_abc(a: &[bool], b: &[bool], c: &[bool]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use univariate_skip::pack_bits;
         (pack_bits(a), pack_bits(b), pack_bits(c))
+    }
+
+    /// The process-cached URM table is the same object witgen now borrows:
+    /// identical k/ell and identical apply() on a full 64-byte row vs a
+    /// fresh `InvNttTableByteSingleGf8::new` of the same S/Λ pair.
+    #[test]
+    fn ranked_k_skip_inv_table_matches_fresh_build() {
+        let shared = ranked_k_skip_inv_table();
+        let fresh = build_urm_inv_table(K_SKIP);
+        assert_eq!(shared.k, fresh.k);
+        assert_eq!(shared.ell, fresh.ell);
+        assert_eq!(shared.n_chunks, fresh.n_chunks);
+        let mut bytes = [0u8; 64];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        let mut out_s = vec![crate::field::F8::ZERO; shared.ell];
+        let mut out_f = vec![crate::field::F8::ZERO; fresh.ell];
+        shared.apply(&bytes[..shared.n_chunks], &mut out_s);
+        fresh.apply(&bytes[..fresh.n_chunks], &mut out_f);
+        assert_eq!(out_s, out_f);
     }
 
     /// `prove` runs end-to-end at the smallest valid m (= k_skip + N_INNER = 13)
