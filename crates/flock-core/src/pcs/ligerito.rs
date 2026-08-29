@@ -6928,11 +6928,15 @@ where
 {
     use rayon::prelude::*;
     let row_len = queries.first().map_or(0, |&q| row(q).len());
+    let mut out = Vec::with_capacity(queries.len());
     if par && queries.len() * row_len >= ROW_GATHER_PAR_MIN_ELEMS {
-        queries.par_iter().map(|&q| row(q).to_vec()).collect()
+        queries.par_iter().map(|&q| row(q).to_vec()).collect_into_vec(&mut out);
     } else {
-        queries.iter().map(|&q| row(q).to_vec()).collect()
+        for &q in queries {
+            out.push(row(q).to_vec());
+        }
     }
+    out
 }
 
 /// Sibling-count floor below which the multi-proof gather stays on the
@@ -6954,16 +6958,14 @@ fn sample_distinct_queries<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
         let v = challenger.sample_f128();
         let q = (v.lo as usize) % block_len;
-        if seen.insert(q) {
-            out.push(q);
+        if let Err(pos) = out.binary_search(&q) {
+            out.insert(pos, q);
         }
     }
-    out.sort_unstable();
     out
 }
 
