@@ -7,7 +7,7 @@ services:
     dockerfilePath: Dockerfile.render
     dockerContext: .
     dockerCommand: sleep infinity
-    plan: "pro max"
+    plan: starter
     region: singapore
     envVars:
       - key: FLOCK_JOB_MAX_SECONDS
