@@ -3136,6 +3136,28 @@ fn r1_cfold_x4_enabled() -> bool {
     *ON
 }
 
+/// Test-only forced-off latch for the unread fold4/quad collapse, so the
+/// identity-C oracle can still check those tensors without mutating env.
+#[cfg(test)]
+pub(crate) static ZC_ELIDE_DEAD_FOLD4_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ZC_ELIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `FLOCK_NO_ZC_ELIDE_DEAD_FOLD4=1` restores fold8→fold4→quad even though
+/// ranked open consumes fold8 only. Default ON: skip those collapses and
+/// derive `s_hat_v_c` from `collapse_s_hat_v_fold8` (already the fold4/quad
+/// identity). Ranked `env_clear()` so default ON.
+fn zc_elide_dead_fold4_enabled() -> bool {
+    #[cfg(test)]
+    if ZC_ELIDE_DEAD_FOLD4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_ELIDE_DEAD_FOLD4").is_none());
+    *ON
+}
+
 /// Round-one AB message from the challenge-independent precompute, with no C
 /// drain. Bit-identical to the AB output of
 /// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4`];
@@ -3387,28 +3409,34 @@ pub fn round1_c_fold4_from_block_major_z(
             let c_inner = identity_c_inner_fold(z_packed, m, k_log, useful_bits, &r[k_log..], par);
             crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail)
         };
-        // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
-        let retained_top_eq = build_eq(&inner_tail[4..6]);
-        let mut fold4 = vec![F128::ZERO; 16 * n_packed];
-        let wide = r1_cfold_x4_enabled();
-        for high in 0..4 {
-            for bank in 0..16 {
-                let src = (bank + 16 * high) * n_packed;
-                let dst = bank * n_packed;
-                if wide {
-                    crate::field::f128_slice::add_scaled(
-                        &mut fold4[dst..dst + n_packed],
-                        &fold8[src..src + n_packed],
-                        retained_top_eq[high],
-                    );
-                } else {
-                    for packed in 0..n_packed {
-                        fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+        if zc_elide_dead_fold4_enabled() {
+            // Ranked open takes fold8 only. fold4/quad are unread on that
+            // path; s_hat_v_c is collapse_s_hat_v_fold8 of the same tensor.
+            (Vec::new(), fold8)
+        } else {
+            // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
+            let retained_top_eq = build_eq(&inner_tail[4..6]);
+            let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+            let wide = r1_cfold_x4_enabled();
+            for high in 0..4 {
+                for bank in 0..16 {
+                    let src = (bank + 16 * high) * n_packed;
+                    let dst = bank * n_packed;
+                    if wide {
+                        crate::field::f128_slice::add_scaled(
+                            &mut fold4[dst..dst + n_packed],
+                            &fold8[src..src + n_packed],
+                            retained_top_eq[high],
+                        );
+                    } else {
+                        for packed in 0..n_packed {
+                            fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                        }
                     }
                 }
             }
+            (fold4, fold8)
         }
-        (fold4, fold8)
     } else {
         // Kill switch restores the incumbent sixteen-bank producer; do not
         // pay for widening and collapsing a statistic no consumer will use.
@@ -3419,29 +3447,37 @@ pub fn round1_c_fold4_from_block_major_z(
         )
     };
 
-    // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 stay bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    let wide_quad = r1_cfold_x4_enabled();
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            if wide_quad {
-                crate::field::f128_slice::add_scaled(
-                    &mut quad[dst..dst + n_packed],
-                    &fold4[src..src + n_packed],
-                    retained_hi_eq[q],
-                );
-            } else {
-                for packed in 0..n_packed {
-                    quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+    let (quad, s_hat_v_c) = if fold4.is_empty() && !fold8.is_empty() {
+        (
+            Vec::new(),
+            crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]),
+        )
+    } else {
+        // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
+        // tensor (coordinates 0 and 1 stay bank selectors).
+        let retained_hi_eq = build_eq(&inner_tail[2..4]);
+        let mut quad = vec![F128::ZERO; 4 * n_packed];
+        let wide_quad = r1_cfold_x4_enabled();
+        for q in 0..4 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                if wide_quad {
+                    crate::field::f128_slice::add_scaled(
+                        &mut quad[dst..dst + n_packed],
+                        &fold4[src..src + n_packed],
+                        retained_hi_eq[q],
+                    );
+                } else {
+                    for packed in 0..n_packed {
+                        quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                    }
                 }
             }
         }
-    }
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        (quad, s_hat_v_c)
+    };
 
     // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
     // bit at the original C point recovers C's 64 S-domain evaluations.
@@ -4627,6 +4663,12 @@ mod tests {
     #[test]
     fn identity_c_fold_matches_row_major_fold4_drain() {
         use crate::zerocheck::univariate_skip::pack_bits;
+        use std::sync::atomic::Ordering;
+
+        let _elide_guard = ZC_ELIDE_TEST_LOCK.lock().unwrap();
+        // This oracle checks fold4/quad tensors the ranked path no longer
+        // reads; force the collapse back on so those asserts still fire.
+        ZC_ELIDE_DEAD_FOLD4_FORCED_OFF.store(true, Ordering::Relaxed);
 
         for (m, useful_bits) in [(22usize, 15_409usize), (24, 15_409), (22, 1usize << 14)] {
             const K_LOG: usize = 14;
@@ -4734,6 +4776,57 @@ mod tests {
                 assert!(fold8_new.is_empty(), "Fold8 kill switch still widened C");
             }
         }
+        ZC_ELIDE_DEAD_FOLD4_FORCED_OFF.store(false, Ordering::Relaxed);
+    }
+
+    /// Eliding unread fold4/quad must keep C's message and s_hat_v_c
+    /// bit-identical to the full collapse (`collapse_s_hat_v_fold8`).
+    #[test]
+    fn elide_dead_fold4_matches_full_collapse() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        use std::sync::atomic::Ordering;
+
+        let _elide_guard = ZC_ELIDE_TEST_LOCK.lock().unwrap();
+        let m = 22usize;
+        const K_LOG: usize = 14;
+        let useful_bits = 15_409usize;
+        let mut rng = Rng::new(0xE11D_F04D);
+        let total_bits = 1usize << m;
+        let mut c = rng.bits(total_bits);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(total_bits / block_size) {
+            for offset in useful_bits..block_size {
+                c[block * block_size + offset] = false;
+            }
+        }
+        let c_p = pack_bits(&c);
+        let c_words: Vec<F128> = c_p
+            .chunks_exact(16)
+            .map(|w| F128 {
+                lo: u64::from_le_bytes(w[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(w[8..].try_into().unwrap()),
+            })
+            .collect();
+        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let r = build_protocol_r(m, &outer);
+        let table = make_inv_table();
+
+        ZC_ELIDE_DEAD_FOLD4_FORCED_OFF.store(true, Ordering::Relaxed);
+        let (c_full, s_hat_full, quad_full, fold4_full, fold8_full) =
+            round1_c_fold4_from_block_major_z(&c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table);
+        ZC_ELIDE_DEAD_FOLD4_FORCED_OFF.store(false, Ordering::Relaxed);
+        let (c_elide, s_hat_elide, quad_elide, fold4_elide, fold8_elide) =
+            round1_c_fold4_from_block_major_z(&c_words, m, K_LOG, K_SKIP, useful_bits, &r, &table);
+
+        assert!(!fold4_full.is_empty(), "forced-off arm skipped fold4");
+        assert!(!quad_full.is_empty(), "forced-off arm skipped quad");
+        if crate::pcs::ranked_direct_fold8_enabled() {
+            assert!(fold4_elide.is_empty(), "elide still built fold4");
+            assert!(quad_elide.is_empty(), "elide still built quad");
+            assert_eq!(fold8_elide, fold8_full, "elide drifted fold8");
+        }
+        assert_eq!(c_elide, c_full, "elide drifted C message");
+        assert_eq!(s_hat_elide, s_hat_full, "elide drifted s_hat_v_c");
     }
 
     #[test]

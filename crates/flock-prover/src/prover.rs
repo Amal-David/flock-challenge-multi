@@ -122,14 +122,17 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
-/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
-/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
+/// Direct-fold8 capture/consumer predicate: fold8 latch and six retainable
+/// tail coordinates. Does **not** require a live fold4 tensor — ranked open
+/// takes fold8 only, and the producer may elide the unread fold4/quad
+/// collapse (`FLOCK_NO_ZC_ELIDE_DEAD_FOLD4`).
 #[inline]
 fn ranked_direct_fold8_precompute_enabled(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
 ) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs, captured)
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold4_enabled()
         && pcs::ranked_direct_fold8_enabled()
         && captured.fold8.is_some()
         && r1cs.k_log >= r1cs.k_skip + 7
