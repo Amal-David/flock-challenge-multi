@@ -4528,12 +4528,10 @@ pub fn generate_witness_batch_major(
 }
 
 #[cfg(test)]
-#[allow(unexpected_cfgs)] // internal `flock_bside_t1_probe` assembly/test gate
 mod tests {
     use super::*;
 
     #[cfg(all(
-        flock_bside_t1_probe,
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512vbmi",
@@ -4557,7 +4555,6 @@ mod tests {
     }
 
     #[cfg(all(
-        flock_bside_t1_probe,
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512vbmi",
@@ -4568,7 +4565,6 @@ mod tests {
     struct T1ProbeCFoldMats([[u64; 8]; 128], [[u64; 8]; 64]);
 
     #[cfg(all(
-        flock_bside_t1_probe,
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512vbmi",
@@ -4884,7 +4880,6 @@ mod tests {
     }
 
     #[cfg(all(
-        flock_bside_t1_probe,
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512vbmi",
@@ -4911,7 +4906,6 @@ mod tests {
     }
 
     #[cfg(all(
-        flock_bside_t1_probe,
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512vbmi",

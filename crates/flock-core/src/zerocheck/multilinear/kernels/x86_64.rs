@@ -1,3 +1,4 @@
+use super::super::PackedB186;
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -200,6 +201,91 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
+    // SAFETY: forwarded contract; the dense wrapper preserves the incumbent
+    // input representation and every fallback arm.
+    unsafe {
+        round2_lookahead_chunk_x86_avx512_impl::<WRITE>(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            None,
+            row_base,
+            a_chunk,
+            b_chunk,
+            eq_lo,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            wtab,
+        )
+    }
+}
+
+/// Packed186-B specialization of the ranked no-materialize round-2 pass.
+/// A remains in the incumbent dense packed layout; each aligned 64-row B
+/// refill is decoded directly into the residue-major GFNI register body.
+///
+/// # Safety
+/// The dense-A, table, and output contracts are those of
+/// [`round2_lookahead_chunk_x86_avx512`]. `row_base` must be 64-row aligned
+/// and the requested rows must lie inside `b_sidecar`.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512_bside(
+    table_data: *const F128,
+    mats: &[u64; 128],
+    a_pkt: *const u8,
+    b_sidecar: PackedB186<'_>,
+    row_base: usize,
+    eq_lo: &[F128],
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
+    assert_eq!(row_base % 64, 0, "packed-B refill must be 64-row aligned");
+    assert!(row_base + 2 * eq_lo.len() <= b_sidecar.rows());
+    assert!(eq_lo.len() >= 32 && eq_lo.len().is_multiple_of(32));
+    assert!(zc_regfold_enabled() && zc_r2_tr_enabled() && zc_r2_bcast_enabled());
+    // SAFETY: the assertions select the exhaustive ranked batch arm, so the
+    // null dense-B sentinel is never dereferenced. The compact view bounds
+    // every decoder refill.
+    unsafe {
+        round2_lookahead_chunk_x86_avx512_impl::<false>(
+            table_data,
+            Some(mats),
+            a_pkt,
+            core::ptr::null(),
+            Some(b_sidecar),
+            row_base,
+            &mut [],
+            &mut [],
+            eq_lo,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            wtab,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn round2_lookahead_chunk_x86_avx512_impl<const WRITE: bool>(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    b_sidecar: Option<PackedB186<'_>>,
+    row_base: usize,
+    a_chunk: &mut [F128],
+    b_chunk: &mut [F128],
+    eq_lo: &[F128],
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -253,6 +339,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if b_sidecar.is_some() {
+            assert!(use_batch && tr_emit && tr_bcast);
+        }
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -274,11 +364,26 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    if let Some(sidecar) = b_sidecar {
+                        b_side_t1_gfni_fold64_regs_sigma_bcast(
+                            b_side_decode_burst_regs(sidecar, g0),
+                            m,
+                            fb.as_mut_ptr(),
+                        );
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    }
                 } else if tr_emit {
+                    debug_assert!(b_sidecar.is_none());
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 } else {
+                    debug_assert!(b_sidecar.is_none());
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
@@ -294,10 +399,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_sidecar.is_none() {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
             }
@@ -315,10 +422,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
@@ -401,6 +510,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let r = 2 * (pair % 32);
                             [fa[r], fa[r + 1], fb[r], fb[r + 1]]
                         } else {
+                            debug_assert!(b_sidecar.is_none());
                             fold_round2_pair_x86_unchecked_8(
                                 table_data,
                                 a_pkt.add(x0g * 8),
@@ -483,6 +593,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             x_lo += 8;
         }
 
+        if b_sidecar.is_some() {
+            assert_eq!(x_lo, lo_size, "packed-B round-2 cannot enter dense tail");
+        }
+
         // Small instances (lo_size ∈ {2, 4}) leave whole groups for the
         // scalar path; identical arithmetic, one group at a time.
         while x_lo + 2 <= lo_size {
@@ -504,6 +618,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 any = true;
                 let x0g = row_base + x0l;
                 let x1g = x0g + 1;
+                debug_assert!(b_sidecar.is_none());
                 rows[half] = fold_round2_pair_x86_unchecked_8(
                     table_data,
                     a_pkt.add(x0g * 8),
@@ -1332,6 +1447,105 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     cfold: Option<&CFoldMats>,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
+    // SAFETY: forwarded contract; the dense wrapper preserves every incumbent
+    // fallback and diagnostic arm.
+    unsafe {
+        fold2_from_packed_lookahead_x86_avx512_impl(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            None,
+            out_base,
+            a_out,
+            b_out,
+            rho1,
+            rho2,
+            eq_lo,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            nt_out,
+            cfold,
+            wtab,
+        )
+    }
+}
+
+/// Packed186-B specialization of the ranked level-0 composed rounds-3+4
+/// pass. A remains dense; every aligned B refill enters the composed GFNI
+/// register body directly, without a decoded 512-byte tile.
+///
+/// # Safety
+/// The dense-A, table, and output contracts are those of
+/// [`fold2_from_packed_lookahead_x86_avx512`]. The requested global row range
+/// must lie inside `b_sidecar`.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512_bside(
+    table_data: *const F128,
+    mats: &[u64; 128],
+    a_pkt: *const u8,
+    b_sidecar: PackedB186<'_>,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: &CFoldMats,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
+    assert_eq!(out_base % 16, 0, "packed-B refill must be 64-row aligned");
+    assert!(4 * out_base + 8 * eq_lo.len() <= b_sidecar.rows());
+    assert!(eq_lo.len() >= 8 && eq_lo.len().is_multiple_of(8));
+    assert!(zc_regfold_enabled() && zc_r34_bcast_enabled());
+    // SAFETY: the assertions select the exhaustive composed batch arm, so the
+    // null dense-B sentinel is never dereferenced. The compact view bounds
+    // every decoder refill.
+    unsafe {
+        fold2_from_packed_lookahead_x86_avx512_impl(
+            table_data,
+            Some(mats),
+            a_pkt,
+            core::ptr::null(),
+            Some(b_sidecar),
+            out_base,
+            a_out,
+            b_out,
+            rho1,
+            rho2,
+            eq_lo,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            nt_out,
+            Some(cfold),
+            wtab,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_x86_avx512_impl(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    b_sidecar: Option<PackedB186<'_>>,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: Option<&CFoldMats>,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -1576,6 +1790,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if b_sidecar.is_some() {
+            assert!(use_batch && use_c4 && c4_bcast);
+        }
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1597,7 +1815,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
@@ -1615,13 +1833,22 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 fa.as_mut_ptr(),
                                 dead,
                             );
-                            gfni_fold64_rows_masked_c4_bcast(
-                                b_pkt.add(4 * xg * 8),
-                                c,
-                                fb.as_mut_ptr(),
-                                dead,
-                            );
+                            if let Some(sidecar) = b_sidecar {
+                                b_side_t1_gfni_fold64_regs_c4_bcast(
+                                    b_side_decode_burst_regs(sidecar, 4 * xg),
+                                    c,
+                                    fb.as_mut_ptr(),
+                                );
+                            } else {
+                                gfni_fold64_rows_masked_c4_bcast(
+                                    b_pkt.add(4 * xg * 8),
+                                    c,
+                                    fb.as_mut_ptr(),
+                                    dead,
+                                );
+                            }
                         } else {
+                            debug_assert!(b_sidecar.is_none());
                             gfni_fold64_rows_masked_c4(
                                 a_pkt.add(4 * xg * 8),
                                 c,
@@ -1636,6 +1863,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             );
                         }
                     } else {
+                        debug_assert!(b_sidecar.is_none());
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
@@ -1651,10 +1879,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_sidecar.is_none() {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                 }
@@ -1715,6 +1945,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             } else {
+                debug_assert!(b_sidecar.is_none());
                 let g = groups_general(
                     table_data,
                     a_pkt,
@@ -1739,10 +1970,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let ap = a_out.as_mut_ptr().add(ol);
@@ -1781,10 +2014,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
@@ -1798,10 +2033,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -1853,6 +2090,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             acc[6].mul_acc(o_aw, o_b);
             acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
             x_lo += 8;
+        }
+
+        if b_sidecar.is_some() {
+            assert_eq!(
+                x_lo, lo_size,
+                "packed-B composed pass cannot enter dense tail"
+            );
         }
 
         // Small instances leave whole groups: one group at a time, scalar finish.
@@ -2928,15 +3172,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     }
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline(always)]
 unsafe fn b_side_t1_load_64_rows_masked(
     rows: *const u8,
@@ -2962,15 +3198,7 @@ unsafe fn b_side_t1_load_64_rows_masked(
     }
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline(always)]
 unsafe fn b_side_t1_gfni_fold64_regs_sigma_bcast(
     z: [core::arch::x86_64::__m512i; 8],
@@ -3048,15 +3276,7 @@ unsafe fn b_side_t1_gfni_fold64_regs_sigma_bcast(
     }
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline(always)]
 unsafe fn b_side_t1_gfni_fold64_regs_c4_bcast(
     z: [core::arch::x86_64::__m512i; 8],
@@ -3212,25 +3432,16 @@ unsafe fn b_side_t1_gfni_fold64_regs_c4_bcast(
 }
 
 // -------------------------------------------------------------------------
-// T1-only B-side burst feasibility prototype.
+// Packed186 B-side burst decoder.
 //
-// The ranked prover does not reference these symbols. They answer one codegen
-// question only: can the canonical 186-bit/G sidecar be expanded one 4096-bit
-// quadrant at a time directly into the existing register consumers without a
-// decoded 512-byte input tile? Descriptor construction is const-evaluated;
-// the emitted decoder is eight unrolled AVX-512 qword gathers and funnel
-// shifts with no scalar row/bit loop and no runtime division or modulo.
+// The canonical 186-bit/G sidecar expands one 4096-bit quadrant directly into
+// the existing register consumers without a decoded 512-byte input tile.
+// Descriptor construction is const-evaluated; the emitted decoder is eight
+// unrolled AVX-512 qword gathers and funnel shifts with no scalar row/bit loop
+// and no runtime division or modulo.
 // -------------------------------------------------------------------------
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[derive(Copy, Clone)]
 struct BSideT1BurstZmmDesc {
     source_base_bytes: u16,
@@ -3240,29 +3451,13 @@ struct BSideT1BurstZmmDesc {
     variable_len: [u8; 8],
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 const _: () = {
     assert!(core::mem::size_of::<BSideT1BurstZmmDesc>() == 34);
     assert!(core::mem::size_of::<[[BSideT1BurstZmmDesc; 8]; 4]>() == 1088);
 };
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 const fn b_side_t1_make_desc(quadrant: usize, zmm: usize) -> BSideT1BurstZmmDesc {
     const GS_BASE: usize = 1153;
     const G_STRIDE: usize = 250;
@@ -3357,15 +3552,7 @@ const fn b_side_t1_make_desc(quadrant: usize, zmm: usize) -> BSideT1BurstZmmDesc
     }
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 const B_SIDE_T1_BURST_PHASES: [[BSideT1BurstZmmDesc; 8]; 4] = [
     [
         b_side_t1_make_desc(0, 0),
@@ -3409,15 +3596,7 @@ const B_SIDE_T1_BURST_PHASES: [[BSideT1BurstZmmDesc; 8]; 4] = [
     ],
 ];
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline(always)]
 unsafe fn b_side_t1_decode_zmm(
     packed: *const u8,
@@ -3463,15 +3642,7 @@ unsafe fn b_side_t1_decode_zmm(
     }
 }
 
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline(always)]
 unsafe fn b_side_t1_decode_burst_regs(
     packed: *const u8,
@@ -3493,17 +3664,27 @@ unsafe fn b_side_t1_decode_burst_regs(
     }
 }
 
-/// T1 assembly sink: decode one sidecar quadrant into the existing round-2
-/// residue-major register body. No ranked call site references this symbol.
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+/// Decode one 64-row post-URM B burst. `row_start` identifies the witness
+/// block and one of its four fixed descriptor phases; the decoded rows remain
+/// in eight ZMM registers and are never materialized as a dense tile.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_decode_burst_regs(
+    sidecar: PackedB186<'_>,
+    row_start: usize,
+) -> [core::arch::x86_64::__m512i; 8] {
+    debug_assert_eq!(row_start % 64, 0);
+    debug_assert!(row_start + 64 <= sidecar.rows());
+    let block = row_start / PackedB186::ROWS_PER_BLOCK;
+    let phase = (row_start % PackedB186::ROWS_PER_BLOCK) / 64;
+    // SAFETY: shape checks above bound the block and phase; the compact view's
+    // constructor pins every block to exactly 1,344 readable bytes.
+    unsafe { b_side_t1_decode_burst_regs(sidecar.block_ptr(block), &B_SIDE_T1_BURST_PHASES[phase]) }
+}
+
+/// Test sink: decode one sidecar quadrant into the production round-2
+/// residue-major register body.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[unsafe(export_name = "flock_t1_bside_tr_bcast_burst")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_tr_bcast_burst(
@@ -3516,21 +3697,17 @@ unsafe extern "C" fn b_side_t1_tr_bcast_burst(
         return;
     };
     unsafe {
-        b_side_t1_gfni_fold64_regs_sigma_bcast(b_side_t1_decode_burst_regs(packed, descs), &*mats, out);
+        b_side_t1_gfni_fold64_regs_sigma_bcast(
+            b_side_t1_decode_burst_regs(packed, descs),
+            &*mats,
+            out,
+        );
     }
 }
 
-/// T1 assembly sink: decode one sidecar quadrant into the existing rounds-3+4
-/// composed register body. No ranked call site references this symbol.
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+/// Test sink: decode one sidecar quadrant into the production rounds-3+4
+/// composed register body.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[unsafe(export_name = "flock_t1_bside_c4_bcast_burst")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_c4_bcast_burst(
@@ -3551,17 +3728,9 @@ unsafe extern "C" fn b_side_t1_c4_bcast_burst(
     }
 }
 
-/// T1 dense control for [`b_side_t1_tr_bcast_burst`]. Both sinks enter the
+/// Dense control for [`b_side_t1_tr_bcast_burst`]. Both sinks enter the
 /// identical downstream register body; only the input loader differs.
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[unsafe(export_name = "flock_t1_bside_tr_bcast_dense")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_tr_bcast_dense(
@@ -3574,17 +3743,9 @@ unsafe extern "C" fn b_side_t1_tr_bcast_dense(
     }
 }
 
-/// T1 dense control for [`b_side_t1_c4_bcast_burst`]. Both sinks enter the
+/// Dense control for [`b_side_t1_c4_bcast_burst`]. Both sinks enter the
 /// identical downstream register body; only the input loader differs.
-#[allow(unexpected_cfgs)]
-#[cfg(all(
-    flock_bside_t1_probe,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[unsafe(export_name = "flock_t1_bside_c4_bcast_dense")]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 unsafe extern "C" fn b_side_t1_c4_bcast_dense(

@@ -45,6 +45,59 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 pub(crate) mod kernels;
 
+/// Compact B operand stream for the BLAKE3 packed-witness layout.
+///
+/// Each 2^14-bit witness block becomes 256 post-`k_skip = 6` rows. Its only
+/// variable B bits are the six 31-bit carry operands in each of 56 G calls;
+/// they occupy one canonical 192-bit slot per G (186 payload bits followed by
+/// six zero bits), for 1,344 bytes per block. The x86 round-2 and composed
+/// rounds-3+4 kernels consume this view directly without materializing dense B.
+#[derive(Copy, Clone, Debug)]
+pub struct PackedB186<'a> {
+    bytes: &'a [u8],
+    blocks: usize,
+}
+
+impl<'a> PackedB186<'a> {
+    pub const BYTES_PER_G: usize = 24;
+    pub const GS_PER_BLOCK: usize = 56;
+    pub const BYTES_PER_BLOCK: usize = Self::GS_PER_BLOCK * Self::BYTES_PER_G;
+    pub const ROWS_PER_BLOCK: usize = 256;
+
+    /// Construct a shape-checked compact B view.
+    pub fn new(bytes: &'a [u8], blocks: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            blocks * Self::BYTES_PER_BLOCK,
+            "packed-B byte length does not match its block count"
+        );
+        Self { bytes, blocks }
+    }
+
+    #[inline]
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn blocks(self) -> usize {
+        self.blocks
+    }
+
+    #[inline]
+    pub fn rows(self) -> usize {
+        self.blocks * Self::ROWS_PER_BLOCK
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn block_ptr(self, block: usize) -> *const u8 {
+        debug_assert!(block < self.blocks);
+        // SAFETY: the constructor pins the exact byte count and the caller
+        // supplies a block index inside that count.
+        unsafe { self.bytes.as_ptr().add(block * Self::BYTES_PER_BLOCK) }
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
