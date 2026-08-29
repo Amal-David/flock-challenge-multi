@@ -550,12 +550,8 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         //   out[i]       = v + v*r_j      ← new bit_j = 0
         //   out[i + len] = v * r_j        ← new bit_j = 1
         // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            let hi = v * r_j;
-            out[i + len] = hi;
-            out[i] = v + hi;
-        }
+        let (lo, hi) = out.split_at_mut(len);
+        crate::field::f128_slice::eq_expand_half(lo, hi, r_j);
     }
     out
 }
@@ -2332,9 +2328,16 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let mut out = Vec::with_capacity(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
     for &er in &eq_rest {
-        for &ls in &lambda_skip {
-            out.push(ls * er);
-        }
+        let initialized = out.len();
+        crate::field::f128_slice::mul_by_const(
+            &lambda_skip,
+            &mut out.spare_capacity_mut()[..ell_skip],
+            er,
+        );
+        // SAFETY: `mul_by_const` initialized exactly the `ell_skip` spare
+        // elements above, or panicked before this point while `len` remained
+        // unchanged. Capacity was reserved for all `total` elements.
+        unsafe { out.set_len(initialized + ell_skip) };
     }
     debug_assert_eq!(out.len(), total);
     out
@@ -3599,7 +3602,7 @@ mod tests {
     /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]
     fn eq_table_matches_direct_formula() {
-        for &d in &[1usize, 2, 3, 5, 8] {
+        for &d in &[1usize, 2, 3, 5, 8, 12] {
             let mut rng = Rng::new(11 + d as u64);
             let point = rng.f128_vec(d);
             let table = build_eq_table(&point);
@@ -3618,6 +3621,26 @@ mod tests {
                 }
                 assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
             }
+        }
+    }
+
+    /// The blocked quirky-table fill (and its ranked four-lane constant
+    /// product leaf) must equal the literal scalar outer product.
+    #[test]
+    fn quirky_eq_table_matches_scalar_outer_product() {
+        let mut rng = Rng::new(0xE91A_5124);
+        for &(k_skip, rest) in &[(1usize, 1usize), (3, 5), (6, 8)] {
+            let z_skip = rng.f128();
+            let point = rng.f128_vec(rest);
+            let lambda = lagrange_weights_naive(k_skip, z_skip);
+            let eq_rest = build_eq_table(&point);
+            let mut expected = Vec::with_capacity(lambda.len() * eq_rest.len());
+            for &er in &eq_rest {
+                for &ls in &lambda {
+                    expected.push(ls * er);
+                }
+            }
+            assert_eq!(build_quirky_eq_table(z_skip, &point, k_skip), expected);
         }
     }
 

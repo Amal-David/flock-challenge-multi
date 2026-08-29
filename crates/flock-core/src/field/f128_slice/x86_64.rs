@@ -1,5 +1,71 @@
 use crate::field::F128;
 
+/// Four-lane equality-table expansion with one broadcast multiplier.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; `lo` and `hi` have equal lengths and
+/// are disjoint (they are the two halves of one equality-table allocation).
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn eq_expand_half(lo: &mut [F128], hi: &mut [F128], r: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(lo.len(), hi.len());
+    // SAFETY: caller supplies the target features and equal disjoint slices.
+    unsafe {
+        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_x4);
+        let lanes = lo.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let value = _mm512_loadu_si512(lo.as_ptr().add(i).cast::<__m512i>());
+            let product = ghash_mul_x4_split(value, r_x4, r_x64);
+            _mm512_storeu_si512(hi.as_mut_ptr().add(i).cast::<__m512i>(), product);
+            _mm512_storeu_si512(
+                lo.as_mut_ptr().add(i).cast::<__m512i>(),
+                _mm512_xor_si512(value, product),
+            );
+            i += 4;
+        }
+        while i < lo.len() {
+            let value = lo[i];
+            let product = value * r;
+            hi[i] = product;
+            lo[i] = value + product;
+            i += 1;
+        }
+    }
+}
+
+/// Four-lane multiplication of a slice by one broadcast field constant.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; `src` and `dst` have equal lengths.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn mul_by_const(src: &[F128], dst: &mut [std::mem::MaybeUninit<F128>], r: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(src.len(), dst.len());
+    // SAFETY: caller supplies the target features and equal slices.
+    unsafe {
+        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_x4);
+        let lanes = src.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let value = _mm512_loadu_si512(src.as_ptr().add(i).cast::<__m512i>());
+            let product = ghash_mul_x4_split(value, r_x4, r_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i).cast::<__m512i>(), product);
+            i += 4;
+        }
+        while i < src.len() {
+            dst.get_unchecked_mut(i).write(src[i] * r);
+            i += 1;
+        }
+    }
+}
+
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
 ///
 /// # Safety

@@ -4,6 +4,71 @@
 
 use super::F128;
 
+/// Expand one equality-table half in place.
+///
+/// For every `i`, writes `hi[i] = lo[i] * r` and replaces `lo[i]` with
+/// `lo[i] + hi[i]`. This is the exact characteristic-two recurrence used by
+/// [`crate::lincheck::build_eq_table`]. Keeping it here lets the ranked
+/// Sapphire Rapids build perform four independent field products per
+/// VPCLMULQDQ group while portable targets retain the scalar recurrence.
+#[inline]
+pub(crate) fn eq_expand_half(lo: &mut [F128], hi: &mut [F128], r: F128) {
+    assert_eq!(lo.len(), hi.len(), "eq expansion halves must match");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate supplies the required target features; the length
+    // assertion supplies one disjoint destination slot per source slot.
+    unsafe {
+        x86_64::eq_expand_half(lo, hi, r);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for i in 0..lo.len() {
+        let value = lo[i];
+        let product = value * r;
+        hi[i] = product;
+        lo[i] = value + product;
+    }
+}
+
+/// Multiply a contiguous slice by one field constant.
+///
+/// The source and destination are separate slices. The x86 ranked build
+/// broadcasts `r` once and reuses its x^64 companion for the whole slice;
+/// other targets use the exact scalar operation.
+#[inline]
+pub(crate) fn mul_by_const(src: &[F128], dst: &mut [std::mem::MaybeUninit<F128>], r: F128) {
+    assert_eq!(src.len(), dst.len(), "constant product slices must match");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate supplies the required target features and the
+    // length assertion supplies one destination slot per source slot.
+    unsafe {
+        x86_64::mul_by_const(src, dst, r);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (slot, &value) in dst.iter_mut().zip(src) {
+        slot.write(value * r);
+    }
+}
+
 #[cfg(any(
     test,
     not(any(
