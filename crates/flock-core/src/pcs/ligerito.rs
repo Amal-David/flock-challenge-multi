@@ -4133,18 +4133,20 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
-/// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
+/// Materializes this chunk's adjacent source pairs into reused scratch, then
+/// [`fold_two_and_msg_in_place`] (AVX-512 + VPCLMUL) folds them in place and
+/// accumulates `(u0, u2)` from the just-folded registers — no `fold_pairs`
+/// store into an L1 stage and no [`msg_reduce_avx512`] reload/RFO of that
+/// stage before publish. The NT kernel then streams the already-reduced
+/// folded prefix. Value-identical to `fold_pairs` + [`msg_reduce_avx512`].
+/// Next reader is the following sumcheck round, after a Fiat–Shamir grind —
+/// DRAM-cold when `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
 ///
 /// # Safety
-/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
-/// `<= stage_f.len()`. `f`/`b` contain `2 * (base + fc.len())` elements.
-/// `stage_*` are write-before-read scratch owned by this worker.
+/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length.
+/// `f`/`b` contain `2 * (base + fc.len())` elements. `stage_*` are
+/// write-before-read scratch owned by this worker with capacity
+/// `>= 2 * fc.len()` (source pair count).
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4158,33 +4160,46 @@ unsafe fn fold_and_msg_chunk_nt_x86(
     fc: &mut [F128],
     bc: &mut [F128],
     r: F128,
-    stage_f: &mut [F128],
-    stage_b: &mut [F128],
+    stage_f: &mut Vec<F128>,
+    stage_b: &mut Vec<F128>,
+    nt: bool,
 ) -> (F128, F128) {
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
-    debug_assert!(len <= stage_f.len() && len <= stage_b.len());
     debug_assert!(len.is_multiple_of(2));
+    let src_len = 2 * len;
+    debug_assert!(stage_f.capacity() >= src_len && stage_b.capacity() >= src_len);
+    debug_assert!(f.len() >= 2 * (base + len) && b.len() >= 2 * (base + len));
 
-    crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
-    crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
-    // SAFETY: target features cfg-guaranteed; stage slices have equal even
-    // length (caller / debug_assert).
-    let (u0, u2) = unsafe { msg_reduce_avx512(&stage_f[..len], &stage_b[..len]) };
+    // L1 pairs: this chunk's even/odd source slots, then the fused leaf
+    // truncates to the folded stream the NT kernel publishes.
+    // SAFETY: capacity checked above; copy writes every slot before the
+    // fused leaf reads; in-place fold only stores `dst[0..len)` which does
+    // not overlap unread source `2t..`.
+    unsafe {
+        stage_f.set_len(src_len);
+        stage_b.set_len(src_len);
+        core::ptr::copy_nonoverlapping(f.as_ptr().add(2 * base), stage_f.as_mut_ptr(), src_len);
+        core::ptr::copy_nonoverlapping(b.as_ptr().add(2 * base), stage_b.as_mut_ptr(), src_len);
+    }
+
+    let (u0, u2) = crate::field::f128_slice::fold_two_and_msg_in_place(stage_f, stage_b, r);
+    debug_assert_eq!(stage_f.len(), len);
+    debug_assert_eq!(stage_b.len(), len);
 
     let dst_aligned = (fc.as_mut_ptr() as usize).is_multiple_of(16)
         && (bc.as_mut_ptr() as usize).is_multiple_of(16);
-    if dst_aligned {
+    if nt && dst_aligned {
         // SAFETY: dest slices are 16-aligned F128 buffers of length `len`;
-        // stage is the just-written source of the same length.
+        // stage prefix is the fused leaf's folded stream.
         unsafe {
             publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
             publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
             core::arch::x86_64::_mm_sfence();
         }
     } else {
-        fc.copy_from_slice(&stage_f[..len]);
-        bc.copy_from_slice(&stage_b[..len]);
+        fc.copy_from_slice(stage_f);
+        bc.copy_from_slice(stage_b);
     }
     (u0, u2)
 }
@@ -4238,6 +4253,21 @@ fn fold_and_msg_lsb_inner(
     }
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        if lazy_ood.is_none() && deferred_basis.is_none() && n.is_multiple_of(4) {
+            let mut nf = f.to_vec();
+            let mut nb = b.to_vec();
+            let (u_0, u_2) = crate::field::f128_slice::fold_two_and_msg_in_place(&mut nf, &mut nb, r);
+            return (
+                FoldBuf::Owned(nf),
+                FoldBuf::Owned(nb),
+                SumcheckMessage { u_0, u_2 },
+            );
+        }
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
         // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
@@ -4374,21 +4404,23 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if use_nt {
-                // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
-                // reused scratch; dest sees only the NT publish.
+            if lazy_ood.is_none() && deferred_basis.is_none() {
+                // Per-worker L1 pairs (2*CHUNK source slots): fused
+                // fold+msg stays in-register; dest sees the reduced
+                // stream via NT publish (DRAM-cold rounds) or a cache
+                // copy (smaller rounds).
                 return OPEN_NT_STAGE.with(|cell| {
                     let mut st = cell.borrow_mut();
-                    if st.0.len() < CHUNK {
-                        st.0 = crate::alloc_uninit_vec(CHUNK);
-                        st.1 = crate::alloc_uninit_vec(CHUNK);
+                    if st.0.capacity() < 2 * CHUNK {
+                        st.0 = crate::alloc_uninit_vec(2 * CHUNK);
+                        st.1 = crate::alloc_uninit_vec(2 * CHUNK);
                     }
                     // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
                     // geometry matches fold_and_msg_lsb's even-length
-                    // power-of-two split; stage capacity is CHUNK.
+                    // power-of-two split; stage capacity is 2*CHUNK.
                     unsafe {
                         let (sf, sb) = &mut *st;
-                        fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
+                        fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb, use_nt)
                     }
                 });
             }
@@ -10176,9 +10208,10 @@ mod tests {
 
             let mut fc_nt = vec![F128::ZERO; n_pairs];
             let mut bc_nt = vec![F128::ZERO; n_pairs];
-            let mut stage_f = vec![F128::ZERO; n_pairs.max(8)];
-            let mut stage_b = vec![F128::ZERO; n_pairs.max(8)];
-            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
+            let mut stage_f = vec![F128::ZERO; 2 * n_pairs];
+            let mut stage_b = vec![F128::ZERO; 2 * n_pairs];
+            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; Vecs sized per contract
+            // (source pair count = 2 * n_pairs).
             let (u0_nt, u2_nt) = unsafe {
                 super::fold_and_msg_chunk_nt_x86(
                     &f,
@@ -10189,6 +10222,7 @@ mod tests {
                     r,
                     &mut stage_f,
                     &mut stage_b,
+                    true,
                 )
             };
             assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
