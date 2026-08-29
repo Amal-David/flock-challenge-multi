@@ -224,6 +224,24 @@ fn fold16_pf_ahead() -> usize {
     *D
 }
 
+/// Test latch so the pipe oracle can drive both arms without mutating env.
+#[cfg(test)]
+pub(super) static FOLD16_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_FOLD16_PIPE=1` restores the serial `g in 0..4` body. Default
+/// ON: preload group `g+1` while `mul_acc` of group `g` covers CLMUL
+/// latency. Ranked `env_clear()`.
+fn fold16_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if FOLD16_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_PIPE").is_none());
+    *ON
+}
+
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
@@ -270,25 +288,50 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 }
             }
             let mut acc = WideGhashX4::zero();
-            for g in 0..4 {
-                // v_s = banks 4g..4g+3 of slot t+s.
-                let base = 16 * t + 4 * g;
-                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
-                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
-                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
-                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
-                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1); // [a0.L0 a1.L0 a0.L1 a1.L1]
-                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1); // [a0.L2 a1.L2 a0.L3 a1.L3]
-                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
-                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2); // bank 4g+0 over slots 0..4
-                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
-                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
-                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+            let load_g = |g: usize| -> [__m512i; 4] {
+                // SAFETY: `t` is a 4-slot block start; `g < 4` keeps
+                // `16t+4g+48` inside the 16-slot source of those four dsts.
+                unsafe {
+                    let base = 16 * t + 4 * g;
+                    let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                    let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
+                    let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
+                    let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
+                    let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                    let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                    let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                    let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                    [
+                        _mm512_permutex2var_epi64(t0, s2_lo, t2),
+                        _mm512_permutex2var_epi64(t0, s2_hi, t2),
+                        _mm512_permutex2var_epi64(t1, s2_lo, t3),
+                        _mm512_permutex2var_epi64(t1, s2_hi, t3),
+                    ]
+                }
+            };
+            let acc_g = |acc: &mut WideGhashX4, g: usize, u: [__m512i; 4]| {
+                // SAFETY: enclosing kernel is target_feature-gated avx512f+vpclmulqdq.
+                unsafe {
+                    acc.mul_acc(u[0], wb[4 * g]);
+                    acc.mul_acc(u[1], wb[4 * g + 1]);
+                    acc.mul_acc(u[2], wb[4 * g + 2]);
+                    acc.mul_acc(u[3], wb[4 * g + 3]);
+                }
+            };
+            if fold16_pipe_enabled() {
+                let mut u = load_g(0);
+                let mut g = 0usize;
+                while g < 3 {
+                    let nxt = load_g(g + 1);
+                    acc_g(&mut acc, g, u);
+                    u = nxt;
+                    g += 1;
+                }
+                acc_g(&mut acc, 3, u);
+            } else {
+                for g in 0..4 {
+                    acc_g(&mut acc, g, load_g(g));
+                }
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;

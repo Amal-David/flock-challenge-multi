@@ -302,6 +302,19 @@ mod tests {
                 }
                 assert_eq!(got[t], want, "n={n} t={t}");
             }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            {
+                use std::sync::atomic::Ordering;
+                super::x86_64::FOLD16_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                let mut serial = vec![F128::ZERO; n];
+                fold16_banked(&src, &mut serial, &w);
+                super::x86_64::FOLD16_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(got, serial, "n={n} pipe vs serial");
+            }
         }
         // Degenerate weights: one-hot, all-zero, all-one.
         let src: Vec<F128> = (0..16 * 8)
