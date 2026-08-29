@@ -560,10 +560,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) => rayon::join(
-                        || ab_pool.install(ab_closure),
-                        || c_pool.install(c_closure),
-                    ),
+                    Some((ab_pool, c_pool)) => {
+                        rayon::join(|| ab_pool.install(ab_closure), || c_pool.install(c_closure))
+                    }
                     None => rayon::join(ab_closure, c_closure),
                 };
             if zc_timing {

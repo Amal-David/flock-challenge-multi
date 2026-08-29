@@ -5333,13 +5333,18 @@ mod tests {
         // F128 outputs; the cfg gate supplies every intrinsic feature.
         unsafe {
             kernels::x86_64::gfni_fold64_rows(clean.as_ptr(), &mats, want.as_mut_ptr());
-            kernels::x86_64::gfni_fold64_rows_masked(
+            kernels::x86_64::gfni_fold64_rows_masked::<false>(
                 poisoned.as_ptr(),
                 &mats,
                 got.as_mut_ptr(),
                 0b1000_0000,
             );
-            kernels::x86_64::gfni_fold64_rows_masked(poisoned.as_ptr(), &mats, off.as_mut_ptr(), 0);
+            kernels::x86_64::gfni_fold64_rows_masked::<false>(
+                poisoned.as_ptr(),
+                &mats,
+                off.as_mut_ptr(),
+                0,
+            );
         }
         assert_eq!(got, want, "masked prefold must be byte-identical");
         // The residue-major emit and its broadcast factorisation compute the
@@ -5349,13 +5354,13 @@ mod tests {
         let mut trb = [F128::ZERO; 64];
         // SAFETY: as above.
         unsafe {
-            kernels::x86_64::gfni_fold64_rows_masked_tr(
+            kernels::x86_64::gfni_fold64_rows_masked_tr::<false>(
                 poisoned.as_ptr(),
                 &mats,
                 tr.as_mut_ptr(),
                 0b1000_0000,
             );
-            kernels::x86_64::gfni_fold64_rows_masked_tr_bcast(
+            kernels::x86_64::gfni_fold64_rows_masked_tr_bcast::<false>(
                 poisoned.as_ptr(),
                 &mats,
                 trb.as_mut_ptr(),
@@ -5381,13 +5386,13 @@ mod tests {
             let mut c4b = [F128::ZERO; 64];
             // SAFETY: as above; both kernels write sixteen F128s.
             unsafe {
-                kernels::x86_64::gfni_fold64_rows_masked_c4(
+                kernels::x86_64::gfni_fold64_rows_masked_c4::<false>(
                     poisoned.as_ptr(),
                     &cm,
                     c4.as_mut_ptr(),
                     dead,
                 );
-                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast::<false>(
                     poisoned.as_ptr(),
                     &cm,
                     c4b.as_mut_ptr(),
@@ -5401,8 +5406,13 @@ mod tests {
         let mut c4b = [F128::ZERO; 64];
         // SAFETY: as above.
         unsafe {
-            kernels::x86_64::gfni_fold64_rows_masked_c4(clean.as_ptr(), &cm, c4.as_mut_ptr(), 0);
-            kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+            kernels::x86_64::gfni_fold64_rows_masked_c4::<false>(
+                clean.as_ptr(),
+                &cm,
+                c4.as_mut_ptr(),
+                0,
+            );
+            kernels::x86_64::gfni_fold64_rows_masked_c4_bcast::<false>(
                 clean.as_ptr(),
                 &cm,
                 c4b.as_mut_ptr(),
