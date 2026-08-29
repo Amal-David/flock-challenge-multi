@@ -67,7 +67,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::ghash_mul_karatsuba_x4;
     use core::arch::x86_64::*;
 
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
@@ -82,7 +82,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_karatsuba_x4;
         use core::arch::x86_64::*;
 
         // SAFETY: caller supplies eight readable F128 values at src.
@@ -91,7 +91,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(even, ghash_mul_karatsuba_x4(r, _mm512_xor_si512(even, odd)))
         }
     }
 
@@ -125,11 +125,11 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
             let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
             let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
-            let g1 = ghash_mul_x4(a1, b1);
-            let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
+            let g1 = ghash_mul_karatsuba_x4(a1, b1);
+            let g_inf = ghash_mul_karatsuba_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
             let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            p1_wide.mul_acc(eq, g1);
-            pinf_wide.mul_acc(eq, g_inf);
+            p1_wide.mul_acc_kara(eq, g1);
+            pinf_wide.mul_acc_kara(eq, g_inf);
             x_lo += 4;
         }
 

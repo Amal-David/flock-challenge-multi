@@ -308,6 +308,53 @@ pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m
     }
 }
 
+/// Per 128-bit lane, duplicate `lo ⊕ hi` into both qwords so CLMUL imm
+/// `0x00` (or `0x11`) is the Karatsuba mixed-limb product.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_halves_x4(v: __m512i) -> __m512i {
+    _mm512_xor_si512(v, _mm512_shuffle_epi32::<0x4E>(v))
+}
+
+/// Karatsuba 3-CLMUL widen: `(lo, mid, hi)` with `lo = x.lo·y.lo`,
+/// `hi = x.hi·y.hi`, `mid = (x.lo⊕x.hi)·(y.lo⊕y.hi) ⊕ lo ⊕ hi`.
+/// Field-identical to the schoolbook 4-CLMUL triple [`WideGhashX4::mul_acc`]
+/// builds; feeds the same two-stage reduce as [`ghash_mul_karatsuba_vec`].
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn ghash_kara_widen_x4(x: __m512i, y: __m512i) -> (__m512i, __m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let pm = _mm512_clmulepi64_epi128::<0x00>(xor_halves_x4(x), xor_halves_x4(y));
+        let mid = _mm512_xor_si512(_mm512_xor_si512(pm, lo), hi);
+        (lo, mid, hi)
+    }
+}
+
+/// 4-lane port of [`ghash_mul_karatsuba_vec`]: 3 product CLMUL + the same
+/// two-stage `0x87` vector reduction [`ghash_reduce_acc_x4`] applies to a
+/// deferred accumulator. Field-identical to [`ghash_mul_x4`].
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_karatsuba_x4(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let (lo, mid, hi) = ghash_kara_widen_x4(x, y);
+        ghash_reduce_acc_x4(lo, mid, hi)
+    }
+}
+
 /// 4 independent GF(2^128) products. `x` and `y` each hold 4 contiguous
 /// `F128`; the result holds the 4 reduced products. Field-identical to
 /// applying `ghash_mul_binius` to each lane.
@@ -518,6 +565,8 @@ impl WideGhashX4 {
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i]·y[i]` into self.
+    /// Schoolbook 4-CLMUL widen (low-limb / split-twiddle callers keep this
+    /// arm; var×var message accumulate uses [`Self::mul_acc_kara`]).
     ///
     /// # Safety
     /// `avx512f` + `vpclmulqdq` available (cfg-gated).
@@ -532,6 +581,26 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
+    }
+
+    /// Karatsuba 3-CLMUL widen of the 4 unreduced products `x[i]·y[i]`.
+    /// Same `(lo, mid, hi)` triple as [`Self::mul_acc`], so [`Self::fold`] /
+    /// [`Self::reduce_lanes`] (the [`ghash_mul_karatsuba_vec`] two-stage
+    /// reduce) stay bit-identical. Var×var only — broadcast / low-limb /
+    /// split-twiddle stays on [`Self::mul_acc`].
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_kara(&mut self, x: __m512i, y: __m512i) {
+        // SAFETY: caller carries avx512f+vpclmulqdq.
+        unsafe {
+            let (lo, mid, hi) = ghash_kara_widen_x4(x, y);
+            self.lo = _mm512_xor_si512(self.lo, lo);
+            self.hi = _mm512_xor_si512(self.hi, hi);
+            self.mid = _mm512_xor_si512(self.mid, mid);
+        }
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

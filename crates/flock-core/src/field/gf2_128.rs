@@ -492,12 +492,14 @@ mod tests {
             let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, bi, "binius");
             assert_eq!(sw, un, "unreduced");
         }
@@ -547,6 +549,53 @@ mod tests {
         }
     }
 
+    /// 4-lane Karatsuba must agree with scalar `F128::mul` (itself
+    /// `ghash_mul_karatsuba_vec`) and with schoolbook `ghash_mul_x4`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ghash_mul_karatsuba_x4_matches_scalar() {
+        use core::arch::x86_64::*;
+        let mut rng = Rng::new(0x4A4_C0DE ^ 1);
+        for _ in 0..256 {
+            let xs = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let ys = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            // SAFETY: vpclmulqdq+avx512f enabled at compile time (cfg gate).
+            let (got_k, got_s): ([F128; 4], [F128; 4]) = unsafe {
+                let x = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
+                let y = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
+                let rk = x86_64::ghash_mul_karatsuba_x4(x, y);
+                let rs = x86_64::ghash_mul_x4(x, y);
+                let mut k = [F128::ZERO; 4];
+                let mut s = [F128::ZERO; 4];
+                _mm512_storeu_si512(k.as_mut_ptr() as *mut __m512i, rk);
+                _mm512_storeu_si512(s.as_mut_ptr() as *mut __m512i, rs);
+                (k, s)
+            };
+            for lane in 0..4 {
+                assert_eq!(
+                    got_k[lane],
+                    xs[lane] * ys[lane],
+                    "lane {lane}: kara_x4 != scalar mul"
+                );
+                assert_eq!(got_k[lane], got_s[lane], "lane {lane}: kara_x4 != x4");
+            }
+        }
+    }
+
     /// The 4-lane deferred-reduction accumulator must equal the scalar
     /// XOR-of-`mul_unreduced` it replaces, both before and after `reduce()`.
     #[cfg(all(
@@ -587,6 +636,56 @@ mod tests {
             let folded = unsafe { wide.fold() };
             assert_eq!(folded, scalar, "wide fold != scalar deferred accumulator");
             assert_eq!(folded.reduce(), scalar.reduce(), "reduced values differ");
+        }
+    }
+
+    /// Karatsuba 3-CLMUL `mul_acc_kara` must match schoolbook `mul_acc` and
+    /// the scalar XOR-of-`mul_unreduced` it replaces.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn wide_ghash_x4_kara_matches_schoolbook_deferred() {
+        let mut rng = Rng::new(0xDEF_E44 ^ 1);
+        for _ in 0..128 {
+            // SAFETY: vpclmulqdq+avx512f+sse4.1 enabled at compile time.
+            let mut kara = unsafe { x86_64::WideGhashX4::zero() };
+            let mut book = unsafe { x86_64::WideGhashX4::zero() };
+            let mut scalar = F256Unreduced::ZERO;
+            for _ in 0..5 {
+                let xs = [
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                ];
+                let ys = [
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                    rng.next_f128(),
+                ];
+                unsafe {
+                    let xv = x86_64::f128x4_loadu(xs.as_ptr());
+                    let yv = x86_64::f128x4_set(ys[0], ys[1], ys[2], ys[3]);
+                    kara.mul_acc_kara(xv, yv);
+                    book.mul_acc(xv, yv);
+                }
+                for i in 0..4 {
+                    scalar ^= xs[i].mul_unreduced(ys[i]);
+                }
+            }
+            let folded_k = unsafe { kara.fold() };
+            let folded_b = unsafe { book.fold() };
+            assert_eq!(folded_k, folded_b, "kara fold != schoolbook fold");
+            assert_eq!(folded_k, scalar, "kara fold != scalar deferred accumulator");
+            assert_eq!(
+                folded_k.reduce(),
+                scalar.reduce(),
+                "kara reduced values differ"
+            );
         }
     }
 }
