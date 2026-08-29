@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: flock-hypothesis-runner
+    runtime: docker
+    repo: https://github.com/Amal-David/flock-challenge-multi.git
+    branch: codex/flock-council-orchestrator
+    dockerfilePath: Dockerfile.render
+    dockerContext: .
+    dockerCommand: sleep infinity
+    plan: "pro max"
+    region: singapore
+    envVars:
+      - key: FLOCK_JOB_MAX_SECONDS
+        value: "900"
+      - key: FLOCK_JOB_REPO_URL
+        value: https://github.com/Amal-David/flock-challenge-multi.git

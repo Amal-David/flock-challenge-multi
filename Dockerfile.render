@@ -1,0 +1,24 @@
+FROM rust:1.97.0-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
+    build-essential \
+    clang \
+    cmake \
+    curl \
+    git \
+    jq \
+    libssl-dev \
+    pkg-config \
+    python3 \
+    python3-pip \
+    tini \
+    util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY scripts/render_job_entrypoint.sh /usr/local/bin/flock-render-job
+RUN chmod 0755 /usr/local/bin/flock-render-job
+
+CMD ["sleep", "infinity"]
