@@ -4271,6 +4271,176 @@ mod tests {
         }
     }
 
+    /// The constant-fiber `b == 1` window (`FLOCK_NO_ZC_B_ONES`) against the
+    /// scalar oracle, on the REAL BLAKE3 `b` pattern.
+    ///
+    /// Three things are asserted:
+    ///   1. the load-bearing identity `T(u64::MAX) == F128::ONE` — the fold
+    ///      table's columns are the Lagrange weights `L_i(z)` of the k_skip
+    ///      domain, so the all-ones row folds to `sum_i L_i(z) = 1` (partition
+    ///      of unity) for EVERY `z`;
+    ///   2. the kernel's outputs and written chunks match
+    ///      `round2_lookahead_chunk_scalar` bit for bit on a witness whose
+    ///      block prefix is all-ones and whose remainder is random, with and
+    ///      without the hoisted `(w, w*x^64)` table, in both WRITE arms;
+    ///   3. the window actually FIRES (hit counter), and does NOT fire when
+    ///      the same shape carries a non-degenerate `b`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn round2_b_ones_window_matches_scalar() {
+        use std::sync::atomic::Ordering;
+        const K_SKIP: usize = 6;
+        // Ranked K-block geometry: 256 post-URM rows = 128 pairs; the const-one
+        // input wires make rows 0..18 and 236..240 the all-ones word.
+        const BLOCK_ROWS: usize = 256;
+        const ONES_ROWS: std::ops::Range<usize> = 0..18;
+        const ONES_ROWS_HI: std::ops::Range<usize> = 236..240;
+        const ZERO_ROWS_HI: std::ops::Range<usize> = 241..256;
+
+        for &(lo_size, mask, useful, base_blocks, degenerate) in &[
+            (128usize, 127usize, 121usize, 0usize, true),
+            (128, 127, 121, 3, true),
+            (256, 127, 121, 1, true),
+            (128, 127, 121, 0, false), // same shape, random b -> must not fire
+            (64, 63, 60, 2, true),     // half-block chunks
+        ] {
+            let mut rng = Rng::new(0xB0E5_0000 + lo_size as u64 + base_blocks as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            // (1) partition of unity.
+            assert_eq!(
+                table.fold_one_row(&[0xffu8; 8]),
+                F128::ONE,
+                "all-ones row must fold to ONE"
+            );
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats = r2_gfni_mats(&table);
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats_arg = r2_mats.as_ref();
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let r2_mats_arg: Option<&[u64; 128]> = None;
+
+            let pair_idx_base = base_blocks * (BLOCK_ROWS / 2);
+            let row_base = 2 * pair_idx_base;
+            let n_rows = row_base + 2 * lo_size;
+            let mut a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            if degenerate {
+                for blk in 0..n_rows.div_ceil(BLOCK_ROWS) {
+                    for r in ONES_ROWS.chain(ONES_ROWS_HI) {
+                        let g = blk * BLOCK_ROWS + r;
+                        if g < n_rows {
+                            b_packed[g * 8..g * 8 + 8].fill(0xff);
+                        }
+                    }
+                    for r in ZERO_ROWS_HI {
+                        let g = blk * BLOCK_ROWS + r;
+                        if g < n_rows {
+                            b_packed[g * 8..g * 8 + 8].fill(0);
+                        }
+                    }
+                }
+            }
+            // Production shape: padded pairs hold zero rows on both sides.
+            for pair in 0..lo_size {
+                if ((pair_idx_base + pair) & mask) >= useful {
+                    let r0 = (row_base + 2 * pair) * 8;
+                    a_packed[r0..r0 + 16].fill(0);
+                    b_packed[r0..r0 + 16].fill(0);
+                }
+            }
+            let eq_lo = rng.f128_vec(lo_size);
+
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = vec![F128::ZERO; 2 * lo_size];
+            let out_s = round2_lookahead_chunk_scalar::<true>(
+                &a_packed,
+                &b_packed,
+                &table,
+                &mut a_s,
+                &mut b_s,
+                &eq_lo,
+                row_base,
+                pair_idx_base,
+                mask,
+                useful,
+            );
+
+            let before = kernels::x86_64::B_ONES_HITS.load(Ordering::Relaxed);
+            let sparse_before = kernels::x86_64::B_SPARSE_HITS.load(Ordering::Relaxed);
+            let mut a_v = vec![F128::ONE; 2 * lo_size];
+            let mut b_v = vec![F128::ONE; 2 * lo_size];
+            // SAFETY: rows/table/chunk lengths satisfy the kernel's contract.
+            let out_v = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut a_v,
+                    &mut b_v,
+                    &eq_lo,
+                    pair_idx_base,
+                    mask,
+                    useful,
+                    None,
+                )
+            };
+            assert_eq!(a_s, a_v, "a chunk lo_size={lo_size} base={base_blocks}");
+            assert_eq!(b_s, b_v, "b chunk lo_size={lo_size} base={base_blocks}");
+            assert_eq!(out_s, out_v, "sums lo_size={lo_size} base={base_blocks}");
+
+            // Same inputs through the no-store arm and the hoisted w table.
+            let wtab_test = build_w_pair_table(&eq_lo);
+            let mut a_e: Vec<F128> = Vec::new();
+            let mut b_e: Vec<F128> = Vec::new();
+            // SAFETY: as above; WRITE=false ignores the (empty) chunks.
+            let out_n = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut a_e,
+                    &mut b_e,
+                    &eq_lo,
+                    pair_idx_base,
+                    mask,
+                    useful,
+                    Some(&wtab_test),
+                )
+            };
+            assert_eq!(
+                out_s, out_n,
+                "wtab sums lo_size={lo_size} base={base_blocks}"
+            );
+            let hits = kernels::x86_64::B_ONES_HITS.load(Ordering::Relaxed) - before;
+            let sparse_hits =
+                kernels::x86_64::B_SPARSE_HITS.load(Ordering::Relaxed) - sparse_before;
+            if degenerate {
+                assert!(
+                    hits >= 2,
+                    "window never fired (lo_size={lo_size} base={base_blocks}, hits={hits})"
+                );
+                assert!(
+                    sparse_hits >= 2 || lo_size < 128,
+                    "sparse window never fired (lo_size={lo_size} base={base_blocks}, hits={sparse_hits})"
+                );
+            } else {
+                assert_eq!(hits, 0, "window fired on a non-degenerate witness");
+                assert_eq!(
+                    sparse_hits, 0,
+                    "sparse window fired on a non-degenerate witness"
+                );
+            }
+        }
+    }
+
     /// AVX-512 composed-fold kernel vs the portable reference on one chunk.
     #[cfg(all(
         target_arch = "x86_64",
