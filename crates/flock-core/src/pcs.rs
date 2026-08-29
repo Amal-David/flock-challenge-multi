@@ -1364,10 +1364,13 @@ fn fused_fast_combine_lookahead(
             let mut c = [F128::ZERO; 6];
             for t in 0..(b / 4) {
                 let i = 4 * t;
-                let v0 = ring_switch::fold_one_slot(eq_lo[i] * e_hi, table);
-                let v1 = ring_switch::fold_one_slot(eq_lo[i + 1] * e_hi, table);
-                let v2 = ring_switch::fold_one_slot(eq_lo[i + 2] * e_hi, table);
-                let v3 = ring_switch::fold_one_slot(eq_lo[i + 3] * e_hi, table);
+                let [v0, v1, v2, v3] = ring_switch::fold_four_slots(
+                    eq_lo[i] * e_hi,
+                    eq_lo[i + 1] * e_hi,
+                    eq_lo[i + 2] * e_hi,
+                    eq_lo[i + 3] * e_hi,
+                    table,
+                );
                 let (b0, b1, b2, b3) = if last == 0 {
                     (v0, v1, v2, v3)
                 } else {
@@ -1451,10 +1454,13 @@ fn deferred_stats_lookahead(
                 let mut c = [F128::ZERO; 6];
                 for t in 0..(b / 4) {
                     let i = 4 * t;
-                    let b0 = ring_switch::fold_one_slot(eq_lo[i], composed);
-                    let b1 = ring_switch::fold_one_slot(eq_lo[i + 1], composed);
-                    let b2 = ring_switch::fold_one_slot(eq_lo[i + 2], composed);
-                    let b3 = ring_switch::fold_one_slot(eq_lo[i + 3], composed);
+                    let [b0, b1, b2, b3] = ring_switch::fold_four_slots(
+                        eq_lo[i],
+                        eq_lo[i + 1],
+                        eq_lo[i + 2],
+                        eq_lo[i + 3],
+                        composed,
+                    );
                     let a0 = packed_witness[base + i];
                     let a1 = packed_witness[base + i + 1];
                     let a2 = packed_witness[base + i + 2];

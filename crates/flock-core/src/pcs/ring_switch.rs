@@ -2234,6 +2234,96 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     r0 + r1
 }
 
+/// Little-endian 16-byte view of one F128, matching [`fold_one_slot`]'s
+/// `lo_bytes` then `hi_bytes` indexing.
+#[inline(always)]
+fn fold_elem_bytes(elem: F128) -> [u8; 16] {
+    let lo = elem.lo.to_le_bytes();
+    let hi = elem.hi.to_le_bytes();
+    [
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], hi[0], hi[1], hi[2], hi[3], hi[4],
+        hi[5], hi[6], hi[7],
+    ]
+}
+
+/// Four independent [`fold_one_slot`] reductions. Loads for table-byte `k`
+/// of all four elems issue before byte `k+1`, covering L1 latency across
+/// slots. F128 add IS XOR, so the 16-term XOR equals the depth-4 tree in
+/// [`fold_one_slot`].
+#[inline(always)]
+pub(crate) fn fold_one_slot_x4(
+    e0: F128,
+    e1: F128,
+    e2: F128,
+    e3: F128,
+    tables: &[F128],
+) -> [F128; 4] {
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let b0 = fold_elem_bytes(e0);
+    let b1 = fold_elem_bytes(e1);
+    let b2 = fold_elem_bytes(e2);
+    let b3 = fold_elem_bytes(e3);
+    let p = tables.as_ptr();
+    // SAFETY: each byte is 0..255 and `k < 16`, so the offset is at most
+    // `15*256 + 255 = 4095`, in-bounds for the asserted table length.
+    unsafe {
+        let mut a0 = F128::ZERO;
+        let mut a1 = F128::ZERO;
+        let mut a2 = F128::ZERO;
+        let mut a3 = F128::ZERO;
+        let mut k = 0usize;
+        while k < FOLD_N_BYTES {
+            let base = k * FOLD_TABLE_SIZE;
+            a0 += *p.add(base + b0[k] as usize);
+            a1 += *p.add(base + b1[k] as usize);
+            a2 += *p.add(base + b2[k] as usize);
+            a3 += *p.add(base + b3[k] as usize);
+            k += 1;
+        }
+        [a0, a1, a2, a3]
+    }
+}
+
+/// Test latch so the x4 oracle can drive both arms without mutating env.
+#[cfg(test)]
+static FOLD_SLOT_X4_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_FOLD_SLOT_X4=1` restores four scalar [`fold_one_slot`] calls.
+/// Default ON: one 4-slot body with interleaved table loads. Ranked
+/// `env_clear()`.
+fn fold_slot_x4_enabled() -> bool {
+    #[cfg(test)]
+    if FOLD_SLOT_X4_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD_SLOT_X4").is_none());
+    *ON
+}
+
+/// Gated 4-wide fold: x4 body, or four [`fold_one_slot`] under the kill
+/// switch / test latch.
+#[inline(always)]
+pub(crate) fn fold_four_slots(
+    e0: F128,
+    e1: F128,
+    e2: F128,
+    e3: F128,
+    tables: &[F128],
+) -> [F128; 4] {
+    if fold_slot_x4_enabled() {
+        fold_one_slot_x4(e0, e1, e2, e3, tables)
+    } else {
+        [
+            fold_one_slot(e0, tables),
+            fold_one_slot(e1, tables),
+            fold_one_slot(e2, tables),
+            fold_one_slot(e3, tables),
+        ]
+    }
+}
+
 #[allow(dead_code)] // Scalar oracle for the generator-based table builder.
 pub(crate) fn build_direct_fold8_table(
     low_eq: &[F128; 64],
@@ -5343,6 +5433,37 @@ mod tests {
                     "trial {trial}"
                 );
             }
+        }
+    }
+
+    /// 4-wide interleaved fold must match four independent [`fold_one_slot`]
+    /// trees. Latch drives the gated wrapper without mutating process env.
+    #[test]
+    fn fold_one_slot_x4_matches_scalar() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0xF01D_5107);
+        for trial in 0..8 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let table = build_direct_fold8_table_from_generators(&generators);
+            let e0 = rng.f128();
+            let e1 = rng.f128();
+            let e2 = rng.f128();
+            let e3 = rng.f128();
+            let want = [
+                fold_one_slot(e0, &table),
+                fold_one_slot(e1, &table),
+                fold_one_slot(e2, &table),
+                fold_one_slot(e3, &table),
+            ];
+            let got = fold_one_slot_x4(e0, e1, e2, e3, &table);
+            assert_eq!(got, want, "trial {trial} x4 body");
+            super::FOLD_SLOT_X4_TEST_OFF.store(false, Ordering::Relaxed);
+            let on = fold_four_slots(e0, e1, e2, e3, &table);
+            super::FOLD_SLOT_X4_TEST_OFF.store(true, Ordering::Relaxed);
+            let off = fold_four_slots(e0, e1, e2, e3, &table);
+            super::FOLD_SLOT_X4_TEST_OFF.store(false, Ordering::Relaxed);
+            assert_eq!(on, want, "trial {trial} gated on");
+            assert_eq!(off, want, "trial {trial} gated off");
         }
     }
 
