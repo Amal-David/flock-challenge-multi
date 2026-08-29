@@ -1,5 +1,9 @@
-use super::{F128, F256Unreduced, ghash_reduce};
+use super::{F128, F256Unreduced};
 use core::arch::x86_64::*;
+
+/// Shift-only GHASH reduction (`x^128 ≡ x^7 + x^2 + x + 1`). Re-exported so
+/// the scalar 3-CLMUL Karatsuba path and `ghash_mul_low_rhs` share one fold.
+pub use super::ghash_reduce;
 
 /// 64×64 carry-less product, returned as a 128-bit vector {lo, hi}.
 ///
@@ -32,8 +36,8 @@ unsafe fn lane1(v: __m128i) -> u64 {
 ///
 /// With `b.hi == 0` both limb products that involve `b.hi` vanish, so the
 /// 256-bit product is exactly `a.lo·b_lo + (a.hi·b_lo)·x^64`. That is **2
-/// CLMUL** plus the shift-only `ghash_reduce`, against the 5 CLMUL of the
-/// general Karatsuba+Barrett path this crate's `Mul` uses on x86.
+/// CLMUL** plus the shift-only `ghash_reduce`, against the 3-CLMUL Karatsuba
+/// + shift-reduce path this crate's scalar `Mul` uses on x86.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -44,7 +48,7 @@ pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     unsafe {
         let p0 = pmull(a.lo, b_lo);
         let q = pmull(a.hi, b_lo);
-        super::ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
+        ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
     }
 }
 
@@ -113,8 +117,9 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 }
 
 /// Karatsuba 3 CLMUL product + binius 2-stage vector reduction (2 CLMUL,
-/// only 2 lane extracts) = 5 CLMUL total, one fewer than the 6-CLMUL binius
-/// schoolbook with the same fully-vector reduction shape. Field-identical.
+/// only 2 lane extracts) = 5 CLMUL total. Vector/slice muls stay on this
+/// 5-CLMUL Barrett-shaped fold; scalar `F128 * F128` uses
+/// [`ghash_mul_karatsuba`] instead. Field-identical.
 ///
 /// # Safety
 /// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
@@ -149,8 +154,9 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Karatsuba 3 CLMUL — middle term depends on XOR of inputs. Port of
-/// `aarch64::ghash_mul_karatsuba`.
+/// Scalar `F128 * F128` on x86: Karatsuba 3 CLMUL + shift-only
+/// [`ghash_reduce`]. Lowest CLMUL count of the full-width variants; the
+/// shift fold has no extra `0x87` CLMUL. Port of `aarch64::ghash_mul_karatsuba`.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -162,18 +168,14 @@ pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
         let p0 = pmull(a.lo, b.lo);
         let p1 = pmull(a.hi, b.hi);
         let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        let cross = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
 
-        let p0_lo = lane0(p0);
-        let p0_hi = lane1(p0);
-        let p1_lo = lane0(p1);
-        let p1_hi = lane1(p1);
-        let pm_lo = lane0(pm);
-        let pm_hi = lane1(pm);
-
-        let cross_lo = pm_lo ^ p0_lo ^ p1_lo;
-        let cross_hi = pm_hi ^ p0_hi ^ p1_hi;
-
-        ghash_reduce(p0_lo, p0_hi ^ cross_lo, p1_lo ^ cross_hi, p1_hi)
+        ghash_reduce(
+            lane0(p0),
+            lane1(p0) ^ lane0(cross),
+            lane0(p1) ^ lane1(cross),
+            lane1(p1),
+        )
     }
 }
 

@@ -90,8 +90,9 @@ impl AddAssign for F128 {
 /// `a * b` for a multiplier already known to satisfy `b.hi == 0`.
 ///
 /// Field-identical to `a * b`; on x86 it takes a 2-CLMUL path instead of the
-/// general 5-CLMUL one. Other targets fall back to the ordinary product, so
-/// callers may use it unconditionally once the precondition holds.
+/// general 3-CLMUL Karatsuba + shift-reduce one. Other targets fall back to
+/// the ordinary product, so callers may use it unconditionally once the
+/// precondition holds.
 #[inline]
 pub fn mul_low_rhs(a: F128, b: F128) -> F128 {
     debug_assert_eq!(b.hi, 0, "mul_low_rhs requires a zero high limb");
@@ -118,10 +119,9 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
-            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
-            // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            // Scalar path: 3-CLMUL Karatsuba + shift-only `ghash_reduce`.
+            // Vector/slice folds stay on `ghash_mul_karatsuba_vec` (5-CLMUL).
+            unsafe { x86_64::ghash_mul_karatsuba(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -491,12 +491,14 @@ mod tests {
             let sw = software::ghash_mul(a, b);
             let sb = unsafe { x86_64::ghash_mul_schoolbook(a, b) };
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
             assert_eq!(sw, un, "unreduced");
