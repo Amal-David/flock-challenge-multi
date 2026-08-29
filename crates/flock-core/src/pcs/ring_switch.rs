@@ -2019,99 +2019,6 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[inline]
-#[target_feature(enable = "avx512f")]
-unsafe fn expand_256_subset_sums(col8: &[F128], block: *mut F128) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let c0 = col8[0];
-        let c1 = col8[1];
-        let c2 = col8[2];
-        let c3 = col8[3];
-        let c4 = col8[4];
-        let c5 = col8[5];
-        let c6 = col8[6];
-        let c7 = col8[7];
-
-        let v0 = _mm512_set_epi64(
-            (c0.hi ^ c1.hi) as i64, (c0.lo ^ c1.lo) as i64,
-            c1.hi as i64, c1.lo as i64,
-            c0.hi as i64, c0.lo as i64,
-            0, 0,
-        );
-        let c2_vec = _mm512_set_epi64(
-            c2.hi as i64, c2.lo as i64,
-            c2.hi as i64, c2.lo as i64,
-            c2.hi as i64, c2.lo as i64,
-            c2.hi as i64, c2.lo as i64,
-        );
-        let v1 = _mm512_xor_si512(v0, c2_vec);
-        let c3_vec = _mm512_set_epi64(
-            c3.hi as i64, c3.lo as i64,
-            c3.hi as i64, c3.lo as i64,
-            c3.hi as i64, c3.lo as i64,
-            c3.hi as i64, c3.lo as i64,
-        );
-        let v2 = _mm512_xor_si512(v0, c3_vec);
-        let v3 = _mm512_xor_si512(v1, c3_vec);
-
-        let lo_quads = [v0, v1, v2, v3];
-
-        let h0 = _mm512_set_epi64(
-            (c4.hi ^ c5.hi) as i64, (c4.lo ^ c5.lo) as i64,
-            c5.hi as i64, c5.lo as i64,
-            c4.hi as i64, c4.lo as i64,
-            0, 0,
-        );
-        let c6_vec = _mm512_set_epi64(
-            c6.hi as i64, c6.lo as i64,
-            c6.hi as i64, c6.lo as i64,
-            c6.hi as i64, c6.lo as i64,
-            c6.hi as i64, c6.lo as i64,
-        );
-        let h1 = _mm512_xor_si512(h0, c6_vec);
-        let c7_vec = _mm512_set_epi64(
-            c7.hi as i64, c7.lo as i64,
-            c7.hi as i64, c7.lo as i64,
-            c7.hi as i64, c7.lo as i64,
-            c7.hi as i64, c7.lo as i64,
-        );
-        let h2 = _mm512_xor_si512(h0, c7_vec);
-        let h3 = _mm512_xor_si512(h1, c7_vec);
-
-        let mut hi_16 = [F128::ZERO; 16];
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(0) as *mut __m512i, h0);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(4) as *mut __m512i, h1);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(8) as *mut __m512i, h2);
-        _mm512_storeu_si512(hi_16.as_mut_ptr().add(12) as *mut __m512i, h3);
-
-        for hi_idx in 0..16 {
-            let h_elem = hi_16[hi_idx];
-            let h_broadcast = _mm512_set_epi64(
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-                h_elem.hi as i64, h_elem.lo as i64,
-            );
-            let out_ptr = block.add(hi_idx * 16);
-            _mm512_storeu_si512(out_ptr.add(0) as *mut __m512i, _mm512_xor_si512(lo_quads[0], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(4) as *mut __m512i, _mm512_xor_si512(lo_quads[1], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(8) as *mut __m512i, _mm512_xor_si512(lo_quads[2], h_broadcast));
-            _mm512_storeu_si512(out_ptr.add(12) as *mut __m512i, _mm512_xor_si512(lo_quads[3], h_broadcast));
-        }
-    }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-#[inline]
-fn expand_256_subset_sums_scalar(col8: &[F128], block: &mut [F128]) {
-    block[0] = F128::ZERO;
-    for v in 1..FOLD_TABLE_SIZE {
-        block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
-    }
-}
-
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
@@ -2119,13 +2026,16 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
-        let col8 = &eq_r_dprime[byte_idx * 8..byte_idx * 8 + 8];
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            expand_256_subset_sums(col8, tables.as_mut_ptr().add(byte_idx * FOLD_TABLE_SIZE));
+        let bit_base = byte_idx * 8;
+        for value in 0..FOLD_TABLE_SIZE {
+            let mut acc = F128::ZERO;
+            for bit_in_byte in 0..8 {
+                if (value >> bit_in_byte) & 1 == 1 {
+                    acc += eq_r_dprime[bit_base + bit_in_byte];
+                }
+            }
+            tables[byte_idx * FOLD_TABLE_SIZE + value] = acc;
         }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-        expand_256_subset_sums_scalar(col8, &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE]);
     }
     tables
 }
@@ -2135,6 +2045,20 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 /// element `e_hi`: fills `out` (length [`FOLD_TABLE_TOTAL`]) so that for
 /// every `x`,
 /// `fold_one_slot(x, out) == fold_one_slot(x * e_hi, base)` **bit-exactly**.
+///
+/// Why this is exact algebra, not an approximation: GF(2^128) multiplication
+/// is F2-bilinear, so with `e_b` the basis element having only bit `b` set,
+/// `x·e_hi = Σ_{b: bit b of x set} (e_b · e_hi)`; and `fold_one_slot(·, base)`
+/// IS the F2-linear map `M`, hence
+/// `M(x·e_hi) = Σ_b x_b · M(e_b·e_hi)`. The columns `col[b] = M(X^b·e_hi)`
+/// are produced by the exact `mul_by_x` doubling chain (bit `b` of the
+/// GHASH layout is the coefficient of `X^b`) + a fold through `base`; the
+/// 16×256 byte tables are their subset sums (`out[k·256+v] =
+/// Σ_{bit j of v} col[8k+j]`). Every step is an exact F2 operation, so the
+/// composed fold is bit-identical to multiply-then-fold.
+///
+/// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
+/// per block, amortized by the caller over ≥ 2048 fold evaluations.
 #[inline(always)]
 pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
@@ -2152,14 +2076,16 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
 pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
     debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
     let cols = compose_block_cols(base, e_hi);
+    // Expand each 8-column group into its 256-entry subset-sum table. Every
+    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
+    // may be uninitialized on entry.
     for k in 0..FOLD_N_BYTES {
         let col8 = &cols[k * 8..k * 8 + 8];
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            expand_256_subset_sums(col8, out.as_mut_ptr().add(k * FOLD_TABLE_SIZE));
+        let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        block[0] = F128::ZERO;
+        for v in 1..FOLD_TABLE_SIZE {
+            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
         }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-        expand_256_subset_sums_scalar(col8, &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE]);
     }
 }
 
