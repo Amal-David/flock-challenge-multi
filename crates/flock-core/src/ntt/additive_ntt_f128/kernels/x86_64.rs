@@ -1363,25 +1363,25 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // precondition for `twiddles[1..]` by inspection of the values.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
-            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
@@ -1405,22 +1405,42 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     twiddles: &[F128; 7],
 ) {
     let low_inner = !low_twiddle_fused3_disabled() && twiddles[1..].iter().all(|t| t.hi == 0);
+    // The outer layer's twiddle is LOW-eligible for half the blocks of the
+    // layer this sweep starts at; verified by inspection like the inner check.
+    let low_outer =
+        !low_twiddle_fused3_disabled() && !low_outer_fused3_disabled() && twiddles[0].hi == 0;
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]` by inspection of the values, and NN
     // substitutes an equal runtime value in the same impl body.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
             (true, false) => {
-                butterfly_fused_3layer_rows_impl::<false, false, NN>(ptr, NN, dense_lanes, twiddles)
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, true>(ptr, NN, dense_lanes, twiddles)
+                } else {
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, false>(ptr, NN, dense_lanes, twiddles)
+                }
             }
             (true, true) => {
-                butterfly_fused_3layer_rows_impl::<false, true, NN>(ptr, NN, dense_lanes, twiddles)
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, true>(ptr, NN, dense_lanes, twiddles)
+                } else {
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, false>(ptr, NN, dense_lanes, twiddles)
+                }
             }
             (false, false) => {
-                butterfly_fused_3layer_rows_impl::<true, false, NN>(ptr, NN, dense_lanes, twiddles)
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, true>(ptr, NN, dense_lanes, twiddles)
+                } else {
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, false>(ptr, NN, dense_lanes, twiddles)
+                }
             }
             (false, true) => {
-                butterfly_fused_3layer_rows_impl::<true, true, NN>(ptr, NN, dense_lanes, twiddles)
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, true>(ptr, NN, dense_lanes, twiddles)
+                } else {
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, false>(ptr, NN, dense_lanes, twiddles)
+                }
             }
         }
     }
@@ -1430,6 +1450,15 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 /// for the fused-three sweep's two inner layers inside the same binary, so a
 /// candidate/control pair differs only in the product form. Read once,
 /// outside every lane loop.
+#[inline]
+fn low_outer_fused3_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
+}
+
+/// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores the general twiddle product
+/// for the fused-three sweep's inner layers; `FLOCK_NO_NTT_LOW_OUTER_FUSED3=1`
+/// does the same for its outer layer.
 #[inline]
 fn low_twiddle_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1447,6 +1476,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,
     const LOW_INNER: bool,
     const NNC: usize,
+    const LOW_OUTER: bool,
 >(
     ptr: *mut F128,
     num_ntts: usize,
@@ -1467,7 +1497,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // loads and two stores for the same 12.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 7];
-        tw[0] = tw_x4::<false, DIET>(twiddles[0]);
+        tw[0] = tw_x4::<LOW_OUTER, DIET>(twiddles[0]);
         for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
             *slot = tw_x4::<LOW_INNER, DIET>(*value);
         }
@@ -1509,7 +1539,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, false);
+                butterfly2!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -1536,7 +1566,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, false);
+                butterfly!(values, i, i + 4, outer, LOW_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
@@ -1573,8 +1603,8 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
             }
             let outer = tw[0];
-            butterfly!(values, 0, 4, outer, false);
-            butterfly!(values, 2, 6, outer, false);
+            butterfly!(values, 0, 4, outer, LOW_OUTER);
+            butterfly!(values, 2, 6, outer, LOW_OUTER);
             butterfly!(values, 0, 2, tw[1], LOW_INNER);
             butterfly!(values, 4, 6, tw[2], LOW_INNER);
             for i in 0..4 {
@@ -1816,25 +1846,25 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0>(
+                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0>(
+                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0>(
+                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0>(
+                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,

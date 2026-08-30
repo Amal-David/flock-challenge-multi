@@ -506,6 +506,12 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
+        if c_identity_z.is_none() {
+            // Fold4/quad fallback consumers require dense AB. In particular,
+            // disabling identity-C must not expose the producer's omitted
+            // one-row windows as though they had been initialized.
+            ab_inner.restore_full_if_ranked_one_rows_elided(a_packed, b_packed, inv_table);
+        }
         if let Some(c_identity_z) = c_identity_z {
             // Ranked identity-C: AB completes without touching `c_packed`, and
             // C's message plus all three capture tensors come from one

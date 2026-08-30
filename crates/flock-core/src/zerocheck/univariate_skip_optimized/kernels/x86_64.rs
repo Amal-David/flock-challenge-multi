@@ -1979,6 +1979,60 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
     mats: &[u64; C_FOLD4_MATS_PER_GROUP],
     plane_banks: &mut [u8; C_PLANE_BANK_BYTES],
 ) {
+    // SAFETY: same contract as this function's own.
+    unsafe {
+        accumulate_c_banks_fold4_fused_x86_gfni_impl::<false>(c_group, n_b_med, mats, plane_banks);
+    }
+}
+
+/// First-write twin of [`accumulate_c_banks_fold4_fused_x86_gfni`]. The
+/// kernel's nested loops store every output plane on every call — a dead row
+/// contributes a zero mask rather than being skipped — so the first live group
+/// of a band can take an all-zero register as the prior value instead of
+/// loading the plane. In characteristic two the final plane values are
+/// identical, so the reassembled `partial_c4` is bit-for-bit the incumbent's.
+///
+/// # Safety
+/// As for [`accumulate_c_banks_fold4_fused_x86_gfni`], plus: the caller must
+/// have established that no earlier group of this band has written the bank.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+pub(crate) unsafe fn write_c_banks_fold4_fused_x86_gfni(
+    c_group: &[u8],
+    n_b_med: &[usize; 4],
+    mats: &[u64; C_FOLD4_MATS_PER_GROUP],
+    plane_banks: &mut [u8; C_PLANE_BANK_BYTES],
+) {
+    // SAFETY: same contract as the accumulating twin.
+    unsafe {
+        accumulate_c_banks_fold4_fused_x86_gfni_impl::<true>(c_group, n_b_med, mats, plane_banks);
+    }
+}
+
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
+    c_group: &[u8],
+    n_b_med: &[usize; 4],
+    mats: &[u64; C_FOLD4_MATS_PER_GROUP],
+    plane_banks: &mut [u8; C_PLANE_BANK_BYTES],
+) {
     use core::arch::x86_64::*;
     const ROW_BYTES: usize = ELL; // one medium row = 64 packed C bytes
     const WINDOW_BYTES: usize = 16 * ROW_BYTES; // 16 medium rows per window
@@ -2033,7 +2087,15 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
                         planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
                     _mm512_storeu_si512(
                         ptr,
-                        _mm512_ternarylogic_epi64::<0x96>(_mm512_loadu_si512(ptr), g_lo, g_hi),
+                        _mm512_ternarylogic_epi64::<0x96>(
+                            if FIRST_WRITE {
+                                _mm512_setzero_si512()
+                            } else {
+                                _mm512_loadu_si512(ptr as *const __m512i)
+                            },
+                            g_lo,
+                            g_hi,
+                        ),
                     );
                 }
             }

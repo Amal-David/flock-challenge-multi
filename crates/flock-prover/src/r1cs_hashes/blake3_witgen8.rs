@@ -26,6 +26,7 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
@@ -482,6 +483,70 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
     }
 }
 
+/// Transpose one fully-live ranked side and widen its offsets while the
+/// complete block-major rows are still live.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn ranked_dense_rows_and_offsets_rollback(
+    ring: *const V8,
+    w: usize,
+    op: *mut u16,
+) -> [__m512i; 8] {
+    unsafe {
+        let rows = tr8x16_zmm(ring, w);
+        widen_ranked_dense_rows(&rows, op);
+        rows
+    }
+}
+
+/// `FLOCK_NO_WITGEN_RANKED_DIRECT_PUBLISH=1` restores the ranked hot-window
+/// stage stores plus stage reload publication. Default ON; the ranked worker's
+/// cleared environment never disables it.
+#[inline(always)]
+fn ranked_direct_dense_publish_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_RANKED_DIRECT_PUBLISH").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
+}
+
+/// `FLOCK_NO_WITGEN_RANKED_DIRECT_INLINE=1` restores the original
+/// by-value-row + outlined-consumer ABI inside the direct-publish path while
+/// preserving its bytes and publication schedule.
+#[inline(always)]
+fn ranked_direct_dense_inline_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_RANKED_DIRECT_INLINE").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn widen_ranked_dense_rows(rows: &[__m512i; 8], op: *mut u16) {
+    unsafe {
+        let mut r = 0usize;
+        while r != 8 {
+            widen_off_line(rows[r], op.add(r * ROUND1_AB_OFF_WORDS));
+            r += 1;
+        }
+    }
+}
+
 /// Transpose and stage one fully-live ranked side, preserving each complete
 /// ZMM row long enough to build its two offset halves without a stage reload.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -489,9 +554,100 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
 unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op: *mut u16) {
     unsafe {
         let rows = tr8x16_zmm(ring, w);
-        for (r, row) in rows.into_iter().enumerate() {
-            store_ranked_stage_line(stage.add(r * STEP_WORDS), row);
-            widen_off_line(row, op.add(r * ROUND1_AB_OFF_WORDS));
+        widen_ranked_dense_rows(&rows, op);
+        let mut r = 0usize;
+        while r != 8 {
+            store_ranked_stage_line(stage.add(r * STEP_WORDS), rows[r]);
+            r += 1;
+        }
+    }
+}
+
+/// Caller-owned direct-publish path: keep the ranked rows in the caller's
+/// frame, widen their offsets there, and consume them without an outlined ABI
+/// boundary or a by-value `[__m512i; 8]` return.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    a_ring: *const V8,
+    b_ring: *const V8,
+    rw: usize,
+    off: *mut u16,
+) {
+    unsafe {
+        debug_assert!(blk > 1 && blk < 30);
+        let a_rows = tr8x16_zmm(a_ring, rw);
+        widen_ranked_dense_rows(&a_rows, off);
+        let b_rows = tr8x16_zmm(b_ring, rw);
+        widen_ranked_dense_rows(&b_rows, off.add(64));
+
+        if proj.one_rows_elided && blk == 2 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 2 * 64).cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0xfc,
+                );
+                j += 1;
+            }
+            return;
+        }
+        if proj.one_rows_elided && blk == 29 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 29 * 64).cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0x0f,
+                );
+                j += 1;
+            }
+            return;
+        }
+
+        let mut j = 0usize;
+        while j != 8 {
+            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
+            if plan.bcomplement_static_eligible() {
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    blk,
+                );
+            } else {
+                round1_ab_inner_window_from_offsets_nt2(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                );
+            }
+            j += 1;
         }
     }
 }
@@ -616,12 +772,81 @@ impl StreamProj<'_> {
                 self.project_blocks_ranked_hot_offsets_residual::<29,0x0f>(plan,imgs,rows,off);
                 return;
             }
+            // E=true is selected only for the ranked all-elide witness
+            // geometry. Its structural B=1 bytes are proved by the
+            // b-complement mode-plan test; the core plan separately verifies
+            // the exact inverse-table identity. Keep the cold/dense fallback
+            // in this same outlined boundary behind its cached kill switch.
+            if plan.bcomplement_static_eligible() {
+                self.project_blocks_ranked_hot_offsets_bcomplement(blk,plan,imgs,rows,off);
+                return;
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    /// Ranked static-B complement projection for full windows. The producer's
+    /// publish-then-project pacing is intentionally identical to the generic
+    /// hot leaf; only B's table application is shortened.
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_bcomplement(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            debug_assert!(blk > 1 && blk < 30);
+            debug_assert!(plan.bcomplement_static_eligible());
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+                    &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    blk,
+                );
+                j+=1;
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_direct_rollback(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, a_rows: &[__m512i; 8], b_rows: &[__m512i; 8], off: *const u16) {
+        unsafe {
+            debug_assert!(blk > 1 && blk < 30);
+            if self.one_rows_elided && blk == 2 {
+                self.project_blocks_ranked_hot_offsets_residual_direct_rollback::<2,0xfc>(plan,imgs,rows,a_rows,b_rows,off);
+                return;
+            }
+            if self.one_rows_elided && blk == 29 {
+                self.project_blocks_ranked_hot_offsets_residual_direct_rollback::<29,0x0f>(plan,imgs,rows,a_rows,b_rows,off);
+                return;
+            }
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense_values(j,a_rows[j],b_rows[j]);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                if plan.bcomplement_static_eligible() {
+                    round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+                        &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
+                        out,
+                        plan,
+                        imgs,
+                        blk,
+                    );
+                } else {
+                    round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                }
                 j+=1;
             }
         }
@@ -636,6 +861,22 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                j+=1;
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_residual_direct_rollback<const BLK:usize,const KEEP:u8>(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, a_rows: &[__m512i; 8], b_rows: &[__m512i; 8], off: *const u16) {
+        unsafe {
+            const { assert!((BLK==2 && KEEP==0xfc)||(BLK==29 && KEEP==0x0f)); }
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense_values(j,a_rows[j],b_rows[j]);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
@@ -1238,6 +1479,19 @@ impl RankedRows {
         }
     }
 
+    /// Dense ranked windows 2..29, sourced directly from the live transposed
+    /// rows instead of staging and immediately reloading them.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_dense_values(&self, j: usize, av: __m512i, bv: __m512i) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+            stream_ranked_line(self.a.add(o), av);
+            stream_ranked_line(self.b.add(o), bv);
+        }
+    }
+
     /// Static-B ranked windows 0/1: B=1, so the complete z and a lines match.
     #[inline(always)]
     unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
@@ -1391,12 +1645,36 @@ impl Drain8<'_> {
 
                 if E {
                     // Ranked dense path: each side's two AVX2 half-transposes
-                    // become one 16-word ZMM transpose, one aligned store per
-                    // block row, and the same live ZMM feeds offset widening.
+                    // become one 16-word ZMM transpose, and the same live ZMM
+                    // rows feed offset widening. The incumbent fallback stages
+                    // those rows once; the direct arm streams them straight to
+                    // z/a/b.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        stage_ranked_dense_side(self.ast,rw,sa,op);
-                        stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        if ranked_direct_dense_publish_enabled() {
+                            if ranked_direct_dense_inline_enabled() {
+                                project_blocks_ranked_hot_offsets_direct_inline(
+                                    proj,
+                                    blk,
+                                    plan,
+                                    imgs,
+                                    rows,
+                                    self.ast,
+                                    self.bs,
+                                    rw,
+                                    op,
+                                );
+                            } else {
+                                let a_rows=ranked_dense_rows_and_offsets_rollback(self.ast,rw,op);
+                                let b_rows=ranked_dense_rows_and_offsets_rollback(self.bs,rw,op.add(64));
+                                proj.project_blocks_ranked_hot_offsets_direct_rollback(blk,plan,imgs,rows,&a_rows,&b_rows,op as *const u16);
+                            }
+                        } else {
+                            stage_ranked_dense_side(self.ast,rw,sa,op);
+                            stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
+                            proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
+                        }
                     }
                     // Portable builds cannot select E=true: the ranked gate
                     // requires the AVX-512 offset plan. Retain the old staging
@@ -1417,9 +1695,9 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
                     // transposes and its per-window offset eligibility gate.
@@ -2188,6 +2466,130 @@ mod tests {
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
                 let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
                 assert_eq!(got, expected, "block {block}");
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn ranked_direct_dense_rows_and_publish_match_staged_path() {
+        #[repr(C, align(64))]
+        struct Input([[u32; 8]; STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct Stage {
+            a: [u32; 8 * STEP_WORDS],
+            b: [u32; 8 * STEP_WORDS],
+        }
+        #[repr(C, align(64))]
+        struct Offsets([u16; 8 * ROUND1_AB_OFF_WORDS]);
+        #[repr(C, align(64))]
+        struct RankedBuf([u32; 8 * U32_PER_BLOCK]);
+
+        unsafe {
+            for case in 0..6usize {
+                let a_input = Input(core::array::from_fn(|word| {
+                    core::array::from_fn(|block| match case {
+                        0 => u32::MAX,
+                        1 => 0,
+                        _ => {
+                            0xA5A5_0000u32
+                                ^ ((case as u32) << 20)
+                                ^ ((word as u32) << 9)
+                                ^ ((block as u32).wrapping_mul(0x0101_0101))
+                        }
+                    })
+                }));
+                let b_input = Input(core::array::from_fn(|word| {
+                    core::array::from_fn(|block| match case {
+                        0 => ((word as u32) << 16) ^ ((block as u32) * 0x1111_1111),
+                        1 => u32::MAX,
+                        _ => {
+                            0x5A5A_0000u32
+                                ^ ((case as u32) << 17)
+                                ^ ((word as u32).wrapping_mul(0x1021))
+                                ^ ((block as u32).wrapping_mul(0x0102_0408))
+                        }
+                    })
+                }));
+
+                let a_rows = tr8x16_zmm(a_input.0.as_ptr().cast::<V8>(), 0);
+                let b_rows = tr8x16_zmm(b_input.0.as_ptr().cast::<V8>(), 0);
+                let mut inline_off = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
+                widen_ranked_dense_rows(&a_rows, inline_off.0.as_mut_ptr());
+                widen_ranked_dense_rows(&b_rows, inline_off.0.as_mut_ptr().add(64));
+
+                let mut rollback_off = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
+                let rollback_a_rows = ranked_dense_rows_and_offsets_rollback(
+                    a_input.0.as_ptr().cast::<V8>(),
+                    0,
+                    rollback_off.0.as_mut_ptr(),
+                );
+                let rollback_b_rows = ranked_dense_rows_and_offsets_rollback(
+                    b_input.0.as_ptr().cast::<V8>(),
+                    0,
+                    rollback_off.0.as_mut_ptr().add(64),
+                );
+
+                let mut staged = Stage {
+                    a: [0u32; 8 * STEP_WORDS],
+                    b: [0u32; 8 * STEP_WORDS],
+                };
+                let mut staged_off = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
+                stage_ranked_dense_side(
+                    a_input.0.as_ptr().cast::<V8>(),
+                    0,
+                    staged.a.as_mut_ptr(),
+                    staged_off.0.as_mut_ptr(),
+                );
+                stage_ranked_dense_side(
+                    b_input.0.as_ptr().cast::<V8>(),
+                    0,
+                    staged.b.as_mut_ptr(),
+                    staged_off.0.as_mut_ptr().add(64),
+                );
+
+                for row in 0..8 {
+                    let mut got_a = [0u32; STEP_WORDS];
+                    let mut got_b = [0u32; STEP_WORDS];
+                    _mm512_storeu_si512(got_a.as_mut_ptr().cast::<__m512i>(), a_rows[row]);
+                    _mm512_storeu_si512(got_b.as_mut_ptr().cast::<__m512i>(), b_rows[row]);
+                    let mut rollback_a = [0u32; STEP_WORDS];
+                    let mut rollback_b = [0u32; STEP_WORDS];
+                    _mm512_storeu_si512(rollback_a.as_mut_ptr().cast::<__m512i>(), rollback_a_rows[row]);
+                    _mm512_storeu_si512(rollback_b.as_mut_ptr().cast::<__m512i>(), rollback_b_rows[row]);
+                    assert_eq!(
+                        &staged.a[row * STEP_WORDS..(row + 1) * STEP_WORDS],
+                        &got_a,
+                        "staged a row mismatch, case={case} row={row}"
+                    );
+                    assert_eq!(
+                        &staged.b[row * STEP_WORDS..(row + 1) * STEP_WORDS],
+                        &got_b,
+                        "staged b row mismatch, case={case} row={row}"
+                    );
+                    assert_eq!(rollback_a, got_a, "rollback a row mismatch, case={case} row={row}");
+                    assert_eq!(rollback_b, got_b, "rollback b row mismatch, case={case} row={row}");
+                }
+                assert_eq!(inline_off.0, staged_off.0, "inline offset mismatch, case={case}");
+                assert_eq!(rollback_off.0, staged_off.0, "rollback offset mismatch, case={case}");
+
+                let mut staged_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let mut staged_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let mut staged_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let mut direct_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let mut direct_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let mut direct_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                let staged_rows =
+                    RankedRows::new(staged_z.0.as_mut_ptr(), staged_a.0.as_mut_ptr(), staged_b.0.as_mut_ptr());
+                let direct_rows =
+                    RankedRows::new(direct_z.0.as_mut_ptr(), direct_a.0.as_mut_ptr(), direct_b.0.as_mut_ptr());
+                for j in 0..8 {
+                    staged_rows.publish_dense(j, staged.a.as_ptr(), staged.b.as_ptr());
+                    direct_rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                }
+                assert_eq!(staged_z.0, direct_z.0, "z mismatch, case={case}");
+                assert_eq!(staged_a.0, direct_a.0, "a mismatch, case={case}");
+                assert_eq!(staged_b.0, direct_b.0, "b mismatch, case={case}");
             }
         }
     }

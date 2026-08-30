@@ -5300,6 +5300,207 @@ mod tests {
         assert_ne!(run(&ap3, &b), base, "row 240 is live");
     }
 
+    /// Canonical B subgroups must match the complete dense map, including
+    /// a linear map whose all-one input does not map to F128::ONE.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_b_canonical_prefold_matches_dense() {
+        let mut rng = Rng::new(0xBC64_0049);
+        let tail_bits = 0x0001_ffff_ffff_ffffu64.to_le_bytes();
+        for altered_map in [false, true] {
+            let mut table = UniSkipFoldTable::new(6, rng.f128());
+            if altered_map {
+                // Add a nonzero basis column to chunk zero. This preserves
+                // F2-linearity and zero, but changes the all-one image.
+                let delta = F128::new(0x1357_9BDF, 0x2468_ACE0);
+                for v in (1..256).step_by(2) {
+                    table.data[v] += delta;
+                }
+                assert_ne!(table.fold_one_row(&[0xff; 8]), F128::ONE);
+            }
+            let mats = kernels::x86_64::build_row_fold_mats(&table.data);
+            for group in [0u8, 3] {
+                let mut clean: Vec<u8> = (0..512).map(|_| rng.next_u64() as u8).collect();
+                if group == 0 {
+                    clean[..128].fill(0xff);
+                } else {
+                    clean[384..].fill(0);
+                    clean[384..392].copy_from_slice(&tail_bits);
+                }
+                let folded = if group == 0 {
+                    table.fold_one_row(&[0xff; 8])
+                } else {
+                    table.fold_one_row(&tail_bits)
+                };
+                for mutation in 0..18 {
+                    let mut rows = clean.clone();
+                    if (1..=16).contains(&mutation) {
+                        // Every guarded qword gets an independent miss case.
+                        let row = 16 * usize::from(group) + mutation - 1;
+                        rows[row * 8 + mutation % 8] ^= 1;
+                    } else if mutation == 17 {
+                        // A mutation in the retained dense groups must not
+                        // disable the shortcut or disappear from the output.
+                        let row = if group == 0 { 63 } else { 0 };
+                        rows[row * 8] ^= 0x40;
+                    }
+                    let mut want = [F128::ZERO; 64];
+                    let poison = F128::new(0xA5A5_A5A5, 0x5A5A_5A5A);
+                    let mut got = [poison; 64];
+                    // SAFETY: 512 readable input bytes, 64 writable outputs,
+                    // and folded is the exact image of the guarded pattern.
+                    let hit = unsafe {
+                        kernels::x86_64::gfni_fold64_rows_masked_tr_bcast(
+                            rows.as_ptr(),
+                            &mats,
+                            want.as_mut_ptr(),
+                            0,
+                        );
+                        kernels::x86_64::gfni_fold64_rows_tr_bcast_b_canonical(
+                            rows.as_ptr(),
+                            &mats,
+                            got.as_mut_ptr(),
+                            group,
+                            folded,
+                        )
+                    };
+                    assert_eq!(hit, mutation == 0 || mutation == 17);
+                    assert_eq!(got, want, "map={altered_map} group={group} case={mutation}");
+                    for unsupported in [1u8, 2, 255] {
+                        got.fill(poison);
+                        // SAFETY: unsupported groups use the same dense map.
+                        let hit = unsafe {
+                            kernels::x86_64::gfni_fold64_rows_tr_bcast_b_canonical(
+                                rows.as_ptr(),
+                                &mats,
+                                got.as_mut_ptr(),
+                                unsupported,
+                                folded,
+                            )
+                        };
+                        assert!(!hit);
+                        assert_eq!(got, want);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check both tile phases and the downstream message, not only the
+    /// local cache layout. Arbitrary A rows rule out A-side assumptions.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn round2_b_canonical_prefold_matches_scalar() {
+        let mut rng = Rng::new(0xBC64_1200);
+        for altered_map in [false, true] {
+            for lo_size in [128usize, 256] {
+                for pair_base in [0usize, 1, 32] {
+                    let row_base = 2 * pair_base;
+                    let n_rows = row_base + 2 * lo_size;
+                    let mut table = UniSkipFoldTable::new(6, rng.f128());
+                    if altered_map {
+                        // Exercise the kernel's basis-derived replacement
+                        // values as well as the direct helper's supplied ones.
+                        let delta = F128::new(0x1357_9BDF, 0x2468_ACE0);
+                        for v in (1..256).step_by(2) {
+                            table.data[v] += delta;
+                        }
+                        assert_ne!(table.fold_one_row(&[0xff; 8]), F128::ONE);
+                    }
+                    let mats = kernels::x86_64::build_row_fold_mats(&table.data);
+                    let eq_lo = rng.f128_vec(lo_size);
+                    let wtab = build_w_pair_table(&eq_lo);
+                    let a: Vec<u8> = (0..8 * n_rows).map(|_| rng.next_u64() as u8).collect();
+                    let mut b: Vec<u8> = (0..8 * n_rows).map(|_| rng.next_u64() as u8).collect();
+                    for base in (0..n_rows).step_by(256) {
+                        b[base * 8..(base + 16).min(n_rows) * 8].fill(0xff);
+                        if base + 256 <= n_rows {
+                            b[(base + 240) * 8..(base + 256) * 8].fill(0);
+                            b[(base + 240) * 8..(base + 241) * 8]
+                                .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+                        }
+                    }
+                    let mut a_ref = vec![F128::ZERO; 2 * lo_size];
+                    let mut b_ref = vec![F128::ZERO; 2 * lo_size];
+                    let want = round2_lookahead_chunk_scalar::<true>(
+                        &a,
+                        &b,
+                        &table,
+                        &mut a_ref,
+                        &mut b_ref,
+                        &eq_lo,
+                        row_base,
+                        pair_base,
+                        0,
+                        usize::MAX,
+                    );
+                    for weights in [None, Some(wtab.as_slice())] {
+                        // SAFETY: all packed rows and eq entries exist. The
+                        // no-materialize kernel does not touch empty outputs.
+                        let got = unsafe {
+                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                                table.data.as_ptr(),
+                                Some(&mats),
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                row_base,
+                                &mut [],
+                                &mut [],
+                                &eq_lo,
+                                pair_base,
+                                0,
+                                usize::MAX,
+                                weights,
+                            )
+                        };
+                        assert_eq!(
+                            got, want,
+                            "nomat lo={lo_size} phase={pair_base} map={altered_map}"
+                        );
+                        let mut a_out = vec![F128::ONE; 2 * lo_size];
+                        let mut b_out = vec![F128::ONE; 2 * lo_size];
+                        // SAFETY: same valid inputs and full-sized destinations;
+                        // WRITE=true retains the existing materialized path.
+                        let got = unsafe {
+                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                                table.data.as_ptr(),
+                                Some(&mats),
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                row_base,
+                                &mut a_out,
+                                &mut b_out,
+                                &eq_lo,
+                                pair_base,
+                                0,
+                                usize::MAX,
+                                weights,
+                            )
+                        };
+                        assert_eq!(
+                            got, want,
+                            "materialized lo={lo_size} phase={pair_base} map={altered_map}"
+                        );
+                        assert_eq!(a_out, a_ref);
+                        assert_eq!(b_out, b_ref);
+                    }
+                }
+            }
+        }
+    }
+
     /// Byte-identity of the predicated prefold against the unpredicated
     /// kernel, on hardware. Compiles wherever the AVX-512/GFNI arms compile
     /// (e.g. `-C target-cpu=sapphirerapids`); on hosts without those features

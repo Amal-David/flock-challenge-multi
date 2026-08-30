@@ -278,6 +278,11 @@ pub fn prewarm_prover(m: usize) {
             unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
     });
+    // Ask the kernel to upgrade any 4 KiB-backed stretches to 2 MiB (see
+    // `collapse_hugepages`); no-op where first-touch already won THP.
+    bufs.par_iter_mut().for_each(|b| {
+        crate::collapse_hugepages(b.as_mut_ptr().cast::<u8>(), b.len() * 16);
+    });
     for b in bufs {
         give_f128(b);
     }
