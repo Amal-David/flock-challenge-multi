@@ -1156,6 +1156,363 @@ mod tests {
 
     use super::*;
 
+    const COMPACT_PROBE_CUTOFF_LOG: usize = 4;
+    const COMPACT_PROBE_LEAVES: usize = 1 << COMPACT_PROBE_CUTOFF_LOG;
+    const COMPACT_PROBE_LOCAL_NODES: usize = 2 * COMPACT_PROBE_LEAVES - 1;
+
+    fn compact_probe_start(num_leaves: usize) -> usize {
+        let roots = num_leaves >> COMPACT_PROBE_CUTOFF_LOG;
+        2 * num_leaves - 2 * roots
+    }
+
+    fn compact_probe_len(num_leaves: usize) -> usize {
+        2 * (num_leaves >> COMPACT_PROBE_CUTOFF_LOG) - 1
+    }
+
+    fn compact_probe_fill_local(
+        tree: &mut [Hash; COMPACT_PROBE_LOCAL_NODES],
+        data: &[u8],
+        leaf_size: usize,
+        kind: HashKind,
+    ) {
+        debug_assert_eq!(data.len(), COMPACT_PROBE_LEAVES * leaf_size);
+        hash_leaves_serial(data, leaf_size, &mut tree[..COMPACT_PROBE_LEAVES], kind);
+        let mut read_start = 0usize;
+        let mut read_len = COMPACT_PROBE_LEAVES;
+        while read_len > 1 {
+            let next_len = read_len >> 1;
+            let (read, rest) = tree[read_start..].split_at_mut(read_len);
+            hash_pairs_level_serial(read, &mut rest[..next_len], kind);
+            read_start += read_len;
+            read_len = next_len;
+        }
+    }
+
+    /// Build the exact full-tree suffix beginning at depth four. Low nodes
+    /// live only in callback-local 16-leaf scratch, matching the representation
+    /// the measurement-only compact-tree probe prices.
+    fn compact_probe_fill(compact: &mut [Hash], data: &[u8], num_leaves: usize, kind: HashKind) {
+        use rayon::prelude::*;
+
+        assert!(num_leaves >= COMPACT_PROBE_LEAVES && num_leaves.is_power_of_two());
+        assert_eq!(data.len() % num_leaves, 0);
+        assert_eq!(compact.len(), compact_probe_len(num_leaves));
+        let leaf_size = data.len() / num_leaves;
+        let roots = num_leaves >> COMPACT_PROBE_CUTOFF_LOG;
+        const GROUPS_PER_TASK: usize = 8;
+        let task_bytes = GROUPS_PER_TASK * COMPACT_PROBE_LEAVES * leaf_size;
+        data.par_chunks(task_bytes)
+            .zip(compact[..roots].par_chunks_mut(GROUPS_PER_TASK))
+            .for_each(|(task_data, task_roots)| {
+                assert_eq!(
+                    task_data.len(),
+                    task_roots.len() * COMPACT_PROBE_LEAVES * leaf_size
+                );
+                for (group, root) in task_data
+                    .chunks_exact(COMPACT_PROBE_LEAVES * leaf_size)
+                    .zip(task_roots.iter_mut())
+                {
+                    let mut local = [Hash::default(); COMPACT_PROBE_LOCAL_NODES];
+                    compact_probe_fill_local(&mut local, group, leaf_size, kind);
+                    *root = local[COMPACT_PROBE_LOCAL_NODES - 1];
+                }
+            });
+
+        let mut read_start = 0usize;
+        let mut read_len = roots;
+        while read_len > 1 {
+            let next_len = read_len >> 1;
+            let (read, rest) = compact[read_start..].split_at_mut(read_len);
+            hash_pairs_level(read, &mut rest[..next_len], kind);
+            read_start += read_len;
+            read_len = next_len;
+        }
+    }
+
+    fn compact_probe_flat_depth(num_leaves: usize, flat_index: usize) -> (usize, usize) {
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        let mut len = num_leaves;
+        loop {
+            if flat_index < start + len {
+                return (depth, flat_index - start);
+            }
+            start += len;
+            len >>= 1;
+            depth += 1;
+        }
+    }
+
+    /// Reconstruct touched 16-leaf mini-trees and gather the incumbent flat
+    /// sibling indices in their existing global level-major order.
+    fn compact_probe_multi_proof(
+        data: &[u8],
+        compact: &[Hash],
+        num_leaves: usize,
+        positions: &[usize],
+        kind: HashKind,
+    ) -> (Vec<Hash>, usize) {
+        assert_eq!(data.len() % num_leaves, 0);
+        assert_eq!(compact.len(), compact_probe_len(num_leaves));
+        let leaf_size = data.len() / num_leaves;
+        let mut blocks: Vec<usize> = positions
+            .iter()
+            .map(|&position| position >> COMPACT_PROBE_CUTOFF_LOG)
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let mut locals = vec![[Hash::default(); COMPACT_PROBE_LOCAL_NODES]; blocks.len()];
+        for (&block, local) in blocks.iter().zip(locals.iter_mut()) {
+            let lo = block * COMPACT_PROBE_LEAVES * leaf_size;
+            compact_probe_fill_local(
+                local,
+                &data[lo..lo + COMPACT_PROBE_LEAVES * leaf_size],
+                leaf_size,
+                kind,
+            );
+        }
+
+        let cutoff_start = compact_probe_start(num_leaves);
+        let indices = merkle_multi_proof_sibling_indices(num_leaves, positions);
+        let mut proof = Vec::with_capacity(indices.len());
+        for flat_index in indices {
+            let (depth, node_index) = compact_probe_flat_depth(num_leaves, flat_index);
+            if depth >= COMPACT_PROBE_CUTOFF_LOG {
+                proof.push(compact[flat_index - cutoff_start]);
+                continue;
+            }
+            let nodes_per_block = COMPACT_PROBE_LEAVES >> depth;
+            let block = node_index / nodes_per_block;
+            let in_block = node_index % nodes_per_block;
+            let local_start = 2 * COMPACT_PROBE_LEAVES - 2 * (COMPACT_PROBE_LEAVES >> depth);
+            let slot = blocks
+                .binary_search(&block)
+                .expect("missing touched cutoff block");
+            proof.push(locals[slot][local_start + in_block]);
+        }
+        (proof, blocks.len())
+    }
+
+    fn compact_probe_queries(num_leaves: usize, count: usize, mut seed: u64) -> Vec<usize> {
+        let mut positions = Vec::with_capacity(count);
+        while positions.len() < count {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let position = (z ^ (z >> 31)) as usize & (num_leaves - 1);
+            match positions.binary_search(&position) {
+                Ok(_) => {}
+                Err(index) => positions.insert(index, position),
+            }
+        }
+        positions
+    }
+
+    #[test]
+    fn compact_probe_c16_suffix_and_multiproof_match_full_tree() {
+        let query_sets: &[&[usize]] = &[
+            &[0],
+            &[15],
+            &[15, 16],
+            &[0, 1, 14, 15],
+            &[0, 2, 17, 31, 32, 63],
+            &[63, 1, 1, 14, 27],
+        ];
+        for kind in KINDS {
+            for &(num_leaves, leaf_size) in &[(16usize, 64usize), (64, 128), (256, 1024)] {
+                let data = random_data(num_leaves, leaf_size, num_leaves as u64 ^ 0xC016);
+                let full = merkle_tree(&data, num_leaves, kind);
+                let mut compact = vec![Hash::default(); compact_probe_len(num_leaves)];
+                compact_probe_fill(&mut compact, &data, num_leaves, kind);
+                assert_eq!(
+                    compact,
+                    full[compact_probe_start(num_leaves)..],
+                    "compact suffix mismatch: kind={kind} leaves={num_leaves}"
+                );
+                for raw in query_sets {
+                    let positions: Vec<usize> =
+                        raw.iter().map(|position| position % num_leaves).collect();
+                    let want = merkle_multi_proof(&full, num_leaves, &positions);
+                    let (got, _) =
+                        compact_probe_multi_proof(&data, &compact, num_leaves, &positions, kind);
+                    assert_eq!(got, want, "proof mismatch: kind={kind} leaves={num_leaves}");
+                }
+            }
+        }
+    }
+
+    /// Measurement-only exposure probe. Production source remains untouched.
+    /// Run on Sapphire Rapids with:
+    /// `FLOCK_MERKLE_COMPACT_PROBE_REPS=40 cargo test -p flock-core --release compact_merkle_c16_ranked_exposure_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn compact_merkle_c16_ranked_exposure_probe() {
+        struct Level {
+            log_leaves: usize,
+            leaf_size: usize,
+            data: Vec<u8>,
+            full: Vec<Hash>,
+            compact: Vec<Hash>,
+            queries: Vec<usize>,
+        }
+
+        fn median(values: &[f64]) -> f64 {
+            let mut values = values.to_vec();
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        }
+
+        fn percentile(values: &[f64], numerator: usize, denominator: usize) -> f64 {
+            let mut values = values.to_vec();
+            values.sort_by(f64::total_cmp);
+            let index = ((values.len() - 1) * numerator) / denominator;
+            values[index]
+        }
+
+        fn run_full(levels: &mut [Level]) -> f64 {
+            let start = std::time::Instant::now();
+            for level in levels {
+                fill_merkle_tree(
+                    &mut level.full,
+                    &level.data,
+                    1usize << level.log_leaves,
+                    HashKind::Blake3,
+                );
+                std::hint::black_box(merkle_multi_proof(
+                    &level.full,
+                    1usize << level.log_leaves,
+                    &level.queries,
+                ));
+            }
+            start.elapsed().as_secs_f64() * 1e3
+        }
+
+        fn run_compact(levels: &mut [Level]) -> (f64, usize) {
+            let start = std::time::Instant::now();
+            let mut rebuilt_blocks = 0usize;
+            for level in levels {
+                let num_leaves = 1usize << level.log_leaves;
+                compact_probe_fill(
+                    &mut level.compact,
+                    &level.data,
+                    num_leaves,
+                    HashKind::Blake3,
+                );
+                let (proof, blocks) = compact_probe_multi_proof(
+                    &level.data,
+                    &level.compact,
+                    num_leaves,
+                    &level.queries,
+                    HashKind::Blake3,
+                );
+                rebuilt_blocks += blocks;
+                std::hint::black_box(proof);
+            }
+            (start.elapsed().as_secs_f64() * 1e3, rebuilt_blocks)
+        }
+
+        let specs = [
+            (20usize, 1024usize, 218usize),
+            (18, 128, 106),
+            (16, 128, 71),
+            (14, 128, 53),
+            (12, 128, 43),
+            (10, 128, 36),
+        ];
+        let mut levels = Vec::with_capacity(specs.len());
+        for (level, &(log_leaves, leaf_size, query_count)) in specs.iter().enumerate() {
+            let num_leaves = 1usize << log_leaves;
+            let mut data = vec![0u8; num_leaves * leaf_size];
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = (index as u64)
+                    .wrapping_mul(0x9E37_79B9)
+                    .wrapping_add((level as u64) << 5) as u8;
+            }
+            levels.push(Level {
+                log_leaves,
+                leaf_size,
+                data,
+                full: vec![Hash::default(); 2 * num_leaves - 1],
+                compact: vec![Hash::default(); compact_probe_len(num_leaves)],
+                queries: compact_probe_queries(num_leaves, query_count, 0xC016_0000 ^ level as u64),
+            });
+        }
+
+        // Fault in and validate both resident representations before timing.
+        let _ = run_full(&mut levels);
+        let (_, rebuilt_blocks) = run_compact(&mut levels);
+        for level in &levels {
+            let num_leaves = 1usize << level.log_leaves;
+            assert_eq!(
+                level.compact,
+                level.full[compact_probe_start(num_leaves)..],
+                "ranked suffix mismatch at log_leaves={}",
+                level.log_leaves
+            );
+            let want = merkle_multi_proof(&level.full, num_leaves, &level.queries);
+            let (got, _) = compact_probe_multi_proof(
+                &level.data,
+                &level.compact,
+                num_leaves,
+                &level.queries,
+                HashKind::Blake3,
+            );
+            assert_eq!(
+                got, want,
+                "ranked proof mismatch at log_leaves={}",
+                level.log_leaves
+            );
+        }
+
+        let reps = std::env::var("FLOCK_MERKLE_COMPACT_PROBE_REPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value >= 2)
+            .unwrap_or(4);
+        let mut full_ms = Vec::with_capacity(reps);
+        let mut compact_ms = Vec::with_capacity(reps);
+        let mut paired_delta_ms = Vec::with_capacity(reps);
+        for repetition in 0..reps {
+            let (full, compact) = if repetition & 1 == 0 {
+                let full = run_full(&mut levels);
+                let (compact, _) = run_compact(&mut levels);
+                (full, compact)
+            } else {
+                let (compact, _) = run_compact(&mut levels);
+                let full = run_full(&mut levels);
+                (full, compact)
+            };
+            full_ms.push(full);
+            compact_ms.push(compact);
+            paired_delta_ms.push(full - compact);
+            eprintln!(
+                "[compact-c16-sample] rep={} order={} full_ms={full:.6} compact_ms={compact:.6} delta_ms={:.6}",
+                repetition + 1,
+                if repetition & 1 == 0 { "F/C" } else { "C/F" },
+                full - compact
+            );
+        }
+
+        let full_median = median(&full_ms);
+        let compact_median = median(&compact_ms);
+        let delta_median = median(&paired_delta_ms);
+        let delta_p05 = percentile(&paired_delta_ms, 1, 20);
+        let full_nodes: usize = specs
+            .iter()
+            .map(|(log_leaves, _, _)| 2 * (1usize << log_leaves) - 1)
+            .sum();
+        let compact_nodes: usize = specs
+            .iter()
+            .map(|(log_leaves, _, _)| compact_probe_len(1usize << log_leaves))
+            .sum();
+        eprintln!(
+            "[compact-c16-summary] reps={reps} full_median_ms={full_median:.6} compact_median_ms={compact_median:.6} paired_delta_median_ms={delta_median:.6} paired_delta_p05_ms={delta_p05:.6} rebuilt_blocks={rebuilt_blocks} omitted_nodes={} omitted_bytes={} proceed_median_ms=2.75 proceed_lower_ms=2.25 reject_at_or_below_ms=1.50",
+            full_nodes - compact_nodes,
+            (full_nodes - compact_nodes) * core::mem::size_of::<Hash>()
+        );
+    }
+
     /// Every structural test runs against both hashes: the tree, path and
     /// multi-proof logic is hash-agnostic, so anything true of one must hold
     /// for the other.
