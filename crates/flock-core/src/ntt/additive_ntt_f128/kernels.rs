@@ -37,6 +37,13 @@ mod aarch64;
 ))]
 mod x86_64;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) use x86_64::PreparedTw15;
+
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     debug_assert_eq!(top.len(), bot.len());
@@ -759,6 +766,115 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     unsafe {
         let _ = pf_r;
         portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+    }
+}
+
+/// Build one fused-four twiddle table for repeated row leaves.
+///
+/// # Safety
+/// Requires the statically selected AVX-512 + VPCLMULQDQ features.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn prepare_tw15(twiddles: &[F128; 15]) -> PreparedTw15<'_> {
+    // SAFETY: the cfg gate supplies the target features.
+    unsafe { x86_64::prepare_tw15(twiddles) }
+}
+
+/// Prepared-table twin of [`butterfly_fused_4layer_row`].
+///
+/// # Safety
+/// Same row-geometry and disjointness contract as the raw wrapper; `prepared`
+/// must have been built from the matching scalar twiddle table.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    prepared: &PreparedTw15<'_>,
+) {
+    debug_assert!(lanes <= num_ntts);
+    // SAFETY: forwarded caller contract. The shaped constants replace equal
+    // runtime values, exactly as in the incumbent raw dispatch.
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_prepared::<128, 64, 0>(
+                        ptr, sixteenth, num_ntts, lanes, r, prepared, 0,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_prepared::<8, 64, 0>(
+                        ptr, sixteenth, num_ntts, lanes, r, prepared, 0,
+                    );
+                }
+                1 => {
+                    return x86_64::butterfly_fused_4layer_row_prepared::<1, 64, 0>(
+                        ptr, sixteenth, num_ntts, lanes, r, prepared, 0,
+                    );
+                }
+                _ => {}
+            }
+        }
+        x86_64::butterfly_fused_4layer_row_prepared::<0, 0, 0>(
+            ptr, sixteenth, num_ntts, lanes, r, prepared, 0,
+        );
+    }
+}
+
+/// Prepared-table twin of [`butterfly_fused_4layer_row_pf`].
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row_prepared`]; `pf_r` must lie
+/// inside the same block.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared_pf<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    prepared: &PreparedTw15<'_>,
+    pf_r: usize,
+) {
+    debug_assert!(lanes <= num_ntts);
+    // SAFETY: forwarded caller contract; `H` is the same hint-only selector
+    // as the incumbent wrapper.
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_prepared::<128, 64, H>(
+                        ptr, sixteenth, num_ntts, lanes, r, prepared, pf_r,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_prepared::<8, 64, H>(
+                        ptr, sixteenth, num_ntts, lanes, r, prepared, pf_r,
+                    );
+                }
+                _ => {}
+            }
+        }
+        x86_64::butterfly_fused_4layer_row_prepared::<0, 0, H>(
+            ptr, sixteenth, num_ntts, lanes, r, prepared, pf_r,
+        );
     }
 }
 

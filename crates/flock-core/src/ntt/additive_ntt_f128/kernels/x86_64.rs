@@ -17,6 +17,15 @@ fn mul_diet_disabled() -> bool {
 /// and is dropped by DCE.
 type TwX4 = (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i);
 
+/// Pass-owned fused-four twiddles in both their scalar and split-product SIMD
+/// forms. The scalar table is borrowed for the sub-four-lane tail; the SIMD
+/// table is built once and borrowed by every prepared row leaf.
+pub(in crate::ntt::additive_ntt_f128) struct PreparedTw15<'a> {
+    scalar: &'a [F128; 15],
+    x4: [TwX4; 15],
+    diet: bool,
+}
+
 /// Broadcast `value` to all lanes and, when the split product will be used,
 /// derive its `x^64` companion. Every caller does this OUTSIDE its lane loop,
 /// so the extra CLMUL is amortised over the whole row set.
@@ -37,6 +46,46 @@ unsafe fn tw_x4<const LOW: bool, const DIET: bool>(value: F128) -> TwX4 {
         let companion = if DIET && !LOW { ghash_shift64_x4(t) } else { t };
         (t, companion)
     }
+}
+
+/// Prepare the pass-constant fused-four twiddle table once for reuse by row
+/// leaves. The selected multiply form is captured with the table so every
+/// consumer uses the companions that were actually materialised.
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline]
+pub(super) unsafe fn prepare_tw15(twiddles: &[F128; 15]) -> PreparedTw15<'_> {
+    let diet = !mul_diet_disabled();
+    // SAFETY: this function carries the target features. `DIET` is captured
+    // beside the resulting table and is therefore preserved by every leaf.
+    let x4 = unsafe {
+        if diet {
+            prepare_tw15_impl::<true>(twiddles)
+        } else {
+            prepare_tw15_impl::<false>(twiddles)
+        }
+    };
+    PreparedTw15 {
+        scalar: twiddles,
+        x4,
+        diet,
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn prepare_tw15_impl<const DIET: bool>(twiddles: &[F128; 15]) -> [TwX4; 15] {
+    use core::arch::x86_64::*;
+
+    let zero = _mm512_setzero_si512();
+    let mut prepared = [(zero, zero); 15];
+    for (slot, value) in prepared.iter_mut().zip(twiddles.iter()) {
+        // SAFETY: this function carries the target features.
+        *slot = unsafe { tw_x4::<false, DIET>(*value) };
+    }
+    prepared
 }
 
 /// Broadcast-twiddle product. `LOW` asserts the twiddle's high limb is zero
@@ -1325,6 +1374,164 @@ unsafe fn butterfly_fused_4layer_row_impl<
     }
 }
 
+/// Fused-four row leaf backed by a pass-owned prepared twiddle table. `S16`
+/// and `NN` follow [`butterfly_fused_4layer_row_impl`]: zero selects the
+/// runtime geometry; nonzero values must equal it. `H = 0` disables hints.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]. The prepared table must
+/// outlive this call and must have been built by [`prepare_tw15`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared<
+    const S16: usize,
+    const NN: usize,
+    const H: u8,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    prepared: &PreparedTw15<'_>,
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract. The multiply form is the same one
+    // captured when `prepared.x4` was constructed.
+    unsafe {
+        if prepared.diet {
+            butterfly_fused_4layer_row_prepared_impl::<true, H, S16, NN>(
+                ptr,
+                sixteenth,
+                num_ntts,
+                active_lanes,
+                r,
+                prepared.scalar,
+                &prepared.x4,
+                pf_r,
+            )
+        } else {
+            butterfly_fused_4layer_row_prepared_impl::<false, H, S16, NN>(
+                ptr,
+                sixteenth,
+                num_ntts,
+                active_lanes,
+                r,
+                prepared.scalar,
+                &prepared.x4,
+                pf_r,
+            )
+        }
+    }
+}
+
+/// Prepared-table twin of [`butterfly_fused_4layer_row_impl`]. Its lane and
+/// scalar-tail bodies intentionally stay byte-for-byte algebraically equal;
+/// only the per-row `tw_x4` construction is absent.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_prepared_impl<
+    const DIET: bool,
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    tw: &[TwX4; 15],
+    pf_r: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let sixteenth = if S16 != 0 { S16 } else { sixteenth };
+    let num_ntts = if NN != 0 { NN } else { num_ntts };
+
+    // SAFETY: caller provides target features and pointer geometry; `tw` was
+    // built with the same `DIET` specialization selected by the wrapper.
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+        let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
+        let lanes = active_lanes & !3;
+        let mut lane = 0;
+        while lane < lanes {
+            macro_rules! pf_quad {
+                ($g:expr) => {{
+                    if H != 0 {
+                        let off = lane * core::mem::size_of::<F128>();
+                        for i in (4 * $g)..(4 * $g + 4) {
+                            let p = pf_row(i).add(off);
+                            if H == 1 {
+                                _mm_prefetch::<_MM_HINT_T0>(p);
+                            } else {
+                                _mm_prefetch::<_MM_HINT_T1>(p);
+                            }
+                        }
+                    }
+                }};
+            }
+            let mut values = [zero; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            macro_rules! butterfly {
+                ($u:expr, $v:expr, $twiddle:expr) => {{
+                    let new_u =
+                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    values[$u] = new_u;
+                }};
+            }
+
+            pf_quad!(0);
+            let outer = tw[0];
+            for i in 0..8 {
+                butterfly!(i, i + 8, outer);
+            }
+            pf_quad!(1);
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..4 {
+                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                }
+            }
+            pf_quad!(2);
+            for s in 0..4 {
+                let twiddle = tw[3 + s];
+                for i in 0..2 {
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                }
+            }
+            pf_quad!(3);
+            for s in 0..8 {
+                let twiddle = tw[7 + s];
+                butterfly!(2 * s, 2 * s + 1, twiddle);
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+            lane += 4;
+        }
+
+        while lane < active_lanes {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
 /// Process one fused-three-layer group of eight CONSECUTIVE rows.
 ///
 /// `ptr` addresses row 0; row `i` starts at `i · num_ntts`. Lanes
@@ -2132,5 +2339,74 @@ mod diet_tests {
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
         }
+    }
+
+    /// Pass-owned twiddle preparation changes only where the fifteen SIMD
+    /// pairs are materialized. Pin exact raw/prepared equality across every
+    /// ranked shape, hint level, SIMD tail, and multiply specialization.
+    #[test]
+    fn prepared_fused4_matches_raw_all_rank_shapes() {
+        fn check<const DIET: bool, const H: u8, const S16: usize, const NN: usize>(
+            sixteenth: usize,
+            num_ntts: usize,
+            active_lanes: usize,
+            seed: u64,
+        ) {
+            let mut next = rng(seed);
+            let twiddles: [F128; 15] = std::array::from_fn(|_| next());
+            let src: Vec<F128> = (0..16 * sixteenth * num_ntts).map(|_| next()).collect();
+            let r = if sixteenth == 1 { 0 } else { sixteenth / 3 };
+            let pf_r = (r + 1) % sixteenth;
+            let mut raw = src.clone();
+            let mut prepared = src;
+            // SAFETY: this test module is statically gated on the target
+            // features; buffers contain the full runtime geometry and pf_r
+            // stays inside the same block.
+            unsafe {
+                butterfly_fused_4layer_row_impl::<DIET, H, S16, NN>(
+                    raw.as_mut_ptr(),
+                    sixteenth,
+                    num_ntts,
+                    active_lanes,
+                    r,
+                    &twiddles,
+                    pf_r,
+                );
+                let table = prepare_tw15_impl::<DIET>(&twiddles);
+                butterfly_fused_4layer_row_prepared_impl::<DIET, H, S16, NN>(
+                    prepared.as_mut_ptr(),
+                    sixteenth,
+                    num_ntts,
+                    active_lanes,
+                    r,
+                    &twiddles,
+                    &table,
+                    pf_r,
+                );
+            }
+            assert_eq!(
+                prepared, raw,
+                "diet={DIET} H={H} S16={S16} NN={NN} runtime=({sixteenth},{num_ntts}) lanes={active_lanes}"
+            );
+        }
+
+        macro_rules! both_diets {
+            ($h:expr, $s16:expr, $nn:expr, $rs16:expr, $rnn:expr, $lanes:expr, $seed:expr) => {{
+                check::<false, $h, $s16, $nn>($rs16, $rnn, $lanes, $seed);
+                check::<true, $h, $s16, $nn>($rs16, $rnn, $lanes, $seed ^ 0xD1E7);
+            }};
+        }
+
+        both_diets!(0, 128, 64, 128, 64, 64, 0x1000);
+        both_diets!(1, 128, 64, 128, 64, 64, 0x1001);
+        both_diets!(2, 128, 64, 128, 64, 64, 0x1002);
+        both_diets!(0, 8, 64, 8, 64, 64, 0x2000);
+        both_diets!(1, 8, 64, 8, 64, 60, 0x2001);
+        both_diets!(2, 8, 64, 8, 64, 61, 0x2002);
+        both_diets!(0, 1, 64, 1, 64, 60, 0x3000);
+        both_diets!(0, 1, 64, 1, 64, 61, 0x3001);
+        both_diets!(0, 1, 64, 1, 64, 64, 0x3002);
+        both_diets!(0, 0, 0, 8, 5, 5, 0x4000);
+        both_diets!(0, 0, 0, 1, 7, 5, 0x4001);
     }
 }

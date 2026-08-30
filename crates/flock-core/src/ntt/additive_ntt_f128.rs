@@ -628,6 +628,51 @@ fn ntt_shaped_enabled() -> bool {
     *ON
 }
 
+/// Test-only latch for the ranked pass-constant twiddle preparation path.
+#[cfg(test)]
+static NTT_TWPREP_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static TWPREP_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Prepare each ranked L0 fused-four twiddle table once at its pass owner and
+/// borrow it from all row leaves. The exact-rank guard keeps recursive NTTs
+/// and non-ranked shapes on the incumbent path. `FLOCK_NO_NTT_TWPREP=1`
+/// restores raw per-row preparation in the same binary.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn ntt_twprep_enabled(log_d: usize, num_ntts: usize) -> bool {
+    #[cfg(test)]
+    if NTT_TWPREP_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TWPREP").is_none());
+    *ON && log_d == ZERO_TAIL_LOG_D && num_ntts == ZERO_TAIL_NUM_NTTS
+}
+
+/// Counted owner-level builder used by every prepared ranked table.
+///
+/// # Safety
+/// Requires the statically selected AVX-512 + VPCLMULQDQ features.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+unsafe fn prepare_ranked_tw15(twiddles: &[F128; 15]) -> kernels::PreparedTw15<'_> {
+    #[cfg(test)]
+    TWPREP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: forwarded caller feature contract.
+    unsafe { kernels::prepare_tw15(twiddles) }
+}
+
 /// `FLOCK_NO_NTT_FUSED3=1` disables just this half (diagnostics).
 #[inline]
 fn ntt_fused3_disabled() -> bool {
@@ -1468,11 +1513,29 @@ unsafe fn st_fmp_fold4(
     lanes4_tail: usize,
     stage_perm: bool,
     tw4: &[[F128; 15]],
+    prepared_tw4: Option<&[kernels::PreparedTw15<'_>]>,
 ) {
     let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
     unsafe {
+        if let Some(prepared_tw4) = prepared_tw4 {
+            for (block, prepared) in prepared_tw4.iter().enumerate() {
+                let region = bufp.add(block * 64 * row_len);
+                for j in 0..4 {
+                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                    kernels::butterfly_fused_4layer_row_prepared(
+                        region.add(j * g4_base * row_len),
+                        g4_stride,
+                        row_len,
+                        lanes4,
+                        0,
+                        prepared,
+                    );
+                }
+            }
+            return;
+        }
         for block in 0..8 {
             let region = bufp.add(block * 64 * row_len);
             let tw = &tw4[block];
@@ -2411,6 +2474,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        prepared_tw4: Option<&[kernels::PreparedTw15<'_>]>,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2428,16 +2492,30 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 let tw = &tw4[block];
-                for j in 0..4 {
-                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
-                        region.add(j * g4_base * row_len),
-                        g4_stride,
-                        row_len,
-                        lanes4,
-                        0,
-                        tw,
-                    );
+                if let Some(prepared) = prepared_tw4.map(|tables| &tables[block]) {
+                    for j in 0..4 {
+                        let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                        kernels::butterfly_fused_4layer_row_prepared(
+                            region.add(j * g4_base * row_len),
+                            g4_stride,
+                            row_len,
+                            lanes4,
+                            0,
+                            prepared,
+                        );
+                    }
+                } else {
+                    for j in 0..4 {
+                        let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                        kernels::butterfly_fused_4layer_row(
+                            region.add(j * g4_base * row_len),
+                            g4_stride,
+                            row_len,
+                            lanes4,
+                            0,
+                            tw,
+                        );
+                    }
                 }
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
                     region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
@@ -2634,6 +2712,23 @@ impl AdditiveNttF128 {
                 tw
             })
             .collect();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let prepared_tw4 = if ntt_twprep_enabled(log_d, num_ntts) {
+            // SAFETY: the static target-feature cfg is the prepared builder's
+            // complete feature contract. Every table borrows its stable raw
+            // owner in `tw4`, which outlives all task closures below.
+            let prepared = tw4
+                .iter()
+                .map(|tw| unsafe { prepare_ranked_tw15(tw) })
+                .collect::<Vec<_>>();
+            Some(prepared)
+        } else {
+            None
+        };
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
@@ -2856,6 +2951,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            prepared_tw4.as_deref(),
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2869,6 +2965,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            prepared_tw4.as_deref(),
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2880,6 +2977,41 @@ impl AdditiveNttF128 {
                 for block in 0..8 {
                     let region = bufp.add(block * 64 * row_len);
                     let tw = &tw4[block];
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if let Some(prepared) = prepared_tw4.as_deref().map(|tables| &tables[block]) {
+                        for j in 0..4 {
+                            let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                            kernels::butterfly_fused_4layer_row_prepared(
+                                region.add(j * g4_base * row_len),
+                                g4_stride,
+                                row_len,
+                                lanes4,
+                                0,
+                                prepared,
+                            );
+                        }
+                    } else {
+                        for j in 0..4 {
+                            let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
+                            kernels::butterfly_fused_4layer_row(
+                                region.add(j * g4_base * row_len),
+                                g4_stride,
+                                row_len,
+                                lanes4,
+                                0,
+                                tw,
+                            );
+                        }
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
                     for j in 0..4 {
                         let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
                         kernels::butterfly_fused_4layer_row(
@@ -2949,7 +3081,16 @@ impl AdditiveNttF128 {
             // SAFETY: `bufp` addresses the 512 seeded staging rows of task
             // `r`; this half writes nothing outside them.
             unsafe {
-                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4);
+                st_fmp_fold4(
+                    bufp,
+                    row_len,
+                    sub_stride,
+                    r,
+                    lanes4_tail,
+                    stage_perm,
+                    &tw4,
+                    prepared_tw4.as_deref(),
+                );
             }
         };
         #[cfg(all(
@@ -3413,6 +3554,12 @@ impl AdditiveNttF128 {
             && start_layer <= n_top
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let use_twprep = ntt_twprep_enabled(log_d, num_ntts);
 
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
@@ -3439,17 +3586,35 @@ impl AdditiveNttF128 {
                     for s in 0..8 {
                         tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
                     }
+                    let tail = if sixteenth.is_multiple_of(2) {
+                        odd_tail
+                    } else {
+                        0
+                    };
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if use_twprep && sixteenth > 1 {
+                        // SAFETY: static target features satisfy the builder;
+                        // `tw` outlives this complete row sweep.
+                        let prepared = unsafe { prepare_ranked_tw15(&tw) };
+                        butterfly_interleaved_fused_4layer_rows_prepared(
+                            sub_data, &prepared, sixteenth, num_ntts, tail, hint,
+                        );
+                    } else {
+                        butterfly_interleaved_fused_4layer_rows(
+                            sub_data, &tw, sixteenth, num_ntts, tail, hint,
+                        );
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
                     butterfly_interleaved_fused_4layer_rows(
-                        sub_data,
-                        &tw,
-                        sixteenth,
-                        num_ntts,
-                        if sixteenth.is_multiple_of(2) {
-                            odd_tail
-                        } else {
-                            0
-                        },
-                        hint,
+                        sub_data, &tw, sixteenth, num_ntts, tail, hint,
                     );
                 }
                 // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
@@ -3477,17 +3642,35 @@ impl AdditiveNttF128 {
                         tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
                     }
                     let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
+                    let tail4 = if sixteenth4.is_multiple_of(2) {
+                        odd_tail
+                    } else {
+                        0
+                    };
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if use_twprep && sixteenth4 > 1 {
+                        // SAFETY: static target features satisfy the builder;
+                        // `tw` owns this complete per-block row sweep.
+                        let prepared = unsafe { prepare_ranked_tw15(&tw) };
+                        butterfly_interleaved_fused_4layer_rows_prepared(
+                            blk, &prepared, sixteenth4, num_ntts, tail4, hint,
+                        );
+                    } else {
+                        butterfly_interleaved_fused_4layer_rows(
+                            blk, &tw, sixteenth4, num_ntts, tail4, hint,
+                        );
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
                     butterfly_interleaved_fused_4layer_rows(
-                        blk,
-                        &tw,
-                        sixteenth4,
-                        num_ntts,
-                        if sixteenth4.is_multiple_of(2) {
-                            odd_tail
-                        } else {
-                            0
-                        },
-                        hint,
+                        blk, &tw, sixteenth4, num_ntts, tail4, hint,
                     );
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
@@ -3556,17 +3739,36 @@ impl AdditiveNttF128 {
                                 tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
                             }
                             let block_start = block_in_sub * block_bytes;
+                            let block = &mut sub_data[block_start..block_start + block_bytes];
+                            let tail = if sixteenth.is_multiple_of(2) {
+                                odd_tail
+                            } else {
+                                0
+                            };
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if use_twprep && sixteenth > 1 {
+                                // SAFETY: static target features satisfy the
+                                // builder; `tw` owns this entire row sweep.
+                                let prepared = unsafe { prepare_ranked_tw15(&tw) };
+                                butterfly_interleaved_fused_4layer_rows_prepared(
+                                    block, &prepared, sixteenth, num_ntts, tail, hint,
+                                );
+                            } else {
+                                butterfly_interleaved_fused_4layer_rows(
+                                    block, &tw, sixteenth, num_ntts, tail, hint,
+                                );
+                            }
+                            #[cfg(not(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "vpclmulqdq"
+                            )))]
                             butterfly_interleaved_fused_4layer_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                &tw,
-                                sixteenth,
-                                num_ntts,
-                                if sixteenth.is_multiple_of(2) {
-                                    odd_tail
-                                } else {
-                                    0
-                                },
-                                hint,
+                                block, &tw, sixteenth, num_ntts, tail, hint,
                             );
                         }
                         layer += 4;
@@ -4459,6 +4661,60 @@ fn butterfly_interleaved_fused_4layer_rows(
     }
 }
 
+/// Prepared-table twin of [`butterfly_interleaved_fused_4layer_rows`]. The
+/// owner builds `prepared` once, then every row leaf borrows it; hint delivery
+/// and row order are unchanged.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn butterfly_interleaved_fused_4layer_rows_prepared(
+    block: &mut [F128],
+    prepared: &kernels::PreparedTw15<'_>,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    hint: u8,
+) {
+    debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
+    debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
+    let base = block.as_mut_ptr();
+    for r in 0..sixteenth {
+        let lanes = row_lanes(r, num_ntts, odd_tail);
+        // SAFETY: identical geometry/disjointness to the raw driver; the
+        // prepared table was built from this block owner's raw twiddles.
+        unsafe {
+            if hint == 0 || r + 1 >= sixteenth {
+                kernels::butterfly_fused_4layer_row_prepared(
+                    base, sixteenth, num_ntts, lanes, r, prepared,
+                )
+            } else if hint == 1 {
+                kernels::butterfly_fused_4layer_row_prepared_pf::<1>(
+                    base,
+                    sixteenth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    prepared,
+                    r + 1,
+                )
+            } else {
+                kernels::butterfly_fused_4layer_row_prepared_pf::<2>(
+                    base,
+                    sixteenth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    prepared,
+                    r + 1,
+                )
+            }
+        };
+    }
+}
+
 #[inline]
 fn log2_pow2(n: usize) -> usize {
     assert!(
@@ -4525,6 +4781,31 @@ fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ranked_twprep_selector_and_builder_are_reachable() {
+        use std::sync::atomic::Ordering;
+
+        NTT_TWPREP_TEST_OFF.store(false, Ordering::Relaxed);
+        assert!(ntt_twprep_enabled(ZERO_TAIL_LOG_D, ZERO_TAIL_NUM_NTTS));
+        assert!(!ntt_twprep_enabled(ZERO_TAIL_LOG_D - 1, ZERO_TAIL_NUM_NTTS));
+        assert!(!ntt_twprep_enabled(ZERO_TAIL_LOG_D, 32));
+
+        let before = TWPREP_HITS.load(Ordering::Relaxed);
+        let twiddles = [F128::ONE; 15];
+        // SAFETY: this test is compiled only with the builder's features.
+        let _prepared = unsafe { prepare_ranked_tw15(&twiddles) };
+        assert_eq!(TWPREP_HITS.load(Ordering::Relaxed), before + 1);
+
+        NTT_TWPREP_TEST_OFF.store(true, Ordering::Relaxed);
+        assert!(!ntt_twprep_enabled(ZERO_TAIL_LOG_D, ZERO_TAIL_NUM_NTTS));
+        NTT_TWPREP_TEST_OFF.store(false, Ordering::Relaxed);
+    }
 
     /// The shaped row kernels are the generic kernels with the shape
     /// constants substituted for equal runtime values — bit-identical by
