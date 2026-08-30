@@ -1213,7 +1213,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     ))]
     #[allow(unused_variables)]
     let r2_mats_arg = r2_mats.as_ref();
-
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1429,7 +1428,6 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     ))]
     #[allow(unused_variables)]
     let r2_mats_arg = r2_mats.as_ref();
-
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -4269,6 +4267,74 @@ mod tests {
                 "scalar no-store sums lo_size={lo_size} mask={mask}"
             );
         }
+    }
+
+    /// The canonical B prefold omits exactly one independent broadcast group
+    /// on a guarded hit and is otherwise the incumbent full helper. Compare
+    /// every cache entry for both ranked groups and force each guarded qword
+    /// to miss independently so fallback coverage cannot hide a stale slot.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_b_canonical_prefold_matches_dense() {
+        let mut rng = Rng::new(0xBC_AA_0272);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mats = kernels::x86_64::build_row_fold_mats(&table.data);
+        let mut seed_rows = vec![0u8; 64 * 8];
+        for row in seed_rows.chunks_exact_mut(8) {
+            row.copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+
+        let check = |rows: &[u8], phase: usize, expect_hit: bool| {
+            let mut dense = [F128::ZERO; 64];
+            let mut candidate = [F128::ZERO; 64];
+            // SAFETY: both helpers receive 64 readable eight-byte rows, the
+            // protocol-shaped matrices, and 64 writable F128 outputs.
+            unsafe {
+                kernels::x86_64::gfni_fold64_rows_masked_tr_bcast(
+                    rows.as_ptr(),
+                    &mats,
+                    dense.as_mut_ptr(),
+                    0,
+                );
+                let hit = kernels::x86_64::gfni_fold64_rows_masked_tr_bcast_b_canonical(
+                    table.data.as_ptr(),
+                    rows.as_ptr(),
+                    &mats,
+                    candidate.as_mut_ptr(),
+                    0,
+                    phase,
+                );
+                assert_eq!(hit, expect_hit, "phase={phase}");
+            }
+            assert_eq!(candidate, dense, "cache phase={phase}");
+        };
+
+        let mut head = seed_rows.clone();
+        head[..16 * 8].fill(0xff);
+        check(&head, 0, true);
+        for qword in 0..16 {
+            let mut miss = head.clone();
+            miss[8 * qword] ^= 1;
+            check(&miss, 0, false);
+        }
+
+        let mut tail = seed_rows;
+        tail[48 * 8..].fill(0);
+        tail[48 * 8..49 * 8].copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+        check(&tail, 192, true);
+        for qword in 0..16 {
+            let mut miss = tail.clone();
+            miss[(48 + qword) * 8] ^= 1;
+            check(&miss, 192, false);
+        }
+
+        check(&tail, 64, false);
     }
 
     /// AVX-512 composed-fold kernel vs the portable reference on one chunk.

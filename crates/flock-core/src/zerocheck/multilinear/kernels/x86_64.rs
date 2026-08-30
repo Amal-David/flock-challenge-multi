@@ -278,6 +278,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let b_canonical_prefold = tr_bcast && zc_b_canonical_prefold_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -299,7 +301,27 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    let tile_row_phase = g0 & 255;
+                    if b_canonical_prefold
+                        && ((tile_row_phase == 0 && b_ones_on)
+                            || (tile_row_phase == 192 && b_sparse_on))
+                    {
+                        gfni_fold64_rows_masked_tr_bcast_b_canonical(
+                            table_data,
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                            tile_row_phase,
+                        );
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    }
                 } else if tr_emit {
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -1337,6 +1359,13 @@ pub(crate) fn zc_b_ones_enabled() -> bool {
 fn zc_b_sparse_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_SPARSE").is_none());
+    *ENABLED
+}
+
+#[inline]
+fn zc_b_canonical_prefold_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none());
     *ENABLED
 }
 
@@ -2552,6 +2581,75 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     }
 }
 
+/// Ranked round-two B prefold with one canonical 16-row subgroup omitted.
+/// The head tile's rows 0..16 are all `u64::MAX`; the tail tile's row 240
+/// is `0x0001_ffff_ffff_ffff` and rows 241..256 are zero. After checking the
+/// exact raw qwords, the corresponding independent broadcast group is
+/// replaced by its known folded residue-major outputs. Any mismatch executes
+/// the incumbent full broadcast body on the already-loaded registers.
+///
+/// Returns whether the guarded subgroup was synthesized.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr_bcast`]. `tile_row_phase` must be the
+/// tile's row offset inside its 256-row B block.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline(never)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_b_canonical(
+    table_data: *const F128,
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+    tile_row_phase: usize,
+) -> bool {
+    use core::arch::x86_64::*;
+    // SAFETY: as for the generic row wrapper. The exact-value guards cover
+    // every qword of the one subgroup whose affine work is omitted.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        if dead_lines == 0 {
+            for (i, slot) in z.iter_mut().enumerate() {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
+            }
+        }
+
+        if dead_lines == 0 && tile_row_phase == 0 {
+            let ones = _mm512_set1_epi64(-1);
+            if _mm512_cmpeq_epi64_mask(z[0], ones) == 0xff
+                && _mm512_cmpeq_epi64_mask(z[1], ones) == 0xff
+            {
+                gfni_fold64_regs_sigma_bcast_body::<true, false>(z, mats, out, F128::ZERO);
+                return true;
+            }
+        } else if dead_lines == 0 && tile_row_phase == 192 {
+            let sparse = _mm512_setr_epi64(0x0001_ffff_ffff_ffff, 0, 0, 0, 0, 0, 0, 0);
+            let zero = _mm512_setzero_si512();
+            if _mm512_cmpeq_epi64_mask(z[6], sparse) == 0xff
+                && _mm512_cmpeq_epi64_mask(z[7], zero) == 0xff
+            {
+                let bytes = 0x0001_ffff_ffff_ffffu64.to_le_bytes();
+                let mut b_sparse_fold = F128::ZERO;
+                for (j, byte) in bytes.into_iter().enumerate() {
+                    b_sparse_fold += *table_data.add(j * 256 + byte as usize);
+                }
+                gfni_fold64_regs_sigma_bcast_body::<false, true>(z, mats, out, b_sparse_fold);
+                return true;
+            }
+        }
+
+        gfni_fold64_regs_sigma_bcast_body::<false, false>(z, mats, out, F128::ZERO);
+        false
+    }
+}
+
 /// 64-byte-aligned backing for the per-worker prefold caches `fa`/`fb`:
 /// every refill store and every consume load of these buffers is ZMM-wide,
 /// and `[F128; 64]`'s natural 16-byte alignment lets those 64-byte accesses
@@ -3290,6 +3388,28 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
     mats: &[u64; 128],
     out: *mut F128,
 ) {
+    // SAFETY: forwarded contract. Both const omissions are false, so this is
+    // the incumbent four-group body with no new runtime branch.
+    unsafe {
+        gfni_fold64_regs_sigma_bcast_body::<false, false>(z, mats, out, F128::ZERO);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[inline]
+unsafe fn gfni_fold64_regs_sigma_bcast_body<const OMIT_G0: bool, const OMIT_G3: bool>(
+    z: [core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    out: *mut F128,
+    b_sparse_fold: F128,
+) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 writable F128s at `out`; the
     // scratch is a local 512-byte array written and read in full; every
@@ -3324,6 +3444,9 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
         let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
         let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
         for g in 0..4 {
+            if (OMIT_G0 && g == 0) || (OMIT_G3 && g == 3) {
+                continue;
+            }
             let mut a01 = [_mm512_setzero_si512(); 2];
             let mut a23 = [_mm512_setzero_si512(); 2];
             for half in 0..2 {
@@ -3357,6 +3480,33 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
             _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
             _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
             _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+        }
+
+        let dst = out as *mut __m512i;
+        if OMIT_G0 {
+            // Folding an all-one 64-bit row is the sum of all 64 Lagrange
+            // weights, hence exactly one. Each residue-major destination for
+            // g=0 contains four such rows.
+            let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
+            _mm512_storeu_si512(dst, one);
+            _mm512_storeu_si512(dst.add(4), one);
+            _mm512_storeu_si512(dst.add(8), one);
+            _mm512_storeu_si512(dst.add(12), one);
+        }
+        if OMIT_G3 {
+            // g=3 covers tile rows 48..64. Only its first row is the sparse
+            // canonical tail; in the residue-major layout that is F128 lane
+            // zero of destination (k=0,g=3). The other fifteen rows are zero.
+            let sparse = _mm512_broadcast_i32x4(_mm_set_epi64x(
+                b_sparse_fold.hi as i64,
+                b_sparse_fold.lo as i64,
+            ));
+            let sparse_lane0 = _mm512_maskz_mov_epi64(0x03, sparse);
+            let zero = _mm512_setzero_si512();
+            _mm512_storeu_si512(dst.add(3), sparse_lane0);
+            _mm512_storeu_si512(dst.add(7), zero);
+            _mm512_storeu_si512(dst.add(11), zero);
+            _mm512_storeu_si512(dst.add(15), zero);
         }
     }
 }
