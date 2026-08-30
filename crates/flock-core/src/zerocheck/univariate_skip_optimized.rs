@@ -432,6 +432,10 @@ pub struct Round1AbInner {
     /// [`planned_round1_gpu_prefix_bytes`]). Always a multiple of the
     /// per-x_hi window byte count; 0 means fully valid.
     invalid_prefix_bytes: usize,
+    /// Ranked BLAKE3 only: the producer omitted the complete K-rows on which
+    /// B is identically one. Round one adds their identity-C contribution
+    /// before the AB message is emitted.
+    ranked_one_rows_elided: bool,
 }
 
 impl Round1AbInner {
@@ -451,7 +455,20 @@ impl Round1AbInner {
         Self {
             storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
             invalid_prefix_bytes: 0,
+            ranked_one_rows_elided: false,
         }
+    }
+
+    /// Brand the exact ranked residual representation.
+    pub fn set_ranked_one_rows_elided(&mut self) {
+        assert_eq!(self.invalid_prefix_bytes, 0);
+        self.ranked_one_rows_elided = true;
+    }
+
+    /// Whether `storage` is the ranked residual-AB representation.
+    #[inline]
+    pub fn ranked_one_rows_elided(&self) -> bool {
+        self.ranked_one_rows_elided
     }
 
     /// Declare the leading `bytes` of the storage unwritten (the producer
@@ -521,6 +538,13 @@ impl Round1AbInner {
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
     }
+}
+
+/// Exact same-binary rollback for ranked complete-one-row reuse.
+pub fn ranked_one_rows_reuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_ONE_REUSE").is_none());
+    *ON
 }
 
 impl Drop for Round1AbInner {
@@ -635,6 +659,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
     Round1AbInner {
         storage,
         invalid_prefix_bytes: 0,
+        ranked_one_rows_elided: false,
     }
 }
 
@@ -1172,6 +1197,43 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
         target_feature = "avx512bw"
     )))]
     unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
+/// Residual twin for the two ranked windows containing complete B=1 K-rows.
+/// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    keep: u8,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!(keep == 0xfc || keep == 0x0f);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+            keep,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("residual nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
@@ -2929,6 +2991,7 @@ fn process_one_x_hi_ab_only(
     eq_fold: Option<(&[F128], &[u64], usize)>,
     plane_first_write: bool,
     plane_cache: bool,
+    ranked_one_rows_elided: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
@@ -2985,14 +3048,24 @@ fn process_one_x_hi_ab_only(
         // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
         // padding skip leaves live.
         #[cfg(target_arch = "x86_64")]
-        let (n_next, next_base) = if pf_windows != 0 {
+        let (n_next, next_base, next_first_b_med) = if pf_windows != 0 {
             let x_next = x_outer_lo + pf_windows;
             (
                 b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
                 ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
+                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                },
             )
         } else {
-            (0, 0)
+            (0, 0, 0)
+        };
+        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+            2
+        } else {
+            0
         };
         // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
         // possible, and the address is formed by `wrapping_add` on the base
@@ -3008,16 +3081,16 @@ fn process_one_x_hi_ab_only(
         };
         #[cfg(target_arch = "x86_64")]
         if !pf_spread {
-            for b_med in 0..n_next {
+            for b_med in next_first_b_med..n_next {
                 pf_one(b_med);
             }
         }
-        for b_med in 0..n_b_med {
+        for b_med in first_b_med..n_b_med {
             // Spread delivery: one hint per copy step, so each hint is
             // issued next to one demand line rather than the whole block
             // queueing ahead of the copy. Same lines, same look-ahead.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med < n_next {
+            if pf_spread && b_med >= next_first_b_med && b_med < n_next {
                 pf_one(b_med);
             }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -3025,7 +3098,7 @@ fn process_one_x_hi_ab_only(
         }
         #[cfg(target_arch = "x86_64")]
         if pf_spread {
-            for b_med in n_b_med..n_next {
+            for b_med in n_b_med.max(next_first_b_med)..n_next {
                 pf_one(b_med);
             }
         }
@@ -3046,16 +3119,43 @@ fn process_one_x_hi_ab_only(
                 .try_into()
                 .expect("one plane bank per low index");
             if plane_first_write && w_idx == 0 {
-                kernels::write_convert_ab_nomul_gfni(&state.chunk_ab_bytes, n_b_med, mats_w, bank);
+                if first_b_med == 2 {
+                    kernels::write_convert_ab_nomul_gfni_range2(
+                        &state.chunk_ab_bytes,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                } else {
+                    kernels::write_convert_ab_nomul_gfni(
+                        &state.chunk_ab_bytes,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                }
             } else {
-                kernels::accumulate_convert_ab_nomul_gfni(
-                    &state.chunk_ab_bytes,
-                    n_b_med,
-                    mats_w,
-                    bank,
-                );
+                if first_b_med == 2 {
+                    kernels::accumulate_convert_ab_nomul_gfni_range2(
+                        &state.chunk_ab_bytes,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                } else {
+                    kernels::accumulate_convert_ab_nomul_gfni(
+                        &state.chunk_ab_bytes,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                    );
+                }
             }
         } else {
+            if first_b_med == 2 {
+                state.chunk_ab_bytes[0].fill(0);
+                state.chunk_ab_bytes[1].fill(0);
+            }
             kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,
                 n_b_med,
@@ -3072,6 +3172,10 @@ fn process_one_x_hi_ab_only(
         )))]
         {
             debug_assert!(eq_fold.is_none());
+            if first_b_med == 2 {
+                state.chunk_ab_bytes[0].fill(0);
+                state.chunk_ab_bytes[1].fill(0);
+            }
             kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,
                 n_b_med,
@@ -3173,6 +3277,13 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let eq_hi = build_eq(&r_outer[n_lo..]);
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ranked_one_rows_elided = ab_inner.ranked_one_rows_elided();
+    if ranked_one_rows_elided {
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15409);
+        assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    }
     let ab_inner_bytes = ab_inner.as_bytes();
     #[cfg(all(
         target_arch = "x86_64",
@@ -3285,6 +3396,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 eq_fold_arg,
                 plane_first_write,
                 plane_cache,
+                ranked_one_rows_elided,
                 &mut state,
             );
             state
@@ -3348,6 +3460,52 @@ pub(crate) fn identity_c_inner_fold(
 /// has reduced identity C to its 16,384-element inner table; unlike the old
 /// raw-row DirectFold8 experiment, this does not widen round one's GFNI plane
 /// state or revisit the 512 MiB witness.
+fn round1_lifted_from_fold8(
+    fold8: &[F128],
+    inner_tail: &[F128],
+    prefix: F128,
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    assert_eq!(inner_tail.len(), 7);
+    assert_eq!(fold8.len(), 64 * n_packed);
+
+    let retained_top_eq = build_eq(&inner_tail[4..6]);
+    let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+    for high in 0..4 {
+        for bank in 0..16 {
+            let src = (bank + 16 * high) * n_packed;
+            let dst = bank * n_packed;
+            crate::field::f128_slice::add_scaled(
+                &mut fold4[dst..dst + n_packed],
+                &fold8[src..src + n_packed],
+                retained_top_eq[high],
+            );
+        }
+    }
+    let retained_hi_eq = build_eq(&inner_tail[2..4]);
+    let mut quad = vec![F128::ZERO; 4 * n_packed];
+    for q in 0..4 {
+        for e in 0..4 {
+            let src = (e + 4 * q) * n_packed;
+            let dst = e * n_packed;
+            crate::field::f128_slice::add_scaled(
+                &mut quad[dst..dst + n_packed],
+                &fold4[src..src + n_packed],
+                retained_hi_eq[q],
+            );
+        }
+    }
+    let s_hat = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+    let c_s_inv = c_s_inv_for_identity_c();
+    let mut res_s = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        let naive = (F128::ONE + prefix) * s_hat[lane] + prefix * s_hat[ELL + lane];
+        res_s[lane] = c_s_inv * naive;
+    }
+    ntt_extend_f128_vec_ghash(&res_s, inv_table)
+}
+
 pub fn round1_c_fold4_from_block_major_z(
     z_packed: &[F128],
     m: usize,
@@ -3356,7 +3514,15 @@ pub fn round1_c_fold4_from_block_major_z(
     useful_bits: usize,
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    ranked_one_rows: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Option<Vec<F128>>,
+) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -3365,27 +3531,57 @@ pub fn round1_c_fold4_from_block_major_z(
     assert_eq!(r.len(), m);
     assert_eq!(z_packed.len(), (1usize << m) / 128);
     assert_eq!(inv_table.k, k_skip);
+    if ranked_one_rows {
+        assert_eq!(m, 32);
+        assert_eq!(k_log, 14);
+        assert_eq!(useful_bits, 15409);
+    }
 
     let inner_tail = &r[k_skip + 1..k_log];
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let par = crate::serial_par_enabled();
-    let (fold4, fold8) = if crate::pcs::ranked_direct_fold8_enabled() {
+    let (fold4, fold8, one_fold8) = if crate::pcs::ranked_direct_fold8_enabled() {
         // Ranked shape has one coordinate above the six Fold8 bank
         // selectors. On the parallel/GFNI path, bind it while reducing the
         // worker byte planes so the full length-2^k_log C inner table is
         // never written and immediately read back by a second Rayon pass.
-        let fold8 = if par && inner_tail.len() == 7 {
-            crate::lincheck::fold_block_major_one_shot_bind_top(
-                z_packed,
-                m,
-                k_log,
-                useful_bits,
-                &r[k_log..],
-                inner_tail[6],
-            )
+        let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
+            if ranked_one_rows {
+                let (full, one) =
+                    crate::lincheck::fold_block_major_one_shot_bind_top_ranked_one_rows(
+                        z_packed,
+                        m,
+                        k_log,
+                        useful_bits,
+                        &r[k_log..],
+                        inner_tail[6],
+                    );
+                (full, Some(one))
+            } else {
+                (
+                    crate::lincheck::fold_block_major_one_shot_bind_top(
+                        z_packed,
+                        m,
+                        k_log,
+                        useful_bits,
+                        &r[k_log..],
+                        inner_tail[6],
+                    ),
+                    None,
+                )
+            }
         } else {
             let c_inner = identity_c_inner_fold(z_packed, m, k_log, useful_bits, &r[k_log..], par);
-            crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail)
+            let one = ranked_one_rows.then(|| {
+                let mut one_inner = vec![F128::ZERO; 1 << k_log];
+                one_inner[..1152].copy_from_slice(&c_inner[..1152]);
+                one_inner[15104..15360].copy_from_slice(&c_inner[15104..15360]);
+                crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&one_inner, inner_tail)
+            });
+            (
+                crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail),
+                one,
+            )
         };
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
         let retained_top_eq = build_eq(&inner_tail[4..6]);
@@ -3408,14 +3604,19 @@ pub fn round1_c_fold4_from_block_major_z(
                 }
             }
         }
-        (fold4, fold8)
+        (fold4, fold8, one_fold8)
     } else {
+        assert!(
+            !ranked_one_rows,
+            "one-row reuse requires ranked DirectFold8"
+        );
         // Kill switch restores the incumbent sixteen-bank producer; do not
         // pay for widening and collapsing a statistic no consumer will use.
         let c_inner = identity_c_inner_fold(z_packed, m, k_log, useful_bits, &r[k_log..], par);
         (
             crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail),
             Vec::new(),
+            None,
         )
     };
 
@@ -3453,7 +3654,9 @@ pub fn round1_c_fold4_from_block_major_z(
         res_c_s[lane] = c_s_inv * naive;
     }
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (res_c_lifted, s_hat_v_c, quad, fold4, fold8)
+    let one_ab_lifted = one_fold8
+        .map(|one_fold8| round1_lifted_from_fold8(&one_fold8, inner_tail, prefix, inv_table));
+    (res_c_lifted, s_hat_v_c, quad, fold4, fold8, one_ab_lifted)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -4690,7 +4893,7 @@ mod tests {
                 &table,
                 &padding,
             );
-            let (c_new, s_hat_new, quad_new, fold4_new, fold8_new) =
+            let (c_new, s_hat_new, quad_new, fold4_new, fold8_new, one_ab) =
                 round1_c_fold4_from_block_major_z(
                     &c_words,
                     m,
@@ -4699,7 +4902,9 @@ mod tests {
                     useful_bits,
                     &r,
                     &table,
+                    false,
                 );
+            assert!(one_ab.is_none());
 
             assert_eq!(
                 ab_new, ab_ref,

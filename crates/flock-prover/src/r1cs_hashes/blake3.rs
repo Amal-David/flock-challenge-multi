@@ -2168,6 +2168,14 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let one_rows_elided = ab_stream
+        && skip_blocks == 0
+        && z.len() / F128_PER_BLOCK == 1 << 18
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+        && flock_core::pcs::ranked_direct_fold8_enabled();
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2283,6 +2291,7 @@ fn generate_round1_inner_octa(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
+                                one_rows_elided,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
