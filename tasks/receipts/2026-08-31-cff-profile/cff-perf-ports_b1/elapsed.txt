@@ -1,0 +1,5 @@
+label=ports_b1
+events=uops_dispatched.port_2_3_10,uops_dispatched.port_4_9,uops_dispatched.port_6,uops_dispatched.port_7_8
+seed=1311768467463790320
+elapsed_ns=234684536
+worker_status=0

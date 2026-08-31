@@ -1,0 +1,1131 @@
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.037 ms  @    0.037 ms  witness: pool entered
+[gap] +   43.627 ms  @   43.663 ms  witness: work done (incl. prefault)
+[gap] +    0.021 ms  @   43.684 ms  witness: pool exited
+[gap] +    0.007 ms  @   43.691 ms  lc_circuit built
+[gap] +    0.006 ms  @   43.697 ms  inner: enter
+[gap] +    2.209 ms  @   45.906 ms  core: padding built
+[gap] +    0.009 ms  @   45.915 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   45.922 ms  commit: pool entered
+[gap] +   35.069 ms  @   80.991 ms  ntt: seed+top fused pass done
+[gap] +   45.932 ms  @  126.922 ms  ntt: deep pass done
+[commit-timing] ntt: 67.00 ms
+[commit-timing] merkle: 0.03 ms (subtree levels folded in-callback: 11)
+[gap] +    0.075 ms  @  126.997 ms  commit: work done
+[gap] +    0.011 ms  @  127.008 ms  commit: pool exited
+[gap] +  271.692 ms  @  398.700 ms  bind_statement done
+[gap] +    0.203 ms  @  398.903 ms  zerocheck: pool entered
+[gap] +    0.013 ms  @  398.916 ms  zerocheck: views built
+[zc-timing] round1 AB 15.45 ms || identity-C fold 16.27 ms -> 16.33 ms
+[gap] +   16.408 ms  @  415.324 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.39 ms
+[gap] +    0.016 ms  @  415.340 ms  zc: round1 observed + z sampled
+[gap] +    0.139 ms  @  415.479 ms  zc: fold_table built
+[gap] +   21.129 ms  @  436.608 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 21.22 ms
+[gap] +    0.030 ms  @  436.638 ms  zc: tail ping-pong buffers taken
+[gap] +   15.174 ms  @  451.812 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.890 ms  @  460.702 ms  zc: tail rounds done
+[gap] +    0.022 ms  @  460.724 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.18 n24:6.09 n22:2.01 n20:0.48 n18:0.12 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.01 n11:0.01 n10:0.01 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.11 ms
+[gap] +    0.020 ms  @  460.744 ms  zerocheck: work done
+[gap] +    0.039 ms  @  460.783 ms  zerocheck: pool exited
+[gap] +    0.017 ms  @  460.800 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  460.809 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.39 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.31 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +   10.137 ms  @  470.947 ms  lincheck: done
+[gap] +    0.018 ms  @  470.965 ms  s_hat_v_ab built (core exit)
+[gap] +    0.009 ms  @  470.974 ms  core: returned
+[gap] +    0.008 ms  @  470.981 ms  open: begin
+[gap] +    0.075 ms  @  471.057 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.39 ms
+[gap] +    0.466 ms  @  471.523 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.45 ms
+[gap] +    0.012 ms  @  471.535 ms  open: b_combined taken
+[gap] +    0.007 ms  @  471.542 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.016 ms  @  471.558 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.98 ms upper 0.00 ms minflt +561
+      [sparse-ntt] log_d=20 k=12 wins=142 win-phase 0.28 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.73 ms  dense(8 layers) 0.61 ms  minflt +537
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.66 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=73 win-phase 0.06 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.18 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.30 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.13 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 20.20 ms
+  initial sumcheck (initial_k folds + SC build): 14.58 ms
+    round 0: grind 1.22 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.20 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.10 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.06 ms, fold 0.01 ms, arena=false
+    round 4: grind 0.02 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 12.89 ms, arena=false
+  recursive commits (NTT + merkle):              1.55 ms
+  opens (rows + multi-proof):                    0.21 ms
+  induce_sumcheck_poly:                          2.44 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.72 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.33 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.28 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.05 ms
+  sumcheck recursive folds:                      0.72 ms
+  introduce_new + glue:                          0.23 ms
+  OOD samples (5): MLE evals + glue:            0.25 ms
+[gap] +   20.282 ms  @  491.840 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  20.28 ms
+  [open_batch] TOTAL:  20.79 ms
+[gap] +    0.032 ms  @  491.871 ms  open: returned
+[gap] +    0.017 ms  @  491.888 ms  proof assembled
+[gap] +    0.010 ms  @  491.899 ms  s_hat_v dropped
+[gap] +    0.009 ms  @  491.908 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   35.677 ms  @   35.679 ms  witness: work done (incl. prefault)
+[gap] +    0.021 ms  @   35.700 ms  witness: pool exited
+[gap] +    0.014 ms  @   35.714 ms  lc_circuit built
+[gap] +    0.008 ms  @   35.722 ms  inner: enter
+[gap] +    0.013 ms  @   35.735 ms  core: padding built
+[gap] +    0.008 ms  @   35.743 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   35.751 ms  commit: pool entered
+[gap] +   20.116 ms  @   55.867 ms  ntt: seed+top fused pass done
+[gap] +   38.969 ms  @   94.836 ms  ntt: deep pass done
+[commit-timing] ntt: 59.10 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.039 ms  @   94.875 ms  commit: work done
+[gap] +    0.007 ms  @   94.882 ms  commit: pool exited
+[gap] +    0.009 ms  @   94.891 ms  bind_statement done
+[gap] +    0.017 ms  @   94.908 ms  zerocheck: pool entered
+[gap] +    0.008 ms  @   94.916 ms  zerocheck: views built
+[zc-timing] round1 AB 15.90 ms || identity-C fold 16.12 ms -> 16.17 ms
+[gap] +   16.216 ms  @  111.131 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.21 ms
+[gap] +    0.023 ms  @  111.154 ms  zc: round1 observed + z sampled
+[gap] +    0.023 ms  @  111.177 ms  zc: fold_table built
+[gap] +   19.723 ms  @  130.900 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.75 ms
+[gap] +    0.028 ms  @  130.928 ms  zc: tail ping-pong buffers taken
+[gap] +   15.353 ms  @  146.280 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.594 ms  @  154.875 ms  zc: tail rounds done
+[gap] +    0.024 ms  @  154.898 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.36 n24:6.22 n22:1.59 n20:0.46 n18:0.12 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.01 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 23.99 ms
+[gap] +    0.018 ms  @  154.917 ms  zerocheck: work done
+[gap] +    0.017 ms  @  154.934 ms  zerocheck: pool exited
+[gap] +    0.007 ms  @  154.941 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  154.949 ms  x_ab built
+[lc] build_quirky_eq               0.12 ms
+[lc] fold_alpha_batched            0.50 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.37 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +   10.170 ms  @  165.118 ms  lincheck: done
+[gap] +    0.009 ms  @  165.128 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  165.138 ms  core: returned
+[gap] +    0.010 ms  @  165.148 ms  open: begin
+[gap] +    0.045 ms  @  165.193 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.33 ms
+[gap] +    0.410 ms  @  165.603 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.41 ms
+[gap] +    0.014 ms  @  165.617 ms  open: b_combined taken
+[gap] +    0.009 ms  @  165.626 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.018 ms  @  165.644 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.06 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.96 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.89 ms  dense(8 layers) 0.69 ms  minflt +486
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.57 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.08 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.16 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.21 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.54 ms
+  initial sumcheck (initial_k folds + SC build): 9.63 ms
+    round 0: grind 0.30 ms, fold 0.01 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.11 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.18 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.04 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.78 ms, arena=false
+  recursive commits (NTT + merkle):              1.06 ms
+  opens (rows + multi-proof):                    0.22 ms
+  induce_sumcheck_poly:                          3.31 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 2.66 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.32 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.23 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.69 ms
+  introduce_new + glue:                          0.19 ms
+  OOD samples (5): MLE evals + glue:            0.23 ms
+[gap] +   15.641 ms  @  181.284 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.64 ms
+  [open_batch] TOTAL:  16.10 ms
+[gap] +    0.027 ms  @  181.311 ms  open: returned
+[gap] +    0.008 ms  @  181.319 ms  proof assembled
+[gap] +    0.009 ms  @  181.328 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  181.335 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.208 ms  @   36.209 ms  witness: work done (incl. prefault)
+[gap] +    0.023 ms  @   36.233 ms  witness: pool exited
+[gap] +    0.008 ms  @   36.241 ms  lc_circuit built
+[gap] +    0.008 ms  @   36.248 ms  inner: enter
+[gap] +    0.014 ms  @   36.262 ms  core: padding built
+[gap] +    0.009 ms  @   36.271 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   36.280 ms  commit: pool entered
+[gap] +   20.326 ms  @   56.605 ms  ntt: seed+top fused pass done
+[gap] +   38.903 ms  @   95.508 ms  ntt: deep pass done
+[commit-timing] ntt: 59.26 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.054 ms  @   95.562 ms  commit: work done
+[gap] +    0.010 ms  @   95.572 ms  commit: pool exited
+[gap] +    0.011 ms  @   95.583 ms  bind_statement done
+[gap] +    0.162 ms  @   95.745 ms  zerocheck: pool entered
+[gap] +    0.017 ms  @   95.762 ms  zerocheck: views built
+[zc-timing] round1 AB 15.10 ms || identity-C fold 15.96 ms -> 16.03 ms
+[gap] +   16.084 ms  @  111.847 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.07 ms
+[gap] +    0.017 ms  @  111.864 ms  zc: round1 observed + z sampled
+[gap] +    0.018 ms  @  111.882 ms  zc: fold_table built
+[gap] +   19.688 ms  @  131.570 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.71 ms
+[gap] +    0.025 ms  @  131.595 ms  zc: tail ping-pong buffers taken
+[gap] +   15.371 ms  @  146.966 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.450 ms  @  155.416 ms  zc: tail rounds done
+[gap] +    0.019 ms  @  155.434 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.38 n24:6.12 n22:1.54 n20:0.46 n18:0.13 n16:0.04 n15:0.03 n14:0.02 n13:0.01 n12:0.01 n11:0.02 n10:0.01 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 23.86 ms
+[gap] +    0.022 ms  @  155.456 ms  zerocheck: work done
+[gap] +    0.022 ms  @  155.479 ms  zerocheck: pool exited
+[gap] +    0.017 ms  @  155.495 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  155.503 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.19 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z               10.12 ms
+[lc] sumcheck (all rounds)         0.10 ms
+[gap] +   10.569 ms  @  166.072 ms  lincheck: done
+[gap] +    0.012 ms  @  166.085 ms  s_hat_v_ab built (core exit)
+[gap] +    0.011 ms  @  166.095 ms  core: returned
+[gap] +    0.010 ms  @  166.105 ms  open: begin
+[gap] +    0.045 ms  @  166.150 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.36 ms
+[gap] +    0.410 ms  @  166.560 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.41 ms
+[gap] +    0.016 ms  @  166.576 ms  open: b_combined taken
+[gap] +    0.009 ms  @  166.585 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.017 ms  @  166.602 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.51 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.25 ms  alloc(zeroed 2^20) 0.01 ms  densify 1.19 ms  dense(8 layers) 0.63 ms  minflt +435
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.59 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.07 ms  dense(7 layers) 0.19 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.23 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.27 ms
+  initial sumcheck (initial_k folds + SC build): 9.73 ms
+    round 0: grind 0.35 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.11 ms, fold 0.01 ms, arena=false
+    round 3: grind 0.19 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.04 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.82 ms, arena=false
+  recursive commits (NTT + merkle):              1.10 ms
+  opens (rows + multi-proof):                    0.28 ms
+  induce_sumcheck_poly:                          2.86 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 2.19 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.37 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.18 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.06 ms
+  sumcheck recursive folds:                      0.69 ms
+  introduce_new + glue:                          0.21 ms
+  OOD samples (5): MLE evals + glue:            0.19 ms
+[gap] +   15.367 ms  @  181.969 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.37 ms
+  [open_batch] TOTAL:  15.83 ms
+[gap] +    0.030 ms  @  181.999 ms  open: returned
+[gap] +    0.014 ms  @  182.013 ms  proof assembled
+[gap] +    0.010 ms  @  182.023 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  182.031 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   35.788 ms  @   35.790 ms  witness: work done (incl. prefault)
+[gap] +    0.018 ms  @   35.808 ms  witness: pool exited
+[gap] +    0.007 ms  @   35.815 ms  lc_circuit built
+[gap] +    0.007 ms  @   35.823 ms  inner: enter
+[gap] +    0.024 ms  @   35.846 ms  core: padding built
+[gap] +    0.007 ms  @   35.854 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   35.860 ms  commit: pool entered
+[gap] +   20.005 ms  @   55.865 ms  ntt: seed+top fused pass done
+[gap] +   39.464 ms  @   95.329 ms  ntt: deep pass done
+[commit-timing] ntt: 59.50 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.055 ms  @   95.384 ms  commit: work done
+[gap] +    0.010 ms  @   95.394 ms  commit: pool exited
+[gap] +    0.011 ms  @   95.405 ms  bind_statement done
+[gap] +    0.142 ms  @   95.547 ms  zerocheck: pool entered
+[gap] +    0.015 ms  @   95.562 ms  zerocheck: views built
+[zc-timing] round1 AB 15.45 ms || identity-C fold 16.11 ms -> 16.15 ms
+[gap] +   16.211 ms  @  111.773 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.19 ms
+[gap] +    0.015 ms  @  111.788 ms  zc: round1 observed + z sampled
+[gap] +    0.016 ms  @  111.804 ms  zc: fold_table built
+[gap] +   19.469 ms  @  131.273 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.50 ms
+[gap] +    0.029 ms  @  131.302 ms  zc: tail ping-pong buffers taken
+[gap] +   15.039 ms  @  146.341 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.738 ms  @  155.080 ms  zc: tail rounds done
+[gap] +    0.020 ms  @  155.100 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.05 n24:6.30 n22:1.65 n20:0.47 n18:0.12 n16:0.04 n15:0.02 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 23.82 ms
+[gap] +    0.021 ms  @  155.122 ms  zerocheck: work done
+[gap] +    0.044 ms  @  155.166 ms  zerocheck: pool exited
+[gap] +    0.016 ms  @  155.182 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  155.189 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.22 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                8.98 ms
+[lc] sumcheck (all rounds)         0.11 ms
+[gap] +    9.675 ms  @  164.864 ms  lincheck: done
+[gap] +    0.018 ms  @  164.882 ms  s_hat_v_ab built (core exit)
+[gap] +    0.008 ms  @  164.890 ms  core: returned
+[gap] +    0.009 ms  @  164.899 ms  open: begin
+[gap] +    0.272 ms  @  165.171 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.34 ms
+[gap] +    0.396 ms  @  165.566 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.39 ms
+[gap] +    0.011 ms  @  165.578 ms  open: b_combined taken
+[gap] +    0.019 ms  @  165.597 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.03 ms
+[gap] +    0.016 ms  @  165.612 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.37 ms upper 0.00 ms minflt +2
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.26 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.40 ms  dense(8 layers) 1.04 ms  minflt +14
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.56 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.17 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.20 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.44 ms
+  initial sumcheck (initial_k folds + SC build): 9.92 ms
+    round 0: grind 0.34 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.16 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.11 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.24 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.04 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.97 ms, arena=false
+  recursive commits (NTT + merkle):              1.05 ms
+  opens (rows + multi-proof):                    0.24 ms
+  induce_sumcheck_poly:                          2.42 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.80 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.33 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.18 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.74 ms
+  introduce_new + glue:                          0.22 ms
+  OOD samples (5): MLE evals + glue:            0.64 ms
+[gap] +   15.522 ms  @  181.134 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.52 ms
+  [open_batch] TOTAL:  15.97 ms
+[gap] +    0.025 ms  @  181.159 ms  open: returned
+[gap] +    0.015 ms  @  181.174 ms  proof assembled
+[gap] +    0.010 ms  @  181.184 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  181.192 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   38.150 ms  @   38.152 ms  witness: work done (incl. prefault)
+[gap] +    0.024 ms  @   38.177 ms  witness: pool exited
+[gap] +    0.014 ms  @   38.191 ms  lc_circuit built
+[gap] +    0.008 ms  @   38.199 ms  inner: enter
+[gap] +    0.013 ms  @   38.212 ms  core: padding built
+[gap] +    0.009 ms  @   38.221 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   38.229 ms  commit: pool entered
+[gap] +   20.129 ms  @   58.358 ms  ntt: seed+top fused pass done
+[gap] +   39.047 ms  @   97.405 ms  ntt: deep pass done
+[commit-timing] ntt: 59.20 ms
+[commit-timing] merkle: 0.02 ms (subtree levels folded in-callback: 11)
+[gap] +    0.057 ms  @   97.462 ms  commit: work done
+[gap] +    0.010 ms  @   97.472 ms  commit: pool exited
+[gap] +    0.010 ms  @   97.483 ms  bind_statement done
+[gap] +    0.212 ms  @   97.694 ms  zerocheck: pool entered
+[gap] +    0.022 ms  @   97.716 ms  zerocheck: views built
+[zc-timing] round1 AB 15.31 ms || identity-C fold 16.39 ms -> 16.45 ms
+[gap] +   16.497 ms  @  114.213 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.48 ms
+[gap] +    0.017 ms  @  114.230 ms  zc: round1 observed + z sampled
+[gap] +    0.030 ms  @  114.260 ms  zc: fold_table built
+[gap] +   21.043 ms  @  135.304 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 21.07 ms
+[gap] +    0.023 ms  @  135.326 ms  zc: tail ping-pong buffers taken
+[gap] +   15.451 ms  @  150.777 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.967 ms  @  159.744 ms  zc: tail rounds done
+[gap] +    0.022 ms  @  159.766 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.46 n24:6.09 n22:2.08 n20:0.46 n18:0.14 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.46 ms
+[gap] +    0.023 ms  @  159.789 ms  zerocheck: work done
+[gap] +    0.037 ms  @  159.825 ms  zerocheck: pool exited
+[gap] +    0.017 ms  @  159.842 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  159.850 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.22 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                8.84 ms
+[lc] sumcheck (all rounds)         0.07 ms
+[gap] +    9.561 ms  @  169.411 ms  lincheck: done
+[gap] +    0.010 ms  @  169.420 ms  s_hat_v_ab built (core exit)
+[gap] +    0.012 ms  @  169.432 ms  core: returned
+[gap] +    0.010 ms  @  169.442 ms  open: begin
+[gap] +    0.046 ms  @  169.489 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.04 ms
+    [rs::prove_batched] per-opening tail ×2:   0.33 ms
+[gap] +    0.407 ms  @  169.896 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.40 ms
+[gap] +    0.011 ms  @  169.907 ms  open: b_combined taken
+[gap] +    0.007 ms  @  169.914 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.016 ms  @  169.930 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.96 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.24 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.29 ms  dense(8 layers) 1.08 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.68 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.17 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.18 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 14.77 ms
+  initial sumcheck (initial_k folds + SC build): 9.42 ms
+    round 0: grind 0.30 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.18 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.11 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.19 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.04 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 8.53 ms, arena=false
+  recursive commits (NTT + merkle):              1.12 ms
+  opens (rows + multi-proof):                    0.22 ms
+  induce_sumcheck_poly:                          2.30 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.69 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.34 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.17 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.07 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      1.05 ms
+  introduce_new + glue:                          0.22 ms
+  OOD samples (5): MLE evals + glue:            0.21 ms
+[gap] +   14.850 ms  @  184.780 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  14.85 ms
+  [open_batch] TOTAL:  15.30 ms
+[gap] +    0.027 ms  @  184.806 ms  open: returned
+[gap] +    0.016 ms  @  184.822 ms  proof assembled
+[gap] +    0.008 ms  @  184.831 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  184.838 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   34.909 ms  @   34.912 ms  witness: work done (incl. prefault)
+[gap] +    0.022 ms  @   34.934 ms  witness: pool exited
+[gap] +    0.012 ms  @   34.946 ms  lc_circuit built
+[gap] +    0.009 ms  @   34.955 ms  inner: enter
+[gap] +    0.015 ms  @   34.969 ms  core: padding built
+[gap] +    0.014 ms  @   34.983 ms  core: gpu prewire spawned
+[gap] +    0.010 ms  @   34.993 ms  commit: pool entered
+[gap] +   20.152 ms  @   55.145 ms  ntt: seed+top fused pass done
+[gap] +   39.201 ms  @   94.346 ms  ntt: deep pass done
+[commit-timing] ntt: 59.38 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.058 ms  @   94.403 ms  commit: work done
+[gap] +    0.010 ms  @   94.413 ms  commit: pool exited
+[gap] +    0.010 ms  @   94.423 ms  bind_statement done
+[gap] +    0.025 ms  @   94.448 ms  zerocheck: pool entered
+[gap] +    0.009 ms  @   94.457 ms  zerocheck: views built
+[zc-timing] round1 AB 15.40 ms || identity-C fold 16.05 ms -> 16.11 ms
+[gap] +   16.148 ms  @  110.605 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.15 ms
+[gap] +    0.036 ms  @  110.641 ms  zc: round1 observed + z sampled
+[gap] +    0.017 ms  @  110.657 ms  zc: fold_table built
+[gap] +   19.828 ms  @  130.485 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.85 ms
+[gap] +    0.027 ms  @  130.512 ms  zc: tail ping-pong buffers taken
+[gap] +   15.636 ms  @  146.148 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.293 ms  @  155.441 ms  zc: tail rounds done
+[gap] +    0.025 ms  @  155.466 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.64 n24:6.94 n22:1.60 n20:0.43 n18:0.11 n16:0.04 n15:0.02 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.01 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.98 ms
+[gap] +    0.025 ms  @  155.491 ms  zerocheck: work done
+[gap] +    0.038 ms  @  155.529 ms  zerocheck: pool exited
+[gap] +    0.018 ms  @  155.547 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  155.555 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.24 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.02 ms
+[lc] sumcheck (all rounds)         0.07 ms
+[gap] +    9.715 ms  @  165.270 ms  lincheck: done
+[gap] +    0.009 ms  @  165.279 ms  s_hat_v_ab built (core exit)
+[gap] +    0.007 ms  @  165.286 ms  core: returned
+[gap] +    0.007 ms  @  165.293 ms  open: begin
+[gap] +    0.043 ms  @  165.336 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.35 ms
+[gap] +    0.394 ms  @  165.730 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.39 ms
+[gap] +    0.011 ms  @  165.741 ms  open: b_combined taken
+[gap] +    0.007 ms  @  165.748 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.01 ms
+[gap] +    0.013 ms  @  165.761 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.94 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.37 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.52 ms  dense(8 layers) 0.74 ms  minflt +16
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.53 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.16 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.20 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.12 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.08 ms upper 0.00 ms minflt +0
+[lig-prove] total = 14.56 ms
+  initial sumcheck (initial_k folds + SC build): 9.56 ms
+    round 0: grind 0.29 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.12 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.20 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.06 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 8.68 ms, arena=false
+  recursive commits (NTT + merkle):              1.06 ms
+  opens (rows + multi-proof):                    0.23 ms
+  induce_sumcheck_poly:                          2.36 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.73 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.32 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.19 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.08 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.73 ms
+  introduce_new + glue:                          0.19 ms
+  OOD samples (5): MLE evals + glue:            0.20 ms
+[gap] +   14.638 ms  @  180.399 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  14.64 ms
+  [open_batch] TOTAL:  15.07 ms
+[gap] +    0.025 ms  @  180.423 ms  open: returned
+[gap] +    0.016 ms  @  180.439 ms  proof assembled
+[gap] +    0.009 ms  @  180.448 ms  s_hat_v dropped
+[gap] +    0.010 ms  @  180.458 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   35.750 ms  @   35.753 ms  witness: work done (incl. prefault)
+[gap] +    0.023 ms  @   35.775 ms  witness: pool exited
+[gap] +    0.011 ms  @   35.786 ms  lc_circuit built
+[gap] +    0.010 ms  @   35.796 ms  inner: enter
+[gap] +    0.013 ms  @   35.809 ms  core: padding built
+[gap] +    0.010 ms  @   35.819 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   35.828 ms  commit: pool entered
+[gap] +   20.050 ms  @   55.878 ms  ntt: seed+top fused pass done
+[gap] +   38.811 ms  @   94.689 ms  ntt: deep pass done
+[commit-timing] ntt: 58.89 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.052 ms  @   94.741 ms  commit: work done
+[gap] +    0.007 ms  @   94.748 ms  commit: pool exited
+[gap] +    0.009 ms  @   94.757 ms  bind_statement done
+[gap] +    0.020 ms  @   94.777 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   94.784 ms  zerocheck: views built
+[zc-timing] round1 AB 14.95 ms || identity-C fold 15.91 ms -> 15.98 ms
+[gap] +   16.012 ms  @  110.796 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.00 ms
+[gap] +    0.015 ms  @  110.812 ms  zc: round1 observed + z sampled
+[gap] +    0.017 ms  @  110.829 ms  zc: fold_table built
+[gap] +   19.589 ms  @  130.418 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.62 ms
+[gap] +    0.029 ms  @  130.447 ms  zc: tail ping-pong buffers taken
+[gap] +   15.710 ms  @  146.156 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.649 ms  @  155.805 ms  zc: tail rounds done
+[gap] +    0.023 ms  @  155.829 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.72 n24:6.61 n22:2.22 n20:0.47 n18:0.13 n16:0.04 n15:0.02 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 25.42 ms
+[gap] +    0.035 ms  @  155.863 ms  zerocheck: work done
+[gap] +    0.018 ms  @  155.881 ms  zerocheck: pool exited
+[gap] +    0.016 ms  @  155.898 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  155.906 ms  x_ab built
+[lc] build_quirky_eq               0.05 ms
+[lc] fold_alpha_batched            0.22 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.03 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +    9.466 ms  @  165.371 ms  lincheck: done
+[gap] +    0.014 ms  @  165.385 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  165.395 ms  core: returned
+[gap] +    0.011 ms  @  165.406 ms  open: begin
+[gap] +    0.069 ms  @  165.475 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.39 ms
+[gap] +    0.467 ms  @  165.942 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.45 ms
+[gap] +    0.015 ms  @  165.957 ms  open: b_combined taken
+[gap] +    0.009 ms  @  165.966 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.016 ms  @  165.983 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.82 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.26 ms  alloc(zeroed 2^20) 0.01 ms  densify 1.33 ms  dense(8 layers) 1.01 ms  minflt +528
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.63 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.06 ms  dense(7 layers) 0.20 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.19 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.12 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.43 ms
+  initial sumcheck (initial_k folds + SC build): 9.38 ms
+    round 0: grind 0.33 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.13 ms, fold 0.01 ms, arena=false
+    round 3: grind 0.20 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.04 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.48 ms, arena=false
+  recursive commits (NTT + merkle):              1.11 ms
+  opens (rows + multi-proof):                    0.23 ms
+  induce_sumcheck_poly:                          3.37 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 2.71 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.36 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.19 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.70 ms
+  introduce_new + glue:                          0.21 ms
+  OOD samples (5): MLE evals + glue:            0.21 ms
+[gap] +   15.510 ms  @  181.492 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.51 ms
+  [open_batch] TOTAL:  16.03 ms
+[gap] +    0.025 ms  @  181.518 ms  open: returned
+[gap] +    0.015 ms  @  181.532 ms  proof assembled
+[gap] +    0.011 ms  @  181.543 ms  s_hat_v dropped
+[gap] +    0.009 ms  @  181.552 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   37.792 ms  @   37.795 ms  witness: work done (incl. prefault)
+[gap] +    0.031 ms  @   37.826 ms  witness: pool exited
+[gap] +    0.015 ms  @   37.841 ms  lc_circuit built
+[gap] +    0.010 ms  @   37.851 ms  inner: enter
+[gap] +    0.012 ms  @   37.864 ms  core: padding built
+[gap] +    0.009 ms  @   37.873 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   37.882 ms  commit: pool entered
+[gap] +   20.048 ms  @   57.930 ms  ntt: seed+top fused pass done
+[gap] +   38.992 ms  @   96.922 ms  ntt: deep pass done
+[commit-timing] ntt: 59.06 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.052 ms  @   96.974 ms  commit: work done
+[gap] +    0.008 ms  @   96.981 ms  commit: pool exited
+[gap] +    0.009 ms  @   96.990 ms  bind_statement done
+[gap] +    0.159 ms  @   97.148 ms  zerocheck: pool entered
+[gap] +    0.014 ms  @   97.163 ms  zerocheck: views built
+[zc-timing] round1 AB 16.57 ms || identity-C fold 16.01 ms -> 16.60 ms
+[gap] +   16.641 ms  @  113.804 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.63 ms
+[gap] +    0.017 ms  @  113.821 ms  zc: round1 observed + z sampled
+[gap] +    0.029 ms  @  113.849 ms  zc: fold_table built
+[gap] +   19.372 ms  @  133.221 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.40 ms
+[gap] +    0.022 ms  @  133.244 ms  zc: tail ping-pong buffers taken
+[gap] +   15.340 ms  @  148.584 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.650 ms  @  157.234 ms  zc: tail rounds done
+[gap] +    0.016 ms  @  157.250 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.34 n24:6.32 n22:1.53 n20:0.47 n18:0.13 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.03 ms
+[gap] +    0.024 ms  @  157.274 ms  zerocheck: work done
+[gap] +    0.041 ms  @  157.315 ms  zerocheck: pool exited
+[gap] +    0.017 ms  @  157.332 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  157.340 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.24 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                8.92 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +    9.674 ms  @  167.013 ms  lincheck: done
+[gap] +    0.015 ms  @  167.028 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  167.038 ms  core: returned
+[gap] +    0.009 ms  @  167.047 ms  open: begin
+[gap] +    0.057 ms  @  167.104 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.43 ms
+[gap] +    0.510 ms  @  167.614 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.50 ms
+[gap] +    0.012 ms  @  167.626 ms  open: b_combined taken
+[gap] +    0.007 ms  @  167.632 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.015 ms  @  167.647 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.95 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.37 ms  alloc(zeroed 2^20) 0.01 ms  densify 2.08 ms  dense(8 layers) 1.21 ms  minflt +527
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.60 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.06 ms  dense(7 layers) 0.16 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.22 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.12 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 16.73 ms
+  initial sumcheck (initial_k folds + SC build): 9.55 ms
+    round 0: grind 0.28 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.14 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.13 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.18 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.07 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.68 ms, arena=false
+  recursive commits (NTT + merkle):              1.11 ms
+  opens (rows + multi-proof):                    0.22 ms
+  induce_sumcheck_poly:                          4.44 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 3.75 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.33 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.25 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.07 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.79 ms
+  introduce_new + glue:                          0.21 ms
+  OOD samples (5): MLE evals + glue:            0.20 ms
+[gap] +   16.801 ms  @  184.448 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  16.80 ms
+  [open_batch] TOTAL:  17.35 ms
+[gap] +    0.041 ms  @  184.489 ms  open: returned
+[gap] +    0.014 ms  @  184.503 ms  proof assembled
+[gap] +    0.010 ms  @  184.513 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  184.521 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.644 ms  @   36.646 ms  witness: work done (incl. prefault)
+[gap] +    0.023 ms  @   36.669 ms  witness: pool exited
+[gap] +    0.010 ms  @   36.680 ms  lc_circuit built
+[gap] +    0.009 ms  @   36.689 ms  inner: enter
+[gap] +    0.013 ms  @   36.702 ms  core: padding built
+[gap] +    0.009 ms  @   36.711 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   36.719 ms  commit: pool entered
+[gap] +   19.798 ms  @   56.517 ms  ntt: seed+top fused pass done
+[gap] +   39.399 ms  @   95.916 ms  ntt: deep pass done
+[commit-timing] ntt: 59.22 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.048 ms  @   95.964 ms  commit: work done
+[gap] +    0.007 ms  @   95.971 ms  commit: pool exited
+[gap] +    0.009 ms  @   95.980 ms  bind_statement done
+[gap] +    0.023 ms  @   96.003 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   96.010 ms  zerocheck: views built
+[zc-timing] round1 AB 15.95 ms || identity-C fold 16.15 ms -> 16.19 ms
+[gap] +   16.230 ms  @  112.240 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.22 ms
+[gap] +    0.020 ms  @  112.260 ms  zc: round1 observed + z sampled
+[gap] +    0.021 ms  @  112.280 ms  zc: fold_table built
+[gap] +   20.817 ms  @  133.097 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 20.85 ms
+[gap] +    0.034 ms  @  133.132 ms  zc: tail ping-pong buffers taken
+[gap] +   15.445 ms  @  148.577 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.482 ms  @  157.060 ms  zc: tail rounds done
+[gap] +    0.019 ms  @  157.079 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.45 n24:6.13 n22:1.56 n20:0.45 n18:0.12 n16:0.05 n15:0.02 n14:0.02 n13:0.02 n12:0.02 n11:0.01 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 23.97 ms
+[gap] +    0.023 ms  @  157.102 ms  zerocheck: work done
+[gap] +    0.017 ms  @  157.119 ms  zerocheck: pool exited
+[gap] +    0.007 ms  @  157.126 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  157.133 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.22 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.01 ms
+[lc] sumcheck (all rounds)         0.07 ms
+[gap] +    9.435 ms  @  166.568 ms  lincheck: done
+[gap] +    0.012 ms  @  166.580 ms  s_hat_v_ab built (core exit)
+[gap] +    0.023 ms  @  166.602 ms  core: returned
+[gap] +    0.011 ms  @  166.614 ms  open: begin
+[gap] +    0.051 ms  @  166.665 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.36 ms
+[gap] +    0.420 ms  @  167.085 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.42 ms
+[gap] +    0.010 ms  @  167.095 ms  open: b_combined taken
+[gap] +    0.008 ms  @  167.104 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.016 ms  @  167.119 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.21 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.26 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.29 ms  dense(8 layers) 0.74 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.56 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.06 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.16 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.19 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.12 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.08 ms upper 0.00 ms minflt +0
+[lig-prove] total = 14.38 ms
+  initial sumcheck (initial_k folds + SC build): 9.71 ms
+    round 0: grind 0.32 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.16 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.11 ms, fold 0.01 ms, arena=false
+    round 3: grind 0.20 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.05 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.02 ms, fold 8.81 ms, arena=false
+  recursive commits (NTT + merkle):              1.05 ms
+  opens (rows + multi-proof):                    0.23 ms
+  induce_sumcheck_poly:                          2.01 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.39 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.31 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.20 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.07 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.71 ms
+  introduce_new + glue:                          0.20 ms
+  OOD samples (5): MLE evals + glue:            0.24 ms
+[gap] +   14.474 ms  @  181.593 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  14.47 ms
+  [open_batch] TOTAL:  14.94 ms
+[gap] +    0.031 ms  @  181.624 ms  open: returned
+[gap] +    0.009 ms  @  181.632 ms  proof assembled
+[gap] +    0.010 ms  @  181.643 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  181.650 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.757 ms  @   36.759 ms  witness: work done (incl. prefault)
+[gap] +    0.020 ms  @   36.778 ms  witness: pool exited
+[gap] +    0.011 ms  @   36.789 ms  lc_circuit built
+[gap] +    0.009 ms  @   36.799 ms  inner: enter
+[gap] +    0.014 ms  @   36.813 ms  core: padding built
+[gap] +    0.009 ms  @   36.822 ms  core: gpu prewire spawned
+[gap] +    0.010 ms  @   36.832 ms  commit: pool entered
+[gap] +   19.856 ms  @   56.688 ms  ntt: seed+top fused pass done
+[gap] +   38.866 ms  @   95.554 ms  ntt: deep pass done
+[commit-timing] ntt: 58.74 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.055 ms  @   95.610 ms  commit: work done
+[gap] +    0.008 ms  @   95.617 ms  commit: pool exited
+[gap] +    0.009 ms  @   95.626 ms  bind_statement done
+[gap] +    0.017 ms  @   95.644 ms  zerocheck: pool entered
+[gap] +    0.008 ms  @   95.651 ms  zerocheck: views built
+[zc-timing] round1 AB 15.40 ms || identity-C fold 16.07 ms -> 16.12 ms
+[gap] +   16.156 ms  @  111.807 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.15 ms
+[gap] +    0.020 ms  @  111.828 ms  zc: round1 observed + z sampled
+[gap] +    0.024 ms  @  111.852 ms  zc: fold_table built
+[gap] +   19.368 ms  @  131.220 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.39 ms
+[gap] +    0.024 ms  @  131.244 ms  zc: tail ping-pong buffers taken
+[gap] +   15.181 ms  @  146.424 ms  zc: rounds 3+4 composed fold done
+[gap] +   10.645 ms  @  157.070 ms  zc: tail rounds done
+[gap] +    0.026 ms  @  157.096 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.19 n24:8.24 n22:1.63 n20:0.45 n18:0.12 n16:0.04 n15:0.02 n14:0.02 n13:0.02 n12:0.01 n11:0.02 n10:0.01 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 25.88 ms
+[gap] +    0.025 ms  @  157.121 ms  zerocheck: work done
+[gap] +    0.017 ms  @  157.139 ms  zerocheck: pool exited
+[gap] +    0.008 ms  @  157.146 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  157.154 ms  x_ab built
+[lc] build_quirky_eq               0.06 ms
+[lc] fold_alpha_batched            0.19 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.40 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +    9.813 ms  @  166.967 ms  lincheck: done
+[gap] +    0.008 ms  @  166.976 ms  s_hat_v_ab built (core exit)
+[gap] +    0.008 ms  @  166.984 ms  core: returned
+[gap] +    0.008 ms  @  166.992 ms  open: begin
+[gap] +    0.047 ms  @  167.039 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.34 ms
+[gap] +    0.394 ms  @  167.433 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.39 ms
+[gap] +    0.011 ms  @  167.443 ms  open: b_combined taken
+[gap] +    0.006 ms  @  167.449 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.01 ms
+[gap] +    0.015 ms  @  167.464 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.13 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.30 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.33 ms  dense(8 layers) 0.71 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.62 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.18 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.20 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.12 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 14.82 ms
+  initial sumcheck (initial_k folds + SC build): 10.02 ms
+    round 0: grind 0.32 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.13 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.20 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.06 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 9.09 ms, arena=false
+  recursive commits (NTT + merkle):              1.10 ms
+  opens (rows + multi-proof):                    0.23 ms
+  induce_sumcheck_poly:                          2.06 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.43 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.35 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.18 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.75 ms
+  introduce_new + glue:                          0.20 ms
+  OOD samples (5): MLE evals + glue:            0.25 ms
+[gap] +   14.912 ms  @  182.376 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  14.91 ms
+  [open_batch] TOTAL:  15.35 ms
+[gap] +    0.026 ms  @  182.402 ms  open: returned
+[gap] +    0.008 ms  @  182.410 ms  proof assembled
+[gap] +    0.010 ms  @  182.419 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  182.428 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.075 ms  @   36.077 ms  witness: work done (incl. prefault)
+[gap] +    0.019 ms  @   36.096 ms  witness: pool exited
+[gap] +    0.010 ms  @   36.106 ms  lc_circuit built
+[gap] +    0.009 ms  @   36.115 ms  inner: enter
+[gap] +    0.014 ms  @   36.129 ms  core: padding built
+[gap] +    0.009 ms  @   36.139 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   36.148 ms  commit: pool entered
+[gap] +   19.941 ms  @   56.088 ms  ntt: seed+top fused pass done
+[gap] +   39.225 ms  @   95.314 ms  ntt: deep pass done
+[commit-timing] ntt: 59.19 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.053 ms  @   95.367 ms  commit: work done
+[gap] +    0.008 ms  @   95.375 ms  commit: pool exited
+[gap] +    0.011 ms  @   95.386 ms  bind_statement done
+[gap] +    0.026 ms  @   95.412 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   95.420 ms  zerocheck: views built
+[zc-timing] round1 AB 14.98 ms || identity-C fold 16.09 ms -> 16.21 ms
+[gap] +   16.259 ms  @  111.678 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.24 ms
+[gap] +    0.030 ms  @  111.709 ms  zc: round1 observed + z sampled
+[gap] +    0.019 ms  @  111.728 ms  zc: fold_table built
+[gap] +   19.049 ms  @  130.777 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.08 ms
+[gap] +    0.029 ms  @  130.806 ms  zc: tail ping-pong buffers taken
+[gap] +   15.210 ms  @  146.016 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.452 ms  @  155.468 ms  zc: tail rounds done
+[gap] +    0.025 ms  @  155.493 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.22 n24:7.05 n22:1.64 n20:0.44 n18:0.11 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.01 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.71 ms
+[gap] +    0.024 ms  @  155.517 ms  zerocheck: work done
+[gap] +    0.018 ms  @  155.534 ms  zerocheck: pool exited
+[gap] +    0.008 ms  @  155.542 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  155.549 ms  x_ab built
+[lc] build_quirky_eq               0.04 ms
+[lc] fold_alpha_batched            0.21 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                8.85 ms
+[lc] sumcheck (all rounds)         0.08 ms
+[gap] +    9.290 ms  @  164.839 ms  lincheck: done
+[gap] +    0.013 ms  @  164.852 ms  s_hat_v_ab built (core exit)
+[gap] +    0.008 ms  @  164.861 ms  core: returned
+[gap] +    0.010 ms  @  164.871 ms  open: begin
+[gap] +    0.068 ms  @  164.939 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.36 ms
+[gap] +    0.414 ms  @  165.353 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.41 ms
+[gap] +    0.014 ms  @  165.367 ms  open: b_combined taken
+[gap] +    0.008 ms  @  165.375 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.03 ms
+[gap] +    0.028 ms  @  165.403 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.94 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=147 win-phase 0.19 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.28 ms  dense(8 layers) 0.93 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.67 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=77 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.06 ms  dense(7 layers) 0.19 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.23 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.24 ms
+  initial sumcheck (initial_k folds + SC build): 9.37 ms
+    round 0: grind 0.32 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.15 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.10 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.19 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.06 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 8.47 ms, arena=false
+  recursive commits (NTT + merkle):              1.18 ms
+  opens (rows + multi-proof):                    0.22 ms
+  induce_sumcheck_poly:                          2.15 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.48 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.37 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.20 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.76 ms
+  introduce_new + glue:                          1.12 ms
+  OOD samples (5): MLE evals + glue:            0.22 ms
+[gap] +   15.348 ms  @  180.750 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.35 ms
+  [open_batch] TOTAL:  15.82 ms
+[gap] +    0.030 ms  @  180.780 ms  open: returned
+[gap] +    0.010 ms  @  180.791 ms  proof assembled
+[gap] +    0.011 ms  @  180.801 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  180.809 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   38.610 ms  @   38.612 ms  witness: work done (incl. prefault)
+[gap] +    0.019 ms  @   38.631 ms  witness: pool exited
+[gap] +    0.010 ms  @   38.641 ms  lc_circuit built
+[gap] +    0.010 ms  @   38.651 ms  inner: enter
+[gap] +    0.013 ms  @   38.664 ms  core: padding built
+[gap] +    0.008 ms  @   38.672 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   38.681 ms  commit: pool entered
+[gap] +   20.023 ms  @   58.704 ms  ntt: seed+top fused pass done
+[gap] +   38.881 ms  @   97.585 ms  ntt: deep pass done
+[commit-timing] ntt: 58.92 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.045 ms  @   97.630 ms  commit: work done
+[gap] +    0.007 ms  @   97.637 ms  commit: pool exited
+[gap] +    0.009 ms  @   97.646 ms  bind_statement done
+[gap] +    0.020 ms  @   97.666 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   97.673 ms  zerocheck: views built
+[zc-timing] round1 AB 15.52 ms || identity-C fold 16.08 ms -> 16.12 ms
+[gap] +   16.154 ms  @  113.827 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.16 ms
+[gap] +    0.032 ms  @  113.859 ms  zc: round1 observed + z sampled
+[gap] +    0.018 ms  @  113.877 ms  zc: fold_table built
+[gap] +   21.471 ms  @  135.348 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 21.51 ms
+[gap] +    0.041 ms  @  135.390 ms  zc: tail ping-pong buffers taken
+[gap] +   15.330 ms  @  150.720 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.973 ms  @  159.693 ms  zc: tail rounds done
+[gap] +    0.024 ms  @  159.717 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.34 n24:6.20 n22:1.93 n20:0.51 n18:0.13 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.01 n10:0.01 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 24.35 ms
+[gap] +    0.023 ms  @  159.740 ms  zerocheck: work done
+[gap] +    0.017 ms  @  159.756 ms  zerocheck: pool exited
+[gap] +    0.009 ms  @  159.766 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  159.773 ms  x_ab built
+[lc] build_quirky_eq               0.07 ms
+[lc] fold_alpha_batched            0.20 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.29 ms
+[lc] sumcheck (all rounds)         0.09 ms
+[gap] +    9.734 ms  @  169.507 ms  lincheck: done
+[gap] +    0.009 ms  @  169.516 ms  s_hat_v_ab built (core exit)
+[gap] +    0.007 ms  @  169.524 ms  core: returned
+[gap] +    0.009 ms  @  169.533 ms  open: begin
+[gap] +    0.062 ms  @  169.595 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.03 ms
+    [rs::prove_batched] per-opening tail ×2:   0.37 ms
+[gap] +    0.422 ms  @  170.016 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.42 ms
+[gap] +    0.012 ms  @  170.028 ms  open: b_combined taken
+[gap] +    0.007 ms  @  170.035 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.01 ms
+[gap] +    0.015 ms  @  170.050 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 3.20 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=150 win-phase 0.28 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.74 ms  dense(8 layers) 0.72 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.56 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=70 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.05 ms  dense(7 layers) 0.17 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.23 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.11 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 15.46 ms
+  initial sumcheck (initial_k folds + SC build): 10.23 ms
+    round 0: grind 0.51 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.14 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.15 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.21 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.03 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 9.14 ms, arena=false
+  recursive commits (NTT + merkle):              1.07 ms
+  opens (rows + multi-proof):                    0.24 ms
+  induce_sumcheck_poly:                          2.48 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.83 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.34 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.21 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.04 ms
+  sumcheck recursive folds:                      0.77 ms
+  introduce_new + glue:                          0.21 ms
+  OOD samples (5): MLE evals + glue:            0.23 ms
+[gap] +   15.558 ms  @  185.608 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  15.56 ms
+  [open_batch] TOTAL:  16.02 ms
+[gap] +    0.025 ms  @  185.633 ms  open: returned
+[gap] +    0.009 ms  @  185.642 ms  proof assembled
+[gap] +    0.009 ms  @  185.651 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  185.658 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.009 ms  @    0.009 ms  witness: pool entered
+[gap] +   35.204 ms  @   35.213 ms  witness: work done (incl. prefault)
+[gap] +    0.015 ms  @   35.228 ms  witness: pool exited
+[gap] +    0.011 ms  @   35.239 ms  lc_circuit built
+[gap] +    0.013 ms  @   35.252 ms  inner: enter
+[gap] +    0.023 ms  @   35.275 ms  core: padding built
+[gap] +    0.010 ms  @   35.285 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   35.294 ms  commit: pool entered
+[gap] +   19.879 ms  @   55.173 ms  ntt: seed+top fused pass done
+[gap] +   39.082 ms  @   94.255 ms  ntt: deep pass done
+[commit-timing] ntt: 58.99 ms
+[commit-timing] merkle: 0.01 ms (subtree levels folded in-callback: 11)
+[gap] +    0.059 ms  @   94.314 ms  commit: work done
+[gap] +    0.010 ms  @   94.324 ms  commit: pool exited
+[gap] +    0.012 ms  @   94.335 ms  bind_statement done
+[gap] +    0.031 ms  @   94.366 ms  zerocheck: pool entered
+[gap] +    0.012 ms  @   94.378 ms  zerocheck: views built
+[zc-timing] round1 AB 15.13 ms || identity-C fold 16.27 ms -> 16.51 ms
+[gap] +   16.551 ms  @  110.928 ms  zc: round1 done (URM + C_s restore)
+[zc-timing] round1 URM: 16.54 ms
+[gap] +    0.017 ms  @  110.945 ms  zc: round1 observed + z sampled
+[gap] +    0.017 ms  @  110.962 ms  zc: fold_table built
+[gap] +   19.610 ms  @  130.572 ms  zc: round2 fused fold done
+[zc-timing] round2 fused fold: 19.63 ms
+[gap] +    0.025 ms  @  130.598 ms  zc: tail ping-pong buffers taken
+[gap] +   15.204 ms  @  145.801 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.463 ms  @  154.264 ms  zc: tail rounds done
+[gap] +    0.020 ms  @  154.284 ms  zc: tail buffers recycled
+[zc-timing] tail rounds (log_n:ms): n26:15.21 n24:6.12 n22:1.55 n20:0.46 n18:0.13 n16:0.04 n15:0.03 n14:0.02 n13:0.02 n12:0.02 n11:0.02 n10:0.02 n9:0.00 n8:0.00 n7:0.00 n6:0.00 n5:0.00 n4:0.00 n3:0.00 n2:0.00
+[zc-timing] rounds 3+ tail: 23.71 ms
+[gap] +    0.024 ms  @  154.308 ms  zerocheck: work done
+[gap] +    0.018 ms  @  154.326 ms  zerocheck: pool exited
+[gap] +    0.008 ms  @  154.334 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  154.343 ms  x_ab built
+[lc] build_quirky_eq               0.05 ms
+[lc] fold_alpha_batched            0.19 ms
+[lc] wait kicked z-fold (overlapped)    0.00 ms
+[lc] partial_fold_z                9.06 ms
+[lc] sumcheck (all rounds)         0.09 ms
+[gap] +    9.479 ms  @  163.821 ms  lincheck: done
+[gap] +    0.014 ms  @  163.835 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  163.845 ms  core: returned
+[gap] +    0.010 ms  @  163.855 ms  open: begin
+[gap] +    0.079 ms  @  163.933 ms  open: fold arena ready
+    [rs::prove_batched] build_eq dense×2 (split) + sparse×0:   0.00 ms
+    [rs::prove_batched] fold_1b_rows dense(k=2)+sparse(k=0):   0.02 ms
+    [rs::prove_batched] per-opening tail ×2:   0.40 ms
+[gap] +    0.454 ms  @  164.387 ms  open: ring_switch done
+  [open_batch] ring_switch::prove_batched ×2:   0.45 ms
+[gap] +    0.014 ms  @  164.401 ms  open: b_combined taken
+[gap] +    0.008 ms  @  164.409 ms  open: combine kernel done
+  [open_batch] combine rs_eq_ind (L=33554432, rs×2, pd×0):   0.02 ms
+[gap] +    0.018 ms  @  164.427 ms  open: combined basis + target done
+[open-timing] ligero_commit: leaves=2^18 leaf=128B (32.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(14) 2.92 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=20 k=12 wins=139 win-phase 0.32 ms  alloc(zeroed 2^20) 0.01 ms  densify 0.31 ms  dense(8 layers) 0.73 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^16 leaf=128B (8.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(12) 0.53 ms upper 0.00 ms minflt +0
+      [sparse-ntt] log_d=18 k=11 wins=73 win-phase 0.07 ms  alloc(zeroed 2^18) 0.00 ms  densify 0.07 ms  dense(7 layers) 0.16 ms  minflt +0
+[open-timing] ligero_commit: leaves=2^14 leaf=128B (2.0 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.20 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^12 leaf=128B (0.5 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 131071) FUSED encode+leaves+subtree(8) 0.13 ms upper 0.00 ms minflt +0
+[open-timing] ligero_commit: leaves=2^10 leaf=128B (0.1 MiB) mat-alloc 0.00 ms (cap 33554432 F128, tree cap 524287) FUSED encode+leaves+subtree(10) 0.07 ms upper 0.00 ms minflt +0
+[lig-prove] total = 14.61 ms
+  initial sumcheck (initial_k folds + SC build): 9.95 ms
+    round 0: grind 0.57 ms, fold 0.02 ms, arena=false
+    round 1: grind 0.16 ms, fold 0.01 ms, arena=false
+    round 2: grind 0.13 ms, fold 0.00 ms, arena=false
+    round 3: grind 0.05 ms, fold 0.00 ms, arena=false
+    round 4: grind 0.03 ms, fold 0.00 ms, arena=false
+    round 5: grind 0.03 ms, fold 8.94 ms, arena=false
+  recursive commits (NTT + merkle):              1.04 ms
+  opens (rows + multi-proof):                    0.24 ms
+  induce_sumcheck_poly:                          2.12 ms
+    induce L0: log_msg_cols=19 queries=218 ntt=true 1.46 ms
+    induce L1: log_msg_cols=16 queries=106 ntt=true 0.34 ms
+    induce L2: log_msg_cols=13 queries=71 ntt=false 0.20 ms
+    induce L3: log_msg_cols=10 queries=53 ntt=false 0.06 ms
+    induce L4: log_msg_cols=7 queries=43 ntt=false 0.05 ms
+  sumcheck recursive folds:                      0.68 ms
+  introduce_new + glue:                          0.18 ms
+  OOD samples (5): MLE evals + glue:            0.20 ms
+[gap] +   14.697 ms  @  179.123 ms  open: ligerito recursive prover done
+  [open_batch] ligerito::recursive_prover_with_basis:  14.70 ms
+  [open_batch] TOTAL:  15.20 ms
+[gap] +    0.029 ms  @  179.153 ms  open: returned
+[gap] +    0.010 ms  @  179.162 ms  proof assembled
+[gap] +    0.012 ms  @  179.174 ms  s_hat_v dropped
+[gap] +    0.009 ms  @  179.183 ms  prover_data dropped
