@@ -499,17 +499,14 @@ unsafe fn ranked_dense_rows_and_offsets_rollback(
     }
 }
 
-/// `FLOCK_NO_WITGEN_RANKED_DIRECT_PUBLISH=1` restores the ranked hot-window
-/// stage stores plus stage reload publication. Default ON; the ranked worker's
-/// cleared environment never disables it.
+/// The ranked AVX-512 worker publishes dense rows directly. The official
+/// worker clears its environment, so keeping the rollback gate dynamic only
+/// preserves dead dispatch and staged-publication code in the hot function.
 #[inline(always)]
 fn ranked_direct_dense_publish_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_WITGEN_RANKED_DIRECT_PUBLISH").is_none()
-        });
-        *ON
+        true
     }
     #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
     {
