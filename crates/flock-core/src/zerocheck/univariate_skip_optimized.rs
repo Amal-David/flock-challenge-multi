@@ -40,6 +40,20 @@ use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, 
 
 mod kernels;
 
+/// Ranked C-drain reconstruct: 16×64 byte-planes → 64 F128. Identity-C
+/// lincheck worker-reduce has the same plane layout.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn c_plane_bank_to_f128(bank_planes: &[u8; 1024], out: &mut [F128; 64]) {
+    kernels::c_plane_bank_to_f128(bank_planes, out)
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
@@ -419,13 +433,20 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
-/// The storage has exactly the same byte length and block layout as either
-/// packed input: every `(x_outer, b_med)` consumes one 64-byte A block and one
-/// 64-byte B block and produces one 64-byte transformed block.  Keeping this
-/// in a separate scratch allocation is intentional: round 2 still needs the
-/// original A and B tables after the round-1 transcript challenge is sampled.
+/// Dense storage has the same byte length and block layout as either packed
+/// input: every `(x_outer, b_med)` consumes one 64-byte A block and one
+/// 64-byte B block and produces one 64-byte transformed block. The ranked
+/// residual representation may physically pack its 29 live rows while
+/// retaining that dense logical extent. Keeping this in a separate scratch
+/// allocation is intentional: round 2 still needs the original A and B tables
+/// after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    /// Logical dense byte length. Ranked residual storage may physically omit
+    /// the two structural-one rows and the dead padding row from every
+    /// 2-KiB witness block, while all protocol shape checks still use the
+    /// original dense length.
+    dense_len_bytes: usize,
     /// Bytes at the start of `storage` that were NEVER written by the
     /// producer because round 1's GPU URM share was planned to cover those
     /// x_hi windows from the raw a/b buffers (see
@@ -436,7 +457,13 @@ pub struct Round1AbInner {
     /// B is identically one. Round one adds their identity-C contribution
     /// before the AB message is emitted.
     ranked_one_rows_elided: bool,
+    /// Ranked BLAKE3 residual rows 2..=30 are stored contiguously: 29 cache
+    /// lines per witness block instead of the dense 32-line address space.
+    ranked_compact: bool,
 }
+
+const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
+const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
 
 impl Round1AbInner {
     #[inline]
@@ -454,14 +481,38 @@ impl Round1AbInner {
         assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
         Self {
             storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
+            dense_len_bytes: total_bytes,
             invalid_prefix_bytes: 0,
             ranked_one_rows_elided: false,
+            ranked_compact: false,
+        }
+    }
+
+    /// Take the exact ranked residual representation. The producer and the
+    /// AB-only round-one consumer both brand this geometry independently;
+    /// every other shape keeps [`Self::take_uninit`].
+    pub fn take_ranked_compact_uninit(total_bytes: usize) -> Self {
+        assert_eq!(total_bytes, 1usize << 29);
+        assert_eq!(total_bytes % RANKED_AB_DENSE_BLOCK_BYTES, 0);
+        let blocks = total_bytes / RANKED_AB_DENSE_BLOCK_BYTES;
+        let stored_bytes = blocks * RANKED_AB_COMPACT_BLOCK_BYTES;
+        assert_eq!(stored_bytes % core::mem::size_of::<F128>(), 0);
+        Self {
+            storage: crate::scratch::take_f128(stored_bytes / core::mem::size_of::<F128>()),
+            dense_len_bytes: total_bytes,
+            invalid_prefix_bytes: 0,
+            ranked_one_rows_elided: false,
+            ranked_compact: true,
         }
     }
 
     /// Brand the exact ranked residual representation.
     pub fn set_ranked_one_rows_elided(&mut self) {
         assert_eq!(self.invalid_prefix_bytes, 0);
+        if self.ranked_compact {
+            assert_eq!(self.dense_len_bytes, 1usize << 29);
+            assert_eq!(self.as_bytes().len(), (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES);
+        }
         self.ranked_one_rows_elided = true;
     }
 
@@ -469,6 +520,14 @@ impl Round1AbInner {
     #[inline]
     pub fn ranked_one_rows_elided(&self) -> bool {
         self.ranked_one_rows_elided
+    }
+
+    /// Whether the ranked residual rows use the physical 29-line block
+    /// layout. This is an internal producer/consumer address contract only;
+    /// the proof and the round-one algebra are unchanged.
+    #[inline]
+    pub fn ranked_compact(&self) -> bool {
+        self.ranked_compact
     }
 
     /// Restore dense AB when a consumer cannot add the identity-C one rows.
@@ -484,10 +543,17 @@ impl Round1AbInner {
             return;
         }
         // Validate before the existing prefix repair reaches raw kernels.
-        assert_eq!(a_packed.len(), self.len_bytes());
-        assert_eq!(b_packed.len(), self.len_bytes());
+        assert_eq!(a_packed.len(), self.dense_len_bytes);
+        assert_eq!(b_packed.len(), self.dense_len_bytes);
         assert_eq!(inv_table.k, K_SKIP);
-        self.invalid_prefix_bytes = self.len_bytes();
+        if self.ranked_compact {
+            let dense = crate::scratch::take_f128(
+                self.dense_len_bytes / core::mem::size_of::<F128>(),
+            );
+            crate::scratch::give_f128(core::mem::replace(&mut self.storage, dense));
+            self.ranked_compact = false;
+        }
+        self.invalid_prefix_bytes = self.dense_len_bytes;
         self.fill_invalid_prefix(a_packed, b_packed, inv_table);
         self.ranked_one_rows_elided = false;
     }
@@ -497,7 +563,8 @@ impl Round1AbInner {
     /// from raw a/b). Round 1 recomputes them on CPU if the GPU share
     /// doesn't materialize.
     pub fn set_invalid_prefix_bytes(&mut self, bytes: usize) {
-        assert!(bytes <= self.len_bytes());
+        assert!(bytes <= self.dense_len_bytes);
+        assert!(!self.ranked_compact || bytes == 0);
         self.invalid_prefix_bytes = bytes;
     }
 
@@ -555,10 +622,19 @@ impl Round1AbInner {
         }
     }
 
-    /// Resident scratch bytes retained until the challenge-weighted finish.
+    /// Logical dense extent used by protocol-shape checks. The physical
+    /// ranked-compact allocation can be smaller; callers that need its actual
+    /// storage iterate [`Self::as_bytes`] or [`Self::as_bytes_mut`].
     pub fn len_bytes(&self) -> usize {
-        self.storage.len() * core::mem::size_of::<F128>()
+        self.dense_len_bytes
     }
+}
+
+/// Exact same-binary rollback for the ranked 29-row physical layout.
+pub fn ranked_ab_compact_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_AB_COMPACT").is_none());
+    *ON
 }
 
 /// Exact same-binary rollback for ranked complete-one-row reuse.
@@ -679,8 +755,10 @@ fn precompute_round1_ab_inner_packed_padded_impl(
 
     Round1AbInner {
         storage,
+        dense_len_bytes: total_bytes,
         invalid_prefix_bytes: 0,
         ranked_one_rows_elided: false,
+        ranked_compact: false,
     }
 }
 
@@ -1137,6 +1215,55 @@ pub unsafe fn round1_ab_inner_window_with_images(
     );
 }
 
+/// Ranked default collapses window 30's eight-K Horner to the live K0
+/// product. `FLOCK_NO_R1_WIN30_K0=1` restores the generic eight-K body.
+#[inline]
+pub fn r1_win30_k0_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R1_WIN30_K0").is_none())
+}
+
+/// Window 30: only the first eight bytes of A and B are live. Same bytes as
+/// [`round1_ab_inner_window_with_images`] for this geometry because y_1..y_7
+/// are zero.
+///
+/// # Safety
+/// As [`round1_ab_inner_window_with_images`], with `out` 64-byte aligned for
+/// the ranked nt=2 stream store. Caller sfence.
+#[inline]
+pub unsafe fn round1_ab_inner_window30_k0(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    if r1_win30_k0_enabled() && plan.nt == 2 && plan.kernel.uses_images() {
+        unsafe {
+            kernels::x86_64::shift_reduce_inner_ab_x86_avx512_window30_k0(
+                a_window,
+                b_window,
+                out,
+                (imgs.0, imgs.1),
+            );
+        }
+        return;
+    }
+    unsafe {
+        round1_ab_inner_window_with_images(
+            a_window, b_window, out, blk, inv_table, plan, imgs,
+        );
+    }
+}
+
 /// `u16` count of one window-block's pre-scaled offset block for
 /// [`round1_ab_inner_window_from_offsets`].
 pub const ROUND1_AB_OFF_WORDS: usize = 128;
@@ -1304,6 +1431,42 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
             out,
             (imgs.0, imgs.1),
             blk,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
+    const BLK: usize,
+>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK>(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
         );
     }
     #[cfg(not(all(
@@ -2122,6 +2285,10 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    assert!(
+        !ab_inner.ranked_compact(),
+        "the fused C consumer requires dense AB storage"
+    );
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
@@ -2835,6 +3002,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    assert!(
+        !ab_inner.ranked_compact(),
+        "the Fold4 C consumer requires dense AB storage"
+    );
     let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     assert!(
@@ -3044,6 +3215,21 @@ fn zc_r1ab_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// Read the ranked AB residual rows directly from their producer's live
+/// span. `FLOCK_NO_ZC_R1_AB_DIRECT=1` restores the packed-row staging copy.
+/// Resolved before the parallel band fold, never in the row/plane loops.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn zc_r1_ab_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_AB_DIRECT").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_R1AB_FIRST_WRITE=1` restores the per-band plane-bank clear
 /// and load/XOR first visit. The default arm is used only when every padding
 /// window is live, which proves that `w_idx == 0` overwrites each bank before
@@ -3138,7 +3324,9 @@ impl Drop for WorkerStateAbOnly {
 /// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
 /// instruction: same window order, same kernels, same band-end plane fold.
 /// Every C statement (and every `c_packed` byte) is gone.
-fn process_one_x_hi_ab_only(
+/// `DIRECT` only changes the GFNI input loads: the caller selects it once
+/// per band for the ranked residual `(first, end) = (2, 16), (0, 15)` pair.
+fn process_one_x_hi_ab_only<const DIRECT: bool>(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -3152,10 +3340,19 @@ fn process_one_x_hi_ab_only(
     plane_first_write: bool,
     plane_cache: bool,
     ranked_one_rows_elided: bool,
+    ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+    debug_assert!(
+        !DIRECT
+            || (eq_fold.is_some()
+                && ranked_one_rows_elided
+                && within_outer_mask == 1
+                && b_med_counts == [16, 15])
+    );
+    debug_assert!(!ranked_compact || ranked_one_rows_elided);
     if let Some((eq_bot, _, _)) = eq_fold {
         let plane_len = eq_bot.len() * 16 * ELL;
         if state.plane_banks.len() != plane_len {
@@ -3178,6 +3375,17 @@ fn process_one_x_hi_ab_only(
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
+    #[inline(always)]
+    fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
+        if compact {
+            let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
+            debug_assert!((2..31).contains(&row_in_block));
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES
+                + (row_in_block - 2) * ELL
+        } else {
+            x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
+        }
+    }
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
     // inside the window loop).
     #[cfg(target_arch = "x86_64")]
@@ -3196,7 +3404,12 @@ fn process_one_x_hi_ab_only(
         if n_b_med == 0 {
             continue;
         }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+            2
+        } else {
+            0
+        };
+        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
         // The window `ZC_R1AB_PF_WINDOWS` steps on — exactly the lines that
         // window's copy loop will demand, and exactly as many of them (the
         // padding skip drops the last chunk of every second window). Issued
@@ -3208,58 +3421,64 @@ fn process_one_x_hi_ab_only(
         // The window `ZC_R1AB_PF_WINDOWS` on, and how many of its lines the
         // padding skip leaves live.
         #[cfg(target_arch = "x86_64")]
-        let (n_next, next_base, next_first_b_med) = if pf_windows != 0 {
+        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
             let x_next = x_outer_lo + pf_windows;
+            let x_next_outer = x_next | (x_hi << n_lo);
+            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided
+                && ((x_outer + pf_windows) & within_outer_mask) == 0
+            {
+                2
+            } else {
+                0
+            };
             (
-                b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize,
-                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
-                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
-                    2
-                } else {
-                    0
-                },
+                n_next,
+                live_row_base(x_next_outer, next_first, ranked_compact),
+                next_first,
             )
         } else {
             (0, 0, 0)
         };
-        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
-            2
-        } else {
-            0
-        };
-        // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
-        // possible, and the address is formed by `wrapping_add` on the base
-        // pointer.
-        #[cfg(target_arch = "x86_64")]
-        let pf_one = |b_med: usize| unsafe {
-            core::arch::x86_64::_mm_prefetch(
-                ab_inner_ptr
-                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                    .cast::<i8>(),
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        };
-        #[cfg(target_arch = "x86_64")]
-        if !pf_spread {
-            for b_med in next_first_b_med..n_next {
-                pf_one(b_med);
-            }
-        }
-        for b_med in first_b_med..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
+        // The direct specialization issues the same hints beside its first
+        // input loads in the leaf. The fallback keeps the original copy and
+        // its prefetch delivery intact.
+        if !DIRECT {
+            // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
+            // possible, and the address is formed by `wrapping_add` on the base
+            // pointer.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med >= next_first_b_med && b_med < n_next {
-                pf_one(b_med);
+            let pf_one = |b_med: usize| unsafe {
+                core::arch::x86_64::_mm_prefetch(
+                    ab_inner_ptr
+                        .wrapping_add(next_live_base + (b_med - next_first_b_med) * ELL)
+                        .cast::<i8>(),
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+            };
+            #[cfg(target_arch = "x86_64")]
+            if !pf_spread {
+                for b_med in next_first_b_med..n_next {
+                    pf_one(b_med);
+                }
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if pf_spread {
-            for b_med in n_b_med.max(next_first_b_med)..n_next {
-                pf_one(b_med);
+            for b_med in first_b_med..n_b_med {
+                // Spread delivery: one hint per copy step, so each hint is
+                // issued next to one demand line rather than the whole block
+                // queueing ahead of the copy. Same lines, same look-ahead.
+                #[cfg(target_arch = "x86_64")]
+                if pf_spread && b_med >= next_first_b_med && b_med < n_next {
+                    pf_one(b_med);
+                }
+                let byte_base_b = live_base + (b_med - first_b_med) * ELL;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + ELL]);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if pf_spread {
+                for b_med in n_b_med.max(next_first_b_med)..n_next {
+                    pf_one(b_med);
+                }
             }
         }
         #[cfg(all(
@@ -3278,7 +3497,42 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            if plane_first_write && w_idx == 0 {
+            if DIRECT {
+                // Borrow only initialized, consumed rows. In particular, do
+                // not form a full-window array reference over the two omitted
+                // prefix rows or the odd window's unused final row.
+                let live_rows = &ab_inner
+                    [live_base..live_base + (n_b_med - first_b_med) * ELL];
+                let prefetch = kernels::AbDirectPrefetch {
+                    next_window: if pf_windows == 0 {
+                        core::ptr::null()
+                    } else {
+                        ab_inner_ptr.wrapping_add(next_live_base)
+                    },
+                    first: next_first_b_med,
+                    end: n_next,
+                    spread: pf_spread,
+                };
+                if plane_first_write && w_idx == 0 {
+                    kernels::convert_ab_nomul_gfni_direct::<true>(
+                        live_rows,
+                        first_b_med,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                        &prefetch,
+                    );
+                } else {
+                    kernels::convert_ab_nomul_gfni_direct::<false>(
+                        live_rows,
+                        first_b_med,
+                        n_b_med,
+                        mats_w,
+                        bank,
+                        &prefetch,
+                    );
+                }
+            } else if plane_first_write && w_idx == 0 {
                 if first_b_med == 2 {
                     kernels::write_convert_ab_nomul_gfni_range2(
                         &state.chunk_ab_bytes,
@@ -3438,11 +3692,21 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ranked_one_rows_elided = ab_inner.ranked_one_rows_elided();
+    let ranked_compact = ab_inner.ranked_compact();
     if ranked_one_rows_elided {
         assert_eq!(m, 32);
         assert_eq!(padding.k_log, 14);
         assert_eq!(padding.useful_bits_per_block, 15409);
         assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    }
+    if ranked_compact {
+        assert!(ranked_one_rows_elided);
+        assert_eq!(within_outer_mask, 1);
+        assert_eq!(b_med_counts.as_slice(), [16, 15]);
+        assert_eq!(
+            ab_inner.as_bytes().len(),
+            (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES
+        );
     }
     let ab_inner_bytes = ab_inner.as_bytes();
     #[cfg(all(
@@ -3524,6 +3788,24 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     )))]
     let plane_cache = false;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_ab = ranked_one_rows_elided
+        && eq_fold_state.is_some()
+        && within_outer_mask == 1
+        && b_med_counts.as_slice() == [16, 15]
+        && zc_r1_ab_direct_enabled();
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let direct_ab = false;
     let res_ab = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
@@ -3543,22 +3825,43 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 target_feature = "gfni"
             )))]
             let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
-            process_one_x_hi_ab_only(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                ab_inner_bytes,
-                &eq_lo_scaled,
-                eq_hi[x_hi],
-                convert,
-                eq_fold_arg,
-                plane_first_write,
-                plane_cache,
-                ranked_one_rows_elided,
-                &mut state,
-            );
+            if direct_ab {
+                process_one_x_hi_ab_only::<true>(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq_hi[x_hi],
+                    convert,
+                    eq_fold_arg,
+                    plane_first_write,
+                    plane_cache,
+                    ranked_one_rows_elided,
+                    ranked_compact,
+                    &mut state,
+                );
+            } else {
+                process_one_x_hi_ab_only::<false>(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq_hi[x_hi],
+                    convert,
+                    eq_fold_arg,
+                    plane_first_write,
+                    plane_cache,
+                    ranked_one_rows_elided,
+                    ranked_compact,
+                    &mut state,
+                );
+            }
             state
         })
         .map(|s| s.local_res_ab)

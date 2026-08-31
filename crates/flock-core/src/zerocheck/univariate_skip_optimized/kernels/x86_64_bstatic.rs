@@ -152,6 +152,13 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_SHIFT_REDUCE").is_none())
 }
 
+/// `FLOCK_NO_BSTATIC_28=1` keeps block 28 on the incumbent generic kernel.
+/// Ranked env is cleared, so the specialised mixed body runs for blk 28.
+fn bstatic_28_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_28").is_none())
+}
+
 /// Blocks whose specialised kernel measured faster than the incumbent on the
 /// AVX-512 box (single-thread hot, production entry point, plan-shaped
 /// inputs): 0 and 1 (every K-row's b word is all-ones: 0.70×), 30 (seven
@@ -165,6 +172,7 @@ pub(crate) const BSTATIC_LIVE: [bool; BSTATIC_BLOCKS] = {
     let mut t = [false; BSTATIC_BLOCKS];
     t[0] = true;
     t[1] = true;
+    t[28] = true;
     t[30] = true;
     t[31] = true;
     t
@@ -552,6 +560,19 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
             // Blocks 0 and 1 carry the identical plan (all-ones b on every
             // row), so they share one body and one set of partial images.
             kernel::<0>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                partials,
+                out,
+                nt,
+            )
+        } else if blk == 28 && bstatic_28_enabled() {
+            // Five STATIC rows + three GENERIC. The unrolled mixed body
+            // measured slower on typical mixed blocks; 28 is the most
+            // static mixed plan. Kill restores the incumbent for this blk.
+            kernel::<28>(
                 a_packed,
                 b_packed,
                 inv_table,

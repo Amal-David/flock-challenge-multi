@@ -82,7 +82,7 @@ pub(super) fn prepare_bstatic(
 /// resolves this once instead of entering the dispatcher per block.
 #[inline]
 pub(super) fn bstatic_window_live(blk: usize) -> bool {
-    blk <= 1 || blk == 30 || blk == 31
+    blk <= 1 || blk == 28 || blk == 30 || blk == 31
 }
 
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
@@ -346,7 +346,7 @@ pub(super) fn shift_reduce_inner_ab_at(
         unsafe {
             if let Some(partials) = bstatic {
                 // The outlined static-B dispatcher (`inline(never)`) is live
-                // only for windows 0, 1, 30, 31 — every other `blk` returns
+                // only for windows 0, 1, 28, 30, 31 — every other `blk` returns
                 // false without writing. The streaming producer still called
                 // it 28/32 of the time. Gate here so those windows stay on
                 // the prepared generic body with no extra call. Unexpected
@@ -579,6 +579,71 @@ pub(super) fn write_convert_ab_nomul_gfni_range2(
     }
 }
 
+/// The incumbent two-window prefetch schedule. `next_window` points at the
+/// first live row (`first`) so dense and ranked-compact storage share the
+/// same relative hint walk. It is used only for nonfaulting hints, never as a
+/// slice or a load/store pointer. An empty range disables hints, including
+/// when this pointer is null.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(super) struct AbDirectPrefetch {
+    pub(super) next_window: *const u8,
+    pub(super) first: usize,
+    pub(super) end: usize,
+    pub(super) spread: bool,
+}
+
+/// Direct-input twin of the ranked GFNI drains. The slice contains ONLY
+/// absolute medium rows `first_b_med..n_b_med`, not the entire window.
+/// Matrix indexing remains absolute; omitted prefix/tail rows are never read.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
+    live_rows: &[u8],
+    first_b_med: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+    prefetch: &AbDirectPrefetch,
+) {
+    // SAFETY: each arm checks the precise live span for its fixed row range;
+    // the plane/matrix arrays cover all accesses and the cfg supplies GFNI.
+    match (first_b_med, n_b_med) {
+        (2, 16) => {
+            assert_eq!(live_rows.len(), 14 * 64);
+            unsafe {
+                x86_64::convert_ab_nomul_x86_gfni_direct::<2, 16, FIRST_WRITE>(
+                    live_rows,
+                    mats,
+                    bank_planes,
+                    prefetch,
+                );
+            }
+        }
+        (0, 15) => {
+            assert_eq!(live_rows.len(), 15 * 64);
+            unsafe {
+                x86_64::convert_ab_nomul_x86_gfni_direct::<0, 15, FIRST_WRITE>(
+                    live_rows,
+                    mats,
+                    bank_planes,
+                    prefetch,
+                );
+            }
+        }
+        _ => unreachable!("direct AB input requires the ranked residual row pair"),
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
@@ -669,6 +734,14 @@ pub(super) fn write_c_banks_fold4_fused_gfni(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],

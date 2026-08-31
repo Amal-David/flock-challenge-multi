@@ -2750,6 +2750,13 @@ fn rs_elide_dead_basis_enabled() -> bool {
     *ON
 }
 
+#[inline]
+fn rs_reuse_fold8_a_state_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_REUSE_FOLD8_A").is_none());
+    *ON
+}
+
 fn rs_tail_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_TAIL_PAR").is_none());
@@ -2778,8 +2785,18 @@ fn direct_fold8_round0_wide(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 /// statistic and γ-baked byte table. `par` selects the full-width tail (see
 /// [`rs_tail_par_enabled`]); `false` is the incumbent sequential scalar
 /// form, kept verbatim as the kill-switch path and the byte-identity oracle.
+#[cfg(test)]
 fn build_direct_fold8_factors(
     fold8: &[F128],
+    suffix: &[F128],
+    table: &[F128],
+    par: bool,
+) -> DirectFold8Factors {
+    build_direct_fold8_factors_reusing_a_state(fold8.to_vec(), suffix, table, par)
+}
+
+fn build_direct_fold8_factors_reusing_a_state(
+    fold8: Vec<F128>,
     suffix: &[F128],
     table: &[F128],
     par: bool,
@@ -2793,7 +2810,7 @@ fn build_direct_fold8_factors(
     let (a_state, w_state, round0) = if par {
         direct_fold8_states_par(fold8, &low_eq, table)
     } else {
-        direct_fold8_states_seq(fold8, &low_eq, table)
+        direct_fold8_states_seq(&fold8, &low_eq, table)
     };
     let tail = &suffix[6..];
     let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -2838,7 +2855,7 @@ fn direct_fold8_states_seq(
 /// stripe), the bit-major gather writes disjoint 64-lane rows, and the
 /// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
 fn direct_fold8_states_par(
-    fold8: &[F128],
+    fold8: Vec<F128>,
     low_eq: &[F128; 64],
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
@@ -2868,7 +2885,12 @@ fn direct_fold8_states_par(
         },
     );
     let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = vec![F128::ZERO; 64 * n_packed];
+    let mut a_state = if rs_reuse_fold8_a_state_enabled() && fold8.len() == 64 * n_packed {
+        fold8
+    } else {
+        vec![F128::ZERO; 64 * n_packed]
+    };
+    debug_assert_eq!(a_state.len(), 64 * n_packed);
     w_state
         .par_chunks_mut(64)
         .zip(a_state.par_chunks_mut(64))
@@ -3546,7 +3568,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
     let claim_output =
-        |i: usize, w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
+        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -3604,10 +3626,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 }
                 _ => None,
             };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => Some(
-                    build_direct_fold8_factors(fold8, dense_suffixes[d], &table, tail_par),
-                ),
+            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
+                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
+                    Some(build_direct_fold8_factors_reusing_a_state(
+                        fold8,
+                        dense_suffixes[d],
+                        &table,
+                        tail_par,
+                    ))
+                }
                 _ => None,
             };
             let rs_eq_ind = match kinds[i] {

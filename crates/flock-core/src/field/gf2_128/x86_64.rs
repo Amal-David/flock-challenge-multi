@@ -433,6 +433,49 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// Broadcast a scalar multiplier to all four lanes and materialize its
+/// `x^64` companion once for repeated [`ghash_mul_x4_split`] calls.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` are available.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_broadcast_split(t: F128) -> (__m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        (tv, ghash_shift64_x4(tv))
+    }
+}
+
+/// Four independent [`ghash_mul_x4_split`] products by one split multiplier.
+///
+/// # Safety
+/// Same contract as [`ghash_mul_x4_split`] for every operand.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_unroll4(
+    v0: __m512i,
+    v1: __m512i,
+    v2: __m512i,
+    v3: __m512i,
+    t: __m512i,
+    t_x64: __m512i,
+) -> (__m512i, __m512i, __m512i, __m512i) {
+    // SAFETY: forwarded to four independent lane groups with the same valid
+    // split multiplier.
+    unsafe {
+        (
+            ghash_mul_x4_split(v0, t, t_x64),
+            ghash_mul_x4_split(v1, t, t_x64),
+            ghash_mul_x4_split(v2, t, t_x64),
+            ghash_mul_x4_split(v3, t, t_x64),
+        )
+    }
+}
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many
@@ -455,6 +498,41 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
 pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
     // SAFETY: caller guarantees 4 readable F128 at p.
     unsafe { _mm512_loadu_si512(p as *const __m512i) }
+}
+
+/// Extract four `F128` lanes from a 512-bit register.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `sse4.1` are available.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,sse4.1")]
+pub unsafe fn f128x4_extract(v: __m512i) -> [F128; 4] {
+    // SAFETY: register-only lane extraction under the declared features.
+    unsafe {
+        let l0 = _mm512_extracti32x4_epi32::<0>(v);
+        let l1 = _mm512_extracti32x4_epi32::<1>(v);
+        let l2 = _mm512_extracti32x4_epi32::<2>(v);
+        let l3 = _mm512_extracti32x4_epi32::<3>(v);
+        [
+            F128 {
+                lo: _mm_extract_epi64::<0>(l0) as u64,
+                hi: _mm_extract_epi64::<1>(l0) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l1) as u64,
+                hi: _mm_extract_epi64::<1>(l1) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l2) as u64,
+                hi: _mm_extract_epi64::<1>(l2) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l3) as u64,
+                hi: _mm_extract_epi64::<1>(l3) as u64,
+            },
+        ]
+    }
 }
 
 /// Pack 4 `F128` scalars into a `__m512i` (lane 0 = `a`, …, lane 3 = `d`).
@@ -546,14 +624,12 @@ impl WideGhashX4 {
     /// shift. Bit-identical to `mul_acc(x, ONE)`.
     ///
     /// # Safety
-    /// `avx512f` available (cfg-gated).
+    /// `avx512f` + `avx512bw` available (cfg-gated).
     #[inline]
-    #[target_feature(enable = "avx512f")]
+    #[target_feature(enable = "avx512f,avx512bw")]
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
-        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
-        self.mid =
-            _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
+        self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

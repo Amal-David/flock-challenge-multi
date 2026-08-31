@@ -169,6 +169,14 @@ fn cascade5_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
 }
 
+/// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted five-level cap. The
+/// default keeps composing the remaining value-identical round pairs through
+/// the ranked 26-variable tail.
+#[inline]
+fn deep_cascade_off() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+}
+
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
@@ -179,6 +187,11 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 /// The worker's mandatory untimed proof initializes it before measurements.
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
+
+#[inline]
+pub fn shared_urm_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -867,19 +880,41 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    let use_cascade6 =
+        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO && !deep_cascade_off();
+    let use_cascade7 = use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO;
+    let use_cascade8 = use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO;
+    let use_cascade9 = use_cascade8 && n_mlv >= 20 && r[k_skip + 17] != F128::ZERO;
+    let use_cascade10 = use_cascade9 && n_mlv >= 22 && r[k_skip + 19] != F128::ZERO;
+    let use_cascade11 = use_cascade10 && n_mlv >= 24 && r[k_skip + 21] != F128::ZERO;
+    let use_cascade12 = use_cascade11 && n_mlv >= 26 && r[k_skip + 23] != F128::ZERO;
     let n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
         use_cascade4,
         use_cascade5,
+        use_cascade6,
+        use_cascade7,
+        use_cascade8,
+        use_cascade9,
+        use_cascade10,
+        use_cascade11,
+        use_cascade12,
     ) {
         (false, ..) => 0,
         (true, false, ..) => 1,
         (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+        (true, true, true, false, ..) => 3,
+        (true, true, true, true, false, ..) => 4,
+        (true, true, true, true, true, false, ..) => 5,
+        (true, true, true, true, true, true, false, ..) => 6,
+        (true, true, true, true, true, true, true, false, ..) => 7,
+        (true, true, true, true, true, true, true, true, false, ..) => 8,
+        (true, true, true, true, true, true, true, true, true, false, ..) => 9,
+        (true, true, true, true, true, true, true, true, true, true, false, ..) => 10,
+        (true, true, true, true, true, true, true, true, true, true, true, false) => 11,
+        (true, true, true, true, true, true, true, true, true, true, true, true) => 12,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);

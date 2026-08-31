@@ -1116,6 +1116,89 @@ fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
     t
 }
 
+/// Build the per-pass eq bake for the round-two lookahead sweep.
+///
+/// `r_lo` are the low split's coordinates in `build_eq` order — index bit `t`
+/// of `eq_lo` selects `r_lo[t]` — i.e. `mlv_challenges[1..][..n_lo]`.
+///
+/// The sweep's odd-lane weight for the group at `x_lo = 32·B + 8·g`, lane
+/// `lane`, is `eq_lo[32·B + 8·g + 2·lane + 1]`. Those index bits split three
+/// ways: bits 0-2 are `(1, lane & 1, lane >> 1)`, bits 3-4 are `(g & 1,
+/// g >> 1)`, bits 5.. are `B`. `eq_lo` is the rank-one tensor of `r_lo`, so
+///
+/// ```text
+/// w = LV(lane) · S(g) · Etop(B)
+/// ```
+///
+/// exactly (one reassociation of the same field product). `S` is baked into
+/// four A-side matrix sets: the broadcast prefold picks its matrix per
+/// eight-row input octet `i`, and octet `i` of a 64-row batch is the four
+/// pairs `4i..4i+4`, all inside group `g = i >> 1`. `Etop` is baked into one
+/// B-side set per 32-pair batch. `LV` survives as a four-lane vector applied
+/// to the lane-reduced accumulators once per worker chunk.
+///
+/// Returns `None` unless the factorization is verified against every odd
+/// entry of `eq_lo`: the sweep must never trust a low tensor that is not this
+/// product.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_r2_eq_bake(
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    r_lo: &[F128],
+) -> Option<kernels::x86_64::R2EqBake> {
+    use crate::zerocheck::univariate_skip::build_eq;
+    use rayon::prelude::*;
+    let lo_size = eq_lo.len();
+    if r_lo.len() < 5 || (1usize << r_lo.len()) != lo_size || !lo_size.is_multiple_of(32) {
+        return None;
+    }
+    let n_batches = lo_size / 32;
+    // f₀·f₁·f₂ at the always-set bit 0: the odd entries of the three-
+    // coordinate eq, i.e. lane `l` at index `1 + 2·l`.
+    let eq3 = build_eq(&r_lo[..3]);
+    let lv: [F128; 4] = std::array::from_fn(|l| eq3[1 + 2 * l]);
+    // f₃·f₄, indexed by the 16-row group `g` of the prefold batch.
+    let s = build_eq(&r_lo[3..5]);
+    // f₅ ⋯ f_{n_lo−1}, indexed by the 32-pair prefold batch.
+    let etop = build_eq(&r_lo[5..]);
+    if s.len() != 4 || etop.len() != n_batches {
+        return None;
+    }
+    for b in 0..n_batches {
+        for g in 0..4 {
+            for lane in 0..4 {
+                let w = lv[lane] * s[g] * etop[b];
+                if w != eq_lo[32 * b + 8 * g + 2 * lane + 1] {
+                    return None;
+                }
+            }
+        }
+    }
+    // Scaling a fold table's 64 basis columns scales every XOR-composed image
+    // by the same factor, so the matrices of `c · fold` are the matrices of
+    // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
+    let cols: [F128; 64] =
+        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let scaled = |c: F128| {
+        let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
+        kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
+    };
+    let a_mats: [kernels::x86_64::R2FoldMats; 4] = std::array::from_fn(|g| scaled(s[g]));
+    let b_mats: Vec<kernels::x86_64::R2FoldMats> = etop.par_iter().map(|e| scaled(*e)).collect();
+    Some(kernels::x86_64::R2EqBake {
+        a_mats,
+        b_mats,
+        b_scale: etop,
+        lane: lv,
+    })
+}
+
 fn packed_split_n_hi(n_vars: usize) -> usize {
     let base = lookahead_n_hi(n_vars);
     #[cfg(test)]
@@ -1283,7 +1366,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             // row of this chunk, the table has the protocol-fixed 8 × 256
             // shape, and the cfg gate supplies every intrinsic feature.
             let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true, false>(
                     table.data.as_ptr(),
                     r2_mats_arg,
                     a_packed.as_ptr(),
@@ -1296,6 +1379,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     wtab_arg,
+                    None,
                 )
             };
             #[cfg(not(all(
@@ -1477,6 +1561,39 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let wtab_arg = wtab_vec.as_deref();
+    // Per-pass eq bake: the odd-lane weight factored into the prefold's
+    // matrix sets (A per broadcast octet, B per 32-pair batch) plus a
+    // period-two lane vector, so the message block consumes pre-weighted rows
+    // and its four `ghash_mul_x4_split` prescales per four-group iteration
+    // disappear. `FLOCK_NO_R2_EQ_BAKE=1` rolls back to the prescales. Ranked draw 2 marker.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let bake_vec = {
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        {
+            if r2_mats_arg.is_some()
+                && kernels::x86_64::zc_r2_bake_route_ok(lo_size)
+                && mlv_challenges.len() > eq.n_lo
+            {
+                build_r2_eq_bake(table, eq_lo, &mlv_challenges[1..1 + eq.n_lo])
+            } else {
+                None
+            }
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        {
+            None::<kernels::x86_64::R2EqBake>
+        }
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let bake_arg = bake_vec.as_ref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     let (sum1, sum_inf, agg) = (0..hi_size)
@@ -1497,20 +1614,39 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             // shape, WRITE=false touches no chunk, and the cfg gate supplies
             // every intrinsic feature.
             let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut none_a,
-                    &mut none_b,
-                    eq_lo,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    wtab_arg,
-                )
+                if let Some(bk) = bake_arg {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                        Some(bk),
+                    )
+                } else {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                        None,
+                    )
+                }
             };
             #[cfg(not(all(
                 target_arch = "x86_64",
@@ -4140,6 +4276,89 @@ mod tests {
         }
     }
 
+    /// The eq bake reproduces the portable reference exactly on the route it
+    /// replaces, with random rows and with both canonical B windows live.
+    /// A non-tensor `eq_lo` must be rejected by the builder rather than
+    /// silently mis-weighted.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn round2_lookahead_bake_matches_scalar() {
+        use crate::zerocheck::univariate_skip::build_eq;
+        const K_SKIP: usize = 6;
+        for &(lo_size, canon) in &[(32usize, false), (64, false), (128, false), (128, true)] {
+            let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            let r2_mats = r2_gfni_mats(&table);
+            let n_lo = lo_size.trailing_zeros() as usize;
+            let r_lo: Vec<F128> = (0..n_lo).map(|_| rng.f128()).collect();
+            let eq_lo = build_eq(&r_lo);
+            let n_rows = 2 * lo_size;
+            let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            if canon {
+                // All-ones B window over pairs 0..8 and the sparse window over
+                // pairs 120..128: the two raw guards of the canonical prefold.
+                b_packed[0..128].fill(0xff);
+                b_packed[240 * 8..256 * 8].fill(0);
+                b_packed[240 * 8..240 * 8 + 8]
+                    .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+            }
+            let bake =
+                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let mut a_s: [F128; 0] = [];
+            let mut b_s: [F128; 0] = [];
+            let out_s = round2_lookahead_chunk_scalar::<false>(
+                &a_packed,
+                &b_packed,
+                &table,
+                &mut a_s,
+                &mut b_s,
+                &eq_lo,
+                0,
+                0,
+                0,
+                usize::MAX,
+            );
+            let mut a_e: [F128; 0] = [];
+            let mut b_e: [F128; 0] = [];
+            // SAFETY: the packed rows cover row_base..row_base+2*lo_size, the
+            // table has the protocol shape, WRITE=false touches no chunk, and
+            // the bake was built for this exact `eq_lo` and fold table.
+            let out_b = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
+                    table.data.as_ptr(),
+                    r2_mats.as_ref(),
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    0,
+                    &mut a_e,
+                    &mut b_e,
+                    &eq_lo,
+                    0,
+                    0,
+                    usize::MAX,
+                    None,
+                    Some(&bake),
+                )
+            };
+            assert_eq!(out_s, out_b, "bake lo_size={lo_size} canon={canon}");
+        }
+        // Guard: an eq table that is not the tensor of `r_lo` cannot be
+        // factored, and the builder must say so.
+        let mut rng = Rng::new(0x5BFF);
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let r_lo: Vec<F128> = (0..5).map(|_| rng.f128()).collect();
+        let mut eq_lo = build_eq(&r_lo);
+        eq_lo[7] += F128::ONE;
+        assert!(build_r2_eq_bake(&table, &eq_lo, &r_lo).is_none());
+    }
+
     /// AVX-512 lookahead sweep kernel vs the portable reference on one chunk,
     /// with and without padded pairs, at several `lo_size` (incl. the scalar
     /// tail sizes 2 and 4).
@@ -4206,7 +4425,7 @@ mod tests {
             let mut b_v = vec![F128::ONE; 2 * lo_size];
             // SAFETY: rows/table/chunk lengths satisfy the kernel's contract.
             let out_v = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true, false>(
                     table.data.as_ptr(),
                     r2_mats_arg,
                     a_packed.as_ptr(),
@@ -4218,6 +4437,7 @@ mod tests {
                     pair_idx_base,
                     mask,
                     useful,
+                    None,
                     None,
                 )
             };
@@ -4236,7 +4456,7 @@ mod tests {
             let mut b_e: Vec<F128> = Vec::new();
             // SAFETY: as above; WRITE=false ignores the (empty) chunks.
             let out_n = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
                     table.data.as_ptr(),
                     r2_mats_arg,
                     a_packed.as_ptr(),
@@ -4249,6 +4469,7 @@ mod tests {
                     mask,
                     useful,
                     wtab_test.as_deref(),
+                    None,
                 )
             };
             assert_eq!(out_s, out_n, "no-store sums lo_size={lo_size} mask={mask}");
@@ -5450,7 +5671,7 @@ mod tests {
                         // SAFETY: all packed rows and eq entries exist. The
                         // no-materialize kernel does not touch empty outputs.
                         let got = unsafe {
-                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
                                 table.data.as_ptr(),
                                 Some(&mats),
                                 a.as_ptr(),
@@ -5463,6 +5684,7 @@ mod tests {
                                 0,
                                 usize::MAX,
                                 weights,
+                                None,
                             )
                         };
                         assert_eq!(
@@ -5474,7 +5696,7 @@ mod tests {
                         // SAFETY: same valid inputs and full-sized destinations;
                         // WRITE=true retains the existing materialized path.
                         let got = unsafe {
-                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                            kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true, false>(
                                 table.data.as_ptr(),
                                 Some(&mats),
                                 a.as_ptr(),
@@ -5487,6 +5709,7 @@ mod tests {
                                 0,
                                 usize::MAX,
                                 weights,
+                                None,
                             )
                         };
                         assert_eq!(

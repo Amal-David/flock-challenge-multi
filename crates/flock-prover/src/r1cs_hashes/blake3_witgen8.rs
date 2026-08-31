@@ -27,8 +27,9 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
-    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const,
+    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window30_k0,
+    round1_ab_inner_window_with_images, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -104,6 +105,30 @@ struct PreparedInputs {
     counter_hi: V8,
     block_len: V8,
     flags: V8,
+}
+
+/// `FLOCK_NO_EY_DEAD_W31=1` restores the incumbent projection of ranked
+/// window 31. Default ON; the ranked worker's cleared environment never
+/// disables it.
+///
+/// Window 31 is `w = 1, b_med = 15`. Round one reads window `w * 16 + b_med`
+/// only for `b_med < n_b_med[w]`, and `build_b_med_counts` gives
+/// `n_b_med[1] = ceil((USEFUL_BITS - 8192) / 512) = 15` at the pinned BLAKE3
+/// shape (`K_LOG = 14`, `USEFUL_BITS = 15409`), so `b_med = 15` is past the
+/// last live window. Nothing else reads those bytes: every `ab_inner`
+/// consumer is one of the three `b_med < n_b_med` copy loops, and the cold
+/// `restore_full_if_ranked_one_rows_elided` fallback recomputes the whole
+/// buffer from raw a/b rather than reading it.
+///
+/// Same precedent as the elided one-rows: under `one_rows_elided` windows 0
+/// and 1 are already left unwritten because round one starts at
+/// `first_b_med = 2`. The elision is gated on that same brand, so the exact
+/// shape assumptions above are the ones already asserted for it.
+#[inline(always)]
+pub(crate) fn ey_dead_w31_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_DEAD_W31").is_none());
+    *ON
 }
 
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
@@ -535,6 +560,18 @@ fn ranked_direct_dense_inline_enabled() -> bool {
     }
 }
 
+/// `FLOCK_NO_R1_B_CONSTWIN=1` restores the runtime-block B-complement leaf.
+/// Cache the rollback once and share it between the outlined and direct-inline
+/// publishers so the default ranked path cannot bypass the const-window leaf.
+#[inline(always)]
+fn ranked_b_constwin_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1_B_CONSTWIN").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    });
+    *ON
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_ranked_dense_rows(rows: &[__m512i; 8], op: *mut u16) {
@@ -590,7 +627,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 2 * 64).cast::<[u8; 64]>();
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
@@ -608,7 +648,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 29 * 64).cast::<[u8; 64]>();
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
@@ -623,10 +666,45 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
             return;
         }
 
+        if plan.bcomplement_static_eligible() && ranked_b_constwin_enabled() {
+            match blk {
+                3 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                4 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                5 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                6 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                7 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                8 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                9 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                10 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<10>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                11 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<11>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                12 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<12>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                13 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<13>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                14 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<14>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                15 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<15>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                16 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<16>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                17 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<17>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                18 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<18>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                19 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<19>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                20 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<20>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                21 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<21>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                22 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<22>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                23 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<23>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                24 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<24>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                25 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<25>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                26 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<26>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                27 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<27>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                28 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<28>(proj,plan,imgs,rows,&a_rows,&b_rows,off),
+                _ => {}
+            }
+        }
+
         let mut j = 0usize;
         while j != 8 {
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
+            let out = &mut *proj
+                .out
+                .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast::<[u8; 64]>();
             if plan.bcomplement_static_eligible() {
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
                     &*off
@@ -647,6 +725,43 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
                     imgs,
                 );
             }
+            j += 1;
+        }
+    }
+}
+
+/// Direct-inline const-window leaf. The producer-owned transposed rows remain
+/// live across publication, while the block index is fixed for the corrected
+/// B-complement core wrapper.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<const BLK: usize>(
+    proj: &StreamProj<'_>,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    a_rows: &[__m512i; 8],
+    b_rows: &[__m512i; 8],
+    off: *const u16,
+) {
+    unsafe {
+        debug_assert!((3..=28).contains(&BLK));
+        debug_assert!(plan.bcomplement_static_eligible());
+        let mut j = 0usize;
+        while j != 8 {
+            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+            let out = &mut *proj
+                .out
+                .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast::<[u8; 64]>();
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK>(
+                &*off
+                    .add(j * ROUND1_AB_OFF_WORDS)
+                    .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                out,
+                plan,
+                imgs,
+            );
             j += 1;
         }
     }
@@ -688,7 +803,12 @@ const _RING_GEOMETRY: () = {
 /// `BYTES_PER_BLOCK` ab_inner blocks.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
+    /// Physical start of this octa's output region. `out_bias` maps logical
+    /// ranked row 2 to physical row 0 without ever forming a pointer before
+    /// the allocation.
     pub(crate) out: *mut u8,
+    pub(crate) out_stride: usize,
+    pub(crate) out_bias: usize,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
     /// Ranked residual representation; dense producers leave this off.
@@ -739,7 +859,7 @@ impl StreamProj<'_> {
                 let mut j=0usize;
                 while j!=8 {
                     rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                     round1_ab_inner_window_from_offsets(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                     j+=1;
                 }
@@ -747,7 +867,7 @@ impl StreamProj<'_> {
                 let mut j=0usize;
                 while j!=8 {
                     rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                     round1_ab_inner_window_with_images(&*sa.add(j*STEP_WORDS).cast::<[u8;64]>(),&*sb.add(j*STEP_WORDS).cast::<[u8;64]>(),out,blk,self.inv_table,plan,imgs);
                     j+=1;
                 }
@@ -785,7 +905,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
             }
@@ -801,17 +921,70 @@ impl StreamProj<'_> {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
             debug_assert!(plan.bcomplement_static_eligible());
+            if ranked_b_constwin_enabled() {
+                match blk {
+                    3 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<3>(plan,imgs,rows,off),
+                    4 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<4>(plan,imgs,rows,off),
+                    5 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<5>(plan,imgs,rows,off),
+                    6 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<6>(plan,imgs,rows,off),
+                    7 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<7>(plan,imgs,rows,off),
+                    8 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<8>(plan,imgs,rows,off),
+                    9 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<9>(plan,imgs,rows,off),
+                    10 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<10>(plan,imgs,rows,off),
+                    11 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<11>(plan,imgs,rows,off),
+                    12 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<12>(plan,imgs,rows,off),
+                    13 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<13>(plan,imgs,rows,off),
+                    14 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<14>(plan,imgs,rows,off),
+                    15 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<15>(plan,imgs,rows,off),
+                    16 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<16>(plan,imgs,rows,off),
+                    17 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<17>(plan,imgs,rows,off),
+                    18 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<18>(plan,imgs,rows,off),
+                    19 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<19>(plan,imgs,rows,off),
+                    20 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<20>(plan,imgs,rows,off),
+                    21 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<21>(plan,imgs,rows,off),
+                    22 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<22>(plan,imgs,rows,off),
+                    23 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<23>(plan,imgs,rows,off),
+                    24 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<24>(plan,imgs,rows,off),
+                    25 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<25>(plan,imgs,rows,off),
+                    26 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<26>(plan,imgs,rows,off),
+                    27 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<27>(plan,imgs,rows,off),
+                    28 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<28>(plan,imgs,rows,off),
+                    _ => {}
+                }
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
                     &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
                     out,
                     plan,
                     imgs,
                     blk,
+                );
+                j+=1;
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_bcomplement_const<const BLK: usize>(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            debug_assert!((3..=28).contains(&BLK));
+            debug_assert!(plan.bcomplement_static_eligible());
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK>(
+                    &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
                 );
                 j+=1;
             }
@@ -835,7 +1008,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 if plan.bcomplement_static_eligible() {
                     round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
                         &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
@@ -861,7 +1034,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
@@ -877,7 +1050,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
@@ -899,7 +1072,7 @@ impl StreamProj<'_> {
                 let a = &*self.stage.add(j * STEP_WORDS).cast::<[u8; 64]>();
                 let out = &mut *self
                     .out
-                    .add(j * BYTES_PER_BLOCK + BLK * 64)
+                    .add(j * self.out_stride + BLK * 64 - self.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_with_images(
                     a,
@@ -926,7 +1099,7 @@ impl StreamProj<'_> {
             while j != 8 {
                 let out = &mut *self
                     .out
-                    .add(j * BYTES_PER_BLOCK + 31 * 64)
+                    .add(j * self.out_stride + 31 * 64 - self.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_with_images(
                     &RANKED_ZERO.0,
@@ -957,8 +1130,8 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_sparse_30(j,q.add(j));
                 let a=&*q.add(j).cast::<[u8;64]>();
-                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+30*64).cast::<[u8;64]>();
-                round1_ab_inner_window_with_images(a,&RANKED_B30.0,out,30,self.inv_table,plan,imgs);
+                let out=&mut *self.out.add(j*self.out_stride+30*64-self.out_bias).cast::<[u8;64]>();
+                round1_ab_inner_window30_k0(a,&RANKED_B30.0,out,self.inv_table,plan,imgs,30);
                 j+=1;
             }
         }
@@ -1145,7 +1318,7 @@ macro_rules! pushf8 {
 }
 
 #[inline(always)]
-fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
+fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8) {
     // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
     // `left = x ^ cin` and `right = y ^ cin`, and both collapse algebraically
     // (`left = sum ^ y`, `right = sum ^ x`). Computing them off `sum` removes
@@ -1153,8 +1326,7 @@ fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
     let sum = add_v8(x, y);
     let left = xor_v8(sum, y);
     let right = xor_v8(sum, x);
-    let carry = and_v8(left, right);
-    (sum, left, right, carry)
+    (sum, left, right)
 }
 
 #[inline(always)]
@@ -1578,10 +1750,18 @@ impl Drain8<'_> {
             let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
             let b_g1=if E||self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
             let (sa, sb) = proj.sides();
+            // Window 31 is `w = 1, b_med = 15`, one past round one's last live
+            // b_med at the pinned BLAKE3 shape — its 64 output bytes are never
+            // read, exactly as windows 0 and 1 are never read under the same
+            // `one_rows_elided` brand. Resolved once per call, not per window.
+            let dead_w31 = E && proj.one_rows_elided && ey_dead_w31_enabled();
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
+                if dead_w31 && blk == 31 {
+                    continue;
+                }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
                     let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
@@ -2067,25 +2247,25 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
-                let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
+                let (t0, l0, r0) = add_carry_parts_v8(state[$la], state[$lb]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
+                let (a1, l1, r1) = add_carry_parts_v8(t0, m[$mx]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
-                let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
+                let (c1s, l2, r2) = add_carry_parts_v8(state[$lc], d1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
-                let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
+                let (t1, l3, r3) = add_carry_parts_v8(a1, b1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
+                let (a2, l4, r4) = add_carry_parts_v8(t1, m[$my]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
-                let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
+                let (c2s, l5, r5) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);

@@ -89,43 +89,98 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2(
         let plan = WINDOW_PLANS[blk - 2];
         let mut modes = plan.modes;
         let apply = |p| apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, p);
-        let mut acc = _mm512_gf2p8mul_epi8(
-            apply(op.add(7 * 8)),
-            apply_b_mode(imgs, op.add(64 + 7 * 8), modes as u8),
-        );
+        let av = apply(op.add(7 * 8));
+        let (bv, correction) = apply_b_mode(imgs, op.add(64 + 7 * 8), modes as u8, av);
+        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
         let x = _mm512_set1_epi8(2);
         for k in (0..7usize).rev() {
             modes >>= 8;
             let av = apply(op.add(k * 8));
-            let bv = apply_b_mode(imgs, op.add(64 + k * 8), modes as u8);
+            let (bv, correction) =
+                apply_b_mode(imgs, op.add(64 + k * 8), modes as u8, av);
             let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), product);
+            acc = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8mul_epi8(acc, x),
+                product,
+                correction,
+            );
         }
+        _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    debug_assert!((3..=28).contains(&BLK));
+    unsafe {
+        let plan = WINDOW_PLANS[BLK - 2];
+        let apply = |p| apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, p);
+        let av = apply(op.add(7 * 8));
+        let (bv, correction) =
+            apply_b_mode(imgs, op.add(64 + 7 * 8), plan.modes as u8, av);
+        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let x = _mm512_set1_epi8(2);
+        macro_rules! step {
+            ($k:expr, $shift:expr) => {{
+                let av = apply(op.add($k * 8));
+                let (bv, correction) = apply_b_mode(
+                    imgs,
+                    op.add(64 + $k * 8),
+                    (plan.modes >> $shift) as u8,
+                    av,
+                );
+                let product = _mm512_gf2p8mul_epi8(av, bv);
+                acc = _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_gf2p8mul_epi8(acc, x),
+                    product,
+                    correction,
+                );
+            }};
+        }
+        step!(6, 8);
+        step!(5, 16);
+        step!(4, 24);
+        step!(3, 32);
+        step!(2, 40);
+        step!(1, 48);
+        step!(0, 56);
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
 }
 
 /// Shared dispatch inside the existing consumer, not one call per K-row.
 #[inline(always)]
-unsafe fn apply_b_mode(imgs: (*const u8, *const u8), op: *const u16, mode: u8) -> __m512i {
+unsafe fn apply_b_mode(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    mode: u8,
+    av: __m512i,
+) -> (__m512i, __m512i) {
     unsafe {
         match mode {
-            1 => apply_b_complement::<1, 8>(imgs, op),
-            2 => apply_b_complement::<2, 8>(imgs, op),
-            3 => apply_b_complement::<3, 8>(imgs, op),
-            4 => apply_b_complement::<4, 8>(imgs, op),
-            5 => apply_b_complement::<5, 8>(imgs, op),
-            6 => apply_b_complement::<6, 8>(imgs, op),
-            7 => apply_b_complement::<7, 8>(imgs, op),
-            8 => apply_b_complement::<0, 7>(imgs, op),
-            9 => apply_b_complement::<0, 6>(imgs, op),
-            10 => apply_b_complement::<0, 5>(imgs, op),
-            11 => apply_b_complement::<0, 4>(imgs, op),
-            12 => apply_b_complement::<0, 3>(imgs, op),
-            13 => apply_b_complement::<0, 2>(imgs, op),
-            14 => apply_b_complement::<0, 1>(imgs, op),
-            15 => _mm512_set1_epi8(1),
-            _ => apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, op),
+            1 => (apply_b_complement::<1, 8>(imgs, op), av),
+            2 => (apply_b_complement::<2, 8>(imgs, op), av),
+            3 => (apply_b_complement::<3, 8>(imgs, op), av),
+            4 => (apply_b_complement::<4, 8>(imgs, op), av),
+            5 => (apply_b_complement::<5, 8>(imgs, op), av),
+            6 => (apply_b_complement::<6, 8>(imgs, op), av),
+            7 => (apply_b_complement::<7, 8>(imgs, op), av),
+            8 => (apply_b_complement::<0, 7>(imgs, op), av),
+            9 => (apply_b_complement::<0, 6>(imgs, op), av),
+            10 => (apply_b_complement::<0, 5>(imgs, op), av),
+            11 => (apply_b_complement::<0, 4>(imgs, op), av),
+            12 => (apply_b_complement::<0, 3>(imgs, op), av),
+            13 => (apply_b_complement::<0, 2>(imgs, op), av),
+            14 => (apply_b_complement::<0, 1>(imgs, op), av),
+            15 => (_mm512_setzero_si512(), av),
+            _ => (
+                apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, op),
+                _mm512_setzero_si512(),
+            ),
         }
     }
 }
@@ -212,9 +267,7 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize>(
             _mm512_shuffle_i64x2::<0xB1>(odd, odd),
             (FIRST < 4 && END > 2) || END > 6
         );
-        // Return the actual projection, keeping Horner free of an additional
-        // per-K correction branch. This is one extra vector XOR per partial row.
-        _mm512_xor_si512(complement, _mm512_set1_epi8(1))
+        complement
     }
 }
 

@@ -570,9 +570,19 @@ pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
 // the function (the safety contract above is what makes it sound).
 #[allow(clippy::uninit_vec)]
 pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
-    let mut v: Vec<T> = Vec::with_capacity(n);
+    // Layout-basin probe, gated to LARGE allocations only. The lever exists to
+    // shift the phase of the 512 MiB pool buffers inside their 2 MiB pages, and
+    // those already go straight to mmap. Applying it to small allocations would
+    // push them over glibc's 128 KiB M_MMAP_THRESHOLD and turn heap bumps into
+    // mmap syscalls — measured at -8% before this gate was added.
+    const EY_TAIL_PAGES: usize = 96;
+    let bytes = n * core::mem::size_of::<T>();
+    let tail = if bytes >= (2 << 20) {
+        core::hint::black_box(EY_TAIL_PAGES) * 4096 / core::mem::size_of::<T>().max(1)
+    } else { 0 };
+    let mut v: Vec<T> = Vec::with_capacity(n + tail);
     // SAFETY:
-    // - capacity == n was just allocated, so set_len(n) is in bounds.
+    // - capacity >= n was just allocated, so set_len(n) is in bounds.
     // - T: Copy implies !Drop, so leaking uninit elements is a no-op.
     // - Caller upholds write-before-read.
     unsafe {

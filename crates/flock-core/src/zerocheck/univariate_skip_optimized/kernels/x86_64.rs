@@ -475,6 +475,45 @@ unsafe fn residual_2img_offw_k2_7(
     }
 }
 
+/// Ranked window 30: only K0 is live (A words 480–481, B = 0x0001_ffff_ffff_ffff
+/// then zeros). Horner of y_1..y_7 = 0 collapses to y_0 = T(A0)·T(B0).
+///
+/// # Safety
+/// `a`/`b` each supply eight readable bytes at offset 0; `out` is 64-byte
+/// aligned; `imgs` are the table's base and σ₈ image. Caller sfence.
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_window30_k0(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let apply = |bytes: *const u8| {
+            let row = |img: *const u8, i: usize| {
+                _mm512_loadu_si512(img.add(*bytes.add(i) as usize * 64).cast::<__m512i>())
+            };
+            let u0 = _mm512_xor_si512(row(imgs.0, 0), row(imgs.1, 1));
+            let u1 = _mm512_xor_si512(row(imgs.0, 2), row(imgs.1, 3));
+            let u2 = _mm512_xor_si512(row(imgs.0, 4), row(imgs.1, 5));
+            let u3 = _mm512_xor_si512(row(imgs.0, 6), row(imgs.1, 7));
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        };
+        let acc = _mm512_gf2p8mul_epi8(apply(a.as_ptr()), apply(b.as_ptr()));
+        _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
 /// Explicit ranked block-29 subset of [`horner_2img_offw`].
 #[inline(always)]
 #[cfg(all(
@@ -1470,13 +1509,13 @@ mod tests {
                     &mut dynamic,
                 );
                 if n_b_med == 15 {
-                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15, false>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
                     );
                 } else {
-                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16, false>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
@@ -1541,15 +1580,38 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
-    // SAFETY: forwarded unchanged to the shared target-feature body; the
-    // caller's write-before-read proof permits the overwrite specialization.
+    // SAFETY: each callee has this entry point's fixed-array and feature
+    // contract. Ranked 15/16 use the same const-N body as accumulate, with
+    // FIRST_WRITE so the first visit does not load dead planes. Counts
+    // outside that pair keep the generic first-write impl.
     unsafe {
-        accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
-            chunk_ab_bytes,
-            n_b_med,
-            mats,
-            bank_planes,
-        );
+        if !r1_ab_write_fixed_enabled() {
+            accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            );
+            return;
+        }
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            _ => accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            ),
+        }
     }
 }
 
@@ -1732,9 +1794,27 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
     }
 }
 
+/// Ranked first-write 15/16 uses the same const-N GFNI body as accumulate.
+/// `FLOCK_NO_R1_AB_WRITE_FIXED=1` restores the generic first-write impl.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn r1_ab_write_fixed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none()
+    });
+    *ON
+}
+
 /// Ranked fixed-row body. BLAKE3's two padding classes contain exactly
 /// fifteen and sixteen live medium rows; making that count a monomorphized
 /// constant removes LLVM's per-plane bounds ladder from the GFNI battery.
+/// `FIRST_WRITE` starts each plane from a zero register instead of loading
+/// dead bytes — the same split range2 already uses.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1743,7 +1823,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
-unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize, const FIRST_WRITE: bool>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
@@ -1759,7 +1839,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
             let mut bm = 0;
             while bm + 1 < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -1803,18 +1887,112 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     // contract. Counts outside the ranked pair retain the incumbent body.
     unsafe {
         match n_b_med {
-            15 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(chunk_ab_bytes, mats, bank_planes)
-            }
-            16 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(chunk_ab_bytes, mats, bank_planes)
-            }
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
                 chunk_ab_bytes,
                 n_b_med,
                 mats,
                 bank_planes,
             ),
+        }
+    }
+}
+
+/// Same ranked GFNI row/plane chains as the staged entry points, loading
+/// only the producer's initialized `FIRST..N` span. The caller proves the
+/// span length and that FIRST_WRITE overwrites every plane before a read.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
+    const FIRST: usize,
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    live_rows: &[u8],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+    prefetch: &super::AbDirectPrefetch,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && N == 15));
+    debug_assert_eq!(live_rows.len(), (N - FIRST) * ELL);
+    // SAFETY: the wrapper checks all (N - FIRST) live rows. Input loads use
+    // relative offsets, while matrix/row indices retain their absolute bm.
+    // The fixed output array covers all sixteen 64-byte plane stores. The
+    // prefetch pointer is only used by nonfaulting hints via wrapping_add.
+    unsafe {
+        let pf_one = |bm: usize| {
+            _mm_prefetch(
+                prefetch
+                    .next_window
+                    .wrapping_add((bm - prefetch.first) * ELL)
+                    .cast::<i8>(),
+                _MM_HINT_T0,
+            );
+        };
+        if !prefetch.spread {
+            for bm in prefetch.first..prefetch.end {
+                pf_one(bm);
+            }
+        }
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in FIRST..N {
+            // Preserve the old copy-loop hint/load interleave, now beside
+            // the first and only demand load of the original input line.
+            if prefetch.spread && bm >= prefetch.first && bm < prefetch.end {
+                pf_one(bm);
+            }
+            rows[bm] =
+                _mm512_loadu_si512(live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i);
+        }
+        if prefetch.spread {
+            for bm in N.max(prefetch.first)..prefetch.end {
+                pf_one(bm);
+            }
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = FIRST;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
         }
     }
 }
