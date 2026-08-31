@@ -3465,8 +3465,6 @@ fn process_one_x_hi_ab_direct(
     bank_bits: usize,
     plane_first_write: bool,
     plane_cache: bool,
-    pf_windows: usize,
-    pf_spread: bool,
     state: &mut WorkerStateAbOnly,
 ) {
     // The selector in the caller proves these ranked constants before this
@@ -3488,7 +3486,6 @@ fn process_one_x_hi_ab_direct(
     );
 
     let n_lo = n_lo_and_inner - N_INNER;
-    let ab_inner_ptr = ab_inner.as_ptr();
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         // Ranked padding alternates full windows (with the two identity-C
@@ -3499,17 +3496,6 @@ fn process_one_x_hi_ab_direct(
         let first_b_med = if full_window { 2 } else { 0 };
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
 
-        let (n_next, next_base, next_first_b_med) = if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            let next_outer = x_outer + pf_windows;
-            (
-                if (next_outer & 1) == 0 { 16 } else { 15 },
-                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
-                if (next_outer & 1) == 0 { 2 } else { 0 },
-            )
-        } else {
-            (0, 0, 0)
-        };
         let live_rows = &ab_inner[chunk_byte_base + first_b_med * ELL
             ..chunk_byte_base + n_b_med * ELL];
         let w_idx = x_outer_lo >> bank_bits;
@@ -3521,16 +3507,6 @@ fn process_one_x_hi_ab_direct(
             [u * 16 * ELL..(u + 1) * 16 * ELL])
             .try_into()
             .expect("one plane bank per low index");
-        let prefetch = kernels::AbDirectPrefetch {
-            next_window: if pf_windows == 0 {
-                core::ptr::null()
-            } else {
-                ab_inner_ptr.wrapping_add(next_base)
-            },
-            first: next_first_b_med,
-            end: n_next,
-            spread: pf_spread,
-        };
         if plane_first_write && w_idx == 0 {
             kernels::convert_ab_nomul_gfni_direct::<true>(
                 live_rows,
@@ -3538,7 +3514,6 @@ fn process_one_x_hi_ab_direct(
                 n_b_med,
                 mats_w,
                 bank,
-                &prefetch,
             );
         } else {
             kernels::convert_ab_nomul_gfni_direct::<false>(
@@ -3547,7 +3522,6 @@ fn process_one_x_hi_ab_direct(
                 n_b_med,
                 mats_w,
                 bank,
-                &prefetch,
             );
         }
     }
@@ -3630,8 +3604,6 @@ fn round1_ab_direct_parallel(
     bank_bits: usize,
     plane_first_write: bool,
     plane_cache: bool,
-    pf_windows: usize,
-    pf_spread: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     let res_ab = (0..hi_size)
@@ -3648,8 +3620,6 @@ fn round1_ab_direct_parallel(
                 bank_bits,
                 plane_first_write,
                 plane_cache,
-                pf_windows,
-                pf_spread,
                 &mut state,
             );
             state
@@ -3839,12 +3809,6 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         let (eq_bot, mats, bank_bits) = eq_fold_state
             .as_ref()
             .expect("direct AB requires the ranked eq-fold factors");
-        let pf_windows = if zc_r1ab_pf_enabled() {
-            ZC_R1AB_PF_WINDOWS
-        } else {
-            0
-        };
-        let pf_spread = zc_r1ab_pf_spread_enabled();
         round1_ab_direct_parallel(
             hi_size,
             big_lo_size,
@@ -3856,8 +3820,6 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             *bank_bits,
             plane_first_write,
             plane_cache,
-            pf_windows,
-            pf_spread,
         )
     } else {
         let eq_fold_arg = eq_fold_state

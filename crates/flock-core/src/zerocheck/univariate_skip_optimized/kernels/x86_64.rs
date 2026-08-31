@@ -1516,13 +1516,6 @@ mod tests {
             *matrix = next();
         }
         let seed = std::array::from_fn(|i| (next() as u8).wrapping_add(i as u8));
-        let prefetch = super::super::AbDirectPrefetch {
-            next_window: core::ptr::null(),
-            first: 0,
-            end: 0,
-            spread: false,
-        };
-
         for &(first, n) in &[(2usize, 16usize), (0, 15usize)] {
             let live_rows = unsafe {
                 core::slice::from_raw_parts(
@@ -1568,25 +1561,21 @@ mod tests {
                             live_rows,
                             &mats,
                             &mut direct,
-                            &prefetch,
                         ),
                         (2, 16, true) => convert_ab_nomul_x86_gfni_direct::<2, 16, true>(
                             live_rows,
                             &mats,
                             &mut direct,
-                            &prefetch,
                         ),
                         (0, 15, false) => convert_ab_nomul_x86_gfni_direct::<0, 15, false>(
                             live_rows,
                             &mats,
                             &mut direct,
-                            &prefetch,
                         ),
                         (0, 15, true) => convert_ab_nomul_x86_gfni_direct::<0, 15, true>(
                             live_rows,
                             &mats,
                             &mut direct,
-                            &prefetch,
                         ),
                         _ => unreachable!(),
                     }
@@ -1947,28 +1936,14 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     live_rows: &[u8],
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
-    prefetch: &super::AbDirectPrefetch,
 ) {
     use core::arch::x86_64::*;
     debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && N == 15));
     debug_assert_eq!(live_rows.len(), (N - FIRST) * ELL);
     // SAFETY: the wrapper checks all (N - FIRST) live rows. Input loads use
     // relative offsets, while matrix/row indices retain their absolute bm.
-    // The fixed output array covers all sixteen 64-byte plane stores. The
-    // prefetch pointer is only used by nonfaulting hints via wrapping_add.
+    // The fixed output array covers all sixteen 64-byte plane stores.
     unsafe {
-        let pf_one = |bm: usize| {
-            _mm_prefetch(
-                prefetch.next_window.wrapping_add(bm * ELL).cast::<i8>(),
-                _MM_HINT_T0,
-            );
-        };
-        if !prefetch.spread {
-            for bm in prefetch.first..prefetch.end {
-                pf_one(bm);
-            }
-        }
-
         // Row-major fusion: each producer row is loaded exactly once, then
         // fed through all sixteen GFNI matrices while the sixteen plane
         // accumulators stay live. The old leaf loaded the same row once per
@@ -1985,11 +1960,6 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
             };
         }
         for bm in FIRST..N {
-            // Preserve the old copy-loop hint/load interleave, now beside
-            // the first and only demand load of the original input line.
-            if prefetch.spread && bm >= prefetch.first && bm < prefetch.end {
-                pf_one(bm);
-            }
             let row = _mm512_loadu_si512(
                 live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i,
             );
@@ -1997,11 +1967,6 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
                 let matrix = _mm512_set1_epi64(mats[bm * 16 + k] as i64);
                 let converted = _mm512_gf2p8affine_epi64_epi8::<0>(row, matrix);
                 acc[k] = _mm512_xor_si512(acc[k], converted);
-            }
-        }
-        if prefetch.spread {
-            for bm in N.max(prefetch.first)..prefetch.end {
-                pf_one(bm);
             }
         }
         for k in 0..16 {

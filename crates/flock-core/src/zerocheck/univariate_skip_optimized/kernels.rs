@@ -579,22 +579,6 @@ pub(super) fn write_convert_ab_nomul_gfni_range2(
     }
 }
 
-/// The incumbent two-window prefetch schedule. `next_window` is used only
-/// for nonfaulting hints, never as a slice or a load/store pointer. An empty
-/// range disables hints, including when this pointer is null.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-pub(super) struct AbDirectPrefetch {
-    pub(super) next_window: *const u8,
-    pub(super) first: usize,
-    pub(super) end: usize,
-    pub(super) spread: bool,
-}
-
 /// Direct-input twin of the ranked GFNI drains. The slice contains ONLY
 /// absolute medium rows `first_b_med..n_b_med`, not the entire window.
 /// Matrix indexing remains absolute; omitted prefix/tail rows are never read.
@@ -611,7 +595,6 @@ pub(super) fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
     n_b_med: usize,
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * 64],
-    prefetch: &AbDirectPrefetch,
 ) {
     // SAFETY: each arm checks the precise live span for its fixed row range;
     // the plane/matrix arrays cover all accesses and the cfg supplies GFNI.
@@ -623,7 +606,6 @@ pub(super) fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
                     live_rows,
                     mats,
                     bank_planes,
-                    prefetch,
                 );
             }
         }
@@ -634,7 +616,6 @@ pub(super) fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
                     live_rows,
                     mats,
                     bank_planes,
-                    prefetch,
                 );
             }
         }
