@@ -1382,6 +1382,11 @@ fn st_fmp_run(
                 while !self.st.f_gone.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
+                // Drain this producer's published rows now. One fence at
+                // producer exit replaces the per-task fence in the split
+                // publish half; the broadcast join below remains the
+                // reader's happens-before edge for the codeword.
+                unsafe { core::arch::x86_64::_mm_sfence() };
             }
         }
         let _drain = DrainGuard { st };
@@ -2975,10 +2980,6 @@ impl AdditiveNttF128 {
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
                     );
                 }
-                // All 512 rows of this task are published. Drain the WC
-                // buffers here, exactly as the fused path does per task; the
-                // rayon join below is the reader's happens-before edge.
-                core::arch::x86_64::_mm_sfence();
             }
         };
 
