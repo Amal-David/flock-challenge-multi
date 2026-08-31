@@ -2165,6 +2165,31 @@ pub(crate) fn build_row_fold_mats_from_cols(cols: &[F128]) -> [u64; 128] {
     mats
 }
 
+/// Eight-qword broadcasts of the 128 GFNI matrices consumed by the
+/// DirectFold8 four-map batch.  The explicit 64-byte alignment lets the
+/// consumer use one aligned ZMM load per matrix; the storage lives in a box
+/// because four maps (four 8 KiB blocks) are live for one `eq_hi` block and
+/// must not enlarge the materializer's stack frame.
+#[repr(C, align(64))]
+pub(crate) struct GfniBroadcastMats(pub(crate) [[u64; 8]; 128]);
+
+/// Build a heap-resident, line-aligned broadcast form of a row-fold matrix
+/// block.  This is called once for each reachable `eq_hi`/block, outside the
+/// 64-slot loop; the old scalar matrix block remains available to the oracle
+/// kernel and to all non-DirectFold8 shapes.
+pub(crate) fn build_row_fold_mats_bcast(mats: &[u64; 128]) -> Box<GfniBroadcastMats> {
+    let mut out: Box<core::mem::MaybeUninit<GfniBroadcastMats>> = Box::new_uninit();
+    let dst = out.as_mut_ptr().cast::<[u64; 8]>();
+    for (i, &value) in mats.iter().enumerate() {
+        // SAFETY: the box points at exactly 128 contiguous `[u64; 8]`
+        // elements; each slot is written once before the box is assumed
+        // initialized.  The wrapper's repr(C) places the array at offset 0.
+        unsafe { dst.add(i).write([value; 8]) };
+    }
+    // SAFETY: every element of the sole field was initialized above.
+    unsafe { out.assume_init() }
+}
+
 /// Fold 64 consecutive packed 8-byte rows through the univariate-skip byte
 /// tables in one GFNI batch: `out[r] = Σ_j T_j[rows[8r + j]]`, bit-identical
 /// to eight gathers per row (same XOR terms, reassociated).
@@ -2431,6 +2456,141 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {
                 _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+            };
+            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+            _mm512_xor_si512(v2, v3)
+        };
+
+        {
+            let p0 = input_planes(rows0);
+            let p1 = input_planes(rows1);
+            for k in 0..16 {
+                let value = _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
+                _mm512_storeu_si512(planes.add(k), value);
+            }
+        }
+        {
+            let p2 = input_planes(rows2);
+            let p3 = input_planes(rows3);
+            for k in 0..16 {
+                let value = _mm512_xor_si512(map_plane(&p2, mats2, k), map_plane(&p3, mats3, k));
+                let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
+                _mm512_storeu_si512(planes.add(k), value);
+            }
+        }
+
+        let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
+        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
+        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        for i in 0..8 {
+            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
+            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
+            let v0 = _mm512_permutex2var_epi64(lo, il_lo, hi);
+            let v1 = _mm512_permutex2var_epi64(lo, il_hi, hi);
+            let out_ptr = out.add(8 * i).cast::<__m512i>();
+            _mm512_storeu_si512(out_ptr, v0);
+            _mm512_storeu_si512(out_ptr.add(1), v1);
+        }
+    }
+}
+
+/// DirectFold8 four-map batch with the affine matrices pre-broadcast once per
+/// `eq_hi`/block.  It is deliberately kept beside
+/// [`gfni_fold64_four_maps_staged`], whose scalar-broadcast form is the
+/// byte-exact oracle and remains the fallback for every other route.
+///
+/// The input/output transposes and the two staged accumulation trees are
+/// unchanged.  Only the matrix operand changes from a per-batch
+/// `_mm512_set1_epi64` to an aligned ZMM load from [`GfniBroadcastMats`].
+///
+/// # Safety
+/// Each row pointer covers 512 bytes, `out` covers 64 F128s, `planes` covers
+/// sixteen ZMMs, and the target features in the cfg are available.  Every
+/// broadcast matrix block must have been built by
+/// [`build_row_fold_mats_bcast`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_four_maps_staged_bcast(
+    rows0: *const u8,
+    mats0: &GfniBroadcastMats,
+    rows1: *const u8,
+    mats1: &GfniBroadcastMats,
+    rows2: *const u8,
+    mats2: &GfniBroadcastMats,
+    rows3: *const u8,
+    mats3: &GfniBroadcastMats,
+    out: *mut F128,
+    planes: *mut core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: callers provide the row/output/scratch extents and the cfg
+    // supplies every intrinsic used below.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast());
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+        let input_planes = |rows: *const u8| -> [__m512i; 8] {
+            let z: [__m512i; 8] =
+                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
+            qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
+        };
+        let map_plane = |p: &[__m512i; 8], mats: &GfniBroadcastMats, k: usize| {
+            let matrix_ptr = mats.0.as_ptr().cast::<__m512i>();
+            let g = |j: usize| {
+                // Every inner array is one 64-byte line, so this is an
+                // aligned load of eight pre-broadcast matrix qwords.
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_load_si512(matrix_ptr.add(j * 16 + k)),
+                )
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));

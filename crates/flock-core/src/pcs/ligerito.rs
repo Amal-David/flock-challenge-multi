@@ -6103,6 +6103,25 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     *ON
 }
 
+/// Same-binary rollback for the DirectFold8 matrix-broadcast hoist.  The
+/// incumbent scalar-broadcast four-map kernel remains the oracle whenever
+/// this switch is set, while the default ranked arm loads the pre-broadcast
+/// matrices built once per reachable `eq_hi` block.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_b_gfni_bcast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD8_B_GFNI_BCAST").is_none()
+    });
+    *ON
+}
+
 /// Commit parameters for the ranked DirectFold8 -> L1 overlap. This carries
 /// no challenger: the early arm can only compute (not observe) the future
 /// root.
@@ -6194,7 +6213,8 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
     use crate::zerocheck::multilinear::kernels::x86_64::{
-        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+        build_row_fold_mats_bcast, build_row_fold_mats_from_cols,
+        gfni_fold64_four_maps_staged, gfni_fold64_four_maps_staged_bcast,
     };
     use rayon::prelude::*;
 
@@ -6244,24 +6264,44 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                     super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                let use_bcast = direct_fold8_b_gfni_bcast_enabled();
+                let mats0_lo_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats0_lo));
+                let mats0_hi_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats0_hi));
+                let mats1_lo_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats1_lo));
+                let mats1_hi_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats1_hi));
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
                     // outputs cover 64 F128s, and this helper's cfg fixes all
                     // target features required by the kernel.
                     unsafe {
-                        gfni_fold64_four_maps_staged(
-                            rows0.0.as_ptr().add(slot).cast::<u8>(),
-                            &mats0_lo,
-                            rows0.1.as_ptr().add(slot).cast::<u8>(),
-                            &mats0_hi,
-                            rows1.0.as_ptr().add(slot).cast::<u8>(),
-                            &mats1_lo,
-                            rows1.1.as_ptr().add(slot).cast::<u8>(),
-                            &mats1_hi,
-                            b_out.as_mut_ptr().add(slot),
-                            gfni_tmp.as_mut_ptr().cast(),
-                        );
+                        if use_bcast {
+                            gfni_fold64_four_maps_staged_bcast(
+                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                mats0_lo_bcast.as_deref().unwrap(),
+                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                mats0_hi_bcast.as_deref().unwrap(),
+                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                mats1_lo_bcast.as_deref().unwrap(),
+                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                mats1_hi_bcast.as_deref().unwrap(),
+                                b_out.as_mut_ptr().add(slot),
+                                gfni_tmp.as_mut_ptr().cast(),
+                            );
+                        } else {
+                            gfni_fold64_four_maps_staged(
+                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_lo,
+                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_hi,
+                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_lo,
+                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_hi,
+                                b_out.as_mut_ptr().add(slot),
+                                gfni_tmp.as_mut_ptr().cast(),
+                            );
+                        }
                     }
                 }
                 // SAFETY: this helper's cfg guarantees AVX-512F+VPCLMUL;
@@ -6540,7 +6580,8 @@ fn materialize_direct_fold8(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+                        build_row_fold_mats_bcast, build_row_fold_mats_from_cols,
+                        gfni_fold64_four_maps_staged, gfni_fold64_four_maps_staged_bcast,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
@@ -6555,23 +6596,43 @@ fn materialize_direct_fold8(
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let use_bcast = direct_fold8_b_gfni_bcast_enabled();
+                    let mats0_lo_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats0_lo));
+                    let mats0_hi_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats0_hi));
+                    let mats1_lo_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats1_lo));
+                    let mats1_hi_bcast = use_bcast.then(|| build_row_fold_mats_bcast(&mats1_hi));
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
-                                b_out.as_mut_ptr().add(slot),
-                                gfni_tmp.as_mut_ptr().cast(),
-                            );
+                            if use_bcast {
+                                gfni_fold64_four_maps_staged_bcast(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    mats0_lo_bcast.as_deref().unwrap(),
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    mats0_hi_bcast.as_deref().unwrap(),
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    mats1_lo_bcast.as_deref().unwrap(),
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    mats1_hi_bcast.as_deref().unwrap(),
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            } else {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    gfni_tmp.as_mut_ptr().cast(),
+                                );
+                            }
                         }
                     }
                 }
@@ -12764,7 +12825,8 @@ mod tests {
     #[test]
     fn direct_fold4_two_claim_gfni_matches_composed_table_oracle() {
         use crate::zerocheck::multilinear::kernels::x86_64::{
-            build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+            build_row_fold_mats_bcast, build_row_fold_mats_from_cols,
+            gfni_fold64_four_maps_staged, gfni_fold64_four_maps_staged_bcast,
         };
         use core::arch::x86_64::_mm512_setzero_si512;
 
@@ -12814,6 +12876,28 @@ mod tests {
                 planes.as_mut_ptr(),
             );
         }
+        let mats0_lo_bcast = build_row_fold_mats_bcast(&mats0_lo);
+        let mats0_hi_bcast = build_row_fold_mats_bcast(&mats0_hi);
+        let mats1_lo_bcast = build_row_fold_mats_bcast(&mats1_lo);
+        let mats1_hi_bcast = build_row_fold_mats_bcast(&mats1_hi);
+        let mut got_bcast = vec![F128::ZERO; 64];
+        let mut planes_bcast = unsafe { [_mm512_setzero_si512(); 16] };
+        // SAFETY: the pre-broadcast blocks are aligned and fully initialized;
+        // all row/output/scratch extents match the oracle invocation above.
+        unsafe {
+            gfni_fold64_four_maps_staged_bcast(
+                rows[0].0.as_ptr().cast::<u8>(),
+                &mats0_lo_bcast,
+                rows[0].1.as_ptr().cast::<u8>(),
+                &mats0_hi_bcast,
+                rows[1].0.as_ptr().cast::<u8>(),
+                &mats1_lo_bcast,
+                rows[1].1.as_ptr().cast::<u8>(),
+                &mats1_hi_bcast,
+                got_bcast.as_mut_ptr(),
+                planes_bcast.as_mut_ptr(),
+            );
+        }
         let mut composed0 = vec![F128::ZERO; super::super::ring_switch::FOLD_TABLE_TOTAL];
         let mut composed1 = vec![F128::ZERO; super::super::ring_switch::FOLD_TABLE_TOTAL];
         super::super::ring_switch::compose_block_table(&direct_tables[0], eq_hi[0], &mut composed0);
@@ -12827,6 +12911,7 @@ mod tests {
                 &composed1,
             );
             assert_eq!(got[slot], expect, "slot {slot}");
+            assert_eq!(got_bcast[slot], got[slot], "broadcast slot {slot}");
         }
     }
 
