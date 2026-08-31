@@ -3150,12 +3150,71 @@ impl Drop for WorkerStateAbOnly {
     }
 }
 
+#[inline]
+fn prepare_ab_plane_banks(
+    state: &mut WorkerStateAbOnly,
+    plane_len: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+) {
+    if state.plane_banks.len() != plane_len {
+        if state.cached_plane_banks {
+            state.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+        }
+        state.plane_banks = if plane_cache {
+            state.cached_plane_banks = true;
+            take_ranked_ab_plane()
+        } else if plane_first_write {
+            // Every byte is overwritten by the `w_idx == 0` visits below
+            // before the vector is read; see the function-level guard.
+            crate::alloc_uninit_vec(plane_len)
+        } else {
+            vec![0u8; plane_len]
+        };
+    } else if !plane_first_write {
+        state.plane_banks.fill(0);
+    }
+}
+
+#[inline]
+fn finish_ab_hi(state: &mut WorkerStateAbOnly, eq_hi_val: F128) {
+    if r1_eqfold_x4_enabled() {
+        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        }
+    }
+}
+
+#[inline]
+fn finish_ab_eqfold(state: &mut WorkerStateAbOnly, eq_bot: &[F128], eq_hi_val: F128) {
+    // Plane-major -> F128 through the same vectorized kernel the C drain uses
+    // (identical bank layout: plane k, byte `k*ELL + lane`).
+    let mut bank_f128 = [F128::ZERO; ELL];
+    let wide = r1_eqfold_x4_enabled();
+    for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+        let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+            .try_into()
+            .expect("one 16-plane bank");
+        kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
+        if wide {
+            crate::field::f128_slice::add_scaled(&mut state.partial_ab, &bank_f128, *eq_bot_val);
+        } else {
+            for lane in 0..ELL {
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+            }
+        }
+    }
+    finish_ab_hi(state, eq_hi_val);
+}
+
 /// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
 /// instruction: same window order, same kernels, same band-end plane fold.
 /// Every C statement (and every `c_packed` byte) is gone.
-/// `DIRECT` only changes the GFNI input loads: the caller selects it once
-/// per band for the ranked residual `(first, end) = (2, 16), (0, 15)` pair.
-fn process_one_x_hi_ab_only<const DIRECT: bool>(
+fn process_one_x_hi_ab_only_generic(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -3173,33 +3232,13 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
 ) {
     state.partial_ab.fill(F128::ZERO);
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
-    debug_assert!(
-        !DIRECT
-            || (eq_fold.is_some()
-                && ranked_one_rows_elided
-                && within_outer_mask == 1
-                && b_med_counts == [16, 15])
-    );
     if let Some((eq_bot, _, _)) = eq_fold {
-        let plane_len = eq_bot.len() * 16 * ELL;
-        if state.plane_banks.len() != plane_len {
-            if state.cached_plane_banks {
-                state.cached_plane_banks = false;
-                give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
-            }
-            state.plane_banks = if plane_cache {
-                state.cached_plane_banks = true;
-                take_ranked_ab_plane()
-            } else if plane_first_write {
-                // Every byte is overwritten by the `w_idx == 0` visits below
-                // before the vector is read; see the function-level guard.
-                crate::alloc_uninit_vec(plane_len)
-            } else {
-                vec![0u8; plane_len]
-            };
-        } else if !plane_first_write {
-            state.plane_banks.fill(0);
-        }
+        prepare_ab_plane_banks(
+            state,
+            eq_bot.len() * 16 * ELL,
+            plane_first_write,
+            plane_cache,
+        );
     }
     let n_lo = n_lo_and_inner - N_INNER;
     // Packed-row prefetch look-ahead, resolved once per x_hi band (never
@@ -3251,44 +3290,40 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         } else {
             0
         };
-        // The direct specialization issues the same hints beside its first
-        // input loads in the leaf. The fallback keeps the original copy and
-        // its prefetch delivery intact.
-        if !DIRECT {
-            // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
-            // possible, and the address is formed by `wrapping_add` on the base
-            // pointer.
-            #[cfg(target_arch = "x86_64")]
-            let pf_one = |b_med: usize| unsafe {
-                core::arch::x86_64::_mm_prefetch(
-                    ab_inner_ptr
-                        .wrapping_add(next_base + b_med * N_CHUNKS * 8)
-                        .cast::<i8>(),
-                    core::arch::x86_64::_MM_HINT_T0,
-                );
-            };
-            #[cfg(target_arch = "x86_64")]
-            if !pf_spread {
-                for b_med in next_first_b_med..n_next {
-                    pf_one(b_med);
-                }
+        // SAFETY: `_mm_prefetch` is a hint — no memory is read, no fault is
+        // possible, and the address is formed by `wrapping_add` on the base
+        // pointer.
+        #[cfg(target_arch = "x86_64")]
+        let pf_one = |b_med: usize| unsafe {
+            core::arch::x86_64::_mm_prefetch(
+                ab_inner_ptr
+                    .wrapping_add(next_base + b_med * N_CHUNKS * 8)
+                    .cast::<i8>(),
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        };
+        #[cfg(target_arch = "x86_64")]
+        if !pf_spread {
+            for b_med in next_first_b_med..n_next {
+                pf_one(b_med);
             }
-            for b_med in first_b_med..n_b_med {
-                // Spread delivery: one hint per copy step, so each hint is
-                // issued next to one demand line rather than the whole block
-                // queueing ahead of the copy. Same lines, same look-ahead.
-                #[cfg(target_arch = "x86_64")]
-                if pf_spread && b_med >= next_first_b_med && b_med < n_next {
-                    pf_one(b_med);
-                }
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-            }
+        }
+        for b_med in first_b_med..n_b_med {
+            // Spread delivery: one hint per copy step, so each hint is
+            // issued next to one demand line rather than the whole block
+            // queueing ahead of the whole block. Same lines, same look-ahead.
             #[cfg(target_arch = "x86_64")]
-            if pf_spread {
-                for b_med in n_b_med.max(next_first_b_med)..n_next {
-                    pf_one(b_med);
-                }
+            if pf_spread && b_med >= next_first_b_med && b_med < n_next {
+                pf_one(b_med);
+            }
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med]
+                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if pf_spread {
+            for b_med in n_b_med.max(next_first_b_med)..n_next {
+                pf_one(b_med);
             }
         }
         #[cfg(all(
@@ -3307,42 +3342,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            if DIRECT {
-                // Borrow only initialized, consumed rows. In particular, do
-                // not form a full-window array reference over the two omitted
-                // prefix rows or the odd window's unused final row.
-                let live_rows = &ab_inner[chunk_byte_base + first_b_med * ELL
-                    ..chunk_byte_base + n_b_med * ELL];
-                let prefetch = kernels::AbDirectPrefetch {
-                    next_window: if pf_windows == 0 {
-                        core::ptr::null()
-                    } else {
-                        ab_inner_ptr.wrapping_add(next_base)
-                    },
-                    first: next_first_b_med,
-                    end: n_next,
-                    spread: pf_spread,
-                };
-                if plane_first_write && w_idx == 0 {
-                    kernels::convert_ab_nomul_gfni_direct::<true>(
-                        live_rows,
-                        first_b_med,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                        &prefetch,
-                    );
-                } else {
-                    kernels::convert_ab_nomul_gfni_direct::<false>(
-                        live_rows,
-                        first_b_med,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                        &prefetch,
-                    );
-                }
-            } else if plane_first_write && w_idx == 0 {
+            if plane_first_write && w_idx == 0 {
                 if first_b_med == 2 {
                     kernels::write_convert_ab_nomul_gfni_range2(
                         &state.chunk_ab_bytes,
@@ -3444,6 +3444,229 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     }
 }
 
+/// Ranked GFNI AB band body. The direct route has one fixed geometry and a
+/// non-optional eq-fold state, so the Rayon closure can stay entirely on the
+/// row-major direct leaf without carrying the generic fallback branches.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+fn process_one_x_hi_ab_direct(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    ab_inner: &[u8],
+    eq_hi_val: F128,
+    eq_bot: &[F128],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+    pf_windows: usize,
+    pf_spread: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    // The selector in the caller proves these ranked constants before this
+    // body is entered. Keep the assumptions local so a future caller cannot
+    // silently route another padding/layout shape through direct indexing.
+    debug_assert_eq!(big_lo_size, 1 << 12);
+    debug_assert_eq!(n_lo_and_inner, 12 + N_INNER);
+    debug_assert_eq!(eq_bot.len(), 1 << 7);
+    debug_assert_eq!(bank_bits, 7);
+    debug_assert_eq!(mats.len(), 32 * 256);
+
+    state.partial_ab.fill(F128::ZERO);
+    debug_assert!(!plane_first_write || !eq_bot.is_empty());
+    prepare_ab_plane_banks(
+        state,
+        eq_bot.len() * 16 * ELL,
+        plane_first_write,
+        plane_cache,
+    );
+
+    let n_lo = n_lo_and_inner - N_INNER;
+    let ab_inner_ptr = ab_inner.as_ptr();
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        // Ranked padding alternates full windows (with the two identity-C
+        // rows elided) and fifteen-row windows. This is the only geometry
+        // direct is allowed to see.
+        let full_window = (x_outer & 1) == 0;
+        let n_b_med = if full_window { 16 } else { 15 };
+        let first_b_med = if full_window { 2 } else { 0 };
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+
+        let (n_next, next_base, next_first_b_med) = if pf_windows != 0 {
+            let x_next = x_outer_lo + pf_windows;
+            let next_outer = x_outer + pf_windows;
+            (
+                if (next_outer & 1) == 0 { 16 } else { 15 },
+                ((x_next << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS,
+                if (next_outer & 1) == 0 { 2 } else { 0 },
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let live_rows = &ab_inner[chunk_byte_base + first_b_med * ELL
+            ..chunk_byte_base + n_b_med * ELL];
+        let w_idx = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & ((1usize << bank_bits) - 1);
+        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+            .try_into()
+            .expect("one 16x16 qword matrix block per w");
+        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+            [u * 16 * ELL..(u + 1) * 16 * ELL])
+            .try_into()
+            .expect("one plane bank per low index");
+        let prefetch = kernels::AbDirectPrefetch {
+            next_window: if pf_windows == 0 {
+                core::ptr::null()
+            } else {
+                ab_inner_ptr.wrapping_add(next_base)
+            },
+            first: next_first_b_med,
+            end: n_next,
+            spread: pf_spread,
+        };
+        if plane_first_write && w_idx == 0 {
+            kernels::convert_ab_nomul_gfni_direct::<true>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        } else {
+            kernels::convert_ab_nomul_gfni_direct::<false>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        }
+    }
+
+    finish_ab_eqfold(state, eq_bot, eq_hi_val);
+}
+
+/// Generic AB band fold, kept cold because the ranked direct selector takes
+/// the hot path whenever its exact geometry and eq-fold proof hold.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn round1_ab_generic_parallel(
+    hi_size: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner_bytes: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi: &[F128],
+    convert: &[F128],
+    eq_fold: Option<(&[F128], &[u64], usize)>,
+    plane_first_write: bool,
+    plane_cache: bool,
+    ranked_one_rows_elided: bool,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let res_ab = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+            process_one_x_hi_ab_only_generic(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner_bytes,
+                eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                eq_fold,
+                plane_first_write,
+                plane_cache,
+                ranked_one_rows_elided,
+                &mut state,
+            );
+            state
+        })
+        .map(|s| s.local_res_ab)
+        .reduce(
+            || [F128::ZERO; ELL],
+            |mut ab1, ab2| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
+                ab1
+            },
+        );
+    res_ab.to_vec()
+}
+
+/// Ranked direct AB fold. The closure has no Option/fallback dispatch: all
+/// ranked geometry and eq-fold factors are fixed by the caller's gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+fn round1_ab_direct_parallel(
+    hi_size: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    ab_inner_bytes: &[u8],
+    eq_hi: &[F128],
+    eq_bot: &[F128],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+    pf_windows: usize,
+    pf_spread: bool,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+    let res_ab = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+            process_one_x_hi_ab_direct(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                ab_inner_bytes,
+                eq_hi[x_hi],
+                eq_bot,
+                mats,
+                bank_bits,
+                plane_first_write,
+                plane_cache,
+                pf_windows,
+                pf_spread,
+                &mut state,
+            );
+            state
+        })
+        .map(|s| s.local_res_ab)
+        .reduce(
+            || [F128::ZERO; ELL],
+            |mut ab1, ab2| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                }
+                ab1
+            },
+        );
+    res_ab.to_vec()
+}
+
 /// Ranked default routes the round-one AB band folds — the plane-bank
 /// accumulate and the band-end `eq_hi` fold — through the shared
 /// `f128_slice::add_scaled` leaf. `FLOCK_NO_ZC_R1_EQFOLD_X4=1` restores the
@@ -3478,7 +3701,6 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
@@ -3596,83 +3818,89 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     ))]
     let direct_ab = ranked_one_rows_elided
         && eq_fold_state.is_some()
+        && m == 32
+        && n_lo == 12
+        && hi_size == 128
         && within_outer_mask == 1
         && b_med_counts.as_slice() == [16, 15]
+        && eq_fold_state
+            .as_ref()
+            .is_some_and(|(eq_bot, mats, bank_bits)| {
+                eq_bot.len() == 1 << 7 && mats.len() == (1 << 5) * 256 && *bank_bits == 7
+            })
         && zc_r1_ab_direct_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let res_ab = if direct_ab {
+        let (eq_bot, mats, bank_bits) = eq_fold_state
+            .as_ref()
+            .expect("direct AB requires the ranked eq-fold factors");
+        let pf_windows = if zc_r1ab_pf_enabled() {
+            ZC_R1AB_PF_WINDOWS
+        } else {
+            0
+        };
+        let pf_spread = zc_r1ab_pf_spread_enabled();
+        round1_ab_direct_parallel(
+            hi_size,
+            big_lo_size,
+            n_lo_and_inner,
+            ab_inner_bytes,
+            &eq_hi,
+            eq_bot,
+            mats,
+            *bank_bits,
+            plane_first_write,
+            plane_cache,
+            pf_windows,
+            pf_spread,
+        )
+    } else {
+        let eq_fold_arg = eq_fold_state
+            .as_ref()
+            .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
+        round1_ab_generic_parallel(
+            hi_size,
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            &b_med_counts,
+            ab_inner_bytes,
+            &eq_lo_scaled,
+            &eq_hi,
+            convert,
+            eq_fold_arg,
+            plane_first_write,
+            plane_cache,
+            ranked_one_rows_elided,
+        )
+    };
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     )))]
-    let direct_ab = false;
-    let res_ab = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let eq_fold_arg = eq_fold_state
-                .as_ref()
-                .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
-            if direct_ab {
-                process_one_x_hi_ab_only::<true>(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    ab_inner_bytes,
-                    &eq_lo_scaled,
-                    eq_hi[x_hi],
-                    convert,
-                    eq_fold_arg,
-                    plane_first_write,
-                    plane_cache,
-                    ranked_one_rows_elided,
-                    &mut state,
-                );
-            } else {
-                process_one_x_hi_ab_only::<false>(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    ab_inner_bytes,
-                    &eq_lo_scaled,
-                    eq_hi[x_hi],
-                    convert,
-                    eq_fold_arg,
-                    plane_first_write,
-                    plane_cache,
-                    ranked_one_rows_elided,
-                    &mut state,
-                );
-            }
-            state
-        })
-        .map(|s| s.local_res_ab)
-        .reduce(
-            || [F128::ZERO; ELL],
-            |mut ab1, ab2| {
-                for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                }
-                ab1
-            },
-        );
-    res_ab.to_vec()
+    let res_ab = round1_ab_generic_parallel(
+        hi_size,
+        big_lo_size,
+        n_lo_and_inner,
+        within_outer_mask,
+        &b_med_counts,
+        ab_inner_bytes,
+        &eq_lo_scaled,
+        &eq_hi,
+        convert,
+        None,
+        plane_first_write,
+        plane_cache,
+        ranked_one_rows_elided,
+    );
+    res_ab
 }
 
 /// Identity-C's block-major outer fold at `r_outer`. `par` routes through

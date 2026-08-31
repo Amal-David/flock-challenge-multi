@@ -1267,13 +1267,17 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
 mod tests {
     use super::super::accumulate_c_banks_scalar;
     use super::{
-        F128, accumulate_c_banks_x86_avx512, accumulate_c_banks_x86_avx512_nibble,
+        ELL, F128, N_MEDIUM, accumulate_c_banks_x86_avx512,
+        accumulate_c_banks_x86_avx512_nibble,
         accumulate_convert_ab_x86_avx512, accumulate_convert_ab_x86_avx512_nibble,
     };
     #[cfg(target_feature = "gfni")]
     use super::{
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
         accumulate_convert_ab_nomul_x86_gfni_fixed,
+        accumulate_convert_ab_nomul_x86_gfni_range2,
+        convert_ab_nomul_x86_gfni_direct, write_convert_ab_nomul_x86_gfni,
+        write_convert_ab_nomul_x86_gfni_range2,
     };
 
     #[test]
@@ -1484,6 +1488,111 @@ mod tests {
                 }
             }
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
+        }
+    }
+
+    /// The row-major direct leaf must match the staged old leaf for both
+    /// ranked padding geometries, with and without the first-write
+    /// overwrite. A poisoned destination makes an accidental bank read in
+    /// the overwrite form observable.
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn direct_row_major_matches_staged_poisoned_bank() {
+        let mut word = 0xD6E8_FEB8_6659_FD93u64;
+        let mut next = || {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            word
+        };
+        let mut chunk_ab_bytes = [[0u8; ELL]; 1 << N_MEDIUM];
+        for row in &mut chunk_ab_bytes {
+            for byte in row {
+                *byte = next() as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for matrix in &mut mats {
+            *matrix = next();
+        }
+        let seed = std::array::from_fn(|i| (next() as u8).wrapping_add(i as u8));
+        let prefetch = super::super::AbDirectPrefetch {
+            next_window: core::ptr::null(),
+            first: 0,
+            end: 0,
+            spread: false,
+        };
+
+        for &(first, n) in &[(2usize, 16usize), (0, 15usize)] {
+            let live_rows = unsafe {
+                core::slice::from_raw_parts(
+                    chunk_ab_bytes.as_ptr().cast::<u8>().add(first * ELL),
+                    (n - first) * ELL,
+                )
+            };
+            for &first_write in &[false, true] {
+                let mut old = seed;
+                let mut direct = seed;
+                // The old wrappers and the direct leaf both use absolute
+                // matrix row indices; only the direct input span is sliced.
+                unsafe {
+                    match (first, n, first_write) {
+                        (2, 16, false) => accumulate_convert_ab_nomul_x86_gfni_range2(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut old,
+                        ),
+                        (2, 16, true) => write_convert_ab_nomul_x86_gfni_range2(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut old,
+                        ),
+                        (0, 15, false) => accumulate_convert_ab_nomul_x86_gfni(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut old,
+                        ),
+                        (0, 15, true) => write_convert_ab_nomul_x86_gfni(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut old,
+                        ),
+                        _ => unreachable!(),
+                    }
+                    match (first, n, first_write) {
+                        (2, 16, false) => convert_ab_nomul_x86_gfni_direct::<2, 16, false>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (2, 16, true) => convert_ab_nomul_x86_gfni_direct::<2, 16, true>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (0, 15, false) => convert_ab_nomul_x86_gfni_direct::<0, 15, false>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (0, 15, true) => convert_ab_nomul_x86_gfni_direct::<0, 15, true>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+                assert_eq!(direct, old, "first={first} n={n} first_write={first_write}");
+            }
         }
     }
 }
@@ -1859,15 +1968,36 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
                 pf_one(bm);
             }
         }
-        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+
+        // Row-major fusion: each producer row is loaded exactly once, then
+        // fed through all sixteen GFNI matrices while the sixteen plane
+        // accumulators stay live. The old leaf loaded the same row once per
+        // plane by keeping a `rows` array and iterating plane-major; that
+        // array is deliberately absent here so the demand stream is one
+        // contiguous pass over `live_rows`.
+        let mut acc = [_mm512_setzero_si512(); 16];
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            acc[k] = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+        }
         for bm in FIRST..N {
             // Preserve the old copy-loop hint/load interleave, now beside
             // the first and only demand load of the original input line.
             if prefetch.spread && bm >= prefetch.first && bm < prefetch.end {
                 pf_one(bm);
             }
-            rows[bm] =
-                _mm512_loadu_si512(live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i);
+            let row = _mm512_loadu_si512(
+                live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i,
+            );
+            for k in 0..16 {
+                let matrix = _mm512_set1_epi64(mats[bm * 16 + k] as i64);
+                let converted = _mm512_gf2p8affine_epi64_epi8::<0>(row, matrix);
+                acc[k] = _mm512_xor_si512(acc[k], converted);
+            }
         }
         if prefetch.spread {
             for bm in N.max(prefetch.first)..prefetch.end {
@@ -1876,32 +2006,7 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = if FIRST_WRITE {
-                _mm512_setzero_si512()
-            } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
-            };
-            let mut bm = FIRST;
-            while bm + 1 < N {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
-                );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
-                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
-                );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                bm += 2;
-            }
-            if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
-                );
-                acc = _mm512_xor_si512(acc, g);
-            }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(plane_ptr, acc[k]);
         }
     }
 }

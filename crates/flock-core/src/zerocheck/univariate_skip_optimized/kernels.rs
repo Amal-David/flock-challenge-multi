@@ -732,6 +732,14 @@ pub(super) fn write_c_banks_fold4_fused_gfni(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],
