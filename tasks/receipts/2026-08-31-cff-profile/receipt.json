@@ -3,6 +3,7 @@
   "base_sha": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
   "canonical_receipts": {
     "council_closure": "R-5db2338c4987b2cd079a8e4117cbd32e69537a36c117072b87929e37e4959fe7",
+    "latest_public_cluster": "R-29a130f953319863d4ba20bc94ded09427af08c048715e15d1d715d4f44be996",
     "profile": "R-5269fb3fa85527e8d1d859fbd9310c4cd5412c8ab0848a494c09ae6f0a50431c"
   },
   "decision": "PROFILE_COMPLETE_ADMIT_NONE",
