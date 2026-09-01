@@ -2008,8 +2008,7 @@ unsafe fn fold16_to_4_deferred(
         let x02 = _mm512_xor_si512(x0, x2);
         let x0123 = _mm512_xor_si512(x01, _mm512_xor_si512(x2, x3));
         let mut acc = WideGhashX4::zero();
-        acc.mul_acc(ra, x01);
-        acc.mul_acc(rb, x02);
+        acc.mul_acc2(ra, x01, rb, x02);
         acc.mul_acc(rarb, x0123);
         _mm512_xor_si512(x0, acc.reduce_lanes())
     }

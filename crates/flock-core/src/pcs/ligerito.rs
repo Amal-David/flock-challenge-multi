@@ -6520,7 +6520,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(2);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
