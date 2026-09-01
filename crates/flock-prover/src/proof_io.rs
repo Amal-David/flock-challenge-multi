@@ -239,6 +239,64 @@ pub(crate) fn pre_encode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
 }
 
+/// `FLOCK_NO_PUBTAIL_FIX=1` restores the incumbent stash: allocate the ~460 kB
+/// publish buffer on the helper thread and leave all but the ~2 pages the
+/// prefix lands in UNTOUCHED, so ~104 of them first-touch inside the timed
+/// publish tail. Default on (the ranked harness `env_clear()`s).
+fn pubtail_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_PUBTAIL_FIX").map_or(true, |v| v != "1"))
+}
+
+/// First-touch every page of `bytes`' whole *capacity* on the calling thread.
+///
+/// The stash allocates `HEADER_LEN + 460_000` bytes and writes only the
+/// ~4.3 kB prefix into it, so ~104 pages of that buffer are still virgin when
+/// the stash is handed to the publish tail — and the tail's
+/// `encode_pcs_open_into` first-touches every one of them INSIDE the scored
+/// window. The allocation itself is not the problem (the incumbent
+/// single-shot `to_bytes` reserves the same 460 kB); the problem is *when*
+/// the pages are first written.
+///
+/// One byte per page, written where nothing will ever read it, moves that
+/// work onto the stash's own detached helper thread. It is paid off-tail,
+/// concurrent with the ~20 ms open, and — because every untimed warm-up prove
+/// stashes too — the allocator's backing pages are already resident by the
+/// time the scored prove runs, so the scored window pays it a second time
+/// only for whatever the allocator hands out fresh. Measured on this box
+/// (36 paired same-binary processes, minor faults between seed-write and
+/// proof-rename): median 126.5 faults with `FLOCK_NO_PUBTAIL_FIX=1`, 50 with
+/// the fix on (16 vs 122 over the 22 pairs free of an unrelated box-level
+/// fault burst); publish tail 0.556 ms -> 0.402 ms, paired median
+/// -0.154 ms, 33/36 wins.
+///
+/// The published bytes cannot move: only `[0, len)` is ever serialized, and
+/// this touches only `[len, capacity)` and leaves `len` alone.
+fn prefault_spare_capacity(bytes: &mut Vec<u8>) {
+    // Smallest page this target can hand out; a huge page just makes some of
+    // these stores redundant, never wrong.
+    const PAGE: usize = 4096;
+    let cap = bytes.capacity();
+    if cap == 0 {
+        return;
+    }
+    let ptr = bytes.as_mut_ptr();
+    let mut off = 0usize;
+    while off < cap {
+        // SAFETY: `ptr` owns `cap` bytes of allocated storage, so every
+        // offset below `cap` is in bounds of that allocation. A `u8` write
+        // needs no prior initialization and cannot leave an invalid value.
+        // `len` is untouched, so the writes stay in the never-read spare
+        // capacity. `write_volatile` keeps them from being optimized away as
+        // dead stores — the page fault they force IS the point.
+        unsafe { std::ptr::write_volatile(ptr.add(off), 0u8) };
+        off += PAGE;
+    }
+    // The final partial page (`cap` is not a page multiple).
+    // SAFETY: as above; `cap >= 1` here.
+    unsafe { std::ptr::write_volatile(ptr.add(cap - 1), 0u8) };
+}
+
 /// Encode and stash the publish prefix for a prove whose commitment /
 /// zerocheck / lincheck are final. Called by the prover on a detached helper
 /// thread concurrently with the PCS open (tens of µs of alloc + encode
@@ -248,12 +306,27 @@ pub fn stash_pre_encoded_prefix(
     zerocheck: &flock_core::zerocheck::ZerocheckProof,
     lincheck: &flock_core::lincheck::LincheckProof,
 ) {
+    stash_pre_encoded_prefix_with(commitment, zerocheck, lincheck, pubtail_fix_enabled());
+}
+
+/// [`stash_pre_encoded_prefix`] with the publish-tail fix taken as an
+/// argument instead of from the process-wide env gate, so a test can encode
+/// the same bundle both ways in one process and byte-compare.
+fn stash_pre_encoded_prefix_with(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+    prefault: bool,
+) {
     if !pre_encode_enabled() {
         return;
     }
     // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
     // append extends this exact Vec, so it must never need to grow.
     let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
+    if prefault {
+        prefault_spare_capacity(&mut bytes);
+    }
     write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
     let mut sec_lens = [0u64; 3];
     let mut mark = bytes.len();
@@ -662,6 +735,205 @@ mod tests {
                 "flat encoder diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
             );
         }
+    }
+
+    /// A synthetic bundle with a `pcs_open` of a chosen size. Fully public
+    /// fields, so no prove is needed — this test is about bytes, not soundness.
+    fn synthetic_bundle(
+        seed: u64,
+        n_rows: usize,
+        width: usize,
+        n_rec: usize,
+        n_msgs: usize,
+    ) -> R1csProofBundleLigerito {
+        let mut rng = Rng::new(seed);
+        let f128 = |rng: &mut Rng| F128::new(rng.nx(), rng.nx());
+        let f128_vec = |rng: &mut Rng, n: usize| -> Vec<F128> {
+            (0..n).map(|_| F128::new(rng.nx(), rng.nx())).collect()
+        };
+        let hash_vec = |rng: &mut Rng, n: usize| -> Vec<MerkleHash> {
+            (0..n)
+                .map(|_| std::array::from_fn(|_| rng.nx() as u8))
+                .collect()
+        };
+        let rows = |rng: &mut Rng, n: usize, w: usize| -> Vec<Vec<F128>> {
+            (0..n)
+                .map(|i| {
+                    (0..(w + i % 3))
+                        .map(|_| F128::new(rng.nx(), rng.nx()))
+                        .collect()
+                })
+                .collect()
+        };
+        let recursive_proof = |rng: &mut Rng| RecursiveProof {
+            opened_rows: rows(rng, n_rows, width),
+            merkle_proof: hash_vec(rng, n_rows * 2 + 1),
+        };
+        let pcs_open = BatchOpeningProofLigerito {
+            ring_switches: (0..3)
+                .map(|i| RingSwitchProof {
+                    s_hat_v: f128_vec(&mut rng, i * 9 + 5),
+                })
+                .collect(),
+            ligerito: LigeritoProof {
+                initial_root: std::array::from_fn(|_| rng.nx() as u8),
+                initial_proof: recursive_proof(&mut rng),
+                recursive_roots: hash_vec(&mut rng, n_rec),
+                recursive_proofs: (0..n_rec).map(|_| recursive_proof(&mut rng)).collect(),
+                final_proof: FinalProof {
+                    yr: f128_vec(&mut rng, n_msgs * 3),
+                    opened_rows: rows(&mut rng, n_rows, width),
+                    merkle_proof: hash_vec(&mut rng, n_rows),
+                },
+                sumcheck_transcript: (0..n_msgs)
+                    .map(|_| SumcheckMessage {
+                        u_0: f128(&mut rng),
+                        u_2: f128(&mut rng),
+                    })
+                    .collect(),
+                grinding_nonces: (0..n_rec).map(|_| rng.nx()).collect(),
+                ood_values: f128_vec(&mut rng, n_rec),
+                fold_grinding_nonces: (0..n_msgs).map(|_| rng.nx()).collect(),
+            },
+        };
+        R1csProofBundleLigerito {
+            commitment: Commitment {
+                root: std::array::from_fn(|_| rng.nx() as u8),
+                params: flock_core::pcs::PcsParams {
+                    m: 32,
+                    log_inv_rate: 1,
+                    log_batch_size: 5,
+                    profile: Default::default(),
+                    merkle_hash: Default::default(),
+                },
+            },
+            proof: flock_core::proof::R1csProofLigerito {
+                zerocheck: flock_core::zerocheck::ZerocheckProof {
+                    round1_ab: f128_vec(&mut rng, 128),
+                    round1_c: f128_vec(&mut rng, 128),
+                    multilinear_rounds: (0..25)
+                        .map(|_| (f128(&mut rng), f128(&mut rng)))
+                        .collect(),
+                    final_a_eval: f128(&mut rng),
+                    final_b_eval: f128(&mut rng),
+                    final_c_eval: f128(&mut rng),
+                },
+                lincheck: flock_core::lincheck::LincheckProof {
+                    rounds: (0..11).map(|_| (f128(&mut rng), f128(&mut rng))).collect(),
+                    z_partial: f128_vec(&mut rng, 256),
+                },
+                pcs_open,
+            },
+        }
+    }
+
+    /// Index of the first byte at which two equal-length buffers differ.
+    fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+        (a != b).then(|| a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0))
+    }
+
+    /// The publish-tail prefault must not move a single published byte.
+    ///
+    /// The shipped default (`prefault = true`) and the `FLOCK_NO_PUBTAIL_FIX=1`
+    /// incumbent (`prefault = false`) encode the SAME bundle in the SAME
+    /// process, and both must equal the incumbent single-shot
+    /// `header ‖ bincode(bundle)`. Two shapes: one whose encoding fits the
+    /// stash's reserved 460 kB (the ranked case, no realloc after the
+    /// prefault) and one that overflows it (the prefaulted buffer must still
+    /// grow correctly).
+    #[test]
+    fn pubtail_prefault_keeps_bytes_identical() {
+        for (label, n_rows, width, n_rec, n_msgs) in [
+            ("under-capacity", 64usize, 48usize, 4usize, 55usize),
+            ("over-capacity", 128, 64, 4, 55),
+        ] {
+            let bundle = synthetic_bundle(0x5AFE_7A11, n_rows, width, n_rec, n_msgs);
+
+            let mut reference = Vec::new();
+            write_header(&mut reference, FLAVOR_R1CS_LIGERITO);
+            bincode::serialize_into(&mut reference, &bundle).expect("reference serialize");
+
+            let mut arms: Vec<Vec<u8>> = Vec::new();
+            for prefault in [true, false] {
+                // Clear any stash a sibling test left behind, so the
+                // `is_some` check below is about OUR stash.
+                if let Ok(mut slot) = PRE_ENCODED.lock() {
+                    *slot = None;
+                }
+                stash_pre_encoded_prefix_with(
+                    &bundle.commitment,
+                    &bundle.proof.zerocheck,
+                    &bundle.proof.lincheck,
+                    prefault,
+                );
+                if pre_encode_enabled() {
+                    assert!(
+                        PRE_ENCODED.lock().expect("stash lock").is_some(),
+                        "{label}: stash not written (prefault={prefault})"
+                    );
+                }
+                let bytes = bundle.to_bytes();
+                if pre_encode_enabled() {
+                    assert!(
+                        PRE_ENCODED.lock().expect("stash lock").is_none(),
+                        "{label}: fast path did not consume the stash (prefault={prefault})"
+                    );
+                }
+                assert_eq!(
+                    bytes.len(),
+                    reference.len(),
+                    "{label}: length moved (prefault={prefault})"
+                );
+                // Compact report: a 437 kB `assert_eq!` dump is unreadable.
+                if let Some(i) = first_difference(&bytes, &reference) {
+                    panic!(
+                        "{label}: published bytes moved at index {i} \
+                         (prefault={prefault}): got {:#04x}, want {:#04x}",
+                        bytes[i], reference[i]
+                    );
+                }
+                arms.push(bytes);
+            }
+            if let Some(i) = first_difference(&arms[0], &arms[1]) {
+                panic!(
+                    "{label}: fix ON vs OFF differ at index {i}: {:#04x} vs {:#04x}",
+                    arms[0][i], arms[1][i]
+                );
+            }
+            eprintln!(
+                "pubtail prefault {label}: {} bytes identical ON/OFF",
+                arms[0].len()
+            );
+        }
+    }
+
+    /// The prefault writes only into spare capacity: it must not reallocate,
+    /// must not change `len`, and must leave every subsequently written byte
+    /// exactly where it would otherwise be.
+    #[test]
+    fn prefault_touches_only_spare_capacity() {
+        let payload: Vec<u8> = (0..9_999u32).map(|i| (i % 251) as u8).collect();
+        let mut plain = Vec::with_capacity(HEADER_LEN + 460_000);
+        plain.extend_from_slice(&payload);
+
+        let mut touched = Vec::with_capacity(HEADER_LEN + 460_000);
+        let cap_before = touched.capacity();
+        let ptr_before = touched.as_ptr();
+        prefault_spare_capacity(&mut touched);
+        assert_eq!(touched.len(), 0, "prefault changed len");
+        assert_eq!(touched.capacity(), cap_before, "prefault reallocated");
+        assert_eq!(touched.as_ptr(), ptr_before, "prefault moved the buffer");
+        touched.extend_from_slice(&payload);
+        assert_eq!(touched, plain, "prefault perturbed written bytes");
+
+        // Degenerate shapes must be no-ops, not out-of-bounds writes.
+        let mut empty: Vec<u8> = Vec::new();
+        prefault_spare_capacity(&mut empty);
+        assert!(empty.is_empty());
+        let mut tiny: Vec<u8> = Vec::with_capacity(1);
+        prefault_spare_capacity(&mut tiny);
+        tiny.push(7);
+        assert_eq!(tiny, vec![7]);
     }
 
     /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.

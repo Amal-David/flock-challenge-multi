@@ -900,14 +900,86 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         m,
         k_log,
         useful_bits,
-        |outer_base| {
-            std::array::from_fn(|r| {
-                let outer = outer_base + r;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
-        },
+        |outer_base| eq8_from_factors(eq_lo, eq_hi, outer_base, log_b, lo_mask),
         top_bind,
     )
+}
+
+/// `FLOCK_NO_LC_EQ8_X4=1` restores eight scalar `eq_lo * eq_hi` products per
+/// stripe. Default: two 4-lane `ghash_mul_x4` products. Same 8 field
+/// elements; F128 multiply is the canonical mod-p product either way.
+fn lc_eq8_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EQ8_X4").is_none());
+    *ON
+}
+
+/// Eight consecutive factorized outer weights starting at `outer_base`.
+fn eq8_from_factors(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_eq8_x4_enabled() {
+        // SAFETY: cfg supplies avx512f+vpclmulqdq; the 8 indices are the
+        // same formula as the scalar loop (lo_mask / log_b).
+        return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
+    }
+    std::array::from_fn(|r| {
+        let outer = outer_base + r;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
+}
+
+/// Four-then-four 4-lane products of the factorized eq tensor. Bit-identical
+/// to eight scalar `eq_lo[i]*eq_hi[i]` because `ghash_mul_x4` is the same
+/// canonical reduction as `Mul`.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq`. `outer_base .. outer_base+8` is in-range for
+/// the factorized tensor (`eq_lo.len() * eq_hi.len()`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn eq8_from_factors_x4(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    let mut out = [F128::ZERO; 8];
+    // SAFETY: eight consecutive factorized indices; each load is an F128
+    // the scalar loop would read, packed into one ZMM of four lanes.
+    unsafe {
+        for g in 0..2 {
+            let mut lo = [F128::ZERO; 4];
+            let mut hi = [F128::ZERO; 4];
+            for r in 0..4 {
+                let outer = outer_base + 4 * g + r;
+                lo[r] = eq_lo[outer & lo_mask];
+                hi[r] = eq_hi[outer >> log_b];
+            }
+            let prod = ghash_mul_x4(
+                _mm512_loadu_si512(lo.as_ptr() as *const __m512i),
+                _mm512_loadu_si512(hi.as_ptr() as *const __m512i),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(4 * g) as *mut __m512i, prod);
+        }
+    }
+    out
 }
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
@@ -1246,6 +1318,25 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: identity-C worker-reduce reconstructs each 64-column
+/// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
+/// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
+/// restores the incumbent GPR transpose. Same bytes either way.
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar `scale * out[i]` loops for
+/// the ranked identity-C one-row epilogue. Default uses [`add_scaled`] on
+/// the two live ranges (zero dest ⇒ `scale * src`). Ranked env is cleared.
+fn lc_one_scale_vec_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_SCALE").is_some());
+    *OFF
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1472,6 +1563,20 @@ unsafe fn reduce_worker_plane_block(
         unsafe {
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
+    }
+    // Same 16×64 plane layout as the fused C-drain bank. That leaf already
+    // bit-transposes eight plane-ZMMs and interleaves lo/hi into AoS F128;
+    // the GPR 8×8 path below is the same map on 8-byte groups.
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_plane_f128_enabled() {
+        let bank: &[u8; 1024] = &acc;
+        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(bank, out64);
+        return;
     }
     // The plane rows are contiguous, while the old per-column loop made 16
     // strided byte loads for every F128. Transpose eight 8-byte groups with
@@ -2191,11 +2296,23 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         let half = k / 2;
         let mut one = vec![F128::ZERO; half];
         let scale_lo = F128::ONE + r;
-        for i in 0..1152 {
-            one[i] = scale_lo * out[i];
-        }
-        for i in 15104..15360 {
-            one[i - half] = r * out[i];
+        // Ranked one-rows: 1152 live low slots and 256 live high slots.
+        // `add_scaled` on a zero dest is `scale * src` (XOR-identity). Kill
+        // `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
+        if lc_one_scale_vec_disabled() {
+            for i in 0..1152 {
+                one[i] = scale_lo * out[i];
+            }
+            for i in 15104..15360 {
+                one[i - half] = r * out[i];
+            }
+        } else {
+            crate::field::f128_slice::add_scaled(&mut one[..1152], &out[..1152], scale_lo);
+            crate::field::f128_slice::add_scaled(
+                &mut one[15104 - half..15360 - half],
+                &out[15104..15360],
+                r,
+            );
         }
         Some(one)
     } else {

@@ -322,6 +322,54 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     }
 }
 
+/// `FLOCK_NO_LC_MATS_AOS=1` restores sixteen scalar `.lo`/`.hi` extracts.
+/// Default: two `loadu` of the AoS `[F128; 8]` and one even/odd qword
+/// deinterleave into the lo/hi lane arrays the bit-transpose already
+/// consumes. Same 16 qwords.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_mats_aos_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_MATS_AOS").is_none())
+}
+
+/// Deinterleave eight AoS F128 into lo-qword and hi-qword lane arrays.
+///
+/// # Safety
+/// `eq8.len() == 8`. `avx512f`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
+    use core::arch::x86_64::*;
+    let mut lo_lanes = [0u64; 8];
+    let mut hi_lanes = [0u64; 8];
+    // SAFETY: eight contiguous F128 (128 bytes) = two ZMM. F128 is lo||hi
+    // qwords, so even qwords are `.lo` and odd qwords are `.hi`.
+    unsafe {
+        let p = eq8.as_ptr() as *const __m512i;
+        let v0 = _mm512_loadu_si512(p);
+        let v1 = _mm512_loadu_si512(p.add(1));
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        _mm512_storeu_si512(
+            lo_lanes.as_mut_ptr() as *mut __m512i,
+            _mm512_permutex2var_epi64(v0, lo_idx, v1),
+        );
+        _mm512_storeu_si512(
+            hi_lanes.as_mut_ptr() as *mut __m512i,
+            _mm512_permutex2var_epi64(v0, hi_idx, v1),
+        );
+    }
+    (lo_lanes, hi_lanes)
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
@@ -343,8 +391,15 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
 
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
+    let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
+        // SAFETY: len==8 asserted; cfg supplies avx512f.
+        unsafe { aos8_lohi(eq8) }
+    } else {
+        (
+            std::array::from_fn(|j| eq8[j].lo),
+            std::array::from_fn(|j| eq8[j].hi),
+        )
+    };
     let mut lo_bytes = [0u8; 64];
     let mut hi_bytes = [0u8; 64];
     crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);

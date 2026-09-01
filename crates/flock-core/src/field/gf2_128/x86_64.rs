@@ -612,6 +612,36 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// XOR-accumulate two 4-lane unreduced products, `x0[i]·y0[i]` and
+    /// `x1[i]·y1[i]`, into self.
+    ///
+    /// Bit-identical to `mul_acc(x0, y0); mul_acc(x1, y1)` (XOR is
+    /// associative and commutative), but the two products are folded into
+    /// each limb with one three-input `vpternlogq` instead of two lone
+    /// `vpxorq`: four accumulate uops per pair of products instead of six,
+    /// and each limb is read and written once instead of twice.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc2(&mut self, x0: __m512i, y0: __m512i, x1: __m512i, y1: __m512i) {
+        // Register-only widen (8 CLMULs) + ternlog-accumulate; cfg-gated.
+        let c00_0 = _mm512_clmulepi64_epi128::<0x00>(x0, y0);
+        let c00_1 = _mm512_clmulepi64_epi128::<0x00>(x1, y1);
+        let c11_0 = _mm512_clmulepi64_epi128::<0x11>(x0, y0);
+        let c11_1 = _mm512_clmulepi64_epi128::<0x11>(x1, y1);
+        let c01_0 = _mm512_clmulepi64_epi128::<0x01>(x0, y0);
+        let c10_0 = _mm512_clmulepi64_epi128::<0x10>(x0, y0);
+        let c01_1 = _mm512_clmulepi64_epi128::<0x01>(x1, y1);
+        let c10_1 = _mm512_clmulepi64_epi128::<0x10>(x1, y1);
+        // 0x96 = a ^ b ^ c.
+        self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
+        self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+    }
+
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
     /// operand, specialized.
     ///

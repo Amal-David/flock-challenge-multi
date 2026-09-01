@@ -2310,10 +2310,6 @@ impl AdditiveNttF128 {
     /// one task. Byte-identical to seed pass + top pass by construction (same
     /// kernels, same twiddles, same lane bounds; the seed kernels write all
     /// lanes, so the structurally zero tail lanes stay zero).
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     /// `FLOCK_NO_NTT_SCATTER_NT=1` restores plain write-allocate publish
     /// stores in the seed-fused top pass (exact same-binary A/B); the ranked
     /// worker's cleared env never sets it.

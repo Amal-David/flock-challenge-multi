@@ -562,6 +562,90 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
     }
 }
 
+/// Parity-split twin of [`apply_x86_avx512_register_2img_offw_at`]. Identical
+/// value and identical table addresses; only where the eight pre-scaled
+/// offsets of one K-row sit differs. `even` is one 64-bit word holding the
+/// row's bytes 0, 2, 4, 6 and `even.add(32)` the word holding bytes 1, 3, 5,
+/// 7 — the layout `vpmaddubsw` against `{64, 0, 64, 0, …}` / `{0, 64, 0, 64,
+/// …}` produces from one 64-byte side (K-row `k` is u64 lane `k` of the even
+/// ZMM and u64 lane `k` of the odd ZMM). The base image reads the even word
+/// and the σ₈ image the odd word, field for field: the same eight rows as
+/// the byte-order form, XORed in the same order.
+///
+/// # Safety
+/// `even` and `even.add(32)` must each be readable as one 64-bit word of four
+/// pre-scaled offsets, `byte * 64` with `byte <= 255`, so every field lands
+/// inside a 256-row image of 64 readable bytes per row.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
+    base: *const u8,
+    base8: *const u8,
+    even: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: two readable 64-bit words per the contract; each extracted
+    // field is one pre-scaled offset inside the readable image.
+    unsafe {
+        let we = (even as *const u64).read_unaligned();
+        let wo = (even.add(32) as *const u64).read_unaligned();
+        let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        let u0 = _mm512_xor_si512(
+            row(base, we as u16 as usize),
+            row(base8, wo as u16 as usize),
+        );
+        let u1 = _mm512_xor_si512(
+            row(base, (we >> 16) as u16 as usize),
+            row(base8, (wo >> 16) as u16 as usize),
+        );
+        let u2 = _mm512_xor_si512(
+            row(base, (we >> 32) as u16 as usize),
+            row(base8, (wo >> 32) as u16 as usize),
+        );
+        let u3 = _mm512_xor_si512(
+            row(base, (we >> 48) as usize),
+            row(base8, (wo >> 48) as usize),
+        );
+        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
+/// Word offset of K-row `k` inside one 64-offset arena side under the
+/// byte-order layout (`P = false`: eight contiguous offsets at `8k`) or the
+/// parity-split layout (`P = true`: four even offsets at `4k`, the four odd
+/// ones 32 words later).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) const fn offw_krow_words<const P: bool>(k: usize) -> usize {
+    if P { 4 * k } else { 8 * k }
+}
+
+/// K-row apply under either arena layout: `p` is
+/// `side.add(offw_krow_words::<P>(k))`.
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_2img_offw_at`] (`P = false`) or
+/// [`apply_x86_avx512_register_2img_offp_at`] (`P = true`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
+    base: *const u8,
+    base8: *const u8,
+    p: *const u16,
+) -> core::arch::x86_64::__m512i {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        if P {
+            apply_x86_avx512_register_2img_offp_at(base, base8, p)
+        } else {
+            apply_x86_avx512_register_2img_offw_at(base, base8, p)
+        }
+    }
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
@@ -824,6 +908,33 @@ mod tests {
                             bytes
                         );
                     }
+                    // Parity-split form: bytes 0, 2, 4, 6 as one word at `p`
+                    // and bytes 1, 3, 5, 7 as one word at `p + 32`. Same value
+                    // as the byte-order wide read.
+                    let mut offp = [0u16; 64];
+                    for (b, &byte) in bytes.iter().enumerate() {
+                        offp[(b & 1) * 32 + (b >> 1)] = byte as u16 * 64;
+                    }
+                    let (base, base8) = table.image_ptrs();
+                    // SAFETY: avx512f; both images present; `offp` holds the
+                    // even word at 0 and the odd word at 32.
+                    let reg = unsafe {
+                        apply_x86_avx512_register_2img_offp_at(base, base8, offp.as_ptr())
+                    };
+                    let mut got = [0u8; 64];
+                    // SAFETY: 64-byte destination for one ZMM store.
+                    unsafe {
+                        core::arch::x86_64::_mm512_storeu_si512(
+                            got.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                            reg,
+                        )
+                    };
+                    let got: Vec<F8> = got.iter().map(|&b| F8(b)).collect();
+                    assert_eq!(
+                        out_scalar, got,
+                        "scalar/avx512-offp apply disagree at k={k}, bytes={:02x?}",
+                        bytes
+                    );
                 }
             }
         }

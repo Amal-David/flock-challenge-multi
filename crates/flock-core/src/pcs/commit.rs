@@ -253,6 +253,7 @@ fn finalize_commit(
 ) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let ntt = AdditiveNttF128::standard(params.k_code());
+    let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
 
     // ---- GPU-hybrid streaming commit (BLAKE3 Merkle on Metal, leaves hashed
     // in ordered 1/8th-codeword chunks as the NTT deep pass completes them).
@@ -260,7 +261,8 @@ fn finalize_commit(
     // size, GPU Merkle pipeline available (Metal present, not latched off,
     // FLOCK_NO_GPU / FLOCK_NO_GPU_MERKLE unset). Everything else — and any
     // in-flight GPU failure — lands on the existing pure-CPU path below.
-    if params.merkle_hash == HashKind::Blake3
+    if merkle_cut_depth == 0
+        && params.merkle_hash == HashKind::Blake3
         && params.n_leaves() >= (1 << 18)
         && merkle::blake3_leaf_size_is_batchable(params.leaf_size_bytes())
         && crate::gpu::merkle::available()
@@ -296,12 +298,13 @@ fn finalize_commit(
     let kind = params.merkle_hash;
     let leaf_size = params.leaf_size_bytes();
     let num_ntts = params.num_ntts();
+    let stored_leaves = n_leaves >> merkle_cut_depth;
     // Pooled like every other prove-cycle buffer: `ProverData::drop` returns
-    // the tree to TREE_POOL, so on all proves after the first the 64 MiB
-    // (ranked shape) allocation is already resident — no mmap/fault-in here
+    // the tree to TREE_POOL, so on all proves after the first the ranked-tree
+    // allocation is already resident — no mmap/fault-in here
     // and no munmap/TLB-shootdown at drop. Same write-before-read contract
     // as the uninit alloc this replaces.
-    let mut merkle_tree: Vec<Hash> = take_tree(2 * n_leaves - 1);
+    let mut merkle_tree: Vec<Hash> = take_tree(2 * stored_leaves - 1);
     let tree_addr = merkle_tree.as_mut_ptr() as usize;
 
     // Subtree parents while hot: after a deep-pass sub-group's leaves are
@@ -339,16 +342,31 @@ fn finalize_commit(
                     sub_data.len() * core::mem::size_of::<F128>(),
                 )
             };
-            // SAFETY: each deep-pass sub-group maps to a disjoint leaf-index
-            // range; only this worker writes `tree[range]`, and NTT writes to
-            // those leaves have retired on this thread.
+            // At cut depth one, every two ordinary leaves are hashed directly
+            // to their parent and only that parent level is retained. Ranked
+            // deep-pass ranges are even-sized and pair-aligned, so workers
+            // still own disjoint output ranges.
+            let stored_range = if merkle_cut_depth == 1 {
+                assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
+                assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
+                (range.start >> 1)..(range.end >> 1)
+            } else {
+                range.clone()
+            };
+            // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
+            // range; only this worker writes it, and all corresponding NTT
+            // rows have retired on this thread.
             let out = unsafe {
                 core::slice::from_raw_parts_mut(
-                    (tree_addr as *mut Hash).add(range.start),
-                    range.len(),
+                    (tree_addr as *mut Hash).add(stored_range.start),
+                    stored_range.len(),
                 )
             };
-            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            if merkle_cut_depth == 1 {
+                merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
+            } else {
+                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            }
 
             if !subtree_parents {
                 return;
@@ -363,11 +381,16 @@ fn finalize_commit(
             else {
                 return;
             };
+            let parent_range = if merkle_cut_depth == 1 {
+                (parent_range.start >> 1)..(parent_range.end >> 1)
+            } else {
+                parent_range
+            };
             let len = parent_range.len();
             let depth = if len.is_power_of_two()
                 && len >= 2
                 && parent_range.start % len == 0
-                && n_leaves % len == 0
+                && stored_leaves % len == 0
             {
                 len.trailing_zeros() as usize
             } else {
@@ -395,8 +418,8 @@ fn finalize_commit(
             let mut lvl_read_off = parent_range.start; // level 0 = leaves
             let mut lvl_read_len = len;
             for j in 1..=depth {
-                let nodes_j = n_leaves >> j;
-                let base_j = 2 * n_leaves - 2 * nodes_j;
+                let nodes_j = stored_leaves >> j;
+                let base_j = 2 * stored_leaves - 2 * nodes_j;
                 let write_off = base_j + (parent_range.start >> j);
                 let write_len = len >> j;
                 // SAFETY: the read range is this worker's own just-written
@@ -432,8 +455,13 @@ fn finalize_commit(
         usize::MAX | 0 => 0,
         d => d,
     };
-    build_upper_levels(&mut merkle_tree, n_leaves, n_leaves >> folded, kind);
-    let root = merkle_tree[2 * n_leaves - 2];
+    build_upper_levels(
+        &mut merkle_tree,
+        stored_leaves,
+        stored_leaves >> folded,
+        kind,
+    );
+    let root = merkle_tree[2 * stored_leaves - 2];
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms (subtree levels folded in-callback: {})",
@@ -452,6 +480,26 @@ fn finalize_commit(
             merkle_tree,
         },
     )
+}
+
+/// The ranked x86 BLAKE3 L0 tree retains level 1 and above. Its omitted leaf
+/// CVs are reconstructed from the retained codeword only when queried during
+/// opening. `FLOCK_NO_MERKLE_CUT` restores the ordinary full tree.
+fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
+    if cfg!(target_arch = "x86_64")
+        && std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none()
+        && params.m == 32
+        && params.log_inv_rate == 1
+        && params.log_batch_size == 6
+        && params.profile == crate::pcs::ligerito::LigeritoProfile::Fast
+        && params.merkle_hash == HashKind::Blake3
+        && params.n_leaves() == (1 << 20)
+        && params.leaf_size_bytes() == 1024
+    {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -535,12 +583,33 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
     crate::alloc_uninit_vec(total_nodes)
 }
 
+/// `FLOCK_NO_TREE_COLLAPSE=1` skips `madvise(MADV_COLLAPSE)` when parking a
+/// Merkle tree. Ranked env is cleared, so the untimed prove's first-touched
+/// 4/16/64 MiB trees are collapsed before the timed prove takes them.
+fn tree_collapse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TREE_COLLAPSE").is_none());
+    *ON
+}
+
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
     // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
     // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
     if tree.capacity() < (1 << 16) {
         return;
+    }
+    // Untimed warmup first-touches these pages; collapse upgrades 4 KiB
+    // stretches to 2 MiB before the timed prove retakes the buffer. F128
+    // scratch already collapses in `prewarm_prover`; TREE_POOL did not. Use
+    // the live tree length instead of the full allocation capacity. The
+    // kernel may round the final partial page, but the separate 96-page
+    // layout tail is otherwise outside the requested range.
+    if tree_collapse_enabled() {
+        crate::collapse_hugepages(
+            tree.as_mut_ptr().cast::<u8>(),
+            tree.len() * core::mem::size_of::<Hash>(),
+        );
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {

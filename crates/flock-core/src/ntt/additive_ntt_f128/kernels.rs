@@ -231,10 +231,6 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
 /// The caller must ensure the four selected source rows are valid, the four
 /// selected destination rows are valid, and concurrent calls write disjoint
 /// destination row groups. Source and destination must not overlap.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from(
     src: *const F128,
@@ -299,10 +295,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_nt(
 ///
 /// # Safety
 /// Same contract as [`butterfly_fused_2layer_row_from`].
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
@@ -359,10 +351,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
 ///
 /// # Safety
 /// Same contract as [`butterfly_fused_2layer_row_from`].
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
@@ -422,10 +410,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
 /// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`]; the four
 /// rows `pf_src + i * src_quarter * num_ntts` must also lie inside the source
 /// buffer.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
@@ -486,10 +470,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
 /// # Safety
 /// Union of the sparse-geo and dense-geo contracts on the shared source and
 /// the two destinations. Destinations must not alias.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[allow(dead_code)] // Retained fused-kernel rollback/oracle entry point.
@@ -564,10 +544,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 /// # Safety
 /// Same source/destination validity, non-aliasing, and disjoint-write contract
 /// as [`butterfly_fused_2layer_row_from`].
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     src: *const F128,

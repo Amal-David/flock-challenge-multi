@@ -1565,7 +1565,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     // matrix sets (A per broadcast octet, B per 32-pair batch) plus a
     // period-two lane vector, so the message block consumes pre-weighted rows
     // and its four `ghash_mul_x4_split` prescales per four-group iteration
-    // disappear. `FLOCK_NO_R2_EQ_BAKE=1` rolls back to the prescales. Ranked draw 2 marker.
+    // disappear. `FLOCK_NO_R2_EQ_BAKE=1` rolls back to the prescales.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4291,7 +4291,23 @@ mod tests {
     fn round2_lookahead_bake_matches_scalar() {
         use crate::zerocheck::univariate_skip::build_eq;
         const K_SKIP: usize = 6;
-        for &(lo_size, canon) in &[(32usize, false), (64, false), (128, false), (128, true)] {
+        // Every shape runs under both round-two body arms: the 16-pair body
+        // (`unroll16 = true`, the default) and the incumbent 8-pair body the
+        // `FLOCK_NO_R2_UNROLL16` kill switch restores. The canonical windows
+        // (all-ones at pair 0, sparse at pair 120) sit inside the sweep so
+        // the pairing must refuse them and fall back to the 8-pair arms.
+        let shapes = [
+            (32usize, false),
+            (64, false),
+            (128, false),
+            (32, true),
+            (64, true),
+            (128, true),
+        ];
+        for (&(lo_size, canon), unroll16) in
+            shapes.iter().flat_map(|s| [(s, true), (s, false)])
+        {
+            let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
             let r2_mats = r2_gfni_mats(&table);
@@ -4302,12 +4318,15 @@ mod tests {
             let a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
             let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
             if canon {
-                // All-ones B window over pairs 0..8 and the sparse window over
-                // pairs 120..128: the two raw guards of the canonical prefold.
+                // All-ones B window over pairs 0..8 and (when the shape has
+                // the rows) the sparse window over pairs 120..128: the two
+                // raw guards of the canonical prefold.
                 b_packed[0..128].fill(0xff);
-                b_packed[240 * 8..256 * 8].fill(0);
-                b_packed[240 * 8..240 * 8 + 8]
-                    .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+                if n_rows >= 256 {
+                    b_packed[240 * 8..256 * 8].fill(0);
+                    b_packed[240 * 8..240 * 8 + 8]
+                        .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+                }
             }
             let bake =
                 build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
@@ -4347,7 +4366,10 @@ mod tests {
                     Some(&bake),
                 )
             };
-            assert_eq!(out_s, out_b, "bake lo_size={lo_size} canon={canon}");
+            assert_eq!(
+                out_s, out_b,
+                "bake lo_size={lo_size} canon={canon} unroll16={unroll16}"
+            );
         }
         // Guard: an eq table that is not the tensor of `r_lo` cannot be
         // factored, and the builder must say so.
@@ -4370,16 +4392,22 @@ mod tests {
     #[test]
     fn round2_lookahead_chunk_x86_matches_scalar() {
         const K_SKIP: usize = 6;
-        for &(lo_size, mask, useful) in &[
+        let shapes = [
             (2usize, 0usize, usize::MAX),
             (4, 0, usize::MAX),
             (8, 0, usize::MAX),
             (16, 0, usize::MAX),
+            (32, 0, usize::MAX),
             (64, 0, usize::MAX),
             (64, 7, 5), // every block of 8 pairs keeps 5 (mixed group + zero groups)
             (128, 15, 12),
             (128, 127, 121),
-        ] {
+        ];
+        // Both round-two body arms (16-pair default, 8-pair kill-switch).
+        for (&(lo_size, mask, useful), unroll16) in
+            shapes.iter().flat_map(|s| [(s, true), (s, false)])
+        {
+            let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x3C00 + lo_size as u64 + mask as u64);
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
