@@ -4259,55 +4259,57 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
 
-    let len = fc.len();
-    debug_assert_eq!(bc.len(), len);
-    // Process 8 F128 (4 message pairs) per iteration.
-    let lanes = len & !7;
-    let mut u0_acc = WideGhashX4::zero();
-    let mut u2_acc = WideGhashX4::zero();
+    unsafe {
+        let len = fc.len();
+        debug_assert_eq!(bc.len(), len);
+        // Process 8 F128 (4 message pairs) per iteration.
+        let lanes = len & !7;
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
 
-    let mut k = 0;
-    while k < lanes {
-        // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
-        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+        let mut k = 0;
+        while k < lanes {
+            // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
+            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-        // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-        u0_acc.mul_acc(f_even, b_even);
+            // u0: products at even pair-positions k, k+2, k+4, k+6.
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            u0_acc.mul_acc(f_even, b_even);
 
-        // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
-        //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-        u2_acc.mul_acc(f_sum, b_sum);
+            // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
+            //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
 
-        k += 8;
+            k += 8;
+        }
+
+        // Fold the 4-lane unreduced accumulators to scalar F128.
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+
+        // Scalar tail for remaining pairs.
+        while k + 1 < len {
+            let f0 = fc[k];
+            let f1 = fc[k + 1];
+            let b0 = bc[k];
+            let b1 = bc[k + 1];
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+
+        (u0, u2)
     }
-
-    // Fold the 4-lane unreduced accumulators to scalar F128.
-    let mut u0 = u0_acc.fold().reduce();
-    let mut u2 = u2_acc.fold().reduce();
-
-    // Scalar tail for remaining pairs.
-    while k + 1 < len {
-        let f0 = fc[k];
-        let f1 = fc[k + 1];
-        let b0 = bc[k];
-        let b1 = bc[k + 1];
-        u0 += f0 * b0;
-        u2 += (f0 + f1) * (b0 + b1);
-        k += 2;
-    }
-
-    (u0, u2)
 }
 
 /// [`msg_reduce_avx512`] with the full inner product `Σ_i fc[i]·bc[i]`

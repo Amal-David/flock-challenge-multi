@@ -1352,122 +1352,95 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let r34_unroll16 = zc_r34_unroll16_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
-        let zmm_zero = _mm512_setzero_si512();
-        let mut have_r34_pending = false;
-        let mut pending_lhs = [zmm_zero; 8];
-        let mut pending_rhs = [zmm_zero; 8];
         // Input look-ahead, resolved once per worker chunk (never inside the
         // loop). One body consumes 64 F128 from each side.
         let pf_on = zc_tail_pf_enabled();
         let pf_spread = zc_tail_pf_spread_enabled();
         const PF_OFF: usize = ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
 
-        while x_lo + 8 <= lo_size {
-            let output = 2 * x_lo;
-            let input = 4 * output;
-            let a_src = a_in.as_ptr().add(input);
-            let b_src = b_in.as_ptr().add(input);
-            let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
-            let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
-            if pf_on {
-                let hi = if pf_spread { 4 } else { 16 };
-                for l in 0..hi {
-                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
-                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+        macro_rules! process_window {
+            ($x:expr) => {{
+                let output = 2 * $x;
+                let input = 4 * output;
+                let a_src = a_in.as_ptr().add(input);
+                let b_src = b_in.as_ptr().add(input);
+                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+                if pf_on {
+                    let hi = if pf_spread { 4 } else { 16 };
+                    for l in 0..hi {
+                        _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                        _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                    }
                 }
-            }
-            let (oa0, oa1, oa2, oa3, ob0, ob1, ob2, ob3) = if defer {
-                (
-                    fold16_to_4_deferred(a_src, ra, rb, rarb),
-                    fold16_to_4_deferred(a_src.add(16), ra, rb, rarb),
-                    fold16_to_4_deferred(a_src.add(32), ra, rb, rarb),
-                    fold16_to_4_deferred(a_src.add(48), ra, rb, rarb),
-                    fold16_to_4_deferred(b_src, ra, rb, rarb),
-                    fold16_to_4_deferred(b_src.add(16), ra, rb, rarb),
-                    fold16_to_4_deferred(b_src.add(32), ra, rb, rarb),
-                    fold16_to_4_deferred(b_src.add(48), ra, rb, rarb),
-                )
-            } else {
-                (
-                    fold16_to_4(a_src, ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(16), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(32), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(a_src.add(48), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src, ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(16), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(32), ra, rb, even_idx, odd_idx),
-                    fold16_to_4(b_src.add(48), ra, rb, even_idx, odd_idx),
-                )
-            };
-            // Spread delivery: the rest of this body's hint block, at
-            // later points in the same body.
-            if pf_on && pf_spread {
-                for l in 4..8 {
-                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
-                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                let (oa0, oa1, oa2, oa3, ob0, ob1, ob2, ob3) = if defer {
+                    (
+                        fold16_to_4_deferred(a_src, ra, rb, rarb),
+                        fold16_to_4_deferred(a_src.add(16), ra, rb, rarb),
+                        fold16_to_4_deferred(a_src.add(32), ra, rb, rarb),
+                        fold16_to_4_deferred(a_src.add(48), ra, rb, rarb),
+                        fold16_to_4_deferred(b_src, ra, rb, rarb),
+                        fold16_to_4_deferred(b_src.add(16), ra, rb, rarb),
+                        fold16_to_4_deferred(b_src.add(32), ra, rb, rarb),
+                        fold16_to_4_deferred(b_src.add(48), ra, rb, rarb),
+                    )
+                } else {
+                    (
+                        fold16_to_4(a_src, ra, rb, even_idx, odd_idx),
+                        fold16_to_4(a_src.add(16), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(a_src.add(32), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(a_src.add(48), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(b_src, ra, rb, even_idx, odd_idx),
+                        fold16_to_4(b_src.add(16), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(b_src.add(32), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(b_src.add(48), ra, rb, even_idx, odd_idx),
+                    )
+                };
+                if pf_on && pf_spread {
+                    for l in 4..8 {
+                        _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                        _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                    }
                 }
-            }
-            let ap = a_out.as_mut_ptr().add(output);
-            let bp = b_out.as_mut_ptr().add(output);
-            if nt_out {
-                stream_zmm_as_xmm4(ap, oa0);
-                stream_zmm_as_xmm4(ap.add(4), oa1);
-                stream_zmm_as_xmm4(ap.add(8), oa2);
-                stream_zmm_as_xmm4(ap.add(12), oa3);
-                stream_zmm_as_xmm4(bp, ob0);
-                stream_zmm_as_xmm4(bp.add(4), ob1);
-                stream_zmm_as_xmm4(bp.add(8), ob2);
-                stream_zmm_as_xmm4(bp.add(12), ob3);
-            } else {
-                _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
-                _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
-                _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), oa2);
-                _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), oa3);
-                _mm512_storeu_si512(bp.cast::<__m512i>(), ob0);
-                _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), ob1);
-                _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), ob2);
-                _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
-            }
-
-            // Spread delivery: the rest of this body's hint block, at
-            // later points in the same body.
-            if pf_on && pf_spread {
-                for l in 8..12 {
-                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
-                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                let ap = a_out.as_mut_ptr().add(output);
+                let bp = b_out.as_mut_ptr().add(output);
+                if nt_out {
+                    stream_zmm_as_xmm4(ap, oa0);
+                    stream_zmm_as_xmm4(ap.add(4), oa1);
+                    stream_zmm_as_xmm4(ap.add(8), oa2);
+                    stream_zmm_as_xmm4(ap.add(12), oa3);
+                    stream_zmm_as_xmm4(bp, ob0);
+                    stream_zmm_as_xmm4(bp.add(4), ob1);
+                    stream_zmm_as_xmm4(bp.add(8), ob2);
+                    stream_zmm_as_xmm4(bp.add(12), ob3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), oa2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), oa3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), ob0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), ob1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), ob2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), ob3);
                 }
-            }
-            let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
-            let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
-            // Spread delivery: the rest of this body's hint block, at
-            // later points in the same body.
-            if pf_on && pf_spread {
-                for l in 12..16 {
-                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
-                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                if pf_on && pf_spread {
+                    for l in 8..12 {
+                        _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                        _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                    }
                 }
-            }
-            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
-                // (w, w·x⁶⁴) precomputed once per pass: both are pure
-                // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
-                // companions), yet the incumbent recomputed the companion —
-                // a permute plus a CLMUL of pure latency — at the head of
-                // the chain feeding all eight accumulates, every iteration.
-                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                let w = _mm512_loadu_si512(wp);
-                let w64 = _mm512_loadu_si512(wp.add(1));
-                (
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                )
-            } else {
-                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
+                let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
+                if pf_on && pf_spread {
+                    for l in 12..16 {
+                        _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                        _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                    }
+                }
+                let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
+                    let wp = wt.as_ptr().add($x) as *const __m512i;
+                    let w = _mm512_loadu_si512(wp);
+                    let w64 = _mm512_loadu_si512(wp.add(1));
                     (
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
@@ -1475,61 +1448,69 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                     )
                 } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
-                }
-            };
-            let e_aw = _mm512_xor_si512(a0w, a2w);
-            let e_b = _mm512_xor_si512(b0, b2);
-            let o_aw = _mm512_xor_si512(a1w, a3w);
-            let o_b = _mm512_xor_si512(b1, b3);
-            let lhs = [
-                a1w,
-                _mm512_xor_si512(a0w, a1w),
-                a3w,
-                _mm512_xor_si512(a2w, a3w),
-                a2w,
-                e_aw,
-                o_aw,
-                _mm512_xor_si512(e_aw, o_aw),
-            ];
-            let rhs = [
-                b1,
-                _mm512_xor_si512(b0, b1),
-                b3,
-                _mm512_xor_si512(b2, b3),
-                b2,
-                e_b,
-                o_b,
-                _mm512_xor_si512(e_b, o_b),
-            ];
-            if r34_unroll16 {
-                if have_r34_pending {
-                    for i in 0..8 {
-                        acc[i].mul_acc2(pending_lhs[i], pending_rhs[i], lhs[i], rhs[i]);
+                    let e_lo = f128x4_loadu(eq_lo.as_ptr().add($x));
+                    let e_hi = f128x4_loadu(eq_lo.as_ptr().add($x + 4));
+                    let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                    if wsplit {
+                        let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                        (
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                        )
+                    } else {
+                        (
+                            ghash_mul_x4(w, a0),
+                            ghash_mul_x4(w, a1),
+                            ghash_mul_x4(w, a2),
+                            ghash_mul_x4(w, a3),
+                        )
                     }
-                    have_r34_pending = false;
-                } else {
-                    pending_lhs = lhs;
-                    pending_rhs = rhs;
-                    have_r34_pending = true;
-                }
-            } else {
-                for i in 0..8 {
-                    acc[i].mul_acc(lhs[i], rhs[i]);
-                }
-            }
-            x_lo += 8;
+                };
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                let lhs = [
+                    a1w,
+                    _mm512_xor_si512(a0w, a1w),
+                    a3w,
+                    _mm512_xor_si512(a2w, a3w),
+                    a2w,
+                    e_aw,
+                    o_aw,
+                    _mm512_xor_si512(e_aw, o_aw),
+                ];
+                let rhs = [
+                    b1,
+                    _mm512_xor_si512(b0, b1),
+                    b3,
+                    _mm512_xor_si512(b2, b3),
+                    b2,
+                    e_b,
+                    o_b,
+                    _mm512_xor_si512(e_b, o_b),
+                ];
+                (lhs, rhs)
+            }};
         }
 
-        if have_r34_pending {
+        while x_lo + 16 <= lo_size && r34_unroll16 {
+            let (lhs0, rhs0) = process_window!(x_lo);
+            let (lhs1, rhs1) = process_window!(x_lo + 8);
             for i in 0..8 {
-                acc[i].mul_acc(pending_lhs[i], pending_rhs[i]);
+                acc[i].mul_acc2(lhs0[i], rhs0[i], lhs1[i], rhs1[i]);
             }
+            x_lo += 16;
+        }
+
+        while x_lo + 8 <= lo_size {
+            let (lhs, rhs) = process_window!(x_lo);
+            for i in 0..8 {
+                acc[i].mul_acc(lhs[i], rhs[i]);
+            }
+            x_lo += 8;
         }
 
         // Small instances (lo_size ∈ {2, 4, 6}) leave whole groups: fold one
@@ -4416,10 +4397,10 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<const WRITE_CANONICAL: bool
                 a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
             }
             let dst = out.cast::<__m512i>().add(g);
-            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
-            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
-            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
-            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+            _mm512_store_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_store_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_store_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_store_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
         }
 
         if WRITE_CANONICAL {
@@ -4428,16 +4409,16 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<const WRITE_CANONICAL: bool
             let dst = out.cast::<__m512i>().add(skipped);
             let value = _mm512_broadcast_i32x4(_mm_set_epi64x(folded.hi as i64, folded.lo as i64));
             if group == 0 {
-                _mm512_storeu_si512(dst, value);
-                _mm512_storeu_si512(dst.add(4), value);
-                _mm512_storeu_si512(dst.add(8), value);
-                _mm512_storeu_si512(dst.add(12), value);
+                _mm512_store_si512(dst, value);
+                _mm512_store_si512(dst.add(4), value);
+                _mm512_store_si512(dst.add(8), value);
+                _mm512_store_si512(dst.add(12), value);
             } else {
                 let zero = _mm512_setzero_si512();
-                _mm512_storeu_si512(dst, _mm512_maskz_mov_epi64(0x03, value));
-                _mm512_storeu_si512(dst.add(4), zero);
-                _mm512_storeu_si512(dst.add(8), zero);
-                _mm512_storeu_si512(dst.add(12), zero);
+                _mm512_store_si512(dst, _mm512_maskz_mov_epi64(0x03, value));
+                _mm512_store_si512(dst.add(4), zero);
+                _mm512_store_si512(dst.add(8), zero);
+                _mm512_store_si512(dst.add(12), zero);
             }
         }
     }

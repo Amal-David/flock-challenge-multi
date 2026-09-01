@@ -3097,28 +3097,30 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        let t0 = vtrn1q_u32(w0, w1);
-        let t1 = vtrn2q_u32(w0, w1);
-        let t2 = vtrn1q_u32(w2, w3);
-        let t3 = vtrn2q_u32(w2, w3);
-        (
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-        )
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -3335,12 +3337,14 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        let sum = vaddq_u32(x, y);
-        let cin = veorq_u32(veorq_u32(sum, x), y);
-        let left = veorq_u32(x, cin);
-        let right = veorq_u32(y, cin);
-        let carry = vandq_u32(left, right);
-        (sum, left, right, carry)
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -3349,8 +3353,10 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        let v = veorq_u32(x, y);
-        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,

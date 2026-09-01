@@ -44,7 +44,7 @@
 - Public donor comments and traffic arithmetic are untrusted until exact-cff reachability is traced. PR2306 claimed a `2^26` six-fold path and multi-gigabyte deletion, but DirectFold8 leaves `2^19`; the eligible direct fold-message leaf touches only ~`7.08 MB` inside a sub-ms phase.
 - Hardware-counter pressure is not itself an optimization. The exact cff profile confirms 3.285B loads, 696.5M stores, and saturated arithmetic/shuffle/load ports, but every admitted leaf still needs a concrete removable computation or representation exceeding `3 ms` after replacement cost.
 - Bound pairwise public-score stories by the entire touched phase. PR2311's sparse L0 auth batching appeared roughly 31 bips better than a sibling bundle, but the exact changed work is only 0.22 MiB inside a 0.23-0.25 ms phase; the score difference is noise/confounding, not causal headroom.
-- Current worker-routing override: use the authenticated Antigravity CLI through `agy` with `gemini-3.7-flash-high` and high effort for Flock hypothesis and frontier research. Keep Codex as the single evidence writer/orchestrator; do not mix Luna councils into the same decision wave unless the user changes routing again.
+- Current worker-routing override: use Fable 5.1 as the primary Flock optimization advisor. Keep Codex as the evidence writer, implementer, and final gatekeeper; do not route hypothesis review to the previous Gemini advisor unless the user changes routing again.
 
 ## 2026-09-01 frontier epoch da9435c (PR 2524) and exclusion power
 
@@ -61,5 +61,6 @@
 
 ## 2026-09-02 advisor and model routing update
 
-- Advisor / Orchestrator routing: Do not use Claude Fable 5 as advisor. Use **GPT 5.6 Sol (High Effort)** as the advisor/orchestrator across all hypothesis formation, solver reviews, and campaign strategy.
+- Advisor / Orchestrator routing: Use **Claude Fable 5.1 (xhigh)** as the advisor/orchestrator across all hypothesis formation, solver reviews, and campaign strategy.
+- Official Evaluation PR #2688 (submission `e6cd43d2`): Scored **`1,620,133.37` compressions/sec** across 100 trials, successfully beating current leaderboard #1 (`1,615,101.61` by +5,031.76 comp/s, +31.15 bips). Required threshold to promote is $\ge +100\text{ bips}$ (`> 1,631,252.62`). Target delta needed: **+11,119.25 comp/s (+68.85 bips)**.
 
