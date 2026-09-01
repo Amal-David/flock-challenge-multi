@@ -445,12 +445,17 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
+    let r_inner_tail = if lc_claim.r_inner_rest.len() > 1 {
+        &lc_claim.r_inner_rest[1..]
+    } else {
+        &[]
+    };
     let s_hat_v_ab = finish_ab_s_hat_v(
         r1cs,
         &s_hat_v_c,
         z_vec_pre,
         z_mode,
-        &lc_claim.r_inner_rest[1..],
+        r_inner_tail,
     );
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
