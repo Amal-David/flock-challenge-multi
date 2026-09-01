@@ -125,6 +125,81 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         let mut pinf_tail = F256Unreduced::ZERO;
         let mut x_lo = 0;
 
+        let r1_unroll8 = zc_r1_unroll8_enabled();
+        if r1_unroll8 {
+            while x_lo + 8 <= eq_lo.len() {
+                let output_a = 2 * x_lo;
+                let a_lo_a = fold_x4(a_in.as_ptr().add(2 * output_a), r, r64, even_idx, odd_idx, split);
+                let a_hi_a = fold_x4(
+                    a_in.as_ptr().add(2 * (output_a + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+                let b_lo_a = fold_x4(b_in.as_ptr().add(2 * output_a), r, r64, even_idx, odd_idx, split);
+                let b_hi_a = fold_x4(
+                    b_in.as_ptr().add(2 * (output_a + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output_a).cast::<__m512i>(), a_lo_a);
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output_a + 4).cast::<__m512i>(), a_hi_a);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output_a).cast::<__m512i>(), b_lo_a);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output_a + 4).cast::<__m512i>(), b_hi_a);
+
+                let a0_a = _mm512_permutex2var_epi64(a_lo_a, even_idx, a_hi_a);
+                let a1_a = _mm512_permutex2var_epi64(a_lo_a, odd_idx, a_hi_a);
+                let b0_a = _mm512_permutex2var_epi64(b_lo_a, even_idx, b_hi_a);
+                let b1_a = _mm512_permutex2var_epi64(b_lo_a, odd_idx, b_hi_a);
+                let g1_a = ghash_mul_x4(a1_a, b1_a);
+                let g_inf_a = ghash_mul_x4(_mm512_xor_si512(a0_a, a1_a), _mm512_xor_si512(b0_a, b1_a));
+                let eq_a = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+
+                let output_b = 2 * (x_lo + 4);
+                let a_lo_b = fold_x4(a_in.as_ptr().add(2 * output_b), r, r64, even_idx, odd_idx, split);
+                let a_hi_b = fold_x4(
+                    a_in.as_ptr().add(2 * (output_b + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+                let b_lo_b = fold_x4(b_in.as_ptr().add(2 * output_b), r, r64, even_idx, odd_idx, split);
+                let b_hi_b = fold_x4(
+                    b_in.as_ptr().add(2 * (output_b + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output_b).cast::<__m512i>(), a_lo_b);
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output_b + 4).cast::<__m512i>(), a_hi_b);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output_b).cast::<__m512i>(), b_lo_b);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output_b + 4).cast::<__m512i>(), b_hi_b);
+
+                let a0_b = _mm512_permutex2var_epi64(a_lo_b, even_idx, a_hi_b);
+                let a1_b = _mm512_permutex2var_epi64(a_lo_b, odd_idx, a_hi_b);
+                let b0_b = _mm512_permutex2var_epi64(b_lo_b, even_idx, b_hi_b);
+                let b1_b = _mm512_permutex2var_epi64(b_lo_b, odd_idx, b_hi_b);
+                let g1_b = ghash_mul_x4(a1_b, b1_b);
+                let g_inf_b = ghash_mul_x4(_mm512_xor_si512(a0_b, a1_b), _mm512_xor_si512(b0_b, b1_b));
+                let eq_b = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+
+                p1_wide.mul_acc2(eq_a, g1_a, eq_b, g1_b);
+                pinf_wide.mul_acc2(eq_a, g_inf_a, eq_b, g_inf_b);
+                x_lo += 8;
+            }
+        }
+
         while x_lo + 4 <= eq_lo.len() {
             let output = 2 * x_lo;
             let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
@@ -1274,8 +1349,13 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        let r34_unroll16 = zc_r34_unroll16_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
+        let zmm_zero = _mm512_setzero_si512();
+        let mut have_r34_pending = false;
+        let mut pending_lhs = [zmm_zero; 8];
+        let mut pending_rhs = [zmm_zero; 8];
         // Input look-ahead, resolved once per worker chunk (never inside the
         // loop). One body consumes 64 F128 from each side.
         let pf_on = zc_tail_pf_enabled();
@@ -1403,19 +1483,53 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            let lhs = [
+                a1w,
+                _mm512_xor_si512(a0w, a1w),
+                a3w,
+                _mm512_xor_si512(a2w, a3w),
+                a2w,
+                e_aw,
+                o_aw,
+                _mm512_xor_si512(e_aw, o_aw),
+            ];
+            let rhs = [
+                b1,
+                _mm512_xor_si512(b0, b1),
+                b3,
+                _mm512_xor_si512(b2, b3),
+                b2,
+                e_b,
+                o_b,
+                _mm512_xor_si512(e_b, o_b),
+            ];
+            if r34_unroll16 {
+                if have_r34_pending {
+                    for i in 0..8 {
+                        acc[i].mul_acc2(pending_lhs[i], pending_rhs[i], lhs[i], rhs[i]);
+                    }
+                    have_r34_pending = false;
+                } else {
+                    pending_lhs = lhs;
+                    pending_rhs = rhs;
+                    have_r34_pending = true;
+                }
+            } else {
+                for i in 0..8 {
+                    acc[i].mul_acc(lhs[i], rhs[i]);
+                }
+            }
             x_lo += 8;
+        }
+
+        if have_r34_pending {
+            for i in 0..8 {
+                acc[i].mul_acc(pending_lhs[i], pending_rhs[i]);
+            }
         }
 
         // Small instances (lo_size ∈ {2, 4, 6}) leave whole groups: fold one
@@ -1690,6 +1804,15 @@ pub(crate) fn zc_r2_eq_bake_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_R1_UNROLL8=1` restores one 4-pair message accumulation
+/// window per update in the round-1 kernel. Default on: two consecutive
+/// 4-pair message updates are batched with `WideGhashX4::mul_acc2`.
+pub(crate) fn zc_r1_unroll8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_UNROLL8").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_R2_UNROLL16=1` restores the incumbent 8-pair round-two batch
 /// body. Default on: two consecutive regular 8-pair windows are folded into
 /// the eight unreduced accumulators with `WideGhashX4::mul_acc2` (one
@@ -1703,6 +1826,17 @@ pub(crate) fn zc_r2_unroll16_enabled() -> bool {
     }
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_UNROLL16").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_R34_UNROLL16=1` restores one 8-pair message accumulation
+/// window per update in the composed rounds-3/4 lookahead kernels. Default on:
+/// two consecutive 8-pair message updates are batched with `WideGhashX4::mul_acc2`
+/// (one `vpternlogq` per limb pair instead of two `vpxorq`), halving accumulator
+/// read-modify-write traffic on the serializing dependency chain.
+pub(crate) fn zc_r34_unroll16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R34_UNROLL16").is_none());
     *ON
 }
 
@@ -2202,8 +2336,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        let r34_unroll16 = zc_r34_unroll16_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
+        let zmm_zero = _mm512_setzero_si512();
+        let mut have_r34_pending = false;
+        let mut pending_lhs = [zmm_zero; 8];
+        let mut pending_rhs = [zmm_zero; 8];
 
         // GFNI batch fold: each iteration's four groups consume exactly 64
         // consecutive rows per side (rows 4·xg .. 4·xg+64) — one bit-matrix
@@ -2484,19 +2623,53 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
-            acc[5].mul_acc(e_aw, e_b);
-            acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            let lhs = [
+                a1w,
+                _mm512_xor_si512(a0w, a1w),
+                a3w,
+                _mm512_xor_si512(a2w, a3w),
+                a2w,
+                e_aw,
+                o_aw,
+                _mm512_xor_si512(e_aw, o_aw),
+            ];
+            let rhs = [
+                b1,
+                _mm512_xor_si512(b0, b1),
+                b3,
+                _mm512_xor_si512(b2, b3),
+                b2,
+                e_b,
+                o_b,
+                _mm512_xor_si512(e_b, o_b),
+            ];
+            if r34_unroll16 {
+                if have_r34_pending {
+                    for i in 0..8 {
+                        acc[i].mul_acc2(pending_lhs[i], pending_rhs[i], lhs[i], rhs[i]);
+                    }
+                    have_r34_pending = false;
+                } else {
+                    pending_lhs = lhs;
+                    pending_rhs = rhs;
+                    have_r34_pending = true;
+                }
+            } else {
+                for i in 0..8 {
+                    acc[i].mul_acc(lhs[i], rhs[i]);
+                }
+            }
             x_lo += 8;
+        }
+
+        if have_r34_pending {
+            for i in 0..8 {
+                acc[i].mul_acc(pending_lhs[i], pending_rhs[i]);
+            }
         }
 
         // Small instances leave whole groups: one group at a time, scalar finish.
