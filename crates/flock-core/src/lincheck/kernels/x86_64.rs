@@ -121,22 +121,24 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
             },
         );
 
-    // One transpose back to F128 columns at the very end.
+    // One transpose back to F128 columns at the very end (parallelised across 64-column blocks).
     let mut out = vec![F128::ZERO; k];
-    for b in 0..k / 64 {
-        let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+    out.par_chunks_exact_mut(64)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let base = b * 1024;
+            for col in 0..64 {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                out_chunk[col] = F128 { lo, hi };
             }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            out[b * 64 + col] = F128 { lo, hi };
-        }
-    }
+        });
     out
 }
 
