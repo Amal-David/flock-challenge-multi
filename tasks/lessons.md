@@ -58,3 +58,8 @@
 - On an isolated restarted c7i.4xlarge, the proposed compound of Rounds-3/4 `mul_acc2`, sparse-dual depth 2, and the Merkle batch restructure did not beat exact `da9435c`: `1,322,602.676` versus `1,323,199.952` median compressions/s (`-0.045%`, 10 verified trials each). Do not combine official sub-threshold receipts additively; interactions and layout noise erased the apparent gains.
 - Round-1 `mul_acc2` was a drag (`1,317,685.841` versus `1,318,325.194` in the initial seven-trial ablation) and must not be carried into a follow-up. Rounds-3/4 alone showed only a small screen (`1,321,178.662`, about `+0.216%`) and is not promotion-scale.
 - Compact Rounds-3/4 pending storage, Ligerito `msg_reduce_avx512` 16-item batching, NTT butterfly ternary rewrites, and static lincheck tile assignment all failed confirmation. The NTT/message stack fell to `1,303,350.465`; static tiling was indistinguishable from dynamic (`1,322,480.749` versus `1,322,602.676`). Tombstone these exact forms.
+
+## 2026-09-02 advisor and model routing update
+
+- Advisor / Orchestrator routing: Do not use Claude Fable 5 as advisor. Use **GPT 5.6 Sol (High Effort)** as the advisor/orchestrator across all hypothesis formation, solver reviews, and campaign strategy.
+
