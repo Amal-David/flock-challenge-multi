@@ -4488,7 +4488,9 @@ unsafe fn fold_and_msg_chunk_x86(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            if stream && (ptr as usize).is_multiple_of(64) {
+                _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+            } else if stream && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
