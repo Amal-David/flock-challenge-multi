@@ -1,0 +1,15 @@
+{
+  "actor": "yukon_frontier_projector",
+  "role": "official_result_projector",
+  "authority": "OFFICIAL_PROMOTED",
+  "occurred_at": "2026-08-31T13:54:55Z",
+  "operation": "FRONTIER_ADVANCED",
+  "payload": {
+    "previous_epoch_id": "E-YUKON-fab32a5-cff868b",
+    "new_epoch_id": "E-YUKON-cc3bbe1-7968097",
+    "submission": "cc3bbe1d-695e-4546-a821-23bec2653466",
+    "source": "7968097f311d6fc5b30ba4cf9cd146c240e3daf2",
+    "score": 1590863.47318654,
+    "receipt_id": "R-d1a08c931664f78f2ce3884b2570b2a6feaf4246a086687640f47a19c9c7f00c"
+  }
+}

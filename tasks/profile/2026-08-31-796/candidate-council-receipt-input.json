@@ -1,0 +1,38 @@
+{
+  "authority": "LOCAL_STATIC",
+  "benchmark": "eigenlabs/flock-challenge-multi/x86",
+  "kind": "frontier796_current_crown_candidate_council",
+  "epoch_id": "E-YUKON-cc3bbe1-7968097",
+  "source": "7968097f311d6fc5b30ba4cf9cd146c240e3daf2",
+  "required_source_deletion_ms": 2.1,
+  "decision": "ADMIT_NONE",
+  "findings": [
+    {
+      "id": "H-WIT-NTT-SEED-PIPE-796",
+      "classification": "refuted_dependency",
+      "finding": "The fused rate-half seed/top task needs four distant message quarters and its earliest complete task becomes ready only after 99.609375% of contiguous witness production. Splitting seed earlier reintroduces the 1 GiB intermediate that the current fusion deletes, followed by another read/write pass.",
+      "do_not_retry": "Do not add a witness-to-NTT queue unless a materially new code representation removes the four-quarter fan-in without restoring the 1 GiB intermediate."
+    },
+    {
+      "id": "H-R2-ONEPASS-796",
+      "classification": "refuted_dependency",
+      "finding": "Round two and the composed round-three/four traversal are separated by observing the deferred round-three message and sampling rho. A one-pass formulation requires unknown-rho symbolic state or retained/replayed rows, recreating the closed multi-gigabyte representation problem.",
+      "do_not_retry": "Do not tune chunk count or replay packed rows; reopen only with a new algebraic representation that crosses the Fiat-Shamir boundary soundly."
+    },
+    {
+      "id": "H-NTT-F4-F2-REGISTER-FUSE-796",
+      "classification": "refuted_register_pressure",
+      "finding": "A register-resident fused-four plus fused-two pass needs four 16-row groups live at once, or 64 payload ZMM registers before twiddles, on a 32-ZMM machine. The only source-counted F4 setup residual is 15 companions versus 2560 VPCLMUL per row group, a 0.586% upper bound below about 0.13 ms.",
+      "do_not_retry": "Do not revive LOW2, TWPREP companions, prefetch removal, shaped dispatch, or two-butterfly ILP without a distinct arithmetic reduction and spill-free assembly proof."
+    },
+    {
+      "id": "H-D8-L1-PIPE-PARTITION-796",
+      "classification": "refuted_dependency_exposure",
+      "finding": "The ranked DirectFold8 L1 precommit already overlaps the full L1 commit with the GFNI/M6 sibling. L1 rate-one-quarter seed tasks need four quarter rows and the current global Rayon join has no bounded worker-partition surface. Ring-switch itself is only about 0.4 to 0.45 ms.",
+      "do_not_retry": "Do not pursue ring-switch-only, f8 reread, or static worker-split riders unless a current proof-window measurement shows at least 2.1 ms of non-overlapped critical-path work."
+    }
+  ],
+  "profile_receipt_id": "R-41d350d06e8e48cc43b44b16cca486008683b56541f90c7c45f94e2860899a90",
+  "production_edits": false,
+  "submission_performed": false
+}

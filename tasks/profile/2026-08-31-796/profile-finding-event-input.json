@@ -1,0 +1,14 @@
+{
+  "actor": "frontier796_profile_projector",
+  "role": "performance_validator",
+  "authority": "SAPPHIRE_DIRECTIONAL",
+  "occurred_at": "2026-08-31T16:21:51Z",
+  "operation": "FINDING",
+  "payload": {
+    "epoch_id": "E-YUKON-cc3bbe1-7968097",
+    "classification": "current-crown phase refresh; no candidate admitted",
+    "finding": "Exact 7968097 phase evidence attributes about 2.732 ms of its directional parent-relative gain to zerocheck, including about 1.801 ms in round 2, while the 65.083 ms commit phase is flat. All cff-era performance candidates are stale for promotion. A system-wide sampled-symbol attempt failed its proof-window gate and is excluded from hotspot ranking.",
+    "receipt_id": "R-41d350d06e8e48cc43b44b16cca486008683b56541f90c7c45f94e2860899a90",
+    "submission_performed": false
+  }
+}

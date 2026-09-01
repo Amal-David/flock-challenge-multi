@@ -1,0 +1,31 @@
+{
+  "authority": "OFFICIAL_PROMOTED",
+  "benchmark": "eigenlabs/flock-challenge-multi/x86",
+  "kind": "yukon_submission_terminal",
+  "decision": "advance_official_frontier",
+  "status": "promoted",
+  "submission": "cc3bbe1d-695e-4546-a821-23bec2653466",
+  "source": "7968097f311d6fc5b30ba4cf9cd146c240e3daf2",
+  "score": 1590863.47318654,
+  "minimum_improvement_bips": 100,
+  "metrics": {
+    "threads": 16,
+    "verified": true,
+    "batch_size": 262144,
+    "warmup_runs": 20,
+    "measured_runs": 100,
+    "p10_seconds": 0.163913284,
+    "median_seconds": 0.164780953,
+    "aggregate_compressions_per_second": 1586488.09,
+    "p90_p10_latency_ratio": 1.015122,
+    "proof_bytes": 439183
+  },
+  "previous_frontier": {
+    "epoch_id": "E-YUKON-fab32a5-cff868b",
+    "submission": "fab32a5d-4121-420c-86e6-6314c92b11f2",
+    "source": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+    "score": 1572651.80209234
+  },
+  "github_actions_run": "https://github.com/Layr-Labs/flock-challenge-multi/actions/runs/33397888192",
+  "queried_at": "2026-08-31T16:09:34Z"
+}

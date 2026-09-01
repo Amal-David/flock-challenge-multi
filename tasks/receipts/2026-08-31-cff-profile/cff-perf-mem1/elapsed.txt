@@ -1,0 +1,5 @@
+label=mem1
+events=mem_inst_retired.all_loads,mem_inst_retired.all_stores,mem_load_retired.l2_miss,cycle_activity.stalls_l1d_miss
+seed=1311768467463790320
+elapsed_ns=234607035
+worker_status=0

@@ -1,0 +1,2353 @@
+ Percent |	Source code & Disassembly of stfmp-control-worker for cpu/cycles/P (4041 samples, percent: local period)
+------------------------------------------------------------------------------------------------------------------------
+         : 0      0x3c5bc0 <_blake3_hash_many_avx512>:
+    0.03 :   3c5bc0:        endbr64
+    0.00 :   3c5bc4:        push    r15
+    0.00 :   3c5bc6:        push    r14
+    0.05 :   3c5bc8:        push    r13
+    0.00 :   3c5bca:        push    r12
+    0.00 :   3c5bcc:        push    rbx
+    0.00 :   3c5bcd:        push    rbp
+    0.00 :   3c5bce:        mov     rbp, rsp
+    0.00 :   3c5bd1:        sub     rsp, 0x90
+    0.00 :   3c5bd8:        and     rsp, -0x40
+    0.00 :   3c5bdc:        neg     r9
+    0.00 :   3c5bdf:        kmovw   k1, r9d
+    0.03 :   3c5be4:        vmovd   xmm0, r8d
+    0.00 :   3c5be9:        vpbroadcastd    ymm0, xmm0
+    0.00 :   3c5bee:        shr     r8, 0x20
+    0.00 :   3c5bf2:        vmovd   xmm1, r8d
+    0.05 :   3c5bf7:        vpbroadcastd    ymm1, xmm1
+    0.00 :   3c5bfc:        vmovdqa ymm4, ymm1
+    0.00 :   3c5c00:        vmovdqa ymm5, ymm1
+    0.00 :   3c5c04:        vpaddd  ymm2, ymm0, ymmword ptr [rip - 0x37eb8c]  # 0x47080 <ADD0>
+    0.07 :   3c5c0c:        vpaddd  ymm3, ymm0, ymmword ptr [rip - 0x37eb74]  # 0x470a0 <ADD0+0x20>
+    0.00 :   3c5c14:        vpcmpltud       k2, ymm2, ymm0
+    0.00 :   3c5c1b:        vpcmpltud       k3, ymm3, ymm0
+    0.00 :   3c5c22:        vpaddd  ymm4 {k2}, ymm4, dword ptr [rip - 0x37eb6c]{1to8}  # 0x470c0 <ADD1>
+    0.03 :   3c5c2c:        vpaddd  ymm5 {k3}, ymm5, dword ptr [rip - 0x37eb76]{1to8}  # 0x470c0 <ADD1>
+    0.02 :   3c5c36:        knotw   k2, k1
+    0.00 :   3c5c3a:        vmovdqa32       ymm2 {k2}, ymm0
+    0.00 :   3c5c40:        vmovdqa32       ymm3 {k2}, ymm0
+    0.00 :   3c5c46:        vmovdqa32       ymm4 {k2}, ymm1
+    0.02 :   3c5c4c:        vmovdqa32       ymm5 {k2}, ymm1
+    0.07 :   3c5c52:        vmovdqa ymmword ptr [rsp], ymm2
+    0.00 :   3c5c57:        vmovdqa ymmword ptr [rsp + 0x20], ymm3
+    0.02 :   3c5c5d:        vmovdqa ymmword ptr [rsp + 0x40], ymm4
+    0.05 :   3c5c63:        vmovdqa ymmword ptr [rsp + 0x60], ymm5
+    0.00 :   3c5c69:        shl     rdx, 0x6
+    0.00 :   3c5c6d:        mov     qword ptr [rsp + 0x80], rdx
+    0.00 :   3c5c75:        cmp     rsi, 0x10
+    0.00 :   3c5c79:        jb      0x3c7600 <_blake3_hash_many_avx512+0x1a40>
+    0.00 :   3c5c7f:        vpbroadcastd    zmm0, dword ptr [rcx]
+    0.08 :   3c5c85:        vpbroadcastd    zmm1, dword ptr [rcx + 0x4]
+    0.00 :   3c5c8c:        vpbroadcastd    zmm2, dword ptr [rcx + 0x8]
+    0.00 :   3c5c93:        vpbroadcastd    zmm3, dword ptr [rcx + 0xc]
+    0.02 :   3c5c9a:        vpbroadcastd    zmm4, dword ptr [rcx + 0x10]
+    0.00 :   3c5ca1:        vpbroadcastd    zmm5, dword ptr [rcx + 0x14]
+    0.00 :   3c5ca8:        vpbroadcastd    zmm6, dword ptr [rcx + 0x18]
+    0.00 :   3c5caf:        vpbroadcastd    zmm7, dword ptr [rcx + 0x1c]
+    0.02 :   3c5cb6:        movzx   eax, byte ptr [rbp + 0x38]
+    0.02 :   3c5cba:        movzx   ebx, byte ptr [rbp + 0x40]
+    0.00 :   3c5cbe:        or      eax, ebx
+    0.00 :   3c5cc0:        xor     edx, edx
+    0.00 :   3c5cc2:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c5ccd:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c5cd8:        nop     dword ptr [rax + rax]
+    0.02 :   3c5ce0:        movzx   ebx, byte ptr [rbp + 0x48]
+    0.00 :   3c5ce4:        or      ebx, eax
+    0.05 :   3c5ce6:        add     rdx, 0x40
+    0.00 :   3c5cea:        cmp     rdx, qword ptr [rsp + 0x80]
+    0.05 :   3c5cf2:        cmove   eax, ebx
+    0.00 :   3c5cf5:        mov     dword ptr [rsp + 0x88], eax
+    0.10 :   3c5cfc:        mov     r8, qword ptr [rdi]
+    0.00 :   3c5cff:        mov     r9, qword ptr [rdi + 0x8]
+    0.03 :   3c5d03:        mov     r10, qword ptr [rdi + 0x10]
+    0.00 :   3c5d07:        mov     r11, qword ptr [rdi + 0x18]
+    0.03 :   3c5d0b:        mov     r12, qword ptr [rdi + 0x40]
+    0.15 :   3c5d0f:        mov     r13, qword ptr [rdi + 0x48]
+    0.05 :   3c5d13:        mov     r14, qword ptr [rdi + 0x50]
+    0.03 :   3c5d17:        mov     r15, qword ptr [rdi + 0x58]
+    0.02 :   3c5d1b:        vmovdqu32       ymm16, ymmword ptr [rdx + r8 - 0x40]
+    0.20 :   3c5d23:        vinserti64x4    zmm16, zmm16, ymmword ptr [rdx + r12 - 0x40], 0x1
+    1.16 :   3c5d2c:        vmovdqu32       ymm17, ymmword ptr [rdx + r9 - 0x40]
+    0.38 :   3c5d34:        vinserti64x4    zmm17, zmm17, ymmword ptr [rdx + r13 - 0x40], 0x1
+    0.81 :   3c5d3d:        vpunpcklqdq     zmm8, zmm16, zmm17
+    0.86 :   3c5d43:        vpunpckhqdq     zmm9, zmm16, zmm17
+    0.08 :   3c5d49:        vmovdqu32       ymm18, ymmword ptr [rdx + r10 - 0x40]
+    0.28 :   3c5d51:        vinserti64x4    zmm18, zmm18, ymmword ptr [rdx + r14 - 0x40], 0x1
+    0.34 :   3c5d5a:        vmovdqu32       ymm19, ymmword ptr [rdx + r11 - 0x40]
+    0.28 :   3c5d62:        vinserti64x4    zmm19, zmm19, ymmword ptr [rdx + r15 - 0x40], 0x1
+    0.30 :   3c5d6b:        vpunpcklqdq     zmm10, zmm18, zmm19
+    0.42 :   3c5d71:        vpunpckhqdq     zmm11, zmm18, zmm19
+    0.05 :   3c5d77:        mov     r8, qword ptr [rdi + 0x20]
+    0.00 :   3c5d7b:        mov     r9, qword ptr [rdi + 0x28]
+    0.00 :   3c5d7f:        mov     r10, qword ptr [rdi + 0x30]
+    0.00 :   3c5d83:        mov     r11, qword ptr [rdi + 0x38]
+    0.00 :   3c5d87:        mov     r12, qword ptr [rdi + 0x60]
+    0.00 :   3c5d8b:        mov     r13, qword ptr [rdi + 0x68]
+    0.05 :   3c5d8f:        mov     r14, qword ptr [rdi + 0x70]
+    0.00 :   3c5d93:        mov     r15, qword ptr [rdi + 0x78]
+    0.03 :   3c5d97:        vmovdqu32       ymm16, ymmword ptr [rdx + r8 - 0x40]
+    0.25 :   3c5d9f:        vinserti64x4    zmm16, zmm16, ymmword ptr [rdx + r12 - 0x40], 0x1
+    0.35 :   3c5da8:        vmovdqu32       ymm17, ymmword ptr [rdx + r9 - 0x40]
+    0.18 :   3c5db0:        vinserti64x4    zmm17, zmm17, ymmword ptr [rdx + r13 - 0x40], 0x1
+    0.28 :   3c5db9:        vpunpcklqdq     zmm12, zmm16, zmm17
+    0.58 :   3c5dbf:        vpunpckhqdq     zmm13, zmm16, zmm17
+    0.07 :   3c5dc5:        vmovdqu32       ymm18, ymmword ptr [rdx + r10 - 0x40]
+    0.17 :   3c5dcd:        vinserti64x4    zmm18, zmm18, ymmword ptr [rdx + r14 - 0x40], 0x1
+    0.25 :   3c5dd6:        vmovdqu32       ymm19, ymmword ptr [rdx + r11 - 0x40]
+    0.12 :   3c5dde:        vinserti64x4    zmm19, zmm19, ymmword ptr [rdx + r15 - 0x40], 0x1
+    0.20 :   3c5de7:        vpunpcklqdq     zmm14, zmm18, zmm19
+    0.46 :   3c5ded:        vpunpckhqdq     zmm15, zmm18, zmm19
+    0.05 :   3c5df3:        vmovdqa32       zmm27, zmmword ptr [rip - 0x37edfd]  # 0x47000 <INDEX0>
+    0.00 :   3c5dfd:        vmovdqa32       zmm31, zmmword ptr [rip - 0x37edc7]  # 0x47040 <INDEX1>
+    0.02 :   3c5e07:        vshufps zmm16, zmm8, zmm10, 0x88
+    0.22 :   3c5e0e:        vshufps zmm17, zmm12, zmm14, 0x88
+    0.15 :   3c5e15:        vmovdqa32       zmm20, zmm16
+    0.00 :   3c5e1b:        vpermt2d        zmm16, zmm27, zmm17
+    0.52 :   3c5e21:        vpermt2d        zmm20, zmm31, zmm17
+    0.07 :   3c5e27:        vshufps zmm17, zmm8, zmm10, 0xdd
+    0.03 :   3c5e2e:        vshufps zmm30, zmm12, zmm14, 0xdd
+    0.05 :   3c5e35:        vmovdqa32       zmm21, zmm17
+    0.02 :   3c5e3b:        vpermt2d        zmm17, zmm27, zmm30
+    0.37 :   3c5e41:        vpermt2d        zmm21, zmm31, zmm30
+    0.05 :   3c5e47:        vshufps zmm18, zmm9, zmm11, 0x88
+    0.02 :   3c5e4e:        vshufps zmm8, zmm13, zmm15, 0x88
+    0.00 :   3c5e55:        vmovdqa32       zmm22, zmm18
+    0.00 :   3c5e5b:        vpermt2d        zmm18, zmm27, zmm8
+    0.27 :   3c5e61:        vpermt2d        zmm22, zmm31, zmm8
+    0.22 :   3c5e67:        vshufps zmm19, zmm9, zmm11, 0xdd
+    0.05 :   3c5e6e:        vshufps zmm8, zmm13, zmm15, 0xdd
+    0.07 :   3c5e75:        vmovdqa32       zmm23, zmm19
+    0.00 :   3c5e7b:        vpermt2d        zmm19, zmm27, zmm8
+    0.38 :   3c5e81:        vpermt2d        zmm23, zmm31, zmm8
+    0.10 :   3c5e87:        mov     r8, qword ptr [rdi]
+    0.00 :   3c5e8a:        mov     r9, qword ptr [rdi + 0x8]
+    0.00 :   3c5e8e:        mov     r10, qword ptr [rdi + 0x10]
+    0.00 :   3c5e92:        mov     r11, qword ptr [rdi + 0x18]
+    0.00 :   3c5e96:        mov     r12, qword ptr [rdi + 0x40]
+    0.00 :   3c5e9a:        mov     r13, qword ptr [rdi + 0x48]
+    0.00 :   3c5e9e:        mov     r14, qword ptr [rdi + 0x50]
+    0.05 :   3c5ea2:        mov     r15, qword ptr [rdi + 0x58]
+    0.05 :   3c5ea6:        vmovdqu32       ymm24, ymmword ptr [r8 + rdx - 0x20]
+    0.02 :   3c5eae:        vinserti64x4    zmm24, zmm24, ymmword ptr [r12 + rdx - 0x20], 0x1
+    0.07 :   3c5eb7:        vmovdqu32       ymm25, ymmword ptr [r9 + rdx - 0x20]
+    0.00 :   3c5ebf:        vinserti64x4    zmm25, zmm25, ymmword ptr [r13 + rdx - 0x20], 0x1
+    0.05 :   3c5ec8:        vpunpcklqdq     zmm8, zmm24, zmm25
+    0.63 :   3c5ece:        vpunpckhqdq     zmm9, zmm24, zmm25
+    0.10 :   3c5ed4:        vmovdqu32       ymm24, ymmword ptr [r10 + rdx - 0x20]
+    0.00 :   3c5edc:        vinserti64x4    zmm24, zmm24, ymmword ptr [r14 + rdx - 0x20], 0x1
+    0.00 :   3c5ee5:        vmovdqu32       ymm25, ymmword ptr [r11 + rdx - 0x20]
+    0.00 :   3c5eed:        vinserti64x4    zmm25, zmm25, ymmword ptr [r15 + rdx - 0x20], 0x1
+    0.02 :   3c5ef6:        vpunpcklqdq     zmm10, zmm24, zmm25
+    0.37 :   3c5efc:        vpunpckhqdq     zmm11, zmm24, zmm25
+    0.05 :   3c5f02:        prefetcht0      byte ptr [r8 + rdx + 0x80]
+    0.15 :   3c5f0b:        prefetcht0      byte ptr [r12 + rdx + 0x80]
+    0.17 :   3c5f14:        prefetcht0      byte ptr [r9 + rdx + 0x80]
+    0.08 :   3c5f1d:        prefetcht0      byte ptr [r13 + rdx + 0x80]
+    0.29 :   3c5f26:        prefetcht0      byte ptr [r10 + rdx + 0x80]
+    0.12 :   3c5f2f:        prefetcht0      byte ptr [r14 + rdx + 0x80]
+    0.13 :   3c5f38:        prefetcht0      byte ptr [r11 + rdx + 0x80]
+    0.30 :   3c5f41:        prefetcht0      byte ptr [r15 + rdx + 0x80]
+    0.15 :   3c5f4a:        mov     r8, qword ptr [rdi + 0x20]
+    0.00 :   3c5f4e:        mov     r9, qword ptr [rdi + 0x28]
+    0.00 :   3c5f52:        mov     r10, qword ptr [rdi + 0x30]
+    0.03 :   3c5f56:        mov     r11, qword ptr [rdi + 0x38]
+    0.00 :   3c5f5a:        mov     r12, qword ptr [rdi + 0x60]
+    0.00 :   3c5f5e:        mov     r13, qword ptr [rdi + 0x68]
+    0.00 :   3c5f62:        mov     r14, qword ptr [rdi + 0x70]
+    0.07 :   3c5f66:        mov     r15, qword ptr [rdi + 0x78]
+    0.05 :   3c5f6a:        vmovdqu32       ymm24, ymmword ptr [r8 + rdx - 0x20]
+    0.00 :   3c5f72:        vinserti64x4    zmm24, zmm24, ymmword ptr [r12 + rdx - 0x20], 0x1
+    0.05 :   3c5f7b:        vmovdqu32       ymm25, ymmword ptr [r9 + rdx - 0x20]
+    0.00 :   3c5f83:        vinserti64x4    zmm25, zmm25, ymmword ptr [r13 + rdx - 0x20], 0x1
+    0.05 :   3c5f8c:        vpunpcklqdq     zmm12, zmm24, zmm25
+    0.70 :   3c5f92:        vpunpckhqdq     zmm13, zmm24, zmm25
+    0.08 :   3c5f98:        vmovdqu32       ymm24, ymmword ptr [r10 + rdx - 0x20]
+    0.00 :   3c5fa0:        vinserti64x4    zmm24, zmm24, ymmword ptr [r14 + rdx - 0x20], 0x1
+    0.03 :   3c5fa9:        vmovdqu32       ymm25, ymmword ptr [r11 + rdx - 0x20]
+    0.00 :   3c5fb1:        vinserti64x4    zmm25, zmm25, ymmword ptr [r15 + rdx - 0x20], 0x1
+    0.00 :   3c5fba:        vpunpcklqdq     zmm14, zmm24, zmm25
+    0.35 :   3c5fc0:        vpunpckhqdq     zmm15, zmm24, zmm25
+    0.05 :   3c5fc6:        prefetcht0      byte ptr [r8 + rdx + 0x80]
+    0.18 :   3c5fcf:        prefetcht0      byte ptr [r12 + rdx + 0x80]
+    0.10 :   3c5fd8:        prefetcht0      byte ptr [r9 + rdx + 0x80]
+    0.10 :   3c5fe1:        prefetcht0      byte ptr [r13 + rdx + 0x80]
+    0.08 :   3c5fea:        prefetcht0      byte ptr [r10 + rdx + 0x80]
+    0.02 :   3c5ff3:        prefetcht0      byte ptr [r14 + rdx + 0x80]
+    0.13 :   3c5ffc:        prefetcht0      byte ptr [r11 + rdx + 0x80]
+    0.15 :   3c6005:        prefetcht0      byte ptr [r15 + rdx + 0x80]
+    0.10 :   3c600e:        vshufps zmm24, zmm8, zmm10, 0x88
+    0.27 :   3c6015:        vshufps zmm30, zmm12, zmm14, 0x88
+    0.13 :   3c601c:        vmovdqa32       zmm28, zmm24
+    0.00 :   3c6022:        vpermt2d        zmm24, zmm27, zmm30
+    0.20 :   3c6028:        vpermt2d        zmm28, zmm31, zmm30
+    0.10 :   3c602e:        vshufps zmm25, zmm8, zmm10, 0xdd
+    0.05 :   3c6035:        vshufps zmm30, zmm12, zmm14, 0xdd
+    0.00 :   3c603c:        vmovdqa32       zmm29, zmm25
+    0.00 :   3c6042:        vpermt2d        zmm25, zmm27, zmm30
+    0.50 :   3c6048:        vpermt2d        zmm29, zmm31, zmm30
+    0.10 :   3c604e:        vshufps zmm26, zmm9, zmm11, 0x88
+    0.12 :   3c6055:        vshufps zmm8, zmm13, zmm15, 0x88
+    0.07 :   3c605c:        vmovdqa32       zmm30, zmm26
+    0.00 :   3c6062:        vpermt2d        zmm26, zmm27, zmm8
+    0.25 :   3c6068:        vpermt2d        zmm30, zmm31, zmm8
+    0.15 :   3c606e:        vshufps zmm8, zmm9, zmm11, 0xdd
+    0.03 :   3c6075:        vshufps zmm10, zmm13, zmm15, 0xdd
+    0.03 :   3c607c:        vpermi2d        zmm27, zmm8, zmm10
+    0.22 :   3c6082:        vpermi2d        zmm31, zmm8, zmm10
+    0.08 :   3c6088:        vpbroadcastd    zmm8, dword ptr [rip - 0x37ef92]  # 0x47100 <BLAKE3_IV>
+    0.02 :   3c6092:        vpbroadcastd    zmm9, dword ptr [rip - 0x37ef98]  # 0x47104 <BLAKE3_IV_1>
+    0.00 :   3c609c:        vpbroadcastd    zmm10, dword ptr [rip - 0x37ef9e]  # 0x47108 <BLAKE3_IV_2>
+    0.03 :   3c60a6:        vpbroadcastd    zmm11, dword ptr [rip - 0x37efa4]  # 0x4710c <BLAKE3_IV_3>
+    0.02 :   3c60b0:        vmovdqa32       zmm12, zmmword ptr [rsp]
+    0.00 :   3c60b7:        vmovdqa32       zmm13, zmmword ptr [rsp + 0x40]
+    0.00 :   3c60bf:        vpbroadcastd    zmm14, dword ptr [rip - 0x37f001]  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.08 :   3c60c9:        vpbroadcastd    zmm15, dword ptr [rsp + 0x88]
+    0.05 :   3c60d1:        vpaddd  zmm0, zmm0, zmm16
+    0.03 :   3c60d7:        vpaddd  zmm1, zmm1, zmm18
+    0.00 :   3c60dd:        vpaddd  zmm2, zmm2, zmm20
+    0.00 :   3c60e3:        vpaddd  zmm3, zmm3, zmm22
+    0.05 :   3c60e9:        vpaddd  zmm0, zmm0, zmm4
+    0.00 :   3c60ef:        vpaddd  zmm1, zmm1, zmm5
+    0.00 :   3c60f5:        vpaddd  zmm2, zmm2, zmm6
+    0.05 :   3c60fb:        vpaddd  zmm3, zmm3, zmm7
+    0.03 :   3c6101:        vpxord  zmm12, zmm12, zmm0
+    0.00 :   3c6107:        vpxord  zmm13, zmm13, zmm1
+    0.02 :   3c610d:        vpxord  zmm14, zmm14, zmm2
+    0.03 :   3c6113:        vpxord  zmm15, zmm15, zmm3
+    0.03 :   3c6119:        vprord  zmm12, zmm12, 0x10
+    0.00 :   3c6120:        vprord  zmm13, zmm13, 0x10
+    0.02 :   3c6127:        vprord  zmm14, zmm14, 0x10
+    0.05 :   3c612e:        vprord  zmm15, zmm15, 0x10
+    0.15 :   3c6135:        vpaddd  zmm8, zmm8, zmm12
+    0.07 :   3c613b:        vpaddd  zmm9, zmm9, zmm13
+    0.00 :   3c6141:        vpaddd  zmm10, zmm10, zmm14
+    0.03 :   3c6147:        vpaddd  zmm11, zmm11, zmm15
+    0.02 :   3c614d:        vpxord  zmm4, zmm4, zmm8
+    0.00 :   3c6153:        vpxord  zmm5, zmm5, zmm9
+    0.05 :   3c6159:        vpxord  zmm6, zmm6, zmm10
+    0.05 :   3c615f:        vpxord  zmm7, zmm7, zmm11
+    0.10 :   3c6165:        vprord  zmm4, zmm4, 0xc
+    0.07 :   3c616c:        vprord  zmm5, zmm5, 0xc
+    0.03 :   3c6173:        vprord  zmm6, zmm6, 0xc
+    0.12 :   3c617a:        vprord  zmm7, zmm7, 0xc
+    0.07 :   3c6181:        vpaddd  zmm0, zmm0, zmm17
+    0.05 :   3c6187:        vpaddd  zmm1, zmm1, zmm19
+    0.05 :   3c618d:        vpaddd  zmm2, zmm2, zmm21
+    0.12 :   3c6193:        vpaddd  zmm3, zmm3, zmm23
+    0.08 :   3c6199:        vpaddd  zmm0, zmm0, zmm4
+    0.07 :   3c619f:        vpaddd  zmm1, zmm1, zmm5
+    0.02 :   3c61a5:        vpaddd  zmm2, zmm2, zmm6
+    0.08 :   3c61ab:        vpaddd  zmm3, zmm3, zmm7
+    0.07 :   3c61b1:        vpxord  zmm12, zmm12, zmm0
+    0.08 :   3c61b7:        vpxord  zmm13, zmm13, zmm1
+    0.16 :   3c61bd:        vpxord  zmm14, zmm14, zmm2
+    0.17 :   3c61c3:        vpxord  zmm15, zmm15, zmm3
+    0.07 :   3c61c9:        vprord  zmm12, zmm12, 0x8
+    0.27 :   3c61d0:        vprord  zmm13, zmm13, 0x8
+    0.35 :   3c61d7:        vprord  zmm14, zmm14, 0x8
+    0.09 :   3c61de:        vprord  zmm15, zmm15, 0x8
+    0.07 :   3c61e5:        vpaddd  zmm8, zmm8, zmm12
+    0.07 :   3c61eb:        vpaddd  zmm9, zmm9, zmm13
+    0.15 :   3c61f1:        vpaddd  zmm10, zmm10, zmm14
+    0.07 :   3c61f7:        vpaddd  zmm11, zmm11, zmm15
+    0.10 :   3c61fd:        vpxord  zmm4, zmm4, zmm8
+    0.15 :   3c6203:        vpxord  zmm5, zmm5, zmm9
+    0.12 :   3c6209:        vpxord  zmm6, zmm6, zmm10
+    0.10 :   3c620f:        vpxord  zmm7, zmm7, zmm11
+    0.10 :   3c6215:        vprord  zmm4, zmm4, 0x7
+    0.17 :   3c621c:        vprord  zmm5, zmm5, 0x7
+    0.24 :   3c6223:        vprord  zmm6, zmm6, 0x7
+    0.12 :   3c622a:        vprord  zmm7, zmm7, 0x7
+    0.05 :   3c6231:        vpaddd  zmm0, zmm0, zmm24
+    0.07 :   3c6237:        vpaddd  zmm1, zmm1, zmm26
+    0.03 :   3c623d:        vpaddd  zmm2, zmm2, zmm28
+    0.05 :   3c6243:        vpaddd  zmm3, zmm3, zmm30
+    0.05 :   3c6249:        vpaddd  zmm0, zmm0, zmm5
+    0.05 :   3c624f:        vpaddd  zmm1, zmm1, zmm6
+    0.05 :   3c6255:        vpaddd  zmm2, zmm2, zmm7
+    0.05 :   3c625b:        vpaddd  zmm3, zmm3, zmm4
+    0.02 :   3c6261:        vpxord  zmm15, zmm15, zmm0
+    0.10 :   3c6267:        vpxord  zmm12, zmm12, zmm1
+    0.07 :   3c626d:        vpxord  zmm13, zmm13, zmm2
+    0.15 :   3c6273:        vpxord  zmm14, zmm14, zmm3
+    0.18 :   3c6279:        vprord  zmm15, zmm15, 0x10
+    0.22 :   3c6280:        vprord  zmm12, zmm12, 0x10
+    0.20 :   3c6287:        vprord  zmm13, zmm13, 0x10
+    0.05 :   3c628e:        vprord  zmm14, zmm14, 0x10
+    0.05 :   3c6295:        vpaddd  zmm10, zmm10, zmm15
+    0.07 :   3c629b:        vpaddd  zmm11, zmm11, zmm12
+    0.15 :   3c62a1:        vpaddd  zmm8, zmm8, zmm13
+    0.05 :   3c62a7:        vpaddd  zmm9, zmm9, zmm14
+    0.02 :   3c62ad:        vpxord  zmm5, zmm5, zmm10
+    0.15 :   3c62b3:        vpxord  zmm6, zmm6, zmm11
+    0.13 :   3c62b9:        vpxord  zmm7, zmm7, zmm8
+    0.07 :   3c62bf:        vpxord  zmm4, zmm4, zmm9
+    0.05 :   3c62c5:        vprord  zmm5, zmm5, 0xc
+    0.05 :   3c62cc:        vprord  zmm6, zmm6, 0xc
+    0.17 :   3c62d3:        vprord  zmm7, zmm7, 0xc
+    0.10 :   3c62da:        vprord  zmm4, zmm4, 0xc
+    0.10 :   3c62e1:        vpaddd  zmm0, zmm0, zmm25
+    0.07 :   3c62e7:        vpaddd  zmm1, zmm1, zmm27
+    0.13 :   3c62ed:        vpaddd  zmm2, zmm2, zmm29
+    0.10 :   3c62f3:        vpaddd  zmm3, zmm3, zmm31
+    0.10 :   3c62f9:        vpaddd  zmm0, zmm0, zmm5
+    0.02 :   3c62ff:        vpaddd  zmm1, zmm1, zmm6
+    0.08 :   3c6305:        vpaddd  zmm2, zmm2, zmm7
+    0.15 :   3c630b:        vpaddd  zmm3, zmm3, zmm4
+    0.07 :   3c6311:        vpxord  zmm15, zmm15, zmm0
+    0.07 :   3c6317:        vpxord  zmm12, zmm12, zmm1
+    0.17 :   3c631d:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c6323:        vpxord  zmm14, zmm14, zmm3
+    0.17 :   3c6329:        vprord  zmm15, zmm15, 0x8
+    0.10 :   3c6330:        vprord  zmm12, zmm12, 0x8
+    0.20 :   3c6337:        vprord  zmm13, zmm13, 0x8
+    0.09 :   3c633e:        vprord  zmm14, zmm14, 0x8
+    0.07 :   3c6345:        vpaddd  zmm10, zmm10, zmm15
+    0.03 :   3c634b:        vpaddd  zmm11, zmm11, zmm12
+    0.03 :   3c6351:        vpaddd  zmm8, zmm8, zmm13
+    0.12 :   3c6357:        vpaddd  zmm9, zmm9, zmm14
+    0.12 :   3c635d:        vpxord  zmm5, zmm5, zmm10
+    0.08 :   3c6363:        vpxord  zmm6, zmm6, zmm11
+    0.12 :   3c6369:        vpxord  zmm7, zmm7, zmm8
+    0.15 :   3c636f:        vpxord  zmm4, zmm4, zmm9
+    0.10 :   3c6375:        vprord  zmm5, zmm5, 0x7
+    0.07 :   3c637c:        vprord  zmm6, zmm6, 0x7
+    0.09 :   3c6383:        vprord  zmm7, zmm7, 0x7
+    0.12 :   3c638a:        vprord  zmm4, zmm4, 0x7
+    0.07 :   3c6391:        vpaddd  zmm0, zmm0, zmm18
+    0.02 :   3c6397:        vpaddd  zmm1, zmm1, zmm19
+    0.07 :   3c639d:        vpaddd  zmm2, zmm2, zmm23
+    0.05 :   3c63a3:        vpaddd  zmm3, zmm3, zmm20
+    0.07 :   3c63a9:        vpaddd  zmm0, zmm0, zmm4
+    0.07 :   3c63af:        vpaddd  zmm1, zmm1, zmm5
+    0.07 :   3c63b5:        vpaddd  zmm2, zmm2, zmm6
+    0.05 :   3c63bb:        vpaddd  zmm3, zmm3, zmm7
+    0.05 :   3c63c1:        vpxord  zmm12, zmm12, zmm0
+    0.23 :   3c63c7:        vpxord  zmm13, zmm13, zmm1
+    0.07 :   3c63cd:        vpxord  zmm14, zmm14, zmm2
+    0.18 :   3c63d3:        vpxord  zmm15, zmm15, zmm3
+    0.12 :   3c63d9:        vprord  zmm12, zmm12, 0x10
+    0.12 :   3c63e0:        vprord  zmm13, zmm13, 0x10
+    0.02 :   3c63e7:        vprord  zmm14, zmm14, 0x10
+    0.13 :   3c63ee:        vprord  zmm15, zmm15, 0x10
+    0.02 :   3c63f5:        vpaddd  zmm8, zmm8, zmm12
+    0.10 :   3c63fb:        vpaddd  zmm9, zmm9, zmm13
+    0.08 :   3c6401:        vpaddd  zmm10, zmm10, zmm14
+    0.08 :   3c6407:        vpaddd  zmm11, zmm11, zmm15
+    0.05 :   3c640d:        vpxord  zmm4, zmm4, zmm8
+    0.00 :   3c6413:        vpxord  zmm5, zmm5, zmm9
+    0.07 :   3c6419:        vpxord  zmm6, zmm6, zmm10
+    0.15 :   3c641f:        vpxord  zmm7, zmm7, zmm11
+    0.15 :   3c6425:        vprord  zmm4, zmm4, 0xc
+    0.20 :   3c642c:        vprord  zmm5, zmm5, 0xc
+    0.15 :   3c6433:        vprord  zmm6, zmm6, 0xc
+    0.12 :   3c643a:        vprord  zmm7, zmm7, 0xc
+    0.00 :   3c6441:        vpaddd  zmm0, zmm0, zmm22
+    0.12 :   3c6447:        vpaddd  zmm1, zmm1, zmm26
+    0.02 :   3c644d:        vpaddd  zmm2, zmm2, zmm16
+    0.08 :   3c6453:        vpaddd  zmm3, zmm3, zmm29
+    0.15 :   3c6459:        vpaddd  zmm0, zmm0, zmm4
+    0.18 :   3c645f:        vpaddd  zmm1, zmm1, zmm5
+    0.21 :   3c6465:        vpaddd  zmm2, zmm2, zmm6
+    0.08 :   3c646b:        vpaddd  zmm3, zmm3, zmm7
+    0.13 :   3c6471:        vpxord  zmm12, zmm12, zmm0
+    0.13 :   3c6477:        vpxord  zmm13, zmm13, zmm1
+    0.10 :   3c647d:        vpxord  zmm14, zmm14, zmm2
+    0.05 :   3c6483:        vpxord  zmm15, zmm15, zmm3
+    0.05 :   3c6489:        vprord  zmm12, zmm12, 0x8
+    0.24 :   3c6490:        vprord  zmm13, zmm13, 0x8
+    0.15 :   3c6497:        vprord  zmm14, zmm14, 0x8
+    0.07 :   3c649e:        vprord  zmm15, zmm15, 0x8
+    0.10 :   3c64a5:        vpaddd  zmm8, zmm8, zmm12
+    0.07 :   3c64ab:        vpaddd  zmm9, zmm9, zmm13
+    0.02 :   3c64b1:        vpaddd  zmm10, zmm10, zmm14
+    0.12 :   3c64b7:        vpaddd  zmm11, zmm11, zmm15
+    0.02 :   3c64bd:        vpxord  zmm4, zmm4, zmm8
+    0.09 :   3c64c3:        vpxord  zmm5, zmm5, zmm9
+    0.05 :   3c64c9:        vpxord  zmm6, zmm6, zmm10
+    0.00 :   3c64cf:        vpxord  zmm7, zmm7, zmm11
+    0.12 :   3c64d5:        vprord  zmm4, zmm4, 0x7
+    0.22 :   3c64dc:        vprord  zmm5, zmm5, 0x7
+    0.10 :   3c64e3:        vprord  zmm6, zmm6, 0x7
+    0.08 :   3c64ea:        vprord  zmm7, zmm7, 0x7
+    0.15 :   3c64f1:        vpaddd  zmm0, zmm0, zmm17
+    0.02 :   3c64f7:        vpaddd  zmm1, zmm1, zmm28
+    0.00 :   3c64fd:        vpaddd  zmm2, zmm2, zmm25
+    0.05 :   3c6503:        vpaddd  zmm3, zmm3, zmm31
+    0.07 :   3c6509:        vpaddd  zmm0, zmm0, zmm5
+    0.08 :   3c650f:        vpaddd  zmm1, zmm1, zmm6
+    0.07 :   3c6515:        vpaddd  zmm2, zmm2, zmm7
+    0.24 :   3c651b:        vpaddd  zmm3, zmm3, zmm4
+    0.12 :   3c6521:        vpxord  zmm15, zmm15, zmm0
+    0.05 :   3c6527:        vpxord  zmm12, zmm12, zmm1
+    0.08 :   3c652d:        vpxord  zmm13, zmm13, zmm2
+    0.20 :   3c6533:        vpxord  zmm14, zmm14, zmm3
+    0.20 :   3c6539:        vprord  zmm15, zmm15, 0x10
+    0.19 :   3c6540:        vprord  zmm12, zmm12, 0x10
+    0.20 :   3c6547:        vprord  zmm13, zmm13, 0x10
+    0.14 :   3c654e:        vprord  zmm14, zmm14, 0x10
+    0.03 :   3c6555:        vpaddd  zmm10, zmm10, zmm15
+    0.05 :   3c655b:        vpaddd  zmm11, zmm11, zmm12
+    0.02 :   3c6561:        vpaddd  zmm8, zmm8, zmm13
+    0.12 :   3c6567:        vpaddd  zmm9, zmm9, zmm14
+    0.08 :   3c656d:        vpxord  zmm5, zmm5, zmm10
+    0.10 :   3c6573:        vpxord  zmm6, zmm6, zmm11
+    0.05 :   3c6579:        vpxord  zmm7, zmm7, zmm8
+    0.15 :   3c657f:        vpxord  zmm4, zmm4, zmm9
+    0.17 :   3c6585:        vprord  zmm5, zmm5, 0xc
+    0.20 :   3c658c:        vprord  zmm6, zmm6, 0xc
+    0.10 :   3c6593:        vprord  zmm7, zmm7, 0xc
+    0.10 :   3c659a:        vprord  zmm4, zmm4, 0xc
+    0.08 :   3c65a1:        vpaddd  zmm0, zmm0, zmm27
+    0.13 :   3c65a7:        vpaddd  zmm1, zmm1, zmm21
+    0.10 :   3c65ad:        vpaddd  zmm2, zmm2, zmm30
+    0.02 :   3c65b3:        vpaddd  zmm3, zmm3, zmm24
+    0.10 :   3c65b9:        vpaddd  zmm0, zmm0, zmm5
+    0.10 :   3c65bf:        vpaddd  zmm1, zmm1, zmm6
+    0.17 :   3c65c5:        vpaddd  zmm2, zmm2, zmm7
+    0.07 :   3c65cb:        vpaddd  zmm3, zmm3, zmm4
+    0.12 :   3c65d1:        vpxord  zmm15, zmm15, zmm0
+    0.17 :   3c65d7:        vpxord  zmm12, zmm12, zmm1
+    0.18 :   3c65dd:        vpxord  zmm13, zmm13, zmm2
+    0.13 :   3c65e3:        vpxord  zmm14, zmm14, zmm3
+    0.12 :   3c65e9:        vprord  zmm15, zmm15, 0x8
+    0.15 :   3c65f0:        vprord  zmm12, zmm12, 0x8
+    0.09 :   3c65f7:        vprord  zmm13, zmm13, 0x8
+    0.12 :   3c65fe:        vprord  zmm14, zmm14, 0x8
+    0.15 :   3c6605:        vpaddd  zmm10, zmm10, zmm15
+    0.03 :   3c660b:        vpaddd  zmm11, zmm11, zmm12
+    0.18 :   3c6611:        vpaddd  zmm8, zmm8, zmm13
+    0.13 :   3c6617:        vpaddd  zmm9, zmm9, zmm14
+    0.07 :   3c661d:        vpxord  zmm5, zmm5, zmm10
+    0.08 :   3c6623:        vpxord  zmm6, zmm6, zmm11
+    0.13 :   3c6629:        vpxord  zmm7, zmm7, zmm8
+    0.02 :   3c662f:        vpxord  zmm4, zmm4, zmm9
+    0.17 :   3c6635:        vprord  zmm5, zmm5, 0x7
+    0.14 :   3c663c:        vprord  zmm6, zmm6, 0x7
+    0.15 :   3c6643:        vprord  zmm7, zmm7, 0x7
+    0.05 :   3c664a:        vprord  zmm4, zmm4, 0x7
+    0.12 :   3c6651:        vpaddd  zmm0, zmm0, zmm19
+    0.00 :   3c6657:        vpaddd  zmm1, zmm1, zmm26
+    0.05 :   3c665d:        vpaddd  zmm2, zmm2, zmm29
+    0.05 :   3c6663:        vpaddd  zmm3, zmm3, zmm23
+    0.15 :   3c6669:        vpaddd  zmm0, zmm0, zmm4
+    0.03 :   3c666f:        vpaddd  zmm1, zmm1, zmm5
+    0.10 :   3c6675:        vpaddd  zmm2, zmm2, zmm6
+    0.07 :   3c667b:        vpaddd  zmm3, zmm3, zmm7
+    0.17 :   3c6681:        vpxord  zmm12, zmm12, zmm0
+    0.17 :   3c6687:        vpxord  zmm13, zmm13, zmm1
+    0.05 :   3c668d:        vpxord  zmm14, zmm14, zmm2
+    0.05 :   3c6693:        vpxord  zmm15, zmm15, zmm3
+    0.10 :   3c6699:        vprord  zmm12, zmm12, 0x10
+    0.13 :   3c66a0:        vprord  zmm13, zmm13, 0x10
+    0.08 :   3c66a7:        vprord  zmm14, zmm14, 0x10
+    0.19 :   3c66ae:        vprord  zmm15, zmm15, 0x10
+    0.10 :   3c66b5:        vpaddd  zmm8, zmm8, zmm12
+    0.10 :   3c66bb:        vpaddd  zmm9, zmm9, zmm13
+    0.05 :   3c66c1:        vpaddd  zmm10, zmm10, zmm14
+    0.07 :   3c66c7:        vpaddd  zmm11, zmm11, zmm15
+    0.12 :   3c66cd:        vpxord  zmm4, zmm4, zmm8
+    0.27 :   3c66d3:        vpxord  zmm5, zmm5, zmm9
+    0.10 :   3c66d9:        vpxord  zmm6, zmm6, zmm10
+    0.10 :   3c66df:        vpxord  zmm7, zmm7, zmm11
+    0.08 :   3c66e5:        vprord  zmm4, zmm4, 0xc
+    0.18 :   3c66ec:        vprord  zmm5, zmm5, 0xc
+    0.14 :   3c66f3:        vprord  zmm6, zmm6, 0xc
+    0.15 :   3c66fa:        vprord  zmm7, zmm7, 0xc
+    0.07 :   3c6701:        vpaddd  zmm0, zmm0, zmm20
+    0.03 :   3c6707:        vpaddd  zmm1, zmm1, zmm28
+    0.08 :   3c670d:        vpaddd  zmm2, zmm2, zmm18
+    0.03 :   3c6713:        vpaddd  zmm3, zmm3, zmm30
+    0.05 :   3c6719:        vpaddd  zmm0, zmm0, zmm4
+    0.17 :   3c671f:        vpaddd  zmm1, zmm1, zmm5
+    0.15 :   3c6725:        vpaddd  zmm2, zmm2, zmm6
+    0.07 :   3c672b:        vpaddd  zmm3, zmm3, zmm7
+    0.05 :   3c6731:        vpxord  zmm12, zmm12, zmm0
+    0.10 :   3c6737:        vpxord  zmm13, zmm13, zmm1
+    0.05 :   3c673d:        vpxord  zmm14, zmm14, zmm2
+    0.05 :   3c6743:        vpxord  zmm15, zmm15, zmm3
+    0.09 :   3c6749:        vprord  zmm12, zmm12, 0x8
+    0.13 :   3c6750:        vprord  zmm13, zmm13, 0x8
+    0.25 :   3c6757:        vprord  zmm14, zmm14, 0x8
+    0.05 :   3c675e:        vprord  zmm15, zmm15, 0x8
+    0.15 :   3c6765:        vpaddd  zmm8, zmm8, zmm12
+    0.03 :   3c676b:        vpaddd  zmm9, zmm9, zmm13
+    0.10 :   3c6771:        vpaddd  zmm10, zmm10, zmm14
+    0.05 :   3c6777:        vpaddd  zmm11, zmm11, zmm15
+    0.05 :   3c677d:        vpxord  zmm4, zmm4, zmm8
+    0.05 :   3c6783:        vpxord  zmm5, zmm5, zmm9
+    0.05 :   3c6789:        vpxord  zmm6, zmm6, zmm10
+    0.12 :   3c678f:        vpxord  zmm7, zmm7, zmm11
+    0.22 :   3c6795:        vprord  zmm4, zmm4, 0x7
+    0.18 :   3c679c:        vprord  zmm5, zmm5, 0x7
+    0.13 :   3c67a3:        vprord  zmm6, zmm6, 0x7
+    0.20 :   3c67aa:        vprord  zmm7, zmm7, 0x7
+    0.05 :   3c67b1:        vpaddd  zmm0, zmm0, zmm22
+    0.05 :   3c67b7:        vpaddd  zmm1, zmm1, zmm25
+    0.12 :   3c67bd:        vpaddd  zmm2, zmm2, zmm27
+    0.12 :   3c67c3:        vpaddd  zmm3, zmm3, zmm24
+    0.05 :   3c67c9:        vpaddd  zmm0, zmm0, zmm5
+    0.15 :   3c67cf:        vpaddd  zmm1, zmm1, zmm6
+    0.08 :   3c67d5:        vpaddd  zmm2, zmm2, zmm7
+    0.07 :   3c67db:        vpaddd  zmm3, zmm3, zmm4
+    0.05 :   3c67e1:        vpxord  zmm15, zmm15, zmm0
+    0.19 :   3c67e7:        vpxord  zmm12, zmm12, zmm1
+    0.12 :   3c67ed:        vpxord  zmm13, zmm13, zmm2
+    0.02 :   3c67f3:        vpxord  zmm14, zmm14, zmm3
+    0.15 :   3c67f9:        vprord  zmm15, zmm15, 0x10
+    0.21 :   3c6800:        vprord  zmm12, zmm12, 0x10
+    0.17 :   3c6807:        vprord  zmm13, zmm13, 0x10
+    0.12 :   3c680e:        vprord  zmm14, zmm14, 0x10
+    0.07 :   3c6815:        vpaddd  zmm10, zmm10, zmm15
+    0.02 :   3c681b:        vpaddd  zmm11, zmm11, zmm12
+    0.05 :   3c6821:        vpaddd  zmm8, zmm8, zmm13
+    0.05 :   3c6827:        vpaddd  zmm9, zmm9, zmm14
+    0.07 :   3c682d:        vpxord  zmm5, zmm5, zmm10
+    0.12 :   3c6833:        vpxord  zmm6, zmm6, zmm11
+    0.17 :   3c6839:        vpxord  zmm7, zmm7, zmm8
+    0.05 :   3c683f:        vpxord  zmm4, zmm4, zmm9
+    0.20 :   3c6845:        vprord  zmm5, zmm5, 0xc
+    0.10 :   3c684c:        vprord  zmm6, zmm6, 0xc
+    0.17 :   3c6853:        vprord  zmm7, zmm7, 0xc
+    0.12 :   3c685a:        vprord  zmm4, zmm4, 0xc
+    0.07 :   3c6861:        vpaddd  zmm0, zmm0, zmm21
+    0.05 :   3c6867:        vpaddd  zmm1, zmm1, zmm16
+    0.05 :   3c686d:        vpaddd  zmm2, zmm2, zmm31
+    0.07 :   3c6873:        vpaddd  zmm3, zmm3, zmm17
+    0.07 :   3c6879:        vpaddd  zmm0, zmm0, zmm5
+    0.05 :   3c687f:        vpaddd  zmm1, zmm1, zmm6
+    0.13 :   3c6885:        vpaddd  zmm2, zmm2, zmm7
+    0.15 :   3c688b:        vpaddd  zmm3, zmm3, zmm4
+    0.14 :   3c6891:        vpxord  zmm15, zmm15, zmm0
+    0.10 :   3c6897:        vpxord  zmm12, zmm12, zmm1
+    0.17 :   3c689d:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c68a3:        vpxord  zmm14, zmm14, zmm3
+    0.10 :   3c68a9:        vprord  zmm15, zmm15, 0x8
+    0.10 :   3c68b0:        vprord  zmm12, zmm12, 0x8
+    0.07 :   3c68b7:        vprord  zmm13, zmm13, 0x8
+    0.18 :   3c68be:        vprord  zmm14, zmm14, 0x8
+    0.10 :   3c68c5:        vpaddd  zmm10, zmm10, zmm15
+    0.05 :   3c68cb:        vpaddd  zmm11, zmm11, zmm12
+    0.12 :   3c68d1:        vpaddd  zmm8, zmm8, zmm13
+    0.12 :   3c68d7:        vpaddd  zmm9, zmm9, zmm14
+    0.07 :   3c68dd:        vpxord  zmm5, zmm5, zmm10
+    0.02 :   3c68e3:        vpxord  zmm6, zmm6, zmm11
+    0.03 :   3c68e9:        vpxord  zmm7, zmm7, zmm8
+    0.05 :   3c68ef:        vpxord  zmm4, zmm4, zmm9
+    0.05 :   3c68f5:        vprord  zmm5, zmm5, 0x7
+    0.12 :   3c68fc:        vprord  zmm6, zmm6, 0x7
+    0.05 :   3c6903:        vprord  zmm7, zmm7, 0x7
+    0.10 :   3c690a:        vprord  zmm4, zmm4, 0x7
+    0.15 :   3c6911:        vpaddd  zmm0, zmm0, zmm26
+    0.05 :   3c6917:        vpaddd  zmm1, zmm1, zmm28
+    0.10 :   3c691d:        vpaddd  zmm2, zmm2, zmm30
+    0.05 :   3c6923:        vpaddd  zmm3, zmm3, zmm29
+    0.08 :   3c6929:        vpaddd  zmm0, zmm0, zmm4
+    0.09 :   3c692f:        vpaddd  zmm1, zmm1, zmm5
+    0.13 :   3c6935:        vpaddd  zmm2, zmm2, zmm6
+    0.05 :   3c693b:        vpaddd  zmm3, zmm3, zmm7
+    0.07 :   3c6941:        vpxord  zmm12, zmm12, zmm0
+    0.10 :   3c6947:        vpxord  zmm13, zmm13, zmm1
+    0.10 :   3c694d:        vpxord  zmm14, zmm14, zmm2
+    0.13 :   3c6953:        vpxord  zmm15, zmm15, zmm3
+    0.02 :   3c6959:        vprord  zmm12, zmm12, 0x10
+    0.25 :   3c6960:        vprord  zmm13, zmm13, 0x10
+    0.00 :   3c6967:        vprord  zmm14, zmm14, 0x10
+    0.08 :   3c696e:        vprord  zmm15, zmm15, 0x10
+    0.05 :   3c6975:        vpaddd  zmm8, zmm8, zmm12
+    0.13 :   3c697b:        vpaddd  zmm9, zmm9, zmm13
+    0.13 :   3c6981:        vpaddd  zmm10, zmm10, zmm14
+    0.03 :   3c6987:        vpaddd  zmm11, zmm11, zmm15
+    0.05 :   3c698d:        vpxord  zmm4, zmm4, zmm8
+    0.10 :   3c6993:        vpxord  zmm5, zmm5, zmm9
+    0.10 :   3c6999:        vpxord  zmm6, zmm6, zmm10
+    0.10 :   3c699f:        vpxord  zmm7, zmm7, zmm11
+    0.00 :   3c69a5:        vprord  zmm4, zmm4, 0xc
+    0.15 :   3c69ac:        vprord  zmm5, zmm5, 0xc
+    0.12 :   3c69b3:        vprord  zmm6, zmm6, 0xc
+    0.05 :   3c69ba:        vprord  zmm7, zmm7, 0xc
+    0.15 :   3c69c1:        vpaddd  zmm0, zmm0, zmm23
+    0.00 :   3c69c7:        vpaddd  zmm1, zmm1, zmm25
+    0.07 :   3c69cd:        vpaddd  zmm2, zmm2, zmm19
+    0.10 :   3c69d3:        vpaddd  zmm3, zmm3, zmm31
+    0.10 :   3c69d9:        vpaddd  zmm0, zmm0, zmm4
+    0.08 :   3c69df:        vpaddd  zmm1, zmm1, zmm5
+    0.05 :   3c69e5:        vpaddd  zmm2, zmm2, zmm6
+    0.13 :   3c69eb:        vpaddd  zmm3, zmm3, zmm7
+    0.13 :   3c69f1:        vpxord  zmm12, zmm12, zmm0
+    0.08 :   3c69f7:        vpxord  zmm13, zmm13, zmm1
+    0.05 :   3c69fd:        vpxord  zmm14, zmm14, zmm2
+    0.12 :   3c6a03:        vpxord  zmm15, zmm15, zmm3
+    0.20 :   3c6a09:        vprord  zmm12, zmm12, 0x8
+    0.17 :   3c6a10:        vprord  zmm13, zmm13, 0x8
+    0.10 :   3c6a17:        vprord  zmm14, zmm14, 0x8
+    0.11 :   3c6a1e:        vprord  zmm15, zmm15, 0x8
+    0.10 :   3c6a25:        vpaddd  zmm8, zmm8, zmm12
+    0.08 :   3c6a2b:        vpaddd  zmm9, zmm9, zmm13
+    0.10 :   3c6a31:        vpaddd  zmm10, zmm10, zmm14
+    0.13 :   3c6a37:        vpaddd  zmm11, zmm11, zmm15
+    0.07 :   3c6a3d:        vpxord  zmm4, zmm4, zmm8
+    0.07 :   3c6a43:        vpxord  zmm5, zmm5, zmm9
+    0.20 :   3c6a49:        vpxord  zmm6, zmm6, zmm10
+    0.08 :   3c6a4f:        vpxord  zmm7, zmm7, zmm11
+    0.13 :   3c6a55:        vprord  zmm4, zmm4, 0x7
+    0.23 :   3c6a5c:        vprord  zmm5, zmm5, 0x7
+    0.17 :   3c6a63:        vprord  zmm6, zmm6, 0x7
+    0.07 :   3c6a6a:        vprord  zmm7, zmm7, 0x7
+    0.15 :   3c6a71:        vpaddd  zmm0, zmm0, zmm20
+    0.05 :   3c6a77:        vpaddd  zmm1, zmm1, zmm27
+    0.10 :   3c6a7d:        vpaddd  zmm2, zmm2, zmm21
+    0.07 :   3c6a83:        vpaddd  zmm3, zmm3, zmm17
+    0.05 :   3c6a89:        vpaddd  zmm0, zmm0, zmm5
+    0.12 :   3c6a8f:        vpaddd  zmm1, zmm1, zmm6
+    0.15 :   3c6a95:        vpaddd  zmm2, zmm2, zmm7
+    0.20 :   3c6a9b:        vpaddd  zmm3, zmm3, zmm4
+    0.17 :   3c6aa1:        vpxord  zmm15, zmm15, zmm0
+    0.20 :   3c6aa7:        vpxord  zmm12, zmm12, zmm1
+    0.12 :   3c6aad:        vpxord  zmm13, zmm13, zmm2
+    0.15 :   3c6ab3:        vpxord  zmm14, zmm14, zmm3
+    0.12 :   3c6ab9:        vprord  zmm15, zmm15, 0x10
+    0.10 :   3c6ac0:        vprord  zmm12, zmm12, 0x10
+    0.10 :   3c6ac7:        vprord  zmm13, zmm13, 0x10
+    0.09 :   3c6ace:        vprord  zmm14, zmm14, 0x10
+    0.03 :   3c6ad5:        vpaddd  zmm10, zmm10, zmm15
+    0.07 :   3c6adb:        vpaddd  zmm11, zmm11, zmm12
+    0.13 :   3c6ae1:        vpaddd  zmm8, zmm8, zmm13
+    0.08 :   3c6ae7:        vpaddd  zmm9, zmm9, zmm14
+    0.05 :   3c6aed:        vpxord  zmm5, zmm5, zmm10
+    0.15 :   3c6af3:        vpxord  zmm6, zmm6, zmm11
+    0.07 :   3c6af9:        vpxord  zmm7, zmm7, zmm8
+    0.17 :   3c6aff:        vpxord  zmm4, zmm4, zmm9
+    0.09 :   3c6b05:        vprord  zmm5, zmm5, 0xc
+    0.15 :   3c6b0c:        vprord  zmm6, zmm6, 0xc
+    0.15 :   3c6b13:        vprord  zmm7, zmm7, 0xc
+    0.17 :   3c6b1a:        vprord  zmm4, zmm4, 0xc
+    0.15 :   3c6b21:        vpaddd  zmm0, zmm0, zmm16
+    0.12 :   3c6b27:        vpaddd  zmm1, zmm1, zmm18
+    0.13 :   3c6b2d:        vpaddd  zmm2, zmm2, zmm24
+    0.05 :   3c6b33:        vpaddd  zmm3, zmm3, zmm22
+    0.03 :   3c6b39:        vpaddd  zmm0, zmm0, zmm5
+    0.07 :   3c6b3f:        vpaddd  zmm1, zmm1, zmm6
+    0.17 :   3c6b45:        vpaddd  zmm2, zmm2, zmm7
+    0.12 :   3c6b4b:        vpaddd  zmm3, zmm3, zmm4
+    0.02 :   3c6b51:        vpxord  zmm15, zmm15, zmm0
+    0.22 :   3c6b57:        vpxord  zmm12, zmm12, zmm1
+    0.10 :   3c6b5d:        vpxord  zmm13, zmm13, zmm2
+    0.05 :   3c6b63:        vpxord  zmm14, zmm14, zmm3
+    0.17 :   3c6b69:        vprord  zmm15, zmm15, 0x8
+    0.17 :   3c6b70:        vprord  zmm12, zmm12, 0x8
+    0.24 :   3c6b77:        vprord  zmm13, zmm13, 0x8
+    0.19 :   3c6b7e:        vprord  zmm14, zmm14, 0x8
+    0.18 :   3c6b85:        vpaddd  zmm10, zmm10, zmm15
+    0.12 :   3c6b8b:        vpaddd  zmm11, zmm11, zmm12
+    0.08 :   3c6b91:        vpaddd  zmm8, zmm8, zmm13
+    0.05 :   3c6b97:        vpaddd  zmm9, zmm9, zmm14
+    0.04 :   3c6b9d:        vpxord  zmm5, zmm5, zmm10
+    0.15 :   3c6ba3:        vpxord  zmm6, zmm6, zmm11
+    0.05 :   3c6ba9:        vpxord  zmm7, zmm7, zmm8
+    0.03 :   3c6baf:        vpxord  zmm4, zmm4, zmm9
+    0.10 :   3c6bb5:        vprord  zmm5, zmm5, 0x7
+    0.18 :   3c6bbc:        vprord  zmm6, zmm6, 0x7
+    0.08 :   3c6bc3:        vprord  zmm7, zmm7, 0x7
+    0.07 :   3c6bca:        vprord  zmm4, zmm4, 0x7
+    0.20 :   3c6bd1:        vpaddd  zmm0, zmm0, zmm28
+    0.07 :   3c6bd7:        vpaddd  zmm1, zmm1, zmm25
+    0.10 :   3c6bdd:        vpaddd  zmm2, zmm2, zmm31
+    0.07 :   3c6be3:        vpaddd  zmm3, zmm3, zmm30
+    0.05 :   3c6be9:        vpaddd  zmm0, zmm0, zmm4
+    0.13 :   3c6bef:        vpaddd  zmm1, zmm1, zmm5
+    0.10 :   3c6bf5:        vpaddd  zmm2, zmm2, zmm6
+    0.12 :   3c6bfb:        vpaddd  zmm3, zmm3, zmm7
+    0.14 :   3c6c01:        vpxord  zmm12, zmm12, zmm0
+    0.17 :   3c6c07:        vpxord  zmm13, zmm13, zmm1
+    0.15 :   3c6c0d:        vpxord  zmm14, zmm14, zmm2
+    0.13 :   3c6c13:        vpxord  zmm15, zmm15, zmm3
+    0.07 :   3c6c19:        vprord  zmm12, zmm12, 0x10
+    0.22 :   3c6c20:        vprord  zmm13, zmm13, 0x10
+    0.05 :   3c6c27:        vprord  zmm14, zmm14, 0x10
+    0.05 :   3c6c2e:        vprord  zmm15, zmm15, 0x10
+    0.13 :   3c6c35:        vpaddd  zmm8, zmm8, zmm12
+    0.10 :   3c6c3b:        vpaddd  zmm9, zmm9, zmm13
+    0.10 :   3c6c41:        vpaddd  zmm10, zmm10, zmm14
+    0.10 :   3c6c47:        vpaddd  zmm11, zmm11, zmm15
+    0.07 :   3c6c4d:        vpxord  zmm4, zmm4, zmm8
+    0.15 :   3c6c53:        vpxord  zmm5, zmm5, zmm9
+    0.17 :   3c6c59:        vpxord  zmm6, zmm6, zmm10
+    0.14 :   3c6c5f:        vpxord  zmm7, zmm7, zmm11
+    0.15 :   3c6c65:        vprord  zmm4, zmm4, 0xc
+    0.15 :   3c6c6c:        vprord  zmm5, zmm5, 0xc
+    0.17 :   3c6c73:        vprord  zmm6, zmm6, 0xc
+    0.17 :   3c6c7a:        vprord  zmm7, zmm7, 0xc
+    0.08 :   3c6c81:        vpaddd  zmm0, zmm0, zmm29
+    0.03 :   3c6c87:        vpaddd  zmm1, zmm1, zmm27
+    0.07 :   3c6c8d:        vpaddd  zmm2, zmm2, zmm26
+    0.05 :   3c6c93:        vpaddd  zmm3, zmm3, zmm24
+    0.10 :   3c6c99:        vpaddd  zmm0, zmm0, zmm4
+    0.03 :   3c6c9f:        vpaddd  zmm1, zmm1, zmm5
+    0.05 :   3c6ca5:        vpaddd  zmm2, zmm2, zmm6
+    0.10 :   3c6cab:        vpaddd  zmm3, zmm3, zmm7
+    0.05 :   3c6cb1:        vpxord  zmm12, zmm12, zmm0
+    0.14 :   3c6cb7:        vpxord  zmm13, zmm13, zmm1
+    0.23 :   3c6cbd:        vpxord  zmm14, zmm14, zmm2
+    0.10 :   3c6cc3:        vpxord  zmm15, zmm15, zmm3
+    0.10 :   3c6cc9:        vprord  zmm12, zmm12, 0x8
+    0.29 :   3c6cd0:        vprord  zmm13, zmm13, 0x8
+    0.07 :   3c6cd7:        vprord  zmm14, zmm14, 0x8
+    0.10 :   3c6cde:        vprord  zmm15, zmm15, 0x8
+    0.22 :   3c6ce5:        vpaddd  zmm8, zmm8, zmm12
+    0.05 :   3c6ceb:        vpaddd  zmm9, zmm9, zmm13
+    0.17 :   3c6cf1:        vpaddd  zmm10, zmm10, zmm14
+    0.00 :   3c6cf7:        vpaddd  zmm11, zmm11, zmm15
+    0.07 :   3c6cfd:        vpxord  zmm4, zmm4, zmm8
+    0.09 :   3c6d03:        vpxord  zmm5, zmm5, zmm9
+    0.07 :   3c6d09:        vpxord  zmm6, zmm6, zmm10
+    0.05 :   3c6d0f:        vpxord  zmm7, zmm7, zmm11
+    0.07 :   3c6d15:        vprord  zmm4, zmm4, 0x7
+    0.22 :   3c6d1c:        vprord  zmm5, zmm5, 0x7
+    0.15 :   3c6d23:        vprord  zmm6, zmm6, 0x7
+    0.05 :   3c6d2a:        vprord  zmm7, zmm7, 0x7
+    0.05 :   3c6d31:        vpaddd  zmm0, zmm0, zmm23
+    0.13 :   3c6d37:        vpaddd  zmm1, zmm1, zmm21
+    0.05 :   3c6d3d:        vpaddd  zmm2, zmm2, zmm16
+    0.08 :   3c6d43:        vpaddd  zmm3, zmm3, zmm22
+    0.10 :   3c6d49:        vpaddd  zmm0, zmm0, zmm5
+    0.05 :   3c6d4f:        vpaddd  zmm1, zmm1, zmm6
+    0.02 :   3c6d55:        vpaddd  zmm2, zmm2, zmm7
+    0.00 :   3c6d5b:        vpaddd  zmm3, zmm3, zmm4
+    0.05 :   3c6d61:        vpxord  zmm15, zmm15, zmm0
+    0.13 :   3c6d67:        vpxord  zmm12, zmm12, zmm1
+    0.17 :   3c6d6d:        vpxord  zmm13, zmm13, zmm2
+    0.25 :   3c6d73:        vpxord  zmm14, zmm14, zmm3
+    0.00 :   3c6d79:        vprord  zmm15, zmm15, 0x10
+    0.13 :   3c6d80:        vprord  zmm12, zmm12, 0x10
+    0.12 :   3c6d87:        vprord  zmm13, zmm13, 0x10
+    0.19 :   3c6d8e:        vprord  zmm14, zmm14, 0x10
+    0.07 :   3c6d95:        vpaddd  zmm10, zmm10, zmm15
+    0.03 :   3c6d9b:        vpaddd  zmm11, zmm11, zmm12
+    0.03 :   3c6da1:        vpaddd  zmm8, zmm8, zmm13
+    0.05 :   3c6da7:        vpaddd  zmm9, zmm9, zmm14
+    0.05 :   3c6dad:        vpxord  zmm5, zmm5, zmm10
+    0.22 :   3c6db3:        vpxord  zmm6, zmm6, zmm11
+    0.13 :   3c6db9:        vpxord  zmm7, zmm7, zmm8
+    0.25 :   3c6dbf:        vpxord  zmm4, zmm4, zmm9
+    0.07 :   3c6dc5:        vprord  zmm5, zmm5, 0xc
+    0.12 :   3c6dcc:        vprord  zmm6, zmm6, 0xc
+    0.18 :   3c6dd3:        vprord  zmm7, zmm7, 0xc
+    0.05 :   3c6dda:        vprord  zmm4, zmm4, 0xc
+    0.17 :   3c6de1:        vpaddd  zmm0, zmm0, zmm18
+    0.08 :   3c6de7:        vpaddd  zmm1, zmm1, zmm19
+    0.05 :   3c6ded:        vpaddd  zmm2, zmm2, zmm17
+    0.05 :   3c6df3:        vpaddd  zmm3, zmm3, zmm20
+    0.07 :   3c6df9:        vpaddd  zmm0, zmm0, zmm5
+    0.03 :   3c6dff:        vpaddd  zmm1, zmm1, zmm6
+    0.12 :   3c6e05:        vpaddd  zmm2, zmm2, zmm7
+    0.15 :   3c6e0b:        vpaddd  zmm3, zmm3, zmm4
+    0.05 :   3c6e11:        vpxord  zmm15, zmm15, zmm0
+    0.02 :   3c6e17:        vpxord  zmm12, zmm12, zmm1
+    0.07 :   3c6e1d:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c6e23:        vpxord  zmm14, zmm14, zmm3
+    0.12 :   3c6e29:        vprord  zmm15, zmm15, 0x8
+    0.12 :   3c6e30:        vprord  zmm12, zmm12, 0x8
+    0.10 :   3c6e37:        vprord  zmm13, zmm13, 0x8
+    0.00 :   3c6e3e:        vprord  zmm14, zmm14, 0x8
+    0.15 :   3c6e45:        vpaddd  zmm10, zmm10, zmm15
+    0.05 :   3c6e4b:        vpaddd  zmm11, zmm11, zmm12
+    0.15 :   3c6e51:        vpaddd  zmm8, zmm8, zmm13
+    0.12 :   3c6e57:        vpaddd  zmm9, zmm9, zmm14
+    0.10 :   3c6e5d:        vpxord  zmm5, zmm5, zmm10
+    0.25 :   3c6e63:        vpxord  zmm6, zmm6, zmm11
+    0.08 :   3c6e69:        vpxord  zmm7, zmm7, zmm8
+    0.08 :   3c6e6f:        vpxord  zmm4, zmm4, zmm9
+    0.17 :   3c6e75:        vprord  zmm5, zmm5, 0x7
+    0.19 :   3c6e7c:        vprord  zmm6, zmm6, 0x7
+    0.10 :   3c6e83:        vprord  zmm7, zmm7, 0x7
+    0.12 :   3c6e8a:        vprord  zmm4, zmm4, 0x7
+    0.10 :   3c6e91:        vpaddd  zmm0, zmm0, zmm25
+    0.10 :   3c6e97:        vpaddd  zmm1, zmm1, zmm27
+    0.05 :   3c6e9d:        vpaddd  zmm2, zmm2, zmm24
+    0.07 :   3c6ea3:        vpaddd  zmm3, zmm3, zmm31
+    0.03 :   3c6ea9:        vpaddd  zmm0, zmm0, zmm4
+    0.10 :   3c6eaf:        vpaddd  zmm1, zmm1, zmm5
+    0.07 :   3c6eb5:        vpaddd  zmm2, zmm2, zmm6
+    0.10 :   3c6ebb:        vpaddd  zmm3, zmm3, zmm7
+    0.10 :   3c6ec1:        vpxord  zmm12, zmm12, zmm0
+    0.13 :   3c6ec7:        vpxord  zmm13, zmm13, zmm1
+    0.05 :   3c6ecd:        vpxord  zmm14, zmm14, zmm2
+    0.15 :   3c6ed3:        vpxord  zmm15, zmm15, zmm3
+    0.10 :   3c6ed9:        vprord  zmm12, zmm12, 0x10
+    0.12 :   3c6ee0:        vprord  zmm13, zmm13, 0x10
+    0.20 :   3c6ee7:        vprord  zmm14, zmm14, 0x10
+    0.18 :   3c6eee:        vprord  zmm15, zmm15, 0x10
+    0.15 :   3c6ef5:        vpaddd  zmm8, zmm8, zmm12
+    0.05 :   3c6efb:        vpaddd  zmm9, zmm9, zmm13
+    0.03 :   3c6f01:        vpaddd  zmm10, zmm10, zmm14
+    0.10 :   3c6f07:        vpaddd  zmm11, zmm11, zmm15
+    0.07 :   3c6f0d:        vpxord  zmm4, zmm4, zmm8
+    0.00 :   3c6f13:        vpxord  zmm5, zmm5, zmm9
+    0.02 :   3c6f19:        vpxord  zmm6, zmm6, zmm10
+    0.00 :   3c6f1f:        vpxord  zmm7, zmm7, zmm11
+    0.10 :   3c6f25:        vprord  zmm4, zmm4, 0xc
+    0.32 :   3c6f2c:        vprord  zmm5, zmm5, 0xc
+    0.25 :   3c6f33:        vprord  zmm6, zmm6, 0xc
+    0.18 :   3c6f3a:        vprord  zmm7, zmm7, 0xc
+    0.07 :   3c6f41:        vpaddd  zmm0, zmm0, zmm30
+    0.03 :   3c6f47:        vpaddd  zmm1, zmm1, zmm21
+    0.17 :   3c6f4d:        vpaddd  zmm2, zmm2, zmm28
+    0.05 :   3c6f53:        vpaddd  zmm3, zmm3, zmm17
+    0.10 :   3c6f59:        vpaddd  zmm0, zmm0, zmm4
+    0.12 :   3c6f5f:        vpaddd  zmm1, zmm1, zmm5
+    0.08 :   3c6f65:        vpaddd  zmm2, zmm2, zmm6
+    0.05 :   3c6f6b:        vpaddd  zmm3, zmm3, zmm7
+    0.07 :   3c6f71:        vpxord  zmm12, zmm12, zmm0
+    0.08 :   3c6f77:        vpxord  zmm13, zmm13, zmm1
+    0.08 :   3c6f7d:        vpxord  zmm14, zmm14, zmm2
+    0.20 :   3c6f83:        vpxord  zmm15, zmm15, zmm3
+    0.05 :   3c6f89:        vprord  zmm12, zmm12, 0x8
+    0.14 :   3c6f90:        vprord  zmm13, zmm13, 0x8
+    0.13 :   3c6f97:        vprord  zmm14, zmm14, 0x8
+    0.02 :   3c6f9e:        vprord  zmm15, zmm15, 0x8
+    0.03 :   3c6fa5:        vpaddd  zmm8, zmm8, zmm12
+    0.10 :   3c6fab:        vpaddd  zmm9, zmm9, zmm13
+    0.05 :   3c6fb1:        vpaddd  zmm10, zmm10, zmm14
+    0.05 :   3c6fb7:        vpaddd  zmm11, zmm11, zmm15
+    0.02 :   3c6fbd:        vpxord  zmm4, zmm4, zmm8
+    0.10 :   3c6fc3:        vpxord  zmm5, zmm5, zmm9
+    0.12 :   3c6fc9:        vpxord  zmm6, zmm6, zmm10
+    0.15 :   3c6fcf:        vpxord  zmm7, zmm7, zmm11
+    0.10 :   3c6fd5:        vprord  zmm4, zmm4, 0x7
+    0.13 :   3c6fdc:        vprord  zmm5, zmm5, 0x7
+    0.15 :   3c6fe3:        vprord  zmm6, zmm6, 0x7
+    0.08 :   3c6fea:        vprord  zmm7, zmm7, 0x7
+    0.03 :   3c6ff1:        vpaddd  zmm0, zmm0, zmm29
+    0.03 :   3c6ff7:        vpaddd  zmm1, zmm1, zmm16
+    0.00 :   3c6ffd:        vpaddd  zmm2, zmm2, zmm18
+    0.13 :   3c7003:        vpaddd  zmm3, zmm3, zmm20
+    0.10 :   3c7009:        vpaddd  zmm0, zmm0, zmm5
+    0.20 :   3c700f:        vpaddd  zmm1, zmm1, zmm6
+    0.12 :   3c7015:        vpaddd  zmm2, zmm2, zmm7
+    0.10 :   3c701b:        vpaddd  zmm3, zmm3, zmm4
+    0.02 :   3c7021:        vpxord  zmm15, zmm15, zmm0
+    0.13 :   3c7027:        vpxord  zmm12, zmm12, zmm1
+    0.12 :   3c702d:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c7033:        vpxord  zmm14, zmm14, zmm3
+    0.05 :   3c7039:        vprord  zmm15, zmm15, 0x10
+    0.12 :   3c7040:        vprord  zmm12, zmm12, 0x10
+    0.25 :   3c7047:        vprord  zmm13, zmm13, 0x10
+    0.05 :   3c704e:        vprord  zmm14, zmm14, 0x10
+    0.15 :   3c7055:        vpaddd  zmm10, zmm10, zmm15
+    0.03 :   3c705b:        vpaddd  zmm11, zmm11, zmm12
+    0.07 :   3c7061:        vpaddd  zmm8, zmm8, zmm13
+    0.17 :   3c7067:        vpaddd  zmm9, zmm9, zmm14
+    0.05 :   3c706d:        vpxord  zmm5, zmm5, zmm10
+    0.02 :   3c7073:        vpxord  zmm6, zmm6, zmm11
+    0.12 :   3c7079:        vpxord  zmm7, zmm7, zmm8
+    0.08 :   3c707f:        vpxord  zmm4, zmm4, zmm9
+    0.10 :   3c7085:        vprord  zmm5, zmm5, 0xc
+    0.10 :   3c708c:        vprord  zmm6, zmm6, 0xc
+    0.20 :   3c7093:        vprord  zmm7, zmm7, 0xc
+    0.15 :   3c709a:        vprord  zmm4, zmm4, 0xc
+    0.15 :   3c70a1:        vpaddd  zmm0, zmm0, zmm19
+    0.02 :   3c70a7:        vpaddd  zmm1, zmm1, zmm26
+    0.08 :   3c70ad:        vpaddd  zmm2, zmm2, zmm22
+    0.05 :   3c70b3:        vpaddd  zmm3, zmm3, zmm23
+    0.07 :   3c70b9:        vpaddd  zmm0, zmm0, zmm5
+    0.05 :   3c70bf:        vpaddd  zmm1, zmm1, zmm6
+    0.20 :   3c70c5:        vpaddd  zmm2, zmm2, zmm7
+    0.17 :   3c70cb:        vpaddd  zmm3, zmm3, zmm4
+    0.10 :   3c70d1:        vpxord  zmm15, zmm15, zmm0
+    0.05 :   3c70d7:        vpxord  zmm12, zmm12, zmm1
+    0.10 :   3c70dd:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c70e3:        vpxord  zmm14, zmm14, zmm3
+    0.15 :   3c70e9:        vprord  zmm15, zmm15, 0x8
+    0.17 :   3c70f0:        vprord  zmm12, zmm12, 0x8
+    0.18 :   3c70f7:        vprord  zmm13, zmm13, 0x8
+    0.08 :   3c70fe:        vprord  zmm14, zmm14, 0x8
+    0.15 :   3c7105:        vpaddd  zmm10, zmm10, zmm15
+    0.05 :   3c710b:        vpaddd  zmm11, zmm11, zmm12
+    0.10 :   3c7111:        vpaddd  zmm8, zmm8, zmm13
+    0.17 :   3c7117:        vpaddd  zmm9, zmm9, zmm14
+    0.10 :   3c711d:        vpxord  zmm5, zmm5, zmm10
+    0.18 :   3c7123:        vpxord  zmm6, zmm6, zmm11
+    0.12 :   3c7129:        vpxord  zmm7, zmm7, zmm8
+    0.12 :   3c712f:        vpxord  zmm4, zmm4, zmm9
+    0.12 :   3c7135:        vprord  zmm5, zmm5, 0x7
+    0.10 :   3c713c:        vprord  zmm6, zmm6, 0x7
+    0.10 :   3c7143:        vprord  zmm7, zmm7, 0x7
+    0.15 :   3c714a:        vprord  zmm4, zmm4, 0x7
+    0.12 :   3c7151:        vpaddd  zmm0, zmm0, zmm27
+    0.00 :   3c7157:        vpaddd  zmm1, zmm1, zmm21
+    0.05 :   3c715d:        vpaddd  zmm2, zmm2, zmm17
+    0.05 :   3c7163:        vpaddd  zmm3, zmm3, zmm24
+    0.08 :   3c7169:        vpaddd  zmm0, zmm0, zmm4
+    0.15 :   3c716f:        vpaddd  zmm1, zmm1, zmm5
+    0.10 :   3c7175:        vpaddd  zmm2, zmm2, zmm6
+    0.10 :   3c717b:        vpaddd  zmm3, zmm3, zmm7
+    0.10 :   3c7181:        vpxord  zmm12, zmm12, zmm0
+    0.20 :   3c7187:        vpxord  zmm13, zmm13, zmm1
+    0.14 :   3c718d:        vpxord  zmm14, zmm14, zmm2
+    0.10 :   3c7193:        vpxord  zmm15, zmm15, zmm3
+    0.15 :   3c7199:        vprord  zmm12, zmm12, 0x10
+    0.17 :   3c71a0:        vprord  zmm13, zmm13, 0x10
+    0.15 :   3c71a7:        vprord  zmm14, zmm14, 0x10
+    0.15 :   3c71ae:        vprord  zmm15, zmm15, 0x10
+    0.07 :   3c71b5:        vpaddd  zmm8, zmm8, zmm12
+    0.05 :   3c71bb:        vpaddd  zmm9, zmm9, zmm13
+    0.10 :   3c71c1:        vpaddd  zmm10, zmm10, zmm14
+    0.10 :   3c71c7:        vpaddd  zmm11, zmm11, zmm15
+    0.12 :   3c71cd:        vpxord  zmm4, zmm4, zmm8
+    0.05 :   3c71d3:        vpxord  zmm5, zmm5, zmm9
+    0.02 :   3c71d9:        vpxord  zmm6, zmm6, zmm10
+    0.02 :   3c71df:        vpxord  zmm7, zmm7, zmm11
+    0.07 :   3c71e5:        vprord  zmm4, zmm4, 0xc
+    0.15 :   3c71ec:        vprord  zmm5, zmm5, 0xc
+    0.15 :   3c71f3:        vprord  zmm6, zmm6, 0xc
+    0.05 :   3c71fa:        vprord  zmm7, zmm7, 0xc
+    0.05 :   3c7201:        vpaddd  zmm0, zmm0, zmm31
+    0.05 :   3c7207:        vpaddd  zmm1, zmm1, zmm16
+    0.10 :   3c720d:        vpaddd  zmm2, zmm2, zmm25
+    0.12 :   3c7213:        vpaddd  zmm3, zmm3, zmm22
+    0.10 :   3c7219:        vpaddd  zmm0, zmm0, zmm4
+    0.07 :   3c721f:        vpaddd  zmm1, zmm1, zmm5
+    0.15 :   3c7225:        vpaddd  zmm2, zmm2, zmm6
+    0.12 :   3c722b:        vpaddd  zmm3, zmm3, zmm7
+    0.08 :   3c7231:        vpxord  zmm12, zmm12, zmm0
+    0.10 :   3c7237:        vpxord  zmm13, zmm13, zmm1
+    0.13 :   3c723d:        vpxord  zmm14, zmm14, zmm2
+    0.05 :   3c7243:        vpxord  zmm15, zmm15, zmm3
+    0.07 :   3c7249:        vprord  zmm12, zmm12, 0x8
+    0.20 :   3c7250:        vprord  zmm13, zmm13, 0x8
+    0.07 :   3c7257:        vprord  zmm14, zmm14, 0x8
+    0.18 :   3c725e:        vprord  zmm15, zmm15, 0x8
+    0.03 :   3c7265:        vpaddd  zmm8, zmm8, zmm12
+    0.10 :   3c726b:        vpaddd  zmm9, zmm9, zmm13
+    0.03 :   3c7271:        vpaddd  zmm10, zmm10, zmm14
+    0.03 :   3c7277:        vpaddd  zmm11, zmm11, zmm15
+    0.17 :   3c727d:        vpxord  zmm4, zmm4, zmm8
+    0.12 :   3c7283:        vpxord  zmm5, zmm5, zmm9
+    0.08 :   3c7289:        vpxord  zmm6, zmm6, zmm10
+    0.15 :   3c728f:        vpxord  zmm7, zmm7, zmm11
+    0.05 :   3c7295:        vprord  zmm4, zmm4, 0x7
+    0.17 :   3c729c:        vprord  zmm5, zmm5, 0x7
+    0.07 :   3c72a3:        vprord  zmm6, zmm6, 0x7
+    0.10 :   3c72aa:        vprord  zmm7, zmm7, 0x7
+    0.15 :   3c72b1:        vpaddd  zmm0, zmm0, zmm30
+    0.05 :   3c72b7:        vpaddd  zmm1, zmm1, zmm18
+    0.17 :   3c72bd:        vpaddd  zmm2, zmm2, zmm19
+    0.05 :   3c72c3:        vpaddd  zmm3, zmm3, zmm23
+    0.05 :   3c72c9:        vpaddd  zmm0, zmm0, zmm5
+    0.03 :   3c72cf:        vpaddd  zmm1, zmm1, zmm6
+    0.17 :   3c72d5:        vpaddd  zmm2, zmm2, zmm7
+    0.07 :   3c72db:        vpaddd  zmm3, zmm3, zmm4
+    0.15 :   3c72e1:        vpxord  zmm15, zmm15, zmm0
+    0.10 :   3c72e7:        vpxord  zmm12, zmm12, zmm1
+    0.03 :   3c72ed:        vpxord  zmm13, zmm13, zmm2
+    0.10 :   3c72f3:        vpxord  zmm14, zmm14, zmm3
+    0.10 :   3c72f9:        vprord  zmm15, zmm15, 0x10
+    0.08 :   3c7300:        vprord  zmm12, zmm12, 0x10
+    0.14 :   3c7307:        vprord  zmm13, zmm13, 0x10
+    0.22 :   3c730e:        vprord  zmm14, zmm14, 0x10
+    0.05 :   3c7315:        vpaddd  zmm10, zmm10, zmm15
+    0.03 :   3c731b:        vpaddd  zmm11, zmm11, zmm12
+    0.13 :   3c7321:        vpaddd  zmm8, zmm8, zmm13
+    0.07 :   3c7327:        vpaddd  zmm9, zmm9, zmm14
+    0.10 :   3c732d:        vpxord  zmm5, zmm5, zmm10
+    0.05 :   3c7333:        vpxord  zmm6, zmm6, zmm11
+    0.00 :   3c7339:        vpxord  zmm7, zmm7, zmm8
+    0.10 :   3c733f:        vpxord  zmm4, zmm4, zmm9
+    0.12 :   3c7345:        vprord  zmm5, zmm5, 0xc
+    0.17 :   3c734c:        vprord  zmm6, zmm6, 0xc
+    0.07 :   3c7353:        vprord  zmm7, zmm7, 0xc
+    0.12 :   3c735a:        vprord  zmm4, zmm4, 0xc
+    0.05 :   3c7361:        vpaddd  zmm0, zmm0, zmm26
+    0.00 :   3c7367:        vpaddd  zmm1, zmm1, zmm28
+    0.03 :   3c736d:        vpaddd  zmm2, zmm2, zmm20
+    0.02 :   3c7373:        vpaddd  zmm3, zmm3, zmm29
+    0.08 :   3c7379:        vpaddd  zmm0, zmm0, zmm5
+    0.15 :   3c737f:        vpaddd  zmm1, zmm1, zmm6
+    0.05 :   3c7385:        vpaddd  zmm2, zmm2, zmm7
+    0.07 :   3c738b:        vpaddd  zmm3, zmm3, zmm4
+    0.10 :   3c7391:        vpxord  zmm15, zmm15, zmm0
+    0.12 :   3c7397:        vpxord  zmm12, zmm12, zmm1
+    0.05 :   3c739d:        vpxord  zmm13, zmm13, zmm2
+    0.13 :   3c73a3:        vpxord  zmm14, zmm14, zmm3
+    0.05 :   3c73a9:        vprord  zmm15, zmm15, 0x8
+    0.22 :   3c73b0:        vprord  zmm12, zmm12, 0x8
+    0.14 :   3c73b7:        vprord  zmm13, zmm13, 0x8
+    0.18 :   3c73be:        vprord  zmm14, zmm14, 0x8
+    0.12 :   3c73c5:        vpaddd  zmm10, zmm10, zmm15
+    0.02 :   3c73cb:        vpaddd  zmm11, zmm11, zmm12
+    0.17 :   3c73d1:        vpaddd  zmm8, zmm8, zmm13
+    0.12 :   3c73d7:        vpaddd  zmm9, zmm9, zmm14
+    0.03 :   3c73dd:        vpxord  zmm5, zmm5, zmm10
+    0.15 :   3c73e3:        vpxord  zmm6, zmm6, zmm11
+    0.07 :   3c73e9:        vpxord  zmm7, zmm7, zmm8
+    0.10 :   3c73ef:        vpxord  zmm4, zmm4, zmm9
+    0.10 :   3c73f5:        vprord  zmm5, zmm5, 0x7
+    0.28 :   3c73fc:        vprord  zmm6, zmm6, 0x7
+    0.10 :   3c7403:        vprord  zmm7, zmm7, 0x7
+    0.14 :   3c740a:        vprord  zmm4, zmm4, 0x7
+    0.14 :   3c7411:        vpxord  zmm0, zmm0, zmm8
+    0.00 :   3c7417:        vpxord  zmm1, zmm1, zmm9
+    0.12 :   3c741d:        vpxord  zmm2, zmm2, zmm10
+    0.10 :   3c7423:        vpxord  zmm3, zmm3, zmm11
+    0.08 :   3c7429:        vpxord  zmm4, zmm4, zmm12
+    0.12 :   3c742f:        vpxord  zmm5, zmm5, zmm13
+    0.12 :   3c7435:        vpxord  zmm6, zmm6, zmm14
+    0.12 :   3c743b:        vpxord  zmm7, zmm7, zmm15
+    0.00 :   3c7441:        movzx   eax, byte ptr [rbp + 0x38]
+    0.00 :   3c7445:        jne     0x3c5ce0 <_blake3_hash_many_avx512+0x120>
+    0.00 :   3c744b:        mov     rbx, qword ptr [rbp + 0x50]
+    0.02 :   3c744f:        vpunpckldq      zmm16, zmm0, zmm1
+    0.05 :   3c7455:        vpunpckhdq      zmm17, zmm0, zmm1
+    0.00 :   3c745b:        vpunpckldq      zmm18, zmm2, zmm3
+    0.00 :   3c7461:        vpunpckhdq      zmm19, zmm2, zmm3
+    0.02 :   3c7467:        vpunpckldq      zmm20, zmm4, zmm5
+    0.00 :   3c746d:        vpunpckhdq      zmm21, zmm4, zmm5
+    0.05 :   3c7473:        vpunpckldq      zmm22, zmm6, zmm7
+    0.00 :   3c7479:        vpunpckhdq      zmm23, zmm6, zmm7
+    0.05 :   3c747f:        vpunpcklqdq     zmm0, zmm16, zmm18
+    0.02 :   3c7485:        vpunpckhqdq     zmm1, zmm16, zmm18
+    0.00 :   3c748b:        vpunpcklqdq     zmm2, zmm17, zmm19
+    0.08 :   3c7491:        vpunpckhqdq     zmm3, zmm17, zmm19
+    0.03 :   3c7497:        vpunpcklqdq     zmm4, zmm20, zmm22
+    0.00 :   3c749d:        vpunpckhqdq     zmm5, zmm20, zmm22
+    0.05 :   3c74a3:        vpunpcklqdq     zmm6, zmm21, zmm23
+    0.02 :   3c74a9:        vpunpckhqdq     zmm7, zmm21, zmm23
+    0.02 :   3c74af:        vshufi32x4      zmm16, zmm0, zmm4, 0x88
+    0.07 :   3c74b6:        vshufi32x4      zmm17, zmm1, zmm5, 0x88
+    0.03 :   3c74bd:        vshufi32x4      zmm18, zmm2, zmm6, 0x88
+    0.00 :   3c74c4:        vshufi32x4      zmm19, zmm3, zmm7, 0x88
+    0.00 :   3c74cb:        vshufi32x4      zmm20, zmm0, zmm4, 0xdd
+    0.02 :   3c74d2:        vshufi32x4      zmm21, zmm1, zmm5, 0xdd
+    0.05 :   3c74d9:        vshufi32x4      zmm22, zmm2, zmm6, 0xdd
+    0.00 :   3c74e0:        vshufi32x4      zmm23, zmm3, zmm7, 0xdd
+    0.00 :   3c74e7:        vshufi32x4      zmm0, zmm16, zmm17, 0x88
+    0.05 :   3c74ee:        vshufi32x4      zmm1, zmm18, zmm19, 0x88
+    0.02 :   3c74f5:        vshufi32x4      zmm2, zmm20, zmm21, 0x88
+    0.05 :   3c74fc:        vshufi32x4      zmm3, zmm22, zmm23, 0x88
+    0.02 :   3c7503:        vshufi32x4      zmm4, zmm16, zmm17, 0xdd
+    0.00 :   3c750a:        vshufi32x4      zmm5, zmm18, zmm19, 0xdd
+    0.00 :   3c7511:        vshufi32x4      zmm6, zmm20, zmm21, 0xdd
+    0.00 :   3c7518:        vshufi32x4      zmm7, zmm22, zmm23, 0xdd
+    0.00 :   3c751f:        vmovdqu32       zmmword ptr [rbx], zmm0
+    0.05 :   3c7525:        vmovdqu32       zmmword ptr [rbx + 0x40], zmm1
+    0.00 :   3c752c:        vmovdqu32       zmmword ptr [rbx + 0x80], zmm2
+    0.02 :   3c7533:        vmovdqu32       zmmword ptr [rbx + 0xc0], zmm3
+    0.00 :   3c753a:        vmovdqu32       zmmword ptr [rbx + 0x100], zmm4
+    0.00 :   3c7541:        vmovdqu32       zmmword ptr [rbx + 0x140], zmm5
+    0.03 :   3c7548:        vmovdqu32       zmmword ptr [rbx + 0x180], zmm6
+    0.00 :   3c754f:        vmovdqu32       zmmword ptr [rbx + 0x1c0], zmm7
+    0.02 :   3c7556:        vmovdqa32       zmm0, zmmword ptr [rsp]
+    0.05 :   3c755d:        vmovdqa32       zmm1, zmmword ptr [rsp + 0x40]
+    0.00 :   3c7565:        vmovdqa32       zmm2, zmm0
+    0.00 :   3c756b:        vpaddd  zmm2 {k1}, zmm0, dword ptr [rip - 0x3804b1]{1to16}  # 0x470c4 <ADD16>
+    0.10 :   3c7575:        vpcmpltud       k2, zmm2, zmm0
+    0.05 :   3c757c:        vpaddd  zmm1 {k2}, zmm1, dword ptr [rip - 0x3804c6]{1to16}  # 0x470c0 <ADD1>
+    0.05 :   3c7586:        vmovdqa32       zmmword ptr [rsp], zmm2
+    0.00 :   3c758d:        vmovdqa32       zmmword ptr [rsp + 0x40], zmm1
+    0.00 :   3c7595:        add     rdi, 0x80
+    0.00 :   3c759c:        add     rbx, 0x200
+    0.00 :   3c75a3:        mov     qword ptr [rbp + 0x50], rbx
+    0.00 :   3c75a7:        sub     rsi, 0x10
+    0.00 :   3c75ab:        cmp     rsi, 0x10
+    0.00 :   3c75af:        jae     0x3c5c7f <_blake3_hash_many_avx512+0xbf>
+    0.00 :   3c75b5:        test    rsi, rsi
+    0.00 :   3c75b8:        jne     0x3c7600 <_blake3_hash_many_avx512+0x1a40>
+    0.00 :   3c75ba:        vzeroupper
+    0.00 :   3c75bd:        mov     rsp, rbp
+    0.02 :   3c75c0:        pop     rbp
+    0.00 :   3c75c1:        pop     rbx
+    0.00 :   3c75c2:        pop     r12
+    0.00 :   3c75c4:        pop     r13
+    0.00 :   3c75c6:        pop     r14
+    0.00 :   3c75c8:        pop     r15
+    0.00 :   3c75ca:        ret
+    0.00 :   3c75cb:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c75d6:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c75e1:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c75ec:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c75f7:        nop     word ptr [rax + rax]
+    0.00 :   3c7600:        test    esi, 0x8
+    0.00 :   3c7606:        je      0x3c8b9d <_blake3_hash_many_avx512+0x2fdd>
+    0.00 :   3c760c:        vpbroadcastd    ymm0, dword ptr [rcx]
+    0.00 :   3c7611:        vpbroadcastd    ymm1, dword ptr [rcx + 0x4]
+    0.00 :   3c7617:        vpbroadcastd    ymm2, dword ptr [rcx + 0x8]
+    0.00 :   3c761d:        vpbroadcastd    ymm3, dword ptr [rcx + 0xc]
+    0.00 :   3c7623:        vpbroadcastd    ymm4, dword ptr [rcx + 0x10]
+    0.00 :   3c7629:        vpbroadcastd    ymm5, dword ptr [rcx + 0x14]
+    0.00 :   3c762f:        vpbroadcastd    ymm6, dword ptr [rcx + 0x18]
+    0.00 :   3c7635:        vpbroadcastd    ymm7, dword ptr [rcx + 0x1c]
+    0.00 :   3c763b:        mov     r8, qword ptr [rdi]
+    0.00 :   3c763e:        mov     r9, qword ptr [rdi + 0x8]
+    0.00 :   3c7642:        mov     r10, qword ptr [rdi + 0x10]
+    0.00 :   3c7646:        mov     r11, qword ptr [rdi + 0x18]
+    0.00 :   3c764a:        mov     r12, qword ptr [rdi + 0x20]
+    0.00 :   3c764e:        mov     r13, qword ptr [rdi + 0x28]
+    0.00 :   3c7652:        mov     r14, qword ptr [rdi + 0x30]
+    0.00 :   3c7656:        mov     r15, qword ptr [rdi + 0x38]
+    0.00 :   3c765a:        movzx   eax, byte ptr [rbp + 0x38]
+    0.00 :   3c765e:        movzx   ebx, byte ptr [rbp + 0x40]
+    0.00 :   3c7662:        or      eax, ebx
+    0.00 :   3c7664:        xor     edx, edx
+    0.00 :   3c7666:        movzx   ebx, byte ptr [rbp + 0x48]
+    0.00 :   3c766a:        or      ebx, eax
+    0.00 :   3c766c:        add     rdx, 0x40
+    0.00 :   3c7670:        cmp     rdx, qword ptr [rsp + 0x80]
+    0.00 :   3c7678:        cmove   eax, ebx
+    0.00 :   3c767b:        mov     dword ptr [rsp + 0x88], eax
+    0.00 :   3c7682:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x40]
+    0.00 :   3c7689:        vinsertf128     ymm8, ymm8, xmmword ptr [r12 + rdx - 0x40], 0x1
+    0.00 :   3c7691:        vmovups xmm9, xmmword ptr [r9 + rdx - 0x40]
+    0.00 :   3c7698:        vinsertf128     ymm9, ymm9, xmmword ptr [r13 + rdx - 0x40], 0x1
+    0.00 :   3c76a0:        vunpcklpd       ymm12, ymm8, ymm9
+    0.00 :   3c76a5:        vunpckhpd       ymm13, ymm8, ymm9
+    0.00 :   3c76aa:        vmovups xmm10, xmmword ptr [r10 + rdx - 0x40]
+    0.00 :   3c76b1:        vinsertf128     ymm10, ymm10, xmmword ptr [r14 + rdx - 0x40], 0x1
+    0.00 :   3c76b9:        vmovups xmm11, xmmword ptr [r11 + rdx - 0x40]
+    0.00 :   3c76c0:        vinsertf128     ymm11, ymm11, xmmword ptr [r15 + rdx - 0x40], 0x1
+    0.00 :   3c76c8:        vunpcklpd       ymm14, ymm10, ymm11
+    0.00 :   3c76cd:        vunpckhpd       ymm15, ymm10, ymm11
+    0.00 :   3c76d2:        vshufps ymm16, ymm12, ymm14, 0x88
+    0.00 :   3c76d9:        vshufps ymm17, ymm12, ymm14, 0xdd
+    0.00 :   3c76e0:        vshufps ymm18, ymm13, ymm15, 0x88
+    0.00 :   3c76e7:        vshufps ymm19, ymm13, ymm15, 0xdd
+    0.00 :   3c76ee:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x30]
+    0.00 :   3c76f5:        vinsertf128     ymm8, ymm8, xmmword ptr [r12 + rdx - 0x30], 0x1
+    0.00 :   3c76fd:        vmovups xmm9, xmmword ptr [r9 + rdx - 0x30]
+    0.00 :   3c7704:        vinsertf128     ymm9, ymm9, xmmword ptr [r13 + rdx - 0x30], 0x1
+    0.00 :   3c770c:        vunpcklpd       ymm12, ymm8, ymm9
+    0.00 :   3c7711:        vunpckhpd       ymm13, ymm8, ymm9
+    0.00 :   3c7716:        vmovups xmm10, xmmword ptr [r10 + rdx - 0x30]
+    0.00 :   3c771d:        vinsertf128     ymm10, ymm10, xmmword ptr [r14 + rdx - 0x30], 0x1
+    0.00 :   3c7725:        vmovups xmm11, xmmword ptr [r11 + rdx - 0x30]
+    0.00 :   3c772c:        vinsertf128     ymm11, ymm11, xmmword ptr [r15 + rdx - 0x30], 0x1
+    0.00 :   3c7734:        vunpcklpd       ymm14, ymm10, ymm11
+    0.00 :   3c7739:        vunpckhpd       ymm15, ymm10, ymm11
+    0.00 :   3c773e:        vshufps ymm20, ymm12, ymm14, 0x88
+    0.00 :   3c7745:        vshufps ymm21, ymm12, ymm14, 0xdd
+    0.00 :   3c774c:        vshufps ymm22, ymm13, ymm15, 0x88
+    0.00 :   3c7753:        vshufps ymm23, ymm13, ymm15, 0xdd
+    0.00 :   3c775a:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x20]
+    0.00 :   3c7761:        vinsertf128     ymm8, ymm8, xmmword ptr [r12 + rdx - 0x20], 0x1
+    0.00 :   3c7769:        vmovups xmm9, xmmword ptr [r9 + rdx - 0x20]
+    0.00 :   3c7770:        vinsertf128     ymm9, ymm9, xmmword ptr [r13 + rdx - 0x20], 0x1
+    0.00 :   3c7778:        vunpcklpd       ymm12, ymm8, ymm9
+    0.00 :   3c777d:        vunpckhpd       ymm13, ymm8, ymm9
+    0.00 :   3c7782:        vmovups xmm10, xmmword ptr [r10 + rdx - 0x20]
+    0.00 :   3c7789:        vinsertf128     ymm10, ymm10, xmmword ptr [r14 + rdx - 0x20], 0x1
+    0.00 :   3c7791:        vmovups xmm11, xmmword ptr [r11 + rdx - 0x20]
+    0.00 :   3c7798:        vinsertf128     ymm11, ymm11, xmmword ptr [r15 + rdx - 0x20], 0x1
+    0.00 :   3c77a0:        vunpcklpd       ymm14, ymm10, ymm11
+    0.00 :   3c77a5:        vunpckhpd       ymm15, ymm10, ymm11
+    0.00 :   3c77aa:        vshufps ymm24, ymm12, ymm14, 0x88
+    0.00 :   3c77b1:        vshufps ymm25, ymm12, ymm14, 0xdd
+    0.00 :   3c77b8:        vshufps ymm26, ymm13, ymm15, 0x88
+    0.00 :   3c77bf:        vshufps ymm27, ymm13, ymm15, 0xdd
+    0.00 :   3c77c6:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x10]
+    0.00 :   3c77cd:        vinsertf128     ymm8, ymm8, xmmword ptr [r12 + rdx - 0x10], 0x1
+    0.00 :   3c77d5:        vmovups xmm9, xmmword ptr [r9 + rdx - 0x10]
+    0.00 :   3c77dc:        vinsertf128     ymm9, ymm9, xmmword ptr [r13 + rdx - 0x10], 0x1
+    0.00 :   3c77e4:        vunpcklpd       ymm12, ymm8, ymm9
+    0.00 :   3c77e9:        vunpckhpd       ymm13, ymm8, ymm9
+    0.00 :   3c77ee:        vmovups xmm10, xmmword ptr [r10 + rdx - 0x10]
+    0.00 :   3c77f5:        vinsertf128     ymm10, ymm10, xmmword ptr [r14 + rdx - 0x10], 0x1
+    0.00 :   3c77fd:        vmovups xmm11, xmmword ptr [r11 + rdx - 0x10]
+    0.00 :   3c7804:        vinsertf128     ymm11, ymm11, xmmword ptr [r15 + rdx - 0x10], 0x1
+    0.00 :   3c780c:        vunpcklpd       ymm14, ymm10, ymm11
+    0.00 :   3c7811:        vunpckhpd       ymm15, ymm10, ymm11
+    0.00 :   3c7816:        vshufps ymm28, ymm12, ymm14, 0x88
+    0.00 :   3c781d:        vshufps ymm29, ymm12, ymm14, 0xdd
+    0.00 :   3c7824:        vshufps ymm30, ymm13, ymm15, 0x88
+    0.00 :   3c782b:        vshufps ymm31, ymm13, ymm15, 0xdd
+    0.00 :   3c7832:        vpbroadcastd    ymm8, dword ptr [rip - 0x38073b]  # 0x47100 <BLAKE3_IV>
+    0.00 :   3c783b:        vpbroadcastd    ymm9, dword ptr [rip - 0x380740]  # 0x47104 <BLAKE3_IV_1>
+    0.00 :   3c7844:        vpbroadcastd    ymm10, dword ptr [rip - 0x380745]  # 0x47108 <BLAKE3_IV_2>
+    0.00 :   3c784d:        vpbroadcastd    ymm11, dword ptr [rip - 0x38074a]  # 0x4710c <BLAKE3_IV_3>
+    0.00 :   3c7856:        vmovdqa ymm12, ymmword ptr [rsp]
+    0.00 :   3c785b:        vmovdqa ymm13, ymmword ptr [rsp + 0x40]
+    0.00 :   3c7861:        vpbroadcastd    ymm14, dword ptr [rip - 0x3807a2]  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.00 :   3c786a:        vpbroadcastd    ymm15, dword ptr [rsp + 0x88]
+    0.00 :   3c7874:        vpaddd  ymm0, ymm0, ymm16
+    0.00 :   3c787a:        vpaddd  ymm1, ymm1, ymm18
+    0.00 :   3c7880:        vpaddd  ymm2, ymm2, ymm20
+    0.00 :   3c7886:        vpaddd  ymm3, ymm3, ymm22
+    0.00 :   3c788c:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7890:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7894:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c7898:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c789c:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c78a2:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c78a8:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c78ae:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c78b4:        vprord  ymm12, ymm12, 0x10
+    0.02 :   3c78bb:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c78c2:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c78c9:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c78d0:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c78d5:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c78da:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c78df:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c78e4:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c78ea:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c78f0:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c78f6:        vpxord  ymm7, ymm7, ymm11
+    0.03 :   3c78fc:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7903:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c790a:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7911:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7918:        vpaddd  ymm0, ymm0, ymm17
+    0.00 :   3c791e:        vpaddd  ymm1, ymm1, ymm19
+    0.00 :   3c7924:        vpaddd  ymm2, ymm2, ymm21
+    0.00 :   3c792a:        vpaddd  ymm3, ymm3, ymm23
+    0.00 :   3c7930:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7934:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7938:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c793c:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c7940:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c7946:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c794c:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c7952:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c7958:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c795f:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7966:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c796d:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7974:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c7979:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c797e:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c7983:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c7988:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c798e:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c7994:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c799a:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c79a0:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c79a7:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c79ae:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c79b5:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c79bc:        vpaddd  ymm0, ymm0, ymm24
+    0.00 :   3c79c2:        vpaddd  ymm1, ymm1, ymm26
+    0.00 :   3c79c8:        vpaddd  ymm2, ymm2, ymm28
+    0.00 :   3c79ce:        vpaddd  ymm3, ymm3, ymm30
+    0.00 :   3c79d4:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c79d8:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c79dc:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c79e0:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c79e4:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c79ea:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c79f0:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c79f6:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c79fc:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c7a03:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c7a0a:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c7a11:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c7a18:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7a1d:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7a22:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7a27:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7a2c:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7a32:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7a38:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c7a3e:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c7a44:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c7a4b:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7a52:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7a59:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7a60:        vpaddd  ymm0, ymm0, ymm25
+    0.00 :   3c7a66:        vpaddd  ymm1, ymm1, ymm27
+    0.00 :   3c7a6c:        vpaddd  ymm2, ymm2, ymm29
+    0.00 :   3c7a72:        vpaddd  ymm3, ymm3, ymm31
+    0.00 :   3c7a78:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c7a7c:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c7a80:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c7a84:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c7a88:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c7a8e:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c7a94:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c7a9a:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c7aa0:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7aa7:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c7aae:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7ab5:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c7abc:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7ac1:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7ac6:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7acb:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7ad0:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7ad6:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7adc:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c7ae2:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c7ae8:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c7aef:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c7af6:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c7afd:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c7b04:        vpaddd  ymm0, ymm0, ymm18
+    0.00 :   3c7b0a:        vpaddd  ymm1, ymm1, ymm19
+    0.00 :   3c7b10:        vpaddd  ymm2, ymm2, ymm23
+    0.00 :   3c7b16:        vpaddd  ymm3, ymm3, ymm20
+    0.00 :   3c7b1c:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7b20:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7b24:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c7b28:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c7b2c:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c7b32:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c7b38:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c7b3e:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c7b44:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c7b4b:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c7b52:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c7b59:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c7b60:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c7b65:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c7b6a:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c7b6f:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c7b74:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c7b7a:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c7b80:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c7b86:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c7b8c:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7b93:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c7b9a:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7ba1:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7ba8:        vpaddd  ymm0, ymm0, ymm22
+    0.00 :   3c7bae:        vpaddd  ymm1, ymm1, ymm26
+    0.00 :   3c7bb4:        vpaddd  ymm2, ymm2, ymm16
+    0.00 :   3c7bba:        vpaddd  ymm3, ymm3, ymm29
+    0.00 :   3c7bc0:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7bc4:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7bc8:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c7bcc:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c7bd0:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c7bd6:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c7bdc:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c7be2:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c7be8:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c7bef:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7bf6:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c7bfd:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7c04:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c7c09:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c7c0e:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c7c13:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c7c18:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c7c1e:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c7c24:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c7c2a:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c7c30:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c7c37:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c7c3e:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c7c45:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c7c4c:        vpaddd  ymm0, ymm0, ymm17
+    0.00 :   3c7c52:        vpaddd  ymm1, ymm1, ymm28
+    0.00 :   3c7c58:        vpaddd  ymm2, ymm2, ymm25
+    0.00 :   3c7c5e:        vpaddd  ymm3, ymm3, ymm31
+    0.00 :   3c7c64:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c7c68:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c7c6c:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c7c70:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c7c74:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c7c7a:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c7c80:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c7c86:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c7c8c:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c7c93:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c7c9a:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c7ca1:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c7ca8:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7cad:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7cb2:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7cb7:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7cbc:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7cc2:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7cc8:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c7cce:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c7cd4:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c7cdb:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7ce2:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7ce9:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7cf0:        vpaddd  ymm0, ymm0, ymm27
+    0.00 :   3c7cf6:        vpaddd  ymm1, ymm1, ymm21
+    0.00 :   3c7cfc:        vpaddd  ymm2, ymm2, ymm30
+    0.00 :   3c7d02:        vpaddd  ymm3, ymm3, ymm24
+    0.00 :   3c7d08:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c7d0c:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c7d10:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c7d14:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c7d18:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c7d1e:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c7d24:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c7d2a:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c7d30:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7d37:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c7d3e:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7d45:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c7d4c:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7d51:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7d56:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7d5b:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7d60:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7d66:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7d6c:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c7d72:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c7d78:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c7d7f:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c7d86:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c7d8d:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c7d94:        vpaddd  ymm0, ymm0, ymm19
+    0.00 :   3c7d9a:        vpaddd  ymm1, ymm1, ymm26
+    0.00 :   3c7da0:        vpaddd  ymm2, ymm2, ymm29
+    0.00 :   3c7da6:        vpaddd  ymm3, ymm3, ymm23
+    0.00 :   3c7dac:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7db0:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7db4:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c7db8:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c7dbc:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c7dc2:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c7dc8:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c7dce:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c7dd4:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c7ddb:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c7de2:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c7de9:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c7df0:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c7df5:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c7dfa:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c7dff:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c7e04:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c7e0a:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c7e10:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c7e16:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c7e1c:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7e23:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c7e2a:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7e31:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7e38:        vpaddd  ymm0, ymm0, ymm20
+    0.00 :   3c7e3e:        vpaddd  ymm1, ymm1, ymm28
+    0.00 :   3c7e44:        vpaddd  ymm2, ymm2, ymm18
+    0.00 :   3c7e4a:        vpaddd  ymm3, ymm3, ymm30
+    0.00 :   3c7e50:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c7e54:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c7e58:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c7e5c:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c7e60:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c7e66:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c7e6c:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c7e72:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c7e78:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c7e7f:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7e86:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c7e8d:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7e94:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c7e99:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c7e9e:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c7ea3:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c7ea8:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c7eae:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c7eb4:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c7eba:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c7ec0:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c7ec7:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c7ece:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c7ed5:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c7edc:        vpaddd  ymm0, ymm0, ymm22
+    0.00 :   3c7ee2:        vpaddd  ymm1, ymm1, ymm25
+    0.00 :   3c7ee8:        vpaddd  ymm2, ymm2, ymm27
+    0.00 :   3c7eee:        vpaddd  ymm3, ymm3, ymm24
+    0.00 :   3c7ef4:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c7ef8:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c7efc:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c7f00:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c7f04:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c7f0a:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c7f10:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c7f16:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c7f1c:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c7f23:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c7f2a:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c7f31:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c7f38:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7f3d:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7f42:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7f47:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7f4c:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7f52:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7f58:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c7f5e:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c7f64:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c7f6b:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c7f72:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c7f79:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c7f80:        vpaddd  ymm0, ymm0, ymm21
+    0.00 :   3c7f86:        vpaddd  ymm1, ymm1, ymm16
+    0.00 :   3c7f8c:        vpaddd  ymm2, ymm2, ymm31
+    0.00 :   3c7f92:        vpaddd  ymm3, ymm3, ymm17
+    0.00 :   3c7f98:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c7f9c:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c7fa0:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c7fa4:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c7fa8:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c7fae:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c7fb4:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c7fba:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c7fc0:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c7fc7:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c7fce:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c7fd5:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c7fdc:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c7fe1:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c7fe6:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c7feb:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c7ff0:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c7ff6:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c7ffc:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c8002:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8008:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c800f:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8016:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c801d:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8024:        vpaddd  ymm0, ymm0, ymm26
+    0.00 :   3c802a:        vpaddd  ymm1, ymm1, ymm28
+    0.00 :   3c8030:        vpaddd  ymm2, ymm2, ymm30
+    0.00 :   3c8036:        vpaddd  ymm3, ymm3, ymm29
+    0.00 :   3c803c:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c8040:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c8044:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c8048:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c804c:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c8052:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c8058:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c805e:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8064:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c806b:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8072:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8079:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c8080:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c8085:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c808a:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c808f:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c8094:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c809a:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c80a0:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c80a6:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c80ac:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c80b3:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c80ba:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c80c1:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c80c8:        vpaddd  ymm0, ymm0, ymm23
+    0.00 :   3c80ce:        vpaddd  ymm1, ymm1, ymm25
+    0.00 :   3c80d4:        vpaddd  ymm2, ymm2, ymm19
+    0.00 :   3c80da:        vpaddd  ymm3, ymm3, ymm31
+    0.00 :   3c80e0:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c80e4:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c80e8:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c80ec:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c80f0:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c80f6:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c80fc:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c8102:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8108:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c810f:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c8116:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c811d:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c8124:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c8129:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c812e:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c8133:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c8138:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c813e:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c8144:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c814a:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c8150:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8157:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c815e:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8165:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c816c:        vpaddd  ymm0, ymm0, ymm20
+    0.00 :   3c8172:        vpaddd  ymm1, ymm1, ymm27
+    0.00 :   3c8178:        vpaddd  ymm2, ymm2, ymm21
+    0.00 :   3c817e:        vpaddd  ymm3, ymm3, ymm17
+    0.00 :   3c8184:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c8188:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c818c:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c8190:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c8194:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c819a:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c81a0:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c81a6:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c81ac:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c81b3:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c81ba:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c81c1:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c81c8:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c81cd:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c81d2:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c81d7:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c81dc:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c81e2:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c81e8:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c81ee:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c81f4:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c81fb:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c8202:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c8209:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c8210:        vpaddd  ymm0, ymm0, ymm16
+    0.00 :   3c8216:        vpaddd  ymm1, ymm1, ymm18
+    0.00 :   3c821c:        vpaddd  ymm2, ymm2, ymm24
+    0.00 :   3c8222:        vpaddd  ymm3, ymm3, ymm22
+    0.00 :   3c8228:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c822c:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c8230:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c8234:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c8238:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c823e:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c8244:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c824a:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c8250:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c8257:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c825e:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c8265:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c826c:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c8271:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8276:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c827b:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c8280:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8286:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c828c:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c8292:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8298:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c829f:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c82a6:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c82ad:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c82b4:        vpaddd  ymm0, ymm0, ymm28
+    0.00 :   3c82ba:        vpaddd  ymm1, ymm1, ymm25
+    0.00 :   3c82c0:        vpaddd  ymm2, ymm2, ymm31
+    0.00 :   3c82c6:        vpaddd  ymm3, ymm3, ymm30
+    0.00 :   3c82cc:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c82d0:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c82d4:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c82d8:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c82dc:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c82e2:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c82e8:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c82ee:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c82f4:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c82fb:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8302:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8309:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c8310:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c8315:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c831a:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c831f:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c8324:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c832a:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c8330:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c8336:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c833c:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c8343:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c834a:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c8351:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c8358:        vpaddd  ymm0, ymm0, ymm29
+    0.00 :   3c835e:        vpaddd  ymm1, ymm1, ymm27
+    0.00 :   3c8364:        vpaddd  ymm2, ymm2, ymm26
+    0.00 :   3c836a:        vpaddd  ymm3, ymm3, ymm24
+    0.00 :   3c8370:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c8374:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c8378:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c837c:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c8380:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c8386:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c838c:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c8392:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8398:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c839f:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c83a6:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c83ad:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c83b4:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c83b9:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c83be:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c83c3:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c83c8:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c83ce:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c83d4:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c83da:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c83e0:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c83e7:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c83ee:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c83f5:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c83fc:        vpaddd  ymm0, ymm0, ymm23
+    0.00 :   3c8402:        vpaddd  ymm1, ymm1, ymm21
+    0.00 :   3c8408:        vpaddd  ymm2, ymm2, ymm16
+    0.00 :   3c840e:        vpaddd  ymm3, ymm3, ymm22
+    0.00 :   3c8414:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c8418:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c841c:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c8420:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c8424:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c842a:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c8430:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c8436:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c843c:        vprord  ymm15, ymm15, 0x10
+    0.02 :   3c8443:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c844a:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8451:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8458:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c845d:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8462:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c8467:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c846c:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8472:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c8478:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c847e:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8484:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c848b:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c8492:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c8499:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c84a0:        vpaddd  ymm0, ymm0, ymm18
+    0.00 :   3c84a6:        vpaddd  ymm1, ymm1, ymm19
+    0.00 :   3c84ac:        vpaddd  ymm2, ymm2, ymm17
+    0.00 :   3c84b2:        vpaddd  ymm3, ymm3, ymm20
+    0.00 :   3c84b8:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c84bc:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c84c0:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c84c4:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c84c8:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c84ce:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c84d4:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c84da:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c84e0:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c84e7:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c84ee:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c84f5:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c84fc:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c8501:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8506:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c850b:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c8510:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8516:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c851c:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c8522:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8528:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c852f:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8536:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c853d:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8544:        vpaddd  ymm0, ymm0, ymm25
+    0.00 :   3c854a:        vpaddd  ymm1, ymm1, ymm27
+    0.00 :   3c8550:        vpaddd  ymm2, ymm2, ymm24
+    0.00 :   3c8556:        vpaddd  ymm3, ymm3, ymm31
+    0.00 :   3c855c:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c8560:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c8564:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c8568:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c856c:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c8572:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c8578:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c857e:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8584:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c858b:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8592:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8599:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c85a0:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c85a5:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c85aa:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c85af:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c85b4:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c85ba:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c85c0:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c85c6:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c85cc:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c85d3:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c85da:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c85e1:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c85e8:        vpaddd  ymm0, ymm0, ymm30
+    0.00 :   3c85ee:        vpaddd  ymm1, ymm1, ymm21
+    0.00 :   3c85f4:        vpaddd  ymm2, ymm2, ymm28
+    0.00 :   3c85fa:        vpaddd  ymm3, ymm3, ymm17
+    0.00 :   3c8600:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c8604:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c8608:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c860c:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c8610:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c8616:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c861c:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c8622:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8628:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c862f:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c8636:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c863d:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c8644:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c8649:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c864e:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c8653:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c8658:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c865e:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c8664:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c866a:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c8670:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8677:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c867e:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8685:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c868c:        vpaddd  ymm0, ymm0, ymm29
+    0.00 :   3c8692:        vpaddd  ymm1, ymm1, ymm16
+    0.00 :   3c8698:        vpaddd  ymm2, ymm2, ymm18
+    0.00 :   3c869e:        vpaddd  ymm3, ymm3, ymm20
+    0.00 :   3c86a4:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c86a8:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c86ac:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c86b0:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c86b4:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c86ba:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c86c0:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c86c6:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c86cc:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c86d3:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c86da:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c86e1:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c86e8:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c86ed:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c86f2:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c86f7:        vpaddd  ymm9, ymm9, ymm14
+    0.03 :   3c86fc:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8702:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c8708:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c870e:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8714:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c871b:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c8722:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c8729:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c8730:        vpaddd  ymm0, ymm0, ymm19
+    0.00 :   3c8736:        vpaddd  ymm1, ymm1, ymm26
+    0.00 :   3c873c:        vpaddd  ymm2, ymm2, ymm22
+    0.00 :   3c8742:        vpaddd  ymm3, ymm3, ymm23
+    0.00 :   3c8748:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c874c:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c8750:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c8754:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c8758:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c875e:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c8764:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c876a:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c8770:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c8777:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c877e:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c8785:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c878c:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c8791:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8796:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c879b:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c87a0:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c87a6:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c87ac:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c87b2:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c87b8:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c87bf:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c87c6:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c87cd:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c87d4:        vpaddd  ymm0, ymm0, ymm27
+    0.00 :   3c87da:        vpaddd  ymm1, ymm1, ymm21
+    0.00 :   3c87e0:        vpaddd  ymm2, ymm2, ymm17
+    0.00 :   3c87e6:        vpaddd  ymm3, ymm3, ymm24
+    0.00 :   3c87ec:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c87f0:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c87f4:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c87f8:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c87fc:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c8802:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c8808:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c880e:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c8814:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c881b:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8822:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8829:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c8830:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c8835:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c883a:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c883f:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c8844:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c884a:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c8850:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c8856:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c885c:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c8863:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c886a:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c8871:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c8878:        vpaddd  ymm0, ymm0, ymm31
+    0.00 :   3c887e:        vpaddd  ymm1, ymm1, ymm16
+    0.00 :   3c8884:        vpaddd  ymm2, ymm2, ymm25
+    0.00 :   3c888a:        vpaddd  ymm3, ymm3, ymm22
+    0.00 :   3c8890:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c8894:        vpaddd  ymm1, ymm1, ymm5
+    0.00 :   3c8898:        vpaddd  ymm2, ymm2, ymm6
+    0.00 :   3c889c:        vpaddd  ymm3, ymm3, ymm7
+    0.00 :   3c88a0:        vpxord  ymm12, ymm12, ymm0
+    0.00 :   3c88a6:        vpxord  ymm13, ymm13, ymm1
+    0.00 :   3c88ac:        vpxord  ymm14, ymm14, ymm2
+    0.00 :   3c88b2:        vpxord  ymm15, ymm15, ymm3
+    0.00 :   3c88b8:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c88bf:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c88c6:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c88cd:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c88d4:        vpaddd  ymm8, ymm8, ymm12
+    0.00 :   3c88d9:        vpaddd  ymm9, ymm9, ymm13
+    0.00 :   3c88de:        vpaddd  ymm10, ymm10, ymm14
+    0.00 :   3c88e3:        vpaddd  ymm11, ymm11, ymm15
+    0.00 :   3c88e8:        vpxord  ymm4, ymm4, ymm8
+    0.00 :   3c88ee:        vpxord  ymm5, ymm5, ymm9
+    0.00 :   3c88f4:        vpxord  ymm6, ymm6, ymm10
+    0.00 :   3c88fa:        vpxord  ymm7, ymm7, ymm11
+    0.00 :   3c8900:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8907:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c890e:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8915:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c891c:        vpaddd  ymm0, ymm0, ymm30
+    0.00 :   3c8922:        vpaddd  ymm1, ymm1, ymm18
+    0.00 :   3c8928:        vpaddd  ymm2, ymm2, ymm19
+    0.00 :   3c892e:        vpaddd  ymm3, ymm3, ymm23
+    0.00 :   3c8934:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c8938:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c893c:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c8940:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c8944:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c894a:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c8950:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c8956:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c895c:        vprord  ymm15, ymm15, 0x10
+    0.00 :   3c8963:        vprord  ymm12, ymm12, 0x10
+    0.00 :   3c896a:        vprord  ymm13, ymm13, 0x10
+    0.00 :   3c8971:        vprord  ymm14, ymm14, 0x10
+    0.00 :   3c8978:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c897d:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8982:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c8987:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c898c:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8992:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c8998:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c899e:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c89a4:        vprord  ymm5, ymm5, 0xc
+    0.00 :   3c89ab:        vprord  ymm6, ymm6, 0xc
+    0.00 :   3c89b2:        vprord  ymm7, ymm7, 0xc
+    0.00 :   3c89b9:        vprord  ymm4, ymm4, 0xc
+    0.00 :   3c89c0:        vpaddd  ymm0, ymm0, ymm26
+    0.00 :   3c89c6:        vpaddd  ymm1, ymm1, ymm28
+    0.00 :   3c89cc:        vpaddd  ymm2, ymm2, ymm20
+    0.00 :   3c89d2:        vpaddd  ymm3, ymm3, ymm29
+    0.00 :   3c89d8:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c89dc:        vpaddd  ymm1, ymm1, ymm6
+    0.00 :   3c89e0:        vpaddd  ymm2, ymm2, ymm7
+    0.00 :   3c89e4:        vpaddd  ymm3, ymm3, ymm4
+    0.00 :   3c89e8:        vpxord  ymm15, ymm15, ymm0
+    0.00 :   3c89ee:        vpxord  ymm12, ymm12, ymm1
+    0.00 :   3c89f4:        vpxord  ymm13, ymm13, ymm2
+    0.00 :   3c89fa:        vpxord  ymm14, ymm14, ymm3
+    0.00 :   3c8a00:        vprord  ymm15, ymm15, 0x8
+    0.00 :   3c8a07:        vprord  ymm12, ymm12, 0x8
+    0.00 :   3c8a0e:        vprord  ymm13, ymm13, 0x8
+    0.00 :   3c8a15:        vprord  ymm14, ymm14, 0x8
+    0.00 :   3c8a1c:        vpaddd  ymm10, ymm10, ymm15
+    0.00 :   3c8a21:        vpaddd  ymm11, ymm11, ymm12
+    0.00 :   3c8a26:        vpaddd  ymm8, ymm8, ymm13
+    0.00 :   3c8a2b:        vpaddd  ymm9, ymm9, ymm14
+    0.00 :   3c8a30:        vpxord  ymm5, ymm5, ymm10
+    0.00 :   3c8a36:        vpxord  ymm6, ymm6, ymm11
+    0.00 :   3c8a3c:        vpxord  ymm7, ymm7, ymm8
+    0.00 :   3c8a42:        vpxord  ymm4, ymm4, ymm9
+    0.00 :   3c8a48:        vprord  ymm5, ymm5, 0x7
+    0.00 :   3c8a4f:        vprord  ymm6, ymm6, 0x7
+    0.00 :   3c8a56:        vprord  ymm7, ymm7, 0x7
+    0.00 :   3c8a5d:        vprord  ymm4, ymm4, 0x7
+    0.00 :   3c8a64:        vpxor   ymm0, ymm0, ymm8
+    0.00 :   3c8a69:        vpxor   ymm1, ymm1, ymm9
+    0.00 :   3c8a6e:        vpxor   ymm2, ymm2, ymm10
+    0.00 :   3c8a73:        vpxor   ymm3, ymm3, ymm11
+    0.00 :   3c8a78:        vpxor   ymm4, ymm4, ymm12
+    0.00 :   3c8a7d:        vpxor   ymm5, ymm5, ymm13
+    0.00 :   3c8a82:        vpxor   ymm6, ymm6, ymm14
+    0.00 :   3c8a87:        vpxor   ymm7, ymm7, ymm15
+    0.00 :   3c8a8c:        movzx   eax, byte ptr [rbp + 0x38]
+    0.00 :   3c8a90:        jne     0x3c7666 <_blake3_hash_many_avx512+0x1aa6>
+    0.00 :   3c8a96:        mov     rbx, qword ptr [rbp + 0x50]
+    0.00 :   3c8a9a:        vunpcklps       ymm8, ymm0, ymm1
+    0.00 :   3c8a9e:        vunpcklps       ymm9, ymm2, ymm3
+    0.00 :   3c8aa2:        vunpckhps       ymm10, ymm0, ymm1
+    0.00 :   3c8aa6:        vunpcklps       ymm11, ymm4, ymm5
+    0.00 :   3c8aaa:        vunpcklps       ymm0, ymm6, ymm7
+    0.00 :   3c8aae:        vshufps ymm12, ymm8, ymm9, 0x4e
+    0.00 :   3c8ab4:        vblendps        ymm1, ymm8, ymm12, 0xcc
+    0.00 :   3c8aba:        vshufps ymm8, ymm11, ymm0, 0x4e
+    0.00 :   3c8abf:        vunpckhps       ymm13, ymm2, ymm3
+    0.00 :   3c8ac3:        vblendps        ymm2, ymm11, ymm8, 0xcc
+    0.00 :   3c8ac9:        vblendps        ymm3, ymm12, ymm9, 0xcc
+    0.00 :   3c8acf:        vperm2f128      ymm12, ymm1, ymm2, 0x20
+    0.00 :   3c8ad5:        vmovups ymmword ptr [rbx], ymm12
+    0.00 :   3c8ad9:        vunpckhps       ymm14, ymm4, ymm5
+    0.00 :   3c8add:        vblendps        ymm4, ymm8, ymm0, 0xcc
+    0.00 :   3c8ae3:        vunpckhps       ymm15, ymm6, ymm7
+    0.00 :   3c8ae7:        vperm2f128      ymm7, ymm3, ymm4, 0x20
+    0.00 :   3c8aed:        vmovups ymmword ptr [rbx + 0x20], ymm7
+    0.00 :   3c8af2:        vshufps ymm5, ymm10, ymm13, 0x4e
+    0.00 :   3c8af8:        vblendps        ymm6, ymm5, ymm13, 0xcc
+    0.00 :   3c8afe:        vshufps ymm13, ymm14, ymm15, 0x4e
+    0.00 :   3c8b04:        vblendps        ymm10, ymm10, ymm5, 0xcc
+    0.00 :   3c8b0a:        vblendps        ymm14, ymm14, ymm13, 0xcc
+    0.00 :   3c8b10:        vperm2f128      ymm8, ymm10, ymm14, 0x20
+    0.00 :   3c8b16:        vmovups ymmword ptr [rbx + 0x40], ymm8
+    0.00 :   3c8b1b:        vblendps        ymm15, ymm13, ymm15, 0xcc
+    0.00 :   3c8b21:        vperm2f128      ymm13, ymm6, ymm15, 0x20
+    0.00 :   3c8b27:        vmovups ymmword ptr [rbx + 0x60], ymm13
+    0.00 :   3c8b2c:        vperm2f128      ymm9, ymm1, ymm2, 0x31
+    0.00 :   3c8b32:        vperm2f128      ymm11, ymm3, ymm4, 0x31
+    0.00 :   3c8b38:        vmovups ymmword ptr [rbx + 0x80], ymm9
+    0.00 :   3c8b40:        vperm2f128      ymm14, ymm10, ymm14, 0x31
+    0.00 :   3c8b46:        vperm2f128      ymm15, ymm6, ymm15, 0x31
+    0.00 :   3c8b4c:        vmovups ymmword ptr [rbx + 0xa0], ymm11
+    0.00 :   3c8b54:        vmovups ymmword ptr [rbx + 0xc0], ymm14
+    0.00 :   3c8b5c:        vmovups ymmword ptr [rbx + 0xe0], ymm15
+    0.00 :   3c8b64:        vmovdqa ymm0, ymmword ptr [rsp]
+    0.00 :   3c8b69:        vmovdqa ymm2, ymmword ptr [rsp + 0x40]
+    0.03 :   3c8b6f:        vmovdqa32       ymm0 {k1}, ymmword ptr [rsp + 0x20]
+    0.00 :   3c8b77:        vmovdqa32       ymm2 {k1}, ymmword ptr [rsp + 0x60]
+    0.00 :   3c8b7f:        vmovdqa ymmword ptr [rsp], ymm0
+    0.00 :   3c8b84:        vmovdqa ymmword ptr [rsp + 0x40], ymm2
+    0.00 :   3c8b8a:        add     rbx, 0x100
+    0.00 :   3c8b91:        mov     qword ptr [rbp + 0x50], rbx
+    0.00 :   3c8b95:        add     rdi, 0x40
+    0.00 :   3c8b99:        sub     rsi, 0x8
+    0.00 :   3c8b9d:        mov     rbx, qword ptr [rbp + 0x50]
+    0.00 :   3c8ba1:        mov     r15, qword ptr [rsp + 0x80]
+    0.00 :   3c8ba9:        movzx   r13, byte ptr [rbp + 0x38]
+    0.00 :   3c8bae:        movzx   r12, byte ptr [rbp + 0x48]
+    0.00 :   3c8bb3:        test    esi, 0x4
+    0.00 :   3c8bb9:        je      0x3c8f08 <_blake3_hash_many_avx512+0x3348>
+    0.00 :   3c8bbf:        vbroadcasti32x4 zmm0, xmmword ptr [rcx]
+    0.00 :   3c8bc5:        vbroadcasti32x4 zmm1, xmmword ptr [rcx + 0x10]
+    0.00 :   3c8bcc:        vmovdqa xmm12, xmmword ptr [rsp]
+    0.00 :   3c8bd1:        vmovdqa xmm13, xmmword ptr [rsp + 0x40]
+    0.00 :   3c8bd7:        vpunpckldq      xmm14, xmm12, xmm13
+    0.00 :   3c8bdc:        vpunpckhdq      xmm15, xmm12, xmm13
+    0.00 :   3c8be1:        vpermq  ymm14, ymm14, 0xdc
+    0.00 :   3c8be7:        vpermq  ymm15, ymm15, 0xdc
+    0.00 :   3c8bed:        vpbroadcastd    zmm12, dword ptr [rip - 0x381b2f]  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.00 :   3c8bf7:        vinserti64x4    zmm13, zmm14, ymm15, 0x1
+    0.00 :   3c8bfe:        mov     eax, 0x4444
+    0.00 :   3c8c03:        kmovw   k2, eax
+    0.00 :   3c8c07:        vpblendmd       zmm13 {k2}, zmm13, zmm12
+    0.00 :   3c8c0d:        vbroadcasti32x4 zmm15, xmmword ptr [rip - 0x381b17]  # 0x47100 <BLAKE3_IV>
+    0.00 :   3c8c17:        mov     r8, qword ptr [rdi]
+    0.00 :   3c8c1a:        mov     r9, qword ptr [rdi + 0x8]
+    0.00 :   3c8c1e:        mov     r10, qword ptr [rdi + 0x10]
+    0.00 :   3c8c22:        mov     r11, qword ptr [rdi + 0x18]
+    0.00 :   3c8c26:        mov     eax, 0xaaaa
+    0.00 :   3c8c2b:        kmovw   k3, eax
+    0.00 :   3c8c2f:        mov     eax, 0x8888
+    0.00 :   3c8c34:        kmovw   k4, eax
+    0.00 :   3c8c38:        movzx   eax, byte ptr [rbp + 0x40]
+    0.00 :   3c8c3c:        or      eax, r13d
+    0.00 :   3c8c3f:        xor     edx, edx
+    0.00 :   3c8c41:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c8c4c:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c8c57:        nop     word ptr [rax + rax]
+    0.00 :   3c8c60:        mov     r14d, eax
+    0.00 :   3c8c63:        or      eax, r12d
+    0.00 :   3c8c66:        add     rdx, 0x40
+    0.00 :   3c8c6a:        cmp     rdx, r15
+    0.00 :   3c8c6d:        cmovne  eax, r14d
+    0.00 :   3c8c71:        mov     dword ptr [rsp + 0x88], eax
+    0.00 :   3c8c78:        vmovdqa32       zmm2, zmm15
+    0.00 :   3c8c7e:        vpbroadcastd    zmm8, dword ptr [rsp + 0x88]
+    0.00 :   3c8c86:        vpblendmd       zmm3 {k4}, zmm13, zmm8
+    0.00 :   3c8c8c:        vmovups zmm8, zmmword ptr [r8 + rdx - 0x40]
+    0.00 :   3c8c94:        vinserti32x4    zmm8, zmm8, xmmword ptr [r9 + rdx - 0x40], 0x1
+    0.00 :   3c8c9d:        vinserti32x4    zmm8, zmm8, xmmword ptr [r10 + rdx - 0x40], 0x2
+    0.00 :   3c8ca6:        vinserti32x4    zmm8, zmm8, xmmword ptr [r11 + rdx - 0x40], 0x3
+    0.00 :   3c8caf:        vmovups zmm9, zmmword ptr [r8 + rdx - 0x30]
+    0.00 :   3c8cba:        vinserti32x4    zmm9, zmm9, xmmword ptr [r9 + rdx - 0x30], 0x1
+    0.00 :   3c8cc3:        vinserti32x4    zmm9, zmm9, xmmword ptr [r10 + rdx - 0x30], 0x2
+    0.00 :   3c8ccc:        vinserti32x4    zmm9, zmm9, xmmword ptr [r11 + rdx - 0x30], 0x3
+    0.00 :   3c8cd5:        vshufps zmm4, zmm8, zmm9, 0x88
+    0.00 :   3c8cdc:        vshufps zmm5, zmm8, zmm9, 0xdd
+    0.00 :   3c8ce3:        vmovups zmm8, zmmword ptr [r8 + rdx - 0x20]
+    0.00 :   3c8cee:        vinserti32x4    zmm8, zmm8, xmmword ptr [r9 + rdx - 0x20], 0x1
+    0.00 :   3c8cf7:        vinserti32x4    zmm8, zmm8, xmmword ptr [r10 + rdx - 0x20], 0x2
+    0.00 :   3c8d00:        vinserti32x4    zmm8, zmm8, xmmword ptr [r11 + rdx - 0x20], 0x3
+    0.00 :   3c8d09:        vmovups zmm9, zmmword ptr [r8 + rdx - 0x10]
+    0.00 :   3c8d14:        vinserti32x4    zmm9, zmm9, xmmword ptr [r9 + rdx - 0x10], 0x1
+    0.00 :   3c8d1d:        vinserti32x4    zmm9, zmm9, xmmword ptr [r10 + rdx - 0x10], 0x2
+    0.00 :   3c8d26:        vinserti32x4    zmm9, zmm9, xmmword ptr [r11 + rdx - 0x10], 0x3
+    0.00 :   3c8d2f:        vshufps zmm6, zmm8, zmm9, 0x88
+    0.00 :   3c8d36:        vshufps zmm7, zmm8, zmm9, 0xdd
+    0.00 :   3c8d3d:        vpshufd zmm6, zmm6, 0x93
+    0.00 :   3c8d44:        vpshufd zmm7, zmm7, 0x93
+    0.00 :   3c8d4b:        mov     al, 0x7
+    0.00 :   3c8d4d:        vpaddd  zmm0, zmm0, zmm4
+    0.00 :   3c8d53:        vpaddd  zmm0, zmm0, zmm1
+    0.00 :   3c8d59:        vpxord  zmm3, zmm3, zmm0
+    0.00 :   3c8d5f:        vprord  zmm3, zmm3, 0x10
+    0.00 :   3c8d66:        vpaddd  zmm2, zmm2, zmm3
+    0.00 :   3c8d6c:        vpxord  zmm1, zmm1, zmm2
+    0.00 :   3c8d72:        vprord  zmm1, zmm1, 0xc
+    0.00 :   3c8d79:        vpaddd  zmm0, zmm0, zmm5
+    0.00 :   3c8d7f:        vpaddd  zmm0, zmm0, zmm1
+    0.00 :   3c8d85:        vpxord  zmm3, zmm3, zmm0
+    0.00 :   3c8d8b:        vprord  zmm3, zmm3, 0x8
+    0.00 :   3c8d92:        vpaddd  zmm2, zmm2, zmm3
+    0.00 :   3c8d98:        vpxord  zmm1, zmm1, zmm2
+    0.00 :   3c8d9e:        vprord  zmm1, zmm1, 0x7
+    0.02 :   3c8da5:        vpshufd zmm0, zmm0, 0x93
+    0.00 :   3c8dac:        vpshufd zmm3, zmm3, 0x4e
+    0.00 :   3c8db3:        vpshufd zmm2, zmm2, 0x39
+    0.00 :   3c8dba:        vpaddd  zmm0, zmm0, zmm6
+    0.00 :   3c8dc0:        vpaddd  zmm0, zmm0, zmm1
+    0.00 :   3c8dc6:        vpxord  zmm3, zmm3, zmm0
+    0.00 :   3c8dcc:        vprord  zmm3, zmm3, 0x10
+    0.00 :   3c8dd3:        vpaddd  zmm2, zmm2, zmm3
+    0.00 :   3c8dd9:        vpxord  zmm1, zmm1, zmm2
+    0.00 :   3c8ddf:        vprord  zmm1, zmm1, 0xc
+    0.00 :   3c8de6:        vpaddd  zmm0, zmm0, zmm7
+    0.00 :   3c8dec:        vpaddd  zmm0, zmm0, zmm1
+    0.00 :   3c8df2:        vpxord  zmm3, zmm3, zmm0
+    0.00 :   3c8df8:        vprord  zmm3, zmm3, 0x8
+    0.00 :   3c8dff:        vpaddd  zmm2, zmm2, zmm3
+    0.00 :   3c8e05:        vpxord  zmm1, zmm1, zmm2
+    0.00 :   3c8e0b:        vprord  zmm1, zmm1, 0x7
+    0.00 :   3c8e12:        vpshufd zmm0, zmm0, 0x39
+    0.03 :   3c8e19:        vpshufd zmm3, zmm3, 0x4e
+    0.00 :   3c8e20:        vpshufd zmm2, zmm2, 0x93
+    0.00 :   3c8e27:        dec     al
+    0.00 :   3c8e29:        je      0x3c8e84 <_blake3_hash_many_avx512+0x32c4>
+    0.00 :   3c8e2b:        vshufps zmm8, zmm4, zmm5, 0xd6
+    0.00 :   3c8e32:        vpshufd zmm9, zmm4, 0xf
+    0.00 :   3c8e39:        vpshufd zmm4, zmm8, 0x39
+    0.00 :   3c8e40:        vshufps zmm8, zmm6, zmm7, 0xfa
+    0.00 :   3c8e47:        vpblendmd       zmm9 {k3}, zmm9, zmm8
+    0.00 :   3c8e4d:        vpunpcklqdq     zmm8, zmm7, zmm5
+    0.00 :   3c8e53:        vpblendmd       zmm8 {k4}, zmm8, zmm6
+    0.00 :   3c8e59:        vpshufd zmm8, zmm8, 0x78
+    0.00 :   3c8e60:        vpunpckhdq      zmm5, zmm5, zmm7
+    0.00 :   3c8e66:        vpunpckldq      zmm6, zmm6, zmm5
+    0.00 :   3c8e6c:        vpshufd zmm7, zmm6, 0x1e
+    0.00 :   3c8e73:        vmovdqa32       zmm5, zmm9
+    0.00 :   3c8e79:        vmovdqa32       zmm6, zmm8
+    0.00 :   3c8e7f:        jmp     0x3c8d4d <_blake3_hash_many_avx512+0x318d>
+    0.00 :   3c8e84:        vpxord  zmm0, zmm0, zmm2
+    0.00 :   3c8e8a:        vpxord  zmm1, zmm1, zmm3
+    0.00 :   3c8e90:        mov     eax, r13d
+    0.00 :   3c8e93:        cmp     rdx, r15
+    0.00 :   3c8e96:        jne     0x3c8c60 <_blake3_hash_many_avx512+0x30a0>
+    0.00 :   3c8e9c:        vmovdqu xmmword ptr [rbx], xmm0
+    0.00 :   3c8ea0:        vmovdqu xmmword ptr [rbx + 0x10], xmm1
+    0.00 :   3c8ea5:        vextracti128    xmmword ptr [rbx + 0x20], ymm0, 0x1
+    0.00 :   3c8eac:        vextracti128    xmmword ptr [rbx + 0x30], ymm1, 0x1
+    0.00 :   3c8eb3:        vextracti32x4   xmmword ptr [rbx + 0x40], zmm0, 0x2
+    0.00 :   3c8ebb:        vextracti32x4   xmmword ptr [rbx + 0x50], zmm1, 0x2
+    0.00 :   3c8ec3:        vextracti32x4   xmmword ptr [rbx + 0x60], zmm0, 0x3
+    0.00 :   3c8ecb:        vextracti32x4   xmmword ptr [rbx + 0x70], zmm1, 0x3
+    0.00 :   3c8ed3:        vmovdqa xmm0, xmmword ptr [rsp]
+    0.00 :   3c8ed8:        vmovdqa xmm2, xmmword ptr [rsp + 0x40]
+    0.00 :   3c8ede:        vmovdqa32       xmm0 {k1}, xmmword ptr [rsp + 0x10]
+    0.00 :   3c8ee6:        vmovdqa32       xmm2 {k1}, xmmword ptr [rsp + 0x50]
+    0.00 :   3c8eee:        vmovdqa xmmword ptr [rsp], xmm0
+    0.00 :   3c8ef3:        vmovdqa xmmword ptr [rsp + 0x40], xmm2
+    0.00 :   3c8ef9:        add     rbx, 0x80
+    0.00 :   3c8f00:        add     rdi, 0x20
+    0.00 :   3c8f04:        sub     rsi, 0x4
+    0.00 :   3c8f08:        test    esi, 0x2
+    0.00 :   3c8f0e:        je      0x3c9173 <_blake3_hash_many_avx512+0x35b3>
+    0.00 :   3c8f14:        vbroadcasti128  ymm0, xmmword ptr [rcx]
+    0.00 :   3c8f19:        vbroadcasti128  ymm1, xmmword ptr [rcx + 0x10]
+    0.00 :   3c8f1f:        vmovd   xmm13, dword ptr [rsp]
+    0.00 :   3c8f24:        vpinsrd xmm13, xmm13, dword ptr [rsp + 0x40], 0x1
+    0.00 :   3c8f2c:        vpinsrd xmm13, xmm13, dword ptr [rip - 0x381e6e], 0x2  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.00 :   3c8f36:        vmovd   xmm14, dword ptr [rsp + 0x4]
+    0.00 :   3c8f3c:        vpinsrd xmm14, xmm14, dword ptr [rsp + 0x44], 0x1
+    0.00 :   3c8f44:        vpinsrd xmm14, xmm14, dword ptr [rip - 0x381e86], 0x2  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.00 :   3c8f4e:        vinserti128     ymm13, ymm13, xmm14, 0x1
+    0.00 :   3c8f54:        mov     r8, qword ptr [rdi]
+    0.00 :   3c8f57:        mov     r9, qword ptr [rdi + 0x8]
+    0.00 :   3c8f5b:        movzx   eax, byte ptr [rbp + 0x40]
+    0.00 :   3c8f5f:        or      eax, r13d
+    0.00 :   3c8f62:        xor     edx, edx
+    0.00 :   3c8f64:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c8f6f:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c8f7a:        nop     word ptr [rax + rax]
+    0.00 :   3c8f80:        mov     r14d, eax
+    0.00 :   3c8f83:        or      eax, r12d
+    0.00 :   3c8f86:        add     rdx, 0x40
+    0.00 :   3c8f8a:        cmp     rdx, r15
+    0.00 :   3c8f8d:        cmovne  eax, r14d
+    0.00 :   3c8f91:        mov     dword ptr [rsp + 0x88], eax
+    0.00 :   3c8f98:        vbroadcasti128  ymm2, xmmword ptr [rip - 0x381ea1]  # 0x47100 <BLAKE3_IV>
+    0.00 :   3c8fa1:        vpbroadcastd    ymm8, dword ptr [rsp + 0x88]
+    0.00 :   3c8fab:        vpblendd        ymm3, ymm13, ymm8, 0x88
+    0.00 :   3c8fb1:        vmovups ymm8, ymmword ptr [r8 + rdx - 0x40]
+    0.00 :   3c8fb8:        vinsertf128     ymm8, ymm8, xmmword ptr [r9 + rdx - 0x40], 0x1
+    0.00 :   3c8fc0:        vmovups ymm9, ymmword ptr [r8 + rdx - 0x30]
+    0.00 :   3c8fc7:        vinsertf128     ymm9, ymm9, xmmword ptr [r9 + rdx - 0x30], 0x1
+    0.00 :   3c8fcf:        vshufps ymm4, ymm8, ymm9, 0x88
+    0.00 :   3c8fd5:        vshufps ymm5, ymm8, ymm9, 0xdd
+    0.00 :   3c8fdb:        vmovups ymm8, ymmword ptr [r8 + rdx - 0x20]
+    0.00 :   3c8fe2:        vinsertf128     ymm8, ymm8, xmmword ptr [r9 + rdx - 0x20], 0x1
+    0.00 :   3c8fea:        vmovups ymm9, ymmword ptr [r8 + rdx - 0x10]
+    0.00 :   3c8ff1:        vinsertf128     ymm9, ymm9, xmmword ptr [r9 + rdx - 0x10], 0x1
+    0.00 :   3c8ff9:        vshufps ymm6, ymm8, ymm9, 0x88
+    0.00 :   3c8fff:        vshufps ymm7, ymm8, ymm9, 0xdd
+    0.00 :   3c9005:        vpshufd ymm6, ymm6, 0x93
+    0.00 :   3c900a:        vpshufd ymm7, ymm7, 0x93
+    0.00 :   3c900f:        mov     al, 0x7
+    0.00 :   3c9011:        vpaddd  ymm0, ymm0, ymm4
+    0.00 :   3c9015:        vpaddd  ymm0, ymm0, ymm1
+    0.00 :   3c9019:        vpxord  ymm3, ymm3, ymm0
+    0.00 :   3c901f:        vprord  ymm3, ymm3, 0x10
+    0.00 :   3c9026:        vpaddd  ymm2, ymm2, ymm3
+    0.00 :   3c902a:        vpxord  ymm1, ymm1, ymm2
+    0.00 :   3c9030:        vprord  ymm1, ymm1, 0xc
+    0.00 :   3c9037:        vpaddd  ymm0, ymm0, ymm5
+    0.00 :   3c903b:        vpaddd  ymm0, ymm0, ymm1
+    0.00 :   3c903f:        vpxord  ymm3, ymm3, ymm0
+    0.00 :   3c9045:        vprord  ymm3, ymm3, 0x8
+    0.00 :   3c904c:        vpaddd  ymm2, ymm2, ymm3
+    0.00 :   3c9050:        vpxord  ymm1, ymm1, ymm2
+    0.00 :   3c9056:        vprord  ymm1, ymm1, 0x7
+    0.00 :   3c905d:        vpshufd ymm0, ymm0, 0x93
+    0.00 :   3c9062:        vpshufd ymm3, ymm3, 0x4e
+    0.00 :   3c9067:        vpshufd ymm2, ymm2, 0x39
+    0.00 :   3c906c:        vpaddd  ymm0, ymm0, ymm6
+    0.00 :   3c9070:        vpaddd  ymm0, ymm0, ymm1
+    0.00 :   3c9074:        vpxord  ymm3, ymm3, ymm0
+    0.00 :   3c907a:        vprord  ymm3, ymm3, 0x10
+    0.00 :   3c9081:        vpaddd  ymm2, ymm2, ymm3
+    0.00 :   3c9085:        vpxord  ymm1, ymm1, ymm2
+    0.00 :   3c908b:        vprord  ymm1, ymm1, 0xc
+    0.00 :   3c9092:        vpaddd  ymm0, ymm0, ymm7
+    0.00 :   3c9096:        vpaddd  ymm0, ymm0, ymm1
+    0.00 :   3c909a:        vpxord  ymm3, ymm3, ymm0
+    0.00 :   3c90a0:        vprord  ymm3, ymm3, 0x8
+    0.00 :   3c90a7:        vpaddd  ymm2, ymm2, ymm3
+    0.00 :   3c90ab:        vpxord  ymm1, ymm1, ymm2
+    0.00 :   3c90b1:        vprord  ymm1, ymm1, 0x7
+    0.00 :   3c90b8:        vpshufd ymm0, ymm0, 0x39
+    0.00 :   3c90bd:        vpshufd ymm3, ymm3, 0x4e
+    0.00 :   3c90c2:        vpshufd ymm2, ymm2, 0x93
+    0.00 :   3c90c7:        dec     al
+    0.00 :   3c90c9:        je      0x3c9110 <_blake3_hash_many_avx512+0x3550>
+    0.00 :   3c90cb:        vshufps ymm8, ymm4, ymm5, 0xd6
+    0.00 :   3c90d0:        vpshufd ymm9, ymm4, 0xf
+    0.00 :   3c90d5:        vpshufd ymm4, ymm8, 0x39
+    0.00 :   3c90db:        vshufps ymm8, ymm6, ymm7, 0xfa
+    0.00 :   3c90e0:        vpblendd        ymm9, ymm9, ymm8, 0xaa
+    0.00 :   3c90e6:        vpunpcklqdq     ymm8, ymm7, ymm5
+    0.00 :   3c90ea:        vpblendd        ymm8, ymm8, ymm6, 0x88
+    0.00 :   3c90f0:        vpshufd ymm8, ymm8, 0x78
+    0.00 :   3c90f6:        vpunpckhdq      ymm5, ymm5, ymm7
+    0.00 :   3c90fa:        vpunpckldq      ymm6, ymm6, ymm5
+    0.00 :   3c90fe:        vpshufd ymm7, ymm6, 0x1e
+    0.00 :   3c9103:        vmovdqa ymm5, ymm9
+    0.00 :   3c9107:        vmovdqa ymm6, ymm8
+    0.00 :   3c910b:        jmp     0x3c9011 <_blake3_hash_many_avx512+0x3451>
+    0.00 :   3c9110:        vpxor   ymm0, ymm0, ymm2
+    0.00 :   3c9114:        vpxor   ymm1, ymm1, ymm3
+    0.00 :   3c9118:        mov     eax, r13d
+    0.00 :   3c911b:        cmp     rdx, r15
+    0.00 :   3c911e:        jne     0x3c8f80 <_blake3_hash_many_avx512+0x33c0>
+    0.00 :   3c9124:        vmovdqu xmmword ptr [rbx], xmm0
+    0.00 :   3c9128:        vmovdqu xmmword ptr [rbx + 0x10], xmm1
+    0.00 :   3c912d:        vextracti128    xmmword ptr [rbx + 0x20], ymm0, 0x1
+    0.00 :   3c9134:        vextracti128    xmmword ptr [rbx + 0x30], ymm1, 0x1
+    0.00 :   3c913b:        vmovdqa xmm0, xmmword ptr [rsp]
+    0.00 :   3c9140:        vmovdqa xmm2, xmmword ptr [rsp + 0x40]
+    0.00 :   3c9146:        vmovdqu32       xmm0 {k1}, xmmword ptr [rsp + 0x8]
+    0.00 :   3c9151:        vmovdqu32       xmm2 {k1}, xmmword ptr [rsp + 0x48]
+    0.00 :   3c915c:        vmovdqa xmmword ptr [rsp], xmm0
+    0.00 :   3c9161:        vmovdqa xmmword ptr [rsp + 0x40], xmm2
+    0.00 :   3c9167:        add     rbx, 0x40
+    0.00 :   3c916b:        add     rdi, 0x10
+    0.00 :   3c916f:        sub     rsi, 0x2
+    0.00 :   3c9173:        test    esi, 0x1
+    0.00 :   3c9179:        je      0x3c75ba <_blake3_hash_many_avx512+0x19fa>
+    0.00 :   3c917f:        vmovdqu xmm0, xmmword ptr [rcx]
+    0.00 :   3c9183:        vmovdqu xmm1, xmmword ptr [rcx + 0x10]
+    0.00 :   3c9188:        vmovd   xmm14, dword ptr [rsp]
+    0.00 :   3c918d:        vpinsrd xmm14, xmm14, dword ptr [rsp + 0x40], 0x1
+    0.00 :   3c9195:        vpinsrd xmm14, xmm14, dword ptr [rip - 0x3820d7], 0x2  # 0x470c8 <BLAKE3_BLOCK_LEN>
+    0.03 :   3c919f:        vmovdqa xmm15, xmmword ptr [rip - 0x3820a7]  # 0x47100 <BLAKE3_IV>
+    0.00 :   3c91a7:        mov     r8, qword ptr [rdi]
+    0.00 :   3c91aa:        movzx   eax, byte ptr [rbp + 0x40]
+    0.00 :   3c91ae:        or      eax, r13d
+    0.00 :   3c91b1:        xor     edx, edx
+    0.00 :   3c91b3:        nop     word ptr cs:[rax + rax]
+    0.00 :   3c91be:        nop
+    0.00 :   3c91c0:        mov     r14d, eax
+    0.00 :   3c91c3:        or      eax, r12d
+    0.00 :   3c91c6:        add     rdx, 0x40
+    0.00 :   3c91ca:        cmp     rdx, r15
+    0.00 :   3c91cd:        cmovne  eax, r14d
+    0.00 :   3c91d1:        vpinsrd xmm3, xmm14, eax, 0x3
+    0.00 :   3c91d7:        vmovdqa xmm2, xmm15
+    0.00 :   3c91db:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x40]
+    0.00 :   3c91e2:        vmovups xmm9, xmmword ptr [r8 + rdx - 0x30]
+    0.00 :   3c91e9:        vshufps xmm4, xmm8, xmm9, 0x88
+    0.00 :   3c91ef:        vshufps xmm5, xmm8, xmm9, 0xdd
+    0.00 :   3c91f5:        vmovups xmm8, xmmword ptr [r8 + rdx - 0x20]
+    0.00 :   3c91fc:        vmovups xmm9, xmmword ptr [r8 + rdx - 0x10]
+    0.00 :   3c9203:        vshufps xmm6, xmm8, xmm9, 0x88
+    0.00 :   3c9209:        vshufps xmm7, xmm8, xmm9, 0xdd
+    0.00 :   3c920f:        vpshufd xmm6, xmm6, 0x93
+    0.00 :   3c9214:        vpshufd xmm7, xmm7, 0x93
+    0.00 :   3c9219:        mov     al, 0x7
+    0.00 :   3c921b:        vpaddd  xmm0, xmm0, xmm4
+    0.00 :   3c921f:        vpaddd  xmm0, xmm0, xmm1
+    0.00 :   3c9223:        vpxord  xmm3, xmm3, xmm0
+    0.00 :   3c9229:        vprord  xmm3, xmm3, 0x10
+    0.00 :   3c9230:        vpaddd  xmm2, xmm2, xmm3
+    0.00 :   3c9234:        vpxord  xmm1, xmm1, xmm2
+    0.00 :   3c923a:        vprord  xmm1, xmm1, 0xc
+    0.00 :   3c9241:        vpaddd  xmm0, xmm0, xmm5
+    0.00 :   3c9245:        vpaddd  xmm0, xmm0, xmm1
+    0.00 :   3c9249:        vpxord  xmm3, xmm3, xmm0
+    0.00 :   3c924f:        vprord  xmm3, xmm3, 0x8
+    0.02 :   3c9256:        vpaddd  xmm2, xmm2, xmm3
+    0.00 :   3c925a:        vpxord  xmm1, xmm1, xmm2
+    0.00 :   3c9260:        vprord  xmm1, xmm1, 0x7
+    0.00 :   3c9267:        vpshufd xmm0, xmm0, 0x93
+    0.00 :   3c926c:        vpshufd xmm3, xmm3, 0x4e
+    0.00 :   3c9271:        vpshufd xmm2, xmm2, 0x39
+    0.00 :   3c9276:        vpaddd  xmm0, xmm0, xmm6
+    0.00 :   3c927a:        vpaddd  xmm0, xmm0, xmm1
+    0.00 :   3c927e:        vpxord  xmm3, xmm3, xmm0
+    0.00 :   3c9284:        vprord  xmm3, xmm3, 0x10
+    0.00 :   3c928b:        vpaddd  xmm2, xmm2, xmm3
+    0.00 :   3c928f:        vpxord  xmm1, xmm1, xmm2
+    0.00 :   3c9295:        vprord  xmm1, xmm1, 0xc
+    0.00 :   3c929c:        vpaddd  xmm0, xmm0, xmm7
+    0.00 :   3c92a0:        vpaddd  xmm0, xmm0, xmm1
+    0.00 :   3c92a4:        vpxord  xmm3, xmm3, xmm0
+    0.00 :   3c92aa:        vprord  xmm3, xmm3, 0x8
+    0.00 :   3c92b1:        vpaddd  xmm2, xmm2, xmm3
+    0.00 :   3c92b5:        vpxord  xmm1, xmm1, xmm2
+    0.00 :   3c92bb:        vprord  xmm1, xmm1, 0x7
+    0.00 :   3c92c2:        vpshufd xmm0, xmm0, 0x39
+    0.00 :   3c92c7:        vpshufd xmm3, xmm3, 0x4e
+    0.00 :   3c92cc:        vpshufd xmm2, xmm2, 0x93
+    0.00 :   3c92d1:        dec     al
+    0.00 :   3c92d3:        je      0x3c931a <_blake3_hash_many_avx512+0x375a>
+    0.00 :   3c92d5:        vshufps xmm8, xmm4, xmm5, 0xd6
+    0.00 :   3c92da:        vpshufd xmm9, xmm4, 0xf
+    0.00 :   3c92df:        vpshufd xmm4, xmm8, 0x39
+    0.00 :   3c92e5:        vshufps xmm8, xmm6, xmm7, 0xfa
+    0.00 :   3c92ea:        vpblendd        xmm9, xmm9, xmm8, 0xaa
+    0.03 :   3c92f0:        vpunpcklqdq     xmm8, xmm7, xmm5
+    0.00 :   3c92f4:        vpblendd        xmm8, xmm8, xmm6, 0x88
+    0.00 :   3c92fa:        vpshufd xmm8, xmm8, 0x78
+    0.00 :   3c9300:        vpunpckhdq      xmm5, xmm5, xmm7
+    0.00 :   3c9304:        vpunpckldq      xmm6, xmm6, xmm5
+    0.00 :   3c9308:        vpshufd xmm7, xmm6, 0x1e
+    0.00 :   3c930d:        vmovdqa xmm5, xmm9
+    0.00 :   3c9311:        vmovdqa xmm6, xmm8
+    0.00 :   3c9315:        jmp     0x3c921b <_blake3_hash_many_avx512+0x365b>
+    0.00 :   3c931a:        vpxor   xmm0, xmm0, xmm2
+    0.00 :   3c931e:        vpxor   xmm1, xmm1, xmm3
+    0.00 :   3c9322:        mov     eax, r13d
+    0.00 :   3c9325:        cmp     rdx, r15
+    0.00 :   3c9328:        jne     0x3c91c0 <_blake3_hash_many_avx512+0x3600>
+    0.00 :   3c932e:        vmovdqu xmmword ptr [rbx], xmm0
+    0.00 :   3c9332:        vmovdqu xmmword ptr [rbx + 0x10], xmm1
+    0.00 :   3c9337:        jmp     0x3c75ba <_blake3_hash_many_avx512+0x19fa>
+    0.00 :   3c933c:        nop     dword ptr [rax]

@@ -1,0 +1,34 @@
+{
+  "authority": "SAPPHIRE_DIRECTIONAL",
+  "base_sha": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+  "candidate_sha": "5e3967a1d69ba7a774aeff9004423a9db90adbd7",
+  "canonical_receipt_id": "R-f3f1349c9d7482a852aa7292e7abe89e158ecd68a56da8cdcd225fd0c685a631",
+  "correctness": {
+    "direct_publish_oracle": "passed",
+    "native_check": "passed",
+    "st_fmp_handoff_oracle": "passed",
+    "trusted_proofs_verified": 20
+  },
+  "decision": "NO_GO",
+  "hypothesis_id": "H-NTT-STFMP-FENCE-HOIST-20260831",
+  "results": {
+    "candidate_1_bips": -84.25554335503848,
+    "candidate_1_score": 1202189.6541037993,
+    "candidate_2_bips": -34.94944854127158,
+    "candidate_2_score": 1208167.548888053,
+    "control_score": 1212404.8369340145,
+    "mean_bips": -59.60249594815448,
+    "measured_runs_per_leg": 5,
+    "order": "candidate_control_candidate",
+    "warmups_per_leg": 1
+  },
+  "runner": {
+    "cpu": "Intel Xeon Platinum 8488C",
+    "instance_id": "i-00096d6dbcafef80d",
+    "instance_state_after_run": "stopped",
+    "instance_type": "c7i.4xlarge",
+    "provider": "AWS EC2"
+  },
+  "submission_performed": false,
+  "trusted_verifier_sha256": "5ad0acfa59a6f3415061b0536d401075b7e7c71da5ec1e5d3d8784bd81d68798"
+}

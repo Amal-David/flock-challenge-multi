@@ -1,0 +1,6 @@
+# started on Mon Aug 31 09:46:24 2026
+
+3284000882,,mem_inst_retired.all_loads,2841992364,100.00,,
+696024902,,mem_inst_retired.all_stores,2841992364,100.00,,
+4086866,,mem_load_retired.l2_miss,2841992364,100.00,,
+611250508,,cycle_activity.stalls_l1d_miss,2841992364,100.00,,
