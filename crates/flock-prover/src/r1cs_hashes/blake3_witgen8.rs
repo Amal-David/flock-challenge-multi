@@ -794,8 +794,17 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     imgs,
                     blk,
                 );
-            } else {
+            } else if plan.nt == 2 {
                 round1_ab_inner_window_from_offsets_nt2::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                );
+            } else {
+                round1_ab_inner_window_from_offsets::<P>(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
                         .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
@@ -1000,7 +1009,11 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                if plan.nt == 2 {
+                    round1_ab_inner_window_from_offsets_nt2::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                } else {
+                    round1_ab_inner_window_from_offsets::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                }
                 j+=1;
             }
         }
