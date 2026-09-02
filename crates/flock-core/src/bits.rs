@@ -73,17 +73,43 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[rustfmt::skip]
-#[inline]
+#[repr(C, align(64))]
+struct BitTransposeI([u8; 64]);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+static BIT_TRANSPOSE_I: BitTransposeI = BitTransposeI([
+    56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,
+    60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7
+]);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     use core::arch::x86_64::*;
-    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
     unsafe {
-        let x=_mm512_loadu_si512(lanes.as_ptr() as *const __m512i);
-        let i=_mm512_loadu_si512(I.as_ptr() as *const __m512i);
-        let id=_mm512_set1_epi64(0x8040201008040201u64 as i64);
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i,_mm512_gf2p8affine_epi64_epi8::<0>(id,_mm512_permutexvar_epi8(i,x)));
+        let x = _mm512_loadu_si512(lanes.as_ptr() as *const __m512i);
+        let i = _mm512_load_si512(BIT_TRANSPOSE_I.0.as_ptr() as *const __m512i);
+        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let res = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, x));
+        let out_ptr = out.as_mut_ptr();
+        if (out_ptr as usize).is_multiple_of(64) {
+            _mm512_store_si512(out_ptr as *mut __m512i, res);
+        } else {
+            _mm512_storeu_si512(out_ptr as *mut __m512i, res);
+        }
     }
 }
 

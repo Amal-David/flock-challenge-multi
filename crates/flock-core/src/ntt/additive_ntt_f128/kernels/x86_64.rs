@@ -1342,12 +1342,6 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
                     _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
                 }
             }
-            if lane + 24 <= lanes {
-                let pf_src_off = (lane + 16) * core::mem::size_of::<F128>();
-                for i in 0..4 {
-                    _mm_prefetch::<_MM_HINT_T0>(src_row(i).add(pf_src_off) as *const i8);
-                }
-            }
             let va0 = load_src(0, lane);
             let vb0 = load_src(1, lane);
             let vc0 = load_src(2, lane);
