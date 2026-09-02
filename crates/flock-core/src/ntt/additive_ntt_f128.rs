@@ -279,6 +279,21 @@ fn ntt_seed_hold4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_ODD_TAIL=1` restores the full-width seed step. By
+/// default, the exact ranked direct-publish shape leaves the four published
+/// zero-tail lanes untouched in odd-row staging groups: every later staging
+/// consumer already uses the same 60-lane bound, so those values are dead.
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ntt_seed_odd_tail_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_ODD_TAIL").is_some())
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -711,12 +726,15 @@ fn staging_init_mode() -> StagingInit {
 ///   `butterfly_fused_2layer_row_from_geo` with `dst = buf + (256+k)·row_len`,
 ///   same geometry. Each of those kernels writes destination rows
 ///   `i·dst_quarter + dst_r` for `i ∈ 0..4` — i.e. rows `k, k+64, k+128, k+192`
-///   and `256+k, …, 256+k+192` — over lanes `0..num_ntts`, the full width (the
-///   AVX-512 body covers `num_ntts & !3` and the scalar tail runs to
-///   `num_ntts`). Over `k ∈ 0..64` that is exactly rows `0..512`, each once,
-///   all lanes. The later `butterfly_fused_4layer_row` / `butterfly_fused_2layer`
-///   kernels are lane-bounded and leave the tail lanes alone — which is why
-///   those lanes must be *seed-written* rather than merely zero, and they are.
+///   and `256+k, …, 256+k+192`. Normally it writes lanes `0..num_ntts`, the
+///   full width. The exact ranked direct-publish shape is the one exception:
+///   on odd `r` tasks it writes lanes `0..60` and leaves the published four-lane
+///   zero tail untouched. Every later staging consumer uses the same 60-lane
+///   bound, and the direct publisher synthesizes the four output zeros without
+///   reloading that scratch suffix, so no read observes it.
+///   The rollback and every non-direct/full-width shape still seed all lanes.
+///   Over `k ∈ 0..64`, every staging element that can be read is therefore
+///   written exactly once before its first read.
 ///
 /// So no read of this buffer ever observes the initializer, and
 /// `fused_staging_poison_does_not_change_output` proves it empirically by
@@ -2308,8 +2326,9 @@ impl AdditiveNttF128 {
     /// exactly as [`Self::top_fused6_pass`] does, then scatters the 512 rows
     /// to their codeword positions. Every codeword row is produced by exactly
     /// one task. Byte-identical to seed pass + top pass by construction (same
-    /// kernels, same twiddles, same lane bounds; the seed kernels write all
-    /// lanes, so the structurally zero tail lanes stay zero).
+    /// kernels, same twiddles, same lane bounds). Normally the seed writes the
+    /// full width; the exact direct-publish odd task may omit the four
+    /// structurally zero tail lanes that no downstream staging consumer reads.
     /// `FLOCK_NO_NTT_SCATTER_NT=1` restores plain write-allocate publish
     /// stores in the seed-fused top pass (exact same-binary A/B); the ranked
     /// worker's cleared env never sets it.
@@ -2384,10 +2403,12 @@ impl AdditiveNttF128 {
     ///
     /// # Safety
     ///
-    /// Exact ranked geometry: `bufp` owns 512 initialized staging rows of 64
-    /// elements; `base` owns the disjoint 2^20×64 codeword; distinct concurrent
-    /// `r` tasks select disjoint destination rows. When `ALIGNED_ZMM`, `base`
-    /// must be 64-byte aligned; otherwise it must be 16-byte aligned.
+    /// Exact ranked geometry: `bufp` owns 512 staging rows of 64 elements,
+    /// initialized through `lanes2` (and through the corresponding fused-four
+    /// lane bound); `base` owns the disjoint 2^20×64 codeword; distinct
+    /// concurrent `r` tasks select disjoint destination rows. When
+    /// `ALIGNED_ZMM`, `base` must be 64-byte aligned; otherwise it must be
+    /// 16-byte aligned.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -2455,10 +2476,11 @@ impl AdditiveNttF128 {
     /// # Safety
     ///
     /// Exact ranked geometry, as [`Self::seed_top_direct_fused2_publish`]:
-    /// `bufp` owns 512 staging rows of 64 elements whose fused-four layers are
-    /// already applied; `base` owns the disjoint 2^20x64 codeword; distinct
-    /// concurrent `r` tasks select disjoint destination rows. When
-    /// `ALIGNED_ZMM`, `base` must be 64-byte aligned; otherwise 16-byte.
+    /// `bufp` owns 512 staging rows whose `lanes2` prefix has already passed
+    /// through the fused-four layers; `base` owns the disjoint 2^20x64
+    /// codeword; distinct concurrent `r` tasks select disjoint destination
+    /// rows. When `ALIGNED_ZMM`, `base` must be 64-byte aligned; otherwise
+    /// 16-byte.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -2511,9 +2533,9 @@ impl AdditiveNttF128 {
     /// and the only call the split adds is per BLOCK — eight per task, not 128.
     ///
     /// # Safety
-    /// `region` owns block `block`'s 64 staging rows of `row_len` elements
-    /// with its fused-four layers already applied; `base` owns the disjoint
-    /// codeword; the contract is otherwise
+    /// `region` owns block `block`'s 64 staging rows of `row_len` elements,
+    /// with fused-four layers already applied through `lanes2`; `base` owns
+    /// the disjoint codeword; the contract is otherwise
     /// [`Self::seed_top_direct_fused2_publish`]'s, forwarded.
     #[cfg(all(
         target_arch = "x86_64",
@@ -2651,6 +2673,12 @@ impl AdditiveNttF128 {
             target_feature = "vpclmulqdq"
         ))]
         let direct_publish_zmm = direct_publish && base_addr % 64 == 0;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let seed_odd_tail = direct_publish && odd_tail == 4 && !ntt_seed_odd_tail_disabled();
         // Staging row order inside a block.
         //
         // The natural order is `k`, and the fused-four kernel then walks its
@@ -2721,6 +2749,17 @@ impl AdditiveNttF128 {
                         target_feature = "vpclmulqdq"
                     ))]
                     if !ntt_seed_hold4_disabled() {
+                        // `sub_stride` and `block_size` are even at the
+                        // ranked shape, so all four source rows have `r`'s
+                        // parity. On odd tasks their last four lanes are the
+                        // published zero tail. Keep the physical pitch at 64
+                        // while stopping the seed kernel at lane 60.
+                        // Yukon exact-content redraw marker: zarar-g-odd-tail-r2.
+                        let seed_active_lanes = if seed_odd_tail && r & 1 == 1 {
+                            row_len - odd_tail
+                        } else {
+                            row_len
+                        };
                         kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
                             src,
                             block_size,
@@ -2729,6 +2768,7 @@ impl AdditiveNttF128 {
                             bufp.add((256 + kp) * row_len),
                             64,
                             row_len,
+                            seed_active_lanes,
                             seed_right,
                             &seed_dense,
                             pf_next,
@@ -2980,8 +3020,11 @@ impl AdditiveNttF128 {
 
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
-        // (all lanes) before the layer loops read any of them, so the
-        // 512 KiB zero-fill per init was dead work — rayon runs the
+        // across every lane the selected downstream path can read. The exact
+        // ranked path stops its staging transforms at the same four dead
+        // odd-tail lanes, then the direct publisher synthesizes their output
+        // zeros; every other path seeds the full width. The 512 KiB zero-fill
+        // per init was therefore dead work — rayon runs the
         // initializer once per JOB, not per worker.
         if sub_stride < PARALLEL_TASK_THRESHOLD {
             let mut buf = staging_block(512, row_len);

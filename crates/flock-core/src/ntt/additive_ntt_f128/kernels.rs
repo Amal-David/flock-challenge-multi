@@ -481,6 +481,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     dst_dense: *mut F128,
     dst_quarter: usize,
     num_ntts: usize,
+    active_lanes: usize,
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
@@ -499,6 +500,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
             dst_dense,
             dst_quarter,
             num_ntts,
+            active_lanes,
             right_twiddle,
             dense_tw,
             pf_src,
@@ -513,6 +515,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     )))]
     unsafe {
         let _ = pf_src;
+        debug_assert_eq!(active_lanes, num_ntts);
         portable::butterfly_fused_2layer_row_from_sparse_geo(
             src,
             src_quarter,

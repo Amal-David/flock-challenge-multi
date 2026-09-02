@@ -2497,6 +2497,25 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RankedClosedDispatch {
+    Auto,
+    ForceGeneric,
+    ForceExact,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct SharedRankedClosedWindowPreps(blake3_witgen8::RankedClosedWindowPreps);
+
+// SAFETY: the table-image pointers in each prep are immutable views into the
+// borrowed `inv_table`; the scoped Rayon traversal joins before that table or
+// this wrapper can be dropped. Every consumer only reads through the pointers.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe impl Send for SharedRankedClosedWindowPreps {}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe impl Sync for SharedRankedClosedWindowPreps {}
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
@@ -2528,6 +2547,36 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+) {
+    generate_round1_inner_octa_with_ranked_closed_dispatch(
+        blocks,
+        skip_blocks,
+        z,
+        a,
+        b,
+        ab_inner,
+        inv_table,
+        padding,
+        elide,
+        ab_nt,
+        RankedClosedDispatch::Auto,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_with_ranked_closed_dispatch(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    ranked_closed_dispatch: RankedClosedDispatch,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -2576,6 +2625,44 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
+    // Exact ranked-closed specialisation: only the crown worker's committed
+    // shape reaches it, and only when the current binary still selects the
+    // direct-dense inline + maddubs chain the helper reuses.
+    let ranked_closed_exact_eligible = matches!(
+        blocks,
+        crate::seed_pipe::BlockSource::Closed { len, .. } if len == 1 << 18
+    ) && compact
+        && ab_stream
+        && one_rows_elided
+        && elide == [true; 3]
+        && abinner_nt
+        && win_plan.offsets_eligible(2)
+        && blake3_witgen8::ranked_direct_dense_publish_enabled()
+        && blake3_witgen8::ranked_direct_dense_inline_enabled()
+        && blake3_witgen8::widen_maddubs_enabled()
+        && blake3_witgen8::ey_dead_w31_enabled()
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
+    let ranked_closed_preps = match ranked_closed_dispatch {
+        RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
+        }
+        RankedClosedDispatch::Auto | RankedClosedDispatch::ForceGeneric => None,
+        RankedClosedDispatch::ForceExact => {
+            assert!(
+                ranked_closed_exact_eligible,
+                "ranked closed exact dispatch requires the committed compact closed-form stream path"
+            );
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
+        }
+    };
+    let ranked_closed_init = match (ranked_closed_preps.as_ref(), blocks) {
+        (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
+        _ => None,
+    };
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -2633,37 +2720,6 @@ fn generate_round1_inner_octa(
                 unsafe {
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
-                        // Lead 2: a full closed-form octa carries only init/base
-                        // into the witness kernel, which generates all 25 draws
-                        // directly in word-major SIMD lanes. Slice input still
-                        // borrows in place; only a ragged closed octa uses the
-                        // scalar staging needed to preserve padding semantics.
-                        let staged: [Compression; SIMD];
-                        let octa = match blocks {
-                            crate::seed_pipe::BlockSource::Slice(s) => {
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    s.get(base + j).unwrap_or(padding)
-                                }))
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len }
-                                if base + SIMD <= len =>
-                            {
-                                blake3_witgen8::OctaInputs::Closed { init, base }
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len } => {
-                                staged = std::array::from_fn(|j| {
-                                    let idx = base + j;
-                                    if idx < len {
-                                        crate::seed_pipe::gen_block(init, idx)
-                                    } else {
-                                        *padding
-                                    }
-                                });
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    &staged[j]
-                                }))
-                            }
-                        };
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
@@ -2681,14 +2737,59 @@ fn generate_round1_inner_octa(
                                 one_rows_elided,
                             }
                         }).unwrap_unchecked();
-                        blake3_witgen8::build_octa_witness_ab_stream_elide(
-                            octa,
-                            z_out.as_mut_ptr().add(off).cast::<u32>(),
-                            a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            proj,
-                            elide,
-                        );
+                        if let Some(preps) = ranked_closed_preps.as_ref() {
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                                ranked_closed_init.unwrap_unchecked(),
+                                base,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                                b_out.as_mut_ptr().add(off).cast::<u32>(),
+                                proj,
+                                &preps.0,
+                                elide,
+                            );
+                        } else {
+                            // Lead 2: a full closed-form octa carries only
+                            // init/base into the witness kernel, which
+                            // generates all 25 draws directly in word-major
+                            // SIMD lanes. Slice input still borrows in place;
+                            // only a ragged closed octa uses the scalar
+                            // staging needed to preserve padding semantics.
+                            let staged: [Compression; SIMD];
+                            let octa = match blocks {
+                                crate::seed_pipe::BlockSource::Slice(s) => {
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        s.get(base + j).unwrap_or(padding)
+                                    }))
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len }
+                                    if base + SIMD <= len =>
+                                {
+                                    blake3_witgen8::OctaInputs::Closed { init, base }
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                    staged = std::array::from_fn(|j| {
+                                        let idx = base + j;
+                                        if idx < len {
+                                            crate::seed_pipe::gen_block(init, idx)
+                                        } else {
+                                            *padding
+                                        }
+                                    });
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        &staged[j]
+                                    }))
+                                }
+                            };
+                            blake3_witgen8::build_octa_witness_ab_stream_elide(
+                                octa,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                                b_out.as_mut_ptr().add(off).cast::<u32>(),
+                                proj,
+                                elide,
+                            );
+                        }
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same
                         // ascending block order as the incumbent loop below, so
@@ -5253,6 +5354,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Direct exact-vs-generic oracle for the ranked closed-form stream path.
+    /// Both runs reuse the same pre-seeded z/a/b buffers so the all-elide
+    /// provenance contract holds; only the ranked-closed dispatch changes.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    #[ignore = "ranked-scale exact oracle; allocates two compact ab_inner buffers"]
+    fn round1_inner_ranked_closed_exact_matches_generic() {
+        use crate::seed_pipe::BlockSource;
+
+        const F128_PER_BLOCK: usize = K / 128;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        const N_TOTAL: usize = 1 << 18;
+        let n_f128 = N_TOTAL * F128_PER_BLOCK;
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let seed = 0xD1CE_C105_EDA5_1E5Du64;
+
+        let run = |dispatch: RankedClosedDispatch,
+                   elide: [bool; 3],
+                   compact_storage: bool,
+                   seed_bufs: Option<&(Vec<F128>, Vec<F128>, Vec<F128>)>|
+         -> (
+            Vec<F128>,
+            Vec<F128>,
+            Vec<F128>,
+            flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+        ) {
+            let (mut z, mut a, mut b) = match seed_bufs {
+                Some((zs, as_, bs)) => (zs.clone(), as_.clone(), bs.clone()),
+                None => (
+                    vec![F128::ZERO; n_f128],
+                    vec![F128::ZERO; n_f128],
+                    vec![F128::ZERO; n_f128],
+                ),
+            };
+            let mut ab_inner = if compact_storage {
+                flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
+                    N_TOTAL * BYTES_PER_BLOCK,
+                )
+            } else {
+                flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+                    N_TOTAL * BYTES_PER_BLOCK,
+                )
+            };
+            generate_round1_inner_octa_with_ranked_closed_dispatch(
+                BlockSource::closed(18, seed),
+                0,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                elide,
+                true,
+                dispatch,
+            );
+            (z, a, b, ab_inner)
+        };
+
+        let (seed_z, seed_a, seed_b, _) = run(
+            RankedClosedDispatch::ForceGeneric,
+            [false; 3],
+            false,
+            None,
+        );
+        let seed_bufs = (seed_z, seed_a, seed_b);
+        let (z_g, a_g, b_g, mut ab_g) = run(
+            RankedClosedDispatch::ForceGeneric,
+            [true; 3],
+            true,
+            Some(&seed_bufs),
+        );
+        let (z_e, a_e, b_e, mut ab_e) = run(
+            RankedClosedDispatch::ForceExact,
+            [true; 3],
+            true,
+            Some(&seed_bufs),
+        );
+
+        assert_eq!(z_g, z_e, "z mismatch");
+        assert_eq!(a_g, a_e, "a mismatch");
+        assert_eq!(b_g, b_e, "b mismatch");
+        assert_eq!(
+            ab_g.ranked_one_rows_elided(),
+            ab_e.ranked_one_rows_elided(),
+            "ranked-one-rows brand mismatch"
+        );
+        assert_eq!(
+            ab_g.ranked_compact(),
+            ab_e.ranked_compact(),
+            "ranked-compact brand mismatch"
+        );
+        assert_eq!(
+            ab_g.invalid_prefix_bytes(),
+            ab_e.invalid_prefix_bytes(),
+            "invalid-prefix brand mismatch"
+        );
+        assert_eq!(ab_g.as_bytes_mut(), ab_e.as_bytes_mut(), "ab_inner mismatch");
     }
 
     /// The closed form must also survive the padding regime: when the block

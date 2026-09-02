@@ -332,23 +332,23 @@ fn blake3_hash_many<const N: usize>(
     {
         let n = outs.len();
         let base_ptr = msgs.as_ptr();
-        // SAFETY: the entry assertion gives every `n`-element output chunk
-        // exactly `n * N` initialized message bytes. All call-site
-        // monomorphizations have `N > 0`, `0 <= i < n`, and `[u8; N]` has
-        // byte alignment, so each pointer below addresses one complete input.
-        // Unused tail slots retain the valid first input and are not passed.
-        let first: &[u8; N] = unsafe { &*(base_ptr as *const [u8; N]) };
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        // SAFETY: every element 0..n is written directly into the MaybeUninit buffer.
+        let mut inputs = core::mem::MaybeUninit::<[&[u8; N]; BLAKE3_BATCH]>::uninit();
+        let inputs_ptr = inputs.as_mut_ptr() as *mut &[u8; N];
         for i in 0..n {
-            inputs[i] = unsafe { &*(base_ptr.add(i * N) as *const [u8; N]) };
+            unsafe {
+                inputs_ptr.add(i).write(&*(base_ptr.add(i * N) as *const [u8; N]));
+            }
         }
+        let inputs_slice: &[&[u8; N]] =
+            unsafe { core::slice::from_raw_parts(inputs_ptr, n) };
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
         let out_bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
-            &inputs[..n],
+            inputs_slice,
             &BLAKE3_IV,
             0,
             blake3::IncrementCounter::No,
@@ -523,12 +523,7 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
-            for (outs, leaves) in out
-                .chunks_mut(BLAKE3_GROUP)
-                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
-            {
-                blake3_hash_many_leaves(leaves, leaf_size, outs);
-            }
+            blake3_hash_many_leaves(data, leaf_size, out);
         }
         HashKind::Blake3 => {
             for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {

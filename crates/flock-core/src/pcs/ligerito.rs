@@ -2574,15 +2574,25 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (coeffs, enforced_sum)
 }
 
-/// Research representation for the exact ranked L0 induced basis.  The
+/// Research representation for an exact ranked induced basis (L0 and, when
+/// [`ranked_sparse_dual_deep_depth`] selects them, the deeper levels).  The
 /// basis itself is `P F^T q`; retaining the sparse query vector lets up to
 /// four LSB folds commute through the corresponding final forward-NTT layers.
-/// Each query caches one inverse-local residue of 8, 16, or 32 codeword rows.
+/// Everything except the final projection `P` is rate-independent: the round
+/// messages and the enforced sum are read off the level's own codeword, where
+/// `P` is already absorbed by the zero-padding the encoder applies.
+/// Each query caches one inverse-local residue of 4, 8, 16, or 32 codeword rows.
 /// The fixed 32-slot backing avoids one heap allocation per query while only
 /// the prefix selected by `cache_len` is constructed or read.
 struct SparseDualL0 {
     ntt: AdditiveNttF128,
     log_d: usize,
+    /// `log_2` of the level's inverse rate. `log_d - log_inv_rate` is the
+    /// message-column count, i.e. the length of the induced basis before any
+    /// fold. Only [`Self::materialize_after_folds`] needs it: every message
+    /// and the enforced sum are computed against the codeword itself, where
+    /// the projection is already absorbed by the zero-padding of the message.
+    log_inv_rate: usize,
     depth: usize,
     cache_len: usize,
     queries: Vec<usize>,
@@ -2651,6 +2661,7 @@ impl SparseDualL0 {
     fn new(
         depth: usize,
         log_d: usize,
+        log_inv_rate: usize,
         l0_codeword: &[F128],
         num_interleaved: usize,
         opened_rows: &[Vec<F128>],
@@ -2659,7 +2670,11 @@ impl SparseDualL0 {
         alpha: &[F128],
     ) -> (Self, F128) {
         use rayon::prelude::*;
-        assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        // The materialized basis lives on `2^(log_d - log_inv_rate - depth)`
+        // coefficients, so the rate must leave at least `depth` message
+        // variables to fold away.
+        assert!(log_inv_rate + depth <= log_d);
         assert_eq!(num_interleaved, 1usize << lane_challenges.len());
         assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
         assert_eq!(opened_rows.len(), queries.len());
@@ -2709,6 +2724,7 @@ impl SparseDualL0 {
             Self {
                 ntt,
                 log_d,
+                log_inv_rate,
                 depth,
                 cache_len,
                 queries: queries.to_vec(),
@@ -2885,8 +2901,15 @@ impl SparseDualL0 {
         }
         let reduced_log_d = self.log_d - k;
         let mut folded = transpose_forward_ntt_sparse(full_ntt, &positions, &values, reduced_log_d);
-        // L0 inverse rate is 1, so the induced message is the low half.
-        folded.truncate(1usize << (reduced_log_d - 1));
+        // The induced basis is the message-column prefix of `Fᵀq` (see
+        // `induce_sumcheck_poly_via_ntt`, which truncates the full codeword
+        // domain to `2^log_msg_cols`). The `k` folded coordinates are the LSBs
+        // of the codeword index and the projection keeps its `log_inv_rate`
+        // MSBs at zero, so the two commute: after `k` folds the prefix is
+        // `2^(reduced_log_d - log_inv_rate) = 2^(log_msg_cols - k)` long. At
+        // L0 (rate 1) this is the low half, which is what the ranked L0 arm
+        // has always taken.
+        folded.truncate(1usize << (reduced_log_d - self.log_inv_rate));
         folded
     }
 }
@@ -4434,16 +4457,23 @@ fn open_ood_x4_enabled() -> bool {
 /// challenge's broadcast and split-reduction companion so every worker chunk
 /// in a round shares one `ghash_shift64_x4` result.
 ///
+/// `CORR` applies the deferred ordinary-basis fold and/or the lazy-OOD
+/// equality correction to the b-side **before** the message accumulate,
+/// matching [`fold_and_msg_lsb_inner`]'s generic chunk. Those rounds pass
+/// `stream = false`: the mixed working set is not the DRAM-cold NT case.
+///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length.
-/// `f`/`b` contain `2 * (base + fc.len())` elements.
+/// `f`/`b` contain `2 * (base + fc.len())` elements. When `CORR`, `deferred`
+/// covers the same source pairs as `b`, and `ood.0[t]` is the folded-domain
+/// equality factor for output slot `t`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn fold_and_msg_chunk_x86(
+unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -4453,6 +4483,8 @@ unsafe fn fold_and_msg_chunk_x86(
     r_x4: core::arch::x86_64::__m512i,
     r_x64: core::arch::x86_64::__m512i,
     stream: bool,
+    deferred: Option<(&[F128], F128)>,
+    ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
     use core::arch::x86_64::*;
@@ -4460,6 +4492,14 @@ unsafe fn fold_and_msg_chunk_x86(
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
     debug_assert!(len.is_multiple_of(2));
+    if CORR {
+        if let Some((basis, _)) = deferred {
+            debug_assert!(basis.len() >= 2 * (base + len));
+        }
+        if let Some((eq_lo, _)) = ood {
+            debug_assert!(eq_lo.len() >= len);
+        }
+    }
 
     // The fold and the next message consume the same eight results. Keep
     // those results in ZMM registers until the two message accumulators have
@@ -4474,6 +4514,25 @@ unsafe fn fold_and_msg_chunk_x86(
         let bc_ptr = bc.as_mut_ptr();
         let dst_aligned =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
+
+        let deferred_vec = if CORR {
+            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+            deferred.map(|(basis, alpha)| {
+                let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+                (basis.as_ptr(), ax, ghash_shift64_x4(ax))
+            })
+        } else {
+            None
+        };
+        let ood_vec = if CORR {
+            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+            ood.map(|(eq_lo, scale)| {
+                let sx = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+                (eq_lo.as_ptr(), sx, ghash_shift64_x4(sx))
+            })
+        } else {
+            None
+        };
 
         let fold4 = |ptr: *const F128, source: usize| -> __m512i {
             let lo = _mm512_loadu_si512(ptr.add(source) as *const __m512i);
@@ -4512,8 +4571,26 @@ unsafe fn fold_and_msg_chunk_x86(
         while t + 8 <= len {
             let f0 = fold4(f_ptr, 2 * (base + t));
             let f1 = fold4(f_ptr, 2 * (base + t + 4));
-            let b0 = fold4(b_ptr, 2 * (base + t));
-            let b1 = fold4(b_ptr, 2 * (base + t + 4));
+            let mut b0 = fold4(b_ptr, 2 * (base + t));
+            let mut b1 = fold4(b_ptr, 2 * (base + t + 4));
+            if CORR {
+                if let Some((dptr, ax, ax64)) = deferred_vec {
+                    b0 = _mm512_xor_si512(
+                        b0,
+                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t)), ax, ax64),
+                    );
+                    b1 = _mm512_xor_si512(
+                        b1,
+                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t + 4)), ax, ax64),
+                    );
+                }
+                if let Some((eptr, sx, sx64)) = ood_vec {
+                    let e0 = _mm512_loadu_si512(eptr.add(t) as *const __m512i);
+                    let e1 = _mm512_loadu_si512(eptr.add(t + 4) as *const __m512i);
+                    b0 = _mm512_xor_si512(b0, ghash_mul_x4_split(e0, sx, sx64));
+                    b1 = _mm512_xor_si512(b1, ghash_mul_x4_split(e1, sx, sx64));
+                }
+            }
 
             let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
             let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
@@ -4540,8 +4617,22 @@ unsafe fn fold_and_msg_chunk_x86(
             let source = 2 * (base + t);
             let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
             let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
-            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            let mut b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
+            let mut b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            if CORR {
+                if let Some((basis, alpha)) = deferred {
+                    let dptr = basis.as_ptr();
+                    let d0 = *dptr.add(source) + r * (*dptr.add(source) + *dptr.add(source + 1));
+                    let d1 =
+                        *dptr.add(source + 2) + r * (*dptr.add(source + 2) + *dptr.add(source + 3));
+                    b0 += alpha * d0;
+                    b1 += alpha * d1;
+                }
+                if let Some((eq_lo, scale)) = ood {
+                    b0 += scale * *eq_lo.as_ptr().add(t);
+                    b1 += scale * *eq_lo.as_ptr().add(t + 1);
+                }
+            }
             *fc_ptr.add(t) = f0;
             *fc_ptr.add(t + 1) = f1;
             *bc_ptr.add(t) = b0;
@@ -4771,12 +4862,35 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if lazy_ood.is_none() && deferred_basis.is_none() {
-                // Fold, accumulate both message terms, and publish directly;
-                // `use_nt` selects streaming only for DRAM-cold large rounds.
-                // SAFETY: target features and chunk geometry are guaranteed.
+            {
+                if lazy_ood.is_none() && deferred_basis.is_none() {
+                    // Fold, accumulate both message terms, and publish directly;
+                    // `use_nt` selects streaming only for DRAM-cold large rounds.
+                    // SAFETY: target features and chunk geometry are guaranteed.
+                    return unsafe {
+                        fold_and_msg_chunk_x86::<false>(
+                            f, b, base, fc, bc, r, r_x4, r_x64, use_nt, None, None,
+                        )
+                    };
+                }
+                // Lazy-OOD / deferred-basis rounds: same register-resident leaf,
+                // ordinary stores. NT publish of this mixed working set is a
+                // closed DRAM-cold family.
                 return unsafe {
-                    fold_and_msg_chunk_x86(f, b, base, fc, bc, r, r_x4, r_x64, use_nt)
+                    let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
+                    fold_and_msg_chunk_x86::<true>(
+                        f,
+                        b,
+                        base,
+                        fc,
+                        bc,
+                        r,
+                        r_x4,
+                        r_x64,
+                        false,
+                        deferred_basis,
+                        ood,
+                    )
                 };
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -4802,42 +4916,49 @@ fn fold_and_msg_lsb_inner(
                 }
 
             }
-            let len = fc.len();
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            if let Some((basis, alpha)) = deferred_basis {
-                crate::field::f128_slice::fold_pairs_with_scaled_addend(
-                    b, basis, base, bc, r, alpha,
-                );
-            } else {
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            }
-            if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
-                let scale = gamma * eq_hi[ci];
-                crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
-            }
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
             {
-                // SAFETY: target features cfg-guaranteed; fc/bc have equal
-                // even length (caller asserts n ≥ 2, power of two).
-                let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
-                (u0, u2)
-            }
-            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-            {
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                let mut k = 0;
-                while k + 1 < len {
-                    let f0 = fc[k];
-                    let f1 = fc[k + 1];
-                    let b0 = bc[k];
-                    let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
-                    k += 2;
+                let len = fc.len();
+                // Fold this slice, then pair up the just-folded values for the msg.
+                crate::field::f128_slice::fold_pairs(f, base, fc, r);
+                if let Some((basis, alpha)) = deferred_basis {
+                    crate::field::f128_slice::fold_pairs_with_scaled_addend(
+                        b, basis, base, bc, r, alpha,
+                    );
+                } else {
+                    crate::field::f128_slice::fold_pairs(b, base, bc, r);
                 }
-                (u0, u2)
+                if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
+                    let scale = gamma * eq_hi[ci];
+                    crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
+                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: target features cfg-guaranteed; fc/bc have equal
+                    // even length (caller asserts n ≥ 2, power of two).
+                    let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
+                    (u0, u2)
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    let mut k = 0;
+                    while k + 1 < len {
+                        let f0 = fc[k];
+                        let f1 = fc[k + 1];
+                        let b0 = bc[k];
+                        let b1 = bc[k + 1];
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                        k += 2;
+                    }
+                    (u0, u2)
+                }
             }
         })
         .reduce(
@@ -6353,9 +6474,24 @@ const ENV_NO_LIG_DEFER_INDUCED_GLUE: &str = "FLOCK_NO_LIG_DEFER_INDUCED_GLUE";
 const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
+const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
+/// Disable-only, default-ON rollback for the L1..L4 extension of the sparse
+/// dual. Setting it restores the incumbent dense/NTT induce at every
+/// recursive level while leaving L0's dual exactly as it is, so the two arms
+/// can be A/B'd on one binary. The ranked runner clears the environment, so
+/// the extension is live unless this is deliberately set.
+const ENV_NO_DEEP_INDUCE_DUAL: &str = "FLOCK_NO_DEEP_INDUCE_DUAL";
 #[cfg(test)]
 thread_local! {
     static SPARSE_DUAL_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Forces the deep-level (L1..L4) dual on for tests whose config cannot
+    /// reach the exact ranked selector. Separate from
+    /// [`SPARSE_DUAL_TEST_DEPTH`] so the existing L0-only oracles keep their
+    /// exact incumbent choreography. The depth is still capped by the folds
+    /// the level actually has left.
+    static SPARSE_DUAL_DEEP_TEST_DEPTH: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Exact official M32 Fast selector. The selected levels are precisely the
@@ -6446,7 +6582,12 @@ fn ranked_sparse_dual_l0_depth_selected(
     defer_disabled: bool,
     depth: usize,
 ) -> Option<usize> {
-    let selected = n_level == 19
+    // Every ranked level that carries an induced basis with a following fold
+    // is eligible; `ranked_deferred_induced_glue_selected` already pins the
+    // exact (n_level, n_queries, log_inv_rate) ladder, and the dual is
+    // rate-general (only its final projection reads `log_inv_rate`). The
+    // caller picks the per-level depth — see `ranked_sparse_dual_deep_depth`.
+    let selected = matches!(n_level, 19 | 16 | 13 | 10 | 7)
         && ranked_deferred_induced_glue_selected(
             config,
             log_n,
@@ -6463,8 +6604,28 @@ fn ranked_sparse_dual_l0_depth_selected(
     if !selected {
         return None;
     }
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
+}
+
+#[inline]
+fn ranked_sparse_dual_l0_depth_setting(
+    explicit_depth: Option<&str>,
+    depth2_disabled: bool,
+) -> usize {
+    let depth = explicit_depth
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 1, 2, 3, or 4")
+        })
+        .unwrap_or(if depth2_disabled {
+            SPARSE_DUAL_MAX_DEPTH
+        } else {
+            RANKED_SPARSE_DUAL_DEFAULT_DEPTH
+        });
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    depth
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6483,7 +6644,7 @@ fn ranked_sparse_dual_l0_depth(
     {
         let forced = SPARSE_DUAL_TEST_DEPTH.with(std::cell::Cell::get);
         if forced != 0 {
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
+            assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
             return Some(forced);
         }
     }
@@ -6513,16 +6674,116 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
-        })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
+    let depth = ranked_sparse_dual_l0_depth_setting(
+        explicit_depth.as_deref(),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+    );
     Some(depth)
+}
+
+/// Sparse-dual depth for one deep ranked level, chosen so that no two live
+/// duals ever materialize into the same fold.
+///
+/// Number the ordinary folds of the recursive phase 0, 1, 2, ... The ranked
+/// ladder folds `recursive_ks[i] = 3` variables per level, and each level's
+/// induced basis is introduced at the seam right before the next level's
+/// folds, so consecutive levels take their first direct message exactly three
+/// folds apart. A dual of depth `d` introduced before fold `s` materializes at
+/// fold `s + d - 1`:
+///
+/// ```text
+///   level          L0   L1   L2   L3   L4
+///   first fold      0    3    6    9   12
+///   depth           4    4    4    4    3
+///   materializes    3    6    9   12   14
+/// ```
+///
+/// The five materialization folds are pairwise distinct, which is exactly what
+/// [`SumcheckProver::defer_folded_sparse_dual`]'s "one deferred basis at a
+/// time" assertion requires. L4 stops at 3 because the recursion ends after
+/// fold 14; at depth 3 it materializes on the last fold of its own level and
+/// therefore merges instead of deferring.
+#[inline]
+fn ranked_sparse_dual_deep_depth_for_level(n_level: usize) -> Option<usize> {
+    // L4 (`n_level == 7`) is kept, against the operation-count argument that
+    // says it should not be: its dense induce is only ~5.5K operations and the
+    // dual's construction there costs ~21K, so on paper it is a net loss. It
+    // was measured both ways on the whole prove and dropping it came out
+    // WORSE, not better (-0.129% without against -0.263% with, though the two
+    // are within one standard error of each other and the honest reading is
+    // that this instrument cannot separate them). Operation counts have
+    // already misled once in this tree — the whole reason for the measurement
+    // is that they do not predict cycles here — so the measured arrangement
+    // stands until something resolves better.
+    match n_level {
+        16 | 13 | 10 => Some(SPARSE_DUAL_MAX_DEPTH),
+        7 => Some(3),
+        _ => None,
+    }
+}
+
+/// Gate for the L1..L4 extension of the sparse dual. `remaining_folds` is the
+/// number of ordinary folds still to come after this level's introduction; the
+/// dual must materialize inside them, so a level with fewer folds left than its
+/// scheduled depth stays on the incumbent dense/NTT induce.
+///
+/// Kill switches, all disable-only: [`ENV_NO_DEEP_INDUCE_DUAL`] turns off only
+/// this extension (L0 keeps its dual), while
+/// [`ENV_NO_OPEN_INDUCE_DUAL`]/[`ENV_NO_OPEN_INDUCE_DUAL2`] and
+/// [`ENV_NO_LIG_DEFER_INDUCED_GLUE`] keep killing every level at once through
+/// [`ranked_sparse_dual_l0_depth_selected`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_sparse_dual_deep_depth(
+    config: &ProverConfig,
+    log_n: usize,
+    n_level: usize,
+    current_len: usize,
+    n_queries: usize,
+    log_inv_rate: usize,
+    lazy_ood: bool,
+    direct_fold8_mode: bool,
+    remaining_folds: usize,
+) -> Option<usize> {
+    #[cfg(test)]
+    {
+        let forced = SPARSE_DUAL_DEEP_TEST_DEPTH.with(std::cell::Cell::get);
+        if forced != 0 {
+            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
+            let depth = forced.min(remaining_folds);
+            return (depth >= 2).then_some(depth);
+        }
+    }
+    if std::env::var_os(ENV_NO_DEEP_INDUCE_DUAL).is_some() {
+        return None;
+    }
+    let depth = ranked_sparse_dual_deep_depth_for_level(n_level)?;
+    if depth > remaining_folds {
+        return None;
+    }
+    let sparse_disabled = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
+        || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
+    let defer_disabled = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
+    let platform_supported = cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ));
+    ranked_sparse_dual_l0_depth_selected(
+        config,
+        log_n,
+        n_level,
+        current_len,
+        n_queries,
+        log_inv_rate,
+        lazy_ood,
+        direct_fold8_mode,
+        platform_supported,
+        sparse_disabled,
+        defer_disabled,
+        depth,
+    )
 }
 
 enum PendingOodEq {
@@ -8691,6 +8952,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let (dual, enforced_sum) = SparseDualL0::new(
             depth,
             n1 + log_inv_rate_0,
+            log_inv_rate_0,
             l0_codeword,
             l0_num_interleaved,
             &opened_rows_0,
@@ -8773,6 +9035,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
+    // Deep (L1..L4) sparse duals still owing direct messages. Two are live at
+    // once across a seam: level i's dual is introduced at the end of iteration
+    // i and only materializes during iteration i+1, by which point level i+1's
+    // dual has already been introduced. Capacity 2 is exact for the ranked
+    // ladder; the Vec is empty whenever the extension is switched off.
+    let mut active_deep_duals: Vec<(SparseDualL0, Vec<F128>)> = Vec::with_capacity(2);
 
     for i in 0..r {
         let k_i = config.recursive_ks[i];
@@ -8800,6 +9068,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     materialized_dual = Some(basis);
                 }
             }
+            let l0_materialized_here = materialized_dual.is_some();
             if let Some(basis) = materialized_dual {
                 if j + 1 < k_i {
                     sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
@@ -8807,6 +9076,42 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     sc_prover.merge_folded_sparse_dual(basis);
                 }
                 active_sparse_dual_0 = None;
+            }
+            // Deep duals, in level order. Exactly the L0 choreography above:
+            // every direct message is added to the fold message BEFORE the
+            // challenger observes it, and the materialized dense basis is
+            // either deferred into the next fold or, when this is the last
+            // fold of the level, merged straight into the combined basis.
+            // Addition in F128 is XOR, so interleaving the deltas of several
+            // live duals into one message is order-independent.
+            if !active_deep_duals.is_empty() {
+                let mut materialized_deep = None;
+                for (dual, fold_challenges) in active_deep_duals.iter_mut() {
+                    fold_challenges.push(ri);
+                    if fold_challenges.len() <= dual.depth {
+                        let delta = dual.round_msg(fold_challenges);
+                        msg = sc_prover.add_to_last_message(delta);
+                    }
+                    if fold_challenges.len() == dual.depth {
+                        // The per-level depth schedule keeps the five
+                        // materialization folds distinct; see
+                        // `ranked_sparse_dual_deep_depth_for_level`.
+                        assert!(
+                            !l0_materialized_here && materialized_deep.is_none(),
+                            "two sparse duals materialize into one fold"
+                        );
+                        materialized_deep = Some(dual.materialize_after_folds(fold_challenges));
+                    }
+                }
+                if let Some(basis) = materialized_deep {
+                    if j + 1 < k_i {
+                        sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
+                    } else {
+                        sc_prover.merge_folded_sparse_dual(basis);
+                    }
+                }
+                active_deep_duals
+                    .retain(|(dual, fold_challenges)| fold_challenges.len() < dual.depth);
             }
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
@@ -8993,13 +9298,43 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             Some(eval_sk_at_vks(n_next))
         };
         let _t = std::time::Instant::now();
+        // Same mechanism as the L0 block: on the exact ranked ladder the
+        // induced basis is kept in its sparse `P Fᵀ q` form, so this level pays
+        // no dense/NTT induce, no full-length introduction message and no
+        // full-length glue. `remaining_folds` is what is left of the recursion
+        // after this seam — the dual must materialize inside it.
+        let remaining_folds: usize = config.recursive_ks[i + 1..].iter().sum();
+        let deep_dual_depth = ranked_sparse_dual_deep_depth(
+            config,
+            log_n,
+            n_next,
+            sc_prover.f().len(),
+            num_queries_i,
+            config.log_inv_rates[i + 1],
+            lazy_deep_ood,
+            direct_fold8_mode,
+            remaining_folds,
+        );
         // `n_next` is exactly wtns_prev's message-column count and
         // `log_inv_rates[i+1]` its rate, so the same dense-vs-Fᵀ-NTT cost
         // dispatch L0 uses applies here. (Was hard-wired to the dense arm
         // back when the transposed NTT cost one DRAM pass per layer; the
         // blocked sweep moved the crossover well below level 1's shape.)
-        let (basis_i_induced, enforced_sum_i) = if induce_sched_enabled() {
-            induce_sumcheck_poly_auto(
+        let (basis_i_induced, deep_dual_i, enforced_sum_i) = if let Some(depth) = deep_dual_depth {
+            let (dual, enforced_sum) = SparseDualL0::new(
+                depth,
+                n_next + config.log_inv_rates[i + 1],
+                config.log_inv_rates[i + 1],
+                &wtns_prev.mat,
+                wtns_prev.num_interleaved,
+                &opened_rows_i,
+                &level_rs,
+                &queries_i,
+                &alpha_i,
+            );
+            (None, Some(dual), enforced_sum)
+        } else if induce_sched_enabled() {
+            let (basis, enforced_sum) = induce_sumcheck_poly_auto(
                 n_next,
                 config.log_inv_rates[i + 1],
                 sks_vks_i.as_deref(),
@@ -9007,9 +9342,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
+            );
+            (Some(basis), None, enforced_sum)
         } else {
-            induce_sumcheck_poly(
+            let (basis, enforced_sum) = induce_sumcheck_poly(
                 n_next,
                 sks_vks_i
                     .as_deref()
@@ -9018,7 +9354,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 &level_rs,
                 &queries_i,
                 &alpha_i,
-            )
+            );
+            (Some(basis), None, enforced_sum)
         };
         if trace {
             let d = _t.elapsed();
@@ -9044,11 +9381,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = if let Some(dual) = deep_dual_i.as_ref() {
+            let msg = dual.round_msg(&[]);
+            sc_prover.introduce_sparse_dual(msg);
+            msg
+        } else {
+            sc_prover.introduce_new(
+                basis_i_induced.expect("ordinary deep induce basis missing"),
+                enforced_sum_i,
+            )
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        if ranked_deferred_induced_glue_enabled(
+        if let Some(mut dual) = deep_dual_i {
+            sc_prover.glue_sparse_dual(beta_i, enforced_sum_i);
+            dual.scale(beta_i);
+            let depth = dual.depth;
+            active_deep_duals.push((dual, Vec::<F128>::with_capacity(depth)));
+        } else if ranked_deferred_induced_glue_enabled(
             config,
             log_n,
             n_next,
@@ -11082,8 +11433,9 @@ mod tests {
                 let mut bc_x86 = vec![F128::ZERO; n_pairs];
                 // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
                 let (u0_x86, u2_x86) = unsafe {
-                    super::fold_and_msg_chunk_x86(
-                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream,
+                    super::fold_and_msg_chunk_x86::<false>(
+                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream, None,
+                        None,
                     )
                 };
                 assert_eq!(fc_ref, fc_x86, "folded f mismatch n_pairs={n_pairs}");
@@ -12060,14 +12412,27 @@ mod tests {
     fn sparse_dual_l0_messages_and_fold2_materialization_match_dense() {
         use crate::challenger::Challenger;
 
-        for log_msg in [5usize, 7, 10] {
-            let log_inv_rate = 1usize;
+        // (log_msg_cols, log_inv_rate). Rate 1 is the ranked L0 shape; rates
+        // 2..=5 are the ranked L1..L4 shapes, where the materialization keeps
+        // `2^(reduced_log_d - log_inv_rate)` coefficients rather than the low
+        // half. Everything else in the dual is rate-independent.
+        for (log_msg, log_inv_rate) in [
+            (5usize, 1usize),
+            (7, 1),
+            (10, 1),
+            (7, 2),
+            (8, 3),
+            (7, 4),
+            (6, 5),
+        ] {
             let log_d = log_msg + log_inv_rate;
             let msg_cols = 1usize << log_msg;
             let block_len = 1usize << log_d;
             let log_interleaved = 2usize;
             let num_interleaved = 1usize << log_interleaved;
-            let mut ch = crate::challenger::RandomChallenger::new(0xD0A1_2000 ^ log_msg as u64);
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0xD0A1_2000 ^ ((log_msg * 8 + log_inv_rate) as u64),
+            );
             let poly = ch.sample_f128_vec(msg_cols * num_interleaved);
             let lane_challenges = ch.sample_f128_vec(log_interleaved);
             let f = partial_eval_lsb(&poly, &lane_challenges);
@@ -12093,10 +12458,11 @@ mod tests {
                 &queries,
                 &alpha,
             );
-            for target_depth in 3..=4 {
+            for target_depth in 1..=4 {
                 let (dual, dual_enforced) = SparseDualL0::new(
                     target_depth,
                     log_d,
+                    log_inv_rate,
                     &l0_codeword,
                     num_interleaved,
                     &opened_rows,
@@ -12127,6 +12493,7 @@ mod tests {
             let (mut dual, dual_enforced) = SparseDualL0::new(
                 2,
                 log_d,
+                log_inv_rate,
                 &l0_codeword,
                 num_interleaved,
                 &opened_rows,
@@ -12251,6 +12618,7 @@ mod tests {
             let (mut dual, dual_enforced) = SparseDualL0::new(
                 target_depth,
                 log_d,
+                1,
                 &l0_codeword,
                 num_interleaved,
                 &opened_rows,
@@ -12380,6 +12748,111 @@ mod tests {
         ));
     }
 
+    /// Proof-byte oracle for the L1..L4 extension. Three recursive steps at
+    /// inverse rates 1/2/3/4 exercise everything the deep wiring adds: two
+    /// duals live at once across the second seam, one materializing into the
+    /// first fold of the next level (deferred) and one into the last fold of
+    /// the recursion (merged), plus the rate-general materialization prefix.
+    /// Run with the L0 dual both on and off so the deep arm is checked in
+    /// isolation as well.
+    #[test]
+    fn sparse_dual_deep_levels_proof_bytes_match_dense() {
+        use crate::challenger::Challenger;
+
+        let log_n = 14usize;
+        let initial_k = 2usize;
+        let (p_cfg, v_cfg) = ood_test_configs(
+            log_n,
+            initial_k,
+            &[3, 3, 2],
+            vec![0, 1, 1, 1],
+            vec![0, 0, 0, 0],
+        );
+        let mut rng = crate::challenger::RandomChallenger::new(0x5A2E_D0A1_0D33);
+        let poly = rng.sample_f128_vec(1usize << log_n);
+        let z = rng.sample_f128_vec(log_n);
+        let basis = build_eq_table(&z);
+        let target = poly
+            .iter()
+            .zip(&basis)
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |x, y| x + y);
+
+        let log_msg_cols_0 = log_n - initial_k;
+        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + p_cfg.log_inv_rates[0]);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            p_cfg.log_inv_rates[0],
+            &ntt_0,
+            p_cfg.merkle_hash,
+        );
+        let initial_root = wtns_0.root();
+
+        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
+        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(0));
+        let mut dense_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
+        let dense = recursive_prover_with_basis(
+            &p_cfg,
+            poly.clone(),
+            basis.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut dense_ch,
+        );
+
+        // Deep extension only: L0 keeps the incumbent dense induce, so this
+        // arm isolates the new wiring.
+        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(4));
+        let mut deep_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
+        let deep_only = recursive_prover_with_basis(
+            &p_cfg,
+            poly.clone(),
+            basis.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut deep_ch,
+        );
+
+        // L0 dual at k=4 plus the deep extension: L0 materializes into the
+        // first fold of level 1, level 1's dual into the first fold of level 2
+        // and level 2's dual (capped at depth 2 by the folds it has left) into
+        // the final fold, so no two land in the same fold.
+        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(4));
+        let mut sparse_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
+        let sparse = recursive_prover_with_basis(
+            &p_cfg,
+            poly,
+            basis.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut sparse_ch,
+        );
+        SPARSE_DUAL_TEST_DEPTH.with(|value| value.set(0));
+        SPARSE_DUAL_DEEP_TEST_DEPTH.with(|value| value.set(0));
+
+        assert_eq!(deep_only, dense, "deep-only sparse arm");
+        assert_eq!(sparse, dense, "L0 + deep sparse arm");
+        assert_eq!(
+            bincode::serialize(&sparse).expect("serialize sparse proof"),
+            bincode::serialize(&dense).expect("serialize dense proof")
+        );
+        let mut verifier_ch =
+            crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
+        assert!(recursive_verifier_with_basis(
+            &v_cfg,
+            &sparse,
+            &basis,
+            target,
+            &initial_root,
+            &mut verifier_ch,
+        ));
+    }
+
     #[test]
     fn sparse_dual_exact_ranked_selector_positive_kill_and_negative() {
         let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
@@ -12411,6 +12884,106 @@ mod tests {
         let mut wrong_shape = config.clone();
         wrong_shape.recursive_ks[0] = 4;
         assert_eq!(select(&wrong_shape, false, false), None);
+    }
+
+    #[test]
+    fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
+        for depth in 1..=4 {
+            let value = depth.to_string();
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
+                depth
+            );
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
+                depth,
+                "explicit depth must override the depth2 rollback"
+            );
+        }
+    }
+
+    /// All five ranked levels reach the sparse arm, both whole-mechanism kill
+    /// switches still take every one of them out, and the per-level depths keep
+    /// the materialization folds pairwise distinct.
+    #[test]
+    fn sparse_dual_deep_selector_covers_every_ranked_level() {
+        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
+            .expect("exact ranked m32 Fast config");
+        config.merkle_hash = HashKind::Blake3;
+        let ladder: [(usize, usize, usize); 5] = [
+            (19, 218, 1),
+            (16, 106, 2),
+            (13, 71, 3),
+            (10, 53, 4),
+            (7, 43, 5),
+        ];
+        for &(n_level, n_queries, rate) in &ladder {
+            let select = |sparse_disabled: bool, defer_disabled: bool| {
+                ranked_sparse_dual_l0_depth_selected(
+                    &config,
+                    25,
+                    n_level,
+                    1usize << n_level,
+                    n_queries,
+                    rate,
+                    true,
+                    true,
+                    true,
+                    sparse_disabled,
+                    defer_disabled,
+                    4,
+                )
+            };
+            assert_eq!(select(false, false), Some(4), "level n={n_level}");
+            assert_eq!(select(true, false), None, "sparse kill at n={n_level}");
+            assert_eq!(select(false, true), None, "defer kill at n={n_level}");
+            // Rate and query count are pinned per level: a neighbour's rate
+            // must not select.
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_selected(
+                    &config,
+                    25,
+                    n_level,
+                    1usize << n_level,
+                    n_queries,
+                    rate + 1,
+                    true,
+                    true,
+                    true,
+                    false,
+                    false,
+                    4,
+                ),
+                None,
+                "wrong rate at n={n_level}"
+            );
+        }
+        // Depth schedule: the ranked ladder folds three variables per level, so
+        // level L's dual takes its first direct message at fold 3L and
+        // materializes at 3L + depth − 1. All five must be distinct.
+        assert_eq!(ranked_sparse_dual_deep_depth_for_level(19), None);
+        // L0 starts at fold 0 and runs at SPARSE_DUAL_MAX_DEPTH.
+        let mut materializations = vec![SPARSE_DUAL_MAX_DEPTH - 1];
+        for (level, n_level) in [16usize, 13, 10, 7].iter().copied().enumerate() {
+            let depth = ranked_sparse_dual_deep_depth_for_level(n_level)
+                .unwrap_or_else(|| panic!("no depth for ranked level n={n_level}"));
+            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+            // Folds left after this level's introduction: three per remaining
+            // recursive level.
+            let remaining = 3 * (4 - level);
+            assert!(depth <= remaining, "n={n_level}: depth {depth} > {remaining}");
+            materializations.push(3 * (level + 1) + depth - 1);
+        }
+        let mut sorted = materializations.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            materializations.len(),
+            "materialization folds collide: {materializations:?}"
+        );
     }
 
     /// Exact ranked post-DirectFold8-state oracle and component timer. This allocates
@@ -12522,6 +13095,7 @@ mod tests {
             let (dual, sparse_enforced) = SparseDualL0::new(
                 depth,
                 LOG_D,
+                1,
                 &l0_codeword,
                 LANES,
                 &opened_rows,
@@ -12770,6 +13344,7 @@ mod tests {
         let dual = SparseDualL0 {
             ntt: AdditiveNttF128::standard(log_d),
             log_d,
+            log_inv_rate: 1,
             depth,
             cache_len: 32,
             queries,
@@ -15675,3 +16250,9 @@ mod tests {
         }
     }
 }
+
+// draw marker: sparse-dual depth selection, redraw 1
+
+// draw marker 2
+
+// draw marker 3

@@ -328,7 +328,7 @@ unsafe fn widen_off_line(v: __m512i, op: *mut u16) {
 /// `vpmovzxbw` + `vpsllw` widen. Default ON; the ranked worker's cleared
 /// environment never disables it.
 #[inline(always)]
-fn widen_maddubs_enabled() -> bool {
+pub(crate) fn widen_maddubs_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     {
         static ON: std::sync::LazyLock<bool> =
@@ -589,7 +589,7 @@ unsafe fn ranked_dense_rows_and_offsets_rollback<const P: bool>(
 /// stage stores plus stage reload publication. Default ON; the ranked worker's
 /// cleared environment never disables it.
 #[inline(always)]
-fn ranked_direct_dense_publish_enabled() -> bool {
+pub(crate) fn ranked_direct_dense_publish_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -607,7 +607,7 @@ fn ranked_direct_dense_publish_enabled() -> bool {
 /// by-value-row + outlined-consumer ABI inside the direct-publish path while
 /// preserving its bytes and publication schedule.
 #[inline(always)]
-fn ranked_direct_dense_inline_enabled() -> bool {
+pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -895,6 +895,18 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) plan: Round1AbWindowPlan,
     /// Ranked residual representation; dense producers leave this off.
     pub(crate) one_rows_elided: bool,
+}
+
+pub(crate) type RankedClosedWindowPreps = [(Round1AbWindowPlan, Round1AbTableImages); 31];
+
+pub(crate) fn prepare_ranked_closed_window_preps(
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+) -> RankedClosedWindowPreps {
+    std::array::from_fn(|blk| {
+        let plan = plan.for_window(blk);
+        (plan, round1_ab_table_images(inv_table, plan))
+    })
 }
 
 #[repr(C, align(64))]
@@ -1233,6 +1245,7 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    ranked_preps: Option<&'t RankedClosedWindowPreps>,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -1797,7 +1810,110 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static{
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+                if let Some(preps)=self.ranked_preps{
+                    self.drain_range_spread_ranked_closed_exact(&self.proj,preps,base_word,ring_word,words);
+                    return;
+                }
+                self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)
+            }else{
+                self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)
+            };
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn drain_range_spread_ranked_closed_exact(
+        &self,
+        proj: &StreamProj<'_>,
+        preps: &RankedClosedWindowPreps,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            debug_assert!(self.ranked_static);
+            debug_assert!(proj.one_rows_elided);
+            let wc = WidenConsts::new();
+            for off in (0..words).step_by(STEP_WORDS) {
+                let abs_word = base_word + off;
+                let rw = ring_word + off;
+                let blk = abs_word / STEP_WORDS;
+                match blk {
+                    0 => {
+                        let (sa, _) = proj.sides();
+                        let a_lo = tr8_chunk(self.ast, rw);
+                        let a_hi = tr8_chunk(self.ast, rw + 8);
+                        for r in 0..8 {
+                            let p = sa.add(r * STEP_WORDS);
+                            store_v8(p, a_lo[r]);
+                            store_v8(p.add(8), a_hi[r]);
+                        }
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let mut j = 0usize;
+                        while j != 8 {
+                            rows.publish_static::<0>(j, sa);
+                            j += 1;
+                        }
+                    }
+                    1 => {
+                        let (sa, _) = proj.sides();
+                        let a_lo = tr8_chunk(self.ast, rw);
+                        let a_hi = tr8_chunk(self.ast, rw + 8);
+                        for r in 0..8 {
+                            let p = sa.add(r * STEP_WORDS);
+                            store_v8(p, a_lo[r]);
+                            store_v8(p.add(8), a_hi[r]);
+                        }
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let mut j = 0usize;
+                        while j != 8 {
+                            rows.publish_static::<1>(j, sa);
+                            j += 1;
+                        }
+                    }
+                    30 => {
+                        let (sa, _) = proj.sides();
+                        let x0 = load_v8(self.ast.add(rw).cast::<u32>());
+                        let x1 = load_v8(self.ast.add(rw + 1).cast::<u32>());
+                        let l = _mm256_unpacklo_epi32(x0, x1);
+                        let h = _mm256_unpackhi_epi32(x0, x1);
+                        store_v8(sa, _mm256_permute2x128_si256::<0x20>(l, h));
+                        store_v8(sa.add(8), _mm256_permute2x128_si256::<0x31>(l, h));
+                        let z = _mm256_setzero_si256();
+                        store_v8(sa.add(16), z);
+                        store_v8(sa.add(24), z);
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let (plan, imgs) = preps[30];
+                        proj.project_blocks_ranked_30(plan, imgs, rows);
+                    }
+                    31 => continue,
+                    2..=29 => {
+                        #[repr(align(64))]
+                        struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
+                        let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+                        let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let (plan, imgs) = preps[blk];
+                        project_blocks_ranked_hot_offsets_direct_inline::<true>(
+                            proj,
+                            blk,
+                            plan,
+                            imgs,
+                            rows,
+                            self.ast,
+                            self.bs,
+                            rw,
+                            op,
+                            wc,
+                        );
+                    }
+                    _ => unreachable!("unexpected ranked closed window {blk}"),
+                }
+            }
         }
     }
 
@@ -2156,100 +2272,17 @@ unsafe fn dump_elide_win(
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
-    inputs: OctaInputs<'_>,
+unsafe fn build_octa_witness_ab_stream_prepared_elide(
+    prepared: PreparedInputs,
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
     proj: StreamProj<'_>,
     elide: [bool; 3],
+    ranked_static: bool,
+    ranked_preps: Option<&RankedClosedWindowPreps>,
 ) {
     unsafe {
-        // Only the all-elide provenance state selects the ranked static
-        // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
-        let prepared = match inputs {
-            OctaInputs::Blocks(inputs) => {
-                let ptrs = [
-                    inputs[0].0.as_ptr(),
-                    inputs[1].0.as_ptr(),
-                    inputs[2].0.as_ptr(),
-                    inputs[3].0.as_ptr(),
-                    inputs[4].0.as_ptr(),
-                    inputs[5].0.as_ptr(),
-                    inputs[6].0.as_ptr(),
-                    inputs[7].0.as_ptr(),
-                ];
-                let cv_rows = [
-                    load_v8(ptrs[0]),
-                    load_v8(ptrs[1]),
-                    load_v8(ptrs[2]),
-                    load_v8(ptrs[3]),
-                    load_v8(ptrs[4]),
-                    load_v8(ptrs[5]),
-                    load_v8(ptrs[6]),
-                    load_v8(ptrs[7]),
-                ];
-                let cv = tr8(
-                    cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
-                    cv_rows[6], cv_rows[7],
-                );
-
-                let mptrs = [
-                    inputs[0].1.as_ptr(),
-                    inputs[1].1.as_ptr(),
-                    inputs[2].1.as_ptr(),
-                    inputs[3].1.as_ptr(),
-                    inputs[4].1.as_ptr(),
-                    inputs[5].1.as_ptr(),
-                    inputs[6].1.as_ptr(),
-                    inputs[7].1.as_ptr(),
-                ];
-                let m_lo = tr8(
-                    load_v8(mptrs[0]),
-                    load_v8(mptrs[1]),
-                    load_v8(mptrs[2]),
-                    load_v8(mptrs[3]),
-                    load_v8(mptrs[4]),
-                    load_v8(mptrs[5]),
-                    load_v8(mptrs[6]),
-                    load_v8(mptrs[7]),
-                );
-                let m_hi = tr8(
-                    load_v8(mptrs[0].add(8)),
-                    load_v8(mptrs[1].add(8)),
-                    load_v8(mptrs[2].add(8)),
-                    load_v8(mptrs[3].add(8)),
-                    load_v8(mptrs[4].add(8)),
-                    load_v8(mptrs[5].add(8)),
-                    load_v8(mptrs[6].add(8)),
-                    load_v8(mptrs[7].add(8)),
-                );
-                let mut message = [dup_u32(0); 16];
-                message[..8].copy_from_slice(&m_lo);
-                message[8..].copy_from_slice(&m_hi);
-
-                let mut tlo_a = [0u32; 8];
-                let mut thi_a = [0u32; 8];
-                let mut bl_a = [0u32; 8];
-                let mut fl_a = [0u32; 8];
-                for j in 0..8 {
-                    tlo_a[j] = inputs[j].2 as u32;
-                    thi_a[j] = (inputs[j].2 >> 32) as u32;
-                    bl_a[j] = inputs[j].3;
-                    fl_a[j] = inputs[j].4;
-                }
-                PreparedInputs {
-                    cv,
-                    message,
-                    counter_lo: load_v8(tlo_a.as_ptr()),
-                    counter_hi: load_v8(thi_a.as_ptr()),
-                    block_len: load_v8(bl_a.as_ptr()),
-                    flags: load_v8(fl_a.as_ptr()),
-                }
-            }
-            OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
-        };
         let cv_v = prepared.cv;
         let m = prepared.message;
         let tlo = prepared.counter_lo;
@@ -2291,6 +2324,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             ranked_static,
+            ranked_preps,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -2447,6 +2481,146 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
         }
         drain.drain_range(0, 0, 16);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
+    inputs: OctaInputs<'_>,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    elide: [bool; 3],
+) {
+    unsafe {
+        // Only the all-elide provenance state selects the ranked static
+        // windows. Partial/cold states still read both rings in every window.
+        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        let prepared = match inputs {
+            OctaInputs::Blocks(inputs) => {
+                let ptrs = [
+                    inputs[0].0.as_ptr(),
+                    inputs[1].0.as_ptr(),
+                    inputs[2].0.as_ptr(),
+                    inputs[3].0.as_ptr(),
+                    inputs[4].0.as_ptr(),
+                    inputs[5].0.as_ptr(),
+                    inputs[6].0.as_ptr(),
+                    inputs[7].0.as_ptr(),
+                ];
+                let cv_rows = [
+                    load_v8(ptrs[0]),
+                    load_v8(ptrs[1]),
+                    load_v8(ptrs[2]),
+                    load_v8(ptrs[3]),
+                    load_v8(ptrs[4]),
+                    load_v8(ptrs[5]),
+                    load_v8(ptrs[6]),
+                    load_v8(ptrs[7]),
+                ];
+                let cv = tr8(
+                    cv_rows[0], cv_rows[1], cv_rows[2], cv_rows[3], cv_rows[4], cv_rows[5],
+                    cv_rows[6], cv_rows[7],
+                );
+
+                let mptrs = [
+                    inputs[0].1.as_ptr(),
+                    inputs[1].1.as_ptr(),
+                    inputs[2].1.as_ptr(),
+                    inputs[3].1.as_ptr(),
+                    inputs[4].1.as_ptr(),
+                    inputs[5].1.as_ptr(),
+                    inputs[6].1.as_ptr(),
+                    inputs[7].1.as_ptr(),
+                ];
+                let m_lo = tr8(
+                    load_v8(mptrs[0]),
+                    load_v8(mptrs[1]),
+                    load_v8(mptrs[2]),
+                    load_v8(mptrs[3]),
+                    load_v8(mptrs[4]),
+                    load_v8(mptrs[5]),
+                    load_v8(mptrs[6]),
+                    load_v8(mptrs[7]),
+                );
+                let m_hi = tr8(
+                    load_v8(mptrs[0].add(8)),
+                    load_v8(mptrs[1].add(8)),
+                    load_v8(mptrs[2].add(8)),
+                    load_v8(mptrs[3].add(8)),
+                    load_v8(mptrs[4].add(8)),
+                    load_v8(mptrs[5].add(8)),
+                    load_v8(mptrs[6].add(8)),
+                    load_v8(mptrs[7].add(8)),
+                );
+                let mut message = [dup_u32(0); 16];
+                message[..8].copy_from_slice(&m_lo);
+                message[8..].copy_from_slice(&m_hi);
+
+                let mut tlo_a = [0u32; 8];
+                let mut thi_a = [0u32; 8];
+                let mut bl_a = [0u32; 8];
+                let mut fl_a = [0u32; 8];
+                for j in 0..8 {
+                    tlo_a[j] = inputs[j].2 as u32;
+                    thi_a[j] = (inputs[j].2 >> 32) as u32;
+                    bl_a[j] = inputs[j].3;
+                    fl_a[j] = inputs[j].4;
+                }
+                PreparedInputs {
+                    cv,
+                    message,
+                    counter_lo: load_v8(tlo_a.as_ptr()),
+                    counter_hi: load_v8(thi_a.as_ptr()),
+                    block_len: load_v8(bl_a.as_ptr()),
+                    flags: load_v8(fl_a.as_ptr()),
+                }
+            }
+            OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
+        };
+        build_octa_witness_ab_stream_prepared_elide(
+            prepared,
+            z,
+            a,
+            b,
+            proj,
+            elide,
+            ranked_static,
+            None,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
+    init: u64,
+    base: usize,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    preps: &RankedClosedWindowPreps,
+    elide: [bool; 3],
+) {
+    unsafe {
+        debug_assert_eq!(elide, [true; 3]);
+        debug_assert!(proj.one_rows_elided);
+        debug_assert_eq!(proj.out_bias, 2 * 64);
+        debug_assert!(proj.plan.offsets_eligible(2));
+        debug_assert!(ranked_direct_dense_publish_enabled());
+        debug_assert!(ranked_direct_dense_inline_enabled());
+        debug_assert!(widen_maddubs_enabled());
+        build_octa_witness_ab_stream_prepared_elide(
+            prepare_closed_inputs(init, base),
+            z,
+            a,
+            b,
+            proj,
+            elide,
+            true,
+            Some(preps),
+        );
     }
 }
 

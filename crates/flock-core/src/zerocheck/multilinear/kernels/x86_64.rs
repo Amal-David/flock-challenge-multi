@@ -46,10 +46,14 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
 
 /// x86 fused fold plus next-round message for one worker chunk.
 ///
-/// Each four-message iteration folds eight `a` and `b` outputs, stores them
-/// for the next round, and consumes the same ZMM registers for the current
-/// message before they leave registers. This removes the immediate output
-/// readback performed by the portable two-pass path.
+/// Each four-message iteration folds eight `a` and `b` outputs and consumes
+/// the same ZMM registers for the current-round message before storing them
+/// for the next round. This removes the output readback performed by the
+/// portable two-pass path and by the incumbent two-pair tail.
+///
+/// `FLOCK_NO_LUNA_FOLDMSG_REORDER=1` restores the original schedule: outputs
+/// are stored before the message is computed and the tail reloads individual
+/// `F128`s from `a_out`/`b_out`.
 ///
 /// # Safety
 /// Input/output lengths must satisfy `input.len() == 2 * output.len()` and
@@ -125,42 +129,91 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         let mut pinf_tail = F256Unreduced::ZERO;
         let mut x_lo = 0;
 
-        while x_lo + 4 <= eq_lo.len() {
-            let output = 2 * x_lo;
-            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
-            let a_hi = fold_x4(
-                a_in.as_ptr().add(2 * (output + 4)),
-                r,
-                r64,
-                even_idx,
-                odd_idx,
-                split,
-            );
-            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
-            let b_hi = fold_x4(
-                b_in.as_ptr().add(2 * (output + 4)),
-                r,
-                r64,
-                even_idx,
-                odd_idx,
-                split,
-            );
+        if luna_foldmsg_reorder_enabled() {
+            // Register-sourced message: compute the round message from the
+            // folded ZMMs, then sink the output stores afterwards.
+            while x_lo + 4 <= eq_lo.len() {
+                let output = 2 * x_lo;
+                let a_lo =
+                    fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let a_hi = fold_x4(
+                    a_in.as_ptr().add(2 * (output + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+                let b_lo =
+                    fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let b_hi = fold_x4(
+                    b_in.as_ptr().add(2 * (output + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
 
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_lo);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), b_hi);
+                let a0 = _mm512_permutex2var_epi64(a_lo, even_idx, a_hi);
+                let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
+                let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
+                let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
+                let g1 = ghash_mul_x4(a1, b1);
+                let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
+                let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                p1_wide.mul_acc(eq, g1);
+                pinf_wide.mul_acc(eq, g_inf);
 
-            let a0 = _mm512_permutex2var_epi64(a_lo, even_idx, a_hi);
-            let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
-            let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
-            let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
-            let g1 = ghash_mul_x4(a1, b1);
-            let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
-            let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            p1_wide.mul_acc(eq, g1);
-            pinf_wide.mul_acc(eq, g_inf);
-            x_lo += 4;
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_lo);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), b_hi);
+
+                x_lo += 4;
+            }
+        } else {
+            // Incumbent: store outputs immediately, then deinterleave from the
+            // register-resident folded ZMMs for the message.
+            while x_lo + 4 <= eq_lo.len() {
+                let output = 2 * x_lo;
+                let a_lo =
+                    fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let a_hi = fold_x4(
+                    a_in.as_ptr().add(2 * (output + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+                let b_lo =
+                    fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let b_hi = fold_x4(
+                    b_in.as_ptr().add(2 * (output + 4)),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
+
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_lo);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), b_hi);
+
+                let a0 = _mm512_permutex2var_epi64(a_lo, even_idx, a_hi);
+                let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
+                let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
+                let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
+                let g1 = ghash_mul_x4(a1, b1);
+                let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
+                let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                p1_wide.mul_acc(eq, g1);
+                pinf_wide.mul_acc(eq, g_inf);
+                x_lo += 4;
+            }
         }
 
         // Power-of-two eq blocks leave either no tail or exactly two pairs.
@@ -183,18 +236,59 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
                 odd_idx,
                 split,
             );
-            _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
-            _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
-            for lane in 0..2 {
-                let o = output + 2 * lane;
-                let a0 = a_out[o];
-                let a1 = a_out[o + 1];
-                let b0 = b_out[o];
-                let b1 = b_out[o + 1];
-                let eq = eq_lo[x_lo + lane];
-                p1_tail ^= eq.mul_unreduced(a1 * b1);
-                pinf_tail ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
+            if luna_foldmsg_reorder_enabled() {
+                // Extract the two tail message pairs directly from the folded
+                // ZMMs before writing the outputs.
+                let a0_0 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<0>(a_folded),
+                );
+                let a1_0 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<1>(a_folded),
+                );
+                let b0_0 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<0>(b_folded),
+                );
+                let b1_0 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<1>(b_folded),
+                );
+                let eq_0 = eq_lo[x_lo];
+                p1_tail ^= eq_0.mul_unreduced(a1_0 * b1_0);
+                pinf_tail ^= eq_0.mul_unreduced((a0_0 + a1_0) * (b0_0 + b1_0));
+
+                let a0_1 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<2>(a_folded),
+                );
+                let a1_1 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<3>(a_folded),
+                );
+                let b0_1 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<2>(b_folded),
+                );
+                let b1_1 = core::mem::transmute::<__m128i, F128>(
+                    _mm512_extracti32x4_epi32::<3>(b_folded),
+                );
+                let eq_1 = eq_lo[x_lo + 1];
+                p1_tail ^= eq_1.mul_unreduced(a1_1 * b1_1);
+                pinf_tail ^= eq_1.mul_unreduced((a0_1 + a1_1) * (b0_1 + b1_1));
+
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
+            } else {
+                // Incumbent: write outputs, then reload individual F128s.
+                _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
+                _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
+
+                for lane in 0..2 {
+                    let o = output + 2 * lane;
+                    let a0 = a_out[o];
+                    let a1 = a_out[o + 1];
+                    let b0 = b_out[o];
+                    let b1 = b_out[o + 1];
+                    let eq = eq_lo[x_lo + lane];
+                    p1_tail ^= eq.mul_unreduced(a1 * b1);
+                    pinf_tail ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
             }
         }
 
@@ -1791,6 +1885,19 @@ pub(crate) struct R2EqBake {
 fn zc_fold_split_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_SPLIT").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LUNA_FOLDMSG_REORDER=1` restores the incumbent store-before-
+/// message schedule in [`fold_and_message_x86_avx512`]: outputs are written
+/// before the current-round message is computed, and the two-pair tail reloads
+/// individual `F128`s from `a_out`/`b_out`. Default OFF keeps the folded ZMMs
+/// register-resident for the message computation and extracts tail lanes
+/// directly from the folded registers before storing. Exact same-binary A/B
+/// values; only the store-to-load dependency schedule changes.
+fn luna_foldmsg_reorder_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LUNA_FOLDMSG_REORDER").is_none());
     *ON
 }
 
