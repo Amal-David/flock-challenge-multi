@@ -398,7 +398,7 @@ pub(crate) fn convert_table() -> &'static [F128] {
 
 const C_MASK_TABLE_STRIDE: usize = 512;
 
-fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
+pub(crate) fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
     let mut tables = crate::scratch::take_f128(eq_lo_scaled.len() * C_MASK_TABLE_STRIDE);

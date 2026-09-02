@@ -1641,6 +1641,15 @@ pub(crate) fn zc_r34_bcast_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_ZC_FOLD_SHUFFLE_FUSION=1` restores the incumbent 2-step byte-transpose
+/// and permute networks in `gfni_fold64_rows_masked_c4_bcast` and
+/// `gfni_fold64_regs_sigma_bcast_gen`.
+pub(crate) fn zc_fold_shuffle_fusion_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_SHUFFLE_FUSION").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
 /// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
 /// same-binary A/B; prefetch is architecturally invisible).
@@ -3680,6 +3689,21 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
     out: *mut F128,
     dead_lines: u8,
 ) {
+    if zc_fold_shuffle_fusion_enabled() {
+        unsafe { gfni_fold64_rows_masked_c4_bcast_gen::<true>(rows, m, out, dead_lines) };
+    } else {
+        unsafe { gfni_fold64_rows_masked_c4_bcast_gen::<false>(rows, m, out, dead_lines) };
+    }
+}
+
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_rows_masked_c4_bcast_gen<const FUSE: bool>(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+    dead_lines: u8,
+) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 readable bytes at
     // `rows.add(64 * i)` for every line not marked dead and 16 writable
@@ -3710,7 +3734,47 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
             4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
             6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
         ];
+        #[rustfmt::skip]
+        const BT_C4_LO: [i8; 64] = [
+            0, 8, 16, 24, 64, 72, 80, 88,
+            1, 9, 17, 25, 65, 73, 81, 89,
+            2, 10, 18, 26, 66, 74, 82, 90,
+            3, 11, 19, 27, 67, 75, 83, 91,
+            4, 12, 20, 28, 68, 76, 84, 92,
+            5, 13, 21, 29, 69, 77, 85, 93,
+            6, 14, 22, 30, 70, 78, 86, 94,
+            7, 15, 23, 31, 71, 79, 87, 95,
+        ];
+        #[rustfmt::skip]
+        const BT_C4_HI: [i8; 64] = [
+            32, 40, 48, 56, 96, 104, 112, 120,
+            33, 41, 49, 57, 97, 105, 113, 121,
+            34, 42, 50, 58, 98, 106, 114, 122,
+            35, 43, 51, 59, 99, 107, 115, 123,
+            36, 44, 52, 60, 100, 108, 116, 124,
+            37, 45, 53, 61, 101, 109, 117, 125,
+            38, 46, 54, 62, 102, 110, 118, 126,
+            39, 47, 55, 63, 103, 111, 119, 127,
+        ];
+        #[rustfmt::skip]
+        const OUT_IL_LO: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  64, 72, 80, 88, 96, 104, 112, 120,
+            1, 9, 17, 25, 33, 41, 49, 57,  65, 73, 81, 89, 97, 105, 113, 121,
+            2, 10, 18, 26, 34, 42, 50, 58,  66, 74, 82, 90, 98, 106, 114, 122,
+            3, 11, 19, 27, 35, 43, 51, 59,  67, 75, 83, 91, 99, 107, 115, 123,
+        ];
+        #[rustfmt::skip]
+        const OUT_IL_HI: [i8; 64] = [
+            4, 12, 20, 28, 36, 44, 52, 60,  68, 76, 84, 92, 100, 108, 116, 124,
+            5, 13, 21, 29, 37, 45, 53, 61,  69, 77, 85, 93, 101, 109, 117, 125,
+            6, 14, 22, 30, 38, 46, 54, 62,  70, 78, 86, 94, 102, 110, 118, 126,
+            7, 15, 23, 31, 39, 47, 55, 63,  71, 79, 87, 95, 103, 111, 119, 127,
+        ];
         let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let bt_c4_lo = _mm512_loadu_si512(BT_C4_LO.as_ptr() as *const __m512i);
+        let bt_c4_hi = _mm512_loadu_si512(BT_C4_HI.as_ptr() as *const __m512i);
+        let out_il_lo = _mm512_loadu_si512(OUT_IL_LO.as_ptr() as *const __m512i);
+        let out_il_hi = _mm512_loadu_si512(OUT_IL_HI.as_ptr() as *const __m512i);
         // 64-byte aligned so each ZMM spill is one line and each broadcast
         // read of it is one load uop.
         #[repr(C, align(64))]
@@ -3722,34 +3786,48 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
         // One half = rows 32h..32h+32 = super-rows 8h..8h+8, whose four
         // residue octets are gathered from exactly these four lines: each
         // line holds only two rows of each residue, so a same-residue octet
-        // spans four of them and the `_tr`-style single `vpermb` becomes a
-        // two-level qword gather. Both halves are gathered up front so all
-        // eight input lines die before the affine passes open and the live
-        // set there is eight broadcasts plus four accumulators.
+        // spans four of them. When shuffle fusion is enabled, single 2-input
+        // byte permutes (`vpermt2b`) fuse stage-2 selection and the 8x8 byte
+        // transpose into 4 shuffles per half instead of 8.
         let gather = |h: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
-            // Stage-1: qwords `{a, a + 4}` of two lines, the only two rows of
-            // residue `a` each line holds.
             let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
             let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
-            // Stage-2: the two 256-bit halves of a residue pair.
-            let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
-            let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
             let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
             let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
             let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
             let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
             let base = op.add(32 * h);
-            // `oct[a].qword[j]` = chunk `j` of rows 32h+4t+a, t = 0..8.
-            let oct = |a: usize, v: __m512i| {
+            if FUSE {
                 _mm512_storeu_si512(
-                    base.add(8 * a) as *mut __m512i,
-                    _mm512_permutexvar_epi8(bt, v),
-                )
-            };
-            oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
-            oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
-            oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
-            oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+                    base as *mut __m512i,
+                    _mm512_permutex2var_epi8(p01, bt_c4_lo, p45),
+                );
+                _mm512_storeu_si512(
+                    base.add(8) as *mut __m512i,
+                    _mm512_permutex2var_epi8(p01, bt_c4_hi, p45),
+                );
+                _mm512_storeu_si512(
+                    base.add(16) as *mut __m512i,
+                    _mm512_permutex2var_epi8(p23, bt_c4_lo, p67),
+                );
+                _mm512_storeu_si512(
+                    base.add(24) as *mut __m512i,
+                    _mm512_permutex2var_epi8(p23, bt_c4_hi, p67),
+                );
+            } else {
+                let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+                let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+                let oct = |a: usize, v: __m512i| {
+                    _mm512_storeu_si512(
+                        base.add(8 * a) as *mut __m512i,
+                        _mm512_permutexvar_epi8(bt, v),
+                    )
+                };
+                oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
+                oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
+                oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
+                oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+            }
         };
         gather(0, z[0], z[1], z[2], z[3]);
         gather(1, z[4], z[5], z[6], z[7]);
@@ -3832,12 +3910,25 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 // `r{0,1}.byte[8k + t]` = output byte `8·hh + k` of super-row
                 // 8h+t; the byte transpose turns that into qword `t` = one half
                 // of `out[8h + t]`, and the interleave rebuilds the `F128`s.
-                let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-                let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-                let a0 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[0], accq[0]));
-                let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
-                _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(a0, il_lo, a1));
-                _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+                let acc0 = _mm512_xor_si512(accp[0], accq[0]);
+                let acc1 = _mm512_xor_si512(accp[1], accq[1]);
+                if FUSE {
+                    _mm512_storeu_si512(
+                        dst.add(2 * H),
+                        _mm512_permutex2var_epi8(acc0, out_il_lo, acc1),
+                    );
+                    _mm512_storeu_si512(
+                        dst.add(2 * H + 1),
+                        _mm512_permutex2var_epi8(acc0, out_il_hi, acc1),
+                    );
+                } else {
+                    let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+                    let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+                    let a0 = _mm512_permutexvar_epi8(bt, acc0);
+                    let a1 = _mm512_permutexvar_epi8(bt, acc1);
+                    _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(a0, il_lo, a1));
+                    _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+                }
             }};
         }
         pass!(0);
@@ -4093,6 +4184,19 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool>(
     mats: *const u64,
     out: *mut F128,
 ) {
+    if zc_fold_shuffle_fusion_enabled() {
+        unsafe { gfni_fold64_regs_sigma_bcast_gen_impl::<MULTI, true>(z, mats, out) };
+    } else {
+        unsafe { gfni_fold64_regs_sigma_bcast_gen_impl::<MULTI, false>(z, mats, out) };
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_regs_sigma_bcast_gen_impl<const MULTI: bool, const FUSE: bool>(
+    z: [core::arch::x86_64::__m512i; 8],
+    mats: *const u64,
+    out: *mut F128,
+) {
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 writable F128s at `out`; the
     // scratch is a local 512-byte array written and read in full; every
@@ -4106,7 +4210,23 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool>(
             4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
             6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
         ];
+        #[rustfmt::skip]
+        const SIGMA_BCAST_A01: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  64, 72, 80, 88, 96, 104, 112, 120,
+            4, 12, 20, 28, 36, 44, 52, 60,  68, 76, 84, 92, 100, 108, 116, 124,
+            1, 9, 17, 25, 33, 41, 49, 57,  65, 73, 81, 89, 97, 105, 113, 121,
+            5, 13, 21, 29, 37, 45, 53, 61,  69, 77, 85, 93, 101, 109, 117, 125,
+        ];
+        #[rustfmt::skip]
+        const SIGMA_BCAST_A23: [i8; 64] = [
+            2, 10, 18, 26, 34, 42, 50, 58,  66, 74, 82, 90, 98, 106, 114, 122,
+            6, 14, 22, 30, 38, 46, 54, 62,  70, 78, 86, 94, 102, 110, 118, 126,
+            3, 11, 19, 27, 35, 43, 51, 59,  67, 75, 83, 91, 99, 107, 115, 123,
+            7, 15, 23, 31, 39, 47, 55, 63,  71, 79, 87, 95, 103, 111, 119, 127,
+        ];
         let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let sigma_a01 = _mm512_loadu_si512(SIGMA_BCAST_A01.as_ptr() as *const __m512i);
+        let sigma_a23 = _mm512_loadu_si512(SIGMA_BCAST_A23.as_ptr() as *const __m512i);
         // 64-byte aligned so each ZMM spill is one line and each broadcast
         // read of it is one load uop.
         #[repr(C, align(64))]
@@ -4150,11 +4270,16 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool>(
                     let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
                     _mm512_xor_si512(v2, v3)
                 };
-                // qword q of `l`/`hh` = output bytes 0..8 / 8..16 of row 8i+q.
-                let l = _mm512_permutexvar_epi8(bt, plane(0));
-                let hh = _mm512_permutexvar_epi8(bt, plane(1));
-                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
-                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+                let (p0, p1) = (plane(0), plane(1));
+                if FUSE {
+                    a01[half] = _mm512_permutex2var_epi8(p0, sigma_a01, p1);
+                    a23[half] = _mm512_permutex2var_epi8(p0, sigma_a23, p1);
+                } else {
+                    let l = _mm512_permutexvar_epi8(bt, p0);
+                    let hh = _mm512_permutexvar_epi8(bt, p1);
+                    a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                    a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+                }
             }
             // Residue-major ZMM (k, g) holds rows 16g + 4·lane + k and lands
             // at F128 index 16k + 4g — the `_tr` layout, byte for byte.
