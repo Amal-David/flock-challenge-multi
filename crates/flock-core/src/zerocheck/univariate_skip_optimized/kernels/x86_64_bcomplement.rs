@@ -96,14 +96,26 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
         let av = apply(op.add(offw_krow_words::<P>(7)));
         let (bv, correction) =
             apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = _mm512_xor_si512(
+            if (modes as u8) == 15 {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_gf2p8mul_epi8(av, bv)
+            },
+            correction,
+        );
         let x = _mm512_set1_epi8(2);
         for k in (0..7usize).rev() {
             modes >>= 8;
             let av = apply(op.add(offw_krow_words::<P>(k)));
+            let mode = modes as u8;
             let (bv, correction) =
-                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
-            let product = _mm512_gf2p8mul_epi8(av, bv);
+                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), mode, av);
+            let product = if mode == 15 {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_gf2p8mul_epi8(av, bv)
+            };
             acc = _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8mul_epi8(acc, x),
                 product,
@@ -131,7 +143,14 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
             plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = _mm512_xor_si512(
+            if (plan.modes as u8) == 15 {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_gf2p8mul_epi8(av, bv)
+            },
+            correction,
+        );
         let x = _mm512_set1_epi8(2);
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
@@ -142,7 +161,11 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
                     (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
+                let product = if ((plan.modes >> $shift) as u8) == 15 {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_gf2p8mul_epi8(av, bv)
+                };
                 acc = _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_gf2p8mul_epi8(acc, x),
                     product,
