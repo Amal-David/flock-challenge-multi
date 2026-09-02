@@ -100,22 +100,23 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     }
 }
 
-/// `FLOCK_NO_URM_APPLY_2IMG=1` restores the one-image inverse-NTT table
-/// apply (ten port-5 shuffles per apply) in the shift-reduce AB kernel.
-/// Resolved once per process.
-#[allow(dead_code)] // Retained same-binary rollback selector.
-/// Ranked default: the round-one AB conversion accumulators use the 5-CLMUL
-/// split product with a loop-hoisted `eq·x^64` companion, matching what the
-/// crown already does in the multilinear fold kernels (`FLOCK_NO_ZC_FOLD_SPLIT`).
-/// `eq` is loop-invariant in both accumulators, so the companion is built once
-/// per call and every product inside the lane loop drops one CLMUL (6 -> 5).
-/// Field-identical; `FLOCK_NO_ZC_AB_SPLIT=1` restores the incumbent 6-CLMUL
-/// `ghash_mul_x4` in the same binary.
+/// `FLOCK_NO_ZC_GHASH_SPLIT=1` restores the plain `ghash_mul_x4` across all
+/// migrated zerocheck sites.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-pub(crate) fn zc_ab_split_enabled() -> bool {
+pub(crate) fn zc_ghash_split_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.get()) {
+        return on;
+    }
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_SPLIT").is_none());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_GHASH_SPLIT").is_none());
     *ON
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+thread_local! {
+    pub(crate) static ZC_GHASH_SPLIT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn urm_apply_2img_enabled() -> bool {
@@ -801,7 +802,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         // `eq` is invariant across the lane loop below, so its x^64
         // companion is built once here and reused by every product.
-        let split = zc_ab_split_enabled();
+        let split = zc_ghash_split_enabled();
         let eq_x64 = if split { ghash_shift64_x4(eq) } else { eq };
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
@@ -944,7 +945,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         // `eq` is invariant across the lane loop below, so its x^64
         // companion is built once here and reused by every product.
-        let split = zc_ab_split_enabled();
+        let split = zc_ghash_split_enabled();
         let eq_x64 = if split { ghash_shift64_x4(eq) } else { eq };
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
@@ -1543,6 +1544,49 @@ mod tests {
                 );
             }
             assert_eq!(nibble, gpr, "n_b_med={n_b_med}");
+        }
+    }
+
+    #[test]
+    fn accumulate_convert_ab_split_and_rollback_equivalence() {
+        let convert = super::super::super::convert_table();
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for b_med in 0..16 {
+            for lane in 0..64 {
+                chunk_ab_bytes[b_med][lane] = (b_med * 17 + lane * 13) as u8 ^ 0x5a;
+            }
+        }
+        let eq = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for n_b_med in 0..=16 {
+            let mut seed = [F128::ZERO; 64];
+            for (lane, value) in seed.iter_mut().enumerate() {
+                *value = F128::new(
+                    (lane as u64).wrapping_mul(0xa24b_aed4_963e_e407),
+                    (lane as u64).wrapping_mul(0x9fb2_1c65_1e98_df25),
+                );
+            }
+
+            // 1. Run with split enabled (default)
+            let (mut gpr_split, mut nibble_split) = (seed, seed);
+            ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(true)));
+            unsafe {
+                accumulate_convert_ab_x86_avx512(&chunk_ab_bytes, n_b_med, convert, eq, &mut gpr_split);
+                accumulate_convert_ab_x86_avx512_nibble(&chunk_ab_bytes, n_b_med, convert, eq, &mut nibble_split);
+            }
+
+            // 2. Run with rollback enabled (split disabled)
+            let (mut gpr_plain, mut nibble_plain) = (seed, seed);
+            ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(false)));
+            unsafe {
+                accumulate_convert_ab_x86_avx512(&chunk_ab_bytes, n_b_med, convert, eq, &mut gpr_plain);
+                accumulate_convert_ab_x86_avx512_nibble(&chunk_ab_bytes, n_b_med, convert, eq, &mut nibble_plain);
+            }
+
+            ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(None));
+
+            assert_eq!(gpr_split, gpr_plain, "GPR split vs plain n_b_med={n_b_med}");
+            assert_eq!(nibble_split, nibble_plain, "Nibble split vs plain n_b_med={n_b_med}");
+            assert_eq!(nibble_split, gpr_split, "Nibble vs GPR n_b_med={n_b_med}");
         }
     }
 
