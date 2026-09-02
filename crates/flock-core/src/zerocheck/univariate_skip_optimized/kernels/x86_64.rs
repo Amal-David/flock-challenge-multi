@@ -410,9 +410,12 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<cons
 /// bit-identical.
 ///
 /// The eight pre-scaled `u16` offsets of every apply are fetched as two
-/// 64-bit reads and split with shifts. `imgs` are the table images the caller
-/// resolved for this run of windows. `P` is the arena layout (byte order or
-/// parity split); either way each K-row costs the same two word reads.
+/// 64-bit reads and split into fields by `crate::ntt::inv_table::urm_field`.
+/// The ranked artifact selects `pext`; the test oracle retains the incumbent
+/// `shr`/`movzx` form, and the two forms are value-identical. `imgs` are the
+/// table images the caller resolved for this run of windows. `P` is the arena
+/// layout (byte order or parity split); either way each K-row costs the same
+/// two word reads.
 ///
 /// # Safety
 /// As for [`shift_reduce_inner_ab_x86_avx512_pidx`], with `imgs` the table's
@@ -428,11 +431,33 @@ unsafe fn horner_2img_offw<const P: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
+    // The ranked artifact carries only the PEXT form. The shift form remains
+    // available to the test-only oracle through the const-generic helper.
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { horner_2img_offw_x::<P, true>(imgs, op) }
+}
+
+/// [`horner_2img_offw`] with the offset-extraction form fixed by `X`.
+///
+/// # Safety
+/// As for [`horner_2img_offw`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn horner_2img_offw_x<const P: bool, const X: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
     use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply =
+            |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, o);
         let xb = _mm512_set1_epi8(2);
         let mut acc = _mm512_gf2p8mul_epi8(
             apply(op.add(offw_krow_words::<P>(7))),
@@ -461,10 +486,30 @@ unsafe fn residual_2img_offw_k2_7<const P: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { residual_2img_offw_k2_7_x::<P, true>(imgs, op) }
+}
+
+/// [`residual_2img_offw_k2_7`] with the offset-extraction form fixed by `X`.
+///
+/// # Safety
+/// As for [`residual_2img_offw_k2_7`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn residual_2img_offw_k2_7_x<const P: bool, const X: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
     use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply =
+            |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, o);
         macro_rules! scaled {
             ($k:literal) => {{
                 let product = _mm512_gf2p8mul_epi8(
@@ -538,10 +583,30 @@ unsafe fn residual_2img_offw_k0_3<const P: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { residual_2img_offw_k0_3_x::<P, true>(imgs, op) }
+}
+
+/// [`residual_2img_offw_k0_3`] with the offset-extraction form fixed by `X`.
+///
+/// # Safety
+/// As for [`residual_2img_offw_k0_3`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn residual_2img_offw_k0_3_x<const P: bool, const X: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
     use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply =
+            |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, o);
         let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
         macro_rules! scaled {
             ($k:literal) => {{

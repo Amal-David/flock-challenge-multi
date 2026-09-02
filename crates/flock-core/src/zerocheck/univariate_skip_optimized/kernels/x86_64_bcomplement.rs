@@ -8,7 +8,7 @@
 use core::arch::x86_64::*;
 
 use super::x86_64_bstatic_plan::{BSTATIC_PLAN, BstaticRow};
-use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
+use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words, urm_field};
 
 #[derive(Clone, Copy)]
 struct WindowPlan {
@@ -88,14 +88,33 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
     imgs: (*const u8, *const u8),
     blk: usize,
 ) {
+    // The ranked artifact carries only the PEXT form. The shift form remains
+    // available to the test-only oracle through the const-generic helper.
+    // SAFETY: forwarded from this function's contract.
+    unsafe { shift_reduce_bcomplement_offw_nt2_x::<P, true>(op, out, imgs, blk) }
+}
+
+/// [`shift_reduce_bcomplement_offw_nt2`] with the offset-extraction form
+/// fixed by `X` (see `crate::ntt::inv_table::urm_field`). `X` changes no
+/// value, only which instruction produces it.
+///
+/// # Safety
+/// As for [`shift_reduce_bcomplement_offw_nt2`].
+#[inline(always)]
+unsafe fn shift_reduce_bcomplement_offw_nt2_x<const P: bool, const X: bool>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+    blk: usize,
+) {
     debug_assert!((2..=29).contains(&blk));
     unsafe {
         let plan = WINDOW_PLANS[blk - 2];
         let mut modes = plan.modes;
-        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
+        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
         let (bv, correction) =
-            apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
+            apply_b_mode::<P, X>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
         let mut acc = _mm512_xor_si512(
             if (modes as u8) == 15 {
                 _mm512_setzero_si512()
@@ -110,7 +129,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
             let av = apply(op.add(offw_krow_words::<P>(k)));
             let mode = modes as u8;
             let (bv, correction) =
-                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), mode, av);
+                apply_b_mode::<P, X>(imgs, op.add(64 + offw_krow_words::<P>(k)), mode, av);
             let product = if mode == 15 {
                 _mm512_setzero_si512()
             } else {
@@ -132,12 +151,32 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
 ) {
+    // The production caller fixes the extraction form to PEXT.
+    // SAFETY: forwarded from this function's contract.
+    unsafe { shift_reduce_bcomplement_offw_nt2_const_x::<BLK, P, true>(op, out, imgs) }
+}
+
+/// [`shift_reduce_bcomplement_offw_nt2_const`] with the offset-extraction
+/// form fixed by `X`. `X` changes no value.
+///
+/// # Safety
+/// As for [`shift_reduce_bcomplement_offw_nt2_const`].
+#[inline(always)]
+unsafe fn shift_reduce_bcomplement_offw_nt2_const_x<
+    const BLK: usize,
+    const P: bool,
+    const X: bool,
+>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
     debug_assert!((3..=28).contains(&BLK));
     unsafe {
         let plan = WINDOW_PLANS[BLK - 2];
-        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
+        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode::<P>(
+        let (bv, correction) = apply_b_mode::<P, X>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
             plan.modes as u8,
@@ -155,7 +194,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode::<P>(
+                let (bv, correction) = apply_b_mode::<P, X>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
                     (plan.modes >> $shift) as u8,
@@ -187,7 +226,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
 /// Shared dispatch inside the existing consumer, not one call per K-row.
 /// `op` addresses this K-row in the `P` layout.
 #[inline(always)]
-unsafe fn apply_b_mode<const P: bool>(
+unsafe fn apply_b_mode<const P: bool, const X: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
     mode: u8,
@@ -195,23 +234,23 @@ unsafe fn apply_b_mode<const P: bool>(
 ) -> (__m512i, __m512i) {
     unsafe {
         match mode {
-            1 => (apply_b_complement::<1, 8, P>(imgs, op), av),
-            2 => (apply_b_complement::<2, 8, P>(imgs, op), av),
-            3 => (apply_b_complement::<3, 8, P>(imgs, op), av),
-            4 => (apply_b_complement::<4, 8, P>(imgs, op), av),
-            5 => (apply_b_complement::<5, 8, P>(imgs, op), av),
-            6 => (apply_b_complement::<6, 8, P>(imgs, op), av),
-            7 => (apply_b_complement::<7, 8, P>(imgs, op), av),
-            8 => (apply_b_complement::<0, 7, P>(imgs, op), av),
-            9 => (apply_b_complement::<0, 6, P>(imgs, op), av),
-            10 => (apply_b_complement::<0, 5, P>(imgs, op), av),
-            11 => (apply_b_complement::<0, 4, P>(imgs, op), av),
-            12 => (apply_b_complement::<0, 3, P>(imgs, op), av),
-            13 => (apply_b_complement::<0, 2, P>(imgs, op), av),
-            14 => (apply_b_complement::<0, 1, P>(imgs, op), av),
+            1 => (apply_b_complement::<1, 8, P, X>(imgs, op), av),
+            2 => (apply_b_complement::<2, 8, P, X>(imgs, op), av),
+            3 => (apply_b_complement::<3, 8, P, X>(imgs, op), av),
+            4 => (apply_b_complement::<4, 8, P, X>(imgs, op), av),
+            5 => (apply_b_complement::<5, 8, P, X>(imgs, op), av),
+            6 => (apply_b_complement::<6, 8, P, X>(imgs, op), av),
+            7 => (apply_b_complement::<7, 8, P, X>(imgs, op), av),
+            8 => (apply_b_complement::<0, 7, P, X>(imgs, op), av),
+            9 => (apply_b_complement::<0, 6, P, X>(imgs, op), av),
+            10 => (apply_b_complement::<0, 5, P, X>(imgs, op), av),
+            11 => (apply_b_complement::<0, 4, P, X>(imgs, op), av),
+            12 => (apply_b_complement::<0, 3, P, X>(imgs, op), av),
+            13 => (apply_b_complement::<0, 2, P, X>(imgs, op), av),
+            14 => (apply_b_complement::<0, 1, P, X>(imgs, op), av),
             15 => (_mm512_setzero_si512(), av),
             _ => (
-                apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, op),
+                apply_x86_avx512_register_2img_krow_at::<P, X>(imgs.0, imgs.1, op),
                 _mm512_setzero_si512(),
             ),
         }
@@ -228,7 +267,7 @@ unsafe fn apply_b_mode<const P: bool>(
 /// Either way a word is read only when one of its bytes is live, and every
 /// byte is complemented, extracted and applied exactly as before.
 #[inline(always)]
-unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool>(
+unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool, const X: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> __m512i {
@@ -274,15 +313,23 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
             )
         };
         // Byte `b`'s complemented offset; `b` is a literal below, so the
-        // selection and shift fold to one constant field extraction.
-        let field = |b: usize| -> usize {
-            let (w, shift) = if P {
-                (if b & 1 == 0 { wa } else { wb }, 16 * (b >> 1))
-            } else {
-                (if b < 4 { wa } else { wb }, 16 * (b & 3))
-            };
-            (w >> shift) as u16 as usize
-        };
+        // word selection and the field index fold to one constant field
+        // extraction. The word numbering matches the two apply forms exactly:
+        // under the parity split word 0 is the even word `wa` and byte `b` is
+        // its field `b / 2`; in byte order word 0 is `wa` (bytes 0..4) and
+        // byte `b` is its field `b % 4`. `X` and `URM_PEXT_SITES` pick the
+        // extraction FORM (`shr`+`movzx` or one `pext`), never the value.
+        macro_rules! field {
+            ($b:literal) => {{
+                if P {
+                    let w = if $b % 2 == 0 { wa } else { wb };
+                    urm_field::<{ $b % 2 }, { $b / 2 }, X>(w)
+                } else {
+                    let w = if $b < 4 { wa } else { wb };
+                    urm_field::<{ $b / 4 }, { $b % 4 }, X>(w)
+                }
+            }};
+        }
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o).cast::<__m512i>());
         // The conditions use only const parameters. Each surviving component
         // is evaluated once, and a one-sided join has no XOR with zero.
@@ -302,27 +349,27 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
             };
         }
         let u0 = join!(
-            row(imgs.0, field(0)),
+            row(imgs.0, field!(0)),
             FIRST == 0,
-            row(imgs.1, field(1)),
+            row(imgs.1, field!(1)),
             FIRST <= 1 && END > 1
         );
         let u1 = join!(
-            row(imgs.0, field(2)),
+            row(imgs.0, field!(2)),
             FIRST <= 2 && END > 2,
-            row(imgs.1, field(3)),
+            row(imgs.1, field!(3)),
             FIRST <= 3 && END > 3
         );
         let u2 = join!(
-            row(imgs.0, field(4)),
+            row(imgs.0, field!(4)),
             FIRST <= 4 && END > 4,
-            row(imgs.1, field(5)),
+            row(imgs.1, field!(5)),
             FIRST <= 5 && END > 5
         );
         let u3 = join!(
-            row(imgs.0, field(6)),
+            row(imgs.0, field!(6)),
             FIRST <= 6 && END > 6,
-            row(imgs.1, field(7)),
+            row(imgs.1, field!(7)),
             END == 8
         );
         let even = join!(

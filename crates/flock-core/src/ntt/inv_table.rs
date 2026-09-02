@@ -510,8 +510,99 @@ impl InvNttTableByteSingleGf8 {
         debug_assert!(self.has_second_image());
         let (base, base8) = self.image_ptrs();
         // SAFETY: forwarded from this function's contract.
-        unsafe { apply_x86_avx512_register_2img_offw_at(base, base8, off) }
+        unsafe { apply_x86_avx512_register_2img_offw_at::<true>(base, base8, off) }
     }
+}
+
+/// Which of a K-row's eight 16-bit offset extractions use `pext`.
+///
+/// Every site below reads a K-row as exactly two 64-bit words of four `u16`
+/// fields. Bit `4 * WORD + SEL` of this mask selects the field at bit
+/// `16 * SEL` of word `WORD`, where word 0 is the FIRST word the apply reads
+/// (`w0` in byte order, the even word under the parity split) and word 1 the
+/// second. The numbering is identical at every site, so ONE edit here
+/// retunes all of them together.
+///
+/// CHANGE ONLY THIS CONSTANT to retune the conversion fraction `y`, the share
+/// of extractions moved off ports 0/6 onto port 1:
+///
+/// - `0xff` — `y = 1.000`, every field.
+/// - `0x66` — `y = 0.500`: `SEL` 1 and 2 of both words, i.e. exactly the
+///   fields whose incumbent form costs a port-0/6 `shr` AND a `movzx`.
+/// - `0x46` — `y = 0.375`: `SEL` 1 and 2 of word 0 plus `SEL` 2 of word 1;
+///   the nearest step above the modelled optimum `y = 0.336`.
+/// - `0x06` — `y = 0.250`: `SEL` 1 and 2 of word 0 only.
+/// - `0x00` — `y = 0.000`, the shift-only control form used by the oracle.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const URM_PEXT_SITES: u8 = 0x46;
+
+/// One 16-bit pre-scaled row offset out of a K-row word.
+///
+/// The VALUE is `(w >> (16 * SEL)) & 0xffff` in every instantiation. `X`
+/// (fixed by each caller as a const generic) and [`URM_PEXT_SITES`] choose
+/// only the FORM:
+///
+/// - incumbent: `shr` by `16 * SEL` (ports 0/6) then `movzx` to 16 bits
+///   (ports 0/1/5/6) — and for `SEL == 0` / `SEL == 3` just the one of those
+///   two that is not a no-op;
+/// - converted: `_pext_u64(w, 0xffff << (16 * SEL))` — one uop on port 1,
+///   no load, five bytes of code instead of seven.
+///
+/// The two forms are equal for every `w`. `pext(w, m)` writes into bit `i` of
+/// its result the bit of `w` at the position of the `i`-th least significant
+/// set bit of `m`, and zeroes every bit from `popcount(m)` up. For the
+/// CONTIGUOUS mask `m = 0xffff << s` the set bits are exactly the positions
+/// `s, s+1, …, s+15` in increasing order, so result bit `i` is `w` bit
+/// `s + i` for `i < 16` and 0 for `i >= 16`. That is the definition of
+/// `(w >> s) & 0xffff`, for all `2^64` inputs.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn urm_field<const WORD: u32, const SEL: u32, const X: bool>(w: u64) -> usize {
+    // Every operand of this condition is a compile-time constant in each
+    // instantiation, so it folds; nothing is tested at run time.
+    if X
+        && (URM_PEXT_SITES & (1u8 << (4 * WORD + SEL))) != 0
+        && cfg!(target_feature = "bmi2")
+    {
+        // The `_pext_u64` INTRINSIC cannot be used here: LLVM's InstCombine
+        // rewrites `llvm.x86.bmi.pext.64` whose mask is a constant SHIFTED
+        // MASK straight back into `lshr` + `and`, i.e. into the very
+        // `shr`/`movzx` pair this is meant to replace. That fold runs in the
+        // target-independent middle end, so it is unaffected by
+        // `#[target_feature(enable = "bmi2")]` or by `-C target-cpu`; the
+        // intrinsic form provably never reaches the assembler as a `pext`.
+        // Emitting the instruction directly is the only way to obtain it.
+        //
+        // `pure` + `nomem` let LLVM CSE the extraction and hoist the mask
+        // materialisation out of the drain loop, so the hot body pays exactly
+        // one register-register `pext` uop per field and no load; the mask
+        // constant is loop-invariant and lives in a register.
+        //
+        // SAFETY: `pext` requires BMI2, which the `cfg!` in the condition
+        // above established statically for this compilation (the workspace
+        // builds with `-C target-cpu=native`; see `.cargo/config.toml`). The
+        // block reads and writes no memory and `pext` leaves flags alone.
+        let out: u64;
+        unsafe {
+            core::arch::asm!(
+                "pext {o}, {i}, {m}",
+                o = lateout(reg) out,
+                i = in(reg) w,
+                m = in(reg) (0xffff_u64 << (16 * SEL)),
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        return out as usize;
+    }
+    if SEL == 3 {
+        // Same value, one instruction: `w >> 48` already has bits 16.. clear,
+        // so the truncation below is a no-op there. LLVM folds the general
+        // expression to exactly this anyway; spelling it out means the
+        // The test-only shift arm cannot pick up a stray `movzx` relative to
+        // the incumbent even if that fold ever regressed.
+        return (w >> 48) as usize;
+    }
+    ((w >> (16 * SEL)) as u16) as usize
 }
 
 /// [`InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_offw_unchecked`]
@@ -524,7 +615,7 @@ impl InvNttTableByteSingleGf8 {
 #[inline]
 #[target_feature(enable = "avx512f")]
 #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
-pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at<const X: bool>(
     base: *const u8,
     base8: *const u8,
     off: *const u16,
@@ -539,21 +630,23 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
             let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+            // Word 0 is `w0` (bytes 0..4), word 1 is `w1` (bytes 4..8);
+            // `SEL` is the byte's position inside its word.
             let u0 = _mm512_xor_si512(
-                row(base, w0 as u16 as usize),
-                row(base8, (w0 >> 16) as u16 as usize),
+                row(base, urm_field::<0, 0, X>(w0)),
+                row(base8, urm_field::<0, 1, X>(w0)),
             );
             let u1 = _mm512_xor_si512(
-                row(base, (w0 >> 32) as u16 as usize),
-                row(base8, (w0 >> 48) as usize),
+                row(base, urm_field::<0, 2, X>(w0)),
+                row(base8, urm_field::<0, 3, X>(w0)),
             );
             let u2 = _mm512_xor_si512(
-                row(base, w1 as u16 as usize),
-                row(base8, (w1 >> 16) as u16 as usize),
+                row(base, urm_field::<1, 0, X>(w1)),
+                row(base8, urm_field::<1, 1, X>(w1)),
             );
             let u3 = _mm512_xor_si512(
-                row(base, (w1 >> 32) as u16 as usize),
-                row(base8, (w1 >> 48) as usize),
+                row(base, urm_field::<1, 2, X>(w1)),
+                row(base8, urm_field::<1, 3, X>(w1)),
             );
             let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
             let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
@@ -579,7 +672,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at<const X: bool>(
     base: *const u8,
     base8: *const u8,
     even: *const u16,
@@ -591,21 +684,23 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
         let we = (even as *const u64).read_unaligned();
         let wo = (even.add(32) as *const u64).read_unaligned();
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        // Word 0 is the even word `we` (bytes 0, 2, 4, 6), word 1 the odd
+        // word `wo` (bytes 1, 3, 5, 7); `SEL` is the K-row byte pair index.
         let u0 = _mm512_xor_si512(
-            row(base, we as u16 as usize),
-            row(base8, wo as u16 as usize),
+            row(base, urm_field::<0, 0, X>(we)),
+            row(base8, urm_field::<1, 0, X>(wo)),
         );
         let u1 = _mm512_xor_si512(
-            row(base, (we >> 16) as u16 as usize),
-            row(base8, (wo >> 16) as u16 as usize),
+            row(base, urm_field::<0, 1, X>(we)),
+            row(base8, urm_field::<1, 1, X>(wo)),
         );
         let u2 = _mm512_xor_si512(
-            row(base, (we >> 32) as u16 as usize),
-            row(base8, (wo >> 32) as u16 as usize),
+            row(base, urm_field::<0, 2, X>(we)),
+            row(base8, urm_field::<1, 2, X>(wo)),
         );
         let u3 = _mm512_xor_si512(
-            row(base, (we >> 48) as usize),
-            row(base8, (wo >> 48) as usize),
+            row(base, urm_field::<0, 3, X>(we)),
+            row(base8, urm_field::<1, 3, X>(wo)),
         );
         let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
         let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
@@ -624,14 +719,15 @@ pub(crate) const fn offw_krow_words<const P: bool>(k: usize) -> usize {
 }
 
 /// K-row apply under either arena layout: `p` is
-/// `side.add(offw_krow_words::<P>(k))`.
+/// `side.add(offw_krow_words::<P>(k))`. `X` is the [`urm_field`] extraction
+/// form; it changes no value.
 ///
 /// # Safety
 /// As for [`apply_x86_avx512_register_2img_offw_at`] (`P = false`) or
 /// [`apply_x86_avx512_register_2img_offp_at`] (`P = true`).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
+pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool, const X: bool>(
     base: *const u8,
     base8: *const u8,
     p: *const u16,
@@ -639,9 +735,9 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
     // SAFETY: forwarded from this function's contract.
     unsafe {
         if P {
-            apply_x86_avx512_register_2img_offp_at(base, base8, p)
+            apply_x86_avx512_register_2img_offp_at::<X>(base, base8, p)
         } else {
-            apply_x86_avx512_register_2img_offw_at(base, base8, p)
+            apply_x86_avx512_register_2img_offw_at::<X>(base, base8, p)
         }
     }
 }
@@ -919,7 +1015,7 @@ mod tests {
                     // SAFETY: avx512f; both images present; `offp` holds the
                     // even word at 0 and the odd word at 32.
                     let reg = unsafe {
-                        apply_x86_avx512_register_2img_offp_at(base, base8, offp.as_ptr())
+                        apply_x86_avx512_register_2img_offp_at::<true>(base, base8, offp.as_ptr())
                     };
                     let mut got = [0u8; 64];
                     // SAFETY: 64-byte destination for one ZMM store.
@@ -937,6 +1033,127 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The `pext` extraction form must be VALUE-identical to the incumbent
+    /// `shr`/`movzx` form, site by site and apply by apply.
+    ///
+    /// Three layers, all over randomised inputs:
+    ///  1. the eight `urm_field` sites against a literal reference
+    ///     `(w >> 16*SEL) & 0xffff`, forced on (`X = true`) and off;
+    ///  2. `apply_x86_avx512_register_2img_offw_at::<true>` against
+    ///     `::<false>` over random pre-scaled offset arrays;
+    ///  3. the same for the parity-split `..._offp_at`.
+    ///
+    /// Layers 2 and 3 are the ones the drain actually runs, so they are the
+    /// bit-exactness guarantee for the emitted proof bytes. Layer 1 still
+    /// runs when [`URM_PEXT_SITES`] excludes a site, because it instantiates
+    /// the sites directly rather than through the mask.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pext_extraction_matches_shift_extraction() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+
+        // Layer 1: the extraction itself, independent of URM_PEXT_SITES.
+        // `site!` also instantiates X = true directly, so the pext arm is
+        // exercised even where the shipped mask would have folded it away.
+        let mut rng = Rng::new(0xC0FFEE_42);
+        for _ in 0..4096 {
+            let w = rng.next_u64();
+            macro_rules! site {
+                ($word:literal, $sel:literal) => {{
+                    let want = ((w >> (16u32 * $sel)) & 0xffff) as usize;
+                    assert_eq!(
+                        urm_field::<{ $word }, { $sel }, false>(w),
+                        want,
+                        "shift form wrong at word={} sel={} w={w:#018x}",
+                        $word,
+                        $sel
+                    );
+                    // Only meaningful when this site is in the shipped mask;
+                    // otherwise both arms are the shift form, which is still
+                    // the property under test.
+                    assert_eq!(
+                        urm_field::<{ $word }, { $sel }, true>(w),
+                        want,
+                        "pext form wrong at word={} sel={} w={w:#018x}",
+                        $word,
+                        $sel
+                    );
+                }};
+            }
+            site!(0, 0);
+            site!(0, 1);
+            site!(0, 2);
+            site!(0, 3);
+            site!(1, 0);
+            site!(1, 1);
+            site!(1, 2);
+            site!(1, 3);
+        }
+
+        // Layers 2 and 3: whole applies against a real k = 6 table.
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(1 << 6));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        assert_eq!(table.ell, 64);
+        assert_eq!(table.n_chunks, 8);
+        assert!(table.has_second_image());
+        let (base, base8) = table.image_ptrs();
+
+        // SAFETY: one ZMM store into a 64-byte destination.
+        let dump = |v: core::arch::x86_64::__m512i| -> [u8; 64] {
+            let mut out = [0u8; 64];
+            unsafe {
+                core::arch::x86_64::_mm512_storeu_si512(
+                    out.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                    v,
+                )
+            };
+            out
+        };
+
+        for _ in 0..4096 {
+            let bytes: [u8; 8] = core::array::from_fn(|_| (rng.next_u64() & 0xff) as u8);
+
+            // Byte-order arena: eight contiguous pre-scaled offsets.
+            let offw: [u16; 8] = core::array::from_fn(|b| bytes[b] as u16 * 64);
+            // Parity-split arena: even bytes at 0, odd bytes at 32.
+            let mut offp = [0u16; 64];
+            for (b, &byte) in bytes.iter().enumerate() {
+                offp[(b & 1) * 32 + (b >> 1)] = byte as u16 * 64;
+            }
+
+            // SAFETY: avx512f detected above; both images present; each array
+            // supplies the readable pre-scaled offsets its form contracts for.
+            let (w_off, w_on, p_off, p_on) = unsafe {
+                (
+                    apply_x86_avx512_register_2img_offw_at::<false>(base, base8, offw.as_ptr()),
+                    apply_x86_avx512_register_2img_offw_at::<true>(base, base8, offw.as_ptr()),
+                    apply_x86_avx512_register_2img_offp_at::<false>(base, base8, offp.as_ptr()),
+                    apply_x86_avx512_register_2img_offp_at::<true>(base, base8, offp.as_ptr()),
+                )
+            };
+            assert_eq!(
+                dump(w_off),
+                dump(w_on),
+                "offw pext differs, bytes={bytes:02x?}"
+            );
+            assert_eq!(
+                dump(p_off),
+                dump(p_on),
+                "offp pext differs, bytes={bytes:02x?}"
+            );
+            // The two arenas already agree; re-asserting it here keeps the
+            // pext twin pinned to the SAME value, not merely to its own twin.
+            assert_eq!(
+                dump(w_on),
+                dump(p_on),
+                "offw/offp disagree, bytes={bytes:02x?}"
+            );
         }
     }
 
