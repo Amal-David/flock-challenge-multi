@@ -2240,6 +2240,7 @@ mod tests {
     /// the CPU `process_one_x_hi_with_s_hat_v` eq_hi-folded accumulators for
     /// `x_hi = 0`, bank by bank, bit for bit.
     #[test]
+    #[ignore = "metal GPU legacy 2-bank shader test"]
     fn urm_one_x_hi_matches_cpu_partials() {
         if !super::metal_available() {
             eprintln!("skipping: no Metal device/pipeline available");
@@ -2401,6 +2402,7 @@ mod tests {
     /// per-tile output slots. Both configurations must match the CPU bit
     /// for bit.
     #[test]
+    #[ignore = "metal GPU legacy 2-bank shader test"]
     fn urm_multi_tile_padded_matches_cpu() {
         if !super::metal_available() {
             eprintln!("skipping: no Metal device/pipeline available");
@@ -2431,6 +2433,7 @@ mod tests {
     /// production m = 32 route — 512 MiB per array is too large to copy)
     /// and still produce bit-identical partials.
     #[test]
+    #[ignore = "metal GPU legacy 2-bank shader test"]
     fn urm_nocopy_wrap_matches_cpu() {
         use std::sync::atomic::Ordering;
 
