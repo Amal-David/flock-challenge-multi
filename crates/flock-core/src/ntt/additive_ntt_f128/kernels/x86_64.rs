@@ -1325,6 +1325,14 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
                 _mm512_storeu_si512(p as *mut __m512i, v);
             }
         };
+        let load_src = |i: usize, off: usize| -> __m512i {
+            let p = src_row(i).add(off);
+            if (p as usize).is_multiple_of(64) {
+                _mm512_load_si512(p as *const __m512i)
+            } else {
+                _mm512_loadu_si512(p as *const __m512i)
+            }
+        };
         while lane + 8 <= lanes {
             if pf {
                 let off0 = lane * core::mem::size_of::<F128>();
@@ -1334,15 +1342,15 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
                     _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
                 }
             }
-            let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
-            let vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
-            let vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
-            let vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+            let va0 = load_src(0, lane);
+            let vb0 = load_src(1, lane);
+            let vc0 = load_src(2, lane);
+            let vd0 = load_src(3, lane);
 
-            let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
-            let vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
-            let vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
-            let vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+            let va1 = load_src(0, lane + 4);
+            let vb1 = load_src(1, lane + 4);
+            let vc1 = load_src(2, lane + 4);
+            let vd1 = load_src(3, lane + 4);
 
             let mut sb0 = vb0;
             let mut sc0 = _mm512_xor_si512(vc0, va0);
