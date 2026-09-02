@@ -327,29 +327,33 @@ unsafe fn butterfly_fused_2layer_impl<
             let mut vc1 = _mm512_loadu_si512(c.as_ptr().add(i + 4) as *const __m512i);
             let mut vd1 = _mm512_loadu_si512(d.as_ptr().add(i + 4) as *const __m512i);
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            let (m_vc0, m_vc1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vc0, vc1);
+            let new_a0 = _mm512_xor_si512(va0, m_vc0);
+            let new_a1 = _mm512_xor_si512(va1, m_vc1);
             vc0 = _mm512_xor_si512(vc0, new_a0);
             vc1 = _mm512_xor_si512(vc1, new_a1);
             va0 = new_a0;
             va1 = new_a1;
 
-            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
-            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vd0, vd1);
+            let new_b0 = _mm512_xor_si512(vb0, m_vd0);
+            let new_b1 = _mm512_xor_si512(vb1, m_vd1);
             vd0 = _mm512_xor_si512(vd0, new_b0);
             vd1 = _mm512_xor_si512(vd1, new_b1);
             vb0 = new_b0;
             vb1 = new_b1;
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+            let (m_vb0, m_vb1) = mul_x4_pair::<INNER_LOW, DIET>(inner_a, vb0, vb1);
+            let new_a0 = _mm512_xor_si512(va0, m_vb0);
+            let new_a1 = _mm512_xor_si512(va1, m_vb1);
             vb0 = _mm512_xor_si512(vb0, new_a0);
             vb1 = _mm512_xor_si512(vb1, new_a1);
             va0 = new_a0;
             va1 = new_a1;
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<INNER_LOW, DIET>(inner_b, vd0, vd1);
+            let new_c0 = _mm512_xor_si512(vc0, m_vd0);
+            let new_c1 = _mm512_xor_si512(vc1, m_vd1);
             vd0 = _mm512_xor_si512(vd0, new_c0);
             vd1 = _mm512_xor_si512(vd1, new_c1);
             vc0 = new_c0;
@@ -800,29 +804,33 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<
             let mut vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
             let mut vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            let (m_vc0, m_vc1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vc0, vc1);
+            let new_a0 = _mm512_xor_si512(va0, m_vc0);
+            let new_a1 = _mm512_xor_si512(va1, m_vc1);
             vc0 = _mm512_xor_si512(vc0, new_a0);
             vc1 = _mm512_xor_si512(vc1, new_a1);
             va0 = new_a0;
             va1 = new_a1;
 
-            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
-            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vd0, vd1);
+            let new_b0 = _mm512_xor_si512(vb0, m_vd0);
+            let new_b1 = _mm512_xor_si512(vb1, m_vd1);
             vd0 = _mm512_xor_si512(vd0, new_b0);
             vd1 = _mm512_xor_si512(vd1, new_b1);
             vb0 = new_b0;
             vb1 = new_b1;
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<false, DIET>(inner_a, vb0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<false, DIET>(inner_a, vb1));
+            let (m_vb0, m_vb1) = mul_x4_pair::<false, DIET>(inner_a, vb0, vb1);
+            let new_a0 = _mm512_xor_si512(va0, m_vb0);
+            let new_a1 = _mm512_xor_si512(va1, m_vb1);
             vb0 = _mm512_xor_si512(vb0, new_a0);
             vb1 = _mm512_xor_si512(vb1, new_a1);
             va0 = new_a0;
             va1 = new_a1;
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, DIET>(inner_b, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<false, DIET>(inner_b, vd0, vd1);
+            let new_c0 = _mm512_xor_si512(vc0, m_vd0);
+            let new_c1 = _mm512_xor_si512(vc1, m_vd1);
             vd0 = _mm512_xor_si512(vd0, new_c0);
             vd1 = _mm512_xor_si512(vd1, new_c1);
             vc0 = new_c0;
@@ -1144,8 +1152,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
             vb0 = _mm512_xor_si512(vb0, va0);
             vb1 = _mm512_xor_si512(vb1, va1);
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<INNER_LOW, DIET>(inner_b, vd0, vd1);
+            let new_c0 = _mm512_xor_si512(vc0, m_vd0);
+            let new_c1 = _mm512_xor_si512(vc1, m_vd1);
             vd0 = _mm512_xor_si512(vd0, new_c0);
             vd1 = _mm512_xor_si512(vd1, new_c1);
             vc0 = new_c0;
