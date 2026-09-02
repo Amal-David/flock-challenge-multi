@@ -1342,6 +1342,12 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
                     _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
                 }
             }
+            if lane + 24 <= lanes {
+                let pf_src_off = (lane + 16) * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(src_row(i).add(pf_src_off) as *const i8);
+                }
+            }
             let va0 = load_src(0, lane);
             let vb0 = load_src(1, lane);
             let vc0 = load_src(2, lane);
@@ -1425,10 +1431,10 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
                     _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
                 }
             }
-            let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
-            let vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
-            let vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
-            let vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+            let va = load_src(0, lane);
+            let vb = load_src(1, lane);
+            let vc = load_src(2, lane);
+            let vd = load_src(3, lane);
 
             let mut sb = vb;
             let mut sc = _mm512_xor_si512(vc, va);
