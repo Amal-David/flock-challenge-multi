@@ -1256,10 +1256,17 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
-        // Truly single-threaded (or explicitly disabled): no extra OS thread;
-        // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
-        // offload and keeps fixed-thread-count sweeps honest.
+    // The pre-fault offload thread is off by default: on the ranked
+    // c7i.4xlarge its page faults contend with the 16 Rayon workers during the
+    // overlapped phase and commit allocating inline is faster end to end.
+    // `FLOCK_PREFAULT=1` re-enables the incumbent offload for same-binary A/B;
+    // `FLOCK_NO_PREFAULT=1` still forces it off.
+    if rayon::current_num_threads() <= 1
+        || std::env::var_os("FLOCK_NO_PREFAULT").is_some()
+        || std::env::var_os("FLOCK_PREFAULT").is_none()
+    {
+        // Truly single-threaded (or not opted in): no extra OS thread; commit
+        // allocates inline.
         return (None, generate());
     }
     let codeword_len = params.n_positions() * params.num_ntts();

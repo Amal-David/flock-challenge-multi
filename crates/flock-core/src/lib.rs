@@ -514,8 +514,15 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
     if bytes < HUGE {
         return;
     }
-    static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
+    // Off by default: on the ranked c7i.4xlarge the synchronous setup-phase
+    // collapse calls cost more than the 2 MiB pages return once the first-touch
+    // faults already won the THP lottery. `FLOCK_MADV_COLLAPSE=1` re-enables the
+    // incumbent behaviour for same-binary A/B; `FLOCK_NO_MADV_COLLAPSE=1` still
+    // forces it off.
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some()
+            || std::env::var_os("FLOCK_MADV_COLLAPSE").is_none()
+    });
     if *DISABLED {
         return;
     }
