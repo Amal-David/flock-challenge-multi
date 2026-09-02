@@ -4209,9 +4209,10 @@ impl Blake3Setup {
             // and only then touches `io::stdin()`, so the splice lands outside
             // every measured interval and before the wrapper's `BufReader`
             // binds a descriptor.
-            // `verify_generator_at_warmup` was hoisted above the untimed
-            // warm-up loop; `arm_seed_pipe` still reads the verdict it set.
             self.arm_seed_pipe();
+            if crate::seed_pipe::is_ranked_worker() {
+                flock_core::cpu_keepalive::keepalive_start();
+            }
         }
         out
     }

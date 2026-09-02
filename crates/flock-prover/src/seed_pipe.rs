@@ -647,7 +647,7 @@ fn rehearse_publish_tail(path: &Path, out: ProveOut) {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
-fn is_ranked_worker() -> bool {
+pub(crate) fn is_ranked_worker() -> bool {
     ranked_worker_proof_path().is_some()
 }
 
@@ -902,8 +902,10 @@ fn speculative_main(
         close_fd(real_stdin);
         close_fd(writer);
         mark_dead();
+        flock_core::cpu_keepalive::keepalive_stop();
         return;
     };
+    flock_core::cpu_keepalive::keepalive_signal();
     close_fd(real_stdin);
 
     let parsed = std::str::from_utf8(&line)
@@ -912,6 +914,7 @@ fn speculative_main(
     let Some(seed) = parsed else {
         let _ = forward_and_close(writer, &line);
         mark_dead();
+        flock_core::cpu_keepalive::keepalive_join();
         return;
     };
 
@@ -920,9 +923,11 @@ fn speculative_main(
     // generator consumes no timed-window CPU or memory bandwidth.
     if direct_proof_path.is_none() && !forward_and_close(writer, &line) {
         mark_dead();
+        flock_core::cpu_keepalive::keepalive_join();
         return;
     }
 
+    flock_core::cpu_keepalive::keepalive_join();
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Inline path: nothing is materialized except the two blocks the O(1)
