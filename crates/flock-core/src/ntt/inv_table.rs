@@ -538,7 +538,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
         unsafe {
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
-            let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+            let row = |img: *const u8, o: usize| _mm512_load_si512(img.add(o) as *const __m512i);
             let u0 = _mm512_xor_si512(
                 row(base, w0 as u16 as usize),
                 row(base8, (w0 >> 16) as u16 as usize),
@@ -590,7 +590,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
     unsafe {
         let we = (even as *const u64).read_unaligned();
         let wo = (even.add(32) as *const u64).read_unaligned();
-        let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        let row = |img: *const u8, o: usize| _mm512_load_si512(img.add(o) as *const __m512i);
         let u0 = _mm512_xor_si512(
             row(base, we as u16 as usize),
             row(base8, wo as u16 as usize),
