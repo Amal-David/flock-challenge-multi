@@ -1534,6 +1534,111 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
+    /// Verified equivalence of direct GFNI kernel against the staged
+    /// accumulate/write reference across all ranked shapes ((2, 16) and (0, 15)),
+    /// with and without first-write initialization, on random poisoned destination buffers.
+    #[cfg(target_feature = "gfni")]
+    #[test]
+    fn test_r1_direct_matches_staged_shapes() {
+        let mut word = 0xA5A5_5A5A_0123_4567u64;
+        let mut next = || {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            word
+        };
+        let mut chunk_ab_bytes = [[0u8; ELL]; 1 << N_MEDIUM];
+        for row in &mut chunk_ab_bytes {
+            for byte in row {
+                *byte = next() as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for matrix in &mut mats {
+            *matrix = next();
+        }
+        let seed = std::array::from_fn(|i| (next() as u8).wrapping_add(i as u8));
+        let prefetch = super::super::AbDirectPrefetch {
+            next_window: core::ptr::null(),
+            first: 0,
+            end: 0,
+            spread: false,
+        };
+
+        for &(first, n) in &[(2usize, 16usize), (0, 15usize)] {
+            let live_rows = unsafe {
+                core::slice::from_raw_parts(
+                    chunk_ab_bytes.as_ptr().cast::<u8>().add(first * ELL),
+                    (n - first) * ELL,
+                )
+            };
+            for &first_write in &[false, true] {
+                let mut direct = seed;
+                let mut staged = seed;
+                unsafe {
+                    match (first, n, first_write) {
+                        (2, 16, false) => convert_ab_nomul_x86_gfni_direct::<2, 16, false>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (2, 16, true) => convert_ab_nomul_x86_gfni_direct::<2, 16, true>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (0, 15, false) => convert_ab_nomul_x86_gfni_direct::<0, 15, false>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        (0, 15, true) => convert_ab_nomul_x86_gfni_direct::<0, 15, true>(
+                            live_rows,
+                            &mats,
+                            &mut direct,
+                            &prefetch,
+                        ),
+                        _ => unreachable!(),
+                    }
+                    match (first, n, first_write) {
+                        (2, 16, false) => accumulate_convert_ab_nomul_x86_gfni_range2(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut staged,
+                        ),
+                        (2, 16, true) => write_convert_ab_nomul_x86_gfni_range2(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut staged,
+                        ),
+                        (0, 15, false) => accumulate_convert_ab_nomul_x86_gfni(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut staged,
+                        ),
+                        (0, 15, true) => write_convert_ab_nomul_x86_gfni(
+                            &chunk_ab_bytes,
+                            n,
+                            &mats,
+                            &mut staged,
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+                assert_eq!(
+                    direct, staged,
+                    "first={first} n={n} first_write={first_write}"
+                );
+            }
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1919,6 +2024,9 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
 /// Same ranked GFNI row/plane chains as the staged entry points, loading
 /// only the producer's initialized `FIRST..N` span. The caller proves the
 /// span length and that FIRST_WRITE overwrites every plane before a read.
+/// Direct-input twin of the ranked GFNI drains. The slice contains ONLY
+/// absolute medium rows `first_b_med..n_b_med`, not the entire window.
+/// Matrix indexing remains absolute; omitted prefix/tail rows are never read.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
