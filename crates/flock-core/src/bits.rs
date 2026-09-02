@@ -95,7 +95,7 @@ static BIT_TRANSPOSE_I: BitTransposeI = BitTransposeI([
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[inline(always)]
+#[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     use core::arch::x86_64::*;
