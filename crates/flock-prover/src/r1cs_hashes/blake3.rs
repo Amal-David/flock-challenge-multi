@@ -2677,12 +2677,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 // the dump writes every window byte before the projection
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
+                let want = if ab_nt && !ab_stream {
                     WIN_LINES
                 } else {
-                    0
+                    STAGE_LINES
                 };
                 if want != 0 {
                     v.reserve_exact(want);
@@ -2705,8 +2703,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 } else {
                     None
                 };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
+                let stage = if win_ab.is_none() {
+                    debug_assert!(win.len() >= STAGE_LINES);
                     Some(win.as_mut_ptr().cast::<u32>())
                 } else {
                     None
