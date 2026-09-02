@@ -4210,9 +4210,6 @@ impl Blake3Setup {
             // every measured interval and before the wrapper's `BufReader`
             // binds a descriptor.
             self.arm_seed_pipe();
-            if crate::seed_pipe::is_ranked_worker() {
-                flock_core::cpu_keepalive::keepalive_start();
-            }
         }
         out
     }

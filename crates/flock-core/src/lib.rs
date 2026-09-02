@@ -19,7 +19,6 @@
 
 pub mod bits;
 pub mod challenger;
-pub mod cpu_keepalive;
 pub mod field;
 pub mod gaptime;
 pub mod gpu;
