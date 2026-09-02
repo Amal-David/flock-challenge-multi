@@ -1,0 +1,6 @@
+# started on Mon Aug 31 09:46:28 2026
+
+300743,,dtlb_load_misses.walk_completed,2842041431,100.00,,
+266433,,dtlb_load_misses.walk_completed_4k,2842041431,100.00,,
+34247,,dtlb_load_misses.walk_completed_2m_4m,2842041431,100.00,,
+171038,,dtlb_store_misses.walk_completed,2842041431,100.00,,

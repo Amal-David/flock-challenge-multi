@@ -1,0 +1,5 @@
+label=tlb1
+events=dtlb_load_misses.walk_completed,dtlb_load_misses.walk_completed_4k,dtlb_load_misses.walk_completed_2m_4m,dtlb_store_misses.walk_completed
+seed=1311768467463790320
+elapsed_ns=237747791
+worker_status=0

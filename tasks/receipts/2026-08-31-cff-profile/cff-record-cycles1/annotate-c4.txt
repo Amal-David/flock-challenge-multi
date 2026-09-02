@@ -1,0 +1,339 @@
+ Percent |	Source code & Disassembly of stfmp-control-worker for cpu/cycles/P (2538 samples, percent: local period)
+------------------------------------------------------------------------------------------------------------------------
+         : 0      0x2760e0 <flock_core::zerocheck::multilinear::kernels::x86_64::gfni_fold64_rows_masked_c4_bcast>:
+    0.86 :   2760e0:        push    rbp
+    0.00 :   2760e1:        mov     rbp, rsp
+    0.00 :   2760e4:        and     rsp, -0x40
+    0.00 :   2760e8:        sub     rsp, 0x280
+    0.00 :   2760ef:        vmovdqu64       zmm1, zmmword ptr [rdi]
+    0.19 :   2760f5:        vmovdqu64       zmm2, zmmword ptr [rdi + 0x40]
+    0.19 :   2760fc:        vmovdqu64       zmm3, zmmword ptr [rdi + 0x80]
+    0.00 :   276103:        vmovdqu64       zmm4, zmmword ptr [rdi + 0xc0]
+    0.48 :   27610a:        vmovdqu64       zmm5, zmmword ptr [rdi + 0x100]
+    0.00 :   276111:        vmovdqu64       zmm6, zmmword ptr [rdi + 0x140]
+    0.08 :   276118:        vmovdqu64       zmm7, zmmword ptr [rdi + 0x180]
+    0.08 :   27611f:        vmovdqu64       zmm8, zmmword ptr [rdi + 0x1c0]
+    0.11 :   276126:        vmovdqa64       zmm0, zmmword ptr [rip - 0x24eef0]  # 0x27240
+    0.00 :   276130:        vmovdqa64       zmm9, zmmword ptr [rip - 0x24f8ba]  # 0x26880
+    0.00 :   27613a:        vmovdqa64       zmm10, zmm1
+    0.00 :   276140:        vpermt2q        zmm10, zmm9, zmm2
+    1.15 :   276146:        vmovdqa64       zmm11, zmmword ptr [rip - 0x24f890]  # 0x268c0
+    0.00 :   276150:        vpermt2q        zmm1, zmm11, zmm2
+    0.24 :   276156:        vmovdqa64       zmm2, zmm3
+    0.00 :   27615c:        vpermt2q        zmm2, zmm9, zmm4
+    0.08 :   276162:        vpermt2q        zmm3, zmm11, zmm4
+    0.04 :   276168:        vinserti64x4    zmm4, zmm10, ymm2, 0x1
+    0.28 :   27616f:        vpermb  zmm4, zmm0, zmm4
+    0.55 :   276175:        vmovdqa64       zmmword ptr [rsp + 0x40], zmm4
+    0.51 :   27617d:        vshufi64x2      zmm2, zmm10, zmm2, 0xee
+    0.00 :   276184:        vpermb  zmm2, zmm0, zmm2
+    0.28 :   27618a:        vmovdqa64       zmmword ptr [rsp + 0x80], zmm2
+    0.40 :   276192:        vinserti64x4    zmm2, zmm1, ymm3, 0x1
+    0.12 :   276199:        vpermb  zmm2, zmm0, zmm2
+    0.47 :   27619f:        vmovdqa64       zmmword ptr [rsp + 0xc0], zmm2
+    0.32 :   2761a7:        vshufi64x2      zmm1, zmm1, zmm3, 0xee
+    0.08 :   2761ae:        vpermb  zmm1, zmm0, zmm1
+    0.54 :   2761b4:        vmovdqa64       zmmword ptr [rsp + 0x100], zmm1
+    0.20 :   2761bc:        vmovdqa64       zmm1, zmm5
+    0.04 :   2761c2:        vpermt2q        zmm1, zmm9, zmm6
+    0.23 :   2761c8:        vpermt2q        zmm5, zmm11, zmm6
+    0.35 :   2761ce:        vpermi2q        zmm9, zmm7, zmm8
+    0.08 :   2761d4:        vpermt2q        zmm7, zmm11, zmm8
+    0.13 :   2761da:        vinserti64x4    zmm2, zmm1, ymm9, 0x1
+    0.72 :   2761e1:        vpermb  zmm2, zmm0, zmm2
+    1.46 :   2761e7:        vmovdqa64       zmmword ptr [rsp + 0x140], zmm2
+    0.55 :   2761ef:        vshufi64x2      zmm1, zmm1, zmm9, 0xee
+    0.04 :   2761f6:        vpermb  zmm1, zmm0, zmm1
+    0.08 :   2761fc:        vmovdqa64       zmmword ptr [rsp + 0x180], zmm1
+    0.21 :   276204:        vinserti64x4    zmm1, zmm5, ymm7, 0x1
+    0.08 :   27620b:        vpermb  zmm1, zmm0, zmm1
+    0.20 :   276211:        vmovdqa64       zmmword ptr [rsp + 0x1c0], zmm1
+    0.19 :   276219:        vshufi64x2      zmm1, zmm5, zmm7, 0xee
+    0.04 :   276220:        vpermb  zmm1, zmm0, zmm1
+    0.39 :   276226:        vmovdqa64       zmmword ptr [rsp + 0x200], zmm1
+    0.31 :   27622e:        lea     rax, [rsp + 0x40]
+    0.00 :   276233:        mov     qword ptr [rsp + 0x38], rax
+    0.04 :   276238:        lea     rax, [rsp + 0x38]
+    0.00 :   27623d:        mov     rax, qword ptr [rsp + 0x38]
+    0.08 :   276242:        add     rsi, 0x2000
+    0.12 :   276249:        mov     qword ptr [rsp + 0x38], rsi
+    0.04 :   27624e:        lea     rcx, [rsp + 0x38]
+    0.12 :   276253:        mov     rcx, qword ptr [rsp + 0x38]
+    0.12 :   276258:        vpbroadcastq    zmm1, qword ptr [rax + 0x38]
+    0.00 :   27625f:        vgf2p8affineqb  zmm2, zmm1, zmmword ptr [rcx + 0x9c0], 0x0
+    0.20 :   276267:        vpbroadcastq    zmm3, qword ptr [rax + 0x30]
+    0.00 :   27626e:        vgf2p8affineqb  zmm4, zmm3, zmmword ptr [rcx + 0x980], 0x0
+    0.16 :   276276:        vpbroadcastq    zmm5, qword ptr [rax + 0x28]
+    0.12 :   27627d:        vgf2p8affineqb  zmm6, zmm5, zmmword ptr [rcx + 0x940], 0x0
+    0.47 :   276285:        vpbroadcastq    zmm7, qword ptr [rax + 0x20]
+    0.00 :   27628c:        vgf2p8affineqb  zmm8, zmm7, zmmword ptr [rcx + 0x900], 0x0
+    0.16 :   276294:        vpbroadcastq    zmm9, qword ptr [rax + 0x18]
+    0.00 :   27629b:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0x8c0], 0x0
+    0.36 :   2762a3:        vpbroadcastq    zmm11, qword ptr [rax + 0x10]
+    0.08 :   2762aa:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0x880], 0x0
+    0.31 :   2762b2:        vpbroadcastq    zmm13, qword ptr [rax + 0x8]
+    0.00 :   2762b9:        vgf2p8affineqb  zmm14, zmm13, zmmword ptr [rcx + 0x840], 0x0
+    0.27 :   2762c1:        vpbroadcastq    zmm15, qword ptr [rax]
+    0.00 :   2762c7:        vgf2p8affineqb  zmm16, zmm15, zmmword ptr [rcx + 0x800], 0x0
+    0.71 :   2762cf:        vpternlogq      zmm10, zmm8, zmm6, 0x96
+    0.00 :   2762d6:        vpternlogq      zmm16, zmm14, zmm12, 0x96
+    0.54 :   2762dd:        vgf2p8affineqb  zmm1, zmm1, zmmword ptr [rcx + 0x1c0], 0x0
+    0.16 :   2762e5:        vgf2p8affineqb  zmm3, zmm3, zmmword ptr [rcx + 0x180], 0x0
+    0.40 :   2762ed:        vgf2p8affineqb  zmm5, zmm5, zmmword ptr [rcx + 0x140], 0x0
+    0.62 :   2762f5:        vgf2p8affineqb  zmm6, zmm7, zmmword ptr [rcx + 0x100], 0x0
+    0.28 :   2762fd:        vgf2p8affineqb  zmm7, zmm9, zmmword ptr [rcx + 0xc0], 0x0
+    0.40 :   276305:        vpternlogq      zmm16, zmm2, zmm4, 0x96
+    0.24 :   27630c:        vpternlogq      zmm7, zmm6, zmm5, 0x96
+    0.68 :   276313:        vgf2p8affineqb  zmm2, zmm11, zmmword ptr [rcx + 0x80], 0x0
+    0.35 :   27631b:        vgf2p8affineqb  zmm4, zmm13, zmmword ptr [rcx + 0x40], 0x0
+    0.46 :   276323:        vgf2p8affineqb  zmm5, zmm15, zmmword ptr [rcx], 0x0
+    0.35 :   27632a:        vpternlogq      zmm5, zmm4, zmm2, 0x96
+    0.51 :   276331:        vpbroadcastq    zmm2, qword ptr [rax + 0x78]
+    0.00 :   276338:        vgf2p8affineqb  zmm4, zmm2, zmmword ptr [rcx + 0xbc0], 0x0
+    0.24 :   276340:        vpbroadcastq    zmm6, qword ptr [rax + 0x70]
+    0.00 :   276347:        vgf2p8affineqb  zmm8, zmm6, zmmword ptr [rcx + 0xb80], 0x0
+    0.35 :   27634f:        vpbroadcastq    zmm9, qword ptr [rax + 0x68]
+    0.12 :   276356:        vgf2p8affineqb  zmm11, zmm9, zmmword ptr [rcx + 0xb40], 0x0
+    0.44 :   27635e:        vpbroadcastq    zmm12, qword ptr [rax + 0x60]
+    0.04 :   276365:        vgf2p8affineqb  zmm13, zmm12, zmmword ptr [rcx + 0xb00], 0x0
+    0.42 :   27636d:        vpbroadcastq    zmm14, qword ptr [rax + 0x58]
+    0.00 :   276374:        vgf2p8affineqb  zmm15, zmm14, zmmword ptr [rcx + 0xac0], 0x0
+    0.58 :   27637c:        vpternlogq      zmm5, zmm1, zmm3, 0x96
+    0.11 :   276383:        vpternlogq      zmm15, zmm13, zmm11, 0x96
+    0.79 :   27638a:        vpternlogq      zmm15, zmm10, zmm16, 0x96
+    0.51 :   276391:        vpbroadcastq    zmm1, qword ptr [rax + 0x50]
+    0.00 :   276398:        vgf2p8affineqb  zmm3, zmm1, zmmword ptr [rcx + 0xa80], 0x0
+    0.43 :   2763a0:        vpbroadcastq    zmm10, qword ptr [rax + 0x48]
+    0.00 :   2763a7:        vgf2p8affineqb  zmm11, zmm10, zmmword ptr [rcx + 0xa40], 0x0
+    0.36 :   2763af:        vpbroadcastq    zmm13, qword ptr [rax + 0x40]
+    0.08 :   2763b6:        vgf2p8affineqb  zmm16, zmm13, zmmword ptr [rcx + 0xa00], 0x0
+    0.56 :   2763be:        vpternlogq      zmm16, zmm11, zmm3, 0x96
+    0.70 :   2763c5:        vpternlogq      zmm16, zmm4, zmm8, 0x96
+    1.39 :   2763cc:        vgf2p8affineqb  zmm2, zmm2, zmmword ptr [rcx + 0x3c0], 0x0
+    0.04 :   2763d4:        vgf2p8affineqb  zmm3, zmm6, zmmword ptr [rcx + 0x380], 0x0
+    0.00 :   2763dc:        vgf2p8affineqb  zmm4, zmm9, zmmword ptr [rcx + 0x340], 0x0
+    0.37 :   2763e4:        vgf2p8affineqb  zmm6, zmm12, zmmword ptr [rcx + 0x300], 0x0
+    0.60 :   2763ec:        vgf2p8affineqb  zmm8, zmm14, zmmword ptr [rcx + 0x2c0], 0x0
+    0.20 :   2763f4:        vpternlogq      zmm8, zmm6, zmm4, 0x96
+    0.27 :   2763fb:        vpternlogq      zmm8, zmm7, zmm5, 0x96
+    0.41 :   276402:        vgf2p8affineqb  zmm1, zmm1, zmmword ptr [rcx + 0x280], 0x0
+    0.11 :   27640a:        vgf2p8affineqb  zmm4, zmm10, zmmword ptr [rcx + 0x240], 0x0
+    0.24 :   276412:        vgf2p8affineqb  zmm5, zmm13, zmmword ptr [rcx + 0x200], 0x0
+    0.27 :   27641a:        vpternlogq      zmm5, zmm4, zmm1, 0x96
+    0.48 :   276421:        vpbroadcastq    zmm1, qword ptr [rax + 0xb8]
+    0.04 :   276428:        vgf2p8affineqb  zmm4, zmm1, zmmword ptr [rcx + 0xdc0], 0x0
+    0.16 :   276430:        vpbroadcastq    zmm6, qword ptr [rax + 0xb0]
+    0.00 :   276437:        vgf2p8affineqb  zmm7, zmm6, zmmword ptr [rcx + 0xd80], 0x0
+    0.28 :   27643f:        vpbroadcastq    zmm9, qword ptr [rax + 0xa8]
+    0.00 :   276446:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0xd40], 0x0
+    0.82 :   27644e:        vpbroadcastq    zmm11, qword ptr [rax + 0xa0]
+    0.00 :   276455:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0xd00], 0x0
+    0.54 :   27645d:        vpbroadcastq    zmm13, qword ptr [rax + 0x98]
+    0.08 :   276464:        vgf2p8affineqb  zmm14, zmm13, zmmword ptr [rcx + 0xcc0], 0x0
+    0.28 :   27646c:        vpternlogq      zmm5, zmm2, zmm3, 0x96
+    0.28 :   276473:        vpternlogq      zmm14, zmm12, zmm10, 0x96
+    0.52 :   27647a:        vpternlogq      zmm14, zmm15, zmm16, 0x96
+    0.47 :   276481:        vpbroadcastq    zmm2, qword ptr [rax + 0x90]
+    0.04 :   276488:        vgf2p8affineqb  zmm3, zmm2, zmmword ptr [rcx + 0xc80], 0x0
+    0.32 :   276490:        vpbroadcastq    zmm10, qword ptr [rax + 0x88]
+    0.00 :   276497:        vgf2p8affineqb  zmm12, zmm10, zmmword ptr [rcx + 0xc40], 0x0
+    0.52 :   27649f:        vpbroadcastq    zmm15, qword ptr [rax + 0x80]
+    0.08 :   2764a6:        vgf2p8affineqb  zmm16, zmm15, zmmword ptr [rcx + 0xc00], 0x0
+    0.58 :   2764ae:        vpternlogq      zmm16, zmm12, zmm3, 0x96
+    0.39 :   2764b5:        vpternlogq      zmm16, zmm4, zmm7, 0x96
+    1.10 :   2764bc:        vgf2p8affineqb  zmm1, zmm1, zmmword ptr [rcx + 0x5c0], 0x0
+    0.12 :   2764c4:        vgf2p8affineqb  zmm3, zmm6, zmmword ptr [rcx + 0x580], 0x0
+    0.20 :   2764cc:        vgf2p8affineqb  zmm4, zmm9, zmmword ptr [rcx + 0x540], 0x0
+    0.16 :   2764d4:        vgf2p8affineqb  zmm6, zmm11, zmmword ptr [rcx + 0x500], 0x0
+    0.81 :   2764dc:        vgf2p8affineqb  zmm7, zmm13, zmmword ptr [rcx + 0x4c0], 0x0
+    0.11 :   2764e4:        vpternlogq      zmm7, zmm6, zmm4, 0x96
+    0.55 :   2764eb:        vpternlogq      zmm7, zmm8, zmm5, 0x96
+    0.63 :   2764f2:        vgf2p8affineqb  zmm2, zmm2, zmmword ptr [rcx + 0x480], 0x0
+    0.12 :   2764fa:        vgf2p8affineqb  zmm4, zmm10, zmmword ptr [rcx + 0x440], 0x0
+    0.12 :   276502:        vgf2p8affineqb  zmm5, zmm15, zmmword ptr [rcx + 0x400], 0x0
+    0.31 :   27650a:        vpternlogq      zmm5, zmm4, zmm2, 0x96
+    0.63 :   276511:        vpbroadcastq    zmm2, qword ptr [rax + 0xf8]
+    0.04 :   276518:        vgf2p8affineqb  zmm4, zmm2, zmmword ptr [rcx + 0xfc0], 0x0
+    0.40 :   276520:        vpbroadcastq    zmm6, qword ptr [rax + 0xf0]
+    0.00 :   276527:        vgf2p8affineqb  zmm8, zmm6, zmmword ptr [rcx + 0xf80], 0x0
+    0.28 :   27652f:        vpbroadcastq    zmm9, qword ptr [rax + 0xe8]
+    0.00 :   276536:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0xf40], 0x0
+    0.58 :   27653e:        vpbroadcastq    zmm11, qword ptr [rax + 0xe0]
+    0.00 :   276545:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0xf00], 0x0
+    0.56 :   27654d:        vpbroadcastq    zmm13, qword ptr [rax + 0xd8]
+    0.07 :   276554:        vgf2p8affineqb  zmm15, zmm13, zmmword ptr [rcx + 0xec0], 0x0
+    0.32 :   27655c:        vpternlogq      zmm5, zmm1, zmm3, 0x96
+    0.24 :   276563:        vpternlogq      zmm15, zmm12, zmm10, 0x96
+    0.91 :   27656a:        vpternlogq      zmm15, zmm14, zmm16, 0x96
+    0.43 :   276571:        vpbroadcastq    zmm1, qword ptr [rax + 0xd0]
+    0.00 :   276578:        vgf2p8affineqb  zmm3, zmm1, zmmword ptr [rcx + 0xe80], 0x0
+    0.32 :   276580:        vpbroadcastq    zmm10, qword ptr [rax + 0xc8]
+    0.00 :   276587:        vgf2p8affineqb  zmm12, zmm10, zmmword ptr [rcx + 0xe40], 0x0
+    0.31 :   27658f:        vpbroadcastq    zmm14, qword ptr [rax + 0xc0]
+    0.04 :   276596:        vgf2p8affineqb  zmm16, zmm14, zmmword ptr [rcx + 0xe00], 0x0
+    0.64 :   27659e:        vpternlogq      zmm16, zmm12, zmm3, 0x96
+    0.63 :   2765a5:        vpternlogq      zmm16, zmm4, zmm8, 0x96
+    1.31 :   2765ac:        vgf2p8affineqb  zmm2, zmm2, zmmword ptr [rcx + 0x7c0], 0x0
+    0.16 :   2765b4:        vgf2p8affineqb  zmm3, zmm6, zmmword ptr [rcx + 0x780], 0x0
+    0.16 :   2765bc:        vgf2p8affineqb  zmm4, zmm9, zmmword ptr [rcx + 0x740], 0x0
+    0.44 :   2765c4:        vgf2p8affineqb  zmm6, zmm11, zmmword ptr [rcx + 0x700], 0x0
+    0.42 :   2765cc:        vgf2p8affineqb  zmm8, zmm13, zmmword ptr [rcx + 0x6c0], 0x0
+    0.24 :   2765d4:        vpxorq  zmm9, zmm15, zmm16
+    0.15 :   2765da:        vpternlogq      zmm8, zmm6, zmm4, 0x96
+    0.35 :   2765e1:        vgf2p8affineqb  zmm1, zmm1, zmmword ptr [rcx + 0x680], 0x0
+    0.07 :   2765e9:        vgf2p8affineqb  zmm4, zmm10, zmmword ptr [rcx + 0x640], 0x0
+    0.23 :   2765f1:        vpternlogq      zmm8, zmm7, zmm5, 0x96
+    0.56 :   2765f8:        vgf2p8affineqb  zmm5, zmm14, zmmword ptr [rcx + 0x600], 0x0
+    0.12 :   276600:        vpternlogq      zmm5, zmm4, zmm1, 0x96
+    0.64 :   276607:        vpternlogq      zmm5, zmm2, zmm3, 0x96
+    1.19 :   27660e:        vpxorq  zmm1, zmm8, zmm5
+    0.84 :   276614:        vpermb  zmm3, zmm0, zmm1
+    1.32 :   27661a:        vpermb  zmm4, zmm0, zmm9
+    0.00 :   276620:        vmovdqa64       zmm1, zmmword ptr [rip - 0x24fd2a]  # 0x26900
+    0.00 :   27662a:        vmovdqa64       zmm2, zmm3
+    0.00 :   276630:        vpermt2q        zmm2, zmm1, zmm4
+    1.19 :   276636:        vmovdqu64       zmmword ptr [rdx], zmm2
+    0.20 :   27663c:        vmovdqa64       zmm2, zmmword ptr [rip - 0x24fd06]  # 0x26940
+    0.00 :   276646:        vpermt2q        zmm3, zmm2, zmm4
+    0.15 :   27664c:        vmovdqu64       zmmword ptr [rdx + 0x40], zmm3
+    0.31 :   276653:        mov     qword ptr [rsp + 0x38], rsi
+    0.00 :   276658:        lea     rcx, [rsp + 0x38]
+    0.00 :   27665d:        mov     rcx, qword ptr [rsp + 0x38]
+    0.00 :   276662:        vpbroadcastq    zmm3, qword ptr [rax + 0x138]
+    0.12 :   276669:        vgf2p8affineqb  zmm4, zmm3, zmmword ptr [rcx + 0x9c0], 0x0
+    0.08 :   276671:        vpbroadcastq    zmm5, qword ptr [rax + 0x130]
+    0.00 :   276678:        vgf2p8affineqb  zmm6, zmm5, zmmword ptr [rcx + 0x980], 0x0
+    0.20 :   276680:        vpbroadcastq    zmm7, qword ptr [rax + 0x128]
+    0.00 :   276687:        vgf2p8affineqb  zmm8, zmm7, zmmword ptr [rcx + 0x940], 0x0
+    0.28 :   27668f:        vpbroadcastq    zmm9, qword ptr [rax + 0x120]
+    0.08 :   276696:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0x900], 0x0
+    0.27 :   27669e:        vpbroadcastq    zmm11, qword ptr [rax + 0x118]
+    0.11 :   2766a5:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0x8c0], 0x0
+    0.28 :   2766ad:        vpternlogq      zmm12, zmm10, zmm8, 0x96
+    0.27 :   2766b4:        vpbroadcastq    zmm8, qword ptr [rax + 0x110]
+    0.24 :   2766bb:        vgf2p8affineqb  zmm10, zmm8, zmmword ptr [rcx + 0x880], 0x0
+    0.11 :   2766c3:        vpbroadcastq    zmm13, qword ptr [rax + 0x108]
+    0.00 :   2766ca:        vgf2p8affineqb  zmm14, zmm13, zmmword ptr [rcx + 0x840], 0x0
+    0.32 :   2766d2:        vpbroadcastq    zmm15, qword ptr [rax + 0x100]
+    0.00 :   2766d9:        vgf2p8affineqb  zmm16, zmm15, zmmword ptr [rcx + 0x800], 0x0
+    0.47 :   2766e1:        vpternlogq      zmm16, zmm14, zmm10, 0x96
+    0.55 :   2766e8:        vgf2p8affineqb  zmm3, zmm3, zmmword ptr [rcx + 0x1c0], 0x0
+    0.24 :   2766f0:        vgf2p8affineqb  zmm5, zmm5, zmmword ptr [rcx + 0x180], 0x0
+    0.24 :   2766f8:        vgf2p8affineqb  zmm7, zmm7, zmmword ptr [rcx + 0x140], 0x0
+    0.32 :   276700:        vpternlogq      zmm16, zmm4, zmm6, 0x96
+    0.35 :   276707:        vgf2p8affineqb  zmm4, zmm9, zmmword ptr [rcx + 0x100], 0x0
+    0.39 :   27670f:        vgf2p8affineqb  zmm6, zmm11, zmmword ptr [rcx + 0xc0], 0x0
+    0.27 :   276717:        vpternlogq      zmm6, zmm4, zmm7, 0x96
+    0.68 :   27671e:        vgf2p8affineqb  zmm4, zmm8, zmmword ptr [rcx + 0x80], 0x0
+    0.45 :   276726:        vgf2p8affineqb  zmm7, zmm13, zmmword ptr [rcx + 0x40], 0x0
+    0.44 :   27672e:        vgf2p8affineqb  zmm8, zmm15, zmmword ptr [rcx], 0x0
+    0.24 :   276735:        vpternlogq      zmm8, zmm7, zmm4, 0x96
+    0.83 :   27673c:        vpternlogq      zmm8, zmm3, zmm5, 0x96
+    1.26 :   276743:        vpbroadcastq    zmm3, qword ptr [rax + 0x178]
+    0.04 :   27674a:        vgf2p8affineqb  zmm4, zmm3, zmmword ptr [rcx + 0xbc0], 0x0
+    0.19 :   276752:        vpbroadcastq    zmm5, qword ptr [rax + 0x170]
+    0.00 :   276759:        vgf2p8affineqb  zmm7, zmm5, zmmword ptr [rcx + 0xb80], 0x0
+    0.12 :   276761:        vpbroadcastq    zmm9, qword ptr [rax + 0x168]
+    0.04 :   276768:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0xb40], 0x0
+    0.48 :   276770:        vpbroadcastq    zmm11, qword ptr [rax + 0x160]
+    0.00 :   276777:        vgf2p8affineqb  zmm13, zmm11, zmmword ptr [rcx + 0xb00], 0x0
+    0.43 :   27677f:        vpbroadcastq    zmm14, qword ptr [rax + 0x158]
+    0.00 :   276786:        vgf2p8affineqb  zmm15, zmm14, zmmword ptr [rcx + 0xac0], 0x0
+    0.51 :   27678e:        vpternlogq      zmm15, zmm13, zmm10, 0x96
+    0.72 :   276795:        vpbroadcastq    zmm10, qword ptr [rax + 0x150]
+    0.00 :   27679c:        vgf2p8affineqb  zmm13, zmm10, zmmword ptr [rcx + 0xa80], 0x0
+    0.20 :   2767a4:        vpbroadcastq    zmm17, qword ptr [rax + 0x148]
+    0.04 :   2767ab:        vgf2p8affineqb  zmm18, zmm17, zmmword ptr [rcx + 0xa40], 0x0
+    0.39 :   2767b3:        vpternlogq      zmm15, zmm12, zmm16, 0x96
+    0.15 :   2767ba:        vpbroadcastq    zmm12, qword ptr [rax + 0x140]
+    0.04 :   2767c1:        vgf2p8affineqb  zmm16, zmm12, zmmword ptr [rcx + 0xa00], 0x0
+    0.35 :   2767c9:        vpternlogq      zmm16, zmm18, zmm13, 0x96
+    0.58 :   2767d0:        vpternlogq      zmm16, zmm4, zmm7, 0x96
+    0.81 :   2767d7:        vgf2p8affineqb  zmm3, zmm3, zmmword ptr [rcx + 0x3c0], 0x0
+    0.04 :   2767df:        vgf2p8affineqb  zmm4, zmm5, zmmword ptr [rcx + 0x380], 0x0
+    0.15 :   2767e7:        vgf2p8affineqb  zmm5, zmm9, zmmword ptr [rcx + 0x340], 0x0
+    0.20 :   2767ef:        vgf2p8affineqb  zmm7, zmm11, zmmword ptr [rcx + 0x300], 0x0
+    0.78 :   2767f7:        vgf2p8affineqb  zmm9, zmm14, zmmword ptr [rcx + 0x2c0], 0x0
+    0.24 :   2767ff:        vpternlogq      zmm9, zmm7, zmm5, 0x96
+    0.32 :   276806:        vpternlogq      zmm9, zmm6, zmm8, 0x96
+    0.43 :   27680d:        vgf2p8affineqb  zmm5, zmm10, zmmword ptr [rcx + 0x280], 0x0
+    0.24 :   276815:        vgf2p8affineqb  zmm6, zmm17, zmmword ptr [rcx + 0x240], 0x0
+    0.20 :   27681d:        vgf2p8affineqb  zmm7, zmm12, zmmword ptr [rcx + 0x200], 0x0
+    0.34 :   276825:        vpternlogq      zmm7, zmm6, zmm5, 0x96
+    0.44 :   27682c:        vpternlogq      zmm7, zmm3, zmm4, 0x96
+    1.15 :   276833:        vpbroadcastq    zmm3, qword ptr [rax + 0x1b8]
+    0.00 :   27683a:        vgf2p8affineqb  zmm4, zmm3, zmmword ptr [rcx + 0xdc0], 0x0
+    0.19 :   276842:        vpbroadcastq    zmm5, qword ptr [rax + 0x1b0]
+    0.00 :   276849:        vgf2p8affineqb  zmm6, zmm5, zmmword ptr [rcx + 0xd80], 0x0
+    0.08 :   276851:        vpbroadcastq    zmm8, qword ptr [rax + 0x1a8]
+    0.00 :   276858:        vgf2p8affineqb  zmm10, zmm8, zmmword ptr [rcx + 0xd40], 0x0
+    0.63 :   276860:        vpbroadcastq    zmm11, qword ptr [rax + 0x1a0]
+    0.00 :   276867:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0xd00], 0x0
+    0.32 :   27686f:        vpbroadcastq    zmm13, qword ptr [rax + 0x198]
+    0.00 :   276876:        vgf2p8affineqb  zmm14, zmm13, zmmword ptr [rcx + 0xcc0], 0x0
+    0.56 :   27687e:        vpternlogq      zmm14, zmm12, zmm10, 0x96
+    0.67 :   276885:        vpbroadcastq    zmm10, qword ptr [rax + 0x190]
+    0.00 :   27688c:        vgf2p8affineqb  zmm12, zmm10, zmmword ptr [rcx + 0xc80], 0x0
+    0.32 :   276894:        vpbroadcastq    zmm17, qword ptr [rax + 0x188]
+    0.00 :   27689b:        vgf2p8affineqb  zmm18, zmm17, zmmword ptr [rcx + 0xc40], 0x0
+    0.52 :   2768a3:        vpternlogq      zmm14, zmm15, zmm16, 0x96
+    0.22 :   2768aa:        vpbroadcastq    zmm15, qword ptr [rax + 0x180]
+    0.04 :   2768b1:        vgf2p8affineqb  zmm16, zmm15, zmmword ptr [rcx + 0xc00], 0x0
+    0.32 :   2768b9:        vpternlogq      zmm16, zmm18, zmm12, 0x96
+    1.01 :   2768c0:        vpternlogq      zmm16, zmm4, zmm6, 0x96
+    1.12 :   2768c7:        vgf2p8affineqb  zmm3, zmm3, zmmword ptr [rcx + 0x5c0], 0x0
+    0.08 :   2768cf:        vgf2p8affineqb  zmm4, zmm5, zmmword ptr [rcx + 0x580], 0x0
+    0.08 :   2768d7:        vgf2p8affineqb  zmm5, zmm8, zmmword ptr [rcx + 0x540], 0x0
+    0.32 :   2768df:        vgf2p8affineqb  zmm6, zmm11, zmmword ptr [rcx + 0x500], 0x0
+    0.67 :   2768e7:        vgf2p8affineqb  zmm8, zmm13, zmmword ptr [rcx + 0x4c0], 0x0
+    0.15 :   2768ef:        vpternlogq      zmm8, zmm6, zmm5, 0x96
+    0.52 :   2768f6:        vpternlogq      zmm8, zmm9, zmm7, 0x96
+    0.23 :   2768fd:        vgf2p8affineqb  zmm5, zmm10, zmmword ptr [rcx + 0x480], 0x0
+    0.23 :   276905:        vgf2p8affineqb  zmm6, zmm17, zmmword ptr [rcx + 0x440], 0x0
+    0.27 :   27690d:        vgf2p8affineqb  zmm7, zmm15, zmmword ptr [rcx + 0x400], 0x0
+    0.23 :   276915:        vpternlogq      zmm7, zmm6, zmm5, 0x96
+    0.55 :   27691c:        vpternlogq      zmm7, zmm3, zmm4, 0x96
+    1.54 :   276923:        vpbroadcastq    zmm3, qword ptr [rax + 0x1f8]
+    0.00 :   27692a:        vgf2p8affineqb  zmm4, zmm3, zmmword ptr [rcx + 0xfc0], 0x0
+    0.12 :   276932:        vpbroadcastq    zmm5, qword ptr [rax + 0x1f0]
+    0.00 :   276939:        vgf2p8affineqb  zmm6, zmm5, zmmword ptr [rcx + 0xf80], 0x0
+    0.12 :   276941:        vpbroadcastq    zmm9, qword ptr [rax + 0x1e8]
+    0.08 :   276948:        vgf2p8affineqb  zmm10, zmm9, zmmword ptr [rcx + 0xf40], 0x0
+    0.95 :   276950:        vpbroadcastq    zmm11, qword ptr [rax + 0x1e0]
+    0.00 :   276957:        vgf2p8affineqb  zmm12, zmm11, zmmword ptr [rcx + 0xf00], 0x0
+    0.23 :   27695f:        vpbroadcastq    zmm13, qword ptr [rax + 0x1d8]
+    0.00 :   276966:        vgf2p8affineqb  zmm15, zmm13, zmmword ptr [rcx + 0xec0], 0x0
+    0.20 :   27696e:        vpternlogq      zmm15, zmm12, zmm10, 0x96
+    0.70 :   276975:        vpbroadcastq    zmm10, qword ptr [rax + 0x1d0]
+    0.00 :   27697c:        vgf2p8affineqb  zmm12, zmm10, zmmword ptr [rcx + 0xe80], 0x0
+    0.28 :   276984:        vpbroadcastq    zmm17, qword ptr [rax + 0x1c8]
+    0.04 :   27698b:        vgf2p8affineqb  zmm18, zmm17, zmmword ptr [rcx + 0xe40], 0x0
+    0.20 :   276993:        vpternlogq      zmm15, zmm14, zmm16, 0x96
+    0.24 :   27699a:        vpbroadcastq    zmm14, qword ptr [rax + 0x1c0]
+    0.08 :   2769a1:        vgf2p8affineqb  zmm16, zmm14, zmmword ptr [rcx + 0xe00], 0x0
+    0.52 :   2769a9:        vpternlogq      zmm16, zmm18, zmm12, 0x96
+    0.84 :   2769b0:        vpternlogq      zmm16, zmm4, zmm6, 0x96
+    0.81 :   2769b7:        vgf2p8affineqb  zmm3, zmm3, zmmword ptr [rcx + 0x7c0], 0x0
+    0.00 :   2769bf:        vgf2p8affineqb  zmm4, zmm5, zmmword ptr [rcx + 0x780], 0x0
+    0.04 :   2769c7:        vgf2p8affineqb  zmm5, zmm9, zmmword ptr [rcx + 0x740], 0x0
+    0.27 :   2769cf:        vpxorq  zmm6, zmm15, zmm16
+    0.54 :   2769d5:        vgf2p8affineqb  zmm9, zmm11, zmmword ptr [rcx + 0x700], 0x0
+    0.31 :   2769dd:        vgf2p8affineqb  zmm11, zmm13, zmmword ptr [rcx + 0x6c0], 0x0
+    0.12 :   2769e5:        vpternlogq      zmm11, zmm9, zmm5, 0x96
+    0.53 :   2769ec:        vgf2p8affineqb  zmm5, zmm10, zmmword ptr [rcx + 0x680], 0x0
+    0.24 :   2769f4:        vgf2p8affineqb  zmm9, zmm17, zmmword ptr [rcx + 0x640], 0x0
+    0.38 :   2769fc:        vgf2p8affineqb  zmm10, zmm14, zmmword ptr [rcx + 0x600], 0x0
+    0.16 :   276a04:        vpternlogq      zmm11, zmm8, zmm7, 0x96
+    0.08 :   276a0b:        vpternlogq      zmm10, zmm9, zmm5, 0x96
+    0.35 :   276a12:        vpternlogq      zmm10, zmm3, zmm4, 0x96
+    1.45 :   276a19:        vpxorq  zmm3, zmm11, zmm10
+    0.82 :   276a1f:        vpermb  zmm3, zmm0, zmm3
+    0.79 :   276a25:        vpermb  zmm0, zmm0, zmm6
+    0.00 :   276a2b:        vpermi2q        zmm1, zmm3, zmm0
+    1.62 :   276a31:        vmovdqu64       zmmword ptr [rdx + 0x80], zmm1
+    0.31 :   276a38:        vpermt2q        zmm3, zmm2, zmm0
+    0.08 :   276a3e:        vmovdqu64       zmmword ptr [rdx + 0xc0], zmm3
+    0.04 :   276a45:        mov     rsp, rbp
+    0.00 :   276a48:        pop     rbp
+    0.00 :   276a49:        vzeroupper
+    0.00 :   276a4c:        ret

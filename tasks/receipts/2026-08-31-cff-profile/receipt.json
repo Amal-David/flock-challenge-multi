@@ -1,0 +1,41 @@
+{
+  "authority": "SAPPHIRE_DIRECTIONAL",
+  "base_sha": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+  "canonical_receipts": {
+    "council_closure": "R-5db2338c4987b2cd079a8e4117cbd32e69537a36c117072b87929e37e4959fe7",
+    "latest_public_cluster": "R-29a130f953319863d4ba20bc94ded09427af08c048715e15d1d715d4f44be996",
+    "profile": "R-5269fb3fa85527e8d1d859fbd9310c4cd5412c8ab0848a494c09ae6f0a50431c"
+  },
+  "decision": "PROFILE_COMPLETE_ADMIT_NONE",
+  "phase_median_ms": {
+    "commit": 59.129,
+    "deep_ntt_merkle": 39.0185,
+    "lincheck": 9.394,
+    "open": 15.2745,
+    "seed_top": 20.1105,
+    "witness": 35.466,
+    "zc_n26": 15.4365,
+    "zc_round1": 16.1655,
+    "zc_round2": 19.34,
+    "zerocheck_total": 60.296
+  },
+  "profile_artifacts_sha256": "38459fd8a08c40908954d7b251f29cd9730cf265ec58454f21050a121b387cd0",
+  "runner": {
+    "cpu": "Intel Xeon Platinum 8488C",
+    "instance_id": "i-00096d6dbcafef80d",
+    "instance_state_after_run": "stopped",
+    "instance_type": "c7i.4xlarge",
+    "inbound_rules_after_run": 0,
+    "provider": "AWS EC2",
+    "volume_id": "vol-0847a9858515dcb5b"
+  },
+  "submission_performed": false,
+  "trace_inflation_percent": 0.8225151676241049,
+  "trusted_proofs": {
+    "clean_measured": 5,
+    "traced_measured": 3,
+    "verified": true
+  },
+  "trusted_verifier_sha256": "5ad0acfa59a6f3415061b0536d401075b7e7c71da5ec1e5d3d8784bd81d68798",
+  "worker_sha256": "c5b70a0d422b04700efa8e79f6de510883981be4dccdfc14778497143cf1e281"
+}

@@ -1,0 +1,2 @@
+c5b70a0d422b04700efa8e79f6de510883981be4dccdfc14778497143cf1e281  /home/ubuntu/stfmp-control-worker
+67103425b23ca9a1dbd11579ee90c33f9e28dce90b2536c046d29903f07d5987  /home/ubuntu/cff-once-off4/run.proof

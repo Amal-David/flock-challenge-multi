@@ -1,0 +1,5 @@
+label=ports_a1
+events=uops_dispatched.port_0,uops_dispatched.port_1,uops_dispatched.port_5_11,resource_stalls.sb
+seed=1311768467463790320
+elapsed_ns=264307173
+worker_status=0

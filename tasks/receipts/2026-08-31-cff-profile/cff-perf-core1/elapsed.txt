@@ -1,0 +1,5 @@
+label=core1
+events=cycles,instructions,branches,branch-misses
+seed=1311768467463790320
+elapsed_ns=256658758
+worker_status=0

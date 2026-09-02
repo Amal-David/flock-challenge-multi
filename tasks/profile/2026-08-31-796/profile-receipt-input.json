@@ -1,0 +1,145 @@
+{
+  "authority": "SAPPHIRE_DIRECTIONAL",
+  "benchmark": "eigenlabs/flock-challenge-multi/x86",
+  "kind": "flock_exact_frontier796_phase_profile",
+  "decision": "phase_profile_valid_symbol_sample_invalid_no_candidate_admitted",
+  "epoch_id": "E-YUKON-cc3bbe1-7968097",
+  "source": "7968097f311d6fc5b30ba4cf9cd146c240e3daf2",
+  "parent_source": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+  "official": {
+    "submission": "cc3bbe1d-695e-4546-a821-23bec2653466",
+    "score": 1590863.47318654,
+    "median_seconds": 0.164780953,
+    "p10_seconds": 0.163913284,
+    "minimum_improvement_bips": 100,
+    "campaign_gate_bips": 125,
+    "minimum_score": 1606772.1079184054,
+    "campaign_score": 1610749.2666013713,
+    "minimum_median_savings_ms": 1.6314945841584214,
+    "campaign_median_savings_ms": 2.034332753086421
+  },
+  "identity": {
+    "worker_sha256": "2004973a98689a0cfd18e26959395adb3b94b02b9ff4e7939aa15721f1a2c38b",
+    "trusted_verifier_sha256": "5ad0acfa59a6f3415061b0536d401075b7e7c71da5ec1e5d3d8784bd81d68798",
+    "fixed_seed_proof_sha256": "67103425b23ca9a1dbd11579ee90c33f9e28dce90b2536c046d29903f07d5987",
+    "fixed_seed_control_profile_match": true
+  },
+  "directional_scores": {
+    "frontier796_clean": {
+      "score": 1235629.3465665234,
+      "median_seconds": 0.212154236,
+      "p10_seconds": 0.2111538752,
+      "measured_runs": 3,
+      "verified": true,
+      "score_json_sha256": "7f8c2c675aec32c2468b225319d181d49dda918cfec4aee78606c10f2251ca76"
+    },
+    "frontier796_traced": {
+      "score": 1238644.210015891,
+      "median_seconds": 0.211637852,
+      "p10_seconds": 0.2115937672,
+      "measured_runs": 3,
+      "verified": true,
+      "score_json_sha256": "1f3cfaae6c9367e171a63e70adace46edb1a5dba665e56d934cc9da605025d86"
+    },
+    "parent_clean": {
+      "score": 1211382.7277832197,
+      "median_seconds": 0.216400642,
+      "p10_seconds": 0.2146859524,
+      "measured_runs": 3,
+      "verified": true,
+      "score_json_sha256": "da6c71be47334636c8967cc13f063e2047f2f57dafc78f1b93ffda123b3bbcec"
+    },
+    "parent_traced": {
+      "score": 1207190.6702043589,
+      "median_seconds": 0.217152109,
+      "p10_seconds": 0.2167748634,
+      "measured_runs": 3,
+      "verified": true,
+      "score_json_sha256": "c031f356475bdfe3d56e4a1039e81f3c40a1454c463064598061d0ac404fb8f3"
+    },
+    "non_interleaved_parent_comparison": {
+      "score_gain_bips": 200.15655025620305,
+      "median_latency_gain_percent": 1.9622890028209827,
+      "median_delta_ms": 4.246406,
+      "rankable": false
+    }
+  },
+  "frontier796_phase_median_ms": {
+    "total_profiled": 200.9275,
+    "witness": 41.515,
+    "commit": 65.083,
+    "seed_top": 21.6245,
+    "deep_ntt_merkle": 43.4685,
+    "zerocheck_total": 66.1205,
+    "zerocheck_round1": 17.614,
+    "zerocheck_round2": 21.387,
+    "zerocheck_n26": 17.7485,
+    "zerocheck_after_n26": 9.0185,
+    "lincheck": 10.553,
+    "open": 17.2415,
+    "ligerito_total": 16.57,
+    "ligerito_initial_fold": 10.995
+  },
+  "parent_phase_median_ms": {
+    "total_profiled": 204.324,
+    "witness": 42.183,
+    "commit": 64.9565,
+    "zerocheck_total": 68.8525,
+    "zerocheck_round1": 18.4565,
+    "zerocheck_round2": 23.1875,
+    "zerocheck_n26": 17.996,
+    "zerocheck_after_n26": 9.1915,
+    "lincheck": 10.6125,
+    "open": 17.527
+  },
+  "attributed_directional_delta_ms": {
+    "total_profiled_saved": 3.3965,
+    "witness_saved": 0.668,
+    "commit_saved": -0.1265,
+    "zerocheck_total_saved": 2.732,
+    "zerocheck_round1_saved": 0.8425,
+    "zerocheck_round2_saved": 1.8005,
+    "zerocheck_n26_saved": 0.2475,
+    "zerocheck_tail_saved": 0.173,
+    "lincheck_saved": 0.0595,
+    "open_saved": 0.2855
+  },
+  "artifacts": {
+    "frontier796_phase_log_sha256": "39aebfe83e69aa413bcf48529ec2a1e9c8907b9a5363f9fe719c4f4371ba9afe",
+    "parent_compare_phase_log_sha256": "c5c8b06ce358153814966d09f2b64d22bc5b170f74bb24c124893d103d0cc118",
+    "invalid_sample_perf_data_sha256": "b6ad10160a4366e3114587db9de6fca8ad420f96593f67b3e74ecf7916f1ef62"
+  },
+  "invalid_symbol_sample": {
+    "status": "rejected_window_integrity",
+    "proof_elapsed_ms": 268.057809,
+    "capture_duration_ms": 294713.956,
+    "total_lost_samples": 0,
+    "idle_symbol_percent": 51.88,
+    "cause": "system-wide perf process remained alive after the proof and sampled idle CPUs until the outer timeout",
+    "use_for_hotspot_ranking": false
+  },
+  "runner": {
+    "provider": "AWS EC2",
+    "region": "us-east-2",
+    "instance_id": "i-00096d6dbcafef80d",
+    "instance_type": "c7i.4xlarge",
+    "cpu": "Intel Xeon Platinum 8488C",
+    "threads": 16,
+    "launch_time": "2026-08-31T15:32:03Z",
+    "stop_time": "2026-08-31T16:21:51Z",
+    "runtime_minutes": 49.8,
+    "hourly_rate_usd": 0.714,
+    "estimated_total_cost_usd": 0.59262,
+    "additional_planned_runtime_minutes": 12.283333333333333,
+    "estimated_additional_cost_usd": 0.14617166666666667,
+    "instance_state_after_run": "stopped",
+    "inbound_rules_after_run": 0
+  },
+  "limitations": [
+    "The parent and crown score blocks were sequential rather than interleaved, so the 200.16-bip directional comparison is not rankable.",
+    "Phase probes rank current exposure but do not authorize a candidate without exact current-source C/B/C.",
+    "The system-wide sampled symbol capture failed its timing-window gate and contributes no hotspot percentages.",
+    "No source candidate, Yukon submission, or public note was created."
+  ],
+  "submission_performed": false
+}

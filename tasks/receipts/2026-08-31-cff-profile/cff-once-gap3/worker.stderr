@@ -1,0 +1,546 @@
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.036 ms  @    0.036 ms  witness: pool entered
+[gap] +   44.458 ms  @   44.494 ms  witness: work done (incl. prefault)
+[gap] +    0.024 ms  @   44.519 ms  witness: pool exited
+[gap] +    0.011 ms  @   44.529 ms  lc_circuit built
+[gap] +    0.007 ms  @   44.536 ms  inner: enter
+[gap] +    2.358 ms  @   46.895 ms  core: padding built
+[gap] +    0.011 ms  @   46.905 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   46.913 ms  commit: pool entered
+[gap] +   34.957 ms  @   81.870 ms  ntt: seed+top fused pass done
+[gap] +   44.589 ms  @  126.459 ms  ntt: deep pass done
+[gap] +    0.058 ms  @  126.517 ms  commit: work done
+[gap] +    0.010 ms  @  126.527 ms  commit: pool exited
+[gap] +  270.670 ms  @  397.197 ms  bind_statement done
+[gap] +    0.221 ms  @  397.418 ms  zerocheck: pool entered
+[gap] +    0.014 ms  @  397.431 ms  zerocheck: views built
+[gap] +   16.281 ms  @  413.712 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.045 ms  @  413.757 ms  zc: round1 observed + z sampled
+[gap] +    0.145 ms  @  413.902 ms  zc: fold_table built
+[gap] +   21.838 ms  @  435.740 ms  zc: round2 fused fold done
+[gap] +    0.018 ms  @  435.758 ms  zc: tail ping-pong buffers taken
+[gap] +   15.367 ms  @  451.125 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.948 ms  @  460.073 ms  zc: tail rounds done
+[gap] +    0.020 ms  @  460.093 ms  zc: tail buffers recycled
+[gap] +    0.017 ms  @  460.110 ms  zerocheck: work done
+[gap] +    0.047 ms  @  460.157 ms  zerocheck: pool exited
+[gap] +    0.022 ms  @  460.179 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  460.188 ms  x_ab built
+[gap] +    9.976 ms  @  470.164 ms  lincheck: done
+[gap] +    0.025 ms  @  470.189 ms  s_hat_v_ab built (core exit)
+[gap] +    0.011 ms  @  470.200 ms  core: returned
+[gap] +    0.011 ms  @  470.211 ms  open: begin
+[gap] +    0.084 ms  @  470.295 ms  open: fold arena ready
+[gap] +    0.544 ms  @  470.839 ms  open: ring_switch done
+[gap] +    0.013 ms  @  470.852 ms  open: b_combined taken
+[gap] +    0.009 ms  @  470.861 ms  open: combine kernel done
+[gap] +    0.011 ms  @  470.872 ms  open: combined basis + target done
+[gap] +   20.431 ms  @  491.302 ms  open: ligerito recursive prover done
+[gap] +    0.052 ms  @  491.354 ms  open: returned
+[gap] +    0.018 ms  @  491.373 ms  proof assembled
+[gap] +    0.010 ms  @  491.382 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  491.390 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   35.696 ms  @   35.698 ms  witness: work done (incl. prefault)
+[gap] +    0.025 ms  @   35.723 ms  witness: pool exited
+[gap] +    0.009 ms  @   35.732 ms  lc_circuit built
+[gap] +    0.010 ms  @   35.741 ms  inner: enter
+[gap] +    0.015 ms  @   35.756 ms  core: padding built
+[gap] +    0.010 ms  @   35.766 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   35.774 ms  commit: pool entered
+[gap] +   20.486 ms  @   56.260 ms  ntt: seed+top fused pass done
+[gap] +   39.291 ms  @   95.551 ms  ntt: deep pass done
+[gap] +    0.048 ms  @   95.599 ms  commit: work done
+[gap] +    0.012 ms  @   95.612 ms  commit: pool exited
+[gap] +    0.011 ms  @   95.623 ms  bind_statement done
+[gap] +    0.172 ms  @   95.795 ms  zerocheck: pool entered
+[gap] +    0.014 ms  @   95.809 ms  zerocheck: views built
+[gap] +   16.633 ms  @  112.442 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.026 ms  @  112.468 ms  zc: round1 observed + z sampled
+[gap] +    0.019 ms  @  112.487 ms  zc: fold_table built
+[gap] +   20.778 ms  @  133.264 ms  zc: round2 fused fold done
+[gap] +    0.045 ms  @  133.310 ms  zc: tail ping-pong buffers taken
+[gap] +   15.899 ms  @  149.209 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.061 ms  @  158.270 ms  zc: tail rounds done
+[gap] +    0.039 ms  @  158.309 ms  zc: tail buffers recycled
+[gap] +    0.011 ms  @  158.320 ms  zerocheck: work done
+[gap] +    0.040 ms  @  158.360 ms  zerocheck: pool exited
+[gap] +    0.017 ms  @  158.377 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  158.386 ms  x_ab built
+[gap] +    9.410 ms  @  167.796 ms  lincheck: done
+[gap] +    0.021 ms  @  167.816 ms  s_hat_v_ab built (core exit)
+[gap] +    0.007 ms  @  167.823 ms  core: returned
+[gap] +    0.007 ms  @  167.831 ms  open: begin
+[gap] +    0.049 ms  @  167.880 ms  open: fold arena ready
+[gap] +    0.405 ms  @  168.284 ms  open: ring_switch done
+[gap] +    0.037 ms  @  168.321 ms  open: b_combined taken
+[gap] +    0.006 ms  @  168.328 ms  open: combine kernel done
+[gap] +    0.009 ms  @  168.336 ms  open: combined basis + target done
+[gap] +   16.236 ms  @  184.572 ms  open: ligerito recursive prover done
+[gap] +    0.038 ms  @  184.611 ms  open: returned
+[gap] +    0.016 ms  @  184.626 ms  proof assembled
+[gap] +    0.009 ms  @  184.635 ms  s_hat_v dropped
+[gap] +    0.010 ms  @  184.645 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   35.654 ms  @   35.657 ms  witness: work done (incl. prefault)
+[gap] +    0.024 ms  @   35.681 ms  witness: pool exited
+[gap] +    0.010 ms  @   35.691 ms  lc_circuit built
+[gap] +    0.008 ms  @   35.699 ms  inner: enter
+[gap] +    0.011 ms  @   35.710 ms  core: padding built
+[gap] +    0.007 ms  @   35.717 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   35.725 ms  commit: pool entered
+[gap] +   20.155 ms  @   55.880 ms  ntt: seed+top fused pass done
+[gap] +   40.187 ms  @   96.067 ms  ntt: deep pass done
+[gap] +    0.048 ms  @   96.114 ms  commit: work done
+[gap] +    0.010 ms  @   96.124 ms  commit: pool exited
+[gap] +    0.009 ms  @   96.134 ms  bind_statement done
+[gap] +    0.024 ms  @   96.158 ms  zerocheck: pool entered
+[gap] +    0.016 ms  @   96.174 ms  zerocheck: views built
+[gap] +   16.135 ms  @  112.309 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.033 ms  @  112.341 ms  zc: round1 observed + z sampled
+[gap] +    0.017 ms  @  112.359 ms  zc: fold_table built
+[gap] +   19.066 ms  @  131.425 ms  zc: round2 fused fold done
+[gap] +    0.022 ms  @  131.447 ms  zc: tail ping-pong buffers taken
+[gap] +   15.332 ms  @  146.779 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.395 ms  @  156.174 ms  zc: tail rounds done
+[gap] +    0.020 ms  @  156.194 ms  zc: tail buffers recycled
+[gap] +    0.009 ms  @  156.203 ms  zerocheck: work done
+[gap] +    0.055 ms  @  156.258 ms  zerocheck: pool exited
+[gap] +    0.019 ms  @  156.277 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  156.285 ms  x_ab built
+[gap] +    9.308 ms  @  165.593 ms  lincheck: done
+[gap] +    0.017 ms  @  165.610 ms  s_hat_v_ab built (core exit)
+[gap] +    0.011 ms  @  165.621 ms  core: returned
+[gap] +    0.010 ms  @  165.630 ms  open: begin
+[gap] +    0.069 ms  @  165.699 ms  open: fold arena ready
+[gap] +    0.459 ms  @  166.158 ms  open: ring_switch done
+[gap] +    0.010 ms  @  166.168 ms  open: b_combined taken
+[gap] +    0.006 ms  @  166.174 ms  open: combine kernel done
+[gap] +    0.009 ms  @  166.183 ms  open: combined basis + target done
+[gap] +   15.185 ms  @  181.368 ms  open: ligerito recursive prover done
+[gap] +    0.045 ms  @  181.413 ms  open: returned
+[gap] +    0.018 ms  @  181.431 ms  proof assembled
+[gap] +    0.010 ms  @  181.441 ms  s_hat_v dropped
+[gap] +    0.010 ms  @  181.452 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   36.955 ms  @   36.957 ms  witness: work done (incl. prefault)
+[gap] +    0.020 ms  @   36.977 ms  witness: pool exited
+[gap] +    0.009 ms  @   36.986 ms  lc_circuit built
+[gap] +    0.007 ms  @   36.993 ms  inner: enter
+[gap] +    0.012 ms  @   37.004 ms  core: padding built
+[gap] +    0.007 ms  @   37.012 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   37.018 ms  commit: pool entered
+[gap] +   19.875 ms  @   56.893 ms  ntt: seed+top fused pass done
+[gap] +   38.938 ms  @   95.831 ms  ntt: deep pass done
+[gap] +    0.047 ms  @   95.878 ms  commit: work done
+[gap] +    0.012 ms  @   95.890 ms  commit: pool exited
+[gap] +    0.012 ms  @   95.901 ms  bind_statement done
+[gap] +    0.041 ms  @   95.942 ms  zerocheck: pool entered
+[gap] +    0.018 ms  @   95.961 ms  zerocheck: views built
+[gap] +   16.073 ms  @  112.033 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.026 ms  @  112.059 ms  zc: round1 observed + z sampled
+[gap] +    0.030 ms  @  112.090 ms  zc: fold_table built
+[gap] +   19.529 ms  @  131.619 ms  zc: round2 fused fold done
+[gap] +    0.026 ms  @  131.645 ms  zc: tail ping-pong buffers taken
+[gap] +   15.467 ms  @  147.112 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.456 ms  @  155.567 ms  zc: tail rounds done
+[gap] +    0.016 ms  @  155.584 ms  zc: tail buffers recycled
+[gap] +    0.012 ms  @  155.596 ms  zerocheck: work done
+[gap] +    0.024 ms  @  155.620 ms  zerocheck: pool exited
+[gap] +    0.015 ms  @  155.635 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  155.643 ms  x_ab built
+[gap] +    9.407 ms  @  165.051 ms  lincheck: done
+[gap] +    0.030 ms  @  165.081 ms  s_hat_v_ab built (core exit)
+[gap] +    0.035 ms  @  165.116 ms  core: returned
+[gap] +    0.009 ms  @  165.125 ms  open: begin
+[gap] +    0.297 ms  @  165.422 ms  open: fold arena ready
+[gap] +    0.391 ms  @  165.813 ms  open: ring_switch done
+[gap] +    0.011 ms  @  165.824 ms  open: b_combined taken
+[gap] +    0.008 ms  @  165.832 ms  open: combine kernel done
+[gap] +    0.011 ms  @  165.843 ms  open: combined basis + target done
+[gap] +   16.401 ms  @  182.244 ms  open: ligerito recursive prover done
+[gap] +    0.040 ms  @  182.284 ms  open: returned
+[gap] +    0.016 ms  @  182.300 ms  proof assembled
+[gap] +    0.010 ms  @  182.310 ms  s_hat_v dropped
+[gap] +    0.009 ms  @  182.319 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.279 ms  @   36.281 ms  witness: work done (incl. prefault)
+[gap] +    0.022 ms  @   36.303 ms  witness: pool exited
+[gap] +    0.010 ms  @   36.314 ms  lc_circuit built
+[gap] +    0.008 ms  @   36.322 ms  inner: enter
+[gap] +    0.013 ms  @   36.335 ms  core: padding built
+[gap] +    0.009 ms  @   36.344 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   36.352 ms  commit: pool entered
+[gap] +   19.937 ms  @   56.289 ms  ntt: seed+top fused pass done
+[gap] +   39.258 ms  @   95.546 ms  ntt: deep pass done
+[gap] +    0.043 ms  @   95.589 ms  commit: work done
+[gap] +    0.008 ms  @   95.597 ms  commit: pool exited
+[gap] +    0.009 ms  @   95.606 ms  bind_statement done
+[gap] +    0.026 ms  @   95.632 ms  zerocheck: pool entered
+[gap] +    0.015 ms  @   95.647 ms  zerocheck: views built
+[gap] +   16.114 ms  @  111.760 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.029 ms  @  111.790 ms  zc: round1 observed + z sampled
+[gap] +    0.017 ms  @  111.806 ms  zc: fold_table built
+[gap] +   21.196 ms  @  133.002 ms  zc: round2 fused fold done
+[gap] +    0.023 ms  @  133.025 ms  zc: tail ping-pong buffers taken
+[gap] +   15.342 ms  @  148.367 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.468 ms  @  156.836 ms  zc: tail rounds done
+[gap] +    0.017 ms  @  156.853 ms  zc: tail buffers recycled
+[gap] +    0.011 ms  @  156.864 ms  zerocheck: work done
+[gap] +    0.019 ms  @  156.883 ms  zerocheck: pool exited
+[gap] +    0.014 ms  @  156.897 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  156.906 ms  x_ab built
+[gap] +    9.249 ms  @  166.154 ms  lincheck: done
+[gap] +    0.020 ms  @  166.175 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  166.185 ms  core: returned
+[gap] +    0.008 ms  @  166.193 ms  open: begin
+[gap] +    0.049 ms  @  166.242 ms  open: fold arena ready
+[gap] +    0.379 ms  @  166.621 ms  open: ring_switch done
+[gap] +    0.009 ms  @  166.630 ms  open: b_combined taken
+[gap] +    0.008 ms  @  166.638 ms  open: combine kernel done
+[gap] +    0.012 ms  @  166.650 ms  open: combined basis + target done
+[gap] +   15.109 ms  @  181.759 ms  open: ligerito recursive prover done
+[gap] +    0.043 ms  @  181.803 ms  open: returned
+[gap] +    0.017 ms  @  181.819 ms  proof assembled
+[gap] +    0.011 ms  @  181.830 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  181.838 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   35.782 ms  @   35.784 ms  witness: work done (incl. prefault)
+[gap] +    0.027 ms  @   35.811 ms  witness: pool exited
+[gap] +    0.007 ms  @   35.819 ms  lc_circuit built
+[gap] +    0.010 ms  @   35.828 ms  inner: enter
+[gap] +    0.016 ms  @   35.844 ms  core: padding built
+[gap] +    0.007 ms  @   35.851 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   35.858 ms  commit: pool entered
+[gap] +   20.045 ms  @   55.903 ms  ntt: seed+top fused pass done
+[gap] +   39.454 ms  @   95.356 ms  ntt: deep pass done
+[gap] +    0.053 ms  @   95.409 ms  commit: work done
+[gap] +    0.010 ms  @   95.420 ms  commit: pool exited
+[gap] +    0.012 ms  @   95.432 ms  bind_statement done
+[gap] +    0.029 ms  @   95.460 ms  zerocheck: pool entered
+[gap] +    0.011 ms  @   95.471 ms  zerocheck: views built
+[gap] +   16.260 ms  @  111.731 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.026 ms  @  111.757 ms  zc: round1 observed + z sampled
+[gap] +    0.020 ms  @  111.777 ms  zc: fold_table built
+[gap] +   20.977 ms  @  132.754 ms  zc: round2 fused fold done
+[gap] +    0.051 ms  @  132.806 ms  zc: tail ping-pong buffers taken
+[gap] +   15.945 ms  @  148.750 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.460 ms  @  157.210 ms  zc: tail rounds done
+[gap] +    0.017 ms  @  157.227 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  157.237 ms  zerocheck: work done
+[gap] +    0.019 ms  @  157.256 ms  zerocheck: pool exited
+[gap] +    0.016 ms  @  157.272 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  157.279 ms  x_ab built
+[gap] +    9.300 ms  @  166.580 ms  lincheck: done
+[gap] +    0.016 ms  @  166.596 ms  s_hat_v_ab built (core exit)
+[gap] +    0.009 ms  @  166.605 ms  core: returned
+[gap] +    0.007 ms  @  166.612 ms  open: begin
+[gap] +    0.053 ms  @  166.665 ms  open: fold arena ready
+[gap] +    0.396 ms  @  167.061 ms  open: ring_switch done
+[gap] +    0.011 ms  @  167.072 ms  open: b_combined taken
+[gap] +    0.006 ms  @  167.078 ms  open: combine kernel done
+[gap] +    0.009 ms  @  167.087 ms  open: combined basis + target done
+[gap] +   14.009 ms  @  181.096 ms  open: ligerito recursive prover done
+[gap] +    0.034 ms  @  181.130 ms  open: returned
+[gap] +    0.018 ms  @  181.148 ms  proof assembled
+[gap] +    0.010 ms  @  181.157 ms  s_hat_v dropped
+[gap] +    0.008 ms  @  181.165 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.578 ms  @   36.580 ms  witness: work done (incl. prefault)
+[gap] +    0.025 ms  @   36.605 ms  witness: pool exited
+[gap] +    0.010 ms  @   36.615 ms  lc_circuit built
+[gap] +    0.008 ms  @   36.623 ms  inner: enter
+[gap] +    0.015 ms  @   36.638 ms  core: padding built
+[gap] +    0.008 ms  @   36.646 ms  core: gpu prewire spawned
+[gap] +    0.010 ms  @   36.656 ms  commit: pool entered
+[gap] +   20.010 ms  @   56.666 ms  ntt: seed+top fused pass done
+[gap] +   39.215 ms  @   95.881 ms  ntt: deep pass done
+[gap] +    0.045 ms  @   95.925 ms  commit: work done
+[gap] +    0.010 ms  @   95.935 ms  commit: pool exited
+[gap] +    0.009 ms  @   95.944 ms  bind_statement done
+[gap] +    0.025 ms  @   95.969 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   95.976 ms  zerocheck: views built
+[gap] +   16.160 ms  @  112.136 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.025 ms  @  112.161 ms  zc: round1 observed + z sampled
+[gap] +    0.016 ms  @  112.177 ms  zc: fold_table built
+[gap] +   22.216 ms  @  134.393 ms  zc: round2 fused fold done
+[gap] +    0.032 ms  @  134.424 ms  zc: tail ping-pong buffers taken
+[gap] +   15.634 ms  @  150.058 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.578 ms  @  158.636 ms  zc: tail rounds done
+[gap] +    0.020 ms  @  158.656 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  158.666 ms  zerocheck: work done
+[gap] +    0.020 ms  @  158.685 ms  zerocheck: pool exited
+[gap] +    0.018 ms  @  158.703 ms  a/b recycled to scratch pool
+[gap] +    0.018 ms  @  158.721 ms  x_ab built
+[gap] +    9.329 ms  @  168.050 ms  lincheck: done
+[gap] +    0.018 ms  @  168.067 ms  s_hat_v_ab built (core exit)
+[gap] +    0.007 ms  @  168.075 ms  core: returned
+[gap] +    0.007 ms  @  168.082 ms  open: begin
+[gap] +    0.055 ms  @  168.137 ms  open: fold arena ready
+[gap] +    0.371 ms  @  168.508 ms  open: ring_switch done
+[gap] +    0.009 ms  @  168.517 ms  open: b_combined taken
+[gap] +    0.006 ms  @  168.523 ms  open: combine kernel done
+[gap] +    0.010 ms  @  168.533 ms  open: combined basis + target done
+[gap] +   13.965 ms  @  182.498 ms  open: ligerito recursive prover done
+[gap] +    0.037 ms  @  182.534 ms  open: returned
+[gap] +    0.018 ms  @  182.552 ms  proof assembled
+[gap] +    0.010 ms  @  182.562 ms  s_hat_v dropped
+[gap] +    0.034 ms  @  182.596 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   37.172 ms  @   37.174 ms  witness: work done (incl. prefault)
+[gap] +    0.027 ms  @   37.201 ms  witness: pool exited
+[gap] +    0.010 ms  @   37.211 ms  lc_circuit built
+[gap] +    0.007 ms  @   37.218 ms  inner: enter
+[gap] +    0.014 ms  @   37.232 ms  core: padding built
+[gap] +    0.011 ms  @   37.243 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   37.251 ms  commit: pool entered
+[gap] +   19.864 ms  @   57.115 ms  ntt: seed+top fused pass done
+[gap] +   39.152 ms  @   96.267 ms  ntt: deep pass done
+[gap] +    0.036 ms  @   96.303 ms  commit: work done
+[gap] +    0.009 ms  @   96.312 ms  commit: pool exited
+[gap] +    0.008 ms  @   96.320 ms  bind_statement done
+[gap] +    0.151 ms  @   96.471 ms  zerocheck: pool entered
+[gap] +    0.018 ms  @   96.490 ms  zerocheck: views built
+[gap] +   16.049 ms  @  112.538 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.028 ms  @  112.566 ms  zc: round1 observed + z sampled
+[gap] +    0.015 ms  @  112.582 ms  zc: fold_table built
+[gap] +   19.356 ms  @  131.938 ms  zc: round2 fused fold done
+[gap] +    0.024 ms  @  131.962 ms  zc: tail ping-pong buffers taken
+[gap] +   15.193 ms  @  147.155 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.070 ms  @  156.225 ms  zc: tail rounds done
+[gap] +    0.019 ms  @  156.244 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  156.255 ms  zerocheck: work done
+[gap] +    0.017 ms  @  156.271 ms  zerocheck: pool exited
+[gap] +    0.015 ms  @  156.286 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  156.294 ms  x_ab built
+[gap] +    9.519 ms  @  165.813 ms  lincheck: done
+[gap] +    0.018 ms  @  165.831 ms  s_hat_v_ab built (core exit)
+[gap] +    0.007 ms  @  165.838 ms  core: returned
+[gap] +    0.007 ms  @  165.845 ms  open: begin
+[gap] +    0.056 ms  @  165.901 ms  open: fold arena ready
+[gap] +    0.378 ms  @  166.280 ms  open: ring_switch done
+[gap] +    0.021 ms  @  166.301 ms  open: b_combined taken
+[gap] +    0.009 ms  @  166.309 ms  open: combine kernel done
+[gap] +    0.011 ms  @  166.321 ms  open: combined basis + target done
+[gap] +   14.717 ms  @  181.037 ms  open: ligerito recursive prover done
+[gap] +    0.042 ms  @  181.080 ms  open: returned
+[gap] +    0.014 ms  @  181.094 ms  proof assembled
+[gap] +    0.009 ms  @  181.103 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  181.111 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   36.925 ms  @   36.927 ms  witness: work done (incl. prefault)
+[gap] +    0.025 ms  @   36.952 ms  witness: pool exited
+[gap] +    0.008 ms  @   36.960 ms  lc_circuit built
+[gap] +    0.006 ms  @   36.966 ms  inner: enter
+[gap] +    0.012 ms  @   36.978 ms  core: padding built
+[gap] +    0.007 ms  @   36.984 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   36.991 ms  commit: pool entered
+[gap] +   20.843 ms  @   57.835 ms  ntt: seed+top fused pass done
+[gap] +   38.809 ms  @   96.643 ms  ntt: deep pass done
+[gap] +    0.043 ms  @   96.686 ms  commit: work done
+[gap] +    0.008 ms  @   96.694 ms  commit: pool exited
+[gap] +    0.018 ms  @   96.712 ms  bind_statement done
+[gap] +    0.036 ms  @   96.748 ms  zerocheck: pool entered
+[gap] +    0.039 ms  @   96.788 ms  zerocheck: views built
+[gap] +   16.105 ms  @  112.893 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.026 ms  @  112.919 ms  zc: round1 observed + z sampled
+[gap] +    0.020 ms  @  112.939 ms  zc: fold_table built
+[gap] +   20.317 ms  @  133.256 ms  zc: round2 fused fold done
+[gap] +    0.023 ms  @  133.279 ms  zc: tail ping-pong buffers taken
+[gap] +   15.199 ms  @  148.478 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.531 ms  @  157.009 ms  zc: tail rounds done
+[gap] +    0.017 ms  @  157.026 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  157.035 ms  zerocheck: work done
+[gap] +    0.025 ms  @  157.060 ms  zerocheck: pool exited
+[gap] +    0.205 ms  @  157.265 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  157.275 ms  x_ab built
+[gap] +    9.171 ms  @  166.446 ms  lincheck: done
+[gap] +    0.019 ms  @  166.465 ms  s_hat_v_ab built (core exit)
+[gap] +    0.011 ms  @  166.475 ms  core: returned
+[gap] +    0.010 ms  @  166.486 ms  open: begin
+[gap] +    0.053 ms  @  166.539 ms  open: fold arena ready
+[gap] +    0.421 ms  @  166.960 ms  open: ring_switch done
+[gap] +    0.011 ms  @  166.971 ms  open: b_combined taken
+[gap] +    0.009 ms  @  166.980 ms  open: combine kernel done
+[gap] +    0.010 ms  @  166.990 ms  open: combined basis + target done
+[gap] +   17.874 ms  @  184.864 ms  open: ligerito recursive prover done
+[gap] +    0.029 ms  @  184.894 ms  open: returned
+[gap] +    0.010 ms  @  184.904 ms  proof assembled
+[gap] +    0.008 ms  @  184.912 ms  s_hat_v dropped
+[gap] +    0.006 ms  @  184.918 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   35.192 ms  @   35.193 ms  witness: work done (incl. prefault)
+[gap] +    0.022 ms  @   35.216 ms  witness: pool exited
+[gap] +    0.011 ms  @   35.227 ms  lc_circuit built
+[gap] +    0.008 ms  @   35.235 ms  inner: enter
+[gap] +    0.016 ms  @   35.250 ms  core: padding built
+[gap] +    0.009 ms  @   35.259 ms  core: gpu prewire spawned
+[gap] +    0.008 ms  @   35.268 ms  commit: pool entered
+[gap] +   20.022 ms  @   55.290 ms  ntt: seed+top fused pass done
+[gap] +   39.233 ms  @   94.523 ms  ntt: deep pass done
+[gap] +    0.043 ms  @   94.565 ms  commit: work done
+[gap] +    0.010 ms  @   94.575 ms  commit: pool exited
+[gap] +    0.012 ms  @   94.586 ms  bind_statement done
+[gap] +    0.164 ms  @   94.750 ms  zerocheck: pool entered
+[gap] +    0.019 ms  @   94.770 ms  zerocheck: views built
+[gap] +   16.203 ms  @  110.973 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.027 ms  @  110.999 ms  zc: round1 observed + z sampled
+[gap] +    0.020 ms  @  111.020 ms  zc: fold_table built
+[gap] +   19.748 ms  @  130.768 ms  zc: round2 fused fold done
+[gap] +    0.038 ms  @  130.806 ms  zc: tail ping-pong buffers taken
+[gap] +   15.440 ms  @  146.246 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.775 ms  @  156.021 ms  zc: tail rounds done
+[gap] +    0.025 ms  @  156.046 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  156.055 ms  zerocheck: work done
+[gap] +    0.017 ms  @  156.072 ms  zerocheck: pool exited
+[gap] +    0.014 ms  @  156.086 ms  a/b recycled to scratch pool
+[gap] +    0.007 ms  @  156.093 ms  x_ab built
+[gap] +    9.365 ms  @  165.459 ms  lincheck: done
+[gap] +    0.017 ms  @  165.476 ms  s_hat_v_ab built (core exit)
+[gap] +    0.009 ms  @  165.485 ms  core: returned
+[gap] +    0.008 ms  @  165.492 ms  open: begin
+[gap] +    0.042 ms  @  165.534 ms  open: fold arena ready
+[gap] +    0.411 ms  @  165.945 ms  open: ring_switch done
+[gap] +    0.010 ms  @  165.956 ms  open: b_combined taken
+[gap] +    0.007 ms  @  165.962 ms  open: combine kernel done
+[gap] +    0.008 ms  @  165.971 ms  open: combined basis + target done
+[gap] +   16.606 ms  @  182.576 ms  open: ligerito recursive prover done
+[gap] +    0.038 ms  @  182.615 ms  open: returned
+[gap] +    0.009 ms  @  182.623 ms  proof assembled
+[gap] +    0.009 ms  @  182.633 ms  s_hat_v dropped
+[gap] +    0.018 ms  @  182.650 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.002 ms  @    0.002 ms  witness: pool entered
+[gap] +   35.952 ms  @   35.953 ms  witness: work done (incl. prefault)
+[gap] +    0.024 ms  @   35.977 ms  witness: pool exited
+[gap] +    0.011 ms  @   35.988 ms  lc_circuit built
+[gap] +    0.009 ms  @   35.997 ms  inner: enter
+[gap] +    0.013 ms  @   36.009 ms  core: padding built
+[gap] +    0.010 ms  @   36.019 ms  core: gpu prewire spawned
+[gap] +    0.009 ms  @   36.028 ms  commit: pool entered
+[gap] +   19.797 ms  @   55.825 ms  ntt: seed+top fused pass done
+[gap] +   39.401 ms  @   95.226 ms  ntt: deep pass done
+[gap] +    0.040 ms  @   95.266 ms  commit: work done
+[gap] +    0.010 ms  @   95.275 ms  commit: pool exited
+[gap] +    0.009 ms  @   95.284 ms  bind_statement done
+[gap] +    0.202 ms  @   95.487 ms  zerocheck: pool entered
+[gap] +    0.020 ms  @   95.507 ms  zerocheck: views built
+[gap] +   16.113 ms  @  111.620 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.030 ms  @  111.650 ms  zc: round1 observed + z sampled
+[gap] +    0.021 ms  @  111.671 ms  zc: fold_table built
+[gap] +   19.539 ms  @  131.209 ms  zc: round2 fused fold done
+[gap] +    0.025 ms  @  131.234 ms  zc: tail ping-pong buffers taken
+[gap] +   15.378 ms  @  146.612 ms  zc: rounds 3+4 composed fold done
+[gap] +    9.310 ms  @  155.923 ms  zc: tail rounds done
+[gap] +    0.024 ms  @  155.946 ms  zc: tail buffers recycled
+[gap] +    0.009 ms  @  155.956 ms  zerocheck: work done
+[gap] +    0.017 ms  @  155.973 ms  zerocheck: pool exited
+[gap] +    0.012 ms  @  155.985 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  155.994 ms  x_ab built
+[gap] +    9.745 ms  @  165.739 ms  lincheck: done
+[gap] +    0.022 ms  @  165.761 ms  s_hat_v_ab built (core exit)
+[gap] +    0.011 ms  @  165.772 ms  core: returned
+[gap] +    0.009 ms  @  165.781 ms  open: begin
+[gap] +    0.057 ms  @  165.838 ms  open: fold arena ready
+[gap] +    0.413 ms  @  166.251 ms  open: ring_switch done
+[gap] +    0.011 ms  @  166.263 ms  open: b_combined taken
+[gap] +    0.008 ms  @  166.271 ms  open: combine kernel done
+[gap] +    0.012 ms  @  166.283 ms  open: combined basis + target done
+[gap] +   13.961 ms  @  180.245 ms  open: ligerito recursive prover done
+[gap] +    0.035 ms  @  180.280 ms  open: returned
+[gap] +    0.015 ms  @  180.294 ms  proof assembled
+[gap] +    0.009 ms  @  180.304 ms  s_hat_v dropped
+[gap] +    0.010 ms  @  180.313 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.003 ms  @    0.003 ms  witness: pool entered
+[gap] +   37.181 ms  @   37.183 ms  witness: work done (incl. prefault)
+[gap] +    0.031 ms  @   37.215 ms  witness: pool exited
+[gap] +    0.009 ms  @   37.224 ms  lc_circuit built
+[gap] +    0.009 ms  @   37.233 ms  inner: enter
+[gap] +    0.012 ms  @   37.245 ms  core: padding built
+[gap] +    0.008 ms  @   37.253 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   37.260 ms  commit: pool entered
+[gap] +   20.060 ms  @   57.320 ms  ntt: seed+top fused pass done
+[gap] +   39.037 ms  @   96.357 ms  ntt: deep pass done
+[gap] +    0.045 ms  @   96.402 ms  commit: work done
+[gap] +    0.008 ms  @   96.410 ms  commit: pool exited
+[gap] +    0.008 ms  @   96.418 ms  bind_statement done
+[gap] +    0.024 ms  @   96.442 ms  zerocheck: pool entered
+[gap] +    0.007 ms  @   96.449 ms  zerocheck: views built
+[gap] +   16.449 ms  @  112.898 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.033 ms  @  112.931 ms  zc: round1 observed + z sampled
+[gap] +    0.020 ms  @  112.951 ms  zc: fold_table built
+[gap] +   19.820 ms  @  132.771 ms  zc: round2 fused fold done
+[gap] +    0.026 ms  @  132.796 ms  zc: tail ping-pong buffers taken
+[gap] +   15.353 ms  @  148.150 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.956 ms  @  157.106 ms  zc: tail rounds done
+[gap] +    0.022 ms  @  157.128 ms  zc: tail buffers recycled
+[gap] +    0.012 ms  @  157.140 ms  zerocheck: work done
+[gap] +    0.022 ms  @  157.162 ms  zerocheck: pool exited
+[gap] +    0.029 ms  @  157.191 ms  a/b recycled to scratch pool
+[gap] +    0.009 ms  @  157.199 ms  x_ab built
+[gap] +   10.167 ms  @  167.366 ms  lincheck: done
+[gap] +    0.025 ms  @  167.391 ms  s_hat_v_ab built (core exit)
+[gap] +    0.010 ms  @  167.401 ms  core: returned
+[gap] +    0.009 ms  @  167.411 ms  open: begin
+[gap] +    0.056 ms  @  167.466 ms  open: fold arena ready
+[gap] +    0.396 ms  @  167.862 ms  open: ring_switch done
+[gap] +    0.013 ms  @  167.875 ms  open: b_combined taken
+[gap] +    0.009 ms  @  167.885 ms  open: combine kernel done
+[gap] +    0.012 ms  @  167.897 ms  open: combined basis + target done
+[gap] +   15.365 ms  @  183.262 ms  open: ligerito recursive prover done
+[gap] +    0.034 ms  @  183.296 ms  open: returned
+[gap] +    0.015 ms  @  183.310 ms  proof assembled
+[gap] +    0.010 ms  @  183.320 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  183.328 ms  prover_data dropped
+[gap] ======== blake3 prove_fast ========
+[gap] +    0.010 ms  @    0.010 ms  witness: pool entered
+[gap] +   35.417 ms  @   35.427 ms  witness: work done (incl. prefault)
+[gap] +    0.016 ms  @   35.443 ms  witness: pool exited
+[gap] +    0.010 ms  @   35.453 ms  lc_circuit built
+[gap] +    0.007 ms  @   35.459 ms  inner: enter
+[gap] +    0.011 ms  @   35.471 ms  core: padding built
+[gap] +    0.007 ms  @   35.477 ms  core: gpu prewire spawned
+[gap] +    0.007 ms  @   35.484 ms  commit: pool entered
+[gap] +   19.711 ms  @   55.196 ms  ntt: seed+top fused pass done
+[gap] +   38.394 ms  @   93.589 ms  ntt: deep pass done
+[gap] +    0.042 ms  @   93.632 ms  commit: work done
+[gap] +    0.011 ms  @   93.642 ms  commit: pool exited
+[gap] +    0.012 ms  @   93.654 ms  bind_statement done
+[gap] +    0.021 ms  @   93.675 ms  zerocheck: pool entered
+[gap] +    0.009 ms  @   93.684 ms  zerocheck: views built
+[gap] +   16.418 ms  @  110.102 ms  zc: round1 done (URM + C_s restore)
+[gap] +    0.035 ms  @  110.137 ms  zc: round1 observed + z sampled
+[gap] +    0.019 ms  @  110.155 ms  zc: fold_table built
+[gap] +   19.256 ms  @  129.411 ms  zc: round2 fused fold done
+[gap] +    0.023 ms  @  129.434 ms  zc: tail ping-pong buffers taken
+[gap] +   15.390 ms  @  144.824 ms  zc: rounds 3+4 composed fold done
+[gap] +    8.829 ms  @  153.653 ms  zc: tail rounds done
+[gap] +    0.022 ms  @  153.674 ms  zc: tail buffers recycled
+[gap] +    0.010 ms  @  153.684 ms  zerocheck: work done
+[gap] +    0.018 ms  @  153.703 ms  zerocheck: pool exited
+[gap] +    0.008 ms  @  153.711 ms  a/b recycled to scratch pool
+[gap] +    0.008 ms  @  153.718 ms  x_ab built
+[gap] +    9.199 ms  @  162.918 ms  lincheck: done
+[gap] +    0.018 ms  @  162.936 ms  s_hat_v_ab built (core exit)
+[gap] +    0.008 ms  @  162.944 ms  core: returned
+[gap] +    0.007 ms  @  162.951 ms  open: begin
+[gap] +    0.076 ms  @  163.027 ms  open: fold arena ready
+[gap] +    0.384 ms  @  163.411 ms  open: ring_switch done
+[gap] +    0.010 ms  @  163.421 ms  open: b_combined taken
+[gap] +    0.006 ms  @  163.428 ms  open: combine kernel done
+[gap] +    0.009 ms  @  163.436 ms  open: combined basis + target done
+[gap] +   14.525 ms  @  177.961 ms  open: ligerito recursive prover done
+[gap] +    0.044 ms  @  178.006 ms  open: returned
+[gap] +    0.011 ms  @  178.017 ms  proof assembled
+[gap] +    0.009 ms  @  178.026 ms  s_hat_v dropped
+[gap] +    0.007 ms  @  178.033 ms  prover_data dropped

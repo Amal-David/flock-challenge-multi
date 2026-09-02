@@ -1,0 +1,19 @@
+{
+  "score": 1194502.6776245858,
+  "metrics": {
+    "warmup_trial_seconds": [],
+    "trial_seconds": [
+      0.219458696
+    ],
+    "p10_seconds": 0.219458696,
+    "median_seconds": 0.219458696,
+    "aggregate_compressions_per_second": 1194502.6776245858,
+    "p90_p10_latency_ratio": 1.0,
+    "batch_size": 262144,
+    "warmup_runs": 0,
+    "measured_runs": 1,
+    "threads": 16,
+    "proof_bytes": 437935,
+    "verified": true
+  }
+}

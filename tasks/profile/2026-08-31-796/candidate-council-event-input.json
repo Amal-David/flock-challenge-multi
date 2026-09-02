@@ -1,0 +1,21 @@
+{
+  "actor": "frontier796_current_head_council",
+  "role": "independent_source_council",
+  "authority": "LOCAL_STATIC",
+  "occurred_at": "2026-08-31T16:32:00Z",
+  "operation": "FINDING",
+  "payload": {
+    "epoch_id": "E-YUKON-cc3bbe1-7968097",
+    "classification": "current-head council closure",
+    "finding": "Independent current-head reviews rejected witness-to-NTT seed pipelining, round-two one-pass replay, fused-four plus fused-two register fusion, and DirectFold8-to-L1 pipeline or worker-partition riders. None has a source-counted 2.1 ms deletion after current fan-in, Fiat-Shamir, register-file, and existing-overlap constraints.",
+    "hypotheses": [
+      "H-WIT-NTT-SEED-PIPE-796",
+      "H-R2-ONEPASS-796",
+      "H-NTT-F4-F2-REGISTER-FUSE-796",
+      "H-D8-L1-PIPE-PARTITION-796"
+    ],
+    "receipt_id": "R-e98f939790052945a9368fe82e5e9be7ccbeaab3b5633372d44e156fa868c893",
+    "decision": "ADMIT_NONE",
+    "submission_performed": false
+  }
+}

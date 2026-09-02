@@ -1,0 +1,40 @@
+{
+  "base_sha": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+  "canonical_receipts": {
+    "public_terminal_rejections": "R-70902e38493809b434c026939bbd36b4fee2b0f5cabebfa023cb113c856b6c78",
+    "source_and_catalyst_audit": "R-85b8235c3b1933d34da1bddca0d5bd5d3ecae3dacf7254918ad25ef1f7f757e2"
+  },
+  "decision": "ADMIT_NONE",
+  "epoch_id": "E-YUKON-fab32a5-cff868b",
+  "public_tombstones": [
+    {
+      "bips_vs_cff": -27.75918230705554,
+      "commit": "41117b3b",
+      "mechanism": "lincheck plane-to-F128 SIMD reconstruction",
+      "score": 1568286.24928436,
+      "submission": "d640401a"
+    },
+    {
+      "bips_vs_cff": -28.475460098174032,
+      "commit": "5eba9055",
+      "mechanism": "PCS-open NT publication at a 2^17 half",
+      "score": 1568173.60372846,
+      "submission": "8b890860"
+    },
+    {
+      "bips_vs_cff": -43.886560272322626,
+      "commit": "5ee59001",
+      "mechanism": "dead carry source hunk already eliminated by LLVM",
+      "score": 1565749.97428235,
+      "submission": "8ce3e826"
+    }
+  ],
+  "source_ceilings_ms": {
+    "fold8_plane_pcs_composition": 0.6,
+    "ntt_merkle_composition": 0.8,
+    "pcs_tail_composition_optimistic": 1.0,
+    "witness_ring_plan_composition": 1.1
+  },
+  "submission_performed": false,
+  "validators": "Luna high"
+}

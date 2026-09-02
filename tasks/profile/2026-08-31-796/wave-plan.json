@@ -1,0 +1,54 @@
+{
+  "wave_id": "frontier796-recovered-profile-20260831T160934Z",
+  "created_at": "2026-08-31T16:09:34Z",
+  "purpose": "Recover the interrupted exact-crown baseline and collect one current-crown sampled profile before choosing any source candidate.",
+  "benchmark": "eigenlabs/flock-challenge-multi/x86",
+  "source": {
+    "crown_sha": "7968097f311d6fc5b30ba4cf9cd146c240e3daf2",
+    "parent_sha": "cff868bcedbf0f56eda51a0c43c49f9dcfe40009",
+    "official_crown_score": 1590863.47318654,
+    "minimum_improvement_bips": 100
+  },
+  "compute": {
+    "provider": "AWS EC2",
+    "region": "us-east-2",
+    "instance_id": "i-00096d6dbcafef80d",
+    "instance_type": "c7i.4xlarge",
+    "hourly_rate_usd": 0.714,
+    "rate_source": "AWS Price List API, Linux shared on-demand, US East Ohio",
+    "instance_was_already_running_when_recovered": true,
+    "observed_launch_time": "2026-08-31T15:32:03Z",
+    "maximum_additional_instance_minutes": 15,
+    "maximum_additional_cost_usd": 0.1785,
+    "maximum_jobs": 2,
+    "maximum_concurrent_jobs": 1,
+    "per_job_timeout_minutes": 5
+  },
+  "jobs": [
+    {
+      "name": "fixed-seed-control",
+      "script": "run_frontier796_once.sh",
+      "result": "proof hash and elapsed time"
+    },
+    {
+      "name": "fixed-seed-system-profile",
+      "script": "run_frontier796_perf_record_system.sh",
+      "result": "proof hash, perf.data hash, elapsed time, sampled symbols, and lost-event count"
+    }
+  ],
+  "gates": {
+    "source_must_equal_crown_sha": true,
+    "worker_must_match_recovered_build_sha256": "2004973a98689a0cfd18e26959395adb3b94b02b9ff4e7939aa15721f1a2c38b",
+    "trusted_verifier_sha256": "5ad0acfa59a6f3415061b0536d401075b7e7c71da5ec1e5d3d8784bd81d68798",
+    "fixed_seed_proofs_must_match": true,
+    "no_source_edit": true,
+    "no_yukon_submission": true
+  },
+  "stop_rules": [
+    "Stop immediately if the crown or worker identity differs.",
+    "Stop if another benchmark or build process is active on the host.",
+    "Stop on any proof mismatch, missing output, profiler error, or nonzero lost-sample signal.",
+    "Stop before the additional 15-minute or USD 0.1785 cap.",
+    "Stop the instance after artifacts are recovered, regardless of outcome."
+  ]
+}
