@@ -2259,6 +2259,7 @@ mod tests {
         let d_inv_val = d_inv();
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
+        let mask_tables = build_c_mask_tables(&eq_lo_scaled);
         let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
 
         // CPU: one x_hi (= 0) into a fresh state ⇒ `local_res_*` hold exactly
@@ -2320,6 +2321,7 @@ mod tests {
         let d_inv_val = d_inv();
         let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
         let convert = convert_table();
+        let mask_tables = build_c_mask_tables(&eq_lo_scaled);
         let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
         let mask_tables = build_c_mask_tables(&eq_lo_scaled);
         let mut state = WorkerStateWithSHatV::new();
