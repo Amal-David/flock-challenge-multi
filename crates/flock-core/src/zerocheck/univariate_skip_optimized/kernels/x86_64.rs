@@ -1063,6 +1063,8 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512(
                         _mm512_i64gather_epi64::<8>(lo_indices, t_lo.as_ptr() as *const i64);
                     let from_hi =
                         _mm512_i64gather_epi64::<8>(hi_indices, t_hi.as_ptr() as *const i64);
+                    let partial_ptr =
+                        bank.as_mut_ptr().add(lane_base + lane_in_group) as *mut __m512i;
                     let updated = _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_loadu_si512(partial_ptr),
                         from_lo,

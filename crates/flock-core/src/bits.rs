@@ -66,27 +66,6 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-#[repr(C, align(64))]
-struct BitTransposeI([u8; 64]);
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "gfni"
-))]
-static BIT_TRANSPOSE_I: BitTransposeI = BitTransposeI([
-    56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,
-    60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7
-]);
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -101,7 +80,16 @@ unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     use core::arch::x86_64::*;
     unsafe {
         let x = _mm512_loadu_si512(lanes.as_ptr() as *const __m512i);
-        let i = _mm512_load_si512(BIT_TRANSPOSE_I.0.as_ptr() as *const __m512i);
+        let i = _mm512_setr_epi64(
+            0x0008101820283038u64 as i64,
+            0x0109111921293139u64 as i64,
+            0x020a121a222a323au64 as i64,
+            0x030b131b232b333bu64 as i64,
+            0x040c141c242c343cu64 as i64,
+            0x050d151d252d353du64 as i64,
+            0x060e161e262e363eu64 as i64,
+            0x070f171f272f373fu64 as i64,
+        );
         let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
         let res = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, x));
         let out_ptr = out.as_mut_ptr();
