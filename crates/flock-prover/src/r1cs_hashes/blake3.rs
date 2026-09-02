@@ -2703,12 +2703,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 } else {
                     None
                 };
-                let stage = if win_ab.is_none() {
-                    debug_assert!(win.len() >= STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
-                } else {
-                    None
-                };
+                let stage = Some(win.as_mut_ptr().cast::<u32>());
                 // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
                 // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
                 // contiguous 512-word blocks disjoint from every witness buffer.
