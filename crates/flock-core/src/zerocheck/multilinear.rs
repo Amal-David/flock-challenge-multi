@@ -5879,60 +5879,61 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
     #[test]
     fn multilinear_ghash_split_and_rollback_equivalence() {
-        let mut rng = Rng::new(0xDEAD_BEEF_C001);
-        let n = 64;
-        let mut a_in = vec![F128::ZERO; 4 * n];
-        let mut b_in = vec![F128::ZERO; 4 * n];
-        for i in 0..4 * n {
-            a_in[i] = rng.f128();
-            b_in[i] = rng.f128();
+        for &lo_size in &[2usize, 4, 8, 16, 64] {
+            let mut rng = Rng::new(0xDEAD_BEEF_C001 + lo_size as u64);
+            let a_in = rng.f128_vec(8 * lo_size);
+            let b_in = rng.f128_vec(8 * lo_size);
+            let eq_lo = rng.f128_vec(lo_size);
+            let rho_a = rng.f128();
+            let rho_b = rng.f128();
+
+            let mut a_out_split = vec![F128::ZERO; 2 * lo_size];
+            let mut b_out_split = vec![F128::ZERO; 2 * lo_size];
+            let mut a_out_plain = vec![F128::ZERO; 2 * lo_size];
+            let mut b_out_plain = vec![F128::ZERO; 2 * lo_size];
+
+            kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(true)));
+            let msg_split = unsafe {
+                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                    &a_in,
+                    &b_in,
+                    &mut a_out_split,
+                    &mut b_out_split,
+                    rho_a,
+                    rho_b,
+                    &eq_lo,
+                    None,
+                    false,
+                )
+            };
+
+            kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(false)));
+            let msg_plain = unsafe {
+                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                    &a_in,
+                    &b_in,
+                    &mut a_out_plain,
+                    &mut b_out_plain,
+                    rho_a,
+                    rho_b,
+                    &eq_lo,
+                    None,
+                    false,
+                )
+            };
+
+            kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(None));
+
+            assert_eq!(a_out_split, a_out_plain, "a_out split vs plain lo_size={lo_size}");
+            assert_eq!(b_out_split, b_out_plain, "b_out split vs plain lo_size={lo_size}");
+            assert_eq!(msg_split, msg_plain, "msg split vs plain lo_size={lo_size}");
         }
-        let eq_lo: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let rho_a = rng.f128();
-        let rho_b = rng.f128();
-
-        let mut a_out_split = vec![F128::ZERO; 2 * n];
-        let mut b_out_split = vec![F128::ZERO; 2 * n];
-        let mut a_out_plain = vec![F128::ZERO; 2 * n];
-        let mut b_out_plain = vec![F128::ZERO; 2 * n];
-
-        kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(true)));
-        let msg_split = unsafe {
-            kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                &a_in,
-                &b_in,
-                &mut a_out_split,
-                &mut b_out_split,
-                rho_a,
-                rho_b,
-                &eq_lo,
-                None,
-                false,
-            )
-        };
-
-        kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(Some(false)));
-        let msg_plain = unsafe {
-            kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                &a_in,
-                &b_in,
-                &mut a_out_plain,
-                &mut b_out_plain,
-                rho_a,
-                rho_b,
-                &eq_lo,
-                None,
-                false,
-            )
-        };
-
-        kernels::x86_64::ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.set(None));
-
-        assert_eq!(a_out_split, a_out_plain, "a_out split vs plain");
-        assert_eq!(b_out_split, b_out_plain, "b_out split vs plain");
-        assert_eq!(msg_split, msg_plain, "msg split vs plain");
     }
 }

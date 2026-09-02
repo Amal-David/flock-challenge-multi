@@ -1953,7 +1953,6 @@ pub(crate) struct R2EqBake {
 
 /// `FLOCK_NO_ZC_GHASH_SPLIT=1` restores the plain `ghash_mul_x4` across all
 /// migrated zerocheck sites.
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 pub(crate) fn zc_ghash_split_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = ZC_GHASH_SPLIT_OVERRIDE.with(|c| c.get()) {
@@ -1964,7 +1963,7 @@ pub(crate) fn zc_ghash_split_enabled() -> bool {
     *ON
 }
 
-#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[cfg(test)]
 thread_local! {
     pub(crate) static ZC_GHASH_SPLIT_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
