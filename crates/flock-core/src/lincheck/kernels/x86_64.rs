@@ -27,6 +27,30 @@ static FUSED_GATHER_LO: FusedGatherIndices =
 static FUSED_GATHER_HI: FusedGatherIndices =
     FusedGatherIndices(super::super::gather_transpose_vpermt2b_indices(true));
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+#[repr(C, align(64))]
+struct PlaneTransposeIndices([u8; 64]);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi"
+))]
+static PLANE_TRANSPOSE_INDICES: PlaneTransposeIndices = PlaneTransposeIndices([
+    0, 8, 16, 24, 32, 40, 48, 56,
+    1, 9, 17, 25, 33, 41, 49, 57,
+    2, 10, 18, 26, 34, 42, 50, 58,
+    3, 11, 19, 27, 35, 43, 51, 59,
+    4, 12, 20, 28, 36, 44, 52, 60,
+    5, 13, 21, 29, 37, 45, 53, 61,
+    6, 14, 22, 30, 38, 46, 54, 62,
+    7, 15, 23, 31, 39, 47, 55, 63,
+]);
+
 /// GFNI twin of [`partial_fold_packed_z_x86_tiled_padded`]: each stripe's
 /// 256-entry sum table is F2-linear (`T[0] = 0`, XOR-composed from the eight
 /// `eq_outer` values), so it IS sixteen 8×8 bit matrices, and
@@ -121,22 +145,81 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
             },
         );
 
-    // One transpose back to F128 columns at the very end (parallelised across 64-column blocks).
+    // Vectorized transpose back to F128 columns at the very end (parallelised across 64-column blocks).
     let mut out = vec![F128::ZERO; k];
     out.par_chunks_exact_mut(64)
         .enumerate()
         .for_each(|(b, out_chunk)| {
             let base = b * 1024;
-            for col in 0..64 {
-                let mut lo = 0u64;
-                let mut hi = 0u64;
-                for byte in 0..8 {
-                    lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi"
+            ))]
+            unsafe {
+                use core::arch::x86_64::*;
+                let v_perm = _mm512_load_si512(PLANE_TRANSPOSE_INDICES.0.as_ptr() as *const __m512i);
+                let p_ptr = planes.as_ptr().add(base);
+                let out_ptr = out_chunk.as_mut_ptr();
+                for g in 0..8 {
+                    let col_off = g * 8;
+                    let r0 = *(p_ptr.add(0 * 64 + col_off) as *const u64);
+                    let r1 = *(p_ptr.add(1 * 64 + col_off) as *const u64);
+                    let r2 = *(p_ptr.add(2 * 64 + col_off) as *const u64);
+                    let r3 = *(p_ptr.add(3 * 64 + col_off) as *const u64);
+                    let r4 = *(p_ptr.add(4 * 64 + col_off) as *const u64);
+                    let r5 = *(p_ptr.add(5 * 64 + col_off) as *const u64);
+                    let r6 = *(p_ptr.add(6 * 64 + col_off) as *const u64);
+                    let r7 = *(p_ptr.add(7 * 64 + col_off) as *const u64);
+                    let lo_mat = _mm512_set_epi64(
+                        r7 as i64, r6 as i64, r5 as i64, r4 as i64,
+                        r3 as i64, r2 as i64, r1 as i64, r0 as i64,
+                    );
+                    let lo_transposed = _mm512_permutexvar_epi8(v_perm, lo_mat);
+
+                    let h0 = *(p_ptr.add(8 * 64 + col_off) as *const u64);
+                    let h1 = *(p_ptr.add(9 * 64 + col_off) as *const u64);
+                    let h2 = *(p_ptr.add(10 * 64 + col_off) as *const u64);
+                    let h3 = *(p_ptr.add(11 * 64 + col_off) as *const u64);
+                    let h4 = *(p_ptr.add(12 * 64 + col_off) as *const u64);
+                    let h5 = *(p_ptr.add(13 * 64 + col_off) as *const u64);
+                    let h6 = *(p_ptr.add(14 * 64 + col_off) as *const u64);
+                    let h7 = *(p_ptr.add(15 * 64 + col_off) as *const u64);
+                    let hi_mat = _mm512_set_epi64(
+                        h7 as i64, h6 as i64, h5 as i64, h4 as i64,
+                        h3 as i64, h2 as i64, h1 as i64, h0 as i64,
+                    );
+                    let hi_transposed = _mm512_permutexvar_epi8(v_perm, hi_mat);
+
+                    let mut lo_arr = [0u64; 8];
+                    let mut hi_arr = [0u64; 8];
+                    _mm512_storeu_si512(lo_arr.as_mut_ptr() as *mut __m512i, lo_transposed);
+                    _mm512_storeu_si512(hi_arr.as_mut_ptr() as *mut __m512i, hi_transposed);
+                    for c in 0..8 {
+                        *out_ptr.add(col_off + c) = F128 {
+                            lo: lo_arr[c],
+                            hi: hi_arr[c],
+                        };
+                    }
                 }
-                for byte in 8..16 {
-                    hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi"
+            )))]
+            {
+                for col in 0..64 {
+                    let mut lo = 0u64;
+                    let mut hi = 0u64;
+                    for byte in 0..8 {
+                        lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                    }
+                    for byte in 8..16 {
+                        hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                    }
+                    out_chunk[col] = F128 { lo, hi };
                 }
-                out_chunk[col] = F128 { lo, hi };
             }
         });
     out
