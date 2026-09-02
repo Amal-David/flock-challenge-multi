@@ -4377,8 +4377,7 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
-            y_acc.mul_acc(f0, b0);
-            y_acc.mul_acc(f1, b1);
+            y_acc.mul_acc2(f0, b0, f1, b1);
 
             k += 8;
         }
