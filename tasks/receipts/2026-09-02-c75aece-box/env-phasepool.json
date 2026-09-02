@@ -1,0 +1,29 @@
+{
+ "label": "env-phasepool",
+ "env": "FLOCK_NO_PHASE_POOLS=1",
+ "utc": "2026-09-02T15:15:04.714397Z",
+ "gain_bips_per_round": [
+  -49.3,
+  -73.1,
+  -63.6,
+  248.4,
+  -115.3,
+  -56.7,
+  70.4,
+  -44.1,
+  15.5,
+  -20.6
+ ],
+ "excl_first": {
+  "n": 9,
+  "mean": -4.4,
+  "median": -44.1,
+  "stdev": 109.0,
+  "stderr": 36.3,
+  "ci95": [
+   -77.0,
+   68.3
+  ],
+  "verdict": "indistinguishable"
+ }
+}

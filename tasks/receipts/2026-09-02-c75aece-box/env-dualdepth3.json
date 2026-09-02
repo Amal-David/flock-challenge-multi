@@ -1,0 +1,29 @@
+{
+ "label": "env-dualdepth3",
+ "env": "FLOCK_OPEN_INDUCE_DUAL_DEPTH=3",
+ "utc": "2026-09-02T15:19:36.894950Z",
+ "gain_bips_per_round": [
+  78.8,
+  -68.8,
+  -45.5,
+  104.6,
+  72.1,
+  -77.9,
+  -56.2,
+  -134.1,
+  207.3,
+  38.0
+ ],
+ "excl_first": {
+  "n": 9,
+  "mean": 4.4,
+  "median": -45.5,
+  "stdev": 108.6,
+  "stderr": 36.2,
+  "ci95": [
+   -68.0,
+   76.8
+  ],
+  "verdict": "indistinguishable"
+ }
+}
