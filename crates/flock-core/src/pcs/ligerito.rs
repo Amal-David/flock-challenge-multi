@@ -1759,9 +1759,50 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
     s * s + s_at_root * s
 }
 
+/// Precomputed `s_k(v_k)` and `s_k(v_k)^{-1}` table for the standard basis `v_i = 1 << i`.
+///
+/// For any `log_n ≤ 64`, `s_k(v_k)` depends only on `k` and not on `log_n`.
+/// Precomputing the table once allows all recursive prover and verifier levels
+/// to slice `&sks_vks[..=log_n]` and `&inv_sks_vks[..=log_n]` directly instead
+/// of re-evaluating the O(log_n^2) field recurrence and O(log_n) field inversions at each level.
+static STANDARD_SKS_VKS_TABLES: std::sync::LazyLock<(Vec<F128>, Vec<F128>)> =
+    std::sync::LazyLock::new(|| {
+        let sks = eval_sk_at_vks_uncached(64);
+        let invs: Vec<F128> = sks
+            .iter()
+            .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+            .collect();
+        (sks, invs)
+    });
+
+/// `FLOCK_NO_OPEN_SKS_SLICE=1` disables the memoized standard basis subspace-polynomial
+/// table slicing across recursive Ligerito levels, restoring the per-call recomputation.
+pub(crate) fn open_sks_slice_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_SKS_SLICE").is_none());
+    *ON
+}
+
+pub(crate) fn standard_sks_vks_and_inverses(log_n: usize) -> (&'static [F128], &'static [F128]) {
+    assert!(
+        log_n <= 64,
+        "log_n ({log_n}) exceeds maximum standard basis dimension 64"
+    );
+    let (sks, invs) = &*STANDARD_SKS_VKS_TABLES;
+    (&sks[..=log_n], &invs[..=log_n])
+}
+
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
-/// Only depends on `log_n`, so callers cache.
+/// Only depends on `log_n`, so callers cache or slice.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
+    if open_sks_slice_enabled() && log_n <= 64 {
+        let (sks, _) = standard_sks_vks_and_inverses(log_n);
+        return sks.to_vec();
+    }
+    eval_sk_at_vks_uncached(log_n)
+}
+
+fn eval_sk_at_vks_uncached(log_n: usize) -> Vec<F128> {
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
     if log_n == 0 {
@@ -2067,11 +2108,20 @@ pub(crate) fn induce_sumcheck_poly(
         table.into_iter().take(n_queries).collect()
     };
 
-    // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    // Precompute inv_sks_vks once across all queries and threads (or slice from static table).
+    let (inv_sks_vks_buf, inv_sks_vks): (Option<Vec<F128>>, &[F128]) =
+        if open_sks_slice_enabled() && log_msg_cols <= 64 {
+            let (_, invs) = standard_sks_vks_and_inverses(log_msg_cols);
+            (None, invs)
+        } else {
+            let buf: Vec<F128> = sks_vks
+                .iter()
+                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+                .collect();
+            let ptr = buf.as_slice() as *const [F128];
+            (Some(buf), unsafe { &*ptr })
+        };
+    let _ = inv_sks_vks_buf;
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -3113,8 +3163,13 @@ pub(crate) fn induce_sumcheck_poly_auto(
         let sks_vks = match sks_vks {
             Some(table) => table,
             None => {
-                computed = eval_sk_at_vks(log_msg_cols);
-                &computed
+                if open_sks_slice_enabled() && log_msg_cols <= 64 {
+                    let (sks, _) = standard_sks_vks_and_inverses(log_msg_cols);
+                    sks
+                } else {
+                    computed = eval_sk_at_vks_uncached(log_msg_cols);
+                    &computed
+                }
             }
         };
         induce_sumcheck_poly(
@@ -9786,12 +9841,16 @@ where
             let induced_residuals: Vec<Vec<F128>> = level_ctxs
                 .iter()
                 .map(|ctx| {
-                    let sks_vks = eval_sk_at_vks(ctx.log_msg_cols);
+                    let sks_vks = if open_sks_slice_enabled() && ctx.log_msg_cols <= 64 {
+                        standard_sks_vks_and_inverses(ctx.log_msg_cols).0
+                    } else {
+                        &eval_sk_at_vks_uncached(ctx.log_msg_cols)[..]
+                    };
                     let ris_for_basis =
                         &ris[ctx.ris_start..ctx.ris_start + ctx.log_msg_cols - yr_log_n];
                     induce_sumcheck_evaluate_at_residual(
                         ctx.log_msg_cols,
-                        &sks_vks,
+                        sks_vks,
                         &ctx.queries,
                         &ctx.alpha,
                         ris_for_basis,
@@ -11037,6 +11096,77 @@ mod tests {
                 multi_proof_gather(&bad_tree, num_leaves, &queries, true),
                 proof_seq,
                 "corrupted sibling went undetected log_leaves={log_leaves}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_sks_slice_matches_uncached_and_rollback() {
+        // 1. Verify standard_sks_vks_and_inverses table against uncached for all dimensions 0..=32.
+        for dim in 0..=32 {
+            let uncached_sks = eval_sk_at_vks_uncached(dim);
+            let (sliced_sks, sliced_invs) = standard_sks_vks_and_inverses(dim);
+            assert_eq!(
+                sliced_sks,
+                &uncached_sks[..],
+                "sliced sks_vks mismatch at dim={dim}"
+            );
+            assert_eq!(sliced_invs.len(), dim + 1);
+            for (k, (&s, &inv)) in sliced_sks.iter().zip(sliced_invs.iter()).enumerate() {
+                if s.is_zero() {
+                    assert_eq!(inv, F128::ZERO, "inv mismatch at zero at dim={dim} k={k}");
+                } else {
+                    assert_eq!(s * inv, F128::ONE, "inv * s != 1 at dim={dim} k={k}");
+                }
+            }
+        }
+
+        // 2. Test induce_sumcheck_poly output with slicing vs rollback uncached on random inputs.
+        let mut state = 0x5EED_5A17_F00D_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(31))
+        };
+        for log_msg_cols in [4usize, 7, 10, 13] {
+            let n_queries = 16;
+            let log_interleaved = 3;
+            let num_interleaved = 1usize << log_interleaved;
+            let opened_rows: Vec<Vec<F128>> = (0..n_queries)
+                .map(|_| (0..num_interleaved).map(|_| random()).collect())
+                .collect();
+            let v_challenges: Vec<F128> = (0..log_interleaved).map(|_| random()).collect();
+            let queries: Vec<usize> = (0..n_queries).map(|i| i * 7).collect();
+            let alpha: Vec<F128> = (0..4).map(|_| random()).collect();
+
+            let sks_vks_uncached = eval_sk_at_vks_uncached(log_msg_cols);
+            let (sliced_sks, _) = standard_sks_vks_and_inverses(log_msg_cols);
+
+            let (basis_sliced, sum_sliced) = induce_sumcheck_poly(
+                log_msg_cols,
+                sliced_sks,
+                &opened_rows,
+                &v_challenges,
+                &queries,
+                &alpha,
+            );
+            let (basis_uncached, sum_uncached) = induce_sumcheck_poly(
+                log_msg_cols,
+                &sks_vks_uncached,
+                &opened_rows,
+                &v_challenges,
+                &queries,
+                &alpha,
+            );
+
+            assert_eq!(
+                basis_sliced, basis_uncached,
+                "basis mismatch for log_msg_cols={log_msg_cols}"
+            );
+            assert_eq!(
+                sum_sliced, sum_uncached,
+                "enforced sum mismatch for log_msg_cols={log_msg_cols}"
             );
         }
     }
