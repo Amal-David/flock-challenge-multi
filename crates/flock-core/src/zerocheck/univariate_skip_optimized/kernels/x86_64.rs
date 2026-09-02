@@ -186,19 +186,24 @@ unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i
     unsafe {
         if nt == 1 {
             let p = out.as_mut_ptr();
-            _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
-            _mm_stream_si128(
-                p.add(16) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<1>(acc),
-            );
-            _mm_stream_si128(
-                p.add(32) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<2>(acc),
-            );
-            _mm_stream_si128(
-                p.add(48) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<3>(acc),
-            );
+            let addr = p as usize;
+            if addr.is_multiple_of(64) {
+                _mm512_stream_si512(p as *mut __m512i, acc);
+            } else {
+                _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
+                _mm_stream_si128(
+                    p.add(16) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<1>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(32) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<2>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(48) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<3>(acc),
+                );
+            }
         } else {
             _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }

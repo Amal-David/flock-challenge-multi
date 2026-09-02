@@ -4546,22 +4546,27 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
             if stream && dst_aligned {
-                _mm_stream_si128(
-                    ptr.cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<0>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(1).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<1>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(2).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<2>(value),
-                );
-                _mm_stream_si128(
-                    ptr.add(3).cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<3>(value),
-                );
+                let addr = ptr as usize;
+                if addr.is_multiple_of(64) {
+                    _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+                } else {
+                    _mm_stream_si128(
+                        ptr.cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<0>(value),
+                    );
+                    _mm_stream_si128(
+                        ptr.add(1).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<1>(value),
+                    );
+                    _mm_stream_si128(
+                        ptr.add(2).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<2>(value),
+                    );
+                    _mm_stream_si128(
+                        ptr.add(3).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<3>(value),
+                    );
+                }
             } else {
                 _mm512_storeu_si512(ptr.cast::<__m512i>(), value);
             }
