@@ -104,6 +104,20 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
 /// apply (ten port-5 shuffles per apply) in the shift-reduce AB kernel.
 /// Resolved once per process.
 #[allow(dead_code)] // Retained same-binary rollback selector.
+/// Ranked default: the round-one AB conversion accumulators use the 5-CLMUL
+/// split product with a loop-hoisted `eq·x^64` companion, matching what the
+/// crown already does in the multilinear fold kernels (`FLOCK_NO_ZC_FOLD_SPLIT`).
+/// `eq` is loop-invariant in both accumulators, so the companion is built once
+/// per call and every product inside the lane loop drops one CLMUL (6 -> 5).
+/// Field-identical; `FLOCK_NO_ZC_AB_SPLIT=1` restores the incumbent 6-CLMUL
+/// `ghash_mul_x4` in the same binary.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub(crate) fn zc_ab_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_SPLIT").is_none());
+    *ON
+}
+
 pub(crate) fn urm_apply_2img_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_APPLY_2IMG").is_none());
@@ -773,7 +787,9 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -783,6 +799,10 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // `eq` is invariant across the lane loop below, so its x^64
+        // companion is built once here and reused by every product.
+        let split = zc_ab_split_enabled();
+        let eq_x64 = if split { ghash_shift64_x4(eq) } else { eq };
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -793,7 +813,12 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let cf_v = f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]);
+            let scaled_ab = if split {
+                ghash_mul_x4_split(cf_v, eq, eq_x64)
+            } else {
+                ghash_mul_x4(cf_v, eq)
+            };
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -873,7 +898,9 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
@@ -915,6 +942,10 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        // `eq` is invariant across the lane loop below, so its x^64
+        // companion is built once here and reused by every product.
+        let split = zc_ab_split_enabled();
+        let eq_x64 = if split { ghash_shift64_x4(eq) } else { eq };
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -953,8 +984,14 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let (scaled0, scaled1) = if split {
+                    (
+                        ghash_mul_x4_split(aos0, eq, eq_x64),
+                        ghash_mul_x4_split(aos1, eq, eq_x64),
+                    )
+                } else {
+                    (ghash_mul_x4(aos0, eq), ghash_mul_x4(aos1, eq))
+                };
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
@@ -1323,6 +1360,53 @@ mod tests {
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
         accumulate_convert_ab_nomul_x86_gfni_fixed,
     };
+
+    /// The round-one AB accumulators were migrated from the 6-CLMUL
+    /// `ghash_mul_x4` to the 5-CLMUL `ghash_mul_x4_split` with a loop-hoisted
+    /// `eq·x^64` companion. That rewrite is only sound because the two forms
+    /// are field-identical whenever the companion really is `t·x^64 mod p`, so
+    /// pin exactly that identity over pseudo-random inputs, for both the
+    /// default path and the `FLOCK_NO_ZC_AB_SPLIT` rollback operand order.
+    #[test]
+    fn ghash_split_product_matches_plain_product() {
+        use crate::field::gf2_128::x86_64::{
+            f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+        };
+        // SAFETY: this module is cfg-gated on avx512f + vpclmulqdq.
+        unsafe {
+            let mut st: u64 = 0x243F_6A88_85A3_08D3;
+            let mut next = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                st
+            };
+            for _ in 0..256 {
+                let v = f128x4_set(
+                    F128::new(next(), next()),
+                    F128::new(next(), next()),
+                    F128::new(next(), next()),
+                    F128::new(next(), next()),
+                );
+                let t_scalar = F128::new(next(), next());
+                let t = f128x4_set(t_scalar, t_scalar, t_scalar, t_scalar);
+                let t_x64 = ghash_shift64_x4(t);
+                let plain = ghash_mul_x4(v, t);
+                let split = ghash_mul_x4_split(v, t, t_x64);
+                let mut a = [0u8; 64];
+                let mut b = [0u8; 64];
+                core::arch::x86_64::_mm512_storeu_si512(
+                    a.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                    plain,
+                );
+                core::arch::x86_64::_mm512_storeu_si512(
+                    b.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                    split,
+                );
+                assert_eq!(a, b, "split product must be byte-identical to the plain product");
+            }
+        }
+    }
 
     #[test]
     fn accumulate_c_banks_avx512_matches_scalar() {
