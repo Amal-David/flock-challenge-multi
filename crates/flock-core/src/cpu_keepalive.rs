@@ -46,16 +46,12 @@ mod imp {
     /// Spin threads spawned but not yet finished.
     static LIVE: AtomicUsize = AtomicUsize::new(0);
 
-    /// How long [`join_all`] may wait for the spin threads to notice the stop signal.
-    const QUIET_TIMEOUT: Duration = Duration::from_micros(250);
+    const QUIET_TIMEOUT: Duration = Duration::from_millis(50);
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)
     /// without SIMD/CLMUL power draw or any shared/memory state.
     fn spin_until_stopped(deadline: Instant) {
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        // qos
-
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         while RUNNING.load(Ordering::Relaxed) {
             for _ in 0..64 {
