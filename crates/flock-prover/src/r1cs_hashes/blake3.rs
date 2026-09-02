@@ -5202,14 +5202,18 @@ mod tests {
                 (z, a, b, ab)
             };
 
+            println!("Testing n_total={n_total}, skip_blocks={skip_blocks}");
             let (z_r, a_r, b_r, ab_r) = run(&blocks, [false; 3], false, None);
+            println!("Got reference run");
             let (z_o, a_o, b_o, _) = run(&other, [false; 3], false, None);
+            println!("Got other run");
             let seed = (z_o, a_o, b_o);
             for &elide_on in &[false, true] {
                 for &ab_nt in &[false, true] {
                     if !elide_on && !ab_nt {
                         continue; // that IS the reference
                     }
+                    println!("Running elide_on={elide_on}, ab_nt={ab_nt}");
                     let elide = [elide_on; 3];
                     let (z, a, b, ab) = run(
                         &blocks,
